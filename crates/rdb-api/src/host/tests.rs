@@ -6422,7 +6422,7 @@ mod routed_fence {
     };
     use rdb_core::contracts::membership::{CopyId, Member};
     use rdb_core::contracts::recovery::{
-        CommittedWithout, LineageAnchor, PriorRecord, RecoveryPlan, WithoutEntry,
+        CommittedWithout, LineageAnchor, PriorMember, PriorRecord, RecoveryPlan, WithoutEntry,
     };
     use rdb_core::contracts::time::Tick;
 
@@ -6787,9 +6787,9 @@ mod routed_fence {
     }
 
     /// PR #74 F-001 (ruling A-R477), new: a plan with `must_hold` set is stored at the current
-    /// version, 3 since #80 S5n, and reads back whole, its `prior` too. A build that reads only
-    /// 1 refuses the version byte by name (`plan version 3, this build reads 1`,
-    /// `plan_unreadable`).
+    /// version, 4 since issue #105 (3 since #80 S5n), and reads back whole, its `prior` too. A
+    /// build that reads only 1 refuses the version byte by name (`plan version 4, this build
+    /// reads 1`, `plan_unreadable`).
     /// Unit (<1 ms).
     #[test]
     fn pr74_f001_a_stored_plan_round_trips_must_hold_and_prior() {
@@ -6801,9 +6801,63 @@ mod routed_fence {
             cutoff: Seq(9),
             copies: vec![(CopyId(2), NodeId(2))],
         });
+        plan.prior.ledger = rdb_core::contracts::recovery::TailLedger {
+            last_writable: Some(Generation(6)),
+            last_writable_regulars: vec![NodeId(1), NodeId(3)],
+            held: vec![rdb_core::contracts::recovery::HeldTail {
+                node: NodeId(3),
+                head: Seq(11),
+            }],
+        };
+        plan.release.through = Some(Seq(11));
         let bytes = crate::admin::encode_promote_plan(&plan);
-        assert_eq!(bytes[0], 3);
+        assert_eq!(bytes[0], 4);
         assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
+    }
+
+    /// `stored_plan()` with `must_hold` {3} and a prior naming three members and no note, as #80
+    /// S5n (`PROMOTE_PLAN_VERSION` 3) stored it: version byte `3`, version 2's fields, then the
+    /// prior's members and note, with no ledger. Kept as bytes like [`V1_STORED_PLAN`].
+    const V3_STORED_PLAN: &str = "0301030209000000000000000000000000000000000000000000000000000000000000000001050201020100020301010102010101010102000101010201020103020107010501ffffffffffffffffff0100e807010301030101000202010303010000";
+
+    /// Issue #105, old to new: a plan #80 stored (version 3, before the ledger and `release`)
+    /// decodes with its `must_hold` and prior members, the ledger unknown and nothing released,
+    /// and still binds a routed fence. Unknown over-holds and never under-holds: that build wrote
+    /// no ledger. Cut: version 3 read as [`RecoveryPlan`], red (the decode fails).
+    /// Unit (<1 ms).
+    #[test]
+    fn issue105_a_version_3_stored_plan_reads_with_the_ledger_unknown() {
+        let old = hex::decode(V3_STORED_PLAN).expect("hex");
+        assert_eq!(old[0], 3);
+        let plan = crate::admin::decode_promote_plan(&old).expect("a version 3 plan");
+        let mut expected = with_prior_unknown(stored_plan());
+        expected.must_hold = [CopyId(3)].into_iter().collect();
+        expected.prior.members = Some(vec![
+            PriorMember {
+                copy: CopyId(1),
+                node: NodeId(1),
+                role: ReplicaRole::Primary,
+            },
+            PriorMember {
+                copy: CopyId(2),
+                node: NodeId(2),
+                role: ReplicaRole::RegularSecondary,
+            },
+            PriorMember {
+                copy: CopyId(3),
+                node: NodeId(3),
+                role: ReplicaRole::RegularSecondary,
+            },
+        ]);
+        assert_eq!(plan, expected);
+        assert_eq!(plan.prior.ledger.last_writable, None);
+        assert_eq!(
+            plan.release,
+            rdb_core::contracts::recovery::TailRelease::default()
+        );
+        let (proof, mut facts) = true_fence();
+        facts.plan = Some(bytes::Bytes::from(old));
+        assert_eq!(bind(&proof, facts), Ok(()));
     }
 
     /// `stored_plan()` with `must_hold` {3} as #79 (57d15ca, `PROMOTE_PLAN_VERSION` 2) stored it:
@@ -6833,6 +6887,7 @@ mod routed_fence {
             prior: PriorRecord {
                 members: None,
                 note: CommittedWithout::default(),
+                ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
             },
             ..plan
         }
@@ -6855,7 +6910,7 @@ mod routed_fence {
     }
 
     /// PR #74 F-001 (Revobot R2, inline 4438738832), new to old: an older build (313f959, which
-    /// reads version 1) refuses this build's version 3 plan by name, never decodes it without
+    /// reads version 1) refuses this build's version 4 plan (3 before issue #105) by name, never decodes it without
     /// `must_hold`. Control: the same gate passes the v1 fixture.
     /// Unit (<1 ms).
     #[test]
@@ -6865,7 +6920,7 @@ mod routed_fence {
         let bytes = crate::admin::encode_promote_plan(&plan);
         assert_eq!(
             frozen_313f959_promote_plan_version_gate(&bytes),
-            Err("plan version 3, this build reads 1".to_owned())
+            Err("plan version 4, this build reads 1".to_owned())
         );
         let old = hex::decode(V1_STORED_PLAN).expect("hex");
         assert_eq!(frozen_313f959_promote_plan_version_gate(&old), Ok(()));

@@ -37,8 +37,11 @@ fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
         },
         ..root
     };
-    let report =
-        |trio: &mut Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
+    let report = |trio: &mut Trio, anchor| {
+        trio.nodes[1]
+            .0
+            .inventory(PartitionId(1), CopyId(1), anchor, None)
+    };
 
     assert!(
         matches!(
@@ -110,7 +113,7 @@ fn a_copy_that_missed_a_writeless_generation_links_it_at_inventory() {
     );
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1])) {
+    match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1]), None) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -142,7 +145,7 @@ fn a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own() 
     );
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor_at(4, 2, digests[1])) {
+    match host.inventory(PartitionId(1), CopyId(1), anchor_at(4, 2, digests[1]), None) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -827,7 +830,10 @@ fn m10_s2_59_a_post_commit_sync_before_the_landing_ends_the_re_sends() {
 
 /// A-R177 rows 3-5 (critic-f5 C2): the guards refuse before anything is written, each by
 /// name: the digest at the base differs, the copy holds past the base (uncertain data an
-/// ask must not truncate), or below it.
+/// ask must not truncate), or below it. Issue #105 (design section 3.3): the copy holding past
+/// the base no longer answers a bare `InventoryFailed`. With L unknown its tail on the newest
+/// lineage below the anchor is treated as current, so it answers `TailHeld` naming the head
+/// and its stamp; that is the refusal F1 caps on. The other two hold no tail and still fail.
 #[test]
 fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
     let dir = config_testkit::fs::temp_dir();
@@ -858,12 +864,253 @@ fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
             host.survivor(PartitionId(1), CopyId(1), anchor).map(drop),
             Err(reason)
         );
-        assert_eq!(
-            host.inventory(PartitionId(1), CopyId(1), anchor),
+        let answer = if reason == "missed_generation_held_past_base" {
+            RecoveryEvent::TailHeld {
+                copy: CopyId(1),
+                head: Seq(3),
+                stamp: Some(Generation(1)),
+                reason: reason.to_owned(),
+            }
+        } else {
             RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+        };
+        assert_eq!(
+            host.inventory(PartitionId(1), CopyId(1), anchor, None),
+            answer,
+            "{reason}"
         );
         assert_eq!(host.engine.lineages(), held, "{reason}: nothing written");
     }
+}
+
+/// Issue #105 (design section 7, "add one with L set"): with the last writable generation L
+/// known, the same tail is judged by its head's stamp. Stamped L (here generation 1) it is
+/// current and answers `TailHeld`. With L at generation 2 it is superseded: a writable commit
+/// went on past it, so it is today's refusal, a bare `InventoryFailed`. Nothing is written
+/// either way. Cut: `tail_scan` keeps a head stamped below L, red (the second answer is
+/// `TailHeld`).
+#[test]
+fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generation() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    let anchor = anchor_at(2, 2, digests[1]);
+    assert_eq!(
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1))),
+        RecoveryEvent::TailHeld {
+            copy: CopyId(1),
+            head: Seq(3),
+            stamp: Some(Generation(1)),
+            reason: "missed_generation_held_past_base".to_owned(),
+        },
+        "stamped L: current"
+    );
+    assert_eq!(
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2))),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+        "stamped below L: superseded"
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+}
+
+/// Issue #105 (design section 3.3): a copy that holds the anchor's generation at the base, and
+/// past it on an older lineage, holds a tail there: `TailHeld` with `tail_on_older_lineage`,
+/// stamped generation 1, whether L is that generation or unknown. Stamped below L it is
+/// superseded and the copy reports. The control: the anchor's lineage holds the same record at
+/// that head (linked there), so there is no tail and the copy answers its own refusal, not
+/// `TailHeld`. And N3(a): a normal recovery's copy holds
+/// no tail and reports, holding L intact. Cuts: `tail_scan` skips a lineage while the anchor is
+/// held, red (the first answer reports); the same-digest check removed, red (the control is
+/// `TailHeld`).
+#[config_log::retcd_test]
+fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_head_is_not() {
+    const METHOD: &str =
+        "issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_head_is_not";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 5);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(3))
+            .expect("inherit");
+        digests
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let anchor = anchor_at(2, 3, digests[2]);
+    let held = RecoveryEvent::TailHeld {
+        copy: CopyId(1),
+        head: Seq(5),
+        stamp: Some(Generation(1)),
+        reason: "tail_on_older_lineage".to_owned(),
+    };
+    assert_eq!(
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1))),
+        held,
+        "stamped L"
+    );
+    assert_eq!(
+        host.inventory(PartitionId(1), CopyId(1), anchor, None),
+        held,
+        "L unknown: the newest lineage below the anchor"
+    );
+    assert!(
+        matches!(
+            host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2))),
+            RecoveryEvent::InventoryReported(_)
+        ),
+        "stamped below L: superseded, the copy reports"
+    );
+    drop(host);
+
+    // The anchor's lineage holds the same record at the old lineage's head (linked there, past
+    // the base): no tail. The copy then fails on its own refusal, not `TailHeld`.
+    let shared = dir.path().join("shared");
+    let digests = {
+        let mut engine = RocksEngine::open(&shared).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 5);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(5))
+            .expect("inherit");
+        digests
+    };
+    let mut host = host_over(&shared, &rt);
+    assert_eq!(
+        host.inventory(
+            PartitionId(1),
+            CopyId(1),
+            anchor_at(2, 3, digests[2]),
+            Some(Generation(1)),
+        ),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+        "the same record at the head is no tail"
+    );
+    drop(host);
+
+    // N3(a): a normal recovery's copy, linked at the base, holds no tail and reports, holding
+    // L (generation 2) intact through the link.
+    let normal = dir.path().join("normal");
+    let digests = {
+        let mut engine = RocksEngine::open(&normal).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 3);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(3))
+            .expect("inherit");
+        digests
+    };
+    let mut host = host_over(&normal, &rt);
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(2, 3, digests[2]),
+        Some(Generation(2)),
+    ) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head.0, Seq(3));
+            assert!(inventory.holds_last_writable, "{inventory:?}");
+        }
+        other => panic!("a normal recovery reports: {other:?}"),
+    }
+    let hits: Vec<_> = logged!(METHOD, "tail_scan")
+        .into_iter()
+        .map(|line| line["hit"].clone())
+        .collect();
+    assert_eq!(
+        hits,
+        [true, true, false, false, false].map(serde_json::Value::Bool),
+        "one scan per ask"
+    );
+}
+
+/// Issue #105 (design section 3.7): a copy holds L intact when it holds L's lineage with a
+/// record at seq 1, read through any link. Not when L is unknown, not when the copy lacks L
+/// (wiped, or never held it), and not when L's lineage is holed below its head. A lineage
+/// linked onto one that holds seq 1 holds it. Cut: `holds_last_writable` skips the seq-1
+/// read, red (the holed lineage counts).
+#[test]
+fn issue105_a_copy_holds_l_intact_only_with_l_from_seq_1() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 3);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(3), Seq(3))
+            .expect("inherit");
+        // Generation 2 holds seqs 4 and 5 only: holed below its head.
+        write_chain_after(&mut engine, Generation(2), vec![Digest::ROOT; 3], 2);
+    }
+    let rt = current_thread();
+    let host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    assert!(!host.holds_last_writable(p, None), "L unknown");
+    assert!(
+        host.holds_last_writable(p, Some(Generation(1))),
+        "written from seq 1"
+    );
+    assert!(
+        host.holds_last_writable(p, Some(Generation(3))),
+        "linked onto seq 1"
+    );
+    assert!(!host.holds_last_writable(p, Some(Generation(2))), "holed");
+    assert!(
+        !host.holds_last_writable(p, Some(Generation(9))),
+        "L not held"
+    );
+}
+
+/// Issue #105 (design section 3.4, layer 2): after a commit, a copy whose own status holds a
+/// tail above the cutoff withholds its durability proof, so a rebuild that needs it stalls and
+/// never activates past the tail. Before the commit, or with the tail at or below the cutoff,
+/// the tail does not withhold it. Cut: the `tail_held` check removed, red (the first reason is
+/// `short`).
+#[config_log::retcd_test]
+fn issue105_a_copy_holding_a_tail_withholds_its_post_commit_proof() {
+    const METHOD: &str = "issue105_a_copy_holding_a_tail_withholds_its_post_commit_proof";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let capture = CapturedPrefix {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        through: AppliedSeq(3),
+    };
+    let tail = |head: u64| TailRefused {
+        generation: Generation(2),
+        head: Seq(head),
+        base: Seq(3),
+        reason: "tail_on_older_lineage",
+    };
+    // `write_chain` publishes no durability, so every answer here is withheld; the reason
+    // says which check withheld it.
+    host.tail_refused.insert(PartitionId(1), tail(5));
+    assert_eq!(host.sync_answer(capture, CopyId(1), true, true), None);
+    assert_eq!(host.sync_answer(capture, CopyId(1), false, true), None);
+    host.tail_refused.insert(PartitionId(1), tail(3));
+    assert_eq!(host.sync_answer(capture, CopyId(1), true, true), None);
+    let reasons: Vec<_> = logged!(METHOD, "sync_withheld")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        ["tail_held", "short", "short"].map(|reason| serde_json::json!(reason)),
+        "after the commit the tail withholds; before it, or at the cutoff, it does not"
+    );
 }
 
 /// S1-8 D2: each `step_view` line names the depth of the view it built, the levels a read
@@ -949,7 +1196,7 @@ fn a_link_made_at_inventory_survives_a_restart_before_the_answer() {
         assert!(host.survivor(PartitionId(1), CopyId(1), anchor).is_ok());
     }
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor) {
+    match host.inventory(PartitionId(1), CopyId(1), anchor, None) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(2), digests[1]));
         }
@@ -1711,7 +1958,12 @@ fn m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base() {
     );
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
-    match host.inventory(PartitionId(1), CopyId(1), anchor_at(2, 40, digests[39])) {
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(2, 40, digests[39]),
+        None,
+    ) {
         RecoveryEvent::InventoryReported(inventory) => {
             assert_eq!(inventory.head, (Seq(40), digests[39]));
             assert_eq!(inventory.ladder, vec![(Seq(40), digests[39])]);
@@ -1845,5 +2097,265 @@ fn s3b_9_a_target_restore_keeps_the_latest_plan_on_a_live_and_a_dormant_receiver
     assert!(
         source.recovery_plan().is_none(),
         "a target restore gave a plan to the receiver beside a serving primary"
+    );
+}
+
+/// Issue #105 (design section 8.1): `admin forget-tail` on the owner. Each refusal is
+/// `no_mutation`, names why, and ends "nothing was given up": no flag; a node that is not the
+/// owner; `--through` at or below the cutoff; `--through` with no tail anywhere to give up; a
+/// live copy's tail without `--give-up-live-copy`; `--no-intact-copy` while the intact rule is
+/// not what holds the partition. With the live copy named it is accepted: the answer names what
+/// is given up and the owner re-plans, committing a later generation that carries the release.
+/// Cut: `forget_tail_asked` skips the live-copy check, red (the bare `--through` is accepted).
+#[config_log::retcd_test]
+fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives_up() {
+    const METHOD: &str =
+        "issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives_up";
+    use rdb_core::contracts::errors::ErrorKind;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (before, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let through = |head: u64| TailRelease {
+        through: Some(Seq(head)),
+        no_intact_copy: false,
+    };
+    let refused = |answer: Result<String, ApiError>, kind: ErrorKind, says: &str| {
+        let error = answer.expect_err(says);
+        assert_eq!(error.kind, kind, "{error:?}");
+        assert!(error.no_mutation, "{error:?}");
+        assert!(error.detail.contains(says), "{says}: {error:?}");
+    };
+    let owner = &mut trio.nodes[0].0;
+    refused(
+        owner.forget_tail_asked(p, TailRelease::default(), false),
+        ErrorKind::InvalidArgument,
+        "--through H or --no-intact-copy",
+    );
+    refused(
+        owner.forget_tail_asked(p, through(cutoff.0), false),
+        ErrorKind::InvalidArgument,
+        "at or below",
+    );
+    refused(
+        owner.forget_tail_asked(p, through(cutoff.0 + 5), false),
+        ErrorKind::InvalidArgument,
+        "nothing for --through to give up",
+    );
+    refused(
+        owner.forget_tail_asked(
+            p,
+            TailRelease {
+                through: None,
+                no_intact_copy: true,
+            },
+            false,
+        ),
+        ErrorKind::InvalidArgument,
+        "the intact rule is not what holds",
+    );
+    owner.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: before,
+            head: Seq(cutoff.0 + 3),
+            base: cutoff,
+            reason: "tail_on_older_lineage",
+        },
+    );
+    refused(
+        owner.forget_tail_asked(p, through(cutoff.0 + 5), false),
+        ErrorKind::InvalidArgument,
+        "add --give-up-live-copy",
+    );
+    assert!(
+        trio.nodes[1]
+            .0
+            .forget_tail_asked(p, through(cutoff.0 + 5), true)
+            .is_err(),
+        "node 2 is not the owner"
+    );
+    let owner = &mut trio.nodes[0].0;
+    let line = owner
+        .forget_tail_asked(p, through(cutoff.0 + 5), true)
+        .expect("accepted");
+    assert!(
+        line.starts_with(&format!(
+            "forget-tail: partition 1 re-plans from generation {}: seqs up to {} ",
+            before.0,
+            cutoff.0 + 5
+        )),
+        "{line}"
+    );
+    // The tail stood in for a probe's report; the re-plan's own inventory decides.
+    owner.tail_refused.remove(&p);
+    let after = trio.until("node 1 committed a later generation", |trio| {
+        trio.nodes[0]
+            .0
+            .committed
+            .get(&p)
+            .map(|committed| committed.new_generation)
+            .filter(|generation| *generation > before)
+    });
+    assert!(after > before);
+    let plans: Vec<_> = logged!(METHOD, "rejoin_plan")
+        .into_iter()
+        .map(|line| line["release_through"].clone())
+        .collect();
+    assert!(
+        plans.contains(&serde_json::json!(format!("Some({})", cutoff.0 + 5))),
+        "the re-plan carried the release: {plans:?}"
+    );
+    assert_eq!(logged!(METHOD, "forget_tail_planned").len(), 1);
+    let refusals = logged!(METHOD, "forget_tail_refused")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .count();
+    assert_eq!(refusals, 5, "node 1 refused five times");
+}
+
+/// Issue #105 (design section 3.3, assumption A7): the tail scan over 512 partitions, as a
+/// whole-node recovery runs it. 256 healthy copies (generation 2 linked at generation 1's
+/// head) read no record; 256 with a two-record tail on generation 1 read one each and are hits.
+/// Every scan logs its `read` count and micros; the totals are printed for the report, and no
+/// time bound is asserted, since this host's load is not this row's subject.
+#[config_log::retcd_test]
+fn issue105_a_tail_scan_over_512_partitions_reads_one_record_per_tail_and_none_when_healthy() {
+    const METHOD: &str =
+        "issue105_a_tail_scan_over_512_partitions_reads_one_record_per_tail_and_none_when_healthy";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let mut bases = Vec::new();
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        for p in 1..=512u32 {
+            let partition = PartitionId(p);
+            let n = if p <= 256 { 3 } else { 5 };
+            let digests = write_chain_in(&mut engine, partition, Generation(1), Vec::new(), n);
+            engine
+                .inherit(partition, Generation(1), Generation(2), Seq(3))
+                .expect("inherit");
+            bases.push((partition, digests[2]));
+        }
+    }
+    let rt = current_thread();
+    let host = host_over(&path, &rt);
+    let started = std::time::Instant::now();
+    let hits: Vec<bool> = bases
+        .iter()
+        .map(|(partition, digest)| {
+            let anchor = LineageAnchor {
+                lineage: Lineage {
+                    partition: *partition,
+                    generation: Generation(2),
+                    owner_epoch: OwnerEpoch(2),
+                },
+                base_seq: Seq(3),
+                base_digest: *digest,
+            };
+            host.tail_scan(*partition, anchor, Some(Generation(1)))
+                .is_some()
+        })
+        .collect();
+    let wall = started.elapsed();
+    assert_eq!(hits.iter().filter(|hit| **hit).count(), 256);
+    assert!(
+        hits[..256].iter().all(|hit| !hit),
+        "healthy copies hold no tail"
+    );
+    let lines = logged!(METHOD, "tail_scan");
+    assert_eq!(lines.len(), 512);
+    let reads = |healthy: bool| -> u64 {
+        lines
+            .iter()
+            .filter(|line| (line["partition"].as_u64().expect("a partition") <= 256) == healthy)
+            .map(|line| line["read"].as_u64().expect("a count"))
+            .sum()
+    };
+    assert_eq!(reads(true), 0, "a healthy copy reads no record");
+    assert_eq!(reads(false), 256, "one point read per tail");
+    let micros: Vec<u64> = lines
+        .iter()
+        .map(|line| line["micros"].as_u64().expect("micros"))
+        .collect();
+    eprintln!(
+        "tail_scan x512: wall {} us, sum {} us, max {} us",
+        wall.as_micros(),
+        micros.iter().sum::<u64>(),
+        micros.iter().max().expect("512 scans")
+    );
+}
+
+/// Issue #105 (design section 3.3, "the same scan runs at landing"): at a first landing a copy
+/// that holds a tail above the commit's cutoff on an older lineage stamped L marks its own
+/// status `tail_on_older_lineage`, so the owner holds its repair and a client is told which
+/// copy holds the seqs, even when the landing itself linked. Stamped below the result's L, the
+/// tail is superseded and nothing is marked. A refusal the landing already made at that
+/// generation keeps its own reason. Cut: `landing_scan` finds nothing, red (no mark).
+#[test]
+fn issue105_a_landing_over_a_current_tail_marks_the_copy_and_a_superseded_one_does_not() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(&dir.path().join("trio"), Trio::fast);
+    trio.bootstrap();
+    let template = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 5);
+        engine
+            .inherit(PartitionId(1), Generation(1), Generation(2), Seq(3))
+            .expect("inherit");
+        digests
+    };
+    let result = |last_writable: u64| {
+        let mut result = (*template).clone();
+        result.selected.root = Lineage {
+            partition: PartitionId(1),
+            generation: Generation(2),
+            owner_epoch: OwnerEpoch(2),
+        };
+        result.selected.cutoff_seq = Seq(3);
+        result.selected.cutoff_digest = digests[2];
+        result.ledger.last_writable = Some(Generation(last_writable));
+        result
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    host.landing_scan(PartitionId(1), &result(2));
+    assert_eq!(
+        host.tail_refused.get(&PartitionId(1)),
+        None,
+        "stamped below L"
+    );
+    host.landing_scan(PartitionId(1), &result(1));
+    assert_eq!(
+        host.tail_refused.get(&PartitionId(1)),
+        Some(&TailRefused {
+            generation: Generation(2),
+            head: Seq(5),
+            base: Seq(3),
+            reason: "tail_on_older_lineage",
+        }),
+        "stamped L: marked"
+    );
+    let refused = TailRefused {
+        generation: Generation(2),
+        head: Seq(5),
+        base: Seq(3),
+        reason: "held_past_base",
+    };
+    host.tail_refused.insert(PartitionId(1), refused);
+    host.landing_scan(PartitionId(1), &result(1));
+    assert_eq!(
+        host.tail_refused.get(&PartitionId(1)),
+        Some(&refused),
+        "the landing's own reason stays"
     );
 }

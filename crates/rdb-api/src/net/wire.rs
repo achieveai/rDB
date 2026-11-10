@@ -26,7 +26,7 @@ use rdb_core::contracts::ids::{
     RequestIdentity, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
-use rdb_core::contracts::recovery::{LineageAnchor, RecoveryResult};
+use rdb_core::contracts::recovery::{LineageAnchor, RecoveryResult, TailRelease};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::transport::{Frame as PeerFrame, PeerLabel};
@@ -685,6 +685,7 @@ pub enum WirePeerAsk {
     Inventory {
         copy: CopyId,
         anchor: LineageAnchor,
+        last_writable: Option<Generation>,
     },
     Sync {
         copy: CopyId,
@@ -703,7 +704,15 @@ pub enum WirePeerAsk {
 impl From<PeerAsk> for WirePeerAsk {
     fn from(ask: PeerAsk) -> Self {
         match ask {
-            PeerAsk::Inventory { copy, anchor } => Self::Inventory { copy, anchor },
+            PeerAsk::Inventory {
+                copy,
+                anchor,
+                last_writable,
+            } => Self::Inventory {
+                copy,
+                anchor,
+                last_writable,
+            },
             PeerAsk::Sync {
                 copy,
                 cutoff,
@@ -733,7 +742,15 @@ impl From<PeerAsk> for WirePeerAsk {
 impl From<WirePeerAsk> for PeerAsk {
     fn from(ask: WirePeerAsk) -> Self {
         match ask {
-            WirePeerAsk::Inventory { copy, anchor } => Self::Inventory { copy, anchor },
+            WirePeerAsk::Inventory {
+                copy,
+                anchor,
+                last_writable,
+            } => Self::Inventory {
+                copy,
+                anchor,
+                last_writable,
+            },
             WirePeerAsk::Sync {
                 copy,
                 cutoff,
@@ -838,6 +855,13 @@ pub enum WireCall {
         through: Seq,
         remaining_millis: u64,
     },
+    // Issue #105: added last, so the variants above keep their encoded index.
+    ForgetTail {
+        identity: RequestIdentity,
+        through: Option<Seq>,
+        no_intact_copy: bool,
+        give_up_live_copy: bool,
+    },
 }
 
 impl WireCall {
@@ -852,7 +876,8 @@ impl WireCall {
             | Self::GetPrevious { identity, .. }
             | Self::Status { identity, .. }
             | Self::Move { identity, .. }
-            | Self::Rebuild { identity, .. } => Some(*identity),
+            | Self::Rebuild { identity, .. }
+            | Self::ForgetTail { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -871,6 +896,7 @@ impl WireCall {
             Self::Move { .. } => "move",
             Self::Rebuild { .. } => "rebuild",
             Self::WaitDurable { .. } => "wait_durable",
+            Self::ForgetTail { .. } => "forget_tail",
         }
     }
 }
@@ -939,6 +965,16 @@ impl TryFrom<&ClientCall> for WireCall {
                 identity: *identity,
                 node: *node,
             },
+            ClientCall::ForgetTail {
+                identity,
+                release,
+                give_up_live_copy,
+            } => Self::ForgetTail {
+                identity: *identity,
+                through: release.through,
+                no_intact_copy: release.no_intact_copy,
+                give_up_live_copy: *give_up_live_copy,
+            },
             ClientCall::WaitDurable {
                 generation,
                 through,
@@ -1004,6 +1040,19 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::ForgetTail {
+                identity,
+                through,
+                no_intact_copy,
+                give_up_live_copy,
+            } => Self::ForgetTail {
+                identity,
+                release: TailRelease {
+                    through,
+                    no_intact_copy,
+                },
+                give_up_live_copy,
+            },
             WireCall::WaitDurable {
                 generation,
                 through,
@@ -1674,6 +1723,10 @@ pub enum WireAnswer {
         line: String,
     },
     Durable,
+    // Issue #105: added last, so the variants above keep their encoded index.
+    TailForgotten {
+        line: String,
+    },
 }
 
 impl WireAnswer {
@@ -1713,6 +1766,7 @@ impl WireAnswer {
                 line: moved.line.clone(),
             },
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
+            Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
             Answer::Durable => Self::Durable,
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
@@ -1751,6 +1805,7 @@ impl WireAnswer {
             Self::Status(status) => Answer::Status(status),
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
             Self::Rebuilt { line } => Answer::Rebuilt(line),
+            Self::TailForgotten { line } => Answer::TailForgotten(line),
             Self::Durable => Answer::Durable,
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),

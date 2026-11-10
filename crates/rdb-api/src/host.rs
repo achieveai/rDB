@@ -58,7 +58,7 @@ use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     CommittedWithout, DurableProof, LineageAnchor, NoteState, PriorMember, PriorRecord,
-    RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult, SurvivorInventory,
+    RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult, SurvivorInventory, TailRelease,
 };
 use rdb_core::contracts::storage::{
     CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
@@ -702,6 +702,9 @@ pub enum PeerAsk {
         copy: CopyId,
         /// The plan's anchor: the only lineage an empty copy can report.
         anchor: LineageAnchor,
+        /// The last writable generation L the plan's ledger names, `None` when unknown (issue
+        /// #105): what the holder's tail scan and its `holds_last_writable` answer are about.
+        last_writable: Option<Generation>,
     },
     /// `SyncWalThrough` for one copy.
     Sync {
@@ -857,6 +860,18 @@ pub enum ClientCall {
         identity: RequestIdentity,
         /// The node to take back.
         node: NodeId,
+    },
+    /// Issue #105: `admin forget-tail` ([`Answer::TailForgotten`]). Only the pinned primary
+    /// takes it. It re-plans the partition with [`TailRelease`]: every held tail at or below
+    /// `through` given up, or the intact rule waived, for that one run. What it gives up is gone
+    /// for good, so over a link only an admin app may send it (`NetConfig::admin_apps`).
+    ForgetTail {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// What the run gives up.
+        release: TailRelease,
+        /// `--give-up-live-copy`: give up a tail a live copy reports too.
+        give_up_live_copy: bool,
     },
     /// #90: answer [`Answer::Durable`] once every regular copy pinned now has proved its WAL
     /// synced through `through` in `generation`. Carries no identity, so it never queues behind
@@ -1094,6 +1109,8 @@ pub enum Answer {
     Moved(MoveAnswer),
     /// A [`ClientCall::Rebuild`] was taken: the operator's line.
     Rebuilt(String),
+    /// A [`ClientCall::ForgetTail`] was taken: the operator's line, naming what is given up.
+    TailForgotten(String),
     /// A [`ClientCall::WaitDurable`] was proved on every regular copy.
     Durable,
     /// The call failed.
@@ -1480,6 +1497,9 @@ struct Replan {
     promote: bool,
     /// When the revocation was asked.
     since: Tick,
+    /// Issue #105: what `admin forget-tail` gives up for this re-plan's run, carried into the
+    /// plan's [`RecoveryPlan::release`]. Default (nothing) for every automatic re-plan.
+    release: TailRelease,
 }
 
 /// M11: a copy move the owner was asked for, from its ask to the commit that pins `to`
@@ -6297,6 +6317,7 @@ impl Host {
             rejoiner,
             promote: false,
             since: self.clock.now(),
+            release: TailRelease::default(),
         };
         self.start_revoke(partition, epoch, replan);
     }
@@ -6460,6 +6481,7 @@ impl Host {
         let prior = PriorRecord {
             members: Some(pinned.members.iter().map(PriorMember::of).collect()),
             note,
+            ledger: committed.ledger.clone(),
         };
         let shadowed = self.restart_shadowed(committed, replan);
         let mut members: Vec<Member> = pinned
@@ -6559,6 +6581,7 @@ impl Host {
             prior,
         );
         plan.must_hold = must_hold;
+        plan.release = replan.release;
         let fence = FencingProof {
             partition,
             prior_generation: root.generation,
@@ -6585,6 +6608,8 @@ impl Host {
             joining = ?joining.map(|member| member.node.0),
             shadowed = ?shadowed.map(|node| node.0),
             must_hold = ?plan.must_hold.iter().map(|copy| copy.0).collect::<Vec<_>>(),
+            release_through = ?plan.release.through.map(|seq| seq.0),
+            release_no_intact_copy = plan.release.no_intact_copy,
             "rejoin_plan"
         );
         self.rejoins
@@ -7503,6 +7528,7 @@ impl Host {
             rejoiner: Some(to),
             promote: false,
             since: self.clock.now(),
+            release: TailRelease::default(),
         };
         self.start_revoke(partition, epoch, replan);
         progress(false)
@@ -7920,6 +7946,7 @@ impl Host {
             rejoiner: Some(shadow.node),
             promote: true,
             since: self.clock.now(),
+            release: TailRelease::default(),
         };
         self.start_revoke(partition, epoch, replan);
     }
@@ -8741,6 +8768,186 @@ impl Host {
         Err(error)
     }
 
+    /// Issue #105 (design section 8.1): `admin forget-tail`. Only the pinned primary takes it.
+    /// Accepted, it re-plans the partition with `release` for that one run, and answers at once
+    /// with what is given up; the commit follows as any re-plan's does. Refused, nothing changes:
+    ///
+    /// - `--through H` at or below the committed cutoff, or with no held tail to give up;
+    /// - `--through H` while a live copy reports a tail above the cutoff, unless
+    ///   `give_up_live_copy`: without adoption (unit 2) no proof exists that it could not come
+    ///   back, so giving it up must be named;
+    /// - `--no-intact-copy` when the intact rule did not cap this owner's last commit;
+    /// - while another re-plan runs.
+    fn forget_tail_asked(
+        &mut self,
+        partition: PartitionId,
+        release: TailRelease,
+        give_up_live_copy: bool,
+    ) -> Result<String, ApiError> {
+        let me = self.node.0;
+        let refuse = |kind: rdb_core::contracts::errors::ErrorKind, detail: String| {
+            tracing::warn!(
+                node = me,
+                partition = partition.0,
+                through = ?release.through.map(|seq| seq.0),
+                no_intact_copy = release.no_intact_copy,
+                give_up_live_copy,
+                %detail,
+                "forget_tail_refused"
+            );
+            let mut error = ApiError::new(
+                kind,
+                format!("{detail}; {}", crate::db::error::FORGET_TAIL_STEP),
+            );
+            error.no_mutation = true;
+            Err(error)
+        };
+        use rdb_core::contracts::errors::ErrorKind::{InvalidArgument, Unavailable};
+        if release.through.is_none() && !release.no_intact_copy {
+            return refuse(
+                InvalidArgument,
+                "forget-tail names what it gives up: --through H or --no-intact-copy".to_owned(),
+            );
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return refuse(
+                Unavailable,
+                format!(
+                    "node {me} has no commit of partition {} to plan from: ask again once it \
+                     has recovered",
+                    partition.0
+                ),
+            );
+        };
+        let owner = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        self.answers_as_owner(partition, owner)?;
+        if self.rejoins.contains_key(&partition) {
+            return refuse(
+                Unavailable,
+                format!(
+                    "a re-plan of partition {} is running: ask again once it commits",
+                    partition.0
+                ),
+            );
+        }
+        let cutoff = committed.selected.cutoff_seq;
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        // The tails live copies report above the cutoff: members a repair probe heard, and
+        // this node's own.
+        let mut live: Vec<(NodeId, Seq)> = self
+            .tail_holds
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .map(|hold| (hold.node, hold.refused.head))
+            .chain(
+                self.tail_refused
+                    .get(&partition)
+                    .map(|refused| (self.node, refused.head)),
+            )
+            .filter(|(_, head)| *head > cutoff)
+            .collect();
+        live.sort_unstable();
+        live.dedup();
+        let mut given_up = Vec::new();
+        if let Some(through) = release.through {
+            if through <= cutoff {
+                return refuse(
+                    InvalidArgument,
+                    format!(
+                        "--through {} is at or below partition {}'s cutoff {} at generation {}: \
+                         no seq above the cutoff would be given up",
+                        through.0, partition.0, cutoff.0, generation.0
+                    ),
+                );
+            }
+            let marked = committed.ledger.held.iter().any(|held| held.head > cutoff);
+            if !marked && live.is_empty() {
+                return refuse(
+                    InvalidArgument,
+                    format!(
+                        "no copy of partition {} holds a tail above its cutoff {} at generation \
+                         {}: there is nothing for --through to give up",
+                        partition.0, cutoff.0, generation.0
+                    ),
+                );
+            }
+            if let Some((node, head)) = live.first().filter(|_| !give_up_live_copy) {
+                return refuse(
+                    InvalidArgument,
+                    format!(
+                        "node {} holds seqs {} to {} of partition {} on a live copy; this release \
+                         cannot bring them back on its own. To give them up, for good, add \
+                         --give-up-live-copy",
+                        node.0,
+                        cutoff.0 + 1,
+                        head.0,
+                        partition.0
+                    ),
+                );
+            }
+            given_up.push(format!(
+                "seqs up to {} on every copy that holds them are given up, for good",
+                through.0
+            ));
+        }
+        if release.no_intact_copy {
+            let capped = self
+                .recoveries
+                .get(&partition)
+                .and_then(Recovery::intact_rule_capped);
+            if capped != Some(true) {
+                return refuse(
+                    InvalidArgument,
+                    format!(
+                        "the intact rule is not what holds partition {} at generation {}: some \
+                         copy of the last writable generation answered, or the rule did not \
+                         apply, so --no-intact-copy would give up nothing it names",
+                        partition.0, generation.0
+                    ),
+                );
+            }
+            given_up.push(
+                "no copy of the last writable generation has answered; records confirmed in \
+                 that generation, up to an amount the system cannot see, are given up, for \
+                 good, including any a silent copy still holds"
+                    .to_owned(),
+            );
+        }
+        tracing::warn!(
+            node = me,
+            partition = partition.0,
+            generation = generation.0,
+            cutoff = cutoff.0,
+            through = ?release.through.map(|seq| seq.0),
+            no_intact_copy = release.no_intact_copy,
+            give_up_live_copy,
+            live = ?live.iter().map(|(node, head)| (node.0, head.0)).collect::<Vec<_>>(),
+            "forget_tail_planned"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: None,
+            promote: false,
+            since: self.clock.now(),
+            release,
+        };
+        self.start_revoke(partition, epoch, replan);
+        Ok(format!(
+            "forget-tail: partition {} re-plans from generation {}: {}",
+            partition.0,
+            generation.0,
+            given_up.join("; ")
+        ))
+    }
+
     /// M11 T12 over processes (lead ruling on dev-a item 1, tester T13): `admin rebuild node`
     /// sent by an app with no node of its own. Only the pinned primary answers, as a move. A node
     /// this commit pins is refused with nothing changed: dropping it is mode B or C, which needs
@@ -9262,6 +9469,7 @@ impl Host {
             None
         };
         if first {
+            self.landing_scan(partition, &result);
             self.stamp_retirement(partition, result.new_generation);
         }
         self.restore_marks(partition, result.new_generation)?;
@@ -10119,6 +10327,7 @@ impl Host {
                     )));
                 };
                 let anchor = plan.anchor;
+                let last_writable = plan.prior.ledger.last_writable;
                 let holders: Vec<(CopyId, Option<NodeId>)> = copies
                     .iter()
                     .map(|copy| (*copy, holder_of(&plan.config.members, *copy)))
@@ -10136,7 +10345,15 @@ impl Host {
                             );
                             self.answer_here(site, RecoveryEvent::InventoryFailed { copy });
                         }
-                        Some(holder) => self.ask(holder, site, PeerAsk::Inventory { copy, anchor }),
+                        Some(holder) => self.ask(
+                            holder,
+                            site,
+                            PeerAsk::Inventory {
+                                copy,
+                                anchor,
+                                last_writable,
+                            },
+                        ),
                         None => self.answer_here(site, RecoveryEvent::InventoryFailed { copy }),
                     }
                 }
@@ -11072,7 +11289,11 @@ impl Host {
         reply: Reply,
     ) -> Option<RecoveryEvent> {
         match *ask {
-            PeerAsk::Inventory { copy, anchor } => Some(self.inventory(partition, copy, anchor)),
+            PeerAsk::Inventory {
+                copy,
+                anchor,
+                last_writable,
+            } => Some(self.inventory(partition, copy, anchor, last_writable)),
             PeerAsk::Sync {
                 copy,
                 cutoff,
@@ -11121,6 +11342,7 @@ impl Host {
         partition: PartitionId,
         copy: CopyId,
         anchor: LineageAnchor,
+        last_writable: Option<Generation>,
     ) -> RecoveryEvent {
         if anchor.lineage.generation > Generation(0) {
             // #80 R4-1: first, so a failed inventory seals too. What this copy acknowledges
@@ -11130,7 +11352,7 @@ impl Host {
             // Issue #105: a tail above the base on another lineage speaks before any refusal. A
             // copy that answered `InventoryFailed` here was left out, and a commit then went on
             // at a cutoff below records writes may have been acknowledged on.
-            if let Some(hit) = self.tail_scan(partition, anchor) {
+            if let Some(hit) = self.tail_scan(partition, anchor, last_writable) {
                 return self.tail_held(partition, copy, anchor, hit);
             }
             #[cfg(test)]
@@ -11142,7 +11364,9 @@ impl Host {
             #[cfg(not(test))]
             let survived = self.survivor(partition, copy, anchor);
             return match survived {
-                Ok(inventory) => {
+                Ok(mut inventory) => {
+                    inventory.holds_last_writable =
+                        self.holds_last_writable(partition, last_writable);
                     tracing::info!(
                         node = self.node.0,
                         partition = partition.0,
@@ -11150,6 +11374,7 @@ impl Host {
                         generation = anchor.lineage.generation.0,
                         base = anchor.base_seq.0,
                         head = inventory.head.0 .0,
+                        holds_last_writable = inventory.holds_last_writable,
                         "inventory_reported"
                     );
                     RecoveryEvent::InventoryReported(Box::new(inventory))
@@ -11225,77 +11450,202 @@ impl Host {
             head: (Seq::ZERO, Digest::ROOT),
             ladder: vec![(Seq::ZERO, Digest::ROOT)],
             quarantined: None,
+            holds_last_writable: false,
         }))
     }
 
-    /// Issue #105 step 1a: the tail this copy holds above `anchor`'s base on the newest lineage
-    /// below the anchor's generation, the lineage a refusal names today. Every such tail is
-    /// treated as current, since no last writable generation is known yet. Not a hit: a staged
-    /// lineage (its own refusal, `interrupted_copy`), a head at or below the base, or the
-    /// anchor's lineage already holding the same record at that head. A head that cannot be read
-    /// is a hit with no stamp (N5), never "no tail". One point read per candidate lineage;
-    /// logged as `tail_scan` with its read count and micros.
-    fn tail_scan(&self, partition: PartitionId, anchor: LineageAnchor) -> Option<TailHit> {
+    /// Issue #105 (design section 3.3): the tail this copy holds above `anchor`'s base on a
+    /// lineage below the anchor's generation, the one a refusal or a landing would leave out.
+    ///
+    /// With the last writable generation L known, every such lineage is a candidate, whatever
+    /// this copy's role, and a head counts only when its record is stamped L (current) or above
+    /// L (impossible unless corrupt, logged at error). A head stamped below L is superseded and
+    /// is today's path. Of the hits, the highest head is kept; a tie goes to the older
+    /// generation, the writer's own lineage. With L unknown, only the newest lineage below the
+    /// anchor is read, and its tail is treated as current: superseded tails stay on disk, so
+    /// scanning every lineage with no stamp test would hold nearly every partition.
+    ///
+    /// Not a hit: a staged lineage (its own refusal, `interrupted_copy`), a head at or below
+    /// the base, or the anchor's lineage already holding the same record at that head (the
+    /// digest, not the head number: a holed lineage's head says nothing about seq 1). A head
+    /// that cannot be read is a hit with no stamp (N5), never "no tail". A lineage above the
+    /// anchor is not read: that copy is ahead of the plan, a late answer. One point read per
+    /// candidate lineage with a tail; logged as `tail_scan` with its read count and micros.
+    fn tail_scan(
+        &self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+        last_writable: Option<Generation>,
+    ) -> Option<TailHit> {
         let started = Instant::now();
         let to = anchor.lineage.generation;
         let base = anchor.base_seq;
         let mut read = 0u32;
         let generations = self.engine.generations(partition);
-        let from = generations.iter().copied().filter(|g| *g < to).max();
-        let hit = from.and_then(|from| {
+        let holds_anchor = generations.contains(&to);
+        let below = generations.iter().copied().filter(|g| *g < to);
+        let candidates: Vec<Generation> = match last_writable {
+            Some(_) => below.collect(),
+            None => below.max().into_iter().collect(),
+        };
+        let mut best: Option<TailHit> = None;
+        for from in candidates {
             if self.engine.staging(partition, from).is_some() {
-                return None;
+                continue;
             }
             let head = Seq(self.engine.buffered_applied(partition, from).0);
             if head <= base {
-                return None;
+                continue;
             }
             read += 1;
-            let holds_anchor = generations.contains(&to);
             let reason = if holds_anchor {
                 "tail_on_older_lineage"
             } else {
                 "missed_generation_held_past_base"
             };
-            let Ok((record, digest)) = self.checked(partition, from, head) else {
-                return Some(TailHit {
+            let hit = match self.checked(partition, from, head) {
+                Err(_) => TailHit {
                     from,
                     head,
                     stamp: None,
                     reason: "tail_head_unreadable",
-                });
-            };
-            if holds_anchor && self.engine.buffered_applied(partition, to).0 >= head.0 {
-                read += 1;
-                if self
-                    .checked(partition, to, head)
-                    .is_ok_and(|(_, at)| at == digest)
-                {
-                    return None;
+                },
+                Ok((record, digest)) => {
+                    let stamp = ReplicationEnvelope::decode(&record)
+                        .ok()
+                        .map(|envelope| envelope.header.generation);
+                    match (last_writable, stamp) {
+                        (Some(l), Some(stamp)) if stamp < l => continue,
+                        (Some(l), Some(stamp)) if stamp > l => {
+                            tracing::error!(
+                                node = self.node.0,
+                                partition = partition.0,
+                                from = from.0,
+                                head = head.0,
+                                stamp = stamp.0,
+                                last_writable = l.0,
+                                "tail_stamp_above_last_writable"
+                            );
+                        }
+                        _ => {}
+                    }
+                    if holds_anchor && self.engine.buffered_applied(partition, to).0 >= head.0 {
+                        read += 1;
+                        if self
+                            .checked(partition, to, head)
+                            .is_ok_and(|(_, at)| at == digest)
+                        {
+                            continue;
+                        }
+                    }
+                    TailHit {
+                        from,
+                        head,
+                        stamp,
+                        reason,
+                    }
                 }
+            };
+            // Ascending generations: a later lineage replaces the kept hit only when higher.
+            if best.as_ref().is_none_or(|kept| hit.head > kept.head) {
+                best = Some(hit);
             }
-            let stamp = ReplicationEnvelope::decode(&record)
-                .ok()
-                .map(|envelope| envelope.header.generation);
-            Some(TailHit {
-                from,
-                head,
-                stamp,
-                reason,
-            })
-        });
+        }
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
             generation = to.0,
             base = base.0,
+            last_writable = last_writable.map(|l| l.0),
             lineages = generations.len(),
             read,
             micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            hit = hit.is_some(),
+            hit = best.is_some(),
             "tail_scan"
         );
-        hit
+        best
+    }
+
+    /// Issue #105 (design section 3.3): the tail scan at a first landing, with L from the
+    /// result's ledger. A hit marks this copy's status refused with `tail_on_older_lineage`,
+    /// even when the landing itself linked: walk A's holder linked G5 at its walked head and
+    /// reported nothing, while its tail stayed on G2. So the owner's repair holds and a client
+    /// is told which copy holds the seqs. A writable commit moved L, so a tail it left behind
+    /// is stamped below L and is not a hit.
+    fn landing_scan(&mut self, partition: PartitionId, result: &RecoveryResult) {
+        let anchor = LineageAnchor {
+            lineage: result.selected.root,
+            base_seq: result.selected.cutoff_seq,
+            base_digest: result.selected.cutoff_digest,
+        };
+        let Some(hit) = self.tail_scan(partition, anchor, result.ledger.last_writable) else {
+            return;
+        };
+        // A landing that refused already named this tail with its own reason
+        // (`held_past_base`); that reason is the more exact one, so it stays.
+        if self
+            .tail_refused
+            .get(&partition)
+            .is_some_and(|refused| refused.generation == anchor.lineage.generation)
+        {
+            return;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = anchor.lineage.generation.0,
+            base = anchor.base_seq.0,
+            from = hit.from.0,
+            head = hit.head.0,
+            stamp = hit.stamp.map(|stamp| stamp.0),
+            reason = hit.reason,
+            "land_tail_held"
+        );
+        self.tail_refused.insert(
+            partition,
+            TailRefused {
+                generation: anchor.lineage.generation,
+                head: hit.head,
+                base: anchor.base_seq,
+                reason: "tail_on_older_lineage",
+            },
+        );
+    }
+
+    /// Whether this copy holds the last writable generation `last_writable` intact (issue
+    /// #105, design section 3.7): it holds lineage `(partition, L)`, not staging, and where
+    /// that lineage applied above seq 0, the record at seq 1 is reachable through its chain.
+    /// A wiped copy, a holed lineage or a copy rebuilt after L does not. F1 checks the node
+    /// is one of L's regulars. `false` while L is unknown: F1 waives the rule then.
+    fn holds_last_writable(
+        &self,
+        partition: PartitionId,
+        last_writable: Option<Generation>,
+    ) -> bool {
+        let Some(l) = last_writable else {
+            return false;
+        };
+        if !self.engine.generations(partition).contains(&l)
+            || self.engine.staging(partition, l).is_some()
+        {
+            return false;
+        }
+        if self.engine.buffered_applied(partition, l).0 == 0 {
+            return true;
+        }
+        match self.engine.history_at(partition, l, Seq(1)) {
+            Ok(found) => found.is_some(),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    last_writable = l.0,
+                    ?fault,
+                    "holds_last_writable_read_failed"
+                );
+                false
+            }
+        }
     }
 
     /// Answer `TailHeld` for `hit` (issue #105), and report the refusal in this node's status,
@@ -11427,6 +11777,7 @@ impl Host {
             head: (head, head_digest),
             ladder,
             quarantined: None,
+            holds_last_writable: false,
         })
     }
 
@@ -11695,6 +12046,27 @@ impl Host {
             );
             return None;
         }
+        // Issue #105 (design section 3.4, layer 2): a copy holding a tail above the cutoff does
+        // not prove it after the commit, so a Rebuild that needs this copy stalls, named, and
+        // never activates past a live holder's records.
+        if let Some(held) = self
+            .tail_refused
+            .get(&partition)
+            .filter(|held| post_commit && held.head > cutoff)
+        {
+            tracing::warn!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                cutoff = cutoff.0,
+                generation = generation.0,
+                head = held.head.0,
+                tail_reason = held.reason,
+                reason = "tail_held",
+                "sync_withheld"
+            );
+            return None;
+        }
         let durable = self.engine.durable(partition, generation);
         if durable.0 < cutoff.0 {
             tracing::warn!(
@@ -11761,6 +12133,7 @@ impl Host {
             | ClientCall::Status { .. }
             | ClientCall::Move { .. }
             | ClientCall::Rebuild { .. }
+            | ClientCall::ForgetTail { .. }
             | ClientCall::WaitDurable { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
@@ -11910,6 +12283,22 @@ impl Host {
             ClientCall::Rebuild { node, .. } => {
                 let answer = match self.rebuild_from_app(partition, node) {
                     Ok(line) => Answer::Rebuilt(line),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
+            // Issue #105: answered in this step; the re-plan it starts runs on.
+            ClientCall::ForgetTail {
+                release,
+                give_up_live_copy,
+                ..
+            } => {
+                let answer = match self.forget_tail_asked(partition, release, give_up_live_copy) {
+                    Ok(line) => Answer::TailForgotten(line),
                     Err(error) => Answer::Error {
                         error,
                         request: None,

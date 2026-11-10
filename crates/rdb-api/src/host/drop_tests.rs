@@ -729,6 +729,7 @@ fn a_block_leaves_out_only_the_member_it_names() {
         rejoiner: rejoiner.map(NodeId),
         promote: false,
         since: Tick(0),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     };
     let rejoin = replan(None, Some(3));
     let out = |reason: &BlockReason, plan: Replan| block_leaves_out(reason, plan, &members);
@@ -2870,7 +2871,8 @@ fn m10_s2_adv3_a_shadow_promote_whose_barrier_never_completes_counts_only_two() 
 /// nothing (`land_link_refused{held_past_base}`), so the tail is never made part of the new
 /// generation. The writes do not stall until a reopen: L1 never counts the shadow, R1 walks it
 /// up from the root, node 1 promotes it, and the next commit is `Active` with all three, node 3
-/// durable through its cutoff, and a put lands there.
+/// durable through its cutoff, and a put lands there. Under issue #105 the tail is superseded:
+/// its stamp is below L, so it holds nothing, and the `Active` commit is L.
 /// Cut: `shadow_duty` returns at once, red (node 3 stays a shadow; no `Active` commit).
 /// Integration (~6 s): b1's drop, the re-add's re-plan, the catch-up, the promote's.
 #[config_log::retcd_test]
@@ -2935,6 +2937,15 @@ fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
         .and_then(|primary| primary.tracker().known(CopyId(2)))
         .expect("node 1 tracks copy 2");
     assert!(known.durable.0 >= cutoff.0, "{known:?} below {cutoff:?}");
+    // Issue #105: the tail is superseded, not held. Writable commits were made after node 3's
+    // generation, so its stamp is below L and the promote's commit makes L its own generation.
+    let ledger = &host.committed[&PartitionId(1)].ledger;
+    assert_eq!(ledger.last_writable, Some(promoted), "{ledger:?}");
+    assert!(
+        held < promoted,
+        "the tail's stamp {held:?} is below L {promoted:?}"
+    );
+    assert_eq!(ledger.held, Vec::new(), "nothing marked");
     trio.ready();
     match trio.ask(put(request)) {
         Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
@@ -5158,6 +5169,7 @@ fn m11_r464_b_a_re_plan_keeps_the_catch_up_clock_start() {
         rejoiner: None,
         promote: false,
         since: Tick(400),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     };
     host.rejoins.insert(
         p,
@@ -5553,6 +5565,7 @@ fn s4a_the_idle_drop_is_refused_on_a_secondary_a_rejoin_read_only_and_divergence
                 rejoiner: None,
                 promote: false,
                 since: now,
+                release: rdb_core::contracts::recovery::TailRelease::default(),
             },
         },
     );

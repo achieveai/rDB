@@ -194,6 +194,7 @@ pub(crate) fn recovery_plan(
         must_hold: std::collections::BTreeSet::new(),
         config,
         prior,
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 
@@ -2541,7 +2542,12 @@ pub(crate) async fn promote_looked(
     let fenced_at = cas(
         &*ctx.store,
         &ControlKey::Partition(ctx.partition).encode(),
-        fencing.encode_with_members(&root, &written, Some(&prior_record.note)),
+        fencing.encode_with_members(
+            &root,
+            &written,
+            Some(&prior_record.note),
+            Some(&prior_record.ledger),
+        ),
         mod_revision,
     )
     .await?;
@@ -2555,7 +2561,12 @@ pub(crate) async fn promote_looked(
             cas(
                 &*ctx.store,
                 &ControlKey::Partition(ctx.partition).encode(),
-                record.encode_with_members(&root, &written, Some(&prior_record.note)),
+                record.encode_with_members(
+                    &root,
+                    &written,
+                    Some(&prior_record.note),
+                    Some(&prior_record.ledger),
+                ),
                 fenced_at.0,
             )
             .await?;
@@ -2873,11 +2884,12 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 /// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
 ///
 /// `2` (PR #74 F-001, ruling A-R477) appends [`RecoveryPlan::must_hold`]. `3` (#80 S5n) appends
-/// [`RecoveryPlan::prior`] after it. postcard is not self-describing, so a field cannot be
-/// defaulted in: this build reads `1` as [`StoredPlanV1`] and `2` as [`StoredPlanV2`], the fields
-/// they lack set by [`StoredPlanV1::with`], and an older build refuses a newer plan by this
-/// byte, naming both versions (`plan version 2, this build reads 1`).
-pub(crate) const PROMOTE_PLAN_VERSION: u8 = 3;
+/// [`RecoveryPlan::prior`] after it. `4` (issue #105) appends the prior record's ledger inside
+/// `prior`, then [`RecoveryPlan::release`]. postcard is not self-describing, so a field cannot be
+/// defaulted in: this build reads `1` as [`StoredPlanV1`], `2` as [`StoredPlanV2`] and `3` as
+/// [`StoredPlanV3`], the fields they lack set by [`StoredPlanV1::with`], and an older build
+/// refuses a newer plan by this byte, naming both versions (`plan version 2, this build reads 1`).
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 4;
 
 /// The stored plan before `must_hold` (version `1`): every field of [`RecoveryPlan`] before it,
 /// in order.
@@ -2895,7 +2907,23 @@ impl StoredPlanV1 {
     /// This plan as today's. The build that stored it wrote no note and named no prior members
     /// in its plan, so `prior` says "not known": F1 judges against the plan's own members and
     /// warns, as it does for a layout 3 record.
-    fn with(self, must_hold: std::collections::BTreeSet<CopyId>) -> RecoveryPlan {
+    fn with(
+        self,
+        must_hold: std::collections::BTreeSet<CopyId>,
+        prior: Option<StoredPriorV3>,
+    ) -> RecoveryPlan {
+        let prior = prior.map_or_else(
+            || PriorRecord {
+                members: None,
+                note: CommittedWithout::default(),
+                ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
+            },
+            |prior| PriorRecord {
+                members: prior.members,
+                note: prior.note,
+                ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
+            },
+        );
         RecoveryPlan {
             anchor: self.anchor,
             config: self.config,
@@ -2904,10 +2932,8 @@ impl StoredPlanV1 {
             authority_view: self.authority_view,
             retention_millis: self.retention_millis,
             must_hold,
-            prior: PriorRecord {
-                members: None,
-                note: CommittedWithout::default(),
-            },
+            prior,
+            release: rdb_core::contracts::recovery::TailRelease::default(),
         }
     }
 }
@@ -2918,6 +2944,22 @@ impl StoredPlanV1 {
 struct StoredPlanV2 {
     v1: StoredPlanV1,
     must_hold: std::collections::BTreeSet<CopyId>,
+}
+
+/// [`PriorRecord`] as version `3` stored it: before its ledger (issue #105).
+#[derive(serde::Deserialize)]
+struct StoredPriorV3 {
+    members: Option<Vec<rdb_core::contracts::recovery::PriorMember>>,
+    note: CommittedWithout,
+}
+
+/// The stored plan before the ledger and `release` (version `3`): version `2`, then `prior` as
+/// it was. Its ledger reads as unknown, which over-holds and never under-holds: the plan was
+/// stored by a build that wrote none.
+#[derive(serde::Deserialize)]
+struct StoredPlanV3 {
+    v2: StoredPlanV2,
+    prior: StoredPriorV3,
 }
 
 /// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
@@ -2963,16 +3005,21 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
         1 => {
             let (old, rest) = postcard::take_from_bytes::<StoredPlanV1>(body)
                 .map_err(|error| error.to_string())?;
-            (old.with(std::collections::BTreeSet::new()), rest)
+            (old.with(std::collections::BTreeSet::new(), None), rest)
         }
         2 => {
             let (old, rest) = postcard::take_from_bytes::<StoredPlanV2>(body)
                 .map_err(|error| error.to_string())?;
-            (old.v1.with(old.must_hold), rest)
+            (old.v1.with(old.must_hold, None), rest)
+        }
+        3 => {
+            let (old, rest) = postcard::take_from_bytes::<StoredPlanV3>(body)
+                .map_err(|error| error.to_string())?;
+            (old.v2.v1.with(old.v2.must_hold, Some(old.prior)), rest)
         }
         _ => {
             return Err(format!(
-                "plan version {version}, this build reads 1, 2 and {PROMOTE_PLAN_VERSION}"
+                "plan version {version}, this build reads 1, 2, 3 and {PROMOTE_PLAN_VERSION}"
             ))
         }
     };
@@ -5491,7 +5538,8 @@ mod tests {
     }
 
     /// #80 S5n row 32: a promote stopped after its `Fencing` write and before its plan leaves
-    /// the note on the record. Cut: the `Fencing` CAS passes `None`: layout 4, red.
+    /// the note on the record, and (issue #105) the ledger. Cut: the `Fencing` CAS passes `None`:
+    /// layout 4, red.
     /// Unit (<500 ms): the freeze after it is refused.
     #[test]
     fn s5n_32_a_promote_stopped_after_its_fencing_write_keeps_the_note() {
@@ -5520,7 +5568,16 @@ mod tests {
         let head = PartitionRecord::decode(&found.value).expect("a record");
         let root = PartitionRoot::decode(&found.value).expect("a root");
         let pinned: Vec<RecordMember> = members().iter().map(RecordMember::of).collect();
-        let noted = head.encode_with_members(&root, &pinned, Some(&note));
+        // Issue #105: the stored record carries a ledger, which the Fencing write keeps.
+        let ledger = rdb_core::contracts::recovery::TailLedger {
+            last_writable: Some(Generation(3)),
+            last_writable_regulars: vec![NodeId(1), NodeId(2)],
+            held: vec![rdb_core::contracts::recovery::HeldTail {
+                node: NodeId(3),
+                head: Seq(9),
+            }],
+        };
+        let noted = head.encode_with_members(&root, &pinned, Some(&note), Some(&ledger));
         rt.block_on(mem.put(PutRequest {
             key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
             value: noted,
@@ -5555,8 +5612,16 @@ mod tests {
             Some(PartitionLifecycle::Fencing),
             "the Fencing write landed"
         );
-        assert_eq!(after.value[0], 5);
+        assert_eq!(
+            after.value[0], 6,
+            "issue #105: the Fencing write keeps the ledger too"
+        );
         assert_eq!(committed_without_of(&after.value), Some(note));
+        assert_eq!(
+            rdb_core::authority::partition::ledger_of(&after.value),
+            Some(ledger),
+            "issue #105: L, its regulars and the mark, unchanged"
+        );
     }
 
     /// A-R447 step 6: another promote fences `partitions/1` again between this run's `Fencing`
@@ -5738,7 +5803,12 @@ mod tests {
                 value: if layout_3 {
                     committed.encode_with(&root)
                 } else {
-                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config), None)
+                    committed.encode_with_members(
+                        &root,
+                        &RecordMember::pinned(&plan.config),
+                        None,
+                        None,
+                    )
                 },
                 expected_mod_revision: Some(revision.0),
                 dedup: None,
@@ -5959,7 +6029,12 @@ mod tests {
         let put = rt
             .block_on(store.put(PutRequest {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                value: readded.encode_with_members(&root, &pinned.expect("(5) layout 4"), None),
+                value: readded.encode_with_members(
+                    &root,
+                    &pinned.expect("(5) layout 4"),
+                    None,
+                    None,
+                ),
                 expected_mod_revision: Some(fenced_at),
                 dedup: None,
             }))

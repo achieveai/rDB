@@ -52,6 +52,10 @@ pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this sa
 /// The tail every `admin move` refusal ends with (M11): its detail names the step.
 pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 
+/// The tail every `admin forget-tail` refusal ends with (issue #105): its detail names the step,
+/// and nothing was given up.
+pub(crate) const FORGET_TAIL_STEP: &str = "nothing was given up";
+
 /// The tail of a move's answer when the move ended by filling a free slot (A-R457 (a)): its
 /// detail says what the move did and the step to move the source's copy.
 pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
@@ -322,6 +326,7 @@ impl ApiError {
             || self.detail.ends_with(REBUILD_STEP)
             || self.detail.ends_with(BARRIER_STEP)
             || self.detail.ends_with(MOVE_STEP)
+            || self.detail.ends_with(FORGET_TAIL_STEP)
             || self.detail.ends_with(MOVE_ENDED)
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)

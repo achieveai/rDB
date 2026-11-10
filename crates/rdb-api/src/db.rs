@@ -4580,6 +4580,48 @@ impl Db {
         }
     }
 
+    /// Issue #105 (design section 8.1): `admin forget-tail`. Asks the owner to re-plan
+    /// partition 1 once, giving up what `release` names: with `through`, every held tail at or
+    /// below that seq; with `no_intact_copy`, the intact rule. `give_up_live_copy` allows giving
+    /// up a tail a live copy still reports. What is given up is gone for good. The answer comes
+    /// at once, naming what is given up; the re-plan runs on the owner.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal, which gave up nothing and names why (`INVALID_ARGUMENT` for a
+    /// release that cannot be made as asked, `UNAVAILABLE` for one to ask again later);
+    /// `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the owner's
+    /// node does not list as an admin app; `NOT_PRIMARY` when the node asked is not the owner;
+    /// `UNAVAILABLE` when no answer came in the read timeout.
+    pub fn forget_tail(
+        &self,
+        release: rdb_core::contracts::recovery::TailRelease,
+        give_up_live_copy: bool,
+    ) -> Result<String, ApiError> {
+        if let Some(error) = self.refuse_groupless("forget_tail", "it runs on one partition only") {
+            return Err(error);
+        }
+        match self.call(
+            PARTITION,
+            ClientCall::ForgetTail {
+                identity: self.identity(),
+                release,
+                give_up_live_copy,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::TailForgotten(line)) => Ok(line),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a forget-tail was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the forget-tail in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
     /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
     /// status look.
     ///
@@ -4989,7 +5031,9 @@ enum Carries {
 fn carries(call: &ClientCall) -> Carries {
     match call {
         ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
-        ClientCall::Move { .. } | ClientCall::Rebuild { .. } => Carries::Admin,
+        ClientCall::Move { .. } | ClientCall::Rebuild { .. } | ClientCall::ForgetTail { .. } => {
+            Carries::Admin
+        }
         ClientCall::Compile { .. }
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
@@ -5902,6 +5946,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Status { .. }
         | ClientCall::Move { .. }
         | ClientCall::Rebuild { .. }
+        | ClientCall::ForgetTail { .. }
         | ClientCall::WaitDurable { .. } => return None,
     };
     let request = identity.request;
@@ -13008,6 +13053,7 @@ mod tests {
             must_hold: std::collections::BTreeSet::new(),
             prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
             config,
+            release: rdb_core::contracts::recovery::TailRelease::default(),
         };
         let fence = FencingProof {
             partition: PARTITION,

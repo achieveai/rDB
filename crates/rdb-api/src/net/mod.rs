@@ -101,7 +101,13 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// that does not decode ends the connection.
 ///
 /// `8` came with #79 S4d: `WireNodeStatus::tail_refused`.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// `9` came with issue #105: `WirePeerAsk::Inventory::last_writable`,
+/// `SurvivorInventory::holds_last_writable`, `RecoveryEvent::TailHeld`, `RecoveryResult::ledger`,
+/// `RecoveryPlan::release`, `WireCall::ForgetTail` and `WireAnswer::TailForgotten`. It ships with
+/// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts
+/// the whole cluster.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -954,15 +960,20 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         (
             Label::App(app),
             WireMsg::Client {
-                call: call @ (wire::WireCall::Move { .. } | wire::WireCall::Rebuild { .. }),
+                call:
+                    call @ (wire::WireCall::Move { .. }
+                    | wire::WireCall::Rebuild { .. }
+                    | wire::WireCall::ForgetTail { .. }),
                 to,
                 ..
             },
         ) if !admin_apps.contains(app) => {
-            let (verb, step) = if matches!(call, wire::WireCall::Move { .. }) {
-                ("move", crate::db::error::MOVE_STEP)
-            } else {
-                ("rebuild", crate::db::error::REBUILD_STEP)
+            let (verb, step) = match call {
+                wire::WireCall::Move { .. } => ("move", crate::db::error::MOVE_STEP),
+                wire::WireCall::ForgetTail { .. } => {
+                    ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
+                }
+                _ => ("rebuild", crate::db::error::REBUILD_STEP),
             };
             // App `admin` refused here is on a node whose list leaves it out: telling it to
             // run as `admin` would be false (critic-479 A6).
@@ -973,8 +984,9 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             };
             return Some(format!(
                 "app {app} is not an admin app on node {}: only an admin app may move or \
-                 rebuild a copy, and the node's operator names them; add {app} to the node's \
-                 admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`){instead}; {step}",
+                 rebuild a copy or forget a tail, and the node's operator names them; add {app} \
+                 to the node's admin apps (`rdb_node --admin-apps`, \
+                 `NetConfig::admin_apps`){instead}; {step}",
                 to.0
             ));
         }

@@ -237,7 +237,7 @@ fn s5n_32_a_note_on_the_record_survives_a_reopen_of_every_node() {
     let members = RecordMember::decode_all(&found.value).expect("members");
     rt.block_on(store.put(config_core::PutRequest {
         key: key.clone(),
-        value: head.encode_with_members(&root, &members, Some(&note)),
+        value: head.encode_with_members(&root, &members, Some(&note), None),
         expected_mod_revision: Some(found.mod_revision),
         dedup: None,
     }))
@@ -269,7 +269,7 @@ fn s5n_32_a_note_on_the_record_survives_a_reopen_of_every_node() {
         .expect("get")
         .record
         .expect("partitions/1");
-    assert_eq!(after.value[0], 5);
+    assert_eq!(after.value[0], 6, "issue #105: the ledger, then the note");
     assert_eq!(committed_without_of(&after.value), Some(note));
     db.shutdown();
 }
@@ -2245,9 +2245,10 @@ fn m10_s2_an_undecodable_partition_record_is_refused_by_its_key_and_changes_noth
 }
 
 /// Bug bash #64, ruling A-R426 row (d): `partitions/1` stamped with a layout this build does not
-/// know (5: a newer build's record) is `Undecodable`, never a forming or an empty store. The
-/// body is this build's own layout-4 record with only its first byte changed, so every other
-/// byte would decode. Cut: `PartitionRecord::decode` takes any byte above 3 as layout 4, red.
+/// know (7: a newer build's record; 5 then, before layouts 5 and 6 landed) is `Undecodable`,
+/// never a forming or an empty store. The body is this build's own record (layout 6 since issue
+/// #105) with only its first byte changed, so every other byte would decode. Cut:
+/// `PartitionRecord::decode` takes any byte above 3 as layout 4, red.
 /// Integration (~1 s): one fresh open until ready, one refused reopen.
 #[config_log::retcd_test]
 fn bb_64_an_unknown_partition_layout_is_undecodable() {
@@ -2261,19 +2262,19 @@ fn bb_64_an_unknown_partition_layout_is_undecodable() {
         .expect("read partitions/1")
         .record
         .expect("partitions/1 exists");
-    assert_eq!(found.value[0], 4, "F1 wrote layout 4");
+    assert_eq!(found.value[0], 6, "F1 wrote layout 6, the ledger's");
     let mut newer = found.value.to_vec();
-    newer[0] = 5;
+    newer[0] = 7;
     rt.block_on(store.put(config_core::PutRequest {
         key,
         value: Bytes::from(newer),
         expected_mod_revision: Some(found.mod_revision),
         dedup: None,
     }))
-    .expect("stamp partitions/1 layout 5");
+    .expect("stamp partitions/1 layout 7");
     match open(&rt, dir.path(), &store) {
         Err(OpenError::Undecodable { .. }) => {}
-        other => panic!("layout 5 is Undecodable, not {:?}", other.map(|_| "Db")),
+        other => panic!("layout 7 is Undecodable, not {:?}", other.map(|_| "Db")),
     }
 }
 

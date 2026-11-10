@@ -138,6 +138,7 @@ fn landed() -> RecoveryResult {
             authority_view: zero(),
         },
         retained_status_map: zero(),
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }
 }
 
@@ -272,6 +273,15 @@ fn calls() -> Vec<ClientCall> {
         from: NodeId(3),
         to: NodeId(4),
     });
+    // Issue #105: `admin forget-tail`, each flag carried.
+    calls.push(ClientCall::ForgetTail {
+        identity: identity(4, 35),
+        release: rdb_core::contracts::recovery::TailRelease {
+            through: Some(rdb_core::contracts::ids::Seq(9)),
+            no_intact_copy: true,
+        },
+        give_up_live_copy: true,
+    });
     calls
 }
 
@@ -363,6 +373,7 @@ fn answers() -> Vec<Answer> {
         Answer::Unchanged,
         Answer::Status(zero()),
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
+        Answer::TailForgotten("forget-tail: partition 1 re-plans from generation 4".to_owned()),
         Answer::Durable,
         Answer::Moved(MoveAnswer {
             done: true,
@@ -459,6 +470,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             ask: PeerAsk::Inventory {
                 copy: CopyId(2),
                 anchor: zero(),
+                last_writable: Some(Generation(4)),
             },
         },
         Msg::PeerAsk {
@@ -1040,6 +1052,7 @@ fn ask_from(asker: u32) -> Msg {
         ask: PeerAsk::Inventory {
             copy: CopyId(1),
             anchor: zero(),
+            last_writable: None,
         },
     }
 }
@@ -1642,7 +1655,7 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 8");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
