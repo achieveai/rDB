@@ -31,6 +31,7 @@ fn m10_s1_6_a_full_cap_frees_at_the_reopen_once_its_writes_aged_since_their_publ
     let open = || {
         // This row pins how the cap fills: the ack floor would empty it (A-R252).
         let config = DbConfig {
+            partitions: None,
             ack_floor: false,
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),

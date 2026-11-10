@@ -234,6 +234,7 @@ fn calls() -> Vec<ClientCall> {
         .collect();
     calls.extend(looks.into_iter().map(|look| ClientCall::Get {
         identity: identity(3, 20),
+        group: rdb_core::contracts::ids::AffinityId(1),
         object: Bytes::from_static(b"obj"),
         look,
     }));
@@ -814,6 +815,7 @@ async fn a_peer_message_crosses_processes_and_a_call_is_answered_on_its_link() {
                 partition: PartitionId(1),
                 call: ClientCall::Get {
                     identity: identity(42, 7),
+                    group: rdb_core::contracts::ids::AffinityId(1),
                     object: Bytes::from_static(b"k"),
                     look: Look::Doc,
                 },
@@ -1590,7 +1592,7 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 4");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 5");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
@@ -1817,6 +1819,7 @@ async fn an_address_that_never_answers_the_tls_hello_says_so() {
 /// A formation config on `dir`: all three nodes, no links, as `rdb_node --form` opens.
 fn db_config(dir: &FsPath) -> crate::db::DbConfig {
     crate::db::DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: dir.to_path_buf(),
         hold: Vec::new(),
@@ -2367,6 +2370,72 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
     );
 }
 
+/// Close window (S3 acceptance finding 2): a call reaches `Net::send` while its link is closing,
+/// after `close` let go the waiters it found and before the route stopped naming the link. The
+/// call must be let go at once. It was left waiting on a dead link for the whole put timeout,
+/// which `Db::send` answers `UNKNOWN_OUTCOME`. Unit: no sockets; red only at the put timeout.
+#[config_log::retcd_test]
+fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let shared = Arc::new(super::Shared {
+        label: Label::App("app".to_owned()),
+        admin_apps: admin_apps(),
+        boot: BootId(0),
+        protocol_version: PROTOCOL_VERSION,
+        faults: Faults::new(),
+        links: std::sync::Weak::new(),
+        routes: std::sync::Mutex::new(BTreeMap::from([(
+            NodeId(2),
+            super::Route {
+                conn: None,
+                queue: std::collections::VecDeque::new(),
+                boot: None,
+                refused: None,
+                last_error: None,
+            },
+        )])),
+        conns: std::sync::Mutex::new(BTreeMap::new()),
+        next_conn: std::sync::atomic::AtomicU64::new(0),
+        rt: rt.handle().clone(),
+        span: tracing::Span::current(),
+        on_boot: std::sync::Mutex::new(None),
+    });
+    let net = Arc::new(Net {
+        shared: Arc::clone(&shared),
+        tasks: std::sync::Mutex::new(Vec::new()),
+        addr: None,
+    });
+    let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
+    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    super::install(&shared, NodeId(2), &conn, BootId(22));
+
+    let (reply, answer) = mpsc::channel();
+    let (sent_tx, sent) = mpsc::channel();
+    let call = Msg::Client(Client {
+        partition: PartitionId(1),
+        call: calls().remove(0),
+        reply,
+    });
+    let in_the_window = Arc::clone(&net);
+    *super::lock(&conn.between_close_halves) = Some(Box::new(move || {
+        let _ = sent_tx.send(in_the_window.send(NodeId(2), call));
+    }));
+    super::close(&shared, &conn, "the peer was killed");
+    let sent = sent
+        .recv_timeout(Duration::ZERO)
+        .expect("the call was made");
+
+    let started = std::time::Instant::now();
+    let waited = answer.recv_timeout(crate::db::Timeouts::default().put);
+    assert!(
+        matches!(waited, Err(mpsc::RecvTimeoutError::Disconnected)),
+        "sent {sent:?}; after {:?} the caller had {waited:?}: its waiter sits on a closed link",
+        started.elapsed()
+    );
+}
+
 /// A handshake from node 2's certificate that this row holds open, as a dialler that has not
 /// given up yet would; dropping both halves abandons it, as a dialler past `HANDSHAKE` has.
 async fn handshake_as_node_2(
@@ -2529,4 +2598,27 @@ fn an_abandoned_handshake_installed_first_leaves_routes_both_ways() {
 #[config_log::retcd_test]
 fn an_abandoned_handshake_installed_second_leaves_routes_both_ways() {
     an_abandoned_handshake_beside_a_live_link_leaves_routes_both_ways(false);
+}
+
+/// A node's accepted socket has Nagle off, or a write of 16 KiB or more waits on the peer's
+/// delayed ACK. Read back from the stream `Net::start` serves: the option is per socket and a
+/// peer cannot see it, which is why this is not a row over a link.
+#[config_log::retcd_test]
+async fn an_accepted_socket_has_nodelay_set() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("listener address");
+    let mut accepted = std::pin::pin!(super::accepted_streams(listener));
+
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+    let socket = tokio_stream::StreamExt::next(&mut accepted)
+        .await
+        .expect("a socket")
+        .expect("accepted");
+    assert!(
+        socket.nodelay().expect("read the option"),
+        "Nagle is still on"
+    );
 }

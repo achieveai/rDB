@@ -63,8 +63,8 @@ use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEven
 use rdb_core::contracts::txn::Outcome;
 use rdb_core::contracts::version::ENVELOPE_VERSION;
 use rdb_core::replication::append::{
-    AppendReceiver, Head, HistoryRoot, ReceiverInit, MAX_ENVELOPE_BYTES, MAX_MUTATIONS,
-    PROGRESS_KEY, UNSOLICITED,
+    AppendReceiver, CatchUpPlan, Head, HistoryRoot, ReceiverInit, MAX_ENVELOPE_BYTES,
+    MAX_MUTATIONS, PROGRESS_KEY, UNSOLICITED,
 };
 use rdb_core::replication::catchup::{retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS};
 use rdb_core::replication::primary::{
@@ -6489,4 +6489,210 @@ fn m10_s2_a_recovery_append_never_reaches_a_receiver_beside_a_serving_primary() 
         (BatchId(0), NEW_GEN, Seq(11)),
         "beside a retired primary the receiver stages the retransmitted append"
     );
+}
+
+// --- #79 S3b: a credentialed append is checked against the plan F1 delivered ----------------
+
+/// `from` at `boot`, authenticated.
+fn booted(node: NodeId, boot: u64) -> PeerLabel {
+    PeerLabel {
+        boot: BootId(boot),
+        ..label(node)
+    }
+}
+
+/// [`config`] with C at `boot`, and with C's role `role`.
+fn planned_config(boot: u64, role: ReplicaRole) -> PartitionConfig {
+    let members = [
+        member(0, A, ReplicaRole::Primary),
+        member(1, B, ReplicaRole::RegularSecondary),
+        Member {
+            boot: BootId(boot),
+            ..member(2, C, role)
+        },
+    ];
+    PartitionConfig::new(P, CONFIG, members.to_vec())
+}
+
+/// F1's plan for `fence(2, EPOCH, Revision(0))`, naming C at `boot`.
+fn plan(boot: u64) -> CatchUpPlan {
+    CatchUpPlan {
+        config: planned_config(boot, ReplicaRole::RegularSecondary),
+        lineage: Lineage {
+            partition: P,
+            generation: GEN,
+            owner_epoch: EPOCH,
+        },
+        revision: Revision(0),
+    }
+}
+
+fn holding(held: CatchUpPlan) -> Replication {
+    let mut module = module();
+    module.keep_recovery_plan(B, P, held);
+    module
+}
+
+fn from_c() -> Bytes {
+    recovery_body(&fence(2, EPOCH, Revision(0)), &golden())
+}
+
+/// The refusal `body` from `from` gets; asserts the receiver did not change at all.
+fn refused_by(module: &mut Replication, from: PeerLabel, body: Bytes) -> AppendOutcome {
+    let before = rx(module).clone();
+    let effects = send_bytes(module, from, body);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(rx(module), &before, "a refused append changes nothing");
+    reply_at(&effects[0], from.node, FRAME_ID, CONFIG)
+}
+
+/// Pin boot 3, plan boot 30: boot 30 is admitted and stages the record. Replacing the plan with
+/// boot 31 admits boot 31. Cut: `sender_admitted` always reads the pin, red.
+#[retcd_test]
+fn s3b_1_a_live_copy_takes_a_credentialed_append_from_the_planned_boot() {
+    let mut module = holding(plan(30));
+    let effects = send_bytes(&mut module, booted(C, 30), from_c());
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+    let mut module = holding(plan(31));
+    let effects = send_bytes(&mut module, booted(C, 31), from_c());
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+}
+
+/// A plan names boot 30, so the pinned old boot 3 and a boot the plan never named are refused,
+/// under the plan's own credential, and nothing moves. Cut: admit when either config matches,
+/// red.
+#[retcd_test]
+fn s3b_2_with_a_plan_held_the_old_boot_and_an_unnamed_boot_are_refused() {
+    for boot in [3, 31] {
+        let mut module = holding(plan(30));
+        assert_eq!(
+            refused_by(&mut module, booted(C, boot), from_c()),
+            rejected(AppendReject::NotAMember),
+            "boot {boot}"
+        );
+    }
+}
+
+/// No plan, as before S3b: the pin decides. Cut: with no plan match by node, red.
+#[retcd_test]
+fn s3b_3_with_no_plan_the_pin_decides() {
+    let mut module = module();
+    let effects = send_bytes(&mut module, booted(C, 3), from_c());
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+    let mut module = self::module();
+    assert_eq!(
+        refused_by(&mut module, booted(C, 30), from_c()),
+        rejected(AppendReject::NotAMember)
+    );
+}
+
+/// A plan held for another generation, epoch or revision says nothing about this credential.
+/// Boot 30 falls to the pin and is refused. Cut: delete any one compare in `names`, red.
+#[retcd_test]
+fn s3b_4_a_plan_that_does_not_match_the_credential_is_not_read() {
+    let other_generation = CatchUpPlan {
+        lineage: Lineage {
+            generation: NEW_GEN,
+            ..plan(30).lineage
+        },
+        ..plan(30)
+    };
+    let other_epoch = CatchUpPlan {
+        lineage: Lineage {
+            owner_epoch: NEW_EPOCH,
+            ..plan(30).lineage
+        },
+        ..plan(30)
+    };
+    let other_revision = CatchUpPlan {
+        revision: Revision(9),
+        ..plan(30)
+    };
+    for held in [other_generation, other_epoch, other_revision] {
+        let mut module = holding(held.clone());
+        assert_eq!(
+            refused_by(&mut module, booted(C, 30), from_c()),
+            rejected(AppendReject::NotAMember),
+            "{held:?}"
+        );
+    }
+}
+
+/// A plain append from the boot a plan names is refused: the plan is read only under a
+/// credential. Cut: the plain arm reads the plan, red.
+#[retcd_test]
+fn s3b_5_a_plain_append_ignores_the_plan() {
+    let members = vec![
+        Member {
+            boot: BootId(30),
+            ..member(0, A, ReplicaRole::Primary)
+        },
+        member(1, B, ReplicaRole::RegularSecondary),
+        member(2, C, ReplicaRole::RegularSecondary),
+    ];
+    let mut module = holding(CatchUpPlan {
+        config: PartitionConfig::new(P, CONFIG, members),
+        ..plan(3)
+    });
+    let body = golden().encode().expect("encode");
+    assert_eq!(
+        refused_by(&mut module, booted(A, 30), body),
+        rejected(AppendReject::NotAMember)
+    );
+}
+
+/// M7B-121 with a plan held: another member replaying the credential is refused. Cut: delete
+/// `member.copy == fence.sender`, red.
+#[retcd_test]
+fn s3b_6_a_second_member_replaying_the_credential_is_refused_under_a_plan() {
+    let mut module = holding(plan(30));
+    assert_eq!(
+        refused_by(&mut module, label(A), from_c()),
+        rejected(AppendReject::NotAMember)
+    );
+}
+
+/// A plan that names the sender a shadow does not admit it. Cut: delete the role clause, red.
+#[retcd_test]
+fn s3b_7_a_shadow_is_refused_under_a_plan() {
+    let mut module = holding(CatchUpPlan {
+        config: planned_config(30, ReplicaRole::Shadow),
+        ..plan(30)
+    });
+    assert_eq!(
+        refused_by(&mut module, booted(C, 30), from_c()),
+        rejected(AppendReject::NotAMember)
+    );
+}
+
+/// `Recovered` clears the plan, and the old credential then gets `StaleGeneration` from the
+/// plan's own boot. Cut: delete the clear, red.
+#[retcd_test]
+fn s3b_12_recovered_clears_the_plan() {
+    let mut module = holding(plan(30));
+    assert!(rx(&module).recovery_plan().is_some());
+    step(&mut module, &recovered(10, d(10), takeover_config()));
+    assert_eq!(rx(&module).recovery_plan(), None);
+    let effects = send_bytes(&mut module, booted(C, 30), from_c());
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+}
+
+/// A later plan replaces an earlier one, as a second open of the owner delivers it: boot 31 is
+/// admitted and the first plan's boot 30 no longer is. Cut: first writer wins, red.
+#[retcd_test]
+fn s3b_9_a_later_plan_replaces_the_first() {
+    let later = || {
+        let mut module = holding(plan(30));
+        module.keep_recovery_plan(B, P, plan(31));
+        module
+    };
+    assert_eq!(
+        refused_by(&mut later(), booted(C, 30), from_c()),
+        rejected(AppendReject::NotAMember)
+    );
+    let effects = send_bytes(&mut later(), booted(C, 31), from_c());
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
 }

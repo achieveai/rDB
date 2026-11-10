@@ -9,6 +9,10 @@
 //! Errors are gRPC rich status: [`to_status`] puts one [`pb::RdbError`] in the details of a
 //! `google.rpc.Status`. An error without it was made by the transport, not by the server.
 #![forbid(unsafe_code)]
+// `tonic::Status` is 176 bytes and it is tonic's type: every service method must return it, and
+// the closures that build it are linted one by one by newer clippy. Boxing would only mean
+// unboxing at every handler.
+#![allow(clippy::result_large_err)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -463,6 +467,22 @@ impl Gateway {
     }
 }
 
+/// The refusal of `call` above one partition (issue #79, ruling Q6): this protocol names no
+/// group, so which partition the call means is not known and is never guessed.
+fn refuse_partitioned(db: &Db, call: &str) -> Option<Status> {
+    let partitions = db.partition_count();
+    if partitions <= 1 {
+        return None;
+    }
+    tracing::warn!(call, partitions, "gateway_call_refused_partitioned");
+    let mut error = ApiError::invalid(format!(
+        "{call} names no group and this database has {partitions} partitions: this gateway \
+         serves one partition only; nothing was sent"
+    ));
+    error.no_mutation = true;
+    Some(to_status(&error, None))
+}
+
 /// The refusal of a call past the in-flight limit: nothing was started.
 fn overloaded(max: usize) -> Status {
     let mut error = ApiError::new(
@@ -625,6 +645,9 @@ impl pb::rdb_server::Rdb for Gateway {
     ) -> Result<Response<pb::WriteReply>, Status> {
         let put = request.into_inner();
         self.blocking("Put", write_request, move |db| {
+            if let Some(refusal) = refuse_partitioned(db, "Put") {
+                return Err(refusal);
+            }
             db.put(&put.object, &put.value, put.if_version)
                 .map(|ok| logged_write("Put", &ok))
                 .map_err(|error| put_status(&error))
@@ -639,6 +662,9 @@ impl pb::rdb_server::Rdb for Gateway {
     ) -> Result<Response<pb::GetReply>, Status> {
         let object = request.into_inner().object;
         self.blocking("Get", no_request, move |db| {
+            if let Some(refusal) = refuse_partitioned(db, "Get") {
+                return Err(refusal);
+            }
             let ok = db.get(&object).map_err(|error| to_status(&error, None))?;
             let (found, version, value) = match ok.value {
                 Some((version, value)) => (true, version, value),
@@ -668,6 +694,9 @@ impl pb::rdb_server::Rdb for Gateway {
             Duration::from_millis(u64::from(txn.deadline_ms))
         };
         self.blocking("Txn", write_request, move |db| {
+            if let Some(refusal) = refuse_partitioned(db, "Txn") {
+                return Err(refusal);
+            }
             let puts: Vec<TxnPut<'_>> = txn
                 .puts
                 .iter()
@@ -692,6 +721,9 @@ impl pb::rdb_server::Rdb for Gateway {
     ) -> Result<Response<pb::StatusReply>, Status> {
         let asked = request.into_inner();
         self.blocking("Status", no_request, move |db| {
+            if let Some(refusal) = refuse_partitioned(db, "Status") {
+                return Err(refusal);
+            }
             let status = db
                 .status(
                     RequestId(asked.request_id),

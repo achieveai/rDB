@@ -4228,6 +4228,7 @@ fn compile(request: u64, object: &'static [u8], value: &'static [u8]) -> ClientC
 fn get(request: u64, object: &'static [u8]) -> ClientCall {
     ClientCall::Get {
         identity: identity(request),
+        group: AffinityId(1),
         object: Bytes::from_static(object),
         look: Look::Doc,
     }
@@ -4509,6 +4510,7 @@ fn a_publish_reissued_while_fenced_is_refused_as_a_read_is_and_unchanged_once_ad
     trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
     let read = ClientCall::Get {
         identity: identity(3),
+        group: AffinityId(1),
         object: Bytes::from_static(b"f"),
         look: Look::Range { offset: 0, len: 4 },
     };
@@ -4831,6 +4833,7 @@ impl Trio {
     fn look(&mut self, request: u64, object: &'static [u8], look: Look) -> Result<Seen, ApiError> {
         let call = ClientCall::Get {
             identity: identity(request),
+            group: AffinityId(1),
             object: Bytes::from_static(object),
             look,
         };
@@ -5406,6 +5409,7 @@ fn m9_s6_a_clear_answers_without_sending_only_while_a_read_would_be_answered() {
     trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
     let read = ClientCall::Get {
         identity: identity(12),
+        group: AffinityId(1),
         object: Bytes::from_static(b"healthy"),
         look: Look::Doc,
     };

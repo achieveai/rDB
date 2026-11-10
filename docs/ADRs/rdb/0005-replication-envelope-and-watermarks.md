@@ -120,6 +120,9 @@ replaces 6 and 7 with three checks: `fence.prior_owner_epoch` equals the receive
 `AuthorityView.owner_epoch` (else `STALE_FENCE`); `fence.control_revision >=` the receiver's last
 seen `partitions/{id}` revision (else `STALE_FENCE`); and the authenticated peer **is
 `fence.sender`** and that copy is a regular member of the pinned config (else `NOT_A_MEMBER`).
+The member is checked in the plan F1 delivered for that fence when the receiver holds one (same
+generation, epoch and control revision), otherwise in the pinned config: the pin can still name a
+restarted recoverer's dead boot (#79 S3b).
 The epoch plus the monotone revision is the whole "your fence is at least as new as anything I have
 seen" check. An earlier draft also compared a `prior_grant_id`; it is withdrawn for the reason given
 two paragraphs up — the receiver's view is derived from `partitions/{id}`, which holds no grant id,

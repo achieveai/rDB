@@ -49,6 +49,13 @@ pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 /// detail says what the move did and the step to move the source's copy.
 pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
 
+/// The tail of [`crate::admin::PromoteError::OwnerAlive`]: a designed refusal whose text names
+/// the step, which "retrying will not help: report this" would contradict (#79 S3 P2).
+pub(crate) const PROMOTE_ALIVE_STEP: &str = "stop that node first, then promote again";
+
+/// The tail of [`crate::admin::PromoteError::TargetFrozen`], for the same reason.
+pub(crate) const PROMOTE_FROZEN_STEP: &str = "promote another node";
+
 /// The tail of [`super::ReadyError::Quarantined`]'s text, which a refusal carries while the
 /// owner's recovery is quarantined ([`super::Db::explained`]). It already says what to do, which
 /// a "wait a few seconds and try again" step would contradict (review-s2 F-003).
@@ -296,6 +303,8 @@ impl ApiError {
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
+            || self.detail.ends_with(PROMOTE_ALIVE_STEP)
+            || self.detail.ends_with(PROMOTE_FROZEN_STEP)
         {
             return None;
         }

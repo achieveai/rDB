@@ -151,6 +151,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let config = DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: format!("{run}/my-app").into(),
         hold: Vec::new(),

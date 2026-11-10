@@ -178,6 +178,7 @@ fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
 
 /// A-R217 rows: node 1's host, the pinned primary of [`landing_at`]'s commit, over the engine
 /// at `path`, with an open bound, so a landing it links can go on to `activate`.
+#[cfg(debug_assertions)]
 fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
     let engine = RocksEngine::open(path).expect("open engine");
     let links = Links::new();
@@ -189,6 +190,7 @@ fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
 }
 
 /// The newest generation `host` asked the open counter to mark activated for partition 1.
+#[cfg(debug_assertions)]
 fn asked(host: &Host) -> Generation {
     host.activation
         .get(&PartitionId(1))
@@ -1756,5 +1758,94 @@ fn m11_a2_a_the_ladder_duty_starves_no_partition() {
         host.inventory_ladder_matches_rebuild(PartitionId(2)),
         Some((true, Seq(10))),
         "the second pass warms partition 2 through its head"
+    );
+}
+
+/// #79 S3b, row 9's host half: a target restore hands the seed to a held receiver, live or
+/// dormant, and the later seed wins. A source restore (`with_history`) never does: its seed is
+/// not this copy's plan. Cut: `restore_dormant` keeps the plan only when `dormant` is false,
+/// the dormant stanza is red; the keep skipped, every stanza is red.
+/// Integration (~3 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn s3b_9_a_target_restore_keeps_the_latest_plan_on_a_live_and_a_dormant_receiver() {
+    use rdb_core::contracts::ids::Revision;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let committed = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let seed = |boot: u64| {
+        let mut config = committed.committed.pinned_config.clone();
+        config.members[0].boot = BootId(boot);
+        DormantSeed {
+            config,
+            lineage: Lineage {
+                partition: PartitionId(1),
+                generation: committed.new_generation,
+                owner_epoch: OwnerEpoch(1),
+            },
+            revision: Revision(1),
+        }
+    };
+    let held_boot = |two: &Host| {
+        two.replication
+            .receiver(NodeId(2), PartitionId(1))
+            .expect("a receiver")
+            .recovery_plan()
+            .map(|plan| plan.config.members[0].boot)
+    };
+    trio.until("node 2 holds a live receiver", |trio| {
+        trio.nodes[1]
+            .0
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .filter(|held| !held.is_dormant())
+            .map(|_| ())
+    });
+    let two = &mut trio.nodes[1].0;
+
+    two.restore_dormant(PartitionId(1), &seed(30), false);
+    assert_eq!(held_boot(two), Some(BootId(30)), "live, the first plan");
+    two.restore_dormant(PartitionId(1), &seed(31), false);
+    assert_eq!(held_boot(two), Some(BootId(31)), "live, the later plan");
+    two.restore_dormant(PartitionId(1), &seed(32), true);
+    assert_eq!(
+        held_boot(two),
+        Some(BootId(31)),
+        "a source restore is no plan"
+    );
+    assert!(
+        two.replication
+            .receiver(NodeId(2), PartitionId(1))
+            .is_some_and(|held| !held.is_dormant()),
+        "the live receiver is kept"
+    );
+
+    let dormant = two
+        .dormant_receiver(PartitionId(1), &seed(40))
+        .expect("a dormant receiver");
+    two.replication.install_receiver(dormant);
+    two.restore_dormant(PartitionId(1), &seed(41), false);
+    assert_eq!(held_boot(two), Some(BootId(41)), "dormant, the later plan");
+
+    // S3b-9: beside a serving primary the receiver only sources, so it is given no plan.
+    let one = &mut trio.nodes[0].0;
+    assert!(
+        one.replication
+            .primary(NodeId(1), PartitionId(1))
+            .is_some_and(|primary| !primary.tracker().retired()),
+        "node 1 serves the partition"
+    );
+    one.restore_dormant(PartitionId(1), &seed(50), true);
+    one.restore_dormant(PartitionId(1), &seed(51), false);
+    let source = one
+        .replication
+        .receiver(NodeId(1), PartitionId(1))
+        .expect("the source restore installed a dormant receiver");
+    assert!(source.is_dormant(), "the source receiver stays dormant");
+    assert!(
+        source.recovery_plan().is_none(),
+        "a target restore gave a plan to the receiver beside a serving primary"
     );
 }

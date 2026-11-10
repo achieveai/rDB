@@ -117,7 +117,9 @@ use crate::contracts::errors::{Capability, RdbError};
 use crate::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName, StepCtx,
 };
-use crate::contracts::ids::{OwnerEpoch, ReplicaRole, Revision, Seq, TimerId, TimerVersion};
+use crate::contracts::ids::{
+    OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, TimerId, TimerVersion,
+};
 use crate::contracts::ignore::ReplicaIgnoreReason;
 use crate::contracts::membership::{CopyId, PartitionConfig};
 use crate::contracts::recovery::{
@@ -135,7 +137,8 @@ use inventory::{Collecting, Deadline, Window};
 use lineage::{select_leader, select_prefix_spied, Rejected, SelectionOutcome, SelectionSpy};
 use rebuild::{Rebuild, Refused};
 
-/// The first [`TimerId`] F1 owns. F1 arms one timer, [`DISCOVERY_TIMER`].
+/// The first [`TimerId`] F1 owns. Each partition's F1 arms one timer, [`discovery_timer`]: this
+/// base plus the partition id less one, so partition 1's is [`DISCOVERY_TIMER`].
 pub const RECOVERY_TIMER_BASE: u64 = 0x00F1 << 48;
 
 /// The discovery-window deadline, reused as the probe-wait deadline once the window closes, and
@@ -143,6 +146,13 @@ pub const RECOVERY_TIMER_BASE: u64 = 0x00F1 << 48;
 /// rebuild sync after commit (ruling B-R52), and on each CAS exchange: the recovery CAS and the
 /// activation CAS (issue #2).
 pub const DISCOVERY_TIMER: TimerId = TimerId(RECOVERY_TIMER_BASE);
+
+/// Partition `partition`'s [`DISCOVERY_TIMER`]: one per partition, so two F1s on one node do not
+/// share an id (issue #79). Partition 1's is [`DISCOVERY_TIMER`] itself.
+#[must_use]
+pub const fn discovery_timer(partition: PartitionId) -> TimerId {
+    TimerId(RECOVERY_TIMER_BASE + partition.0.saturating_sub(1) as u64)
+}
 
 /// How many attempts the wait after selection gets before `BarrierIncomplete` (arch-s2
 /// "BarrierIncomplete retry", ruling A-R225 R2-A1). Attempt `n` waits `2^(n-1)` discovery
@@ -585,8 +595,9 @@ impl Recovery {
 
     fn arm(&mut self, at: Tick, emit: &mut Emit<'_>) {
         self.timer_version = TimerVersion(self.timer_version.0 + 1);
+        let id = discovery_timer(emit.event().partition);
         emit.kind(EffectKind::Timer(TimerEffect::Arm {
-            id: DISCOVERY_TIMER,
+            id,
             version: self.timer_version,
             at,
         }));
@@ -1398,7 +1409,9 @@ impl Module for Recovery {
             EventKind::Kernel(KernelEvent::Recovery(input)) => Some(Input::Recovery(input)),
             EventKind::Kernel(KernelEvent::CopyLost { copy }) => Some(Input::CopyLost(*copy)),
             EventKind::Control(answer) => self.control_input(answer),
-            EventKind::Timer(fired) if fired.id == DISCOVERY_TIMER => Some(Input::Timer(fired)),
+            EventKind::Timer(fired) if fired.id == discovery_timer(event.partition) => {
+                Some(Input::Timer(fired))
+            }
             _ => None,
         };
         let input = input.ok_or(RdbError::unavailable(

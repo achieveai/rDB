@@ -98,6 +98,7 @@ impl AppendReceiver {
     /// ACK, not even for a batch already staged. Only a later `Recovered` that pins it a serving
     /// member clears that.
     pub fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<EffectKind> {
+        self.recovery_plan = None;
         let config = &result.committed.pinned_config;
         let invalid = || {
             vec![ignored(KernelIgnoredReason::Replica(

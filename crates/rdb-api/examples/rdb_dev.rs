@@ -7,6 +7,7 @@
 //!                                           [--control host:port[,host:port...]] [--requests F]
 //!                                           [--abort-after-commit] [--pause-before-sync N=MS]
 //!                                           [--nodes N=E[,N=E...] --cert-dir D [--app NAME]]
+//!                                           [--partitions N]
 //! cargo run -p rdb-api --example rdb_dev -- --help
 //! ```
 //!
@@ -19,6 +20,13 @@
 //! and grants/ records. Each endpoint must be host:port. Without `--control`, a `--dir` that
 //! held anything before this run is never removed either; `Db::open` decides whether it can be
 //! opened. An empty `--dir` made beforehand is removed like one this run created.
+//!
+//! `--partitions N` forms the database with N partitions (1 to 512; issue #79). Partition P's
+//! primary is node ((P-1) mod 3) + 1. Above 1 every call must say which affinity group it is in:
+//! `--group G` right after the verb on `put`, `get`, `doc`, `map`, `set`, `members`, `list`,
+//! `items` and `status`, and a `G:` prefix on each `txn` op. `admin where G` prints the group's
+//! hash, partition and primary. Value verbs also take `--as N` after the verb, a write under
+//! the app's request id N.
 //!
 //! `--keep` keeps `--dir` after the run. rdb_dev's own voters still go at exit, and the
 //! folder's copies need the rEtcd that made them, so a later run cannot open a kept folder
@@ -365,7 +373,9 @@
 //!                                         app then holds, with its request, and `status` says
 //!                                         what became of it. A put that did not apply prints
 //!                                         its own answer and leaves the drop armed
-//! admin promote <n> [--drop <m>]          make node n own partition 1 while its owner is dead
+//! admin readiness                         each partition's owner and whether it takes writes
+//! admin promote <n> [--partition <p>] [--drop <m>]
+//!                                         make node n own a partition while its owner is dead
 //!                                         or cut off. The new configuration keeps every
 //!                                         member but m, by default the prior owner. It
 //!                                         waits out the prior owner's grant first, so it
@@ -538,6 +548,8 @@ struct Args {
     /// `--app NAME`: the app certificate `--nodes` dials as. `admin move` and `admin rebuild`
     /// need an admin app (`rdb_node --admin-apps`, which `lr` sets to `admin`; A-R479, A-R480).
     app: String,
+    /// `--partitions N`: how many partitions to form (issue #79).
+    partitions: Option<u32>,
     /// `--help` or `-h`: print [`usage`] and exit 0, running nothing.
     help: bool,
 }
@@ -579,6 +591,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         nodes: std::collections::BTreeMap::new(),
         cert_dir: None,
         app: "admin".to_owned(),
+        partitions: None,
         help: false,
     };
     while let Some(arg) = args.next() {
@@ -588,6 +601,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--partitions" => {
+                let text = value("--partitions")?;
+                parsed.partitions = Some(
+                    text.parse()
+                        .map_err(|_| format!("--partitions takes a count, not {text:?}"))?,
+                );
+            }
             "--help" | "-h" => {
                 parsed.help = true;
                 return Ok(parsed);
@@ -905,6 +925,7 @@ where
         }
     };
     let config = DbConfig {
+        partitions: args.partitions,
         ack_floor: true,
         dir: args.dir.clone(),
         hold: args.hold.clone(),
@@ -1016,7 +1037,12 @@ where
             args.app
         ));
     } else if db.heal_state() == rdb_api::db::HealState::NotNeeded {
-        say("bootstrap: partition 1 recovery started");
+        match db.partition_count() {
+            1 => say("bootstrap: partition 1 recovery started"),
+            n => say(&format!(
+                "bootstrap: {n} partitions, recovery started on each primary"
+            )),
+        }
     } else {
         say("reopen: partition 1 takes over from the last run (heal started)");
         // A-R467: a reopen does not re-add a dropped copy, so the open says so.
@@ -1816,23 +1842,39 @@ fn repl<'scope, 'env>(
             .next()
             .filter(|verb| VALUE_VERBS.contains(verb))
         {
-            let read = match verb {
-                "members" => Some(parse_members(&line)),
-                "items" => Some(parse_items(&line)),
-                _ => None,
-            };
-            let done = if let Some(read) = read {
-                read.map(|(object, look)| {
-                    let answer = db.read(object.as_bytes(), look);
-                    bad |= answer.is_err();
-                    read_line(answer);
-                })
-            } else {
-                parse_change(&line).map(|(object, expect, change)| {
-                    let answer = db.write(object.as_bytes(), change, expect);
-                    bad |= !write_line(db, answer, &mut sent);
-                })
-            };
+            let done = value_scope(&line, db.partition_count()).and_then(|(line, group, id)| {
+                let read = match verb {
+                    "members" => Some(parse_members(&line)),
+                    "items" => Some(parse_items(&line)),
+                    _ => None,
+                };
+                if let Some(read) = read {
+                    if id.is_some() {
+                        return Err(format!("{verb} reads, so it takes no --as"));
+                    }
+                    read.map(|(object, look)| {
+                        let answer = match group {
+                            Some(group) => db.read_in(group, object.as_bytes(), look),
+                            None => db.read(object.as_bytes(), look),
+                        };
+                        bad |= answer.is_err();
+                        read_line(answer);
+                    })
+                } else {
+                    parse_change(&line).map(|(object, expect, change)| {
+                        let object = object.as_bytes();
+                        let answer = match (group, id) {
+                            (group, Some(id)) => {
+                                let group = group.unwrap_or(rdb_api::db::DEFAULT_GROUP);
+                                db.write_as_in(group, id, object, change, expect)
+                            }
+                            (Some(group), None) => db.write_in(group, object, change, expect),
+                            (None, None) => db.write(object, change, expect),
+                        };
+                        bad |= !write_line(db, answer, &mut sent);
+                    })
+                }
+            });
             if let Err(e) = done {
                 say(&format!("usage: {e}; {}", usage_of(verb)));
                 bad = true;
@@ -1894,6 +1936,13 @@ fn repl<'scope, 'env>(
             bad = true;
             continue;
         }
+        if let Some(why) = needs_group(&words, db.partition_count()) {
+            // Only the fixed message: the line can carry a value (ADR-0013, as `log_command`).
+            tracing::warn!("repl_needs_group");
+            say(&format!("err {line}: {why}"));
+            bad = true;
+            continue;
+        }
         if let Some(verb) = not_built(&words) {
             tracing::warn!(verb, "repl_not_built");
             say(&format!("not built yet: {verb}; nothing was done"));
@@ -1913,9 +1962,28 @@ fn repl<'scope, 'env>(
                 Ok(())
             }),
             ["put", "--as", ..] => Err("put --as <n> <object> <value> [--if-version N]".to_owned()),
+            ["put", "--group", group, object, value, rest @ ..] => {
+                parse_group(group).and_then(|group| {
+                    let if_version = parse_if_version(rest)?;
+                    let answer = put_adopted(
+                        db,
+                        Some(group),
+                        object.as_bytes(),
+                        value.as_bytes(),
+                        if_version,
+                    );
+                    let kind = Kind::Put {
+                        object: object.as_bytes().to_vec(),
+                        if_version,
+                    };
+                    bad |= !app_put_line(db, answer, kind, &mut sent, &mut drop_reply);
+                    Ok(())
+                })
+            }
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
-                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
+                    let answer =
+                        put_adopted(db, None, object.as_bytes(), value.as_bytes(), if_version);
                     let kind = Kind::Put {
                         object: object.as_bytes().to_vec(),
                         if_version,
@@ -1941,7 +2009,8 @@ fn repl<'scope, 'env>(
                 let (object, value) = ((*object).to_owned(), (*value).to_owned());
                 say(&format!("bg {object}: queued"));
                 scope.spawn(move || {
-                    let answer = put_adopted(db, object.as_bytes(), value.as_bytes(), if_version);
+                    let answer =
+                        put_adopted(db, None, object.as_bytes(), value.as_bytes(), if_version);
                     if answer.is_err() {
                         bg_failed.store(true, Ordering::Relaxed);
                     }
@@ -1949,21 +2018,25 @@ fn repl<'scope, 'env>(
                     bg_note(db, &format!("bg {object}"), &answer);
                 });
             }),
-            ["txn", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
+            ["txn", rest @ ..] => groupless_op(rest, db.partition_count())
+                .and_then(|()| parse_txn(rest, deadline))
+                .map(|(deadline, ops)| {
                 let answer = db.txn(&txn_puts(&ops), deadline);
                 bad |= !put_line(db, answer, Some((&mut sent, Kind::Txn)));
             }),
-            ["txn&", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
-                say("bg txn: queued");
-                scope.spawn(move || {
-                    let answer = db.txn(&txn_puts(&ops), deadline);
-                    if answer.is_err() {
-                        bg_failed.store(true, Ordering::Relaxed);
-                    }
-                    say(&format!("bg txn: {}", put_text(&answer)));
-                    bg_note(db, "bg txn", &answer);
-                });
-            }),
+            ["txn&", rest @ ..] => groupless_op(rest, db.partition_count())
+                .and_then(|()| parse_txn(rest, deadline))
+                .map(|(deadline, ops)| {
+                    say("bg txn: queued");
+                    scope.spawn(move || {
+                        let answer = db.txn(&txn_puts(&ops), deadline);
+                        if answer.is_err() {
+                            bg_failed.store(true, Ordering::Relaxed);
+                        }
+                        say(&format!("bg txn: {}", put_text(&answer)));
+                        bg_note(db, "bg txn", &answer);
+                    });
+                }),
             ["retry", rest @ .., "--payload", value] => {
                 sent.pick(rest).and_then(|(request, kind)| {
                     let id = request.identity.request;
@@ -1996,6 +2069,13 @@ fn repl<'scope, 'env>(
                 };
                 bad |= !put_line(db, answer, None);
             }),
+            ["get", "--group", group, object] => parse_group(group).map(|group| {
+                let answer = db
+                    .read_in(group, object.as_bytes(), Look::Doc)
+                    .map_err(get_hint);
+                bad |= answer.is_err();
+                read_line(answer);
+            }),
             ["get", object] => {
                 let answer = db.read(object.as_bytes(), Look::Doc).map_err(get_hint);
                 bad |= answer.is_err();
@@ -2027,7 +2107,10 @@ fn repl<'scope, 'env>(
                 get_line(answer);
                 Ok(())
             }
-            ["status", rest @ ..] => status_line(db, &sent, rest).map(|ok| bad |= !ok),
+            ["status", "--group", group, rest @ ..] => parse_group(group)
+                .and_then(|group| status_line(db, Some(group), &sent, rest))
+                .map(|ok| bad |= !ok),
+            ["status", rest @ ..] => status_line(db, None, &sent, rest).map(|ok| bad |= !ok),
             // App-only, every node is another process: their links are what this one knows.
             ["nodes"] if !args.nodes.is_empty() => {
                 say(APP_ONLY_NODES);
@@ -2053,6 +2136,8 @@ fn repl<'scope, 'env>(
                 });
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
+            ["admin", "where", group] => parse_group(group).map(|group| say(&where_line(db, group))),
+            ["admin", "where", ..] => Err("admin where <group>".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
                 bad |= !answer(&match rt.block_on(admin::clear_grant(db, store, node)) {
                     Ok(clearance) => clearance_line(clearance, node, db),
@@ -2079,10 +2164,16 @@ fn repl<'scope, 'env>(
                 );
                 Ok(())
             }
+            ["admin", "readiness"] => {
+                readiness_lines(db).iter().for_each(|line| say(line));
+                Ok(())
+            }
             ["admin", "promote", rest @ ..] => {
-                parse_promote(rest).map(|(to, drop)| {
+                take_partition(rest).and_then(|(partition, rest)| {
+                    parse_promote(&rest).map(|(to, drop)| (partition, to, drop))
+                }).map(|(partition, to, drop)| {
                     set_promoting(progress, Some(to));
-                    match promote_line(db, to, drop) {
+                    match promote_line(db, partition, to, drop) {
                         Ok(line) => say(&line),
                         Err(line) => {
                             set_promoting(progress, None);
@@ -2225,6 +2316,29 @@ fn repl<'scope, 'env>(
     exit_code(bad, &sent)
 }
 
+/// Why a line that names no group cannot run above one partition, in this prompt's own words
+/// (issue #79); the `Db` refusals name library calls. `None` when the line may run.
+fn needs_group(words: &[&str], partitions: u32) -> Option<String> {
+    if partitions <= 1 {
+        return None;
+    }
+    match words {
+        ["put" | "get" | "status", "--group", ..] => None,
+        [verb @ ("put&" | "put-loop" | "read"), ..] | [verb @ "put", "--as", ..] => Some(format!(
+            "{verb} has no --group form and this database has {partitions} partitions: use put \
+             --group G or get --group G; nothing was sent"
+        )),
+        [verb @ "get", _, "--previous"] => Some(format!(
+            "{verb} --previous has no --group form and this database has {partitions} \
+             partitions; nothing was sent"
+        )),
+        [verb @ ("put" | "get" | "status"), ..] => Some(format!(
+            "{verb} needs --group G: this database has {partitions} partitions; nothing was sent"
+        )),
+        _ => None,
+    }
+}
+
 /// The verb a slice-2 command names when this build does not run it yet, or `None` (M10 S2, W7
 /// day 1). Such a command answers `not built yet: <verb>; nothing was done` and the run exits 1,
 /// so a walk can be written before the verb works and goes red by name, never as `unknown
@@ -2240,8 +2354,45 @@ fn not_built(words: &[&str]) -> Option<&'static str> {
 }
 
 /// `admin promote`'s usage (A-R245).
-const PROMOTE_USAGE: &str = "admin promote <n> [--drop <m>]: n and m are nodes 1 to 8; without \
+const PROMOTE_USAGE: &str =
+    "admin promote <n> [--partition <p>] [--drop <m>]: n and m are nodes 1 to 8; without \
                              --drop the prior owner is dropped";
+
+/// `admin promote`'s `--partition P`, wherever it stands, and the words left without it.
+fn take_partition<'a>(rest: &[&'a str]) -> Result<(Option<PartitionId>, Vec<&'a str>), String> {
+    let Some(at) = rest.iter().position(|word| *word == "--partition") else {
+        return Ok((None, rest.to_vec()));
+    };
+    let partition = rest
+        .get(at + 1)
+        .and_then(|word| word.parse::<u32>().ok())
+        .filter(|partition| *partition >= 1)
+        .ok_or_else(|| PROMOTE_USAGE.to_owned())?;
+    let left = rest[..at].iter().chain(&rest[at + 2..]).copied().collect();
+    Ok((Some(PartitionId(partition)), left))
+}
+
+/// `admin readiness`: one line per partition, then how many are ready.
+fn readiness_lines(db: &Db) -> Vec<String> {
+    let seen = db.readiness();
+    let ready = seen.iter().filter(|partition| partition.ready).count();
+    let total = seen.len();
+    seen.iter()
+        .map(|partition| match &partition.reason {
+            None => format!(
+                "partition {} owner {} ready",
+                partition.partition.0, partition.owner.0
+            ),
+            Some(reason) => format!(
+                "partition {} owner {} not ready: {reason:?}",
+                partition.partition.0, partition.owner.0
+            ),
+        })
+        .chain(std::iter::once(format!(
+            "readiness: {ready} of {total} partitions ready"
+        )))
+        .collect()
+}
 
 /// `admin promote N [--drop M]`'s words after `promote`: the node to own partition 1, and the
 /// node to drop, `None` for `Db::promote`'s default, the prior owner. A node cannot be both.
@@ -2497,19 +2648,37 @@ fn parse_rebuild(rest: &[&str]) -> Result<(NodeId, RebuildAsk), String> {
 /// it committed, the prior owner and the member the new configuration leaves out.
 fn promoted_line(promoted: &admin::Promoted) -> String {
     format!(
-        "promoted: node {} owns partition 1 at generation {} (was node {}); node {} dropped",
-        promoted.owner.0, promoted.generation.0, promoted.prior_owner.0, promoted.dropped.0
+        "promoted: node {} owns partition {} at generation {} (was node {}); node {} dropped",
+        promoted.owner.0,
+        promoted.partition.0,
+        promoted.generation.0,
+        promoted.prior_owner.0,
+        promoted.dropped.0
     )
 }
 
 /// `admin promote <n> [--drop <m>]`'s answer: `promoted: ..`, or `Err` with `err admin promote:
 /// ..` and the error's own text, which names the next step; the run then exits 1.
-fn promote_line(db: &Db, to: NodeId, drop: Option<NodeId>) -> Result<String, String> {
-    say(&format!(
-        "promote: node {} takes partition 1; this first waits out the prior owner's grant",
-        to.0
-    ));
-    match db.promote(to, drop) {
+fn promote_line(
+    db: &Db,
+    partition: Option<PartitionId>,
+    to: NodeId,
+    drop: Option<NodeId>,
+) -> Result<String, String> {
+    if db.partition_count() == 1 || partition.is_some() {
+        say(&format!(
+            "promote: node {} takes partition {}; this first waits out the prior owner's grant",
+            to.0,
+            partition.map_or(1, |partition| partition.0)
+        ));
+    }
+    let answer = match partition {
+        Some(partition) => db
+            .promote_partition(partition, to, drop)
+            .map_err(ApiError::from),
+        None => db.promote(to, drop),
+    };
+    match answer {
         Ok(promoted) => {
             tracing::info!(
                 owner = promoted.owner.0,
@@ -2884,6 +3053,88 @@ fn parse_expect(words: &mut Words<'_>) -> Result<Option<Expected>, String> {
             words.rest = before;
             Ok(None)
         }
+    }
+}
+
+/// `<group>`, an affinity group number.
+fn parse_group(word: &str) -> Result<rdb_api::AffinityId, String> {
+    word.parse()
+        .map(rdb_api::AffinityId)
+        .map_err(|_| format!("a group is a number, not {word:?}"))
+}
+
+/// The raw line with any leading `--group G` and `--as N` taken out, and what they named. Above
+/// one partition a value verb must name its group (issue #79): which partition it means is
+/// never guessed.
+fn value_scope(
+    line: &str,
+    partitions: u32,
+) -> Result<(String, Option<rdb_api::AffinityId>, Option<RequestId>), String> {
+    let (verb, mut rest) = line
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .unwrap_or((line.trim_start(), ""));
+    let mut take = |flag: &str| -> Result<Option<String>, String> {
+        let trimmed = rest.trim_start();
+        let Some(after) = trimmed
+            .strip_prefix(flag)
+            .filter(|after| after.starts_with(char::is_whitespace))
+        else {
+            return Ok(None);
+        };
+        let after = after.trim_start();
+        let (value, tail) = after
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| format!("{flag} needs a value and an object"))?;
+        rest = tail;
+        Ok(Some(value.to_owned()))
+    };
+    let group = take("--group")?.map(|g| parse_group(&g)).transpose()?;
+    let id = take("--as")?.map(|n| parse_app_id(&n)).transpose()?;
+    if partitions > 1 && group.is_none() {
+        return Err(format!(
+            "{verb} needs --group G: this database has {partitions} partitions; nothing was sent"
+        ));
+    }
+    Ok((format!("{verb} {}", rest.trim_start()), group, id))
+}
+
+/// `admin where G`: the group's frozen hash, its partition, and that partition's primary.
+fn where_line(db: &Db, group: rdb_api::AffinityId) -> String {
+    let hash = rdb_api::affinity_hash(rdb_api::TENANT, group);
+    let partition = rdb_api::partition_of(hash, db.partition_count());
+    let owner = db
+        .owner_of(partition)
+        .map_or_else(|| "none".to_owned(), |node| node.0.to_string());
+    format!(
+        "group {} hash {hash:#018x} partition {} primary node {owner}",
+        group.0, partition.0
+    )
+}
+
+/// The first `txn` op that names no group, refused above one partition (issue #79).
+fn groupless_op(rest: &[&str], partitions: u32) -> Result<(), String> {
+    if partitions <= 1 {
+        return Ok(());
+    }
+    let ops = match rest {
+        ["--deadline-ms", _, ops @ ..] => ops,
+        ops => ops,
+    };
+    let missing = ops.iter().find(|op| {
+        !op.split_once(':')
+            .is_some_and(|(digits, _)| is_digits(digits))
+    });
+    match missing {
+        Some(op) => Err(format!(
+            "txn op {op:?} names no group: this database has {partitions} partitions, so write \
+             it as <group>:{op}; nothing was sent"
+        )),
+        None if ops.is_empty() => Err(format!(
+            "txn with no ops names no group: this database has {partitions} partitions; \
+             nothing was sent"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -4434,7 +4685,7 @@ fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) -> bool {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             });
         let started = Instant::now();
-        let answer = put_adopted(db, object.as_bytes(), i.to_string().as_bytes(), None);
+        let answer = put_adopted(db, None, object.as_bytes(), i.to_string().as_bytes(), None);
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = answer
             .as_ref()
@@ -4511,6 +4762,7 @@ const NOT_ADOPTED_PATIENCE: Duration = Duration::from_secs(3);
 /// Any other answer, and the last refusal after the patience, is returned as it came.
 fn put_adopted(
     db: &Db,
+    group: Option<rdb_api::AffinityId>,
     object: &[u8],
     value: &[u8],
     if_version: Option<u64>,
@@ -4518,7 +4770,10 @@ fn put_adopted(
     let started = Instant::now();
     let mut tries = 1_u32;
     loop {
-        let answer = db.put(object, value, if_version);
+        let answer = match group {
+            Some(group) => db.put_in(group, object, value, if_version),
+            None => db.put(object, value, if_version),
+        };
         let not_adopted = answer.as_ref().err().is_some_and(|refused| {
             refused.error.no_mutation
                 && refused
@@ -4541,8 +4796,8 @@ fn put_adopted(
 fn put_text(answer: &Result<rdb_api::PutOk, PutError>) -> String {
     match answer {
         Ok(ok) => format!(
-            "ok p=1 gen={} seq={} {:?} request={}",
-            ok.generation.0, ok.seq.0, ok.durability, ok.request.0
+            "ok p={} gen={} seq={} {:?} request={}",
+            ok.partition.0, ok.generation.0, ok.seq.0, ok.durability, ok.request.0
         ),
         Err(PutError { error, request }) => {
             let id = request
@@ -4609,12 +4864,21 @@ fn parse_status(words: &[&str]) -> Result<(u64, Option<Generation>), String> {
 }
 
 /// `status <request> [<generation>]`'s answer. `Ok(false)` when the answer was an error.
-fn status_line(db: &Db, sent: &Sent, words: &[&str]) -> Result<bool, String> {
+fn status_line(
+    db: &Db,
+    group: Option<rdb_api::AffinityId>,
+    sent: &Sent,
+    words: &[&str],
+) -> Result<bool, String> {
     let (request, generation) = parse_status(words)?;
     // The nodes first: a request node 1 holds in flight that publishes between the two looks is
     // then answered by the status, never called not in flight (Msg 8, W6-D1).
     let nodes = db.node_status();
-    match db.status(RequestId(request), generation) {
+    let status = match group {
+        Some(group) => db.status_in(group, RequestId(request), generation),
+        None => db.status(RequestId(request), generation),
+    };
+    match status {
         // After a restart, `Unknown` can be a write this session saw `ok` (tester W3-D2).
         Ok(TxnStatus::Unknown) => {
             // `None` when node 1 did not answer in time (F-025).
@@ -5370,6 +5634,22 @@ fn wait_ready_line(
 
 #[cfg(test)]
 mod tests {
+    /// Issue #79: above one partition the prompt asks for `--group G`, not a library call. Unit.
+    #[test]
+    fn a_line_with_no_group_is_refused_in_the_prompts_words_above_one_partition() {
+        use super::needs_group;
+        assert_eq!(needs_group(&["put", "k", "v"], 1), None);
+        assert_eq!(needs_group(&["put", "--group", "2", "k", "v"], 2), None);
+        assert_eq!(needs_group(&["get", "--group", "2", "k"], 2), None);
+        assert_eq!(needs_group(&["admin", "status"], 2), None);
+        for line in [&["put", "k", "v"][..], &["get", "k"], &["status"]] {
+            let why = needs_group(line, 2).expect("refused");
+            assert!(why.contains("needs --group G"), "{why}");
+        }
+        let why = needs_group(&["read", "k"], 2).expect("refused");
+        assert!(why.contains("no --group form"), "{why}");
+    }
+
     use super::*;
 
     /// The longest a stopped control leader can leave the voters without one, in ms. A follower
@@ -6932,6 +7212,7 @@ mod tests {
             nodes: std::collections::BTreeMap::new(),
             cert_dir: None,
             app: "admin".to_owned(),
+            partitions: None,
             help: false,
         };
         let voters_under_dir = AtomicBool::new(false);
@@ -6988,6 +7269,7 @@ mod tests {
         // D1: `retry 4 --deadline-ms 2000` published at seq 3.
         sent.resent(&Ok(rdb_api::PutOk {
             request: RequestId(4),
+            partition: rdb_api::PartitionId(1),
             generation: Generation(1),
             owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
             seq: rdb_core::contracts::ids::Seq(3),
@@ -7094,6 +7376,7 @@ mod tests {
             nodes: std::collections::BTreeMap::new(),
             cert_dir: None,
             app: "admin".to_owned(),
+            partitions: None,
             help: false,
         };
         let opened = AtomicBool::new(false);
@@ -7881,6 +8164,7 @@ mod tests {
             nodes: std::collections::BTreeMap::new(),
             cert_dir: None,
             app: "admin".to_owned(),
+            partitions: None,
             help: false,
         };
         let code = run(&args, Db::open);
@@ -8463,6 +8747,31 @@ mod tests {
         }
     }
 
+    /// `--partition P` comes out wherever it stands and the rest stays `parse_promote`'s.
+    /// Cut: stop filtering 0 and `--partition 0` is accepted. Unit.
+    #[test]
+    fn admin_promote_takes_a_partition() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(take_partition(&words("3")), Ok((None, words("3"))));
+        assert_eq!(
+            take_partition(&words("3 --partition 7")),
+            Ok((Some(PartitionId(7)), words("3")))
+        );
+        assert_eq!(
+            take_partition(&words("--partition 7 3 --drop 2")),
+            Ok((Some(PartitionId(7)), words("3 --drop 2")))
+        );
+        for bad in ["3 --partition", "3 --partition 0", "3 --partition x"] {
+            assert_eq!(
+                take_partition(&words(bad)),
+                Err(PROMOTE_USAGE.to_owned()),
+                "{bad:?}"
+            );
+        }
+    }
+
     /// A-R245: `admin promote N [--drop M]` reads the node to promote and the one to drop,
     /// `None` leaving `Db::promote` to drop the prior owner; one node cannot be both, and the
     /// success line names the new owner, generation, prior owner and dropped node (A-R256).
@@ -8493,6 +8802,7 @@ mod tests {
             assert!(parse_promote(&words(bad)).is_err(), "{bad:?}");
         }
         let promoted = admin::Promoted {
+            partition: PartitionId(1),
             owner: NodeId(2),
             prior_owner: NodeId(1),
             dropped: NodeId(3),
@@ -8720,6 +9030,127 @@ mod tests {
         );
     }
 
+    /// The child of [`a_background_txn_with_no_group_is_refused_above_one_partition`]: one
+    /// rdb_dev run of the parent's script, whose answers the parent reads from stdout. Passes at
+    /// once unless the parent started it.
+    #[test]
+    fn zz_script_child() {
+        let (Ok(dir), Ok(script), Ok(partitions)) = (
+            std::env::var(SCRIPT_CHILD_DIR),
+            std::env::var(SCRIPT_CHILD_SCRIPT),
+            std::env::var(SCRIPT_CHILD_PARTITIONS),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let args = Args {
+            log_dir: dir.with_extension("child-logs"),
+            script: Some(PathBuf::from(script)),
+            partitions: Some(partitions.parse().expect("a partition count")),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let args = Args { dir, ..args };
+        let code = run(&args, Db::open);
+        // Passed on stdout: a libtest child cannot exit with `run`'s code.
+        let code = if code == ExitCode::SUCCESS { 0 } else { 1 };
+        say(&format!("SCRIPT_CHILD_EXIT={code}"));
+    }
+
+    const SCRIPT_CHILD_DIR: &str = "RDB_DEV_SCRIPT_CHILD_DIR";
+    const SCRIPT_CHILD_SCRIPT: &str = "RDB_DEV_SCRIPT_CHILD_SCRIPT";
+    const SCRIPT_CHILD_PARTITIONS: &str = "RDB_DEV_SCRIPT_CHILD_PARTITIONS";
+
+    /// One rdb_dev run of `script` at `partitions` partitions in a child process, and what it
+    /// said on stdout. The answers of a run are stdout's alone, so a child is how a row reads them.
+    fn script_output(root: &std::path::Path, name: &str, partitions: u32, script: &str) -> String {
+        let path = root.join(format!("{name}.txt"));
+        std::fs::write(&path, script).expect("write the script");
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(["tests::zz_script_child", "--exact", "--test-threads=1"])
+            .env(SCRIPT_CHILD_DIR, root.join(name))
+            .env(SCRIPT_CHILD_SCRIPT, &path)
+            .env(SCRIPT_CHILD_PARTITIONS, partitions.to_string())
+            .output()
+            .expect("spawn the run");
+        String::from_utf8_lossy(&child.stdout).into_owned()
+    }
+
+    /// PR #102 review: a groupless `txn&` was queued at two partitions, where it is sent to
+    /// partition 2 and its answer arrives later. It is now refused before it is queued, as the
+    /// foreground `txn` is: with and without `--deadline-ms`, and the object is absent. A named
+    /// group still writes, and one partition still takes the groupless form. Cut: the groupless
+    /// check off the `txn&` arm, and `zqa` is queued. Integration (~3 s): two child runs with
+    /// three real rEtcd voters each.
+    #[test]
+    fn a_background_txn_with_no_group_is_refused_above_one_partition() {
+        let root = config_testkit::fs::temp_dir();
+        let said = script_output(
+            root.path(),
+            "two",
+            2,
+            "wait ready 60\ntxn& zqa=v\ntxn& --deadline-ms 1000 zqb=v\ntxn& 1:zqc=v\nsleep 1500\n\
+             get --group 1 zqa\nget --group 1 zqb\nquit\n",
+        );
+        assert_eq!(said.matches("names no group").count(), 2, "{said}");
+        assert_eq!(said.matches("bg txn: queued").count(), 1, "{said}");
+        assert_eq!(said.matches("bg txn: ok p=2").count(), 1, "{said}");
+        let absent = said.lines().filter(|l| l.starts_with("absent ")).count();
+        assert_eq!(absent, 2, "{said}");
+        assert!(
+            said.contains("SCRIPT_CHILD_EXIT=1"),
+            "refused lines exit 1: {said}"
+        );
+
+        let said = script_output(root.path(), "one", 1, "wait ready 60\ntxn& zqd=v\nquit\n");
+        assert_eq!(said.matches("bg txn: ok p=1").count(), 1, "{said}");
+        assert!(said.contains("SCRIPT_CHILD_EXIT=0"), "{said}");
+    }
+
+    /// PR #102 review: the `repl_needs_group` warning logged the whole rejected line, and a line
+    /// can carry a value. A `put`, a `put&` and a `put --as` with a marker value are each refused
+    /// at two partitions, and no record of the test's log holds the marker. The warning itself
+    /// is there, so the log was read. Cut: put `line` back on the warning. Integration (~2 s):
+    /// three real rEtcd voters.
+    #[config_log::retcd_test]
+    fn a_line_refused_for_its_group_logs_no_value() {
+        const METHOD: &str = "a_line_refused_for_its_group_logs_no_value";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let script = root.path().join("script.txt");
+        std::fs::write(
+            &script,
+            "wait ready 60\nput zqobj1 mkv7secret\nput& zqobj2 mkv7secret\n\
+             put --as 7 zqobj3 mkv7secret\nquit\n",
+        )
+        .expect("write the script");
+        let args = Args {
+            dir: root.path().join("run"),
+            log_dir: root.path().join("logs"),
+            script: Some(script),
+            partitions: Some(2),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        assert_eq!(
+            run(&args, Db::open),
+            ExitCode::from(1),
+            "refused lines exit 1"
+        );
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let warned = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_needs_group")
+            .count();
+        assert_eq!(warned, 3, "one warning per refused line");
+        let leaked: Vec<String> = lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|text| text.contains("mkv7secret"))
+            .collect();
+        assert!(leaked.is_empty(), "the value was logged: {leaked:#?}");
+    }
+
     /// The child of [`abort_after_commit_aborts_and_the_next_open_rolls_forward`]: one rdb_dev
     /// run with `--abort-after-commit`, against the parent's voters. Passes at once unless the
     /// parent started it.
@@ -8739,6 +9170,9 @@ mod tests {
             script: Some(script),
             control: Some(control.split(',').map(str::to_owned).collect()),
             abort_after_commit: true,
+            partitions: std::env::var(ABORT_CHILD_PARTITIONS)
+                .ok()
+                .map(|count| count.parse().expect("a partition count")),
             ..parse(std::iter::empty()).expect("defaults")
         };
         let args = Args { dir, ..args };
@@ -8747,6 +9181,7 @@ mod tests {
 
     const ABORT_CHILD_DIR: &str = "RDB_DEV_ABORT_CHILD_DIR";
     const ABORT_CHILD_CONTROL: &str = "RDB_DEV_ABORT_CHILD_CONTROL";
+    const ABORT_CHILD_PARTITIONS: &str = "RDB_DEV_ABORT_CHILD_PARTITIONS";
 
     /// A-R184: `--abort-after-commit` is how the tester reaches a commit that no copy links.
     /// Run 1 writes and quits; run 2 reopens with the flag and dies by abort once its recovery
@@ -8814,6 +9249,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir,
             hold: Vec::new(),
@@ -8836,6 +9272,91 @@ mod tests {
             got.value.map(|(_, bytes)| bytes.to_vec()),
             Some(b"zqv1".to_vec()),
             "run 1's write"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// Issue #79, design 7.2 row 4: a formation of 8 partitions dies by abort at its first
+    /// commit, which leaves a root that no copy linked. Running it again on the same directory
+    /// and control store finishes it, and every partition then takes a write. Cut: the empty
+    /// base condition in `holds_base`. Integration (~15 s): three real rEtcd voters and a child
+    /// process, as `abort_after_commit_aborts_and_the_next_open_rolls_forward`.
+    #[test]
+    fn a_formation_aborted_at_its_first_commit_finishes_when_run_again() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let cluster = rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        );
+        rt.block_on(cluster.leader());
+        let control = cluster.client_endpoints();
+        let dir = root.path().join("run");
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "tests::zz_abort_after_commit_child",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ABORT_CHILD_DIR, &dir)
+            .env(ABORT_CHILD_CONTROL, control.join(","))
+            .env(ABORT_CHILD_PARTITIONS, "8")
+            .output()
+            .expect("spawn the formation");
+        assert!(
+            !child.status.success()
+                && !String::from_utf8_lossy(&child.stdout).contains("test result"),
+            "the formation must die by abort; got {:?}: {}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout)
+        );
+
+        let store: Arc<dyn ConfigStore> = Arc::new(
+            config_client::GrpcClient::connect(
+                control,
+                config_client::GrpcClientOptions::default(),
+            )
+            .expect("a control client"),
+        );
+        let config = DbConfig {
+            partitions: Some(8),
+            ack_floor: true,
+            dir,
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+            local: rdb_api::db::ALL_NODES.to_vec(),
+            links: None,
+            client: rdb_api::db::DEFAULT_CLIENT,
+            boot: None,
+            storage: rdb_api::StorageOptions::default(),
+        };
+        let mut db = rt
+            .block_on(Db::open(config, store, rt.handle().clone()))
+            .expect("running it again finishes the formation");
+        db.wait_ready(Duration::from_secs(60))
+            .expect("every partition becomes ready");
+        let mut written = std::collections::BTreeSet::new();
+        for group in 1..200 {
+            let group = rdb_core::contracts::ids::AffinityId(group);
+            let put = db.put_in(group, b"zqk", b"zqv", None).expect("a put");
+            written.insert(put.partition.0);
+        }
+        assert_eq!(
+            written.len(),
+            8,
+            "every partition took a write: {written:?}"
         );
         db.shutdown();
         rt.block_on(cluster.shutdown());
@@ -8864,6 +9385,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: dir.join("run"),
             hold: Vec::new(),
@@ -8925,6 +9447,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            partitions: None,
             ack_floor: true,
             dir: root.path().join("run"),
             hold: Vec::new(),
@@ -9121,5 +9644,37 @@ mod tests {
         );
         db.shutdown();
         rt.block_on(cluster.shutdown());
+    }
+
+    /// Issue #79 manual walk: `txn 1:b=2` landed in partition 2 and the line printed `p=1`.
+    #[test]
+    fn a_write_line_names_the_partition_it_landed_in() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let ok = rdb_api::PutOk {
+            request: RequestId(2),
+            partition: rdb_api::PartitionId(2),
+            generation: Generation(1),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+            seq: rdb_core::contracts::ids::Seq(2),
+            outcome: rdb_core::contracts::txn::Outcome::Published,
+            durability: rdb_core::contracts::txn::Durability::BufferedOnTwo,
+            sent: Box::new(TxnRequest {
+                api_version: rdb_core::contracts::version::API_VERSION,
+                identity: RequestIdentity {
+                    tenant: TenantId(1),
+                    client: ClientId(1),
+                    request: RequestId(2),
+                },
+                affinity: AffinityId(1),
+                expected_generation: Some(Generation(1)),
+                remaining_millis: 0,
+                conditions: Vec::new(),
+                mutations: Vec::new(),
+                acked_below: None,
+                pinned: Vec::new(),
+            }),
+        };
+        let line = put_text(&Ok(ok));
+        assert!(line.starts_with("ok p=2 "), "{line}");
     }
 }

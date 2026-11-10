@@ -45,7 +45,7 @@ use rdb_core::contracts::event::{
 use rdb_core::contracts::ids::{
     AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, DurableSeq,
     EventId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
-    SnapshotHandle, TimerId, TimerVersion,
+    SnapshotHandle, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -57,6 +57,7 @@ use rdb_core::contracts::recovery::{
 use rdb_core::contracts::storage::{Namespace, SnapshotRead};
 use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{QuarantineReason, Version};
+use rdb_core::protection::HEALTH_EVAL_TIMER;
 use rdb_core::recovery::lineage::{
     select_leader, select_prefix, select_prefix_spied, verify_ancestry, Rejected, SelectionOutcome,
     SelectionSpy, VerifiedInventory,
@@ -774,7 +775,7 @@ fn only_the_current_due_timer_closes_the_window() {
     assert_eq!(f1.step(WINDOW - 1, fired(1)), stale);
     assert_eq!(f1.step(WINDOW, fired(0)), stale);
     let other = EventKind::Timer(TimerFired {
-        id: TimerId(DISCOVERY_TIMER.0 + 1),
+        id: HEALTH_EVAL_TIMER,
         version: TimerVersion(1),
         scheduled_at: Tick(WINDOW),
     });

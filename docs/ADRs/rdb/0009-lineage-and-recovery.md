@@ -80,7 +80,9 @@ credential is one a receiver cannot start re-deriving authority decisions from. 
 comes from `partitions/{id}`, which holds no grant id (§1). `sender` is what makes the credential
 non-replayable: a receiver admits recovery records only from the transport-authenticated peer the
 credential names. It names the sender of *this* transfer, not the recovering node, and F1 mints one
-credential per transfer source — the `from` of each catch-up it orders (§4, §7). An earlier draft
+credential per transfer source — the `from` of each catch-up it orders (§4, §7). The credential does not
+carry a boot: a receiver checks the peer's boot in the plan F1 delivered for that credential, or in
+its pinned config when it holds no such plan (#79 S3b). An earlier draft
 bound it to the recovering node; that rejected every transfer whose source was the selected prefix
 holder on another node, which is the transfer spec §8.3 requires when the holder cannot lead, and
 the plain two-survivor case whenever the fenced node holds the shorter prefix.

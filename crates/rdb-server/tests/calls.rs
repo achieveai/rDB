@@ -1,6 +1,8 @@
 //! The gateway's call line (cs-tester D2, 548d78a): every call ends in one `rdb_server_call`
 //! line, including a call whose client gave up first. That is the unknown-outcome case, where
 //! an operator settles an id-less write from the gateway's log.
+#![allow(clippy::result_large_err)] // `tonic::Status`, as in the library.
+
 use std::time::{Duration, Instant};
 
 use tonic::Status;

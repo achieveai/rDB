@@ -39,7 +39,7 @@
     Kept in sync with scripts/gate.sh.
 
 .PARAMETER Stage
-    fmt, deps, drift, purity, lint, test, or all (the default).
+    fmt, deps, drift, purity, lint, release, test, or all (the default).
 
     Every argument after the stage passes through to cargo, for narrowing a test stage.
 
@@ -55,7 +55,7 @@
 # parameters, and then cargo's `-p` is refused as ambiguous (-ProgressAction, -PipelineVariable).
 # Unbound arguments land in $args instead, in the order given.
 param(
-    [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'test', 'perf', 'all')]
+    [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'release', 'test', 'perf', 'all')]
     [string]$Stage = 'all'
 )
 $CargoArgs = [string[]]$args
@@ -156,6 +156,7 @@ if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'drift', 'all') { Test-Drift }
 if ($Stage -in 'purity', 'all') { Test-Purity }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
+if ($Stage -in 'release', 'all') { Write-Host '== release check'; Invoke-Cargo @('check', '--release', '-p', 'rdb-api', '--lib', '--examples', '--tests') }
 if ($Stage -in 'test', 'all') {
     Write-Host '== test'
     Show-PortPreflight

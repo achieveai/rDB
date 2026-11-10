@@ -39,6 +39,9 @@ pub enum Domain {
     /// One value served by a read: the key and the bytes P1 handed out (lead ruling A-R66).
     /// Its own domain so a single read can never share a preimage with an oracle checkpoint.
     ReadValue = 6,
+    /// The affinity hash that maps a key to a partition (issue #79). Its value is frozen with
+    /// [`crate::partition_map::affinity_hash`].
+    Route = 7,
 }
 
 /// A 32-byte content digest.

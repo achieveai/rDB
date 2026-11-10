@@ -23,6 +23,7 @@ fn an_app_whose_owner_has_stopped_is_told_a_retry_can_help() {
         .expect("runtime");
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let config = |dir: &std::path::Path, local, links, client| DbConfig {
+        partitions: None,
         dir: dir.to_path_buf(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),

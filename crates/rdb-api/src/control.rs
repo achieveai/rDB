@@ -209,7 +209,7 @@ impl ControlAdapter {
         let links = Arc::clone(&self.links);
         let task = self.rt.spawn(
             async move {
-                match crate::admin::activate(&*store, &instance, generation).await {
+                match crate::admin::activate_in(&*store, &instance, partition, generation).await {
                     Ok(_) => {
                         let msg = Msg::Activated {
                             boot,
@@ -337,7 +337,7 @@ impl ControlAdapter {
                 if let Some(wait) = recheck_after {
                     tokio::time::sleep(wait).await;
                 }
-                let facts = fence_facts(&*store, proof.control_revision).await;
+                let facts = fence_facts(&*store, partition, proof.control_revision).await;
                 let msg = Msg::FenceBound {
                     boot,
                     partition,
@@ -592,8 +592,12 @@ const RETRY_BACKOFF_CAP_MILLIS: u64 = 2_000;
 /// [`ControlAdapter::read_fence_facts`]'s three reads: `partitions/1` (as a promote reads it),
 /// then `grants/{owner}` of the owner it names, then the plan stored for the proof's
 /// `control_revision` (A-R447: [`crate::admin::promote_operation`]).
-async fn fence_facts(store: &dyn ConfigStore, revision: Revision) -> Result<FenceFacts, String> {
-    let (record, root, _, mod_revision, _) = crate::admin::read_partition(store)
+async fn fence_facts(
+    store: &dyn ConfigStore,
+    partition: PartitionId,
+    revision: Revision,
+) -> Result<FenceFacts, String> {
+    let (record, root, _, mod_revision, _) = crate::admin::read_partition(store, partition)
         .await
         .map_err(|error| error.to_string())?;
     let key = ControlKey::Grant(record.owner).encode();

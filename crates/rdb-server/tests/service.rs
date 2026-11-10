@@ -2,6 +2,8 @@
 //! tonic on loopback: what an app in another language sees on the wire. C4 status of the last
 //! write, C6 the key limit, C7 a refused conditional write, C9 empty is not absent, C11 one call
 //! line per call.
+#![allow(clippy::result_large_err)] // `tonic::Status`, as in the library.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,9 +47,14 @@ async fn get(client: &mut RdbClient<Channel>, key: &[u8]) -> pb::GetReply {
 /// A ready `Db` of three in-process nodes over `MemStore`, with the default timeouts. Keep the
 /// directory alive as long as the `Db`.
 async fn open_db() -> (Arc<Db>, impl Sized) {
+    open_db_of(None).await
+}
+
+async fn open_db_of(partitions: Option<u32>) -> (Arc<Db>, impl Sized) {
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
     let config = DbConfig {
+        partitions,
         ack_floor: true,
         dir: dir.path().to_path_buf(),
         hold: Vec::new(),
@@ -105,6 +112,89 @@ async fn wait_running(gateway: &Gateway, calls: usize) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Issue #79: above one partition this protocol names no group, so every call that would need
+/// one is refused by name and writes nothing. Cut: `Gateway::txn` does not refuse, and defaults
+/// its group. Integration (a few seconds).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_call_with_no_group_is_refused_by_name_above_one_partition() {
+    let (db, _dir) = open_db_of(Some(2)).await;
+    let timeouts = Timeouts::default();
+    let gateway = Gateway::new(
+        Arc::clone(&db),
+        rdb_api::db::DEFAULT_CLIENT.0,
+        timeouts.put,
+        timeouts.read,
+    );
+    let (listener, addr) = config_testkit::ports::ephemeral_listener().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(rdb_server::serve(gateway, listener, async {
+        let _ = stopped.await;
+    }));
+    let mut client = RdbClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+    let object = Bytes::from_static(b"k");
+    let value = Bytes::from_static(b"v");
+    let answers = [
+        (
+            "Put",
+            client
+                .put(PutRequest {
+                    object: object.clone(),
+                    value: value.clone(),
+                    if_version: None,
+                })
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "Get",
+            client
+                .get(GetRequest {
+                    object: object.clone(),
+                })
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "Txn",
+            client
+                .txn(TxnRequest {
+                    puts: vec![TxnPut {
+                        object,
+                        value,
+                        if_version: None,
+                    }],
+                    deadline_ms: 0,
+                })
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "Status",
+            client
+                .status(StatusRequest {
+                    request_id: 1,
+                    generation: None,
+                })
+                .await
+                .map(|_| ()),
+        ),
+    ];
+    for (call, answer) in answers {
+        let status = answer.expect_err(call);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{call}");
+        assert!(status.message().contains(call), "{status:?}");
+        assert!(status.message().contains("2 partitions"), "{status:?}");
+        let detail = rdb_error_of(&status).expect("a detail");
+        assert!(detail.no_mutation, "{call}");
+    }
+    drop(client);
+    stop.send(()).expect("the server is running");
+    server.await.expect("join").expect("the server stops");
+    shut_down(db).await;
 }
 
 /// Integration (a few seconds): one gateway over one `Db`, every slice-1 call.

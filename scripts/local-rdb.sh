@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run rDB as three real processes with one command (M10 S2, W4): `lr`.
 #
-#   scripts/local-rdb.sh up [--nodes K] [--release] [--base-port P] [--root DIR] [--timeout-sec N]
+#   scripts/local-rdb.sh up [--nodes K] [--partitions P] [--release] [--base-port P] [--root DIR] [--timeout-sec N]
 #   scripts/local-rdb.sh up --resume                              [--run DIR]
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
@@ -9,9 +9,10 @@
 #   scripts/local-rdb.sh hold A-B | heal A-B                      [--run DIR]
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
-#   scripts/local-rdb.sh promote N [--drop M]                     [--run DIR]
+#   scripts/local-rdb.sh promote N [--partition P] [--drop M]     [--run DIR]
 #   scripts/local-rdb.sh rebuild N [--wipe]                       [--run DIR]
 #   scripts/local-rdb.sh move FROM TO                             [--run DIR]
+#   scripts/local-rdb.sh do "LINE"                                [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
@@ -23,6 +24,10 @@
 # `up --nodes K` (3 to 8, default 3) starts nodes 4 to K too, as spares (M11): each opens an
 # empty copy, is a member of nothing, and says ready like the others. `move FROM TO` runs
 # rdb_dev `admin move FROM TO`, which moves FROM's copy of partition 1 onto TO.
+#
+# `up --partitions P` forms the database with P partitions (default 1), fixed from then on; the
+# nodes read the count from the control store. `do "LINE"` runs one rdb_dev line as app `admin`
+# (for example `do "put --group 2 k v"`) and passes its answer and exit code through.
 #
 # `stop N` shuts node N down cleanly (its stop file, then a hard kill after 15 s); `kill N` kills
 # it at once, as a crash. `start N` and `restart N` wait for node N to say ready, as `up` does for
@@ -82,8 +87,10 @@ ARG=""
 ARG2=""
 FAULT_NODE=1
 DROP=""
+PROMOTE_PARTITION=""
 PROFILE=debug
 NODES_ARG=""
+PARTITIONS_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -99,11 +106,16 @@ while [ $# -gt 0 ]; do
             [ "$COMMAND" = up ] || { echo "lr: --nodes goes with 'up' only; other verbs use the run's (run.env)" >&2; exit 2; }
             case "${2:-}" in [3-8]) NODES_ARG="$2" ;; *) echo "lr: --nodes takes 3 to 8, got '${2:-}'" >&2; exit 2 ;; esac
             shift 2 ;;
+        --partitions)
+            [ "$COMMAND" = up ] || { echo "lr: --partitions goes with 'up' only; a formed database keeps its count" >&2; exit 2; }
+            case "${2:-}" in '' | *[!0-9]* | 0*) echo "lr: --partitions takes a count of 1 or more, got '${2:-}'" >&2; exit 2 ;; esac
+            PARTITIONS_ARG="$2"; shift 2 ;;
         --resume)
             [ "$COMMAND" = up ] || { echo "lr: --resume goes with 'up' only" >&2; exit 2; }
             RESUME=1; shift ;;
         --node) FAULT_NODE="$2"; shift 2 ;;
         --drop) DROP="$2"; shift 2 ;;
+        --partition) PROMOTE_PARTITION="$2"; shift 2 ;;
         --release)
             [ "$COMMAND" = up ] || {
                 echo "lr: --release goes with 'up' only; '$COMMAND' uses the binaries its run was started with (run.env)" >&2
@@ -119,7 +131,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -342,7 +354,7 @@ promote_hint() { # n line: a node that gave up waiting for an owner no link reac
     members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
     k="$(promote_target "$gone" "$members")"
     if [ -n "$k" ]; then
-        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN"
+        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN (above one partition, add --partition P once for each partition it owns; lr do \"admin readiness\" lists them)"
     else
         say "node $n waits for node $gone, the owner, and no link reaches it. No running node holds a regular copy to promote (${members:-admin status gave no members line})"
     fi
@@ -539,7 +551,7 @@ form_and_start() {
     "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs" --nodes "$NODES" --apps pilot,pilot-a,pilot-b,admin >/dev/null
     "$NODE_BIN" --gen-certs --cert-dir "$RUN/certs-other" --nodes "$NODES" --apps pilot >/dev/null
     say "certificates in $RUN/certs (a second CA in $RUN/certs-other)"
-    "$NODE_BIN" --form --dir "$RUN/db" --control "$CONTROL" --log-dir "$RUN/logs" \
+    "$NODE_BIN" --form --dir "$RUN/db" --control "$CONTROL" --log-dir "$RUN/logs" ${PARTITIONS_ARG:+--partitions "$PARTITIONS_ARG"} \
         --ready-secs "$TIMEOUT_SEC" >"$RUN/out/form.out" 2>"$RUN/out/form.err" \
         || { cat "$RUN/out/form.err" >&2; false; }
     say "$(cat "$RUN/out/form.out")"
@@ -660,8 +672,9 @@ admin_line() { # line: one admin line through rdb_dev as an app (--nodes); its e
 }
 
 promote() {
-    admin_line "admin promote $ARG${DROP:+ --drop $DROP}" || exit $?
-    spare_hint
+    admin_line "admin promote $ARG${PROMOTE_PARTITION:+ --partition $PROMOTE_PARTITION}${DROP:+ --drop $DROP}" || exit $?
+    # The hint reads partition 1's members; a promote of another partition says nothing of them.
+    [ -n "$PROMOTE_PARTITION" ] || spare_hint
 }
 
 spare_hint() { # after a promote: the owner does not pin a running spare by itself (tester paper
@@ -743,6 +756,9 @@ case "$COMMAND" in
     down) pick_run; no_pids || down ;;
     clean) pick_run; clean ;;
     status) pick_run; status ;;
+    do)
+        pick_run; [ -n "$ARG" ] || die "do takes one rdb_dev line, quoted"
+        admin_line "$ARG" ;;
     env) pick_run; cat "$RUN/run.env"; echo "RUN=$RUN"; echo "PEERS=$(peers)" ;;
     kill) pick_run; check_node_arg "$ARG"; kill_node "$ARG" ;;
     stop)

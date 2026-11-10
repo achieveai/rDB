@@ -7,11 +7,14 @@
 //!   read-then-CAS, and a reopened `Db` takes a fresh grant in the same boot after a control store
 //!   outage (A-R96).
 
-use super::tests::{digest_at, owner_status, owner_when, put_through_pauses, stored_root};
+#[cfg(debug_assertions)]
+use super::tests::stored_root;
+use super::tests::{digest_at, owner_status, owner_when, put_through_pauses};
 use super::*;
 
 fn config(dir: &Path) -> DbConfig {
     DbConfig {
+        partitions: None,
         ack_floor: true,
         dir: dir.to_path_buf(),
         hold: Vec::new(),
@@ -1323,6 +1326,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     let (owner, mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        partition_count: 1,
         store: Arc::clone(&store),
         boot: open,
         budgets: rdb_core::contracts::event::Budgets::SPEC_DEFAULTS,
@@ -1331,6 +1335,8 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         within: Duration::from_millis(300),
         member_boot: Arc::new(move |_| Some(open)),
         owner_node: crate::admin::OWNER,
+        partitions: vec![PARTITION],
+        bootstrap: Vec::new(),
     }));
     let sent: Vec<_> = mailbox.try_iter().collect();
 
@@ -1424,6 +1430,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
     let (owner, _mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        partition_count: 1,
         store: Arc::clone(&store),
         boot: BootId((1 << 16) + 1),
         budgets,
@@ -1432,6 +1439,8 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
         within: Duration::from_millis(300),
         member_boot: Arc::new(|_| Some(BootId((1 << 16) + 1))),
         owner_node: crate::admin::OWNER,
+        partitions: vec![PARTITION],
+        bootstrap: Vec::new(),
     }));
     let error = healed.expect_err("a grant still in use is not cleared");
     assert!(
@@ -2051,7 +2060,7 @@ fn m10_s2_h2_not_primary_refreshes_the_app_route() {
         .expect("the fresh open is ready");
 
     let mut app = open_app(&rt, &store, nodes.links(), ClientId(2));
-    app.route.owner.store(2, Ordering::Relaxed);
+    app.route.owners[0].store(2, Ordering::Relaxed);
     let refused = app
         .put(b"a", b"1", None)
         .expect_err("node 2 is not the owner");
@@ -3080,6 +3089,9 @@ fn bb_64_a_promote_stopped_after_fencing_keeps_the_members_for_the_re_run() {
     written_and_closed(&rt, dir.path(), &store);
     let before = partition_revision(&rt, &store);
     let ctx = admin::PromoteCtx {
+        partition: PARTITION,
+        owner_must_be_dead: false,
+        look_within: Duration::from_secs(1),
         store: Arc::clone(&store),
         budgets: fast(),
         clock: crate::clock::HostClock::start(),
@@ -3095,7 +3107,7 @@ fn bb_64_a_promote_stopped_after_fencing_keeps_the_members_for_the_re_run() {
         .block_on(admin::promote(ctx))
         .expect_err("node 2 is reached by nobody");
     assert!(
-        matches!(stopped, admin::PromoteError::Unreachable { node: 2 }),
+        matches!(stopped, admin::PromoteError::Unreachable { node: 2, .. }),
         "{stopped:?}"
     );
     assert!(
@@ -3351,6 +3363,7 @@ fn m10_s2_59_a_copy_behind_two_writeless_reopens_catches_up_through_a_real_open(
 /// node 1 as owner; node 2's process opens alone. Cut: the joining branch reads `behind`
 /// through `serves()` (a staged copy left out), and the open logs `db_open_joining`, red.
 /// Integration (~4 s): a fresh open, a reopen until ready, one node-process open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn m10_s2_f009_a_node_process_whose_copy_is_staged_into_the_generation_never_joins() {
     const METHOD: &str =
@@ -3826,6 +3839,9 @@ fn promote_redelivering(
         Ok(())
     };
     let ctx = admin::PromoteCtx {
+        partition: PARTITION,
+        owner_must_be_dead: false,
+        look_within: Duration::from_secs(1),
         store: Arc::clone(store),
         budgets: fast(),
         clock: db.clock,
@@ -3887,7 +3903,7 @@ fn partition_and_grant(
     u64,
 ) {
     let (record, root, _, revision, _) = rt
-        .block_on(admin::read_partition(&**store))
+        .block_on(admin::read_partition(&**store, PARTITION))
         .expect("partitions/1");
     let grant = rt
         .block_on(store.get(config_core::GetRequest {
@@ -4490,6 +4506,9 @@ fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_
 
     let boot_links = Arc::clone(nodes.links());
     let stopped = admin::PromoteCtx {
+        partition: PARTITION,
+        owner_must_be_dead: false,
+        look_within: Duration::from_secs(1),
         store: Arc::clone(&store),
         budgets: fast(),
         clock: nodes.clock,
@@ -4505,7 +4524,7 @@ fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_
         .block_on(admin::promote(stopped))
         .expect_err("node 2 is not reached");
     assert!(
-        matches!(refused, admin::PromoteError::Unreachable { node: 2 }),
+        matches!(refused, admin::PromoteError::Unreachable { node: 2, .. }),
         "{refused:?}"
     );
     let (_, _, first, ..) = partition_and_grant(&rt, &store);
@@ -4642,7 +4661,7 @@ fn m10_s2_a_promote_that_could_not_reach_node_2_finishes_when_run_again_and_rede
             .expect("node 2 runs");
     }
 
-    app.route.owner.store(2, Ordering::Relaxed);
+    app.route.owners[0].store(2, Ordering::Relaxed);
     let deadline = std::time::Instant::now() + patience;
     let put = loop {
         match app.put(b"b", b"2", None) {
