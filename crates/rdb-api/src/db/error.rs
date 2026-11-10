@@ -66,18 +66,32 @@ pub(crate) const PROMOTE_ALIVE_STEP: &str = "stop that node first, then promote 
 
 /// The tails of a `RECOVERY_READ_ONLY` refusal whose repair is held on a copy's tail (#79 S4d).
 /// "Writes return when the lost copies are back" is false there: the copy is back, and its tail
-/// is why it cannot rejoin. One per way the refused send can be sent again.
+/// is why it cannot rejoin. One per way the refused send can be sent again, and (issue #105
+/// unit 2, design section 8.3) two per whether the tail can come back on its own: the `HELD`
+/// pair when one cannot, the `ADOPTABLE` pair when every copy named reports its tail `Adoptable`.
 pub(crate) const TAIL_HELD_NEW_WRITE: &str = "reads still work and nothing was discarded; \
-    writes stay refused, and this release has no command that lifts this: restarting a node may \
-    not; do not wipe or rebuild the node named here, or those seqs may be gone; \
-    `Db::node_status` shows this as `tail_refused`; this send wrote nothing: when writes return, \
-    send the write again as a new write, not with `Db::resend`";
+    writes stay refused until the copy named here returns with these seqs or an operator runs \
+    `admin forget-tail`, which accepts losing these seqs; do not wipe or rebuild the node named \
+    here, or those seqs may be gone; `Db::node_status` shows this as `tail_refused`; this send \
+    wrote nothing: when writes return, send the write again as a new write, not with \
+    `Db::resend`";
 pub(crate) const TAIL_HELD_RESEND: &str = "reads still work and nothing was discarded; writes \
-    stay refused, and this release has no command that lifts this: restarting a node may not; \
-    do not wipe or rebuild the node named here, or those seqs may be gone; `Db::node_status` \
-    shows this as `tail_refused`; an earlier send may have applied: when writes return, send \
-    the same request again with `Db::resend`, or ask `Db::status`; never send it under a new \
-    request id";
+    stay refused until the copy named here returns with these seqs or an operator runs \
+    `admin forget-tail`, which accepts losing these seqs; do not wipe or rebuild the node named \
+    here, or those seqs may be gone; `Db::node_status` shows this as `tail_refused`; an earlier \
+    send may have applied: when writes return, send the same request again with `Db::resend`, \
+    or ask `Db::status`; never send it under a new request id";
+pub(crate) const TAIL_ADOPTABLE_NEW_WRITE: &str = "reads still work and nothing was discarded; \
+    the copy named here can restore these seqs, and writes will return on their own; do not \
+    wipe or rebuild the node named here, or those seqs may be gone; `Db::node_status` shows \
+    this as `tail_refused` with adoption `Adoptable`; this send wrote nothing: when writes return, send \
+    the write again as a new write, not with `Db::resend`";
+pub(crate) const TAIL_ADOPTABLE_RESEND: &str = "reads still work and nothing was discarded; \
+    the copy named here can restore these seqs, and writes will return on their own; do not \
+    wipe or rebuild the node named here, or those seqs may be gone; `Db::node_status` shows \
+    this as `tail_refused` with adoption `Adoptable`; an earlier send may have applied: when writes \
+    return, send the same request again with `Db::resend`, or ask `Db::status`; never send it \
+    under a new request id";
 
 /// The tail of [`crate::admin::PromoteError::TargetFrozen`], for the same reason.
 pub(crate) const PROMOTE_FROZEN_STEP: &str = "promote another node";
@@ -335,6 +349,8 @@ impl ApiError {
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)
             || self.detail.ends_with(TAIL_HELD_RESEND)
+            || self.detail.ends_with(TAIL_ADOPTABLE_NEW_WRITE)
+            || self.detail.ends_with(TAIL_ADOPTABLE_RESEND)
         {
             return None;
         }

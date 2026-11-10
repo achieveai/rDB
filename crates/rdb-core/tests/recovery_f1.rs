@@ -398,6 +398,7 @@ fn catch_up(from: CopyId, to: CopyId, through: u64) -> EffectKind {
         from,
         to,
         through: Seq(through),
+        through_digest: dg(0, through),
         credential: proof().credential_for(from),
     })
 }
@@ -1303,6 +1304,7 @@ fn a_shadow_never_leads_and_a_lagging_leader_catches_up_before_grant() {
                 from: D,
                 to: A,
                 through: Seq(25),
+                through_digest: dg(0, 25),
                 credential: proof().credential_for(D),
             }),
             catch_up(D, B, 25),
@@ -2390,6 +2392,7 @@ fn tester_a_holder_without_a_valid_grant_does_not_lead() {
             from: A,
             to: B,
             through: Seq(20),
+            through_digest: dg(0, 20),
             credential: proof().credential_for(A),
         })),
         "{close:?}"
@@ -3263,6 +3266,7 @@ fn m7b_98_holder_that_cannot_lead_gets_catch_up_before_grant() {
                 from: B,
                 to: C,
                 through: Seq(30),
+                through_digest: dg(0, 30),
                 credential: proof().credential_for(B),
             }),
             arm(2, 2 * WINDOW),
@@ -3910,6 +3914,7 @@ fn m7b_118_verified_shadow_source_is_never_leader() {
             from: D,
             to: A,
             through: Seq(25),
+            through_digest: dg(0, 25),
             credential: proof().credential_for(D),
         })),
         "{close:?}"
@@ -4940,6 +4945,7 @@ fn m7b_138_holder_that_cannot_lead_transfers_under_a_credential_naming_the_holde
                 from: B,
                 to: C,
                 through: Seq(30),
+                through_digest: dg(0, 30),
                 credential: proof().credential_for(B),
             }),
             catch_up(B, D, 30),

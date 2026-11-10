@@ -177,6 +177,7 @@ fn s5d_39_a_restarted_copy_refuses_until_it_rejoins() {
             owner_epoch: OwnerEpoch(1),
         },
         revision: Revision(1),
+        cutoff: (Seq::ZERO, Digest::ROOT),
     };
     let three = &mut trio.nodes[2].0;
     three.restore_dormant(P, &seed, false);

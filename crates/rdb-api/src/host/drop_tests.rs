@@ -5925,6 +5925,11 @@ fn read_only_with_a_tail(trio: &mut Trio, before: Generation) -> Generation {
 /// of committing `ReadOnly` again: node 2's status says why, node 1 logs one
 /// `membership_repair_held` naming the copy and the reason, no repair is planned over many
 /// retry periods, and a refused put's text names the copy, the seq range and the next step.
+/// Issue #105 unit 2: a tail stamped by the last writable generation is adopted when its proofs
+/// hold, which would end the hold. So node 2's proofs are fixed to fail
+/// (`tail_not_contiguous`, `crate::host::refuse_adoption`), its status says so, and the row's
+/// subject stays the hold. The adopted outcome of a tail like this one is W-C's
+/// (`db::barrier_tests::w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it`).
 /// Cuts: remove the hold in `repair_duty`, red (a `membership_repair_planned`); keep
 /// `step_for`'s text, red (no copy in the error).
 /// Integration (~4 s): b1's pause and drop, then a window of retries.
@@ -5934,6 +5939,7 @@ fn s4d_a_tail_past_the_cutoff_holds_the_repair_and_names_the_copy() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), tuned);
     trio.nodes[0].0.repair_retry_first_millis = 100;
+    crate::host::refuse_adoption(trio.nodes[1].0.engine.path(), "tail_not_contiguous");
     let read_only = read_only_with_a_tail(&mut trio, before);
     let commit = commit_of(&trio);
     trio.links.heal(NodeId(1), NodeId(2));
@@ -5942,8 +5948,12 @@ fn s4d_a_tail_past_the_cutoff_holds_the_repair_and_names_the_copy() {
         trio.status(1).tail_refused
     });
     assert_eq!(
-        (tail.generation, tail.reason),
-        (read_only, "held_past_base"),
+        (tail.generation, tail.reason, tail.adoption),
+        (
+            read_only,
+            "held_past_base",
+            TailAdoption::Refused("tail_not_contiguous")
+        ),
         "{tail:?}"
     );
     assert!(tail.head > tail.base, "{tail:?}");
@@ -6067,6 +6077,7 @@ fn s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail() {
             head: Seq(3),
             base: Seq(2),
             reason: "held_past_base",
+            adoption: TailAdoption::Unchecked,
         },
     );
     let held = trio.until("the repair held for node 2's tail", |_| {
@@ -6094,6 +6105,45 @@ fn s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail() {
     );
 }
 
+/// Row 7's adoptable case (issue #105 unit 2, architect section 7): the same planted input as
+/// `s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail`, with node 2's tail
+/// reported `Adoptable`. A re-plan is what adopts it, so the repair runs, and no hold names it.
+/// Cut: `TailAdoption::is_adoptable` answers `false` for every state, red (the repair is held).
+/// Integration (~2 s): the trio's start and one repair decision.
+#[config_log::retcd_test]
+fn u2_a_member_answering_clean_repairs_when_the_other_members_tail_is_adoptable() {
+    const METHOD: &str =
+        "u2_a_member_answering_clean_repairs_when_the_other_members_tail_is_adoptable";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let committed = trio.nodes[0]
+        .0
+        .committed
+        .get_mut(&PartitionId(1))
+        .expect("node 1's commit");
+    committed.mode = PartitionMode::ReadOnly;
+    trio.nodes[1].0.tail_refused.insert(
+        PartitionId(1),
+        TailRefused {
+            generation: before,
+            head: Seq(3),
+            base: Seq(2),
+            reason: "held_past_base",
+            adoption: TailAdoption::Adoptable,
+        },
+    );
+    let planned = trio.until("a repair is planned", |_| {
+        let planned = logged!(METHOD, "membership_repair_planned");
+        (!planned.is_empty()).then_some(planned)
+    });
+    assert_eq!(planned[0]["node"], 1, "{planned:?}");
+    let held: Vec<_> = logged!(METHOD, "membership_repair_held")
+        .into_iter()
+        .filter(|line| line["reason"] == "held_past_base")
+        .collect();
+    assert!(held.is_empty(), "held for an adoptable tail: {held:?}");
+}
+
 /// #79 S4d: a full copy that stopped part way leaves a staged child, which no landing or inventory
 /// will ever succeed on. The status says so as `interrupted_copy` (so a restart, which loses the
 /// recorded refusals, cannot hide it), for the newest lineage only: a remnant below a newer
@@ -6119,6 +6169,7 @@ fn s4d_a_staged_copy_on_the_newest_lineage_is_reported_and_a_remnant_is_not() {
             head: Seq(3),
             base: Seq(2),
             reason: "interrupted_copy",
+            adoption: TailAdoption::Unchecked,
         })
     );
 

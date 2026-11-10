@@ -104,7 +104,10 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 ///
 /// `9` came with issue #105: `WirePeerAsk::Inventory::last_writable` and `release_through`,
 /// `SurvivorInventory::holds_last_writable`, `RecoveryEvent::TailHeld`, `RecoveryResult::ledger`,
-/// `RecoveryPlan::release`, `WireCall::ForgetTail` and `WireAnswer::TailForgotten`. It ships with
+/// `RecoveryPlan::release`, `WireCall::ForgetTail`, `WireAnswer::TailForgotten` and (unit 2)
+/// `WireTailRefused::adoption` (one of `adoptable`, `not_ready`, `refused`, `unchecked`) with
+/// `WireTailRefused::adoption_reason`, and `WireSeed::cutoff`, the selected cutoff and its digest that
+/// a routed `CatchUp` or `Restore` seed carries (unit 2, architect section 15.3). It ships with
 /// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts
 /// the whole cluster.
 pub const PROTOCOL_VERSION: u32 = 9;

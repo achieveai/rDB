@@ -4466,6 +4466,12 @@ fn catch_up(from: u8, to: u8, through: u64, credential: FenceCredential) -> Even
         from: CopyId(from),
         to: CopyId(to),
         through: Seq(through),
+        // Seq 0 is the root; `d` indexes the chain from seq 1.
+        through_digest: if through == 0 {
+            Digest::ROOT
+        } else {
+            d(through)
+        },
         credential,
     }))
 }
@@ -6652,6 +6658,9 @@ fn plan(boot: u64) -> CatchUpPlan {
             owner_epoch: EPOCH,
         },
         revision: Revision(0),
+        // At the root: the plan half of the historical rule is inert for these rows, which pin
+        // the plan's boots only (issue #105 unit 2 added the cutoff).
+        cutoff: (Seq::ZERO, Digest::ROOT),
     }
 }
 
@@ -6825,7 +6834,7 @@ fn s3b_9_a_later_plan_replaces_the_first() {
     assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
 }
 
-// --- Issue #105 unit 2: stand-down (architect section 14) ---
+// --- Issue #105 unit 2: stand-down (architect section 14) and the plan rule (section 15) ---
 
 /// `ev`, a `Recovered`, changed by `edit`.
 fn reshaped(mut ev: Event, edit: impl FnOnce(&mut RecoveryResult)) -> Event {
@@ -6905,6 +6914,40 @@ fn dormant_in_new_gen(own: u8, at: u64) -> AppendReceiver {
 /// sent by C's copy 2.
 fn new_gen_fence() -> FenceCredential {
     fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION)
+}
+
+/// F1's plan for [`new_gen_fence`], with its cutoff at `(cutoff, digest)`.
+fn plan_to(cutoff: u64, digest: Digest) -> CatchUpPlan {
+    CatchUpPlan {
+        config: owner_pin(),
+        lineage: authority(NEW_GEN, NEW_EPOCH),
+        revision: REVISION,
+        cutoff: (Seq(cutoff), digest),
+    }
+}
+
+/// B as the pre-commit catch-up target: a dormant receiver in `NEW_GEN` at 2, whose root is
+/// still unset, holding `plan`.
+fn target_holding(plan: CatchUpPlan) -> Replication {
+    let mut module = Replication::new();
+    module.install_receiver(dormant_in_new_gen(1, 2));
+    module.keep_recovery_plan(B, P, plan);
+    module
+}
+
+/// `env`, sealed in `GEN`, as C's recovery append under [`new_gen_fence`], stepped on B.
+fn older_from_c(module: &mut Replication, env: &ReplicationEnvelope) -> Vec<EffectKind> {
+    send_bytes(module, label(C), recovery_body(&new_gen_fence(), env))
+}
+
+/// The one reply to C in `effects`.
+fn reply_to_c(effects: &[EffectKind]) -> AppendOutcome {
+    let replies: Vec<_> = effects
+        .iter()
+        .filter(|kind| matches!(kind, EffectKind::Send(_)))
+        .collect();
+    assert_eq!(replies.len(), 1, "{effects:?}");
+    reply_at(replies[0], C, FRAME_ID, NEW_CONFIG)
 }
 
 /// Section 14 row 1 (B1, `NotRetained`): A's `ReadOnly` owner stood down at 2; adoption put
@@ -7089,4 +7132,180 @@ fn u2_07_a_late_older_recovered_never_replaces_a_stood_down_owner() {
     let tracker = a_tracker(&module);
     assert_eq!(tracker.stood_down(), Some(NEW_GEN));
     assert_eq!(tracker.lineage().generation, NEW_GEN);
+}
+
+/// R6-1: the pre-commit catch-up target, a dormant receiver in `NEW_GEN` whose root is unset,
+/// holds a plan with cutoff 3. A record sealed in the older `GEN` at 3, under the plan's
+/// credential, is historical and staged. Cut: the plan half of `is_historical` removed, red
+/// (`StaleGeneration`).
+#[retcd_test]
+fn u2_r6_1_an_older_record_at_the_plans_cutoff_is_taken() {
+    let mut module = target_holding(plan_to(3, d(3)));
+    let effects = older_from_c(&mut module, &chain(3)[2]);
+    assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(3)));
+}
+
+/// R6-2: the same older record shape above the plan's cutoff is still `StaleGeneration`.
+#[retcd_test]
+fn u2_r6_2_an_older_record_above_the_plans_cutoff_is_stale() {
+    let mut module = target_holding(plan_to(3, d(3)));
+    let effects = older_from_c(&mut module, &chain(4)[3]);
+    assert_eq!(
+        reply_to_c(&effects),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+}
+
+/// R6-3: at the plan's cutoff, a record whose digest is not the plan's is proof: quarantined
+/// `DivergentHistory`, as at the root's floor. Cut: the plan's pin dropped from row 8, red.
+#[retcd_test]
+fn u2_r6_3_a_record_at_the_plans_cutoff_with_another_digest_quarantines() {
+    let mut module = target_holding(plan_to(3, d(2)));
+    let effects = older_from_c(&mut module, &chain(3)[2]);
+    assert!(effects.contains(&quarantine_alert()), "{effects:?}");
+    assert_eq!(
+        rx(&module).quarantine(),
+        Some(AppendReject::DivergentHistory { at: Seq(3) })
+    );
+}
+
+/// R6-4: K-B-37 unchanged for a plain append. B re-anchored at 10 in `NEW_GEN` holds a plan
+/// whose cutoff is 11; C's plain append of a `GEN` record at 11, in a `NEW_GEN` frame, is
+/// above the root's floor and still `StaleGeneration`: the plan is never read without a
+/// credential. Cut: the plan read for a plain append, red.
+#[retcd_test]
+fn u2_r6_4_a_plain_append_never_reads_the_plan() {
+    let mut module = module();
+    step(&mut module, &recovered(10, d(10), takeover_config()));
+    module.keep_recovery_plan(
+        B,
+        P,
+        CatchUpPlan {
+            config: takeover_config(),
+            ..plan_to(11, d(11))
+        },
+    );
+    let effects = step(
+        &mut module,
+        &framed(
+            label(C),
+            authority(NEW_GEN, NEW_EPOCH),
+            NEW_CONFIG,
+            golden().encode().expect("encode"),
+        ),
+    );
+    assert_eq!(
+        reply_to_c(&effects),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+}
+
+/// R6-5: a credential the kept plan does not name (another control revision) gets no
+/// extension: the older record at the cutoff is `StaleGeneration`. Cut: `plan_cutoff` reading
+/// the plan without `names`, red.
+#[retcd_test]
+fn u2_r6_5_a_credential_the_plan_does_not_name_gets_no_extension() {
+    let mut module = target_holding(CatchUpPlan {
+        revision: Revision(1),
+        ..plan_to(3, d(3))
+    });
+    let effects = older_from_c(&mut module, &chain(3)[2]);
+    assert_eq!(
+        reply_to_c(&effects),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+}
+
+/// R6-6: `Recovered` sets the root from the result and drops the plan with its cutoff. B held
+/// a plan at 11; after the takeover at 10 the older record at 11 is above the new floor and
+/// `StaleGeneration`.
+#[retcd_test]
+fn u2_r6_6_recovered_sets_the_root_and_drops_the_plans_cutoff() {
+    let mut module = module();
+    module.keep_recovery_plan(
+        B,
+        P,
+        CatchUpPlan {
+            config: takeover_config(),
+            ..plan_to(11, d(11))
+        },
+    );
+    step(&mut module, &recovered(10, d(10), takeover_config()));
+    assert_eq!(rx(&module).recovery_plan(), None);
+    assert_eq!(
+        rx(&module).root(),
+        HistoryRoot {
+            floor: Seq(10),
+            base_digest: d(10),
+            predecessor: Some(GEN),
+        }
+    );
+    let effects = send_bytes(
+        &mut module,
+        label(C),
+        recovery_body(&fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION), &golden()),
+    );
+    assert_eq!(
+        reply_to_c(&effects),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+}
+
+/// critic-s15 M1: the plan rule adds to the root rule. B re-anchored at 3 under a root whose
+/// floor is 5 holds a plan with the lower cutoff 3; an older record at 4 under the plan's
+/// credential is historical by the root and staged, as without the plan. Cut: the plan
+/// replacing the root rule when present, red.
+#[retcd_test]
+fn u2_m1_a_plan_below_the_roots_floor_narrows_nothing() {
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 3, 3));
+    step(&mut module, &recovered(5, d(5), takeover_config()));
+    assert_eq!(rx(&module).root().floor, Seq(5));
+    assert_eq!(rx(&module).applied_head().seq, Seq(3));
+    module.keep_recovery_plan(
+        B,
+        P,
+        CatchUpPlan {
+            config: takeover_config(),
+            ..plan_to(3, d(3))
+        },
+    );
+    let effects = older_from_c(&mut module, &chain(4)[3]);
+    let (_, generation, seq) = staged_batch(&effects);
+    assert_eq!((generation, seq), (NEW_GEN, Seq(4)));
+}
+
+/// critic-s15 M2 (1): a two-record adopted tail where the record below the cutoff diverges.
+/// It has no pin of its own, so it is staged; the cutoff's digest commits to the chain, so the
+/// record at the cutoff, built on it, is caught there and quarantines `DivergentHistory`.
+#[retcd_test]
+fn u2_m2_1_a_divergent_record_below_the_cutoff_is_caught_at_the_cutoff() {
+    let mut module = target_holding(plan_to(4, d(4)));
+    let forged = envelope(3, d(2), b"forged");
+    let on_forged = envelope(4, forged.record_digest, b"v");
+    let (batch, _, seq) = staged_batch(&older_from_c(&mut module, &forged));
+    assert_eq!(seq, Seq(3));
+    step(&mut module, &committed(batch.0, 3));
+    let effects = older_from_c(&mut module, &on_forged);
+    assert!(effects.contains(&quarantine_alert()), "{effects:?}");
+    assert_eq!(
+        rx(&module).quarantine(),
+        Some(AppendReject::DivergentHistory { at: Seq(4) })
+    );
+}
+
+/// critic-s15 M2 (3): a superseded plan. Run 2 kept a plan with cutoff 3 under the same
+/// credential run 1 used for cutoff 4; run 1's source retransmits record 4. It is above the
+/// kept plan's cutoff, so `StaleGeneration`, and nothing is quarantined.
+#[retcd_test]
+fn u2_m2_3_a_retransmit_above_a_superseding_plans_cutoff_is_stale_not_proof() {
+    let mut module = target_holding(plan_to(3, d(3)));
+    let (batch, _, _) = staged_batch(&older_from_c(&mut module, &chain(3)[2]));
+    step(&mut module, &committed(batch.0, 3));
+    let effects = older_from_c(&mut module, &chain(4)[3]);
+    assert_eq!(
+        reply_to_c(&effects),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+    assert_eq!(rx(&module).quarantine(), None);
 }

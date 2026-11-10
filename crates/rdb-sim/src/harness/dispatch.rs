@@ -63,7 +63,7 @@ use rdb_core::{
     publication::{Publication, ReplicationView},
     recovery::{Recovery, RecoveryPhase},
     replication::{
-        append::{AppendReceiver, Head, ReceiverInit},
+        append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit},
         wire, Replication,
     },
     transaction::Transaction,
@@ -2255,14 +2255,22 @@ impl Dispatcher {
                 from: source,
                 to,
                 through,
+                through_digest,
                 credential,
             }
             | RecoveryEffect::CatchUpBeforeGrant {
                 from: source,
                 to,
                 through,
+                through_digest,
                 credential,
-            } => self.catch_up(*source, *to, *through, *credential, site, scheduler),
+            } => self.catch_up(
+                *source,
+                (*to, *through, *through_digest),
+                *credential,
+                site,
+                scheduler,
+            ),
             RecoveryEffect::ProbeDigestAt { copy, seq } => {
                 self.probe_digest_at(*copy, *seq, site, scheduler)
             }
@@ -2376,8 +2384,7 @@ impl Dispatcher {
     fn catch_up(
         &mut self,
         source: CopyId,
-        to: CopyId,
-        through: Seq,
+        (to, through, through_digest): (CopyId, Seq, Digest),
         credential: FenceCredential,
         site: (NodeId, PartitionId, CorrelationId),
         scheduler: &mut Scheduler,
@@ -2395,7 +2402,7 @@ impl Dispatcher {
             .ok_or(SimError::Config { field: "member" })?;
         match self.plans.get(&(site.0, partition)).cloned() {
             Some(config) => {
-                let seed = DormantSeed::new(config, &credential);
+                let seed = DormantSeed::new(config, &credential, (through, through_digest));
                 match seed.config.members.iter().find(|member| member.copy == to) {
                     Some(target) => {
                         let target = target.node;
@@ -2423,6 +2430,7 @@ impl Dispatcher {
             from: source,
             to,
             through,
+            through_digest,
             credential,
         });
         let now = scheduler.now();
@@ -2446,6 +2454,10 @@ impl Dispatcher {
     ///
     /// Called directly, never delivered: no link drop or hold applies to it, unlike the host's
     /// `Msg::Restore` (review F-011; see [`Self::catch_up`]).
+    ///
+    /// A target restore not beside a serving primary then keeps the seed as the receiver's
+    /// recovery plan, as the host does, **after** any receiver is installed or replaced, so the
+    /// receiver the catch-up reaches holds it (issue #105 unit 2, critic-s15 B1).
     fn restore_dormant(
         &mut self,
         node: NodeId,
@@ -2456,10 +2468,43 @@ impl Dispatcher {
         if self.is_down(node) {
             return;
         }
-        let dormant = self
+        let serving = self
             .replication
-            .receiver(node, partition)
-            .map(AppendReceiver::is_dormant);
+            .primary(node, partition)
+            .is_some_and(|primary| !primary.tracker().retired());
+        self.restore_receiver(node, partition, seed, with_history);
+        if !with_history && !serving {
+            let plan = CatchUpPlan {
+                config: seed.config.clone(),
+                lineage: seed.lineage,
+                revision: seed.revision,
+                cutoff: seed.cutoff,
+            };
+            self.replication.keep_recovery_plan(node, partition, plan);
+        }
+    }
+
+    /// [`Self::restore_dormant`]'s receiver half: install, replace or keep the receiver.
+    fn restore_receiver(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        seed: &DormantSeed,
+        with_history: bool,
+    ) {
+        let primary = self.replication.primary(node, partition);
+        let serving = primary.is_some_and(|primary| !primary.tracker().retired());
+        let stood_down = primary.is_some_and(|primary| primary.tracker().stood_down().is_some());
+        let held = self.replication.receiver(node, partition);
+        // The host's D10 `stale` (A-R398), with issue #105 unit 2's stood-down owner (architect
+        // section 14, M3): a retired receiver beside this node's own primary, serving or stood
+        // down, sources nothing, so a source restore replaces it as if none were held.
+        // A target restore beside a stood-down primary replaces it too: that owner is the copy a
+        // catch-up must reach, and a retired receiver refuses every recovery append `NotAMember`
+        // (observed: `wc3`, the W-C owner held its G2 secondary's receiver, retired at G3).
+        let stale =
+            held.is_some_and(AppendReceiver::retired) && (stood_down || (serving && with_history));
+        let dormant = held.filter(|_| !stale).map(AppendReceiver::is_dormant);
         // A live receiver is kept; it is pinned by m7b_136.
         if dormant == Some(false) {
             return;
@@ -2473,10 +2518,6 @@ impl Dispatcher {
                 "dormant_restore_refused"
             );
         };
-        let serving = self
-            .replication
-            .primary(node, partition)
-            .is_some_and(|primary| !primary.tracker().retired());
         if serving && !with_history {
             refused("serving_primary");
             return;
@@ -3611,10 +3652,12 @@ struct DormantSeed {
     config: PartitionConfig,
     lineage: Lineage,
     revision: Revision,
+    /// F1's selected cutoff and its digest, kept in a target's plan (issue #105 unit 2).
+    cutoff: (Seq, Digest),
 }
 
 impl DormantSeed {
-    fn new(config: PartitionConfig, credential: &FenceCredential) -> Self {
+    fn new(config: PartitionConfig, credential: &FenceCredential, cutoff: (Seq, Digest)) -> Self {
         Self {
             config,
             lineage: Lineage {
@@ -3623,6 +3666,7 @@ impl DormantSeed {
                 owner_epoch: credential.prior_owner_epoch,
             },
             revision: credential.control_revision,
+            cutoff,
         }
     }
 }
@@ -4006,7 +4050,7 @@ mod dormant_twin_tests {
     use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
     use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 
-    use super::{Dispatcher, DormantSeed};
+    use super::{Digest, Dispatcher, DormantSeed};
     use crate::storage::history::canonical_history;
     use crate::storage::memory::MemoryEngine;
 
@@ -4067,6 +4111,7 @@ mod dormant_twin_tests {
             config,
             lineage,
             revision: Revision(1),
+            cutoff: (Seq::ZERO, Digest::ROOT),
         };
         (dispatcher, seed)
     }
@@ -4099,6 +4144,172 @@ mod dormant_twin_tests {
         assert!(
             dispatcher.replication.primary(OWNER, P).is_some(),
             "the primary stays"
+        );
+    }
+
+    /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
+    /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
+    /// (issue #105 unit 2, architect section 14). No receiver is held.
+    fn stood_down_owner() -> (Dispatcher, DormantSeed) {
+        use rdb_core::contracts::authority::{
+            AuthorityEvent, AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
+        };
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module, StepCtx};
+        use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
+        use rdb_core::contracts::recovery::{
+            CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult,
+            RetainedStatusMap, SelectedLineage, TailLedger,
+        };
+        use rdb_core::contracts::time::{ControlTime, Tick};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.replication.forget_node(OWNER);
+        let lineage = seed.lineage;
+        let cutoff = Seq(HEAD);
+        let cutoff_digest = canonical_history(lineage, ConfigVersion(1), HEAD)
+            .expect("history")
+            .digest(HEAD);
+        let view = |authority_seq, past_horizon| AuthorityView {
+            lineage,
+            grant_id: GrantId(1),
+            boot_id: BootId(1),
+            authority_generation: AuthorityGeneration(1),
+            config_version: ConfigVersion(1),
+            authority_seq,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon,
+        };
+        let result = RecoveryResult {
+            fenced_prior: FencingProof {
+                partition: P,
+                prior_generation: Generation(0),
+                prior_owner_epoch: OwnerEpoch(0),
+                prior_grant_id: GrantId(0),
+                prior_boot_id: BootId(1),
+                revocation: Revocation::DurableDrain {
+                    ack_revision: Revision(1),
+                },
+                control_revision: Revision(1),
+                decision_tick: Tick::ZERO,
+            },
+            inventories: Vec::new(),
+            selected: SelectedLineage {
+                root: lineage,
+                cutoff_seq: cutoff,
+                cutoff_digest,
+                source: CopyId(0),
+            },
+            new_generation: lineage.generation,
+            mode: PartitionMode::ReadOnly,
+            barrier: RecoveryBarrier::try_new(
+                &[DurableProof {
+                    copy: CopyId(0),
+                    partition: P,
+                    seq: DurableSeq(HEAD),
+                    digest: cutoff_digest,
+                    boot: BootId(1),
+                }],
+                &[CopyId(0)].into_iter().collect(),
+                cutoff,
+                cutoff_digest,
+            )
+            .expect("node 1 proved the cutoff"),
+            loss: LossRecord {
+                queried: Vec::new(),
+                unavailable: Vec::new(),
+                cutoff_seq: cutoff,
+                highest_advertised_seq: cutoff,
+                uncertain: false,
+            },
+            committed: CommittedRoot {
+                revision: Revision(1),
+                pinned_config: seed.config.clone(),
+                authority_view: view(1, DenyReason::NoGrant),
+            },
+            retained_status_map: RetainedStatusMap {
+                predecessor_generation: Generation(0),
+                predecessor_cutoff: cutoff,
+                retained_through: cutoff,
+                discarded_from: None,
+                uncertain: false,
+            },
+            ledger: TailLedger::unknown(),
+        };
+        let snapshot = EmptySnapshot::new();
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let ctx = StepCtx {
+            now: Tick(0),
+            control_time: ControlTime {
+                estimate: Tick(0),
+                error_millis: 10,
+                bound_established: true,
+                sampled_at: Tick(0),
+            },
+            node: OWNER,
+            boot: BootId(1),
+            partition: P,
+            generation: lineage.generation,
+            owner_epoch: lineage.owner_epoch,
+            config_version: ConfigVersion(1),
+            snapshot: &snapshot,
+            budgets: &budgets,
+        };
+        let on_owner = |kind| Event {
+            id: EventId(1),
+            at: Tick(0),
+            node: OWNER,
+            boot: BootId(1),
+            partition: P,
+            correlation: CorrelationId(1),
+            kind,
+        };
+        for kind in [
+            EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+                2,
+                DenyReason::EpochRevoked,
+            )))),
+        ] {
+            dispatcher
+                .replication
+                .step(&ctx, &on_owner(kind))
+                .expect("R1 answers its own event");
+        }
+        let tracker = dispatcher
+            .replication
+            .primary(OWNER, P)
+            .expect("the recovered primary")
+            .tracker();
+        assert_eq!(tracker.stood_down(), Some(lineage.generation), "stood down");
+        (dispatcher, seed)
+    }
+
+    /// Issue #105 unit 2, R6-8 and critic-s15 B1, the simulator's twin: beside a primary that
+    /// stood down, a target restore installs the dormant receiver, and that receiver holds the
+    /// seed's plan with its cutoff (kept after the install, not before it). Beside a serving
+    /// primary the target restore is still refused
+    /// ([`beside_a_serving_primary_a_source_restore_installs_and_a_target_restore_does_not`]).
+    /// Cuts: `serving` read as "any primary", no receiver, red; the plan kept before the
+    /// install, or not at all, no plan, red. Unit, under a second.
+    #[test]
+    fn beside_a_stood_down_primary_a_target_restore_installs_a_receiver_holding_the_plan() {
+        let (mut dispatcher, mut seed) = stood_down_owner();
+        seed.cutoff = (Seq(HEAD + 1), Digest::ROOT);
+        dispatcher.restore_dormant(OWNER, P, &seed, false);
+        let receiver = dispatcher
+            .replication
+            .receiver(OWNER, P)
+            .expect("a target restore beside a stood-down primary installs the receiver");
+        assert!(receiver.is_dormant());
+        let plan = receiver
+            .recovery_plan()
+            .expect("the installed receiver holds the plan");
+        assert_eq!(
+            (plan.lineage, plan.revision, plan.cutoff),
+            (seed.lineage, seed.revision, seed.cutoff),
+            "the plan carries the seed's lineage, revision and cutoff"
         );
     }
 }

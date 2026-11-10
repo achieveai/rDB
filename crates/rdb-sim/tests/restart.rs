@@ -809,6 +809,7 @@ fn running_catch_up() -> Runner {
                     from: CopyId(1),
                     to: CopyId(2),
                     through: Seq(2),
+                    through_digest: history.digest(2),
                     credential: FenceCredential {
                         partition: RECOVERED,
                         prior_generation: Generation(1),

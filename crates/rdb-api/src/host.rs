@@ -49,8 +49,8 @@ use rdb_core::contracts::event::{
     ModuleName, ReplyEffect, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AffinityId, AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket,
-    Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
+    AffinityId, AppliedSeq, BatchId, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId,
+    FlushTicket, Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
     RequestIdentity, Revision, Seq, SnapshotHandle, TenantId, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
@@ -72,7 +72,9 @@ use rdb_core::partition_map::{affinity_hash, partition_of};
 use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
-use rdb_core::replication::append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit};
+use rdb_core::replication::append::{
+    record_batch, AppendReceiver, CatchUpPlan, Head, ReceiverInit,
+};
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
@@ -750,10 +752,14 @@ pub struct DormantSeed {
     pub lineage: Lineage,
     /// The record's `mod_revision`: row 6R's floor.
     pub revision: Revision,
+    /// F1's selected cutoff and its digest (`RecoveryEffect::CatchUp::through_digest`). A
+    /// target keeps it in its `CatchUpPlan`, where it pins the historical rule's plan half
+    /// (issue #105 unit 2, architect section 15.3).
+    pub cutoff: (Seq, Digest),
 }
 
 impl DormantSeed {
-    fn new(config: PartitionConfig, credential: &FenceCredential) -> Self {
+    fn new(config: PartitionConfig, credential: &FenceCredential, cutoff: (Seq, Digest)) -> Self {
         Self {
             config,
             lineage: Lineage {
@@ -762,6 +768,7 @@ impl DormantSeed {
                 owner_epoch: credential.prior_owner_epoch,
             },
             revision: credential.control_revision,
+            cutoff,
         }
     }
 }
@@ -1186,6 +1193,89 @@ pub struct TailRefused {
     pub base: Seq,
     /// One of [`TAIL_REFUSED_REASONS`].
     pub reason: &'static str,
+    /// Issue #105 unit 2 (design section 3.8): where this tail stands against adoption onto this
+    /// generation. Only [`TailAdoption::Adoptable`] lets a repair run for it.
+    pub adoption: TailAdoption,
+}
+
+/// Issue #105 unit 2 (design sections 3.8 and 8.1, lead ruling on the forget-tail narrowing):
+/// whether a held tail can come back by adoption, and if not, why. Crosses the wire.
+///
+/// | State | Repair | `forget-tail --through` over it |
+/// |---|---|---|
+/// | `Adoptable` | re-plans: the next inventory adopts it | needs `--give-up-live-copy` |
+/// | `NotReady` | holds | needs `--give-up-live-copy`: a later landing can make it adoptable |
+/// | `Refused` | holds | needs no flag: a failed proof can restore nothing |
+/// | `Unchecked` | holds | needs `--give-up-live-copy`, as before unit 2 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailAdoption {
+    /// Every adoption proof holds against the generation (P1 to P3, and replay's
+    /// preconditions where they apply).
+    Adoptable,
+    /// The proofs hold so far, but replay's preconditions are not met yet (`replay_not_ready`):
+    /// the anchor lineage is not linked, is staging, or is below the base.
+    NotReady(&'static str),
+    /// A proof failed, named by one of [`ADOPTION_REFUSALS`]. The tail cannot come back.
+    Refused(&'static str),
+    /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
+    /// survivor's own check). The next landing scan replaces it.
+    Unchecked,
+}
+
+impl TailAdoption {
+    /// The state [`Host::adoption`]'s answer names.
+    fn of<T>(answer: &Result<T, &'static str>) -> Self {
+        match answer {
+            Ok(_) => Self::Adoptable,
+            Err(reason) if *reason == "replay_not_ready" => Self::NotReady(reason),
+            Err(reason) => Self::Refused(reason),
+        }
+    }
+
+    /// Whether a repair re-plans for this tail: only when adoption is ready.
+    #[must_use]
+    pub const fn is_adoptable(self) -> bool {
+        matches!(self, Self::Adoptable)
+    }
+
+    /// Whether this tail could come back without the operator, so giving it up must be named
+    /// (`--give-up-live-copy`). Only a failed proof cannot.
+    #[must_use]
+    pub const fn could_return(self) -> bool {
+        !matches!(self, Self::Refused(_))
+    }
+}
+
+/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first. A reason
+/// crossing the wire must be one of these.
+pub const ADOPTION_REFUSALS: [&str; 9] = [
+    "replay_not_ready",
+    "last_writable_unknown",
+    "tail_not_last_writable",
+    "tail_head_unreadable",
+    "tail_set_aside",
+    "base_digest_differs",
+    "tail_not_contiguous",
+    "anchor_lineage_differs",
+    "tail_too_long",
+];
+
+/// The most records a holder replays onto its anchor lineage to adopt a tail (issue #105, design
+/// section 5.1, assumption A6). A longer tail answers `TailHeld` and needs an operator.
+pub const ADOPT_REPLAY_MAX: u64 = 1_024;
+
+/// How a holder adopts a tail onto the anchor's lineage (issue #105, design section 5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adopt {
+    /// The copy holds no lineage at the anchor's generation: link it onto the tail's lineage at
+    /// the tail's head (`held == base`, a `Linked` inherit).
+    Link,
+    /// The copy already holds the anchor's lineage, linked, at `from` or above the base: append
+    /// the tail's records after `from` onto it.
+    Replay {
+        /// The anchor lineage's head, where the replayed records start after.
+        from: Seq,
+    },
 }
 
 /// One node's state for one partition, for `nodes` and the ready poller.
@@ -1718,6 +1808,26 @@ pub(crate) fn drop_first_caught_up(node_dir: &std::path::Path) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(node_dir.to_path_buf());
+}
+
+/// Test-only: node directories whose host's adoption proofs answer the refusal given, every
+/// time, so a row's holder keeps one adoption state whatever its tail (issue #105 unit 2,
+/// architect section 14 item 2: rows that race adoption fix their holder's state).
+#[cfg(test)]
+static REFUSE_ADOPTION: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
+
+/// Test-only: [`Host::adoption`] on the copy at `node_dir` answers `reason`, one of
+/// [`ADOPTION_REFUSALS`], from now on.
+#[cfg(test)]
+pub(crate) fn refuse_adoption(node_dir: &std::path::Path, reason: &'static str) {
+    assert!(
+        ADOPTION_REFUSALS.contains(&reason),
+        "not a refusal: {reason}"
+    );
+    REFUSE_ADOPTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), reason));
 }
 
 /// The first re-send of a landing's `CopyCaughtUp` (#59 item 4), and the cap its doubling
@@ -4867,10 +4977,16 @@ impl Host {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let step = if refused.no_mutation {
-            crate::db::error::TAIL_HELD_NEW_WRITE
-        } else {
-            crate::db::error::TAIL_HELD_RESEND
+        // Issue #105 unit 2 (design section 8.3): the step depends on whether every tail named
+        // can come back on its own.
+        let adoptable = holds
+            .iter()
+            .all(|hold| hold.refused.adoption.is_adoptable());
+        let step = match (adoptable, refused.no_mutation) {
+            (true, true) => crate::db::error::TAIL_ADOPTABLE_NEW_WRITE,
+            (true, false) => crate::db::error::TAIL_ADOPTABLE_RESEND,
+            (false, true) => crate::db::error::TAIL_HELD_NEW_WRITE,
+            (false, false) => crate::db::error::TAIL_HELD_RESEND,
         };
         refused.detail = format!("{}: {named}; {step}", refused.detail);
         refused
@@ -7077,6 +7193,22 @@ impl Host {
             _ => Vec::new(),
         };
         let answered: Vec<NodeId> = answers.iter().map(|(node, _)| *node).collect();
+        // Issue #105 unit 2 (design section 8.2): A-R383's one exception. A stalled copy that
+        // reports an adoptable tail holds nothing, since the re-plan this repair starts is what
+        // adopts it; holding would keep it `ReadOnly` for good (walk A).
+        let adoptable = |node: &NodeId| {
+            answers.iter().any(|(answered, status)| {
+                answered == node
+                    && status
+                        .tail_refused
+                        .is_some_and(|tail| tail.adoption.is_adoptable())
+            })
+        };
+        let holding: Vec<NodeId> = answered
+            .iter()
+            .copied()
+            .filter(|node| !adoptable(node))
+            .collect();
         if answered.is_empty() {
             let probes: Vec<RepairProbe> = linked
                 .iter()
@@ -7102,7 +7234,7 @@ impl Host {
         if rebuild_holds_repair(
             pinned,
             self.latest_stall.get(&partition),
-            &answered,
+            &holding,
             &members,
         ) {
             tracing::debug!(
@@ -7117,7 +7249,8 @@ impl Host {
         // #79 S4d, widened by #105: a member that answered holds a tail or an interrupted copy,
         // which no repair can take back. F1 caps any commit while that tail is held, so a repair
         // would only commit `ReadOnly` again, however many other members answer clean. It waits
-        // another hold.
+        // another hold. Issue #105 unit 2: a repair runs when every tail held is adoptable, since
+        // the re-plan's inventory adopts them (design section 10); one that is not holds it.
         let holds: Vec<TailHold> = answers
             .iter()
             .filter_map(|(node, status)| {
@@ -7130,7 +7263,11 @@ impl Host {
                 })
             })
             .collect();
-        if !holds.is_empty() {
+        if !holds.is_empty()
+            && !holds
+                .iter()
+                .all(|hold| hold.refused.adoption.is_adoptable())
+        {
             self.hold_for_tails(partition, generation, holds);
             self.repair_since.insert(partition, now);
             return;
@@ -7180,6 +7317,7 @@ impl Host {
                 head = hold.refused.head.0,
                 base = hold.refused.base.0,
                 reason = hold.refused.reason,
+                adoption = ?hold.refused.adoption,
                 "membership_repair_held"
             );
         }
@@ -8778,9 +8916,9 @@ impl Host {
     /// with what is given up; the commit follows as any re-plan's does. Refused, nothing changes:
     ///
     /// - `--through H` at or below the committed cutoff, or with no held tail to give up;
-    /// - `--through H` while a live copy reports a tail above the cutoff, unless
-    ///   `give_up_live_copy`: without adoption (unit 2) no proof exists that it could not come
-    ///   back, so giving it up must be named;
+    /// - `--through H` while a live copy reports a tail above the cutoff that could come back
+    ///   ([`TailAdoption::could_return`]: adoptable, not ready yet, or unchecked), unless
+    ///   `give_up_live_copy`. A tail whose adoption proof failed needs no flag;
     /// - `--no-intact-copy` when the intact rule did not cap this owner's last commit;
     /// - while another re-plan runs.
     fn forget_tail_asked(
@@ -8845,22 +8983,22 @@ impl Host {
         let generation = committed.new_generation;
         let epoch = committed.selected.root.owner_epoch;
         // The tails live copies report above the cutoff: members a repair probe heard, and
-        // this node's own.
-        let mut live: Vec<(NodeId, Seq)> = self
+        // this node's own, each with where it stands against adoption.
+        let mut live: Vec<(NodeId, Seq, TailAdoption)> = self
             .tail_holds
             .get(&partition)
             .into_iter()
             .flatten()
-            .map(|hold| (hold.node, hold.refused.head))
+            .map(|hold| (hold.node, hold.refused.head, hold.refused.adoption))
             .chain(
                 self.tail_refused
                     .get(&partition)
-                    .map(|refused| (self.node, refused.head)),
+                    .map(|refused| (self.node, refused.head, refused.adoption)),
             )
-            .filter(|(_, head)| *head > cutoff)
+            .filter(|(_, head, _)| *head > cutoff)
             .collect();
-        live.sort_unstable();
-        live.dedup();
+        live.sort_unstable_by_key(|(node, head, _)| (*node, *head));
+        live.dedup_by_key(|(node, head, _)| (*node, *head));
         let mut given_up = Vec::new();
         if let Some(through) = release.through {
             if through <= cutoff {
@@ -8884,7 +9022,11 @@ impl Host {
                     ),
                 );
             }
-            if let Some((node, head)) = live.first().filter(|_| !give_up_live_copy) {
+            // Unit 2 (lead ruling on the narrowing): only a tail that could come back, adoptable
+            // or not ready yet, needs giving up named. One whose adoption proof failed can
+            // restore nothing.
+            let restorable = live.iter().find(|(_, _, adoption)| adoption.could_return());
+            if let Some((node, head, _)) = restorable.filter(|_| !give_up_live_copy) {
                 return refuse(
                     InvalidArgument,
                     format!(
@@ -8934,7 +9076,10 @@ impl Host {
             through = ?release.through.map(|seq| seq.0),
             no_intact_copy = release.no_intact_copy,
             give_up_live_copy,
-            live = ?live.iter().map(|(node, head)| (node.0, head.0)).collect::<Vec<_>>(),
+            live = ?live
+                .iter()
+                .map(|(node, head, adoption)| (node.0, head.0, *adoption))
+                .collect::<Vec<_>>(),
             "forget_tail_planned"
         );
         let replan = Replan {
@@ -10414,15 +10559,17 @@ impl Host {
                 from,
                 to,
                 through,
+                through_digest,
                 credential,
             }
             | RecoveryEffect::CatchUpBeforeGrant {
                 from,
                 to,
                 through,
+                through_digest,
                 credential,
             } => {
-                self.route_catch_up(site, (*from, *to, *through), *credential);
+                self.route_catch_up(site, (*from, *to, *through, *through_digest), *credential);
                 Ok(())
             }
             RecoveryEffect::ProbeDigestAt { .. } => {
@@ -10494,7 +10641,7 @@ impl Host {
     fn route_catch_up(
         &mut self,
         site: Site,
-        (from, to, through): (CopyId, CopyId, Seq),
+        (from, to, through, through_digest): (CopyId, CopyId, Seq, Digest),
         credential: FenceCredential,
     ) {
         let Some(config) = self
@@ -10524,7 +10671,7 @@ impl Host {
             );
             return;
         };
-        let seed = DormantSeed::new(config, &credential);
+        let seed = DormantSeed::new(config, &credential, (through, through_digest));
         tracing::info!(
             node = self.node.0,
             partition = site.partition.0,
@@ -10594,6 +10741,7 @@ impl Host {
             from,
             to,
             through,
+            through_digest: seed.cutoff.1,
             credential,
         };
         self.push(site, EventKind::Kernel(kind), true, None);
@@ -10616,27 +10764,54 @@ impl Host {
     /// Nothing here faults the node (critic-d7 F5): a copy that cannot be restored is logged
     /// `dormant_restore_refused{reason}` and holds no receiver, so its catch-up is refused and
     /// F1's deadline ends the recovery with a named `Blocked`.
+    ///
+    /// The plan is kept **after** the receiver half has run (issue #105 unit 2, critic-s15 B1):
+    /// a target restore that installs or replaces a receiver would otherwise drop the plan it
+    /// had just been given, and with it the plan's cutoff the historical rule reads. A live
+    /// receiver keeps it too (#79 S3b). Never beside a serving primary: the plan would let
+    /// recovery appends into its store (A-R314, A-R323).
     fn restore_dormant(&mut self, partition: PartitionId, seed: &DormantSeed, with_history: bool) {
         let node = self.node;
         let serving = self
             .replication
             .primary(node, partition)
             .is_some_and(|primary| !primary.tracker().retired());
-        // Above the live-receiver return, which a live copy must not skip (#79 S3b). Never beside
-        // a serving primary: the plan would let recovery appends into its store (A-R314, A-R323).
+        self.restore_receiver(partition, seed, (with_history, serving));
         if !with_history && !serving {
             let plan = CatchUpPlan {
                 config: seed.config.clone(),
                 lineage: seed.lineage,
                 revision: seed.revision,
+                cutoff: seed.cutoff,
             };
             self.replication.keep_recovery_plan(node, partition, plan);
         }
+    }
+
+    /// [`Self::restore_dormant`]'s receiver half: keep a live receiver, or install or replace a
+    /// dormant one, and build a source's ladder.
+    fn restore_receiver(
+        &mut self,
+        partition: PartitionId,
+        seed: &DormantSeed,
+        (with_history, serving): (bool, bool),
+    ) {
+        let node = self.node;
         let held = self.replication.receiver(node, partition);
         // D10 (A-R398): an owner promoted from a secondary still holds that side's receiver,
         // retired by the promote's `Recovered` (B-R58a). R1 sources no catch-up from a retired
-        // receiver, so a source restore replaces it as if none were held.
-        let stale = serving && with_history && held.is_some_and(AppendReceiver::retired);
+        // receiver, so a source restore replaces it as if none were held. Issue #105 unit 2
+        // (architect section 14, M3): a primary stood down when its epoch was revoked is no longer
+        // serving, and the D10 owner is still that owner, so `stale` reads either.
+        let stood_down = self
+            .replication
+            .primary(node, partition)
+            .is_some_and(|primary| primary.tracker().stood_down().is_some());
+        // A target restore beside a stood-down primary replaces it too: that owner is the copy a
+        // catch-up must reach, and a retired receiver refuses every recovery append `NotAMember`
+        // (observed: `wc3`, the W-C owner held its G2 secondary's receiver, retired at G3).
+        let stale =
+            held.is_some_and(AppendReceiver::retired) && (stood_down || (serving && with_history));
         let dormant = held.filter(|_| !stale).map(AppendReceiver::is_dormant);
         if dormant == Some(false) {
             return;
@@ -10836,16 +11011,30 @@ impl Host {
     /// so the ladder of the generation a commit replaced is extended, not read again. Not put
     /// back: the caller does that once it has used it, so a refused read drops it and the next
     /// one rebuilds.
+    ///
+    /// `floor` is the inventory's base (issue #105, design section 5.1, M1): a kept ladder is
+    /// used only when its first rung is at or below it, and a cold one starts at the lower of
+    /// the floor and the generation's link, so an adopted lineage linked above the base still
+    /// reaches it. `ladder_duty`'s warm reads have no anchor and pass `None`.
     fn inventory_ladder(
         &mut self,
         partition: PartitionId,
         generation: Generation,
         most: u64,
+        floor: Option<Seq>,
     ) -> Result<(&'static str, KeptLadder, u64), &'static str> {
         let kept = self
             .inventory_ladders
             .remove(&partition)
-            .filter(|ladder| self.holds_tip(partition, generation, ladder));
+            .filter(|ladder| self.holds_tip(partition, generation, ladder))
+            .filter(|ladder| {
+                floor.is_none_or(|floor| {
+                    ladder
+                        .rungs
+                        .first()
+                        .is_some_and(|(first, _)| *first <= floor)
+                })
+            });
         let (how, mut ladder) = match kept {
             Some(ladder) => (
                 "extended",
@@ -10857,10 +11046,11 @@ impl Host {
             // Critic-s1b A1: a cold ladder (every one after a reopen) starts at the generation's
             // base, as the inventory reads from there; below it is never asked for.
             None => {
-                let base = self
+                let linked = self
                     .engine
                     .link(partition, generation)
                     .map_or(Seq::ZERO, |link| link.base);
+                let base = floor.map_or(linked, |floor| floor.min(linked));
                 let digest = if base == Seq::ZERO {
                     Digest::ROOT
                 } else {
@@ -10907,7 +11097,7 @@ impl Host {
             if budget == 0 {
                 break;
             }
-            match self.inventory_ladder(partition, generation, budget) {
+            match self.inventory_ladder(partition, generation, budget, None) {
                 Ok((_, ladder, read)) => {
                     budget = budget.saturating_sub(read);
                     self.inventory_ladders.insert(partition, ladder);
@@ -11362,14 +11552,42 @@ impl Host {
             // copy that answered `InventoryFailed` here was left out, and a commit then went on
             // at a cutoff below records writes may have been acknowledged on. A tail the
             // operator gave up for this run (design section 13) is not reported.
+            //
+            // Issue #105 unit 2 (design section 5.1): a tail not released is adopted when every
+            // proof holds, and the copy then reports it as an ordinary longer survivor. One that
+            // cannot be adopted answers `TailHeld`, with nothing written.
             let mut released = None;
+            let mut adopted = None;
             if let Some(hit) = self.tail_scan(partition, anchor, last_writable) {
                 match release_through.filter(|through| hit.head <= *through) {
                     Some(through) => {
                         self.tail_released(partition, copy, anchor, hit, through);
                         released = Some(hit);
                     }
-                    None => return self.tail_held(partition, copy, anchor, hit),
+                    None => match self.adopt(partition, copy, anchor, last_writable, hit) {
+                        Ok(()) => adopted = Some(hit),
+                        Err(refusal) => {
+                            tracing::warn!(
+                                node = self.node.0,
+                                partition = partition.0,
+                                copy = copy.0,
+                                generation = anchor.lineage.generation.0,
+                                from = hit.from.0,
+                                head = hit.head.0,
+                                stamp = hit.stamp.map(|stamp| stamp.0),
+                                reason = refusal,
+                                "tail_not_adoptable"
+                            );
+                            // A write that failed after the proofs held proves nothing
+                            // about the tail: it stays `Unchecked`.
+                            let adoption = if ADOPTION_REFUSALS.contains(&refusal) {
+                                TailAdoption::of::<()>(&Err(refusal))
+                            } else {
+                                TailAdoption::Unchecked
+                            };
+                            return self.tail_held(partition, copy, anchor, hit, adoption);
+                        }
+                    },
                 }
             }
             #[cfg(test)]
@@ -11384,6 +11602,32 @@ impl Host {
             // sealed parent, depth) still holds: `TailHeld`, naming the refusal, so the
             // partition stays `ReadOnly` as without the release. Its status keeps the scan's
             // reason, one of `TAIL_REFUSED_REASONS`.
+            // The same for an adopted tail the survivor then refuses (design section 3.3 item 3):
+            // never a bare `InventoryFailed` once a tail was found.
+            if let (Some(hit), Err(refusal)) = (adopted, &survived) {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    generation = anchor.lineage.generation.0,
+                    from = hit.from.0,
+                    head = hit.head.0,
+                    reason = *refusal,
+                    "tail_adopted_refused"
+                );
+                let refusal = (*refusal).to_owned();
+                return match self.tail_held(partition, copy, anchor, hit, TailAdoption::Unchecked) {
+                    RecoveryEvent::TailHeld {
+                        copy, head, stamp, ..
+                    } => RecoveryEvent::TailHeld {
+                        copy,
+                        head,
+                        stamp,
+                        reason: refusal,
+                    },
+                    other => other,
+                };
+            }
             if let (Some(hit), Err(refusal)) = (released, &survived) {
                 tracing::warn!(
                     node = self.node.0,
@@ -11396,7 +11640,7 @@ impl Host {
                     "tail_release_refused"
                 );
                 let refusal = (*refusal).to_owned();
-                return match self.tail_held(partition, copy, anchor, hit) {
+                return match self.tail_held(partition, copy, anchor, hit, TailAdoption::Unchecked) {
                     RecoveryEvent::TailHeld {
                         copy, head, stamp, ..
                     } => RecoveryEvent::TailHeld {
@@ -11623,16 +11867,33 @@ impl Host {
             base_seq: result.selected.cutoff_seq,
             base_digest: result.selected.cutoff_digest,
         };
-        let Some(hit) = self.tail_scan(partition, anchor, result.ledger.last_writable) else {
+        let last_writable = result.ledger.last_writable;
+        let Some(hit) = self.tail_scan(partition, anchor, last_writable) else {
             return;
         };
+        // Issue #105 unit 2: whether the next inventory at this generation brings the tail
+        // back. The owner's repair runs for an adoptable tail and holds for any other.
+        let answer = self.adoption(partition, anchor, last_writable, hit);
+        if let Err(refusal) = answer {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = anchor.lineage.generation.0,
+                from = hit.from.0,
+                head = hit.head.0,
+                reason = refusal,
+                "land_tail_not_adoptable"
+            );
+        }
+        let adoption = TailAdoption::of(&answer);
         // A landing that refused already named this tail with its own reason
         // (`held_past_base`); that reason is the more exact one, so it stays.
-        if self
+        if let Some(refused) = self
             .tail_refused
-            .get(&partition)
-            .is_some_and(|refused| refused.generation == anchor.lineage.generation)
+            .get_mut(&partition)
+            .filter(|refused| refused.generation == anchor.lineage.generation)
         {
+            refused.adoption = adoption;
             return;
         }
         tracing::warn!(
@@ -11644,6 +11905,7 @@ impl Host {
             head = hit.head.0,
             stamp = hit.stamp.map(|stamp| stamp.0),
             reason = hit.reason,
+            adoption = ?adoption,
             "land_tail_held"
         );
         self.tail_refused.insert(
@@ -11653,6 +11915,7 @@ impl Host {
                 head: hit.head,
                 base: anchor.base_seq,
                 reason: "tail_on_older_lineage",
+                adoption,
             },
         );
     }
@@ -11701,6 +11964,7 @@ impl Host {
         copy: CopyId,
         anchor: LineageAnchor,
         hit: TailHit,
+        adoption: TailAdoption,
     ) -> RecoveryEvent {
         tracing::warn!(
             node = self.node.0,
@@ -11712,6 +11976,7 @@ impl Host {
             head = hit.head.0,
             stamp = hit.stamp.map(|stamp| stamp.0),
             reason = hit.reason,
+            adoption = ?adoption,
             "inventory_tail_held"
         );
         self.tail_refused.insert(
@@ -11721,6 +11986,7 @@ impl Host {
                 head: hit.head,
                 base: anchor.base_seq,
                 reason: hit.reason,
+                adoption,
             },
         );
         RecoveryEvent::TailHeld {
@@ -11763,6 +12029,200 @@ impl Host {
         {
             self.tail_refused.remove(&partition);
         }
+    }
+
+    /// Issue #105 unit 2 (design section 5.1): whether `hit` can be adopted onto `anchor`'s
+    /// lineage, and how. Reads only; nothing is written. In order:
+    ///
+    /// * P3: L is known and the head record is stamped L. A head stamped otherwise, or
+    ///   unreadable, or L unknown, is not usable.
+    /// * Not set aside: a released run (section 13) sealed the tail's lineage under a `Copied`
+    ///   child based below the head. The operator gave that tail up.
+    /// * P1: the digest at the anchor's base on the tail's chain is the anchor's.
+    /// * P2: every record from the base through the head reads, verifies, and chains from that
+    ///   digest ([`Self::chain`]).
+    /// * No lineage at the anchor's generation: [`Adopt::Link`]. One held (walk A's shape):
+    ///   [`Adopt::Replay`], only when it is linked and not staging, its head is at or above the
+    ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first
+    ///   record replayed names its head's digest as `prev_digest` (N1). A lineage not yet linked
+    ///   or below the base is `replay_not_ready`, which a later generation's landing can end.
+    fn adoption(
+        &self,
+        partition: PartitionId,
+        anchor: LineageAnchor,
+        last_writable: Option<Generation>,
+        hit: TailHit,
+    ) -> Result<Adopt, &'static str> {
+        #[cfg(test)]
+        if let Some(reason) = REFUSE_ADOPTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(dir, _)| self.engine.path().starts_with(dir))
+            .map(|(_, reason)| *reason)
+        {
+            return Err(reason);
+        }
+        let l = last_writable.ok_or("last_writable_unknown")?;
+        match hit.stamp {
+            Some(stamp) if stamp == l => {}
+            Some(_) => return Err("tail_not_last_writable"),
+            None => return Err("tail_head_unreadable"),
+        }
+        if let Some(child) = self.engine.sealed_by(partition, hit.from) {
+            if self
+                .engine
+                .link(partition, child)
+                .is_some_and(|link| link.copied && link.base < hit.head)
+            {
+                return Err("tail_set_aside");
+            }
+        }
+        let base = anchor.base_seq;
+        let at_base = if base == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, hit.from, base)
+                .map_err(|_| "base_digest_differs")?
+                .1
+        };
+        if at_base != anchor.base_digest {
+            return Err("base_digest_differs");
+        }
+        self.chain(partition, hit.from, base, anchor.base_digest, hit.head)?;
+        let to = anchor.lineage.generation;
+        if !self.engine.generations(partition).contains(&to) {
+            return Ok(Adopt::Link);
+        }
+        if self.engine.staging(partition, to).is_some() || self.engine.link(partition, to).is_none()
+        {
+            return Err("replay_not_ready");
+        }
+        let from = Seq(self.engine.buffered_applied(partition, to).0);
+        if from < base {
+            return Err("replay_not_ready");
+        }
+        if from >= hit.head {
+            return Err("anchor_lineage_differs");
+        }
+        if hit.head.0 - from.0 > ADOPT_REPLAY_MAX {
+            return Err("tail_too_long");
+        }
+        let at_head = if from == Seq::ZERO {
+            Digest::ROOT
+        } else {
+            self.checked(partition, to, from)
+                .map_err(|_| "replay_not_ready")?
+                .1
+        };
+        let (first, _) = self
+            .checked(partition, hit.from, Seq(from.0 + 1))
+            .map_err(|_| "tail_not_contiguous")?;
+        let first = ReplicationEnvelope::decode(&first).map_err(|_| "tail_not_contiguous")?;
+        if first.prev_digest != at_head {
+            return Err("anchor_lineage_differs");
+        }
+        Ok(Adopt::Replay { from })
+    }
+
+    /// Issue #105 unit 2 (design section 5.1): adopt `hit` onto `anchor`'s lineage when
+    /// [`Self::adoption`] allows it, and log `tail_adopted`. A refusal answers its reason and
+    /// writes nothing. [`Adopt::Link`] links the anchor's generation onto the tail's lineage at
+    /// its head (`inherit` repeats as `AlreadyInherited`). [`Adopt::Replay`] appends each record
+    /// after the anchor lineage's head as the receiver's own batch would
+    /// ([`record_batch`]); a crash leaves a contiguous prefix and the next run resumes from it.
+    /// Either way a receiver held here is removed (N2): a catch-up this copy sources then restores a
+    /// dormant receiver with a full ladder from the engine.
+    fn adopt(
+        &mut self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+        last_writable: Option<Generation>,
+        hit: TailHit,
+    ) -> Result<(), &'static str> {
+        let how = self.adoption(partition, anchor, last_writable, hit)?;
+        let to = anchor.lineage.generation;
+        self.views.remove(&partition);
+        let how = match how {
+            Adopt::Link => match self.engine.inherit(partition, hit.from, to, hit.head) {
+                Ok(_) => "link",
+                Err(_) => return Err("adopt_link_refused"),
+            },
+            Adopt::Replay { from } => {
+                for seq in from.0 + 1..=hit.head.0 {
+                    let (record, _) = self.checked(partition, hit.from, Seq(seq))?;
+                    let envelope =
+                        ReplicationEnvelope::decode(&record).map_err(|_| "undecodable")?;
+                    let batch = record_batch(BatchId(0), partition, to, &envelope, record);
+                    self.engine
+                        .commit(batch)
+                        .map_err(|_| "replay_write_failed")?;
+                }
+                "replay"
+            }
+        };
+        // N2, for both branches: a receiver held here, live or dormant, was anchored at or below
+        // the base (a `Recovered` re-anchors on `DigestLadder::at_or_below`), so it vouches for
+        // nothing past it, and a catch-up this copy is asked to source through the adopted head
+        // is refused `NotASource`. Removed, `source_catch_up` restores a dormant receiver with a
+        // full ladder from the engine, which now holds the tail.
+        let held = self
+            .replication
+            .receiver(self.node, partition)
+            .map(AppendReceiver::is_dormant);
+        if let Some(dormant) = held {
+            self.replication.remove_receiver(self.node, partition);
+            self.ladders.remove(&partition);
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = to.0,
+                dormant,
+                "adopt_receiver_dropped"
+            );
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            from = hit.from.0,
+            to = to.0,
+            base = anchor.base_seq.0,
+            head = hit.head.0,
+            stamp = hit.stamp.map(|stamp| stamp.0),
+            how,
+            "tail_adopted"
+        );
+        self.tail_refused.remove(&partition);
+        Ok(())
+    }
+
+    /// Verify the records after `base` through `head` on `generation`'s chain (issue #105, P2):
+    /// each reads and verifies ([`Self::checked`]), and names the digest before it as its
+    /// `prev_digest`, starting at `base_digest`. A gap, an unreadable record or a broken link is
+    /// `tail_not_contiguous`.
+    fn chain(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        base: Seq,
+        base_digest: Digest,
+        head: Seq,
+    ) -> Result<(), &'static str> {
+        let mut prev = base_digest;
+        for seq in base.0 + 1..=head.0 {
+            let (record, digest) = self
+                .checked(partition, generation, Seq(seq))
+                .map_err(|_| "tail_not_contiguous")?;
+            let envelope =
+                ReplicationEnvelope::decode(&record).map_err(|_| "tail_not_contiguous")?;
+            if envelope.prev_digest != prev {
+                return Err("tail_not_contiguous");
+            }
+            prev = digest;
+        }
+        Ok(())
     }
 
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
@@ -11813,8 +12273,18 @@ impl Host {
             .engine
             .link(partition, generation)
             .ok_or("anchor_generation_unlinked")?;
+        // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
+        // tail's. It passes only when the chain from the base through the link verifies, record
+        // by record, from the anchor's digest; anything else is refused as before.
         if link.base > anchor.base_seq {
-            return Err("base_differs");
+            self.chain(
+                partition,
+                generation,
+                anchor.base_seq,
+                anchor.base_digest,
+                link.base,
+            )
+            .map_err(|_| "base_differs")?;
         }
         let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
             if seq == Seq::ZERO {
@@ -11832,7 +12302,8 @@ impl Host {
         }
         // A-R461: the kept ladder, extended through the head, not a fresh read of every record.
         let started = Instant::now();
-        let (how, kept, read) = self.inventory_ladder(partition, generation, u64::MAX)?;
+        let (how, kept, read) =
+            self.inventory_ladder(partition, generation, u64::MAX, Some(anchor.base_seq))?;
         let first = kept.rungs.first().map_or(0, |(seq, _)| seq.0);
         let from = anchor
             .base_seq
@@ -11913,6 +12384,7 @@ impl Host {
                     head,
                     base,
                     reason: "missed_generation_held_past_base",
+                    adoption: TailAdoption::Unchecked,
                 },
             );
             return Err("missed_generation_held_past_base");
@@ -12014,6 +12486,7 @@ impl Host {
                     head,
                     base,
                     reason: "held_past_base",
+                    adoption: TailAdoption::Unchecked,
                 },
             );
             return Err("held_past_base");
@@ -13094,6 +13567,7 @@ impl Host {
                     head: Seq(self.engine.buffered_applied(partition, parent).0),
                     base,
                     reason: "interrupted_copy",
+                    adoption: TailAdoption::Unchecked,
                 });
             }
         }

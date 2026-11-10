@@ -1787,7 +1787,8 @@ fn select(
         return block(BlockReason::NoEligibleRegular, emit);
     };
     let credential = collect.proof.credential_for(selected.source);
-    let (from, through) = (selected.source, selected.cutoff_seq);
+    let (from, through, through_digest) =
+        (selected.source, selected.cutoff_seq, selected.cutoff_digest);
     let mut awaiting = BTreeSet::new();
     let mut catch_ups = BTreeMap::new();
     for &to in &required {
@@ -1797,6 +1798,7 @@ fn select(
                     from,
                     to,
                     through,
+                    through_digest,
                     credential,
                 }
             } else {
@@ -1804,6 +1806,7 @@ fn select(
                     from,
                     to,
                     through,
+                    through_digest,
                     credential,
                 }
             };

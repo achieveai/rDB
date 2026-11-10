@@ -493,6 +493,10 @@ fn s5d_42_barrier_latency_at_256_partitions_per_node() {
 /// cutoff below K2. Node 3 is linked again and its landing refuses `held_past_base`. Before S4d
 /// this loop committed `ReadOnly` every 5 to 60 s for good. Now node 2 holds the repair and names
 /// the copy and reason once, and for 30 s nothing recommits.
+/// Issue #105 unit 2: K2 is stamped by the last writable generation, so with its proofs holding
+/// node 3 adopts it and the hold ends (W-C's outcome). Node 3's proofs are fixed to fail
+/// (`tail_not_contiguous`, `crate::host::refuse_adoption`) and its status says so, so the row's
+/// subject stays the hold.
 /// Cut: remove the hold in `repair_duty`, red (more repairs, generation moves within 30 s).
 /// Integration (~50 s): the grant wait, the promote, and the 30 s window.
 #[config_log::retcd_test]
@@ -502,6 +506,7 @@ fn s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting() {
     let store = store();
     let dir = config_testkit::fs::temp_dir();
     let patience = crate::host::test_patience(Duration::from_secs(60));
+    crate::host::refuse_adoption(&dir.path().join("nodes").join("3"), "tail_not_contiguous");
     let mut formed = opened(&rt, dir.path(), &store);
     formed.shutdown();
     drop(formed);
@@ -552,6 +557,11 @@ fn s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting() {
     };
     assert!(tail.head.0 >= k2.seq.0, "{tail:?} {k2:?}");
     assert!(tail.base.0 < tail.head.0, "{tail:?}");
+    assert_eq!(
+        tail.adoption,
+        crate::host::TailAdoption::Refused("tail_not_contiguous"),
+        "{tail:?}"
+    );
     let held = |reason: &str| {
         config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
@@ -607,13 +617,24 @@ fn s4d_a_lone_survivor_with_a_tail_holds_its_repair_and_stops_recommitting() {
 
 /// #105 W-C, walk C's schedule: K2 is acknowledged `BufferedOnTwo` on nodes 1 and 3 only, the
 /// operator promotes node 2 (which lacks it), node 3 returns live and still holds K2, and node 1
-/// comes back with its data gone. Before the guard the partition went writable at G5 with cutoff
-/// below K2: K2 read absent, and the next write took K2's seq, while node 3 held K2 and no error
-/// reached a client. Now no generation goes writable while node 3 answers.
-/// Cut: `Recovery`'s `mode_after` answers `mode_for`, red (the put is accepted at K2's seq).
-/// Integration (~45 s): the grant wait, the promote, a reopen and the window a repair would use.
+/// comes back with its data gone. Before the guard the partition went writable with cutoff below
+/// K2: K2 read absent, and the next write took K2's seq. Unit 1 held it `ReadOnly` for good while
+/// node 3 answered. Unit 2 (design section 9.2, "After unit 2"): node 3 adopts K2 automatically,
+/// the commit is writable at cutoff K2, K2 reads `two`, the next write takes the seq after K2,
+/// and K2's own request sent again replays its answer instead of applying twice (A9).
+/// Critic-s15 M3: K2's resend answers `GENERATION_CHANGED`, and the next put lands at the seq
+/// after the first put. That is neither a lost nor a duplicated write. Not lost: K2 reads `two`
+/// at its own seq, adopted with the record its client was acknowledged for. Not duplicated: the
+/// pinned resend is stopped by the generation fence, and the unpinned one by Dedup, which still
+/// holds K2's row under K2's generation and answers it as spec section 8.1 says for an older
+/// generation's row, never executing it again; no seq is taken, which the next put's seq proves.
+/// The client learns K2's outcome by reading it, as `GENERATION_CHANGED` tells it to.
+/// Cut: the holder never adopts (`Host::adoption` answers its refusal), red (no put).
+/// Integration (~45 s): the grant wait, the promote, a reopen and the repair's window.
 #[config_log::retcd_test]
-fn w_c_a_write_acked_on_two_copies_is_not_lost_while_a_live_copy_holds_it() {
+fn w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it() {
+    const METHOD: &str =
+        "w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it";
     let rt = runtime();
     let store = store();
     let dir = config_testkit::fs::temp_dir();
@@ -658,11 +679,28 @@ fn w_c_a_write_acked_on_two_copies_is_not_lost_while_a_live_copy_holds_it() {
     app.promote(NodeId(2), None).expect("the promote commits");
     links.heal(NodeId(2), NodeId(3));
 
-    let status_of = |db: &Db| db.node_status().into_iter().next().expect("its own status");
+    // Node 3 has heard of the promote: it refused the landing, or it already adopted K2.
     let deadline = Instant::now() + patience;
     let three = nodes[2].as_ref().expect("node 3");
-    while status_of(three).tail_refused.is_none() {
-        assert!(Instant::now() < deadline, "node 3 reported no refusal");
+    let adopted_on = |node: u64| {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "tail_adopted" && line["node"] == node)
+            .count()
+    };
+    while three
+        .node_status()
+        .into_iter()
+        .next()
+        .expect("its own status")
+        .tail_refused
+        .is_none()
+        && adopted_on(3) == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "node 3 heard nothing of the promote"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -692,35 +730,78 @@ fn w_c_a_write_acked_on_two_copies_is_not_lost_while_a_live_copy_holds_it() {
         .expect("the node hears the boot");
     }
 
-    // The walk wrote on its first try, about 5 s after the return. Give it 20 s.
-    let window = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
-    let mut last = None;
-    while Instant::now() < window {
-        match app.put(b"after", b"v", None) {
-            Ok(put) => panic!(
-                "a write resumed at {:?} seq {:?} while node 3 holds k2 at seq {:?} (k2 reads {:?})",
-                put.generation,
-                put.seq,
-                k2.seq,
-                app.get(b"k2").map(|got| got.value),
-            ),
-            Err(error) => last = Some(error),
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let refused = last.expect("the window saw at least one put");
+    let put = first_put(&app, crate::host::test_patience(Duration::from_secs(30)))
+        .expect("writes come back once node 3 adopts k2");
     assert_eq!(
-        refused.error.kind,
-        ErrorKind::RecoveryReadOnly,
-        "{refused:?}"
+        put.seq,
+        Seq(k2.seq.0 + 1),
+        "the next write follows k2: {put:?}"
     );
-    let text = refused.error.explain();
-    assert!(text.contains("on node 3"), "{text}");
+    assert!(put.generation > k2.generation, "{put:?}");
+    assert_eq!(
+        app.get(b"k2")
+            .expect("k2 reads")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"two")),
+        "k2 came back"
+    );
+    assert_eq!(
+        app.get(b"k1")
+            .expect("k1 reads")
+            .value
+            .map(|(_, value)| value),
+        Some(Bytes::from_static(b"one")),
+        "k1 kept"
+    );
+    assert!(adopted_on(3) >= 1, "node 3 logged tail_adopted");
+    // A9 and critic-s15 M3: k2's own request, sent again, writes no second seq. Pinned to the
+    // generation it was sent under, the generation fence may answer first, with the documented
+    // `GENERATION_CHANGED` ("this send wrote nothing"); otherwise Dedup replays k2's answer.
+    match app.resend((*k2.sent).clone()) {
+        Ok(again) => assert_eq!(again.seq, k2.seq, "replayed, not applied again: {again:?}"),
+        Err(refused) => assert_eq!(
+            refused.error.kind,
+            ErrorKind::GenerationChanged,
+            "{refused:?}"
+        ),
+    }
+    // Unpinned (the pin is not in the request digest), the same request passes the generation
+    // fence and reaches Dedup, which must hold k2's row across the adoption. A row retained by
+    // an older generation is never re-executed and never replayed transparently (spec §8.1,
+    // `TransactionQueue::head` step 11): it answers `GENERATION_CHANGED` naming the generation
+    // that retained it, k2's. Without the row this send would be applied again, at a new seq.
+    let unpinned = TxnRequest {
+        expected_generation: None,
+        ..(*k2.sent).clone()
+    };
+    let retained = app
+        .resend(unpinned)
+        .expect_err("Dedup answers k2's unpinned resend from its older generation");
+    assert_eq!(
+        retained.error.kind,
+        ErrorKind::GenerationChanged,
+        "{retained:?}"
+    );
+    assert!(
+        retained
+            .error
+            .detail
+            .contains(&format!("expected {:?}", k2.generation)),
+        "Dedup's older-generation answer names k2's generation: {retained:?}"
+    );
+    let next = app.put(b"later", b"v", None).expect("a later write");
+    assert_eq!(next.seq, Seq(put.seq.0 + 1), "the resend took no seq");
 }
 
 /// Walk C's held state, as the W-C row builds it, for the issue #105 section 13 rows: K2
 /// acknowledged on nodes 1 and 3 only, node 2 promoted without it, node 3 live and refusing its
 /// tail, node 1 cut off from both. Answers the app, the nodes, the links and K2.
+///
+/// Issue #105 unit 2: K2 is a sound tail stamped by the last writable generation, so node 3
+/// would adopt it and the held state would end before a row could release it. Every holder's
+/// proofs are fixed to fail (`tail_not_contiguous`, `crate::host::refuse_adoption`): nodes 1 and
+/// 3, the two that hold K2.
 fn walk_c_held(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
@@ -728,6 +809,9 @@ fn walk_c_held(
     app_dir: &Path,
     patience: Duration,
 ) -> (Db, Vec<Option<Db>>, Arc<Links>, PutOk) {
+    for node in ["1", "3"] {
+        crate::host::refuse_adoption(&dir.join("nodes").join(node), "tail_not_contiguous");
+    }
     let mut formed = opened(rt, dir, store);
     formed.shutdown();
     drop(formed);
@@ -846,7 +930,9 @@ fn recovered_modes(method: &str, node: u32) -> Vec<String> {
 /// (node 2) and node 3 the only copies that answer, node 3 refusing K2's tail. `forget-tail
 /// --through K2 --give-up-live-copy` re-plans; node 3 is told the release, copies at the base
 /// and reports, so the commit is writable on two copies, L moves, and the next write takes K2's
-/// seq. K1 is kept. Cut: the owner sends no `release_through`, red (ReadOnly by count, no put).
+/// seq. K1 is kept. Node 3's adoption proofs are fixed to fail (`walk_c_held`), so it does not
+/// bring K2 back before the release. Cut: the owner sends no `release_through`, red (ReadOnly by
+/// count, no put).
 /// Integration (~45 s): the grant wait, the promote and the re-plan.
 #[config_log::retcd_test]
 fn issue105_forget_tail_with_the_holder_the_only_other_copy_resumes_writes() {
@@ -888,13 +974,14 @@ fn issue105_forget_tail_with_the_holder_the_only_other_copy_resumes_writes() {
 /// Walk C's held state, then walk A: node 1, the old owner, comes back on its own data and
 /// lands holding K2 on an older lineage beside the anchor, while node 3 still holds K2 on the
 /// generation it missed. One `forget-tail --through K2 --give-up-live-copy` releases both:
-/// node 1 reports its anchor lineage with nothing written, node 3 copies at the base, and the
-/// commit is writable. Cut: the owner sends no `release_through`, red (no put).
+/// node 1 reports its anchor lineage with nothing written, node 3 copies at the base, both log
+/// `tail_released`, and the commit is writable. Both holders' adoption proofs are fixed to fail
+/// (`walk_c_held`), so neither brings K2 back before the release.
+/// Cut: the owner sends no `release_through`, red (no put).
 /// Integration (~60 s): the grant wait, the promote, a restart and the re-plan.
 #[config_log::retcd_test]
-fn issue105_forget_tail_releases_two_live_holders_together_and_writes_resume() {
-    const METHOD: &str =
-        "issue105_forget_tail_releases_two_live_holders_together_and_writes_resume";
+fn issue105_forget_tail_tells_both_live_holders_and_writes_resume() {
+    const METHOD: &str = "issue105_forget_tail_tells_both_live_holders_and_writes_resume";
     let rt = runtime();
     let store = store();
     let dir = config_testkit::fs::temp_dir();

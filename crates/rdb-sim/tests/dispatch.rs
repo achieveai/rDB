@@ -2037,6 +2037,7 @@ fn provider_no_recovery_request_is_recorded_as_a_fact() {
                 from: CopyId(1),
                 to: CopyId(2),
                 through: Seq(1),
+                through_digest: digest(1),
                 credential,
             },
             refused,
@@ -2046,6 +2047,7 @@ fn provider_no_recovery_request_is_recorded_as_a_fact() {
                 from: CopyId(1),
                 to: CopyId(2),
                 through: Seq(1),
+                through_digest: digest(1),
                 credential,
             },
             refused,
@@ -6741,12 +6743,14 @@ fn provider_catch_up_goes_to_the_node_holding_its_source() {
             from: CopyId(1),
             to: CopyId(2),
             through: Seq(2),
+            through_digest: digest(2),
             credential,
         },
         RecoveryEffect::CatchUpBeforeGrant {
             from: CopyId(1),
             to: CopyId(2),
             through: Seq(2),
+            through_digest: digest(2),
             credential,
         },
     ];
@@ -6776,6 +6780,7 @@ fn provider_catch_up_goes_to_the_node_holding_its_source() {
                 from: CopyId(1),
                 to: CopyId(2),
                 through: Seq(2),
+                through_digest: digest(2),
                 credential,
             }),
             "{request:?}"
@@ -6821,6 +6826,7 @@ fn provider_catch_up_goes_to_the_node_holding_its_source() {
         from: CopyId(3),
         to: CopyId(2),
         through: Seq(2),
+        through_digest: digest(2),
         credential: catch_up_credential(3),
     };
     assert_eq!(
@@ -6995,6 +7001,7 @@ fn provider_a_refused_catch_up_leaves_no_asker_behind() {
                     from: CopyId(1),
                     to: CopyId(2),
                     through: Seq(2),
+                    through_digest: digest(2),
                     credential: catch_up_credential(1),
                 }),
             )],
@@ -7104,6 +7111,7 @@ fn ask_for_catch_up(runner: &mut Runner) {
                     from: CopyId(1),
                     to: CopyId(2),
                     through: Seq(2),
+                    through_digest: digest(2),
                     credential,
                 })),
             }],

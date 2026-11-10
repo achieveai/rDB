@@ -363,6 +363,8 @@ pub enum KernelEvent {
         to: CopyId,
         /// Catch up through this position: a `Seq`.
         through: Seq,
+        /// The selected digest at `through` (issue #105 unit 2, architect section 15.3).
+        through_digest: Digest,
         /// Minted with `sender == from` (K-B-42).
         credential: FenceCredential,
     },

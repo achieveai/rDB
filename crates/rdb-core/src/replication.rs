@@ -292,6 +292,7 @@ impl Module for Replication {
             to,
             through,
             credential,
+            ..
         }) = &event.kind
         {
             let mut kinds = self.catch_up(key, *from, *to, *through, *credential);

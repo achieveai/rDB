@@ -896,21 +896,35 @@ fn a_missed_generation_is_not_linked_unless_held_exactly_through_the_base() {
     }
 }
 
+/// A chain of `n` records in generation 1 whose head does not chain from the record below it, so
+/// adoption refuses that tail, `tail_not_contiguous` (P2, design section 5.3). Seqs 1 to `n - 1`
+/// are [`write_chain`]'s. Answers every digest, `[0]` at seq 1.
+fn write_unchained_head(path: &std::path::Path, n: u64) -> Vec<Digest> {
+    let mut engine = RocksEngine::open(path).expect("open engine");
+    let mut below = write_chain(&mut engine, Generation(1), n - 1);
+    let mut wrong = below.clone();
+    *wrong.last_mut().expect("a record below the head") = Digest([9; 32]);
+    let head = *super::trio::write_chain_after(&mut engine, Generation(1), wrong, 1)
+        .last()
+        .expect("the head");
+    below.push(head);
+    below
+}
+
 /// Issue #105 (design section 7, "add one with L set"): with the last writable generation L
 /// known, the same tail is judged by its head's stamp. Stamped L (here generation 1) it is
 /// current and answers `TailHeld`. With L at generation 2 it is superseded: a writable commit
 /// went on past it, so it is today's refusal, a bare `InventoryFailed`. Nothing is written
-/// either way. Cut: `tail_scan` keeps a head stamped below L, red (the second answer is
-/// `TailHeld`).
+/// either way. Unit 2 (design section 5.1) adopts a current tail whose proofs hold, so this
+/// tail's head is planted not chaining from the record below it: adoption refuses it, and the
+/// copy's status says `tail_not_contiguous`. The adopted outcome on a sound tail is
+/// `u2_a_current_tail_whose_proofs_hold_is_linked_at_its_head_and_reported`.
+/// Cut: `tail_scan` keeps a head stamped below L, red (the second answer is `TailHeld`).
 #[test]
 fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generation() {
     let dir = config_testkit::fs::temp_dir();
     let path = dir.path().join("node");
-    let digests = write_chain(
-        &mut RocksEngine::open(&path).expect("open engine"),
-        Generation(1),
-        3,
-    );
+    let digests = write_unchained_head(&path, 3);
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
     let held = host.engine.lineages();
@@ -926,6 +940,13 @@ fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generatio
         "stamped L: current"
     );
     assert_eq!(
+        host.tail_refused
+            .get(&PartitionId(1))
+            .map(|refused| refused.adoption),
+        Some(TailAdoption::Refused("tail_not_contiguous")),
+        "the status names why it is not adopted"
+    );
+    assert_eq!(
         host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2)), None),
         RecoveryEvent::InventoryFailed { copy: CopyId(1) },
         "stamped below L: superseded"
@@ -933,12 +954,56 @@ fn a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generatio
     assert_eq!(host.engine.lineages(), held, "nothing written");
 }
 
+/// Issue #105 unit 2 (design section 5.1, the Link branch): the shape of
+/// `a_tail_past_the_base_is_held_only_when_stamped_by_the_last_writable_generation` with a sound
+/// tail. Stamped below L it is superseded, `InventoryFailed`, nothing written. Stamped L its
+/// proofs hold, so the copy, which never held the anchor's generation, links it at the tail's
+/// head and reports that head, holding L.
+/// Cut: `Host::adoption` answers its refusal for every tail, red (the second answer is
+/// `TailHeld`).
+#[test]
+fn u2_a_current_tail_whose_proofs_hold_is_linked_at_its_head_and_reported() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    let anchor = anchor_at(2, 2, digests[1]);
+    assert_eq!(
+        host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(2)), None),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+        "stamped below L: superseded"
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+    match host.inventory(PartitionId(1), CopyId(1), anchor, Some(Generation(1)), None) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]), "stamped L: adopted");
+            assert!(inventory.holds_last_writable, "{inventory:?}");
+        }
+        other => panic!("stamped L: adopted and reported, not {other:?}"),
+    }
+    assert_eq!(
+        host.engine
+            .link(PartitionId(1), Generation(2))
+            .map(|link| (link.parent, link.base)),
+        Some((Generation(1), Seq(3))),
+        "linked at the tail's head"
+    );
+}
+
 /// Issue #105 (design section 3.3): a copy that holds the anchor's generation at the base, and
 /// past it on an older lineage, holds a tail there: `TailHeld` with `tail_on_older_lineage`,
 /// stamped generation 1, whether L is that generation or unknown. Stamped below L it is
 /// superseded and the copy reports. The control: the anchor's lineage holds the same record at
-/// that head (linked there), so there is no tail and the copy answers its own refusal, not
-/// `TailHeld`. And N3(a): a normal recovery's copy holds
+/// that head (linked there), so there is no tail and the answer is not `TailHeld`. That is the
+/// shape an adopted tail leaves (unit 2, design section 5.1 M1): the chain from the anchor's base
+/// through the link verifies, so the copy reports its head. Before unit 2 it answered its own
+/// refusal, `InventoryFailed`. And N3(a): a normal recovery's copy holds
 /// no tail and reports, holding L intact. Cuts: `tail_scan` skips a lineage while the anchor is
 /// held, red (the first answer reports); the same-digest check removed, red (the control is
 /// `TailHeld`).
@@ -985,7 +1050,7 @@ fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_he
     drop(host);
 
     // The anchor's lineage holds the same record at the old lineage's head (linked there, past
-    // the base): no tail. The copy then fails on its own refusal, not `TailHeld`.
+    // the base): no tail. That is an adopted tail's shape, so the copy reports its head.
     let shared = dir.path().join("shared");
     let digests = {
         let mut engine = RocksEngine::open(&shared).expect("open engine");
@@ -996,17 +1061,20 @@ fn issue105_a_tail_on_an_older_lineage_beside_the_anchor_is_held_and_a_shared_he
         digests
     };
     let mut host = host_over(&shared, &rt);
-    assert_eq!(
-        host.inventory(
-            PartitionId(1),
-            CopyId(1),
-            anchor_at(2, 3, digests[2]),
-            Some(Generation(1)),
-            None,
+    match host.inventory(
+        PartitionId(1),
+        CopyId(1),
+        anchor_at(2, 3, digests[2]),
+        Some(Generation(1)),
+        None,
+    ) {
+        RecoveryEvent::InventoryReported(inventory) => assert_eq!(
+            inventory.head,
+            (Seq(5), digests[4]),
+            "the same record at the head is no tail: the copy reports it"
         ),
-        RecoveryEvent::InventoryFailed { copy: CopyId(1) },
-        "the same record at the head is no tail"
-    );
+        other => panic!("the same record at the head is no tail: {other:?}"),
+    }
     drop(host);
 
     // N3(a): a normal recovery's copy, linked at the base, holds no tail and reports, holding
@@ -1109,6 +1177,7 @@ fn issue105_a_copy_holding_a_tail_withholds_its_post_commit_proof() {
         head: Seq(head),
         base: Seq(3),
         reason: "tail_on_older_lineage",
+        adoption: TailAdoption::Unchecked,
     };
     // `write_chain` publishes no durability, so every answer here is withheld; the reason
     // says which check withheld it.
@@ -1269,10 +1338,18 @@ fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
         partition: PartitionId(1),
         correlation: CorrelationId(u64::MAX),
     };
+    let through_digest = trio.nodes[1]
+        .0
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("node 2's receiver")
+        .applied_head()
+        .digest;
     let effect = RecoveryEffect::CatchUp {
         from: CopyId(1),
         to: CopyId(2),
         through,
+        through_digest,
         credential,
     };
     trio.nodes[0]
@@ -1829,6 +1906,7 @@ fn a_target_restore_beside_a_serving_primary_installs_nothing() {
             owner_epoch: OwnerEpoch(1),
         },
         revision: Revision(1),
+        cutoff: (Seq::ZERO, Digest::ROOT),
     };
     let one = &mut trio.nodes[0].0;
     let serving = one
@@ -1904,6 +1982,7 @@ fn m10_s2_mat2_a_retired_receiver_beside_a_serving_primary_is_replaced_for_a_sou
             owner_epoch: OwnerEpoch(1),
         },
         revision: Revision(1),
+        cutoff: (Seq::ZERO, Digest::ROOT),
     };
     let one = &mut trio.nodes[0].0;
     assert!(
@@ -2055,6 +2134,7 @@ fn s3b_9_a_target_restore_keeps_the_latest_plan_on_a_live_and_a_dormant_receiver
                 owner_epoch: OwnerEpoch(1),
             },
             revision: Revision(1),
+            cutoff: (Seq::ZERO, Digest::ROOT),
         }
     };
     let held_boot = |two: &Host| {
@@ -2117,6 +2197,79 @@ fn s3b_9_a_target_restore_keeps_the_latest_plan_on_a_live_and_a_dormant_receiver
         source.recovery_plan().is_none(),
         "a target restore gave a plan to the receiver beside a serving primary"
     );
+}
+
+/// Issue #105 unit 2, critic-s15 B1: the receiver a target restore installs holds the plan. On
+/// a node holding no receiver, `restore_dormant` installs a dormant one, and that receiver's
+/// plan names the credential the seed came from (prior generation, prior epoch, control
+/// revision) and carries the seed's cutoff, so section 15.3's plan rule applies to the
+/// catch-up that follows. Before B1 the plan was kept before the install, on no receiver, and
+/// the receiver the catch-up reached held none.
+/// Cut: the plan kept before `restore_receiver`, red (no plan).
+/// Integration (~3 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn u2_b1_a_target_restore_installs_a_receiver_holding_the_plan_and_its_cutoff() {
+    use rdb_core::contracts::ids::Revision;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let committed = trio.until("node 1 committed", |trio| {
+        trio.nodes[0].0.committed.get(&PartitionId(1)).cloned()
+    });
+    let credential = FenceCredential {
+        partition: PartitionId(1),
+        prior_generation: committed.new_generation,
+        prior_owner_epoch: OwnerEpoch(1),
+        control_revision: Revision(1),
+        sender: CopyId(0),
+    };
+    let cutoff = (Seq(7), Digest([7; 32]));
+    let seed = DormantSeed::new(
+        committed.committed.pinned_config.clone(),
+        &credential,
+        cutoff,
+    );
+    // Node 2's store holds the seed's generation once its receiver is live.
+    trio.until("node 2 holds a live receiver", |trio| {
+        trio.nodes[1]
+            .0
+            .replication
+            .receiver(NodeId(2), PartitionId(1))
+            .filter(|held| !held.is_dormant())
+            .map(|_| ())
+    });
+    let two = &mut trio.nodes[1].0;
+    two.replication.forget_node(NodeId(2));
+    assert!(
+        two.replication
+            .receiver(NodeId(2), PartitionId(1))
+            .is_none(),
+        "control: node 2 holds no receiver"
+    );
+
+    two.restore_dormant(PartitionId(1), &seed, false);
+    let receiver = two
+        .replication
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("the target restore installs a dormant receiver");
+    assert!(receiver.is_dormant());
+    let plan = receiver
+        .recovery_plan()
+        .expect("the installed receiver holds the plan");
+    assert_eq!(
+        (
+            plan.lineage.generation,
+            plan.lineage.owner_epoch,
+            plan.revision
+        ),
+        (
+            credential.prior_generation,
+            credential.prior_owner_epoch,
+            credential.control_revision
+        ),
+        "the plan names the credential"
+    );
+    assert_eq!(plan.cutoff, cutoff, "the plan carries the cutoff");
 }
 
 /// Issue #105 (design section 8.1): `admin forget-tail` on the owner. Each refusal is
@@ -2185,6 +2338,7 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
             head: Seq(cutoff.0 + 3),
             base: cutoff,
             reason: "tail_on_older_lineage",
+            adoption: TailAdoption::Unchecked,
         },
     );
     refused(
@@ -2236,6 +2390,103 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
         .filter(|line| line["node"] == 1)
         .count();
     assert_eq!(refusals, 5, "node 1 refused five times");
+}
+
+/// Issue #105 unit 2 (lead ruling on the forget-tail narrowing, architect section 14 item 2):
+/// `--give-up-live-copy` is needed only for a live tail that could come back. Planted on the
+/// owner's status, one state at a time: `Adoptable`, `NotReady` and `Unchecked` each refuse a
+/// bare `--through` by name. A `Refused` own tail beside a member's `NotReady` hold is refused
+/// too, naming that member. A `Refused` tail alone (a failed proof, here `base_digest_differs`)
+/// is accepted with no flag, and the owner re-plans with the release.
+/// Cuts: every live tail needs the flag (unit 1's rule), red (the `Refused` ask is refused);
+/// `TailAdoption::could_return` true only for `Adoptable`, red (the `NotReady` ask is accepted).
+#[config_log::retcd_test]
+fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
+    const METHOD: &str =
+        "u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return";
+    use rdb_core::contracts::errors::ErrorKind;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (before, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let through = || TailRelease {
+        through: Some(Seq(cutoff.0 + 5)),
+        no_intact_copy: false,
+    };
+    let tail = |adoption| TailRefused {
+        generation: before,
+        head: Seq(cutoff.0 + 3),
+        base: cutoff,
+        reason: "tail_on_older_lineage",
+        adoption,
+    };
+    let needs_flag = |answer: Result<String, ApiError>, node: u64, state: &str| {
+        let error = answer.expect_err(state);
+        assert_eq!(error.kind, ErrorKind::InvalidArgument, "{state}: {error:?}");
+        assert!(error.no_mutation, "{state}: {error:?}");
+        assert!(
+            error.detail.contains("add --give-up-live-copy")
+                && error.detail.contains(&format!("node {node} holds seqs")),
+            "{state}: {error:?}"
+        );
+    };
+    let owner = &mut trio.nodes[0].0;
+    for adoption in [
+        TailAdoption::Adoptable,
+        TailAdoption::NotReady("replay_not_ready"),
+        TailAdoption::Unchecked,
+    ] {
+        owner.tail_refused.insert(p, tail(adoption));
+        needs_flag(
+            owner.forget_tail_asked(p, through(), false),
+            1,
+            &format!("{adoption:?}"),
+        );
+    }
+    owner
+        .tail_refused
+        .insert(p, tail(TailAdoption::Refused("base_digest_differs")));
+    owner.tail_holds.insert(
+        p,
+        vec![TailHold {
+            node: NodeId(3),
+            copy: CopyId(2),
+            refused: tail(TailAdoption::NotReady("replay_not_ready")),
+        }],
+    );
+    needs_flag(
+        owner.forget_tail_asked(p, through(), false),
+        3,
+        "a member's NotReady hold",
+    );
+    owner.tail_holds.remove(&p);
+    let line = owner
+        .forget_tail_asked(p, through(), false)
+        .expect("a tail whose proof failed needs no flag");
+    assert!(
+        line.starts_with(&format!(
+            "forget-tail: partition 1 re-plans from generation {}: seqs up to {} ",
+            before.0,
+            cutoff.0 + 5
+        )),
+        "{line}"
+    );
+    // The tail stood in for a probe's report; the re-plan's own inventory decides.
+    owner.tail_refused.remove(&p);
+    trio.until("node 1 committed a later generation", |trio| {
+        trio.nodes[0]
+            .0
+            .committed
+            .get(&p)
+            .map(|committed| committed.new_generation)
+            .filter(|generation| *generation > before)
+    });
+    assert_eq!(logged!(METHOD, "forget_tail_planned").len(), 1);
 }
 
 /// Issue #105 (design section 3.3, assumption A7): the tail scan over 512 partitions, as a
@@ -2315,7 +2566,10 @@ fn issue105_a_tail_scan_over_512_partitions_reads_one_record_per_tail_and_none_w
 /// status `tail_on_older_lineage`, so the owner holds its repair and a client is told which
 /// copy holds the seqs, even when the landing itself linked. Stamped below the result's L, the
 /// tail is superseded and nothing is marked. A refusal the landing already made at that
-/// generation keeps its own reason. Cut: `landing_scan` finds nothing, red (no mark).
+/// generation keeps its own reason. Unit 2: the mark also says where the tail stands against
+/// adoption. This fixture's `inherit` below generation 1's head is a full copy, the shape a
+/// release leaves, so the tail is `Refused("tail_set_aside")`.
+/// Cut: `landing_scan` finds nothing, red (no mark).
 #[test]
 fn issue105_a_landing_over_a_current_tail_marks_the_copy_and_a_superseded_one_does_not() {
     let dir = config_testkit::fs::temp_dir();
@@ -2361,6 +2615,7 @@ fn issue105_a_landing_over_a_current_tail_marks_the_copy_and_a_superseded_one_do
             head: Seq(5),
             base: Seq(3),
             reason: "tail_on_older_lineage",
+            adoption: TailAdoption::Refused("tail_set_aside"),
         }),
         "stamped L: marked"
     );
@@ -2369,19 +2624,25 @@ fn issue105_a_landing_over_a_current_tail_marks_the_copy_and_a_superseded_one_do
         head: Seq(5),
         base: Seq(3),
         reason: "held_past_base",
+        adoption: TailAdoption::Unchecked,
     };
     host.tail_refused.insert(PartitionId(1), refused);
     host.landing_scan(PartitionId(1), &result(1));
     assert_eq!(
         host.tail_refused.get(&PartitionId(1)),
-        Some(&refused),
+        Some(&TailRefused {
+            adoption: TailAdoption::Refused("tail_set_aside"),
+            ..refused
+        }),
         "the landing's own reason stays"
     );
 }
 
 /// Issue #105 (design section 13), walk C's shape: a copy that missed the anchor's generation
 /// and holds a tail past its base on the lineage below. Without a release it answers `TailHeld`;
-/// with `--through` below the tail's head it still does (a tail above `through` caps). With
+/// with `--through` below the tail's head it still does (a tail above `through` caps). Unit 2
+/// would adopt a sound tail on those asks, so the tail's head is planted not chaining from the
+/// record below it (`tail_not_contiguous`); the release half reads nothing above the base. With
 /// `--through` at the head the tail is released: not reported, logged `tail_released`, and the
 /// anchor's generation is inherited by copy at the base (`Copied`, the set-aside). The copy then
 /// reports at the base, its status clears, and the tail stays on disk on the sealed parent. Its
@@ -2394,11 +2655,7 @@ fn issue105_a_released_tail_on_a_missed_generation_is_copied_at_the_base_and_rep
         "issue105_a_released_tail_on_a_missed_generation_is_copied_at_the_base_and_reported";
     let dir = config_testkit::fs::temp_dir();
     let path = dir.path().join("node");
-    let digests = write_chain(
-        &mut RocksEngine::open(&path).expect("open engine"),
-        Generation(1),
-        3,
-    );
+    let digests = write_unchained_head(&path, 3);
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
     let p = PartitionId(1);
@@ -2606,6 +2863,7 @@ fn issue105_a_released_tail_beside_the_anchor_is_not_reported_and_nothing_is_wri
             head: Seq(5),
             base: Seq(3),
             reason: "tail_on_older_lineage",
+            adoption: TailAdoption::Unchecked,
         },
     );
     assert!(

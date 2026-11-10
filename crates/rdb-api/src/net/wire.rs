@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::{DenyReason, FenceCredential, Lineage};
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::KernelEvent;
 use rdb_core::contracts::ids::{
@@ -789,6 +790,7 @@ pub struct WireSeed {
     pub config: PartitionConfig,
     pub lineage: Lineage,
     pub revision: Revision,
+    pub cutoff: (Seq, Digest),
 }
 
 impl From<DormantSeed> for WireSeed {
@@ -797,6 +799,7 @@ impl From<DormantSeed> for WireSeed {
             config: seed.config,
             lineage: seed.lineage,
             revision: seed.revision,
+            cutoff: seed.cutoff,
         }
     }
 }
@@ -807,6 +810,7 @@ impl From<WireSeed> for DormantSeed {
             config: seed.config,
             lineage: seed.lineage,
             revision: seed.revision,
+            cutoff: seed.cutoff,
         }
     }
 }
@@ -1874,6 +1878,48 @@ pub struct WireTailRefused {
     pub head: Seq,
     pub base: Seq,
     pub reason: String,
+    /// Added under version 9 (issue #105 unit 2): where the tail stands against adoption, one
+    /// of `adoptable`, `not_ready`, `refused` and `unchecked`; `adoption_reason` names why for `not_ready` and `refused`.
+    pub adoption: String,
+    /// One of [`crate::host::ADOPTION_REFUSALS`], present exactly for `not_ready` and `refused`.
+    pub adoption_reason: Option<String>,
+}
+
+/// A [`crate::host::TailAdoption`] as [`WireTailRefused::adoption`] and its reason.
+fn adoption_to_wire(adoption: crate::host::TailAdoption) -> (String, Option<String>) {
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    let (state, reason) = match adoption {
+        Adoptable => ("adoptable", None),
+        NotReady(reason) => ("not_ready", Some(reason)),
+        Refused(reason) => ("refused", Some(reason)),
+        Unchecked => ("unchecked", None),
+    };
+    (state.to_owned(), reason.map(str::to_owned))
+}
+
+/// [`WireTailRefused::adoption`] and its reason back to a [`crate::host::TailAdoption`]; an
+/// unknown word, an unknown reason, or a reason on the wrong state is refused.
+fn adoption_from_wire(
+    state: &str,
+    reason: Option<&str>,
+) -> Result<crate::host::TailAdoption, WireError> {
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    let known = |reason: &str| {
+        crate::host::ADOPTION_REFUSALS
+            .iter()
+            .copied()
+            .find(|known| *known == reason)
+            .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
+    };
+    match (state, reason) {
+        ("adoptable", None) => Ok(Adoptable),
+        ("unchecked", None) => Ok(Unchecked),
+        ("not_ready", Some(reason)) => Ok(NotReady(known(reason)?)),
+        ("refused", Some(reason)) => Ok(Refused(known(reason)?)),
+        (state, reason) => Err(WireError::Value(format!(
+            "adoption {state:?} with reason {reason:?}"
+        ))),
+    }
 }
 
 /// The role words a host reports (`host::Node::status`).
@@ -1910,11 +1956,16 @@ impl From<&NodeStatus> for WireNodeStatus {
             qualifying_copy: status.qualifying_copy,
             clock_bound_lost: status.clock_bound_lost,
             committed_without: status.committed_without.clone(),
-            tail_refused: status.tail_refused.map(|tail| WireTailRefused {
-                generation: tail.generation,
-                head: tail.head,
-                base: tail.base,
-                reason: tail.reason.to_owned(),
+            tail_refused: status.tail_refused.map(|tail| {
+                let (adoption, adoption_reason) = adoption_to_wire(tail.adoption);
+                WireTailRefused {
+                    generation: tail.generation,
+                    head: tail.head,
+                    base: tail.base,
+                    reason: tail.reason.to_owned(),
+                    adoption,
+                    adoption_reason,
+                }
             }),
         }
     }
@@ -1971,6 +2022,10 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                         head: tail.head,
                         base: tail.base,
                         reason,
+                        adoption: adoption_from_wire(
+                            &tail.adoption,
+                            tail.adoption_reason.as_deref(),
+                        )?,
                     })
                 })
                 .transpose()?,

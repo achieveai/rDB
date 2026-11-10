@@ -867,6 +867,9 @@ pub enum RecoveryEffect {
         to: CopyId,
         /// Through this position.
         through: Seq,
+        /// The selected digest at `through` (`SelectedLineage::cutoff_digest`). The target's
+        /// catch-up plan pins it (issue #105 unit 2, architect section 15.3, amending K-B-37).
+        through_digest: Digest,
         /// Minted with `sender == from` (K-B-42).
         credential: FenceCredential,
     },
@@ -878,6 +881,8 @@ pub enum RecoveryEffect {
         to: CopyId,
         /// Through this position.
         through: Seq,
+        /// The selected digest at `through`, as [`Self::CatchUp`]'s: the host routes both alike.
+        through_digest: Digest,
         /// Minted with `sender == from` (K-B-42).
         credential: FenceCredential,
     },

@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
-    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity,
+    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::recovery::{CommittedRoot, DurableProof, RecoveryBarrier, RecoveryResult};
@@ -147,6 +148,7 @@ fn seed() -> Box<DormantSeed> {
         config: config(),
         lineage: zero(),
         revision: zero(),
+        cutoff: (Seq(7), Digest::ROOT),
     };
     seed.lineage.partition = PartitionId(1);
     seed.revision.0 = 41;
@@ -438,6 +440,7 @@ fn status() -> NodeStatus {
             head: rdb_core::contracts::ids::Seq(3),
             base: rdb_core::contracts::ids::Seq(2),
             reason: "held_past_base",
+            adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
         }),
     }
 }
