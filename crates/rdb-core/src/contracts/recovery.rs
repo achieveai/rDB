@@ -444,6 +444,67 @@ pub struct RecoveryResult {
     pub committed: CommittedRoot,
     /// The bounds P1 needs for a status query against the previous generation.
     pub retained_status_map: RetainedStatusMap,
+    /// The ledger the commit wrote (issue #105): a plan built from memory carries it on, so a
+    /// mark survives a re-plan with its holder dead (M2).
+    pub ledger: TailLedger,
+}
+
+/// One node the ledger marks as holding records above a cutoff that no commit since has kept
+/// (issue #105). Keyed by node: one entry per holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HeldTail {
+    /// The node holding the tail.
+    pub node: NodeId,
+    /// The highest such record it named.
+    pub head: Seq,
+}
+
+/// What `partitions/{p}` says about the last writable generation and the tails held above it
+/// (issue #105, layout 6). Written on every commit; a record that carries none says "unknown",
+/// never "none".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TailLedger {
+    /// The last generation that committed writable, L. `None` is unknown: a record written by an
+    /// older build, or a partition that has not committed writable on this one.
+    pub last_writable: Option<Generation>,
+    /// The nodes pinned as regulars in L, in the order pinned.
+    pub last_writable_regulars: Vec<NodeId>,
+    /// One entry per node holding a tail above a cutoff, by node.
+    pub held: Vec<HeldTail>,
+}
+
+impl TailLedger {
+    /// The ledger of a record that carries none: L unknown, nothing marked.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            last_writable: None,
+            last_writable_regulars: Vec::new(),
+            held: Vec::new(),
+        }
+    }
+
+    /// The entry for `node`, if it is marked.
+    #[must_use]
+    pub fn held_by(&self, node: NodeId) -> Option<Seq> {
+        self.held
+            .iter()
+            .find(|entry| entry.node == node)
+            .map(|entry| entry.head)
+    }
+}
+
+/// What an operator gave up for one run with `admin forget-tail` (issue #105, section 8.1).
+/// Neither field is set by an automatic plan.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct TailRelease {
+    /// `--through H`: every held tail at or below `H`, reported or marked, is exempt for this run
+    /// and its entry clears. A tail above `H` still caps. Does not waive the intact rule.
+    pub through: Option<Seq>,
+    /// `--no-intact-copy`: the intact rule is waived for this run. Held tails still cap.
+    pub no_intact_copy: bool,
 }
 
 // ---- F1 event and effect vocabulary (lead ruling B-R35, 2026-09-22) ------------------------
@@ -483,6 +544,10 @@ pub struct SurvivorInventory {
     pub ladder: Vec<(Seq, Digest)>,
     /// Set when the copy holds a quarantined history. Kept as evidence, never selectable.
     pub quarantined: Option<QuarantineReason>,
+    /// Whether the copy holds the last writable generation's history intact (issue #105, the
+    /// intact rule): lineage L, not staging, and a record at seq 1 when L applied any. `false`
+    /// when L is unknown to it. F1 counts it only for a node in L's regulars.
+    pub holds_last_writable: bool,
 }
 
 /// Placement's view of one copy as a leader candidate (`design.md` §5.4). Data, not logic.
@@ -524,6 +589,9 @@ pub struct RecoveryPlan {
     pub must_hold: BTreeSet<CopyId>,
     /// What the record this plan supersedes said: whom it pinned and its note (#80 S5n).
     pub prior: PriorRecord,
+    /// What an operator gave up for this run (issue #105, `admin forget-tail`). Empty for every
+    /// automatic plan. After [`Self::prior`], so a stored plan of version 3 is a prefix of today's.
+    pub release: TailRelease,
 }
 
 /// The most recoveries a [`CommittedWithout`] names. The oldest beyond this is trimmed and its
@@ -610,6 +678,8 @@ pub struct PriorRecord {
     pub members: Option<Vec<PriorMember>>,
     /// The old record's note, carried into the new record.
     pub note: CommittedWithout,
+    /// The old record's ledger (issue #105): unknown for a record before layout 6.
+    pub ledger: TailLedger,
 }
 
 impl PriorRecord {
@@ -622,6 +692,7 @@ impl PriorRecord {
                 entries: Vec::new(),
                 dropped_through: Generation(0),
             },
+            ledger: TailLedger::unknown(),
         }
     }
 }

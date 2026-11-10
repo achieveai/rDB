@@ -642,6 +642,14 @@ pub enum BlockReason {
         /// named in `must_hold` and missing at selection. Sorted by copy id.
         missing: Vec<CopyId>,
     },
+    /// The plan leaves out a node the ledger marks as holding a tail above a cutoff (issue
+    /// #105, M4). A node left out is never asked again, so its tail could never cap a later
+    /// commit and the mark could never clear: nothing is fenced and nothing is committed. The
+    /// way out is to plan with the node in, or `admin forget-tail` through its head.
+    DropsMarkedHolder {
+        /// The marked node the plan leaves out; the lowest such node.
+        node: NodeId,
+    },
 }
 
 impl BlockReason {
@@ -677,7 +685,8 @@ impl BlockReason {
             | Self::ControlUnavailable
             | Self::ControlUnknown
             | Self::NoEligibleRegular
-            | Self::BarrierIncomplete { .. } => ErrorKind::DivergenceRequiresOperator,
+            | Self::BarrierIncomplete { .. }
+            | Self::DropsMarkedHolder { .. } => ErrorKind::DivergenceRequiresOperator,
         }
     }
 }
