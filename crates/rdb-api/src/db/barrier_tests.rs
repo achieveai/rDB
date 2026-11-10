@@ -806,13 +806,29 @@ fn forget_k2(app: &Db, through: Seq, patience: Duration) {
 }
 
 /// Puts until one succeeds or the window ends: the first success, or the last error.
+///
+/// Only a refusal that claims `no_mutation` gets a fresh put. Any other error resends the same
+/// request (`Db::resend_within`), as a client must: a put a re-plan raced is answered
+/// `UNKNOWN_OUTCOME` although it may have applied, and its resend replays that answer. A fresh
+/// put there applied a second time at the next seq (gate3 at `65bf9cb`, 2026-11-10: dispatched at
+/// seq 3 in G5, carried into G6 at cutoff 3, then a second put at seq 4).
 fn first_put(app: &Db, window: Duration) -> Result<PutOk, PutError> {
     let end = Instant::now() + window;
+    let mut unsettled: Option<TxnRequest> = None;
     loop {
-        match app.put(b"after", b"v", None) {
+        let sent = match unsettled.take() {
+            Some(request) => app.resend_within(request, Duration::from_secs(5)),
+            None => app.put(b"after", b"v", None),
+        };
+        match sent {
             Ok(put) => return Ok(put),
             Err(error) if Instant::now() >= end => return Err(error),
-            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                if !error.error.no_mutation {
+                    unsettled = error.request.map(|request| *request);
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
     }
 }
