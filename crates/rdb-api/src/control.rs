@@ -1686,7 +1686,12 @@ mod tests {
                 config_version: ConfigVersion(1),
                 lifecycle: PartitionLifecycle::Serving,
             }
-            .encode_with_members(&root, &members, Some(note))
+            .encode_with_members(
+                &root,
+                &members,
+                Some(note),
+                Some(&rdb_core::contracts::recovery::TailLedger::unknown()),
+            )
         };
         let (note_a, note_b) = (note(4, 2), note(5, 3));
         let written = rt

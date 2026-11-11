@@ -69,12 +69,19 @@ const MEMBERED_LAYOUT_VERSION: u8 = 4;
 /// The version byte of a record that also carries a [`CommittedWithout`] note (#80 S5n):
 /// layout 4, then the note. Written only when the note has an entry.
 ///
-/// The upgrade is one-way. Once a note with an entry writes layout 5, a build that knows only
-/// layouts 2 to 4 cannot read that record: it reads it as no record at all.
+/// The upgrade to it was one-way. Once a note with an entry writes layout 5, a build that knows
+/// only layouts 2 to 4 cannot read that record: it reads it as no record at all. This build
+/// still reads layout 5 but writes it from no commit: every commit writes
+/// [`LEDGER_LAYOUT_VERSION`], which carries the note after the ledger.
 const NOTED_LAYOUT_VERSION: u8 = 5;
 
 /// The version byte of a record that also carries a [`TailLedger`] (issue #105): layout 4, then
 /// the ledger, then the note when it has an entry. Every commit by this build writes it.
+///
+/// The upgrade is one-way (spec §8.5.10). A build that knows only layouts 2 to 5 reads a layout-6
+/// record as no record at all, so the whole cluster stops and restarts together, and there is no
+/// rollback. A record written before this layout reads its ledger as unknown (see [`ledger_of`])
+/// until the partition's first writable commit on this build.
 const LEDGER_LAYOUT_VERSION: u8 = 6;
 
 /// `last_writable` in a layout-6 record when it is unknown.
@@ -991,9 +998,10 @@ mod tests {
 
     /// PR #103 review: `prior_of` read directly, for each layout and for bytes that are no
     /// record. Layouts 2 and 3 name no members (`None`, never empty) and hold no note; layout 4
-    /// names its members in order with an empty note; layout 5 names them and its note. A
-    /// truncated body, a layout-5 body with a malformed note, and an unknown layout byte are
-    /// `None`. Cut: `prior_of` reads members only from layout 4, red on layout 5.
+    /// names its members in order with an empty note; layout 5 names them and its note; layout 6
+    /// (issue #105) names them, its note and its ledger. Every layout before 6 reads its ledger
+    /// as unknown. A truncated body, a layout-5 body with a malformed note, and an unknown layout
+    /// byte are `None`. Cut: `prior_of` reads members only from layout 4, red on layout 5.
     #[test]
     fn prior_of_reads_members_and_note_for_each_layout_and_refuses_malformed_bytes() {
         let prior_members: Vec<PriorMember> = members()
@@ -1007,6 +1015,7 @@ mod tests {
         let none = PriorRecord {
             members: None,
             note: CommittedWithout::default(),
+            ledger: TailLedger::unknown(),
         };
         assert_eq!(prior_of(&record().encode()), Some(none.clone()), "layout 2");
         assert_eq!(
@@ -1015,36 +1024,58 @@ mod tests {
             "layout 3"
         );
         assert_eq!(
-            prior_of(&record().encode_with_members(&root(), &members(), None)),
+            prior_of(&record().encode_with_members(&root(), &members(), None, None)),
             Some(PriorRecord {
                 members: Some(prior_members.clone()),
                 note: CommittedWithout::default(),
+                ledger: TailLedger::unknown(),
             }),
             "layout 4"
         );
         assert_eq!(
-            prior_of(&record().encode_with_members(&root(), &[], None)),
+            prior_of(&record().encode_with_members(&root(), &[], None, None)),
             Some(PriorRecord {
                 members: Some(Vec::new()),
                 note: CommittedWithout::default(),
+                ledger: TailLedger::unknown(),
             }),
             "layout 4 with no members: an empty set, not unknown"
         );
-        let five = record().encode_with_members(&root(), &members(), Some(&note()));
+        let five = record().encode_with_members(&root(), &members(), Some(&note()), None);
         assert_eq!(five[0], NOTED_LAYOUT_VERSION);
         assert_eq!(
             prior_of(&five),
             Some(PriorRecord {
-                members: Some(prior_members),
+                members: Some(prior_members.clone()),
                 note: note(),
+                ledger: TailLedger::unknown(),
             }),
             "layout 5"
+        );
+        let ledger = TailLedger {
+            last_writable: Some(Generation(4)),
+            last_writable_regulars: vec![NodeId(1), NodeId(2)],
+            held: vec![HeldTail {
+                node: NodeId(3),
+                head: Seq(40),
+            }],
+        };
+        let six = record().encode_with_members(&root(), &members(), Some(&note()), Some(&ledger));
+        assert_eq!(six[0], LEDGER_LAYOUT_VERSION);
+        assert_eq!(
+            prior_of(&six),
+            Some(PriorRecord {
+                members: Some(prior_members),
+                note: note(),
+                ledger,
+            }),
+            "layout 6"
         );
 
         assert_eq!(prior_of(&[]), None, "empty");
         assert_eq!(prior_of(&five[..five.len() - 1]), None, "a truncated note");
         let mut no_entries = record()
-            .encode_with_members(&root(), &members(), None)
+            .encode_with_members(&root(), &members(), None, None)
             .to_vec();
         no_entries[0] = NOTED_LAYOUT_VERSION;
         no_entries.extend_from_slice(&[0; 9]);

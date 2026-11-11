@@ -2807,6 +2807,7 @@ fn issue105_a_released_tail_that_cannot_be_copied_still_answers_tail_held_and_wr
 /// anchor's generation staged. That ask answers `TailHeld`; the next ask with the release runs
 /// the same inherit again, which clears the staged keys and copies again, and the copy
 /// reports. Cut: `survivor` does not re-enter a staged anchor, red (the second answer fails).
+#[cfg(debug_assertions)]
 #[test]
 fn issue105_a_crash_during_the_released_copy_is_finished_by_the_next_ask() {
     let dir = config_testkit::fs::temp_dir();
