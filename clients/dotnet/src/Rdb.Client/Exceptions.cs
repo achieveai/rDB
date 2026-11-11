@@ -26,6 +26,8 @@ public enum RdbErrorKind
     Unavailable = 19,
     UploadChunkConflict = 20,
     CorruptBlob = 21,
+    /// <summary>A durability barrier ended without proof from every regular copy. Says nothing about the write.</summary>
+    DurabilityUnconfirmed = 22,
 }
 
 /// <summary>What the caller may do after an error. Numbered as on the wire.</summary>

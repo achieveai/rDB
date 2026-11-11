@@ -433,6 +433,9 @@ pub enum Msg {
         fence: u64,
         /// The owner the record names.
         owner: Option<NodeId>,
+        /// The generation the record names, with `owner`. #90 (PR #104 review): a newer one ends
+        /// this node's barriers below it.
+        generation: Option<Generation>,
     },
     /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
     /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
@@ -1917,6 +1920,9 @@ struct BarrierProof {
 struct Barrier {
     partition: PartitionId,
     generation: Generation,
+    /// The tracker's lineage when it started: what A1 must still admit for the barrier to
+    /// answer `Ok` (PR #104 review).
+    lineage: Lineage,
     through: Seq,
     deadline: Tick,
     started: Instant,
@@ -1927,6 +1933,9 @@ struct Barrier {
     owed: BTreeMap<CopyId, NodeId>,
     /// The owed copies already asked. One ask, no retry: a lost one ends in the timeout.
     asked: BTreeSet<CopyId>,
+    /// Every copy proved it while A1 did not admit: the `Ok` waits for A1 to admit again, for
+    /// a newer generation, or for the timeout. Logged once.
+    withheld: bool,
     reply: Sender<Answer>,
 }
 
@@ -2937,6 +2946,7 @@ impl Host {
                 partition,
                 fence,
                 owner,
+                generation,
                 ..
             } => {
                 // A read begun under an earlier fence, or answering after A1 left Fenced, says
@@ -2973,10 +2983,17 @@ impl Host {
                         node = self.node.0,
                         partition = partition.0,
                         owner = owner.map(|owner| owner.0),
+                        generation = generation.map(|generation| generation.0),
                         fence,
                         "host_owner_learned"
                     );
                     self.owner_after_fence.insert(partition, owner);
+                    // #90 (PR #104 review): a promote replaced this node and told it nothing.
+                    // The record names the generation it committed, so this node's barriers
+                    // below it end now, not at their timeout.
+                    if let Some(generation) = generation {
+                        self.end_barriers_below(partition, generation);
+                    }
                 }
                 Ok(())
             }
@@ -3959,12 +3976,15 @@ impl Host {
                     kind = ?error.kind,
                     "durable_barrier_refused"
                 );
-                let _ = reply.send(Answer::Error {
+                // A refusal for a grant that ran out names the new owner once this node has read
+                // it, as a write's does, so `Db` re-reads the route either way.
+                let refused = Answer::Error {
                     error,
                     request: None,
-                });
+                };
+                let _ = reply.send(self.redirect(partition, refused));
             }
-            Ok(owed) => {
+            Ok((owed, lineage)) => {
                 let barrier = self.next_barrier;
                 self.next_barrier += 1;
                 self.barriers.insert(
@@ -3972,12 +3992,14 @@ impl Host {
                     Barrier {
                         partition,
                         generation,
+                        lineage,
                         through,
                         deadline: self.clock.now().plus_millis(remaining_millis),
                         started: Instant::now(),
                         copies: owed.len(),
                         owed,
                         asked: BTreeSet::new(),
+                        withheld: false,
                         reply,
                     },
                 );
@@ -3996,15 +4018,16 @@ impl Host {
         }
     }
 
-    /// The regular copies a barrier at `(generation, through)` must hear from, or why it is
-    /// refused. Every primary and regular secondary pinned now: not a majority and not "live"
-    /// copies, because losing the copies that were proved leaves the one that was not.
+    /// The regular copies a barrier at `(generation, through)` must hear from, and the lineage it
+    /// runs under, or why it is refused. Every primary and regular secondary pinned now: not a
+    /// majority and not "live" copies, because losing the copies that were proved leaves the one
+    /// that was not.
     fn barrier_copies(
         &self,
         partition: PartitionId,
         generation: Generation,
         through: Seq,
-    ) -> Result<BTreeMap<CopyId, NodeId>, ApiError> {
+    ) -> Result<(BTreeMap<CopyId, NodeId>, Lineage), ApiError> {
         let Some(primary) = self.replication.primary(self.node, partition) else {
             let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
                 partition,
@@ -4022,6 +4045,23 @@ impl Host {
         let current = tracker.lineage().generation;
         if generation != current {
             return Err(barrier_generation_changed(generation, current));
+        }
+        // PR #104 review: a promote that drops this node leaves its primary tracker here, at the
+        // old generation and fenced. A1's verdict is the one a write gets, so the refusal is too:
+        // `LEASE_EXPIRED`, or `NOT_PRIMARY` naming the new owner once this node has read it
+        // (`Self::redirect`). `Db` re-reads the route on both, so a retry leaves this node.
+        let lineage = tracker.lineage();
+        if let Verdict::Deny(reason) =
+            self.authority
+                .may_admit_at(lineage, self.clock.now(), &self.budgets)
+        {
+            let mut refused = crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+            refused.detail = format!(
+                "node {} may not answer for partition {} now ({reason:?}); no barrier was started",
+                self.node.0, partition.0
+            );
+            refused.no_mutation = true;
+            return Err(refused);
         }
         if self.committed.get(&partition).is_some_and(|committed| {
             // `committed` can be stale (above): only the current generation's mode counts.
@@ -4044,13 +4084,14 @@ impl Host {
         if self.barriers.len() >= MAX_BARRIERS {
             return Err(ApiError::from_kernel(&RdbError::Overloaded { partition }));
         }
-        Ok(tracker
+        let owed = tracker
             .config()
             .members
             .iter()
             .filter(|member| member.role != ReplicaRole::Shadow)
             .map(|member| (member.copy, member.node))
-            .collect())
+            .collect();
+        Ok((owed, lineage))
     }
 
     /// Ask every owed copy that has applied its barrier's position, and time out the barriers
@@ -4058,9 +4099,14 @@ impl Host {
     fn barrier_duty(&mut self, now: Tick) {
         let mut expired = Vec::new();
         let mut asks = Vec::new();
+        let mut proved = Vec::new();
         for (id, barrier) in &mut self.barriers {
             if barrier.deadline <= now {
                 expired.push(*id);
+                continue;
+            }
+            if barrier.owed.is_empty() {
+                proved.push(*id);
                 continue;
             }
             let Some(primary) = self.replication.primary(self.node, barrier.partition) else {
@@ -4093,6 +4139,9 @@ impl Host {
             self.ask(node, site, ask);
         }
         self.answer_own_asks();
+        for id in proved {
+            self.finish_barrier(id);
+        }
         for id in expired {
             let Some(barrier) = self.barriers.remove(&id) else {
                 continue;
@@ -4112,10 +4161,20 @@ impl Host {
                 owed = owed.as_str(),
                 "durable_barrier_unconfirmed"
             );
-            let detail = format!(
-                "generation {} seq {} of partition {} not proved durable in time; still owed: {owed}",
-                barrier.generation.0, barrier.through.0, barrier.partition.0
-            );
+            let detail = if barrier.owed.is_empty() {
+                format!(
+                    "generation {} seq {} of partition {} not confirmed in time: every regular \
+                     copy proved it, but node {}'s grant stopped admitting before it could answer, \
+                     and a newer owner may have replaced it; read back",
+                    barrier.generation.0, barrier.through.0, barrier.partition.0, self.node.0
+                )
+            } else {
+                format!(
+                    "generation {} seq {} of partition {} not proved durable in time; still owed: \
+                     {owed}",
+                    barrier.generation.0, barrier.through.0, barrier.partition.0
+                )
+            };
             let _ = barrier.reply.send(Answer::Error {
                 error: ApiError::new(ErrorKind::DurabilityUnconfirmed, detail),
                 request: None,
@@ -4247,10 +4306,40 @@ impl Host {
             return;
         }
         barrier.owed.remove(&proof.copy);
-        if !barrier.owed.is_empty() {
+        if barrier.owed.is_empty() {
+            self.finish_barrier(proof.barrier);
+        }
+    }
+
+    /// Answer `Ok` for barrier `id`, whose every copy has proved it, only while A1 still admits
+    /// its lineage (PR #104 review). A promote commits a newer generation only after this node's
+    /// grant is proved expired (`admin::promote_looked` step 5), and from that point A1 admits
+    /// nothing here, so a genuine proof delayed past the commit cannot give `Ok`. Withheld, the
+    /// barrier waits for A1 to admit again ([`Self::barrier_duty`] retries), for a newer
+    /// generation ([`Self::end_barriers_below`]), or for its timeout.
+    fn finish_barrier(&mut self, id: u64) {
+        let Some(barrier) = self.barriers.get_mut(&id) else {
+            return;
+        };
+        if let Verdict::Deny(reason) =
+            self.authority
+                .may_admit_at(barrier.lineage, self.clock.now(), &self.budgets)
+        {
+            if !barrier.withheld {
+                barrier.withheld = true;
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = barrier.partition.0,
+                    generation = barrier.generation.0,
+                    through = barrier.through.0,
+                    barrier = id,
+                    ?reason,
+                    "durable_barrier_withheld"
+                );
+            }
             return;
         }
-        let Some(barrier) = self.barriers.remove(&proof.barrier) else {
+        let Some(barrier) = self.barriers.remove(&id) else {
             return;
         };
         tracing::info!(

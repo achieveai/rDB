@@ -1,5 +1,6 @@
-//! Issue #90 (#80 S5d): the durability barrier through [`Db`], on wall-clock time. Rows 40's
-//! drop under writes, 41, 42 and 47; the rows on three stepped hosts are in `host::barrier_tests`.
+//! Issue #90 (#80 S5d): the durability barrier through [`Db`], on wall-clock time. Rows 37 on a
+//! second partition, 40's drop under writes and its no-answer fallback, 41, 42 and 47; the rows
+//! on three stepped hosts are in `host::barrier_tests`.
 
 use super::reopen_tests::{config, fast, runtime};
 use super::*;
@@ -329,48 +330,183 @@ fn s5d_47_a_generation_change_before_the_marker_forces_another_pass() {
     assert!(settled > k2.generation, "{settled:?}");
 }
 
-/// Row 47, the seq-0 clause, as far as it can be reached. `GetOk::generation`'s doc says a read
-/// right after a cutoff can name the predecessor generation. Polled from the promote's return
-/// with nothing written (S5d-B4), every read named the new generation at the cutoff, so the
-/// journal took no extra pass. If a read ever does name the predecessor, the first assert fails
-/// and this row should then expect the one extra pass the design describes.
+/// Row 47 at a cutoff with nothing after it (PR #104 review): no app write before the promote,
+/// and none after it until the journal runs, so the new generation has written nothing when it is
+/// first read. Seq 0 itself is not reachable through `Db`: a fresh open has already published
+/// seq 1 in generation 1 before any app write, and this row asserts that position rather than
+/// assuming it. Asserted, not assumed: the first read after the promote is at the cutoff and
+/// names the generation the promote committed (the one its node adopted, not the predecessor),
+/// and the journal's key write, marker and barrier land in that generation, so one pass ends
+/// it. A read naming the predecessor would have cost one more pass.
 /// Integration (~5 s): a grant wait.
 #[config_log::retcd_test]
-fn s5d_47_a_read_right_after_a_cutoff_names_the_new_generation_and_the_journal_ends() {
+fn s5d_47_a_read_at_a_bare_cutoff_names_the_new_generation_and_one_pass_ends_the_journal() {
     let rt = runtime();
     let store = store();
     let dir = config_testkit::fs::temp_dir();
     let db = opened(&rt, dir.path(), &store);
-    let k1 = db.put(b"k1", b"one", None).expect("k1");
-    db.wait_durable(GROUP_OF, position(&k1), LONG)
-        .expect("k1 is on every disk");
+    let before = db.get(b"k1").expect("a read before the promote");
+    assert_eq!(
+        (before.generation, before.at),
+        (Generation(1), Seq(1)),
+        "the open's own publication, and no app write: {before:?}"
+    );
+    assert!(before.value.is_none(), "{before:?}");
     db.links().hold(NodeId(1), NodeId(2));
     db.links().hold(NodeId(1), NodeId(3));
-    db.promote(NodeId(2), None).expect("the promote commits");
+    let promoted = db.promote(NodeId(2), None).expect("the promote commits");
+    assert!(promoted.generation > before.generation, "{promoted:?}");
 
-    // Reads are refused for a while after the promote returns, for longer on a loaded host, so
-    // the window starts at the first read that answers: the one nearest the cutoff.
+    // Reads are refused for a while after the promote returns, so this is the first that answers.
     let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
-    let mut views: Vec<Generation> = Vec::new();
-    while views.len() < 200 {
+    let first = loop {
         match db.get(b"k1") {
-            Ok(got) => views.push(got.generation),
+            Ok(got) => break got,
             Err(error) => assert!(Instant::now() < deadline, "no read answered: {error:?}"),
         }
         std::thread::sleep(Duration::from_millis(1));
+    };
+    tracing::info!(
+        generation = first.generation.0,
+        at = first.at.0,
+        "s5d_47_bare_cutoff_first_read"
+    );
+    assert_eq!(first.at, before.at, "nothing after the cutoff: {first:?}");
+    assert_eq!(
+        first.generation, promoted.generation,
+        "the read names the adopted generation: {first:?}"
+    );
+    assert!(first.value.is_none() && !first.recovery_mode, "{first:?}");
+
+    let (passes, settled, seen) = journal_sync(&db, &[(b"k1", b"one")], b"marker", |_| {});
+    assert_eq!(settled, promoted.generation, "the marker and its barrier");
+    assert_eq!(
+        passes, 1,
+        "every generation matched on the first pass: {seen:?}"
+    );
+    let k1 = db.get(b"k1").expect("k1 reads back");
+    assert_eq!(k1.generation, promoted.generation, "{k1:?}");
+    assert!(k1.at > before.at, "{k1:?}");
+    assert_eq!(
+        k1.value.map(|(_, bytes)| bytes),
+        Some(Bytes::from_static(b"one"))
+    );
+}
+
+/// A group whose partition is `partition`.
+fn group_in(db: &Db, partition: PartitionId) -> AffinityId {
+    (1..10_000)
+        .map(AffinityId)
+        .find(|group| db.partition_for(*group) == partition)
+        .expect("some group maps to every partition")
+}
+
+/// Row 37 on partition 2 of 2 (PR #104 review): the barrier goes to the group's own partition
+/// and waits on that partition's copies. Partition 2 has three writes and partition 1 none, so a
+/// barrier sent to partition 1 is refused. With one of partition 2's copies held behind, the
+/// barrier names that copy of partition 2 at its timeout, and answers `Ok` once it catches up.
+/// Cut: `wait_durable` sends to partition 1, and the first barrier is `INVALID_ARGUMENT`.
+/// Integration (~4 s): a two-partition open.
+#[config_log::retcd_test]
+fn s5d_37_a_barrier_on_partition_two_waits_for_partition_twos_copies() {
+    const PART2: PartitionId = PartitionId(2);
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(2),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let group = group_in(&db, PART2);
+    let mut last = None;
+    for n in 0..3_u8 {
+        last = Some(
+            db.put_in(group, &[b'k', n], b"v", None)
+                .expect("a put on partition 2"),
+        );
     }
+    let last = last.expect("three puts");
+    assert!(last.seq >= Seq(3), "{last:?}");
+    db.wait_durable(group, position(&last), LONG)
+        .expect("partition 2's three copies prove it");
+
+    let owner = db.owner_of(PART2).expect("partition 2 has an owner");
+    let behind = if owner == NodeId(3) {
+        NodeId(2)
+    } else {
+        NodeId(3)
+    };
+    db.links().hold(owner, behind);
+    let held = db
+        .put_in(group, b"held", b"v", None)
+        .expect("two copies take it");
+    let error = db
+        .wait_durable(group, position(&held), Duration::from_millis(400))
+        .expect_err("a copy of partition 2 is held behind");
+    assert_eq!(error.kind, ErrorKind::DurabilityUnconfirmed, "{error:?}");
+    assert!(error.detail.contains("of partition 2"), "{error:?}");
     assert!(
-        views.iter().all(|generation| *generation > k1.generation),
-        "a read named the predecessor: {views:?}"
+        error.detail.contains(&format!("on node {}", behind.0)),
+        "{error:?}"
+    );
+    assert!(
+        !error.detail.contains(&format!("on node {}", owner.0)),
+        "{error:?}"
     );
 
-    let (_, settled, seen) = journal_sync(&db, &[(b"k1", b"one")], b"marker", |_| {});
-    assert!(settled > k1.generation, "{settled:?}");
-    assert_eq!(
-        seen.last(),
-        Some(&1),
-        "it ended with one generation: {seen:?}"
+    db.links().heal(owner, behind);
+    db.wait_durable(group, position(&held), LONG)
+        .expect("the copy caught up and proved it");
+}
+
+/// PR #104 review: when the owner does not answer at all, `Db` ends the barrier itself a second
+/// after `timeout`. Node 1 is stalled with the call queued, so the reply channel stays open and
+/// only the wait runs out. The refusal is `DURABILITY_UNCONFIRMED`, a retry with jitter, proves
+/// nothing about the write, says it cannot name the owed copies, and its step is the barrier's:
+/// call it again, never resend. Cut: drop the `None` arm's own text, and the detail no longer
+/// says the copies are unknown.
+/// Integration (~2 s): the answer margin.
+#[config_log::retcd_test]
+fn s5d_40_no_answer_from_the_owner_is_unconfirmed_and_says_to_call_again() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let put = db.put(b"a", b"1", None).expect("a put");
+    let (release, stall) = mpsc::channel();
+    db.send_to(NodeId(1), Msg::Stall(stall)).expect("a stall");
+    let started = Instant::now();
+    let error = db
+        .wait_durable(GROUP_OF, position(&put), Duration::from_millis(50))
+        .expect_err("node 1 is stalled");
+    let waited = started.elapsed();
+    release.send(()).expect("node 1 is still stalled");
+
+    assert!(waited >= BARRIER_ANSWER_MARGIN, "{waited:?}");
+    assert_eq!(error.kind, ErrorKind::DurabilityUnconfirmed, "{error:?}");
+    assert_eq!(error.retry, RetryRule::BoundedJitter, "{error:?}");
+    assert!(!error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains("no barrier answer from the owner"),
+        "{error:?}"
     );
+    assert!(error.detail.contains("not known here"), "{error:?}");
+    let explained = error.explain();
+    assert!(
+        explained.contains("call `Db::wait_durable` again"),
+        "{explained}"
+    );
+    assert!(explained.contains("nothing to `Db::resend`"), "{explained}");
+    assert!(!explained.contains("send the same request"), "{explained}");
 }
 
 /// Row 42's measurement. Not a pass/fail on this host: the 250 ms target is on a dedicated SSD.
@@ -468,7 +604,13 @@ fn s5d_42_barrier_latency_at_256_partitions_per_node() {
         *kinds.entry(kind.as_str()).or_insert(0_u32) += 1;
     }
     println!("s5d_42 failed_ticks={} {kinds:?}", failed.len());
-    let at = |q: f64| millis[((millis.len() - 1) as f64 * q) as usize];
+    // A run where every tick failed has no latency to report; it still prints the rest.
+    let at = |q: f64| {
+        millis.len().checked_sub(1).map_or_else(
+            || "n/a".to_owned(),
+            |last| format!("{:.1}ms", millis[(last as f64 * q) as usize]),
+        )
+    };
     let over = |limit: f64| millis.iter().filter(|m| **m > limit).count();
     let per_node: Vec<f64> = (1..=3)
         .map(|n| {
@@ -476,7 +618,7 @@ fn s5d_42_barrier_latency_at_256_partitions_per_node() {
         })
         .collect();
     println!(
-        "s5d_42 elapsed={elapsed:.1}s ok_per_s={:.1} (asked {PARTITIONS}) ok={} p50={:.1}ms p99={:.1}ms max={:.1}ms over250ms={} over1s={} syncs_per_s_per_node={per_node:?}",
+        "s5d_42 elapsed={elapsed:.1}s ok_per_s={:.1} (asked {PARTITIONS}) ok={} p50={} p99={} max={} over250ms={} over1s={} syncs_per_s_per_node={per_node:?}",
         millis.len() as f64 / elapsed,
         millis.len(),
         at(0.50),

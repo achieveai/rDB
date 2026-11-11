@@ -283,6 +283,16 @@ fn s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok() {
         answer.try_recv().ok()
     });
     assert!(!matches!(got, Answer::Durable), "{got:?}");
+    // PR #104 review: a node 1 whose grant already stopped admitting refuses the barrier
+    // before asking anyone, so node 3 never sees it. That is row 26's precondition lost (a
+    // busy host stretched the schedule past the grant), not this row's claim failing.
+    if let Answer::Error { error, .. } = &got {
+        assert!(
+            !error.detail.contains("no barrier was started"),
+            "precondition lost: node 1's grant stopped admitting before the barrier, so node 3 \
+             was never asked: {got:?}"
+        );
+    }
     let lines = logged!(METHOD, "durable_through_refused");
     assert!(
         lines

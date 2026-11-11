@@ -13,7 +13,7 @@ use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::WithoutEntry;
 
 const P: PartitionId = PartitionId(1);
-const INSTANCE: [u8; INSTANCE_LEN] = [9; INSTANCE_LEN];
+pub(super) const INSTANCE: [u8; INSTANCE_LEN] = [9; INSTANCE_LEN];
 
 pub(super) fn tune(host: &mut Host) {
     Trio::fast(host);

@@ -6379,6 +6379,7 @@ fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_u
         partition: p1,
         fence: current - 1,
         owner: Some(NodeId(3)),
+        generation: None,
     };
     host.handle(stale);
     assert_eq!(

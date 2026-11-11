@@ -618,7 +618,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
-| `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without proof from every regular copy; the message names the copies still owed. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
+| `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without proof from every regular copy. When the owner answers it, the message names the copies still owed. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
 | `UNAVAILABLE`, "went out of reach ...; a write sent here may have applied" | The owner's process stopped after the write was sent (`no_mutation` false). | Once it is back: `db.resend(..)` the request, or ask `db.status(..)`. |
@@ -638,10 +638,24 @@ a partition's note. In a `Db` that runs nodes, an empty list means none of them 
 `generation` and `seq` of a `PutOk`. It makes every regular copy sync and answers `Ok` when all
 have. `Ok` proves every record in the current history at or below that position, and says nothing
 about a record a recovery cut. After `GENERATION_CHANGED`, read back. To know a set of keys is
-durable, finish only when each key's read `generation`, each rewrite's `PutOk.generation` and the
-marker's `PutOk.generation` are equal and the barrier on the marker answers `Ok`, and reject any
-read with `recovery_mode` true. Anything else starts the pass again. This comparison is not a
-fence, and can cost one extra pass at seq 0. A barrier never holds up a write.
+durable, finish a pass only when each key's read `generation`, each rewrite's `PutOk.generation`
+and the marker's `PutOk.generation` are equal and the barrier on the marker answers `Ok`, and
+reject any read with `recovery_mode` true. A read reports the generation its node adopted. A
+generation mismatch, or any error from the barrier, starts the pass again; how many passes that
+takes is not fixed. This comparison is not a fence. A barrier never holds up a write.
+
+Some limits of what a barrier's error can tell you:
+
+- **A copy whose fsync failed shows only as owed.** The copy proves nothing, and the barrier ends
+  at its timeout naming that copy. Why its sync failed is in that copy's node log, not in the
+  error.
+- **A promote that drops the owner ends the owner's barriers only once the owner hears of it.**
+  The dropped owner is fenced and reads the new owner from rEtcd; from then its barriers end in
+  `GENERATION_CHANGED`. An owner cut off from rEtcd cannot read it: it gives no `Ok` once its
+  grant stops admitting, and its barriers end at their timeout.
+- **A node that no longer owns the partition refuses a new barrier** with `LEASE_EXPIRED`, or
+  `NOT_PRIMARY` naming the new owner once it has read it. The `Db` re-reads the owner on both,
+  so the next call goes to the new one.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote

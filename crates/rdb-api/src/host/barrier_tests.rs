@@ -219,19 +219,61 @@ fn s5d_40_a_promote_keeping_the_old_owner_ends_the_barrier_at_once() {
         .expect("the promote commits");
 }
 
-/// Row 40: a promote that drops the old owner tells it nothing, so its barrier ends at the
-/// timeout, naming the copy it still waits on.
-/// Integration (~10 s): the barrier's own timeout.
+/// Row 40, PR #104 review blocker 1: a promote that drops the old owner commits a newer
+/// generation, and node 1, fenced, reads `partitions/1` after its fence (A-R399). Once that read
+/// names node 2 at the newer generation, node 1 ends its barrier in `GENERATION_CHANGED`, long
+/// before the barrier's own timeout. Cut: take `end_barriers_below` out of the `OwnerLearned`
+/// arm, and the barrier waits out its 600 s timeout, so `answer` gives up.
+/// Integration (~6 s): the promote waits out the grant, then the after-fence read.
 #[config_log::retcd_test]
-fn s5d_40_a_promote_dropping_the_old_owner_ends_at_the_timeout() {
+fn s5d_40_a_promote_dropping_the_old_owner_ends_the_barrier_in_generation_changed() {
+    const METHOD: &str =
+        "s5d_40_a_promote_dropping_the_old_owner_ends_the_barrier_in_generation_changed";
     let dir = config_testkit::fs::temp_dir();
     let mut trio = formed(dir.path(), tune);
     trio.links.drop_direction(NodeId(1), NodeId(3));
     let (generation, through) = written(&mut trio, 1, b"a");
-    let answer = trio.call(wait_durable(generation, through, 10_000));
+    let answer = trio.call(wait_durable(generation, through, 600_000));
     trio.until("the barrier is waiting", |trio| {
         (!trio.nodes[0].0.barriers.is_empty()).then_some(())
     });
+
+    let promote = spawn_promote(&trio, 2);
+    let error = refused(trio.answer(&answer));
+    assert_eq!(error.kind, ErrorKind::GenerationChanged, "{error:?}");
+    assert_eq!(
+        error.retry,
+        rdb_core::RetryRule::RetryAfterRecovery,
+        "{error:?}"
+    );
+    assert!(!error.no_mutation, "{error:?}");
+    let lines = logged!(METHOD, "durable_barrier_generation_changed");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["node"], 1, "{lines:?}");
+    assert!(
+        lines[0]["new"].as_u64() > Some(generation.0),
+        "ended by a newer generation: {lines:?}"
+    );
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+}
+
+/// PR #104 review blocker 3: after that promote, node 1 still holds a primary tracker at the old
+/// generation, fenced. A new barrier there is refused the way a write is, and once node 1 has
+/// read the new owner the refusal is `NOT_PRIMARY` naming it, which `Db` re-reads the route on
+/// (`rereads_owner`), so the retry leaves node 1. Cut: drop the A1 check in `barrier_copies`,
+/// and the barrier starts on the stale tracker and ends `DURABILITY_UNCONFIRMED`.
+/// Integration (~6 s): the promote waits out the grant, then the after-fence read.
+#[config_log::retcd_test]
+fn s5d_40_a_fenced_stale_owner_refuses_a_new_barrier_with_the_new_owner() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = formed(dir.path(), tune);
+    let (generation, through) = written(&mut trio, 1, b"a");
 
     let promote = spawn_promote(&trio, 2);
     trio.until("the promote finished", |_| {
@@ -241,12 +283,115 @@ fn s5d_40_a_promote_dropping_the_old_owner_ends_at_the_timeout() {
         .block_on(promote)
         .expect("the promote's task")
         .expect("the promote commits");
+    trio.until("node 1 read node 2 as owner after its fence", |trio| {
+        (trio.nodes[0].0.owner_after_fence.get(&P) == Some(&Some(NodeId(2)))).then_some(())
+    });
     assert!(
-        answer.try_recv().is_err(),
-        "the barrier ended before the promote did, or before its timeout"
+        trio.nodes[0].0.replication.primary(NodeId(1), P).is_some(),
+        "the row needs node 1's stale primary tracker"
     );
+
+    let error = refused(trio.ask(wait_durable(generation, through, 400)));
+    assert_eq!(error.kind, ErrorKind::NotPrimary, "{error:?}");
+    assert!(error.detail.contains("names node 2"), "{error:?}");
+    assert!(trio.nodes[0].0.barriers.is_empty());
+}
+
+/// PR #104 review blocker 2: node 3's real proof of the write, held on its way to node 1 while
+/// a promote drops node 1 and commits a newer generation, is delivered after that commit. Node 1
+/// is cut from rEtcd, so it cannot read the new owner, and its grant no longer admits: the last
+/// proof is credited but the barrier is never `Ok`. Once the cut ends, node 1 reads the new
+/// owner and ends it in `GENERATION_CHANGED`. Cut: answer `Durable` in `durable_proved` without
+/// the A1 check, and the late proof gives `Ok`.
+/// Integration (~8 s): the promote waits out the grant, then the after-fence read.
+#[config_log::retcd_test]
+fn s5d_40_a_real_proof_held_across_a_promote_is_never_ok() {
+    const METHOD: &str = "s5d_40_a_real_proof_held_across_a_promote_is_never_ok";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tune);
+    let faults = super::seal_tests::control_behind_a_cut(&mut trio);
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &super::note_tests::INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.ready();
+    let (generation, through) = written(&mut trio, 1, b"a");
+    let answer = trio.call(wait_durable(generation, through, 600_000));
+    let (barrier, copy) = trio.until("the barrier is waiting", |trio| {
+        trio.nodes[0].0.barriers.iter().next().map(|(id, barrier)| {
+            let copy = barrier
+                .owed
+                .iter()
+                .find(|(_, node)| **node == NodeId(3))
+                .map(|(copy, _)| *copy)
+                .expect("node 3's copy is owed");
+            (*id, copy)
+        })
+    });
+
+    // Node 3's genuine answer, taken out of node 1's mailbox and kept.
+    let mut held = None;
+    let patience = test_patience(Trio::PATIENCE);
+    let started = Instant::now();
+    while held.is_none() {
+        assert!(
+            started.elapsed() < patience,
+            "node 3 never proved the write"
+        );
+        for (host, _, rx) in &mut trio.nodes {
+            host.run_due();
+            host.drain();
+            while let Ok(msg) = rx.try_recv() {
+                let ours = matches!(
+                    &msg,
+                    Msg::DurableProved { copy: from, barrier: id, .. } if *from == copy && *id == barrier
+                );
+                if host.node == NodeId(1) && ours {
+                    held = Some(msg);
+                    continue;
+                }
+                host.handle(msg);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    trio.until("every other copy proved it", |trio| {
+        (trio.nodes[0].0.barriers[&barrier].owed.len() == 1).then_some(())
+    });
+
+    faults.apply("cut-control");
+    let promote = spawn_promote(&trio, 2);
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+
+    trio.nodes[0].0.handle(held.expect("held above"));
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        trio.step();
+        if let Ok(got) = answer.try_recv() {
+            panic!("the barrier answered after the promote: {got:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        trio.nodes[0].0.barriers[&barrier].owed.is_empty(),
+        "the late proof was credited"
+    );
+    assert_eq!(logged!(METHOD, "durable_barrier_withheld").len(), 1);
+
+    faults.apply("");
     let error = refused(trio.answer(&answer));
-    unconfirmed_naming(&error, 3, &[1, 2]);
+    assert_eq!(error.kind, ErrorKind::GenerationChanged, "{error:?}");
 }
 
 /// Row 40: a faulted host answers its barriers instead of leaving the caller to its own timeout.
@@ -385,6 +530,12 @@ fn s5d_43_a_durable_copy_answers_at_once_and_a_full_table_is_overloaded() {
 
     let host = &mut trio.nodes[0].0;
     let deadline = host.clock.now().plus_millis(600_000);
+    let lineage = host
+        .replication
+        .primary(host.node, P)
+        .expect("node 1 is primary")
+        .tracker()
+        .lineage();
     for id in 0..u64::try_from(MAX_BARRIERS).expect("fits") {
         let (reply, _) = mpsc::channel();
         host.barriers.insert(
@@ -392,12 +543,15 @@ fn s5d_43_a_durable_copy_answers_at_once_and_a_full_table_is_overloaded() {
             Barrier {
                 partition: P,
                 generation,
+                lineage,
                 through,
                 deadline,
                 started: Instant::now(),
-                copies: 0,
-                owed: BTreeMap::new(),
+                copies: 1,
+                // A copy no member holds: never asked and never proved, so each one stays.
+                owed: BTreeMap::from([(CopyId(99), NodeId(99))]),
                 asked: BTreeSet::new(),
+                withheld: false,
                 reply,
             },
         );
@@ -484,9 +638,10 @@ fn s5d_44_a_barrier_ok_survives_every_copy_cut_at_its_last_fsync() {
 
 /// Row 46: a held link leaves node 2 behind, and O and node 3 both proved the write. The new
 /// generation is committed below it, and O's barrier is still never `Ok`: a copy is never out of
-/// the owed set for being unreachable. Cut: drop a copy from `owed` when `Host::linked` says it
-/// is down, and this is `Ok`.
-/// Integration (~10 s): the barrier's own timeout.
+/// the owed set for being unreachable. It ends in `GENERATION_CHANGED` once O reads the new owner
+/// after its fence. Cut: drop a copy from `owed` when `Host::linked` says it is down, and this
+/// is `Ok`.
+/// Integration (~6 s): the promote waits out the grant, then the after-fence read.
 #[config_log::retcd_test]
 fn s5d_46_a_network_cut_never_gives_ok_for_a_write_the_new_history_lacks() {
     let dir = config_testkit::fs::temp_dir();
@@ -528,6 +683,13 @@ fn s5d_46_a_network_cut_never_gives_ok_for_a_write_the_new_history_lacks() {
         committed.selected.cutoff_seq
     );
 
+    // Node 1 learns the promote from `partitions/1` after its fence and ends the barrier in
+    // `GENERATION_CHANGED` (PR #104 review); before that, it named node 2's copy at the timeout.
+    // Either way the claim is the same: never `Ok`.
     let error = refused(trio.answer(&answer));
-    unconfirmed_naming(&error, 2, &[1, 3]);
+    assert_eq!(error.kind, ErrorKind::GenerationChanged, "{error:?}");
+    assert!(
+        trio.nodes[0].0.barriers.is_empty(),
+        "the barrier was ended, not left to its timeout"
+    );
 }
