@@ -672,6 +672,13 @@ fn not_ready(status: &NodeStatus) -> Option<NotReady> {
     })
 }
 
+/// Whether a partition reported as `reason` may have moved to another owner by a promote this
+/// `Db` did not hear of: its owner cannot be reached, or answered without admitting. An owner
+/// that gave no answer at all is not one this tells anything about.
+const fn may_have_moved(reason: &NotReady) -> bool {
+    !matches!(reason, NotReady::NoAnswer)
+}
+
 /// The kind a node refused a call with, for a put's or a status look's error and a read's
 /// rejection alike; `None` for an answer that is not a refusal.
 const fn refusal_kind(answer: &Answer) -> Option<ErrorKind> {
@@ -2236,6 +2243,15 @@ impl Db {
             self.ready_seen.store(true, Ordering::Relaxed);
             return Ok(());
         };
+        let timed_out = |partition: PartitionId, phase: String| ReadyError::TimedOut {
+            within_ms: within.as_millis(),
+            owner: self.route.owner_of(partition),
+            phase: if self.route.partitions() > 1 {
+                format!("partition {}: {phase}", partition.0)
+            } else {
+                phase
+            },
+        };
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
@@ -2260,6 +2276,18 @@ impl Db {
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
                     return Ok(());
+                }
+                // It answered without admitting: a resumed old owner stays this way after a
+                // promote it never heard of (PR #102 review). Read the owner again, within
+                // `OWNER_REREAD_GAP`, and look at the owner `partitions/{p}` names now.
+                self.refresh_owner(partition);
+                if self.route.owner_of(partition) != owner.node {
+                    // PR #102 review, round 2: a new owner found after `within` does not get
+                    // another look; the call has run out of time like any other.
+                    if std::time::Instant::now() >= deadline {
+                        return Err(timed_out(partition, phase));
+                    }
+                    continue;
                 }
                 match stuck_recovery(&owner) {
                     Some(ReadyError::Blocked {
@@ -2305,15 +2333,7 @@ impl Db {
                 phase = owner.recovery.unwrap_or_else(|| NO_RECOVERY.to_owned());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(ReadyError::TimedOut {
-                    within_ms: within.as_millis(),
-                    owner: self.route.owner_of(partition),
-                    phase: if self.route.partitions() > 1 {
-                        format!("partition {}: {phase}", partition.0)
-                    } else {
-                        phase
-                    },
-                });
+                return Err(timed_out(partition, phase));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -2333,19 +2353,20 @@ impl Db {
 
     /// Every partition's state now, one entry each in partition order (issue #79 S3). An owner
     /// with no link is `NoLink` at once; the rest share one read timeout. A partition with no
-    /// link has its record read once more, so one moved by another process is asked at its new
-    /// owner rather than reported lost. Holds no state between calls.
+    /// link, or whose owner answers without admitting, has its record read once more, at most
+    /// once per [`OWNER_REREAD_GAP`], so one moved by another process is asked at its new owner
+    /// rather than reported lost or fenced. An owner that does not answer is left as it is.
     #[must_use]
     pub fn readiness(&self) -> Vec<PartitionReady> {
         let all: Vec<PartitionId> = (1..=self.route.partitions()).map(PartitionId).collect();
         let mut seen = self.look_at(&all);
-        let unlinked: Vec<PartitionId> = seen
+        let unadmitted: Vec<PartitionId> = seen
             .iter()
-            .filter(|ready| ready.reason == Some(NotReady::NoLink))
+            .filter(|ready| ready.reason.as_ref().is_some_and(may_have_moved))
             .map(|ready| ready.partition)
             .collect();
-        self.refresh_owners(&unlinked);
-        let moved: Vec<PartitionId> = unlinked
+        self.refresh_owners(&unadmitted);
+        let moved: Vec<PartitionId> = unadmitted
             .into_iter()
             .filter(|partition| {
                 self.route.owner_of(*partition) != seen[partition.0 as usize - 1].owner
@@ -13331,6 +13352,7 @@ mod tests {
     }
 
     /// `partitions/1` in `store` now: the record, its root and its revision.
+    #[cfg(debug_assertions)]
     pub(super) fn stored_root(
         rt: &tokio::runtime::Runtime,
         store: &Arc<dyn ConfigStore>,
@@ -13379,6 +13401,7 @@ mod tests {
     /// with the same root. The crash is a switch fault on node 1's engine, offline, after the
     /// reopen's commit stopped node 1 (`AfterCommit::Fault`). Cut: `check` counts a staged
     /// generation as held, and the last open is never ready. Integration (~8 s): four opens.
+    #[cfg(debug_assertions)]
     #[config_log::retcd_test]
     fn m10_a_reopen_after_a_flatten_cut_short_before_its_switch_rolls_forward_and_reads_back() {
         const METHOD: &str =

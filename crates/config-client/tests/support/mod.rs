@@ -337,6 +337,8 @@ impl ResetServer {
 #[derive(Default)]
 pub struct DeadlineSpy {
     seen: Mutex<Vec<String>>,
+    /// Errors for the next calls, one per call, ahead of `answer`.
+    first: Mutex<std::collections::VecDeque<ConfigError>>,
     answer: Mutex<Option<ConfigError>>,
     hang: tokio::sync::Notify,
 }
@@ -346,6 +348,12 @@ impl DeadlineSpy {
     /// deadline at all is absent, which is what makes "the client sends one" assertable.
     pub fn timeouts(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// Answer the next calls with `errors`, one each, then fall back to `answer_with` or the
+    /// park.
+    pub fn answer_first(&self, errors: Vec<ConfigError>) {
+        *self.first.lock().unwrap() = errors.into();
     }
 
     /// Answer every call with `error` instead of parking on it.
@@ -366,7 +374,8 @@ impl DeadlineSpy {
     // `tonic::Status` is large and is the error type the gRPC trait fixes.
     #[allow(clippy::result_large_err)]
     async fn answer<T>(&self) -> Result<tonic::Response<T>, tonic::Status> {
-        let scripted = self.answer.lock().unwrap().clone();
+        let first = self.first.lock().unwrap().pop_front();
+        let scripted = first.or_else(|| self.answer.lock().unwrap().clone());
         match scripted {
             Some(error) => Err(config_grpc::status_from_error(&error)),
             // Never notified: the caller's budget is the only thing that ends this call.

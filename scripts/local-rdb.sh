@@ -354,7 +354,7 @@ promote_hint() { # n line: a node that gave up waiting for an owner no link reac
     members="$(LR_BUILD=0 admin_line "admin status" 2>/dev/null | grep '^members ' | head -n1 || true)"
     k="$(promote_target "$gone" "$members")"
     if [ -n "$k" ]; then
-        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN (above one partition, add --partition P once for each partition it owns; lr do "admin readiness" lists them)"
+        say "node $n waits for node $gone, the owner, and no link reaches it. If node $gone is lost, run: scripts/local-rdb.sh promote $k --drop $gone --run $RUN (above one partition, add --partition P once for each partition it owns; lr do \"admin readiness\" lists them)"
     else
         say "node $n waits for node $gone, the owner, and no link reaches it. No running node holds a regular copy to promote (${members:-admin status gave no members line})"
     fi

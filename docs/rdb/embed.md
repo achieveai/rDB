@@ -291,7 +291,9 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value is 1,048,240 bytes less the id's length, for a create.
+- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
+  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
+  bytes.
 
 A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
 
@@ -614,7 +616,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | Refusal | Why | When to retry |
 |---|---|---|
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
-| `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd answers this for as long as it is cut. | After `db.wait_ready(..)`. |
+| `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
 | `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without proof from every regular copy; the message names the copies still owed. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |

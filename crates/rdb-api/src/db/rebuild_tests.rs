@@ -625,6 +625,7 @@ fn b3_a_stale_wipe_is_refused_and_leaves_the_folder_in_place() {
 
 /// Fork `nodes`' copies (each differently), restart them, and wait until the owner's F1 is
 /// `Quarantined`. Returns whether it got there within `patience`.
+#[cfg(debug_assertions)]
 fn quarantine_by_fork(db: &Db, nodes: &[NodeId], patience: Duration) -> bool {
     for &node in nodes {
         let generation = db
@@ -658,6 +659,7 @@ fn quarantine_by_fork(db: &Db, nodes: &[NodeId], patience: Duration) -> bool {
 /// Cut: keep the quarantined F1 (no fresh run): the rebuild is refused, red. Cut D-MC1 (no
 /// `bind_instance` on the emptied folder): the reopen is refused `Unbound`, red.
 /// Integration (~5-15 s): two opens, a fork, a quarantine, a re-plan, a restart, a re-add.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn b3_mode_c_takes_a_quarantined_partition_out_and_back() {
     let rt = runtime();
@@ -831,6 +833,7 @@ fn b3_g3_a_second_rebuild_while_one_runs_is_refused() {
 /// G6 with `no_mutation`, and nothing restarts.
 /// Cut: `names` always true: red, but through G4 (3 is a shadow, so dropping 2 leaves 1 alone).
 /// Integration (~1-3 s): one open, a fork, a quarantine.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn b3_g6_a_quarantined_rebuild_of_an_unnamed_copy_is_refused() {
     let rt = runtime();
@@ -858,6 +861,7 @@ fn b3_g6_a_quarantined_rebuild_of_an_unnamed_copy_is_refused() {
 /// its boot and nothing is moved aside.
 /// Cut: `rebuild_duty` ignores a re-quarantine: the rebuild waits out and says timeout, red.
 /// Integration (~1-5 s): one open, two forks, two quarantines.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
     let rt = runtime();
@@ -913,6 +917,7 @@ fn b3_mode_c_refuses_when_the_kept_copies_still_diverge() {
 /// Cut: `rebuild_asked` reads only `committed`: refused "has not committed", red. Cut
 /// D-MC1 (no `bind_instance` on the emptied folder): the third open is refused `Unbound`, red.
 /// Integration (~5-15 s): three opens, a fork, a quarantine, a re-plan, a restart, a re-add.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn b3_mode_c_after_a_reopen_rebuilds_from_the_quarantined_plan() {
     let rt = runtime();

@@ -193,6 +193,7 @@ fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
 
 /// A-R217 rows: node 1's host, the pinned primary of [`landing_at`]'s commit, over the engine
 /// at `path`, with an open bound, so a landing it links can go on to `activate`.
+#[cfg(debug_assertions)]
 fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
     let engine = RocksEngine::open(path).expect("open engine");
     let links = Links::new();
@@ -204,6 +205,7 @@ fn primary_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
 }
 
 /// The newest generation `host` asked the open counter to mark activated for partition 1.
+#[cfg(debug_assertions)]
 fn asked(host: &Host) -> Generation {
     host.activation
         .get(&PartitionId(1))

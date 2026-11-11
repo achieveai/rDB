@@ -7739,6 +7739,9 @@ fn s5n_31_every_old_member_verified_commits_layout_4_and_fires_an_empty_note() {
 }
 
 /// Row 31: a lost member is named, by copy and node, in the commit's record and the effect.
+/// The entry's cutoff is the selected prefix (20), not the anchor's base (`BASE`, 10): the
+/// emitted note and the record's decoded one both say so (PR #103 review). Cut: write
+/// `anchor.base_seq` as the cutoff, red.
 #[retcd_test]
 fn s5n_31_a_lost_member_commits_layout_5_and_names_each_copy_and_node() {
     let (_, commit, effects) = run_over(prior_with(CommittedWithout::default()), &[A]);
@@ -7750,6 +7753,12 @@ fn s5n_31_a_lost_member_commits_layout_5_and_names_each_copy_and_node() {
     assert_eq!(generation, recovered(&effects).new_generation);
     assert_eq!(note.entries.len(), 1);
     assert_eq!(note.entries[0].generation, generation);
+    let selected = recovered(&effects).selected.cutoff_seq;
+    assert_eq!(selected, Seq(20), "the longest head every copy reported");
+    assert_ne!(selected, Seq(BASE), "a cutoff apart from the anchor's base");
+    assert_eq!(note.entries[0].cutoff, selected, "the emitted cutoff");
+    let decoded = committed_without_of(&commit).expect("a record");
+    assert_eq!(decoded.entries[0].cutoff, selected, "the decoded cutoff");
     assert_eq!(
         note.entries[0].copies,
         vec![(B, NodeId(2)), (C, NodeId(3))],

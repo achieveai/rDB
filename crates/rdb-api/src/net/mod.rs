@@ -47,7 +47,9 @@
 //! # Faults
 //!
 //! [`faults::Faults`], read from a file, apply after TLS: a hold delays every frame on a
-//! link, both ways; a dropped request or reply is lost. Every client call a node receives is
+//! link, both ways, except the clock probes and their echoes, which bypass it: a hold is a
+//! slow data path, so it never trips either end's silence timer (losing what it held) and
+//! never costs a node its clock bound; a dropped request or reply is lost. Every client call a node receives is
 //! logged `net_client_request{n, client, request}`.
 
 pub mod certs;
@@ -64,6 +66,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rdb_core::contracts::ids::{BootId, NodeId};
+use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::transport::LinkFault;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -87,7 +90,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireCall::Rebuild` and `WireAnswer::Rebuilt` (M11 T12 over processes) were added under `4`
 /// too: no released build speaks it. So was `RecoveryPlan::must_hold` (PR #74, A-R477), which a
 /// routed `Plan` carries: a build speaking `3` is refused before it could misread one.
-/// `5` is #79's many-partitions wire.
+/// `5` came with issue #79: `WireCall::Get` names the `group` it reads.
 /// `6` came with #80: `Frame::ClockProbe`, `Frame::ClockEcho`,
 /// `WireNodeStatus::{qualifying_copy, clock_bound_lost, committed_without}`, and
 /// `RecoveryPlan::prior`, which a routed `Plan` carries. Those were written as a `4` on a branch
@@ -836,26 +839,35 @@ async fn read(shared: Arc<Shared>, conn: Arc<Conn>, mut inbound: Streaming<Envel
                     },
                 };
                 if !held.is_empty() || shared.faults.holds(&conn.peer) {
-                    held.push_back(frame);
+                    // A hold keeps data back, never the clock exchange: the peer's silence
+                    // timer knows nothing of this side's hold, so a probe held past
+                    // `PROBE_SILENCE` would close the link and lose every frame waiting here
+                    // (PR #103 review). Probes and echoes travel outside the hold both ways, so
+                    // a round is never widened by it and its echo is a true clock sample.
+                    match frame {
+                        frame @ (Frame::ClockProbe { .. } | Frame::ClockEcho { .. }) => {
+                            if let Err(reason) = handle(&shared, &conn, frame) {
+                                return reason;
+                            }
+                        }
+                        frame => held.push_back(frame),
+                    }
                     continue;
                 }
                 if let Err(reason) = handle(&shared, &conn, frame) {
                     return reason;
                 }
             }
-            // A held link sends no probe and stops the silence timer: a hold is a delay, and
-            // an echo sitting in a hold is not a silent peer.
+            // A held link still probes and still counts silence: probes and echoes bypass the
+            // hold (above and `echo`), so a held peer answers and only a silent one trips this.
             _ = probe.tick() => {
-                if shared.faults.holds(&conn.peer) {
-                    *lock(&conn.answered_at) = Instant::now();
-                    continue;
-                }
                 let silent = lock(&conn.answered_at).elapsed();
                 if silent >= PROBE_SILENCE {
                     return format!("no clock echo for {silent:?}");
                 }
                 let id = conn.probe_sent.fetch_add(1, Ordering::Relaxed) + 1;
-                conn.out(Frame::ClockProbe { id, sent: shared.clock.now() });
+                // Written straight to the stream, never behind a hold: see `echo`.
+                conn.write(&Frame::ClockProbe { id, sent: shared.clock.now() });
                 if let Some(guard) = shared.clock.guard() {
                     guard.refresh();
                 }
@@ -874,6 +886,30 @@ async fn read(shared: Arc<Shared>, conn: Arc<Conn>, mut inbound: Streaming<Envel
             }
         }
     }
+}
+
+/// Answer the peer's clock probe `id`. Written straight to the stream, never queued behind a
+/// hold or held data: the echo is the peer's liveness, and a queued one would also widen the
+/// peer's round.
+fn echo(shared: &Shared, conn: &Conn, id: u64, sent: Tick) {
+    conn.write(&Frame::ClockEcho {
+        id,
+        sent,
+        at: shared.clock.now(),
+    });
+}
+
+/// Take the echo of probe `id` as liveness, if it answers a probe this side sent and has not
+/// seen answered: an echo of a future id or a duplicate is no round, and refreshes nothing.
+fn echoed(conn: &Conn, id: u64) -> bool {
+    if id > conn.probe_sent.load(Ordering::Relaxed)
+        || id <= conn.probe_echoed.fetch_max(id, Ordering::Relaxed)
+    {
+        tracing::debug!(peer = %conn.peer, id, "net_clock_echo_unmatched");
+        return false;
+    }
+    *lock(&conn.answered_at) = Instant::now();
+    true
 }
 
 /// Handle one received frame. An error ends the link.
@@ -918,24 +954,15 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
             Ok(())
         }
         Frame::ClockProbe { id, sent } => {
-            conn.out(Frame::ClockEcho {
-                id,
-                sent,
-                at: shared.clock.now(),
-            });
+            echo(shared, conn, id, sent);
             Ok(())
         }
         Frame::ClockEcho { id, sent, at } => {
-            if id > conn.probe_sent.load(Ordering::Relaxed)
-                || id <= conn.probe_echoed.fetch_max(id, Ordering::Relaxed)
-            {
-                tracing::debug!(peer = %conn.peer, id, "net_clock_echo_unmatched");
-                return Ok(());
-            }
-            *lock(&conn.answered_at) = Instant::now();
-            if let (Label::Node(peer), Some(guard)) = (&conn.peer, shared.clock.guard()) {
-                let received = shared.clock.now();
-                guard.observe(*peer, ClockSample { sent, at, received });
+            if echoed(conn, id) {
+                if let (Label::Node(peer), Some(guard)) = (&conn.peer, shared.clock.guard()) {
+                    let received = shared.clock.now();
+                    guard.observe(*peer, ClockSample { sent, at, received });
+                }
             }
             Ok(())
         }

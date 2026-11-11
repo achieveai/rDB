@@ -99,8 +99,9 @@ pub struct StorageOptions {
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
 
 /// The default of [`StorageOptions::sync_stuck_millis`] (A-R317): 5 s, about 1.7 times the
-/// slowest WAL sync measured under load (2,973 ms, lr6). A stuck disk then costs about 8 s
-/// before another node takes over: this, plus the 2.9 s the last renewed grant still lives.
+/// slowest WAL sync measured under load (2,973 ms, lr6). A stuck disk then costs about 11 s
+/// before another node takes over: this, plus the 5.9 s the last renewed grant still lives at
+/// the default 6 s grant (3 s, and about 8 s in all, until issue #80).
 pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 5_000;
 
 /// The default memtable budget of one store, all column families together (A-R300): 64 MiB,

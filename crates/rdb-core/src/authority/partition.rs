@@ -68,6 +68,9 @@ const MEMBERED_LAYOUT_VERSION: u8 = 4;
 
 /// The version byte of a record that also carries a [`CommittedWithout`] note (#80 S5n):
 /// layout 4, then the note. Written only when the note has an entry.
+///
+/// The upgrade is one-way. Once a note with an entry writes layout 5, a build that knows only
+/// layouts 2 to 4 cannot read that record: it reads it as no record at all.
 const NOTED_LAYOUT_VERSION: u8 = 5;
 
 /// The version byte of a record that also carries a [`TailLedger`] (issue #105): layout 4, then
@@ -984,6 +987,71 @@ mod tests {
         no_entries[0] = NOTED_LAYOUT_VERSION;
         no_entries.extend_from_slice(&[0; 9]);
         assert_eq!(PartitionRecord::decode(&no_entries), None);
+    }
+
+    /// PR #103 review: `prior_of` read directly, for each layout and for bytes that are no
+    /// record. Layouts 2 and 3 name no members (`None`, never empty) and hold no note; layout 4
+    /// names its members in order with an empty note; layout 5 names them and its note. A
+    /// truncated body, a layout-5 body with a malformed note, and an unknown layout byte are
+    /// `None`. Cut: `prior_of` reads members only from layout 4, red on layout 5.
+    #[test]
+    fn prior_of_reads_members_and_note_for_each_layout_and_refuses_malformed_bytes() {
+        let prior_members: Vec<PriorMember> = members()
+            .into_iter()
+            .map(|member| PriorMember {
+                copy: member.copy,
+                node: member.node,
+                role: member.role,
+            })
+            .collect();
+        let none = PriorRecord {
+            members: None,
+            note: CommittedWithout::default(),
+        };
+        assert_eq!(prior_of(&record().encode()), Some(none.clone()), "layout 2");
+        assert_eq!(
+            prior_of(&record().encode_with(&root())),
+            Some(none),
+            "layout 3"
+        );
+        assert_eq!(
+            prior_of(&record().encode_with_members(&root(), &members(), None)),
+            Some(PriorRecord {
+                members: Some(prior_members.clone()),
+                note: CommittedWithout::default(),
+            }),
+            "layout 4"
+        );
+        assert_eq!(
+            prior_of(&record().encode_with_members(&root(), &[], None)),
+            Some(PriorRecord {
+                members: Some(Vec::new()),
+                note: CommittedWithout::default(),
+            }),
+            "layout 4 with no members: an empty set, not unknown"
+        );
+        let five = record().encode_with_members(&root(), &members(), Some(&note()));
+        assert_eq!(five[0], NOTED_LAYOUT_VERSION);
+        assert_eq!(
+            prior_of(&five),
+            Some(PriorRecord {
+                members: Some(prior_members),
+                note: note(),
+            }),
+            "layout 5"
+        );
+
+        assert_eq!(prior_of(&[]), None, "empty");
+        assert_eq!(prior_of(&five[..five.len() - 1]), None, "a truncated note");
+        let mut no_entries = record()
+            .encode_with_members(&root(), &members(), None)
+            .to_vec();
+        no_entries[0] = NOTED_LAYOUT_VERSION;
+        no_entries.extend_from_slice(&[0; 9]);
+        assert_eq!(prior_of(&no_entries), None, "a note with no entries");
+        let mut unknown = five.to_vec();
+        unknown[0] = 9;
+        assert_eq!(prior_of(&unknown), None, "an unknown layout");
     }
 
     /// `encode_over` keeps the body's layout and members while it rewrites the head (A-R426 M1).
