@@ -729,6 +729,21 @@ fn w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it()
         )
         .expect("the node hears the boot");
     }
+    // Node 1 is re-added in two commits: a re-plan without it (`DegradedRf2`), then, once its
+    // shadow cursor has caught it up, `shadow_promote` re-plans again to `Active`. A put in flight
+    // across that second re-plan answers `UnknownOutcome` although it is durable, and a send
+    // across either answers `GENERATION_CHANGED` or `LEASE_EXPIRED`; under load each of this
+    // row's three sends below landed inside one (gate on dc1d03d, 2026-11-10). So each waits for
+    // the re-add to settle: the owner's latest commit `Active`, and the owner admitting.
+    let owner = nodes[1].as_ref().expect("node 2");
+    let settled = || {
+        recovered_modes(METHOD, 2).last().map(String::as_str) == Some("Active")
+            && owner
+                .node_status()
+                .first()
+                .is_some_and(|status| status.admits == Some(true))
+    };
+    wait_for("node 1's re-add settled", patience, settled);
 
     let put = first_put(&app, crate::host::test_patience(Duration::from_secs(30)))
         .expect("writes come back once node 3 adopts k2");
@@ -775,6 +790,7 @@ fn w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it()
         expected_generation: None,
         ..(*k2.sent).clone()
     };
+    wait_for("node 1's re-add still settled", patience, settled);
     let retained = app
         .resend(unpinned)
         .expect_err("Dedup answers k2's unpinned resend from its older generation");
@@ -790,6 +806,7 @@ fn w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it()
             .contains(&format!("expected {:?}", k2.generation)),
         "Dedup's older-generation answer names k2's generation: {retained:?}"
     );
+    wait_for("node 1's re-add still settled", patience, settled);
     let next = app.put(b"later", b"v", None).expect("a later write");
     assert_eq!(next.seq, Seq(put.seq.0 + 1), "the resend took no seq");
 }
