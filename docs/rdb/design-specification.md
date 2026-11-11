@@ -623,7 +623,7 @@ flowchart LR
 
 A lineage root in rDB contains `(partition, generation, owner_epoch, base_seq, base_digest, predecessor_generation, predecessor_cutoff)`. Every child history must descend from that root; sequence length alone never selects authority.
 
-Within the same prior authoritative epoch, no new owner has yet written, so compatible contiguous histories can be compared by hash ancestry. Select the longest validated prefix available from eligible survivors; buffered complete entries from a live survivor may be retained, but must be fsynced before the recovery barrier is committed.
+Within the same prior authoritative epoch, no new owner has yet written, so compatible contiguous histories can be compared by hash ancestry. A generation that committed `ReadOnly` and took no writes does not begin a new authoritative epoch for this comparison (amended 2026-11-11, issue #105, §8.5). Select the longest validated prefix available from eligible survivors; buffered complete entries from a live survivor may be retained, but must be fsynced before the recovery barrier is committed.
 
 After fencing, query every reachable eligible previous regular member and verified shadow within a 2 s discovery window. Extend the window while an advertised higher compatible prefix is transferring. If that source fails, record it as unavailable before choosing a shorter prefix.
 
@@ -631,9 +631,11 @@ Records cannot show whether the client received its reply. Select using validate
 
 An isolated holder may remain unavailable, so D6 permits loss-accepting recovery from the surviving prefix. Record queried sources, selected cutoff and loss uncertainty.
 
+**Amended 2026-11-11 (issue #105).** Discovery also stops a writable commit in two cases. A queried or marked copy holds a current tail above the selected cutoff. Or the last writable generation is known and no verified copy holds it intact. The commit is then `ReadOnly`. §8.5 has the rules.
+
 A status query may report `RECOVERED_APPLIED` for a retained request digest/result, never claim the client received the original reply. Old-generation identities remain queryable for the 24 h dedup window through the retained lineage mapping; absence after recovery or expiry returns `UNKNOWN_OUTCOME`/`STATUS_EXPIRED`, not proof of nonexecution. Mutating retries still require explicit generation reconciliation.
 
-Different digests at the same lineage position are corruption or a fencing violation, not a normal tie. Quarantine and block automatic promotion. A returning old owner never overrides a newer committed root, even with a longer suffix.
+Different digests at the same lineage position are corruption or a fencing violation, not a normal tie. Quarantine and block automatic promotion. A returning old owner never overrides a newer committed **writable** root, even with a longer suffix (amended 2026-11-11, issue #105: a newer `ReadOnly` root does not override it, §8.5).
 
 ### 8.2 Why different secondary tails still form one history
 
@@ -705,7 +707,7 @@ flowchart TD
   B --> A["CAS ACTIVE; resume writes"]
 ```
 
-**Takeaway:** with only one surviving regular copy, reads resume from its declared prefix; writes wait for three validated durable copies.
+**Takeaway:** with only one surviving regular copy, reads resume from its declared prefix; writes wait for two validated durable copies under §8.3's rule, and for three to return to `ACTIVE` (amended 2026-11-11, owner decision on issue #105).
 
 
 1. Fence old authority and determine the current authoritative lineage from rDB.
@@ -715,9 +717,200 @@ flowchart TD
 5. Rebuild regular copies from this root. Require all three to fsync the same prefix and validate checksums.
 6. CAS to `ACTIVE`; resume writes after health hysteresis and fresh grants. Explicit client generation refresh is required.
 
-Returning replicas with stale suffixes are quarantined read-only for diagnostics, then rebuilt from the authoritative snapshot. Do not delete a suffix and assume already-applied user values roll back: replace the affected partition prefix in a staging namespace and switch its local manifest atomically.
+**Amended 2026-11-11 (issue #105, owner decision of 2026-11-09): writes may resume on two copies.** Steps 5 and 6 describe the way back to `ACTIVE`. Writes return earlier. Once a second copy is back, a re-plan commits `DEGRADED_RF2` under §8.3's rule: two verified copies, both fsynced through a barrier-proved cutoff, both required for every write. The code did this before the spec said so (`mode_for`). The hazard issue #105 found was a live copy's tail left out, not two copies. §8.5's guard and intact rule close that.
 
-Quarantined suffix retention defaults to seven days and capacity permits; deletion requires operational policy approval. It is not merged automatically into current data. Proven corruption may require manual restore and is outside automatic majority-loss recovery.
+Returning replicas with stale suffixes are quarantined read-only for diagnostics, then rebuilt from the authoritative snapshot. A suffix stamped by the last writable generation is not stale: it is a survivor's history, and §8.5 adopts it (amended 2026-11-11, issue #105). Do not delete a suffix and assume already-applied user values roll back: replace the affected partition prefix in a staging namespace and switch its local manifest atomically.
+
+Quarantined suffix retention defaults to seven days and capacity permits; deletion requires operational policy approval. It is not merged automatically into current data. A suffix adopted under §8.5 was never quarantined. Proven corruption may require manual restore and is outside automatic majority-loss recovery.
+
+### 8.5 A live copy's tail: the guard and the way back
+
+Added 2026-11-11 (issue #105, units 1 and 2). It states what the code does. The owner's decisions of 2026-11-09 are marked where they apply.
+
+**The loss it fixes.** A write confirmed on two copies (`BufferedOnTwo`) could be lost while a live copy still held it. A `ReadOnly` recovery left that copy out. A later recovery committed writable at a lower cutoff, and the next write reused the seq. `wait_durable` `Ok` records were not lost on any schedule walked.
+
+**Terms.**
+
+- **L** is the last generation that committed writable.
+- A **tail** is records a copy holds above a plan's base, on a lineage other than the anchor's.
+- A tail is **current** when the record at its head is stamped L. Stamped below L, it is **superseded**, and recovery treats it as before.
+
+#### 8.5.1 The ledger
+
+`partitions/{p}` carries a `TailLedger` (record layout 6):
+
+- `last_writable`: L, or `None` for unknown.
+- `last_writable_regulars`: the nodes pinned as regulars in L.
+- `held`: one `HeldTail { node, head }` per node holding a tail above a cutoff.
+
+Every recovery CAS and every activation CAS writes it. A promote's `Fencing` write keeps it. A writable commit sets L to its own generation. A `ReadOnly` commit carries L on. A record older than layout 6 reads as L unknown, never as "nothing held". A plan built from the store gets the ledger in `PriorRecord.ledger`. A plan built from memory gets it in `RecoveryResult.ledger`.
+
+#### 8.5.2 The holder speaks
+
+Before any refusal, a queried copy runs `Host::tail_scan` inside `Host::inventory`:
+
+- With L known, it reads every lineage below the anchor's generation that is not staging and has a head above the base. A hit is a head stamped L. A head stamped above L is logged at error and held. A head stamped below L is ignored.
+- With L unknown, it reads only the newest lineage below the anchor, and treats its tail as current.
+- It is not a hit when the anchor's lineage holds the same digest at that head.
+- A head that cannot be read is a hit with no stamp.
+- The highest head wins. On an equal head with an equal digest, the newer lineage wins. On an equal head with different digests, the older one wins.
+
+Any role counts, a shadow's included. A hit is adopted (§8.5.4), released by `forget-tail` (§8.5.9), or answered as `RecoveryEvent::TailHeld { copy, head, stamp, reason }`. Once a copy found a tail, a later refusal in the same answer is still `TailHeld`, never a bare `InventoryFailed`.
+
+The same scan runs when a copy lands a commit for the first time (`Host::landing_scan`), with L from the result. A hit there marks the copy's status `tail_refused`.
+
+#### 8.5.3 F1 caps the mode
+
+`mode_after` makes a commit `ReadOnly` where `mode_for` would make it writable, when either holds:
+
+- **A held tail.** A copy holds a head above the selected cutoff. That covers this run's `TailHeld` answers, a late `InventoryReported` above the cutoff, and the ledger's entries for nodes that did not verify in this run.
+- **The intact rule fails** (§8.5.5).
+
+A tail heard in any phase before the CAS is built counts. The mode and the ledger are fixed when the CAS is built. A tail heard after that is too late for this run, and the copy answers the same way at the next one.
+
+A capped commit arms no rebuild. A copy holding a tail above the cutoff also withholds its post-commit sync proof (`sync_withheld`, `reason=tail_held`). So a rebuild cannot activate past it.
+
+A plan that leaves out a node the ledger marks is blocked with `BlockReason::DropsMarkedHolder { node }`. Nothing is fenced and nothing commits. A node left out would never be asked again, so its mark could never clear.
+
+**When a mark clears.** A node's entry clears when it verifies in a run, when `forget-tail --through` covers it, or when a later cutoff reaches its head. A bare failure never clears it. If the holder dies, the partition stays `ReadOnly` until it returns or an operator runs `forget-tail`.
+
+#### 8.5.4 Adoption: the way back is automatic
+
+**Owner decision (2026-11-09): automatic.** No operator command is needed when a live copy can bring its tail back.
+
+A holder adopts the tail inside its inventory answer. It then reports as an ordinary longer survivor. F1's selection, catch-up and barrier are unchanged. Writes cannot land first: a commit needs the holder's answer, and that answer has either adopted or capped the commit.
+
+`Host::adoption` reads only. It checks, in order:
+
+1. **P3.** L is known, and the tail's head is stamped L.
+2. **Not set aside.** No earlier `forget-tail` sealed the tail's lineage under a copied child.
+3. **P1.** The digest at the anchor's base, on the tail's chain, equals the anchor's.
+4. **P2.** Every record from the base to the head reads, verifies and chains.
+5. **The write's preconditions** for the chosen way, below. These mirror what the storage engine's `inherit` would refuse, so `Adoptable` means the write will succeed.
+
+`Host::adopt` then writes it one of three ways:
+
+- **Link.** The copy holds no lineage at the anchor's generation. `inherit` links it onto the tail's lineage at the tail's head. At the chain depth ceiling (32 levels) the link is a full copy instead. That copy runs on the host thread, at most once per 32 levels.
+- **Resume.** An earlier adoption's full copy crashed part way. The copy finishes it with the same arguments, then links.
+- **Replay.** The copy already holds the anchor's lineage, linked, with its head at or above the base. It appends the tail's records with `record_batch`, as a receiver would. The first record must chain from that head. At most `ADOPT_REPLAY_MAX` (1,024) records are replayed.
+
+After any of them, a receiver held on that copy is dropped. A catch-up it then sources rebuilds a full ladder from the engine. The copy logs `tail_adopted` with `from`, `to`, `head`, `stamp` and `how` (`link`, `resume` or `replay`).
+
+**What an adopted tail can hold.** A record cannot show whether its client got a reply (§8.1). So an adopted tail may hold a write whose client saw an error or no answer. That write becomes visible. A resend with the same identity is deduplicated: the dedup row travels with the record.
+
+#### 8.5.5 The intact rule
+
+**Owner decision (2026-11-09): kept.**
+
+> A commit is writable only if a verified copy, of any role, on a node in L's regulars, holds lineage L intact.
+
+Intact means not staging, and holding a record at seq 1 when L applied any. A copy reports it as `SurvivorInventory.holds_last_writable`. A wiped or rebuilt copy fails it. A flattened copy passes.
+
+The rule is waived while L is unknown, over a first generation, and for a run given `--no-intact-copy`. While it applies and no L-regular has verified intact, the discovery window waits once more for a silent one (`recovery_window_extended_for_intact`).
+
+It is a backstop. On the schedules walked, no `wait_durable` `Ok` record was lost without it.
+
+#### 8.5.6 Adoption states and refusal reasons
+
+A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `adoption: TailAdoption`:
+
+| State | Meaning | Repair | `forget-tail --through` over it |
+|---|---|---|---|
+| `Adoptable` | Every proof holds, and the write will succeed | Re-plans; the next inventory adopts it | Needs `--give-up-live-copy` |
+| `NotReady(reason)` | The proofs hold so far, but a precondition is not met yet | Holds | Needs `--give-up-live-copy` |
+| `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
+| `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
+
+`ADOPTION_REFUSALS` holds every reason, 11 in all. The first three are `NotReady`:
+
+| Reason | State | Meaning |
+|---|---|---|
+| `replay_not_ready` | `NotReady` | The anchor's lineage is not linked yet, is staging, or is below the base. A later landing ends it |
+| `tail_parent_copying` | `NotReady` | A `forget-tail` set-aside of this lineage crashed part way. That release's re-run ends it |
+| `tail_sealed_for_other` | `NotReady` | The tail's lineage is sealed by another child. A backstop: the scan does not reach it |
+| `last_writable_unknown` | `Refused` | L is unknown, for example after an upgrade |
+| `tail_not_last_writable` | `Refused` | The head is not stamped L |
+| `tail_head_unreadable` | `Refused` | The head record cannot be read |
+| `tail_set_aside` | `Refused` | An operator already gave this tail up |
+| `base_digest_differs` | `Refused` | P1 failed: corruption or a fencing violation (§8.1) |
+| `tail_not_contiguous` | `Refused` | P2 failed: a hole or an unreadable record |
+| `anchor_lineage_differs` | `Refused` | Replay: the anchor's lineage does not chain into the tail |
+| `tail_too_long` | `Refused` | Replay: more than `ADOPT_REPLAY_MAX` records |
+
+`TailAdoption::could_return` is true for every state but `Refused`.
+
+The owner's membership repair re-plans only when every held tail is `Adoptable`. A stalled rebuild copy whose tail is `Adoptable` does not hold that repair back, since the re-plan is what adopts it.
+
+A copy whose newest lineage is a staged copy that crashed part way reports `interrupted_copy`. It is `Adoptable` when the staged copy is of a whole tail, which the next adoption resumes, and `Unchecked` otherwise.
+
+A refused write while a tail holds the partition answers `RECOVERY_READ_ONLY`, naming the copy and its seqs:
+
+- every named tail `Adoptable`: "the copy named here can restore these seqs, and writes will return on their own";
+- otherwise: "writes stay refused until the copy named here returns with these seqs or an operator runs `admin forget-tail`, which accepts losing these seqs".
+
+Both say not to wipe or rebuild the named node.
+
+#### 8.5.7 Late and stale asks
+
+The link to a copy queues asks while that copy is down. After a restart it can answer asks the owner has already moved past.
+
+- **An ask behind the copy is late.** If the copy holds a lineage newer than the ask's anchor, it skips the scan and adoption. `survivor` answers `copy_ahead_of_anchor`, logged `inventory_late` at info. This is safe: a lineage at generation N is written only for an ask, a landing or a result at N, so that ask's commit cannot succeed.
+- **An adoption whose answer missed its commit leaves a link.** The next ask under the same L finds the tail on two lineages, at the same head with the same digest. The newer lineage wins, so the copy links again from it.
+- **The asker drops an answer whose anchor is not its plan's.** A stale adoption cannot make a plan take a wrong record, and it loses no write.
+
+#### 8.5.8 The owner behind the cutoff
+
+After adoption, a live `ReadOnly` owner may be the one copy behind the new cutoff. A recovery catch-up must reach its store.
+
+- **Stand-down.** A primary whose last `Recovered` committed `ReadOnly` stands down when A1 revokes its own epoch (`Primary::on_view`, logged `primary_stood_down`). All of these must hold: the view is accepted, it is for the primary's generation, `past_horizon` is `EpochRevoked`, its owner epoch is at or above the primary's, and the recorded mode is `ReadOnly`. A lag-paused `Active` primary is not stood down.
+- **What it does.** The tracker is retired and marked (`ProgressTracker::stood_down`). Cursors, shipped records and started shadows are cleared. The keepalive and the shadow probe stop. Status still shows the node as `primary`, not admitting.
+- **What `Recovered` then does.** For the generation it stood down in, it answers `NotRequired` and the primary stays down. For a newer generation that pins it primary, it is rebuilt at the cutoff, or replaced by a fresh primary when its ladder lacks the cutoff. Pinned anything else, it stays retired.
+- **The catch-up target.** The routed catch-up carries the cutoff's digest (`through_digest`). Under a credential the kept catch-up plan names, an older-generation record at or below the plan's cutoff is historical. At the cutoff its digest must match, or the stream quarantines `DivergentHistory`. A plain append is unchanged.
+
+#### 8.5.9 `admin forget-tail`
+
+It is the only way out when no live copy can bring the tail back. It runs on the owner (`Db::forget_tail`; `rdb_dev admin forget-tail`). Only an admin app may send it.
+
+```text
+admin forget-tail --partition P --through H [--give-up-live-copy]
+admin forget-tail --partition P --no-intact-copy
+```
+
+- **`--through H`** gives up every held tail at or below H, for one run. Those entries clear, the commit may be writable, and L moves. It does not waive the intact rule. A tail above H still caps.
+- **`--no-intact-copy`** waives the intact rule for one run. Held tails still cap.
+- Both may be given together.
+
+It is refused, giving up nothing, when:
+
+- H is at or below the committed cutoff;
+- no copy holds a tail above the cutoff;
+- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given;
+- `--no-intact-copy` is given and the intact rule did not cap the owner's last commit;
+- another re-plan is running.
+
+The owner re-plans with `RecoveryPlan.release`. F1 copies `through` onto that run's inventory asks as `release_through`. A released holder logs `tail_released` and reports at the base. It sets the tail aside with `inherit`'s copied mode: the old lineage keeps the tail, sealed, stamped below the new L. It is never merged.
+
+What is given up is gone for good. Being accepted does not mean writable: the re-plan can still commit `ReadOnly`, for example with too few copies. The next run then holds the tail again.
+
+#### 8.5.10 Upgrade, release and limits
+
+**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 9. An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
+
+**Owner decision (2026-11-09): units 1 and 2 release together.** Unit 1 alone can only give a live copy's tail up.
+
+**Owner decision (2026-11-09): no probe of a dropped old owner.** A promote does not ask the old owner it drops. One loss remains: a `BufferedOnTwo` record whose other copy lost it or is silent, on an old owner a promote drops without asking, when a writable commit happens before that owner is added back. `wait_durable` `Ok` records are not affected. The same loss happened before issue #105.
+
+**Known limits:**
+
+- A silent holder whose tail no earlier run recorded is superseded when it returns, if an intact L-regular verified meanwhile.
+- A copy left read-only by a dead holder stays read-only until the holder returns or `forget-tail` runs.
+- Adoption does not restart the dedup retirement clock. A tail adopted about a day after a `ReadOnly` landing can lose its dedup rows soon after, so a resend could apply twice.
+- Catch-up sends one record per round trip. A 500-record tail took about 4.5 s.
+- `tail_adopted` says `how=link` for a link that became a full copy.
+- The simulator does not model the tail scan or adoption yet.
+- A barrier landing's crashed full copy looks like a resumable adoption, so it also reports `Adoptable`. If its proofs then fail, the repair re-plans in a loop that only its back-off slows.
+- A rebuild source's snapshot merge across a link above the root base is not traced.
+
 
 ## 9. Placement, balancing and shadows
 
@@ -921,5 +1114,7 @@ No production mutation, migration, credential/access change or destructive clean
 Real-system evidence is pinned to rDB `c3fe56bd19674967417897d9691ac44b9f98899b`: [primitive inspection](evidence/rdb-primitives.md), [follow-up](evidence/rdb-primitives-followup.md), [storage inspection](evidence/storage-source-fit.md). Parent independently inspected dependency, CAS guard and storage publication paths; no runtime test or benchmark was run.
 
 New database contracts are **design decisions/inferences**, not existing rDB capabilities. [Protocol critique](evidence/protocol-critique.md) and [fault histories](evidence/fault-model-inferences.md) explain relevant counterexamples. Direct upstream RocksDB Merge documentation, native headers and `rust-rocksdb` 0.23 sources were fetched on 2026-09-20; the verified findings and version limits are recorded in [the Merge analysis](evidence/rocksdb-merge-analysis.md).
+
+**Open finding (2026-11-11, issue #105 unit 2): a durable write can be answered `UNKNOWN_OUTCOME`.** A re-protection re-plan, such as `shadow_promote` after a copy rejoins empty, can revoke the owner's epoch in the same millisecond a put is dispatched. The put is quarantined at its seq, and the new generation then selects a cutoff that includes it. So the write is durable, but its client is answered `UNKNOWN_OUTCOME`. This is safe, not lost: §5.4's rule already covers it. The client must settle it with a status query or `Db::resend` under the same identity, or read the key back. It must never send it again under a new request id. A separate issue tracks resolving such puts as committed.
 
 Pending: proof/model of fencing, RocksDB WAL/flush adapter validation, performance/resource benchmarks, split/load tests, platform clock qualification, destination-specific actor semantics and target Mermaid rendering. These block implementation/release gates as stated in the handoff, not honest delivery of this selected architecture document.

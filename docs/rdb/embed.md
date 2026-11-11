@@ -795,6 +795,26 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     the loss may be missing.
   - Seen in an embedded run with node 1's links to 2 and 3 held (`rdb_dev --hold 1-2,1-3`):
     `get` answered, `put` was refused as above.
+- **A copy holding writes no other copy has keeps the partition read-only until they are
+  back** (issue #105). After a failure, a live copy can hold records above the recovery's
+  cutoff, and a client may have been told those writes succeeded. Writes then stay refused
+  `RECOVERY_READ_ONLY`, naming the copy and its seqs, and `Db::node_status` shows
+  `tail_refused` with an `adoption` state. Reads keep working.
+  - `Adoptable`: the copy brings the records back by itself at the next re-plan, and writes
+    return. Nothing to do. The refusal says "writes will return on their own".
+  - `NotReady`: it should become `Adoptable` after a later re-plan. Wait.
+  - `Refused` or `Unchecked`, or the copy is gone: writes stay refused until it returns or an
+    operator runs `admin forget-tail --partition 1 --through H` (`Db::forget_tail`). That gives
+    up seqs up to H **for good**. Giving up a tail that could still come back also needs
+    `--give-up-live-copy`. Design specification §8.5.9 has every form and refusal.
+  - **Do not wipe or rebuild the node named**, or those seqs may be gone.
+  - A brought-back record may be a write whose client saw an error or no answer. It becomes
+    visible. A resend with `db.resend` is deduplicated.
+- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
+  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
+  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
+  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
+  separate issue.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -834,6 +854,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
   newer one. After an `admin move`, do not roll back to a build before moves (M11) either: it
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
+- **This build's upgrade is one-way, and the whole cluster stops and restarts together**
+  (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
+  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  Roll back only by restoring a backup taken before the upgrade. A partition that already held
+  such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
