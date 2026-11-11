@@ -1176,6 +1176,9 @@ struct TailHit {
     head: Seq,
     /// The generation that wrote the record at `head`; `None` when it could not be read (N5).
     stamp: Option<Generation>,
+    /// The record's digest at `head`; `None` when it could not be read. Design section 16 G1:
+    /// two lineages at one head holding the same record tie.
+    digest: Option<Digest>,
     /// One of [`TAIL_REFUSED_REASONS`].
     reason: &'static str,
 }
@@ -1212,8 +1215,13 @@ pub enum TailAdoption {
     /// Every adoption proof holds against the generation (P1 to P3, and replay's
     /// preconditions where they apply).
     Adoptable,
-    /// The proofs hold so far, but replay's preconditions are not met yet (`replay_not_ready`):
-    /// the anchor lineage is not linked, is staging, or is below the base.
+    /// The proofs hold so far, but a precondition of the write is not met yet, named by one of
+    /// the first [`ADOPTION_NOT_READY`] entries of [`ADOPTION_REFUSALS`]:
+    /// * `replay_not_ready`: the anchor lineage is not linked, is staging, or is below the base;
+    /// * `tail_parent_copying`: another child is staging a copy of the tail's lineage below its
+    ///   head, a release set-aside whose run crashed (design section 16 G3); its re-run ends it;
+    /// * `tail_sealed_for_other`: the tail's lineage is sealed by a child other than the anchor's
+    ///   lineage (G3). A backstop: after G1 and G2 the scan does not reach it.
     NotReady(&'static str),
     /// A proof failed, named by one of [`ADOPTION_REFUSALS`]. The tail cannot come back.
     Refused(&'static str),
@@ -1227,7 +1235,9 @@ impl TailAdoption {
     fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
-            Err(reason) if *reason == "replay_not_ready" => Self::NotReady(reason),
+            Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
+                Self::NotReady(reason)
+            }
             Err(reason) => Self::Refused(reason),
         }
     }
@@ -1246,10 +1256,15 @@ impl TailAdoption {
     }
 }
 
-/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first. A reason
-/// crossing the wire must be one of these.
-pub const ADOPTION_REFUSALS: [&str; 9] = [
+/// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
+pub const ADOPTION_NOT_READY: usize = 3;
+
+/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first
+/// ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+pub const ADOPTION_REFUSALS: [&str; 11] = [
     "replay_not_ready",
+    "tail_parent_copying",
+    "tail_sealed_for_other",
     "last_writable_unknown",
     "tail_not_last_writable",
     "tail_head_unreadable",
@@ -1267,9 +1282,18 @@ pub const ADOPT_REPLAY_MAX: u64 = 1_024;
 /// How a holder adopts a tail onto the anchor's lineage (issue #105, design section 5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Adopt {
-    /// The copy holds no lineage at the anchor's generation: link it onto the tail's lineage at
-    /// the tail's head (`held == base`, a `Linked` inherit).
+    /// The copy holds no lineage at the anchor's generation, or holds it staging a copy of the
+    /// whole tail that crashed part way (design section 16 G4): link it onto the tail's lineage
+    /// at the tail's head (`held == base`; a `Linked` inherit, or `Copied` at the depth
+    /// ceiling, which the same-arguments re-run resumes).
     Link,
+    /// A child below the anchor's generation is staging a copy of the whole tail, an earlier
+    /// adoption's flatten that crashed part way (design section 16 G4): finish that copy with
+    /// the same arguments, then link the anchor's generation onto the child.
+    Resume {
+        /// The staged child.
+        child: Generation,
+    },
     /// The copy already holds the anchor's lineage, linked, at `from` or above the base: append
     /// the tail's records after `from` onto it.
     Replay {
@@ -11644,9 +11668,25 @@ impl Host {
             // Issue #105 unit 2 (design section 5.1): a tail not released is adopted when every
             // proof holds, and the copy then reports it as an ordinary longer survivor. One that
             // cannot be adopted answers `TailHeld`, with nothing written.
+            //
+            // Design section 16 G2: an ask behind a lineage this copy already holds is late. A
+            // lineage at generation N is written only by an ask, landing or result at N, and
+            // `new_root` makes N the prior generation's `next()` with its CAS made against the
+            // prior, so a lineage above the anchor means this ask's CAS cannot succeed. No scan
+            // and no adoption: `survivor` answers `copy_ahead_of_anchor`, logged
+            // `inventory_late` below. This also stops a stale replay into a sealed lineage.
+            let late = self
+                .engine
+                .newest_generation(partition)
+                .is_some_and(|newest| newest > anchor.lineage.generation);
             let mut released = None;
             let mut adopted = None;
-            if let Some(hit) = self.tail_scan(partition, anchor, last_writable) {
+            let hit = if late {
+                None
+            } else {
+                self.tail_scan(partition, anchor, last_writable)
+            };
+            if let Some(hit) = hit {
                 match release_through.filter(|through| hit.head <= *through) {
                     Some(through) => {
                         self.tail_released(partition, copy, anchor, hit, through);
@@ -11757,12 +11797,14 @@ impl Host {
                     RecoveryEvent::InventoryReported(Box::new(inventory))
                 }
                 // C4 (A-R185): an ask that arrives after this copy linked a newer generation at
-                // its landing is late, not a failure of the copy.
+                // its landing is late, not a failure of the copy. Design section 16 G2 (F4): so
+                // is one behind any newer lineage this copy holds.
                 Err("copy_ahead_of_anchor")
-                    if self
-                        .land_linked
-                        .iter()
-                        .any(|(p, g)| *p == partition && *g > anchor.lineage.generation) =>
+                    if late
+                        || self
+                            .land_linked
+                            .iter()
+                            .any(|(p, g)| *p == partition && *g > anchor.lineage.generation) =>
                 {
                     tracing::info!(
                         node = self.node.0,
@@ -11837,7 +11879,9 @@ impl Host {
     /// With the last writable generation L known, every such lineage is a candidate, whatever
     /// this copy's role, and a head counts only when its record is stamped L (current) or above
     /// L (impossible unless corrupt, logged at error). A head stamped below L is superseded and
-    /// is today's path. Of the hits, the highest head is kept; a tie goes to the older
+    /// is today's path. Of the hits, the highest head is kept. A tie on the same record (the
+    /// digest at the head) goes to the newer lineage, which a link or a flatten carried the
+    /// tail onto (design section 16 G1); a tie on different records goes to the older
     /// generation, the writer's own lineage. With L unknown, only the newest lineage below the
     /// anchor is read, and its tail is treated as current: superseded tails stay on disk, so
     /// scanning every lineage with no stamp test would hold nearly every partition.
@@ -11885,6 +11929,7 @@ impl Host {
                     from,
                     head,
                     stamp: None,
+                    digest: None,
                     reason: "tail_head_unreadable",
                 },
                 Ok((record, digest)) => {
@@ -11919,12 +11964,21 @@ impl Host {
                         from,
                         head,
                         stamp,
+                        digest: Some(digest),
                         reason,
                     }
                 }
             };
-            // Ascending generations: a later lineage replaces the kept hit only when higher.
-            if best.as_ref().is_none_or(|kept| hit.head > kept.head) {
+            // Ascending generations: a later lineage replaces the kept hit when higher, or at the
+            // same head holding the same record (design section 16 G1): the newer carries the
+            // tail forward, and a link onto it can extend it, where its parent is sealed for it.
+            let newer_same = |kept: &TailHit| {
+                hit.head == kept.head && hit.digest.is_some() && hit.digest == kept.digest
+            };
+            if best
+                .as_ref()
+                .is_none_or(|kept| hit.head > kept.head || newer_same(kept))
+            {
                 best = Some(hit);
             }
         }
@@ -12129,7 +12183,9 @@ impl Host {
     /// * P1: the digest at the anchor's base on the tail's chain is the anchor's.
     /// * P2: every record from the base through the head reads, verifies, and chains from that
     ///   digest ([`Self::chain`]).
-    /// * No lineage at the anchor's generation: [`Adopt::Link`]. One held (walk A's shape):
+    /// * No lineage at the anchor's generation, or one staging a copy of the whole tail (G4):
+    ///   [`Adopt::Link`], or [`Adopt::Resume`], once [`Self::link_preconditions`] hold (G3).
+    ///   One held (walk A's shape):
     ///   [`Adopt::Replay`], only when it is linked and not staging, its head is at or above the
     ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first
     ///   record replayed names its head's digest as `prev_digest` (N1). A lineage not yet linked
@@ -12179,8 +12235,12 @@ impl Host {
         }
         self.chain(partition, hit.from, base, anchor.base_digest, hit.head)?;
         let to = anchor.lineage.generation;
-        if !self.engine.generations(partition).contains(&to) {
-            return Ok(Adopt::Link);
+        // G4 (same anchor): a lineage at the anchor's generation staging a copy of the whole
+        // tail is this adoption's own flatten, crashed part way; the same link resumes it.
+        if !self.engine.generations(partition).contains(&to)
+            || self.engine.staging(partition, to) == Some((hit.from, hit.head))
+        {
+            return self.link_preconditions(partition, to, hit);
         }
         if self.engine.staging(partition, to).is_some() || self.engine.link(partition, to).is_none()
         {
@@ -12213,12 +12273,61 @@ impl Host {
         Ok(Adopt::Replay { from })
     }
 
+    /// Design section 16 G3 and G4: what `inherit_inner` would refuse a link of `to` onto
+    /// `hit.from` at its head on, checked first, in its order, so that `Adoptable` means the
+    /// link will succeed. `ParentStaging` is not reachable: the scan skips a staging lineage.
+    ///
+    /// * Another child staging a copy of `hit.from` (`ParentHasStagingChild`): one below `to`
+    ///   staging the whole tail, an earlier adoption's flatten that crashed, is finished, not
+    ///   aborted ([`Adopt::Resume`], G4). Any other, a release set-aside below the head (section
+    ///   13) whose run crashed, is `tail_parent_copying`: that release's same-arguments re-run
+    ///   ends it.
+    /// * `hit.from` sealed by a child other than `to` (`ParentSealedForOther`):
+    ///   `tail_sealed_for_other`. A non-copied child holds a pointer, not the bytes, so this is a
+    ///   hold, never a refusal. After G1 and G2 the scan does not reach it; it is a backstop.
+    fn link_preconditions(
+        &self,
+        partition: PartitionId,
+        to: Generation,
+        hit: TailHit,
+    ) -> Result<Adopt, &'static str> {
+        let mut resume = None;
+        for child in self.engine.generations(partition) {
+            if child == to {
+                continue;
+            }
+            match self.engine.staging(partition, child) {
+                Some((parent, base)) if parent == hit.from => {
+                    if base == hit.head && child < to && resume.is_none() {
+                        resume = Some(child);
+                    } else {
+                        return Err("tail_parent_copying");
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self
+            .engine
+            .sealed_by(partition, hit.from)
+            .is_some_and(|child| child != to)
+        {
+            return Err("tail_sealed_for_other");
+        }
+        Ok(resume.map_or(Adopt::Link, |child| Adopt::Resume { child }))
+    }
+
     /// Issue #105 unit 2 (design section 5.1): adopt `hit` onto `anchor`'s lineage when
     /// [`Self::adoption`] allows it, and log `tail_adopted`. A refusal answers its reason and
     /// writes nothing. [`Adopt::Link`] links the anchor's generation onto the tail's lineage at
     /// its head (`inherit` repeats as `AlreadyInherited`). [`Adopt::Replay`] appends each record
     /// after the anchor lineage's head as the receiver's own batch would
     /// ([`record_batch`]); a crash leaves a contiguous prefix and the next run resumes from it.
+    /// [`Adopt::Resume`] re-runs the staged child's copy with its own arguments, then links the
+    /// anchor's generation onto the child, logged `from` the child (design section 16 G4).
+    /// At [`MAX_CHAIN_DEPTH`] the link is a flatten, a full copy run here on the host thread, so
+    /// other partitions' events wait for it: accepted, at most one per 32 levels (section 16 F7,
+    /// R4). `how` says `link` for it too; `flatten` is owed.
     /// Either way a receiver held here is removed (N2): a catch-up this copy sources then restores a
     /// dormant receiver with a full ladder from the engine.
     fn adopt(
@@ -12232,11 +12341,23 @@ impl Host {
         let how = self.adoption(partition, anchor, last_writable, hit)?;
         let to = anchor.lineage.generation;
         self.views.remove(&partition);
+        let mut from = hit.from;
         let how = match how {
             Adopt::Link => match self.engine.inherit(partition, hit.from, to, hit.head) {
                 Ok(_) => "link",
                 Err(_) => return Err("adopt_link_refused"),
             },
+            Adopt::Resume { child } => {
+                let linked = self
+                    .engine
+                    .inherit(partition, hit.from, child, hit.head)
+                    .and_then(|_| self.engine.inherit(partition, child, to, hit.head));
+                if linked.is_err() {
+                    return Err("adopt_link_refused");
+                }
+                from = child;
+                "resume"
+            }
             Adopt::Replay { from } => {
                 for seq in from.0 + 1..=hit.head.0 {
                     let (record, _) = self.checked(partition, hit.from, Seq(seq))?;
@@ -12274,7 +12395,7 @@ impl Host {
             node = self.node.0,
             partition = partition.0,
             copy = copy.0,
-            from = hit.from.0,
+            from = from.0,
             to = to.0,
             base = anchor.base_seq.0,
             head = hit.head.0,
@@ -13647,15 +13768,32 @@ impl Host {
     /// partition's newest lineage, which a restart cannot hide, or the refusal recorded at this
     /// copy's last landing or inventory. Only the newest lineage counts, so a remnant below a
     /// serving generation does not hold a repair.
+    ///
+    /// Lead ruling R5 (design section 16 G4): a staged copy of its parent's whole state (base =
+    /// the parent's head) is what an adoption's flatten at the depth ceiling leaves when it
+    /// crashes, and the next inventory resumes it, so it reports `Adoptable` and the owner's
+    /// repair re-plans. Decision: L is not known here, so this does not run the adoption proofs;
+    /// if they then fail, that inventory's `TailHeld` names the real state, and until the next
+    /// landing replaces it this status says `Adoptable` again. That is a bounded re-plan loop,
+    /// slowed by the repair's back-off, accepted over a hold that nothing would ever end. A
+    /// barrier landing's flatten that crashed has the same shape and reports `Adoptable` too;
+    /// storage cannot tell the two apart. A staged copy below the parent's head (a release
+    /// set-aside, or a landing's copy of a longer parent) stays `Unchecked`.
     fn tail_refused_of(&self, partition: PartitionId) -> Option<TailRefused> {
         if let Some(newest) = self.engine.newest_generation(partition) {
             if let Some((parent, base)) = self.engine.staging(partition, newest) {
+                let head = Seq(self.engine.buffered_applied(partition, parent).0);
+                let adoption = if base == head {
+                    TailAdoption::Adoptable
+                } else {
+                    TailAdoption::Unchecked
+                };
                 return Some(TailRefused {
                     generation: newest,
-                    head: Seq(self.engine.buffered_applied(partition, parent).0),
+                    head,
                     base,
                     reason: "interrupted_copy",
-                    adoption: TailAdoption::Unchecked,
+                    adoption,
                 });
             }
         }

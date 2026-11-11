@@ -3068,3 +3068,460 @@ fn u2_m2_1_a_divergent_record_staged_below_the_cutoff_is_reported_as_the_head_no
         .collect();
     assert_eq!(hits, [serde_json::Value::Bool(false)], "one scan, no hit");
 }
+
+// ---------------------------------------------------------------- design section 16 (Rev 3)
+
+/// Section 16 rows: a tail of 3 records in `generation`, written as R1 stages them, so every
+/// record is stamped `generation` (the last writable generation L). Answers the digests.
+fn tail_in(path: &std::path::Path, generation: u64) -> Vec<Digest> {
+    write_chain(
+        &mut RocksEngine::open(path).expect("open engine"),
+        Generation(generation),
+        3,
+    )
+}
+
+/// Section 16 rows: generation 1 holds 3 records and generations 2 to [`MAX_CHAIN_DEPTH`] are
+/// linked onto it at its head, so generation 32 reads through 32 levels and a link onto it would
+/// pass the ceiling: `inherit` flattens it instead. Every record is stamped generation 1 (L).
+fn tail_at_the_ceiling(path: &std::path::Path) -> Vec<Digest> {
+    let mut engine = RocksEngine::open(path).expect("open engine");
+    let digests = write_chain(&mut engine, Generation(1), 3);
+    let top = u64::try_from(rdb_storage::MAX_CHAIN_DEPTH).expect("a small ceiling");
+    for to in 2..=top {
+        engine
+            .inherit(PartitionId(1), Generation(to - 1), Generation(to), Seq(3))
+            .expect("link one level deeper");
+    }
+    digests
+}
+
+/// The `(from, to, how)` of every `tail_adopted` line this row logged.
+fn adoptions(method: &str) -> Vec<(u64, u64, String)> {
+    logged!(method, "tail_adopted")
+        .into_iter()
+        .map(|line| {
+            (
+                line["from"].as_u64().expect("from"),
+                line["to"].as_u64().expect("to"),
+                line["how"].as_str().expect("how").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// R7-1 (design section 16, G1): a tail of 3 on generation 2 (L). An ask at anchor 3 adopts it by
+/// a link, which seals generation 2 for generation 3. An ask at anchor 4 with the same L, as a
+/// backlog after a restart delivers it, finds generations 2 and 3 holding the same record at
+/// head 3: the newer wins, generation 4 links onto 3, and the copy reports head 3. No hold, and
+/// the status names no tail.
+/// Cut c1 (the tie back to older-wins): red, the second ask is `TailHeld` with
+/// `NotReady("tail_sealed_for_other")`.
+#[config_log::retcd_test]
+fn u2_r7_1_a_backlogged_ask_with_the_same_l_adopts_from_the_newer_lineage() {
+    const METHOD: &str = "u2_r7_1_a_backlogged_ask_with_the_same_l_adopts_from_the_newer_lineage";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = tail_in(&path, 2);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let l = Some(Generation(2));
+    for generation in [3, 4] {
+        match host.inventory(p, CopyId(1), anchor_at(generation, 2, digests[1]), l, None) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(3), digests[2]), "anchor {generation}");
+            }
+            other => panic!("anchor {generation}: adopted and reported, not {other:?}"),
+        }
+    }
+    assert_eq!(
+        adoptions(METHOD),
+        [(2, 3, "link".to_owned()), (3, 4, "link".to_owned())]
+    );
+    assert!(logged!(METHOD, "inventory_tail_held").is_empty());
+    assert_eq!(host.tail_refused_of(p), None);
+}
+
+/// R7-2 (design section 16, G1 and G3): after R7-1's first link (generation 3 onto 2), a
+/// `ReadOnly` landing of generation 4 at cutoff 2 reports the tail `Adoptable`, and the next
+/// inventory at generation 4 does adopt it: what the landing tells the owner's repair is what the
+/// inventory then does.
+/// Cut c1: red, the landing reports `NotReady("tail_sealed_for_other")`.
+#[config_log::retcd_test]
+fn u2_r7_2_a_landing_that_reports_adoptable_is_followed_by_an_adoption() {
+    const METHOD: &str = "u2_r7_2_a_landing_that_reports_adoptable_is_followed_by_an_adoption";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = tail_in(&path, 2);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let l = Some(Generation(2));
+    assert!(matches!(
+        host.inventory(p, CopyId(1), anchor_at(3, 2, digests[1]), l, None),
+        RecoveryEvent::InventoryReported(_)
+    ));
+    let mut landing = landing_at(2, digests[1]);
+    landing.new_generation = Generation(4);
+    landing.selected.root.generation = Generation(4);
+    landing.ledger.last_writable = l;
+    host.landing_scan(p, &landing);
+    assert_eq!(
+        host.tail_refused.get(&p).map(|refused| refused.adoption),
+        Some(TailAdoption::Adoptable),
+        "the landing reports the tail adoptable"
+    );
+    match host.inventory(p, CopyId(1), anchor_at(4, 2, digests[1]), l, None) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]));
+        }
+        other => panic!("the inventory after the landing adopts: {other:?}"),
+    }
+    assert_eq!(adoptions(METHOD).len(), 2, "{:?}", adoptions(METHOD));
+    assert_eq!(host.tail_refused_of(p), None);
+}
+
+/// R7-3 (design section 16, G1): R7-1 with generation 33's adoption a flatten. The tail
+/// lineage reads through 32 levels, so the first link copies it (`copied`, base = head 3, depth
+/// 1). The next ask, with the same L, ties the flattened child with every level below it and
+/// links onto the child.
+/// Cut c1: red at the first ask already, `TailHeld`: older-wins keeps generation 1, sealed by 2.
+#[config_log::retcd_test]
+fn u2_r7_3_a_flattened_child_ties_with_its_parent_and_is_linked_onto() {
+    const METHOD: &str = "u2_r7_3_a_flattened_child_ties_with_its_parent_and_is_linked_onto";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = tail_at_the_ceiling(&path);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let l = Some(Generation(1));
+    for generation in [33, 34] {
+        match host.inventory(p, CopyId(1), anchor_at(generation, 2, digests[1]), l, None) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(3), digests[2]), "anchor {generation}");
+            }
+            other => panic!("anchor {generation}: adopted and reported, not {other:?}"),
+        }
+    }
+    assert_eq!(
+        host.engine
+            .link(p, Generation(33))
+            .map(|link| (link.parent, link.base, link.copied)),
+        Some((Generation(32), Seq(3), true)),
+        "the first adoption flattened"
+    );
+    assert_eq!(
+        adoptions(METHOD),
+        [(32, 33, "link".to_owned()), (33, 34, "link".to_owned())]
+    );
+}
+
+/// R7-4 (design section 16, G1, critic F2): the Replay shape. Generation 3 holds the tail (head
+/// 3, stamped 3) linked onto generation 1's first two records; the anchor's lineage, generation
+/// 4, is linked at the base onto generation 2, which holds the same two records. The ask at
+/// anchor 4 replays the tail onto generation 4 (`how=replay`); its answer is dropped. At the
+/// next anchor, 5, generations 3 and 4 hold the same record at head 3 and the newer, the
+/// anchor lineage that was replayed, is linked onto. This pins the choice only: the older
+/// lineage is unsealed in this shape, so older-wins would link too.
+/// Cut c1: red on the `from` assertion (3, not 4).
+#[config_log::retcd_test]
+fn u2_r7_4_after_a_replay_the_next_anchor_links_onto_the_replayed_lineage() {
+    const METHOD: &str = "u2_r7_4_after_a_replay_the_next_anchor_links_onto_the_replayed_lineage";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let p = PartitionId(1);
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let below = write_chain(&mut engine, Generation(1), 2);
+        for seq in 1..=2 {
+            let (record, _) = engine
+                .history_at(p, Generation(1), Seq(seq))
+                .expect("read")
+                .expect("a record");
+            let envelope = ReplicationEnvelope::decode(&record).expect("decode");
+            engine
+                .commit(record_batch(
+                    BatchId(seq),
+                    p,
+                    Generation(2),
+                    &envelope,
+                    record,
+                ))
+                .expect("the same record in generation 2");
+        }
+        engine
+            .inherit(p, Generation(1), Generation(3), Seq(2))
+            .expect("the tail's lineage");
+        let digests = write_chain_after(&mut engine, Generation(3), below, 1);
+        engine
+            .inherit(p, Generation(2), Generation(4), Seq(2))
+            .expect("the anchor's lineage");
+        digests
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let l = Some(Generation(3));
+    for generation in [4, 5] {
+        match host.inventory(p, CopyId(1), anchor_at(generation, 2, digests[1]), l, None) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(3), digests[2]), "anchor {generation}");
+            }
+            other => panic!("anchor {generation}: adopted and reported, not {other:?}"),
+        }
+    }
+    assert_eq!(
+        adoptions(METHOD),
+        [(3, 4, "replay".to_owned()), (4, 5, "link".to_owned())],
+        "the next anchor links onto the replayed lineage"
+    );
+}
+
+/// R7-5 (design section 16, G2, critic F4): a copy holding generation 5, linked onto its tail
+/// on generation 2, gets an ask at anchor 4 with L = 2. The ask is late: its CAS cannot succeed,
+/// since a lineage at 5 exists only after a commit of 4. No scan and no adoption: it answers
+/// `InventoryFailed`, logged `inventory_late` at info and no `inventory_failed`. Nothing is written
+/// and the status names no tail.
+/// Cuts: c2 (no early return), red, the answer is `TailHeld` with
+/// `NotReady("tail_sealed_for_other")`; c3 (the C4 arm not widened), red, `inventory_failed` at
+/// error.
+#[config_log::retcd_test]
+fn u2_r7_5_an_ask_behind_a_newer_lineage_is_late_and_writes_nothing() {
+    const METHOD: &str = "u2_r7_5_an_ask_behind_a_newer_lineage_is_late_and_writes_nothing";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(2), 3);
+        engine
+            .inherit(PartitionId(1), Generation(2), Generation(5), Seq(3))
+            .expect("generation 5 onto the tail");
+        digests
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let held = host.engine.lineages();
+    assert_eq!(
+        host.inventory(
+            p,
+            CopyId(1),
+            anchor_at(4, 2, digests[1]),
+            Some(Generation(2)),
+            None
+        ),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+    );
+    let late = logged!(METHOD, "inventory_late");
+    assert_eq!(late.len(), 1, "{late:?}");
+    assert_eq!(late[0]["@l"], "Information", "{late:?}");
+    assert!(logged!(METHOD, "inventory_failed").is_empty());
+    assert!(logged!(METHOD, "tail_scan").is_empty(), "no scan");
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+    assert_eq!(host.tail_refused_of(p), None);
+}
+
+/// R7-7 (design section 16, G3, critic F1): `Host::adoption` called with a hit the scan cannot
+/// give since G1, the tail's lineage (2) sealed by a non-copied child (3) other than the anchor's
+/// generation (4). The link would be refused, so adoption says so first, as a hold that keeps the
+/// flag (`NotReady`): the child holds a pointer, not the bytes. Nothing is written.
+/// Cut c4 (G3's seal check removed): red, `Ok(Link)`.
+#[test]
+fn u2_r7_7_adoption_names_a_tail_sealed_for_another_child() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(2), 3);
+        engine
+            .inherit(PartitionId(1), Generation(2), Generation(3), Seq(3))
+            .expect("generation 3 onto the tail");
+        digests
+    };
+    let rt = current_thread();
+    let host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    let hit = TailHit {
+        from: Generation(2),
+        head: Seq(3),
+        stamp: Some(Generation(2)),
+        digest: Some(digests[2]),
+        reason: "missed_generation_held_past_base",
+    };
+    let answer = host.adoption(
+        PartitionId(1),
+        anchor_at(4, 2, digests[1]),
+        Some(Generation(2)),
+        hit,
+    );
+    assert_eq!(answer, Err("tail_sealed_for_other"));
+    assert_eq!(
+        TailAdoption::of(&answer),
+        TailAdoption::NotReady("tail_sealed_for_other")
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing written");
+}
+
+/// R7-8 (design section 16, G3): a tail of 3 on generation 2 with generation 3 staging a
+/// release set-aside from it at base 2 (a released run that crashed part way). Generation 4's
+/// landing reports `NotReady("tail_parent_copying")`, and its inventory answers `TailHeld`
+/// with that state: the repair holds and a bare `forget-tail` needs `--give-up-live-copy`. Once
+/// the same-arguments re-run finishes the copy, the tail is set aside: `Refused("tail_set_aside")`.
+/// Cut c5 (G3's staging-child check removed): red, the landing says `Adoptable`, then the
+/// inventory's link is refused (`Unchecked`).
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn u2_r7_8_a_tail_whose_set_aside_is_still_copying_is_not_ready_until_it_finishes() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let p = PartitionId(1);
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(2), 3);
+        engine.inject_fault(rdb_storage::InjectedFault::CopyBatch);
+        assert!(engine
+            .inherit(p, Generation(2), Generation(3), Seq(2))
+            .is_err());
+        assert_eq!(
+            engine.staging(p, Generation(3)),
+            Some((Generation(2), Seq(2)))
+        );
+        digests
+    };
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let l = Some(Generation(2));
+    let mut landing = landing_at(2, digests[1]);
+    landing.new_generation = Generation(4);
+    landing.selected.root.generation = Generation(4);
+    landing.ledger.last_writable = l;
+    host.landing_scan(p, &landing);
+    let copying = TailAdoption::NotReady("tail_parent_copying");
+    assert_eq!(
+        host.tail_refused.get(&p).map(|refused| refused.adoption),
+        Some(copying),
+        "the landing"
+    );
+    assert!(
+        matches!(
+            host.inventory(p, CopyId(1), anchor_at(4, 2, digests[1]), l, None),
+            RecoveryEvent::TailHeld { .. }
+        ),
+        "the inventory holds"
+    );
+    let adoption = host.tail_refused.get(&p).map(|refused| refused.adoption);
+    assert_eq!(adoption, Some(copying), "the inventory");
+    assert!(!copying.is_adoptable(), "the repair holds");
+    assert!(copying.could_return(), "forget-tail needs the flag");
+
+    host.engine
+        .inherit(p, Generation(2), Generation(3), Seq(2))
+        .expect("the same-arguments re-run finishes the copy");
+    let hit = host
+        .tail_scan(p, anchor_at(4, 2, digests[1]), l)
+        .expect("the tail");
+    assert_eq!(
+        host.adoption(p, anchor_at(4, 2, digests[1]), l, hit),
+        Err("tail_set_aside"),
+        "set aside once the copy finished"
+    );
+}
+
+/// R7-9 (design section 16, F7): a tail whose lineage reads through 32 levels is adopted, the
+/// child flattened (`copied` at base = head 3), and the copy reports head 3.
+/// Cut c6 (refuse at the ceiling, `NotReady`): red, `TailHeld`. Red under c1 too, as R7-3.
+#[config_log::retcd_test]
+fn u2_r7_9_a_tail_at_the_depth_ceiling_is_adopted_by_a_flatten() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = tail_at_the_ceiling(&path);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    match host.inventory(
+        p,
+        CopyId(1),
+        anchor_at(33, 2, digests[1]),
+        Some(Generation(1)),
+        None,
+    ) {
+        RecoveryEvent::InventoryReported(inventory) => {
+            assert_eq!(inventory.head, (Seq(3), digests[2]));
+        }
+        other => panic!("adopted at the ceiling: {other:?}"),
+    }
+    assert_eq!(
+        host.engine
+            .link(p, Generation(33))
+            .map(|link| (link.base, link.copied)),
+        Some((Seq(3), true)),
+        "flattened at the head"
+    );
+}
+
+/// R7-10 (design section 16, G4): the flatten of R7-9 faults on its copy batch, so generation 33
+/// is left staging a copy of the whole tail, and the node restarts.
+/// (a) The same ask again: adoption resumes the copy into 33 (`tail_adopted from=32 to=33`), and
+/// 33 is `copied` at base = head 3.
+/// (b) Variant, the next ask is at anchor 34: the staged child 33 is finished, not aborted, and
+/// 34 links onto it (`tail_adopted from=33 to=34`, `how=resume`); no `tail_parent_copying`.
+/// Cuts: c7 (no same-anchor arm), red in (a), `NotReady("replay_not_ready")`; c8 (no
+/// later-anchor arm), red in (b), `NotReady("tail_parent_copying")`. Red under c1 and c6 too: the
+/// flatten is never staged.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn u2_r7_10_a_flatten_that_crashed_part_way_is_resumed_by_the_next_ask() {
+    const METHOD: &str = "u2_r7_10_a_flatten_that_crashed_part_way_is_resumed_by_the_next_ask";
+    let rt = current_thread();
+    let p = PartitionId(1);
+    let l = Some(Generation(1));
+    for next in [33, 34] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = tail_at_the_ceiling(&path);
+        let mut host = host_over(&path, &rt);
+        host.engine
+            .inject_fault(rdb_storage::InjectedFault::CopyBatch);
+        assert!(
+            matches!(
+                host.inventory(p, CopyId(1), anchor_at(33, 2, digests[1]), l, None),
+                RecoveryEvent::TailHeld { .. }
+            ),
+            "the flatten faulted"
+        );
+        assert_eq!(
+            host.engine.staging(p, Generation(33)),
+            Some((Generation(32), Seq(3))),
+            "staged: a copy of the whole tail"
+        );
+        drop(host);
+        let mut host = host_over(&path, &rt);
+        let before = adoptions(METHOD).len();
+        match host.inventory(p, CopyId(1), anchor_at(next, 2, digests[1]), l, None) {
+            RecoveryEvent::InventoryReported(inventory) => {
+                assert_eq!(inventory.head, (Seq(3), digests[2]), "anchor {next}");
+            }
+            other => panic!("anchor {next}: resumed and reported, not {other:?}"),
+        }
+        assert_eq!(host.engine.staging(p, Generation(33)), None, "finished");
+        assert_eq!(
+            host.engine
+                .link(p, Generation(33))
+                .map(|link| (link.parent, link.base, link.copied)),
+            Some((Generation(32), Seq(3), true)),
+            "33 holds the whole tail, copied"
+        );
+        let expected = if next == 33 {
+            (32, 33, "link".to_owned())
+        } else {
+            (33, 34, "resume".to_owned())
+        };
+        assert_eq!(adoptions(METHOD)[before..], [expected], "anchor {next}");
+    }
+    let held: Vec<_> = logged!(METHOD, "inventory_tail_held")
+        .into_iter()
+        .filter(|line| line["adoption"] == "NotReady(\"tail_parent_copying\")")
+        .collect();
+    assert!(held.is_empty(), "{held:?}");
+}

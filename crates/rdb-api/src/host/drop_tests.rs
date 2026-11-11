@@ -6575,3 +6575,143 @@ fn u2_c4_a_holder_lost_during_the_catch_up_blocks_the_run_and_no_write_lands_unt
     assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2]));
     next_put_follows(&mut trio, 9_500, head, generation);
 }
+
+/// R7-6 (design section 16 G1, the W-C backlog shape), on stepped hosts driven by the real
+/// repair loop: node 2 holds a tail stamped by the last writable generation and stays cut off
+/// from node 1 while node 1's repair commits `ReadOnly` twice more (node 2 restarts, still cut
+/// off, so node 1 plans for it again), so L does not move and node 2's link buffers an inventory
+/// ask for each run. On the heal node 2 answers the backlog in order:
+/// the first ask links its generation onto the tail, and each later one finds that link and the
+/// tail's lineage at the same head with the same record, so it links onto the newer. No adoption
+/// is refused; node 1 commits writable at the tail's head and the next put follows it.
+/// Cut c1 (the tie back to older-wins): red, the second ask finds the tail's lineage sealed for
+/// the first (`NotReady("tail_sealed_for_other")`), and the repair holds.
+/// Integration (~20 s at the gate's scale 3): b19's drop, two retries, the backlog and the re-plan.
+#[config_log::retcd_test]
+fn u2_r7_6_a_holder_cut_off_across_read_only_re_plans_adopts_its_backlog_and_writes_go_on() {
+    const METHOD: &str =
+        "u2_r7_6_a_holder_cut_off_across_read_only_re_plans_adopts_its_backlog_and_writes_go_on";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    // A copy left out is planned for again only at its next boot (`copy_left_out_until_restart`),
+    // so node 2 restarts, still cut off: node 1 hears the boot, plans, and commits `ReadOnly`
+    // without it. Twice, so node 2's link buffers asks at two more generations.
+    let mut last = read_only;
+    for _ in 0..2 {
+        restart(&mut trio, dir.path(), 2);
+        last = until_through_blocks(&mut trio, "node 1 commits read-only again", |trio| {
+            commit_of(trio)
+                .filter(|(generation, mode, _)| {
+                    *generation > last && *mode == PartitionMode::ReadOnly
+                })
+                .map(|(generation, _, _)| generation)
+        });
+    }
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (generation, mode, members) =
+        until_through_blocks(&mut trio, "node 1 commits writable", |trio| {
+            commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+        });
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2]));
+    let adopted: Vec<_> = logged!(METHOD, "tail_adopted")
+        .into_iter()
+        .map(|line| (line["from"].as_u64(), line["to"].as_u64()))
+        .collect();
+    assert!(
+        adopted.len() >= 2,
+        "the backlog adopted more than once: {adopted:?}"
+    );
+    assert!(
+        adopted.windows(2).all(|pair| pair[1].0 == pair[0].1),
+        "each adoption links onto the one before: {adopted:?}"
+    );
+    // No adoption was refused but for `replay_not_ready`: the backlog's buffered landing of the
+    // last read-only commit refuses its link (`held_past_base`) and leaves that generation's
+    // lineage unlinked, so the live ask at it waits for the next landing, which links it (seen
+    // 2026-11-11). Never `tail_sealed_for_other` (c1) nor `adopt_link_refused`.
+    let refused: Vec<_> = logged!(METHOD, "tail_not_adoptable")
+        .into_iter()
+        .filter(|line| line["reason"] != "replay_not_ready")
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+    let recovered = logged!(METHOD, "recovered")
+        .into_iter()
+        .find(|line| line["node"] == 1 && line["generation"] == generation.0)
+        .expect("node 1 logged the commit");
+    assert_eq!(recovered["cutoff"], head.0, "{recovered}");
+    next_put_follows(&mut trio, 9_700, head, generation);
+}
+
+/// R7-11 (lead ruling R5, design section 16 G4), on stepped hosts driven by the real repair loop,
+/// with no ask sent by hand: node 2's adoption of its tail is a flatten (its directory flattens at
+/// its tail lineage's depth, `rdb_storage::flatten_at_depth`, as a tail 32 levels deep would),
+/// and the copy faults on its last batch, so the read-only generation is left staging a copy of
+/// the whole tail. Node 2's status names that copy `interrupted_copy`, `Adoptable`, so node 1's
+/// repair plans again rather than holding; the next inventory resumes the copy, node 1 commits
+/// writable at the tail's head, and the next put follows it.
+/// Cut c9 (a staged copy of the whole tail reported `Unchecked`, as before R5): red, the status
+/// says `Unchecked` and the repair holds.
+/// Integration (~19 s at the gate's scale 3): b19's drop, the faulted adoption and the re-plan.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn u2_r7_11_an_adoption_flatten_that_faulted_part_way_is_resumed_by_the_repair() {
+    const METHOD: &str =
+        "u2_r7_11_an_adoption_flatten_that_faulted_part_way_is_resumed_by_the_repair";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, head) = read_only_beside_an_adoptable_tail(dir.path());
+    let two = &mut trio.nodes[1].0;
+    let tail = two
+        .engine
+        .newest_generation(p)
+        .expect("node 2's tail lineage");
+    let depth = two.engine.chain_depth(p, tail);
+    rdb_storage::flatten_at_depth(two.engine.path(), depth);
+    two.engine
+        .inject_fault(rdb_storage::InjectedFault::CopyBatch);
+    trio.links.heal(NodeId(1), NodeId(2));
+    let staged = trio.until("node 2 reports its staged copy", |trio| {
+        trio.status(1)
+            .tail_refused
+            .filter(|refused| refused.reason == "interrupted_copy")
+    });
+    assert_eq!(
+        (staged.generation, staged.head, staged.base),
+        (read_only, head, head),
+        "the read-only generation staging a copy of the whole tail"
+    );
+    assert_eq!(
+        staged.adoption,
+        TailAdoption::Adoptable,
+        "resumable, so the repair plans again"
+    );
+    let (generation, mode, members) =
+        until_through_blocks(&mut trio, "node 1 commits writable", |trio| {
+            commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
+        });
+    assert_eq!((mode, members), (PartitionMode::DegradedRf2, vec![1, 2]));
+    assert_eq!(
+        logged!(METHOD, "fault_injected").len(),
+        1,
+        "the copy faulted"
+    );
+    assert!(
+        trio.nodes[1].0.engine.staging(p, read_only).is_none(),
+        "the copy finished"
+    );
+    let adopted: Vec<_> = logged!(METHOD, "tail_adopted")
+        .into_iter()
+        .map(|line| (line["node"].clone(), line["how"].clone()))
+        .collect();
+    assert_eq!(
+        adopted.len(),
+        1,
+        "adopted once, by the resumed copy: {adopted:?}"
+    );
+    let recovered = logged!(METHOD, "recovered")
+        .into_iter()
+        .find(|line| line["node"] == 1 && line["generation"] == generation.0)
+        .expect("node 1 logged the commit");
+    assert_eq!(recovered["cutoff"], head.0, "{recovered}");
+    next_put_follows(&mut trio, 9_600, head, generation);
+}
