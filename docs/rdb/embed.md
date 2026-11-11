@@ -617,8 +617,8 @@ first send refused with it true goes again as a new write, and anything else as 
 |---|---|---|
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
-| `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
-| `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without proof from every regular copy. When the owner answers it, the message names the copies still owed. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
+| `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` tries to re-read the owner on this answer (see the barrier notes below for when it does not); the retry goes to the new one once a re-read succeeds. |
+| `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without confirming the position. When the owner answers it, either a regular copy has not proved it, and the message names the copies still owed; or every copy proved it but the owner's grant stopped admitting before it could answer `Ok`, and the message says so, names no copy, and says to read back, since a newer owner may have replaced it. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
 | `UNAVAILABLE`, "went out of reach ...; a write sent here may have applied" | The owner's process stopped after the write was sent (`no_mutation` false). | Once it is back: `db.resend(..)` the request, or ask `db.status(..)`. |
@@ -654,8 +654,12 @@ Some limits of what a barrier's error can tell you:
   `GENERATION_CHANGED`. An owner cut off from rEtcd cannot read it: it gives no `Ok` once its
   grant stops admitting, and its barriers end at their timeout.
 - **A node that no longer owns the partition refuses a new barrier** with `LEASE_EXPIRED`, or
-  `NOT_PRIMARY` naming the new owner once it has read it. The `Db` re-reads the owner on both,
-  so the next call goes to the new one.
+  `NOT_PRIMARY` naming the new owner once it has read it. On both, the `Db` tries to re-read the
+  owner from rEtcd. That re-read is best effort: at most once per partition every 250 ms, so
+  one inside that gap is skipped; it can fail or time out; and a `Db` that runs every node
+  itself has a fixed route and never re-reads. The route changes only after a re-read that
+  succeeds, so only then does the next call go to the new owner. Until then it reaches the
+  same node and is refused again.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -711,7 +715,7 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   0.2 s, or about 2 s twice if its data was wiped. Then it is a full copy again.
 - **The owner is cut off from rEtcd.** While it is cut, it answers `LEASE_EXPIRED`. On that
   answer the `Db` re-reads who owns the partition, at most once every 250 ms. So it follows a
-  promote made elsewhere, and your retries go to the new owner.
+  promote made elsewhere, and your retries go to the new owner once a re-read succeeds.
 - **The cut ends after a promote.** The old owner is now fenced. It reads the owner record
   and answers `NOT_PRIMARY` naming the new owner (`hint`), with `no_mutation` true: this send
   wrote nothing. A first send goes again as a new write; a resend, whose answer has

@@ -135,8 +135,10 @@ pub enum ErrorKind {
     UploadChunkConflict,
     /// A stored blob's manifest or chunks fail their checks. Quarantine and escalate.
     CorruptBlob,
-    /// `Db::wait_durable` ended without proof from every regular copy (#90). It says nothing
-    /// about the write it was asked about.
+    /// `Db::wait_durable` ended without confirming the position (#90): a regular copy had not
+    /// proved it, and the detail names the copies still owed; or every regular copy proved it
+    /// but the owner's grant stopped admitting before it could answer, and the detail names no
+    /// copy. It says nothing about the write it was asked about.
     DurabilityUnconfirmed,
 }
 

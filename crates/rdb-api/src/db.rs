@@ -2725,21 +2725,31 @@ impl Db {
     ///
     /// An `Err` always has `no_mutation` false. It says nothing about the write: settle the
     /// write from the write's own answer. There is nothing to resend. Its next step says to call
-    /// this again, except for `INVALID_ARGUMENT` and a host fault, which keep their own.
+    /// this again, except where it keeps a step of its own: `INVALID_ARGUMENT` and a host fault,
+    /// and a refusal whose message already ends with a prerequisite step, such as opening the
+    /// folder again or rebuilding a quarantined node, including the step this `Db` adds while
+    /// the owner's recovery is stuck for this open. Do that step first.
     ///
-    /// `DURABILITY_UNCONFIRMED` at `timeout` when the owner answers it, naming the copies still
-    /// owed. A copy whose fsync failed is named only as owed: the cause is in that copy's log.
-    /// When the owner does not answer by `timeout` plus a second, this side reports
-    /// `DURABILITY_UNCONFIRMED` itself, "no barrier answer from the owner", and cannot name
-    /// the copies.
+    /// `DURABILITY_UNCONFIRMED` at `timeout` when the owner answers it, in one of two cases. A
+    /// regular copy has not proved the position: the message names the copies still owed. A
+    /// copy whose fsync failed is named only as owed: the cause is in that copy's log. Or every
+    /// regular copy proved it, but the owner's grant stopped admitting before it could answer
+    /// `Ok`: the message says so, names no copy, and warns that a newer owner may have replaced
+    /// it, so read back. When the owner does not answer by `timeout` plus a second, this side
+    /// reports `DURABILITY_UNCONFIRMED` itself, "no barrier answer from the owner", and cannot
+    /// name the copies.
     /// `GENERATION_CHANGED` at once when `written` is not the partition's current generation.
     /// While this waits, a new generation ends it as soon as the owner learns of it: at once when
     /// the owner is a member of the new generation and hears it land, or when it recovers it
     /// itself. A promote that drops the owner tells it nothing; the owner, fenced, learns from
     /// rEtcd's partition record (A-R399), which needs a link to rEtcd. An owner cut off from rEtcd
     /// cannot learn it, gives no `Ok` once its grant stops admitting, and ends at the timeout.
-    /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now, after
-    /// which this `Db` re-reads the owner, so a retry goes to the new one. `RECOVERY_READ_ONLY`
+    /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now. On
+    /// either, this `Db` tries to re-read the owner from rEtcd, best effort: at most once per
+    /// partition every 250 ms and within the read timeout. A re-read inside that gap is skipped,
+    /// one can fail or time out, and a `Db` whose route is fixed (one running every node itself)
+    /// never re-reads. The route changes only after a re-read that succeeds, so only then does a
+    /// retry go to the new owner; until then it reaches the same node. `RECOVERY_READ_ONLY`
     /// from the node asked. `OVERLOADED` when the node holds too many barriers.
     /// `INVALID_ARGUMENT` when `written` is above what the primary has applied.
     pub fn wait_durable(

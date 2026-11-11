@@ -26,7 +26,7 @@ public enum RdbErrorKind
     Unavailable = 19,
     UploadChunkConflict = 20,
     CorruptBlob = 21,
-    /// <summary>A durability barrier ended without proof from every regular copy. Says nothing about the write.</summary>
+    /// <summary>A durability barrier ended without confirming the position: a regular copy had not proved it (the message names the copies still owed), or every copy proved it but the owner's grant stopped admitting before it could confirm (the message names no copy; read back). Says nothing about the write.</summary>
     DurabilityUnconfirmed = 22,
 }
 
