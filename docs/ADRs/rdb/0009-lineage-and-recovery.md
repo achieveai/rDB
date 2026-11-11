@@ -451,8 +451,17 @@ holding **past** the cutoff in its own generation is still refused by name, as b
 | Eligible regulars | Mode | Rules |
 |---|---|---|
 | 2 | `DEGRADED_RF2` | writes resume; `min_regular_acks = 1` of 1, so **both** are required and losing either stops admission and enters majority-loss recovery. Reported degraded until a third copy is caught up, fsynced and CASed into membership (§8.3) |
-| 1 | `READ_ONLY` | `recovery_mode = true`; reads only from the declared prefix; mutations and actor activation rejected; writes wait for **three** copies to fsync the same prefix and validate checksums, then CAS `ACTIVE` (§8.4 steps 4–6) |
+| 1 | `READ_ONLY` | `recovery_mode = true`; reads only from the declared prefix; mutations and actor activation rejected. Writes resume on **two** copies: once a second copy is back, a re-plan commits `DEGRADED_RF2` by the row above. Returning to `ACTIVE` waits for **three** copies to fsync the same prefix and validate checksums, then CAS `ACTIVE` (§8.4 steps 4–6; amended 2026-11-11, below) |
 | 0 | `BLOCKED` | operator restore; outside automatic recovery |
+
+**Amended 2026-11-11 (issue #105; owner decision of 2026-11-09).** The `READ_ONLY` row said
+writes wait for three copies. The code never did: a re-plan with two eligible regulars commits
+`DEGRADED_RF2` (`mode_for`), and the owner ruled that writes may resume on two copies after a
+read-only recovery (spec §8.4, amended). Three copies are still what `ACTIVE` needs. Issue #105
+also adds one cap the count does not show: `mode_after` commits `READ_ONLY` where the count
+would allow writes, while a live copy holds a current tail above the cutoff or the intact rule
+fails (spec §8.5.3). Rows: `recovery_f1`'s issue #105 rows, and the W-C row
+`w_c_a_write_acked_on_two_copies_comes_back_from_the_live_copy_that_holds_it`.
 
 **Amended 2026-10-08 (lead ruling "S0 K1", M9).** At cutoff 0 the rebuild pins its point at
 `(0, ROOT)` when the recovery commits, in every mode, not by a catch-up: a copy that returns

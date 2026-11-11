@@ -176,6 +176,25 @@ the copy is walked by ordinary catch-up. Rows: `m7b_123_historical_envelopes_rea
 `h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine`, and the simulator's
 `m10_d3_a_copy_behind_two_writeless_reopens_catches_up`.
 
+**Amended 2026-11-11 (issue #105 unit 2, architect section 15.3; amends K-B-37 and A-R223):
+historical at or below a kept plan's cutoff.** Adoption breaks the floor rule's premise. A copy
+that adopts a live tail holds records stamped by the last writable generation above the prior
+generation's floor. A pre-commit catch-up from that copy reaches a target whose root is still the
+prior generation's, so the rule above refused those records `STALE_GENERATION`, and the recovery
+deadlocked. The rule now has a second arm, for credentialed frames only
+(`AppendReceiver::plan_cutoff`, `AppendReceiver::is_historical`). If the frame's credential is
+one the kept catch-up plan `names`, a record whose `generation` is older than the receiver's and
+whose `seq` is at or below that plan's cutoff is historical too. The plan is the root this
+recovery will install. The routed catch-up carries the cutoff's digest (`through_digest` on
+`RecoveryEffect::CatchUp` and `KernelEvent::CatchUp`) into the target's `CatchUpPlan.cutoff`, and
+`sequence_row` pins it there as the root pins its floor: a different digest at the plan's cutoff
+quarantines `DIVERGENT_HISTORY`. A plain append, or a credential the plan does not name, uses the
+root alone, as before. Above the plan's cutoff an older record is still `STALE_GENERATION`. The
+plan is replaced or dropped at the next `Recovered`, so the arm ends when the root it stands in
+for is installed. Rows: `replication_append`'s `u2_r6_*` rows (accepted at the cutoff, refused
+above it, quarantined on a different digest, a plain append unchanged, an unnamed credential
+unchanged, the plan gone after `Recovered`).
+
 **The anchor is looked up on every copy, not adopted from the control message.** The rule above
 rests on one premise: a copy that holds `base_seq` holds `base_digest`. Row 9 checks it on arrival
 for a copy that is *behind* the cutoff, because that copy receives the record at `base_seq`. A copy
