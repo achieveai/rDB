@@ -36,6 +36,9 @@ use crate::contracts::ids::{
     BootId, ConfigVersion, Generation, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
 };
 use crate::contracts::membership::{CopyId, Member, PartitionConfig};
+use crate::contracts::recovery::{
+    CommittedWithout, PriorMember, PriorRecord, WithoutEntry, MAX_NOTE_ENTRIES,
+};
 
 /// The version byte every encoded record starts with.
 ///
@@ -61,6 +64,13 @@ pub const INSTANCE_LEN: usize = 16;
 /// The version byte of a record that also carries the members its configuration pins
 /// (bug bash #64, ruling A-R426): layout 3, then a member count and each member.
 const MEMBERED_LAYOUT_VERSION: u8 = 4;
+
+/// The version byte of a record that also carries a [`CommittedWithout`] note (#80 S5n):
+/// layout 4, then the note. Written only when the note has an entry.
+///
+/// The upgrade is one-way. Once a note with an entry writes layout 5, a build that knows only
+/// layouts 2 to 4 cannot read that record: it reads it as no record at all.
+const NOTED_LAYOUT_VERSION: u8 = 5;
 
 /// One member in a layout-4 record: copy slot, node id, role byte.
 const MEMBER_LEN: usize = 1 + 4 + 1;
@@ -176,7 +186,7 @@ impl PartitionRoot {
     pub fn decode(body: &[u8]) -> Option<Self> {
         if !matches!(
             body.first(),
-            Some(&(ROOTED_LAYOUT_VERSION | MEMBERED_LAYOUT_VERSION))
+            Some(&(ROOTED_LAYOUT_VERSION | MEMBERED_LAYOUT_VERSION | NOTED_LAYOUT_VERSION))
         ) {
             return None;
         }
@@ -258,12 +268,15 @@ impl RecordMember {
         }
     }
 
-    /// The members a layout-4 body carries, in the order written, or `None` for a layout-2 or
-    /// layout-3 body or bytes that are not a record. A caller treats `None` as "this record
-    /// names no members", never as an empty set.
+    /// The members a layout-4 or layout-5 body carries, in the order written, or `None` for a
+    /// layout-2 or layout-3 body or bytes that are not a record. A caller treats `None` as "this
+    /// record names no members", never as an empty set.
     #[must_use]
     pub fn decode_all(body: &[u8]) -> Option<Vec<Self>> {
-        if body.first() != Some(&MEMBERED_LAYOUT_VERSION) {
+        if !matches!(
+            body.first(),
+            Some(&(MEMBERED_LAYOUT_VERSION | NOTED_LAYOUT_VERSION))
+        ) {
             return None;
         }
         PartitionRecord::decode(body)?;
@@ -301,17 +314,107 @@ const fn role_from_byte(byte: u8) -> Option<ReplicaRole> {
     }
 }
 
-/// Whether `body`'s tail after layout 3 is a valid member list: a count of at most
-/// [`MAX_RECORD_MEMBERS`], exactly that many members, each with a known role byte.
-fn members_tail_valid(body: &[u8]) -> bool {
-    let Some(&count) = body.get(ROOTED_LEN) else {
-        return false;
-    };
-    let count = usize::from(count);
-    count <= MAX_RECORD_MEMBERS
-        && body.len() == ROOTED_LEN + 1 + count * MEMBER_LEN
+/// Where `body`'s member list ends, when `body` after layout 3 holds a valid one: a count of at
+/// most [`MAX_RECORD_MEMBERS`], that many members, each with a known role byte.
+fn members_end(body: &[u8]) -> Option<usize> {
+    let count = usize::from(*body.get(ROOTED_LEN)?);
+    let end = ROOTED_LEN + 1 + count * MEMBER_LEN;
+    (count <= MAX_RECORD_MEMBERS
+        && body.len() >= end
         && (0..count)
-            .all(|index| role_from_byte(body[ROOTED_LEN + 1 + index * MEMBER_LEN + 5]).is_some())
+            .all(|index| role_from_byte(body[ROOTED_LEN + 1 + index * MEMBER_LEN + 5]).is_some()))
+    .then_some(end)
+}
+
+/// `dropped_through`, the entry count, then each entry: generation, cutoff, copy count, copies.
+fn encode_note(note: &CommittedWithout, out: &mut Vec<u8>) {
+    out.extend_from_slice(&note.dropped_through.0.to_le_bytes());
+    // At most `MAX_NOTE_ENTRIES`, checked by the encoder.
+    out.push(u8::try_from(note.entries.len()).unwrap_or(u8::MAX));
+    for entry in &note.entries {
+        out.extend_from_slice(&entry.generation.0.to_le_bytes());
+        out.extend_from_slice(&entry.cutoff.0.to_le_bytes());
+        out.push(u8::try_from(entry.copies.len()).unwrap_or(u8::MAX));
+        for (copy, node) in &entry.copies {
+            out.push(copy.0);
+            out.extend_from_slice(&node.0.to_le_bytes());
+        }
+    }
+}
+
+/// The note `tail` holds, exactly: `None` for a short or long tail, no entries (never written),
+/// more than [`MAX_NOTE_ENTRIES`] entries or more than [`MAX_RECORD_MEMBERS`] copies in one.
+fn decode_note(tail: &[u8]) -> Option<CommittedWithout> {
+    fn u64_at(tail: &[u8], at: &mut usize) -> Option<u64> {
+        let bytes: [u8; 8] = tail.get(*at..*at + 8)?.try_into().ok()?;
+        *at += 8;
+        Some(u64::from_le_bytes(bytes))
+    }
+    fn u8_at(tail: &[u8], at: &mut usize) -> Option<u8> {
+        let byte = *tail.get(*at)?;
+        *at += 1;
+        Some(byte)
+    }
+    let mut at = 0;
+    let dropped_through = Generation(u64_at(tail, &mut at)?);
+    let count = usize::from(u8_at(tail, &mut at)?);
+    if count == 0 || count > MAX_NOTE_ENTRIES {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let generation = Generation(u64_at(tail, &mut at)?);
+        let cutoff = Seq(u64_at(tail, &mut at)?);
+        let copies = usize::from(u8_at(tail, &mut at)?);
+        if copies > MAX_RECORD_MEMBERS {
+            return None;
+        }
+        let mut held = Vec::with_capacity(copies);
+        for _ in 0..copies {
+            let copy = CopyId(u8_at(tail, &mut at)?);
+            let node: [u8; 4] = tail.get(at..at + 4)?.try_into().ok()?;
+            at += 4;
+            held.push((copy, NodeId(u32::from_le_bytes(node))));
+        }
+        entries.push(WithoutEntry {
+            generation,
+            cutoff,
+            copies: held,
+        });
+    }
+    (at == tail.len()).then_some(CommittedWithout {
+        entries,
+        dropped_through,
+    })
+}
+
+/// The note `body` carries: empty for a record in a layout with no note, `None` when `body` is
+/// not a record.
+#[must_use]
+pub fn committed_without_of(body: &[u8]) -> Option<CommittedWithout> {
+    PartitionRecord::decode(body)?;
+    if body[0] != NOTED_LAYOUT_VERSION {
+        return Some(CommittedWithout::default());
+    }
+    decode_note(&body[members_end(body)?..])
+}
+
+/// What a recovery superseding `body` needs from it, or `None` when `body` is not a record.
+#[must_use]
+pub fn prior_of(body: &[u8]) -> Option<PriorRecord> {
+    Some(PriorRecord {
+        note: committed_without_of(body)?,
+        members: RecordMember::decode_all(body).map(|members| {
+            members
+                .into_iter()
+                .map(|member| PriorMember {
+                    copy: member.copy,
+                    node: member.node,
+                    role: member.role,
+                })
+                .collect()
+        }),
+    })
 }
 
 /// One `partitions/{id}` record: who owns this partition, and under which lineage.
@@ -353,18 +456,45 @@ impl PartitionRecord {
     /// does; [`RecordMember::decode_all`] reads the members back in this order. A build that
     /// knows only layouts 2 and 3 reads it as no record at all, never as one without members.
     ///
+    /// A `note` with an entry makes it layout 5 (#80 S5n). `note` is not defaulted, and this is
+    /// the only encoder: every writer of this layout has to say what it does with the note.
+    ///
     /// # Panics
     ///
-    /// When `members` holds more than [`MAX_RECORD_MEMBERS`]: such a body would not decode.
+    /// When `members` holds more than [`MAX_RECORD_MEMBERS`], or `note` more than
+    /// [`MAX_NOTE_ENTRIES`] entries or [`MAX_RECORD_MEMBERS`] copies in one: such a body would
+    /// not decode.
     #[must_use]
-    pub fn encode_with_members(&self, root: &PartitionRoot, members: &[RecordMember]) -> Bytes {
+    pub fn encode_with_members(
+        &self,
+        root: &PartitionRoot,
+        members: &[RecordMember],
+        note: Option<&CommittedWithout>,
+    ) -> Bytes {
         assert!(
             members.len() <= MAX_RECORD_MEMBERS,
             "a partition record carries at most {MAX_RECORD_MEMBERS} members, not {}",
             members.len()
         );
+        let note = note.filter(|note| !note.is_empty());
+        if let Some(note) = note {
+            assert!(
+                note.entries.len() <= MAX_NOTE_ENTRIES
+                    && note
+                        .entries
+                        .iter()
+                        .all(|entry| entry.copies.len() <= MAX_RECORD_MEMBERS),
+                "a note carries at most {MAX_NOTE_ENTRIES} entries of {MAX_RECORD_MEMBERS} \
+                 copies: {note:?}"
+            );
+        }
         let len = ROOTED_LEN + 1 + members.len() * MEMBER_LEN;
-        let mut out = self.rooted(MEMBERED_LAYOUT_VERSION, len, root);
+        let version = if note.is_some() {
+            NOTED_LAYOUT_VERSION
+        } else {
+            MEMBERED_LAYOUT_VERSION
+        };
+        let mut out = self.rooted(version, len, root);
         // At most `MAX_RECORD_MEMBERS`, checked above.
         out.push(u8::try_from(members.len()).unwrap_or(u8::MAX));
         for member in members {
@@ -373,12 +503,15 @@ impl PartitionRecord {
             out.push(role_to_byte(member.role));
         }
         debug_assert_eq!(out.len(), len);
+        if let Some(note) = note {
+            encode_note(note, &mut out);
+        }
         Bytes::from(out)
     }
 
-    /// This record in `body`'s layout, with `body`'s members and `root` (or `body`'s root when
-    /// `root` is `None`): the one way to rewrite a stored record without losing what it
-    /// carries (A-R426 M1). `None` when `body` is not a record, or `root` is given for a
+    /// This record in `body`'s layout, with `body`'s members and note and `root` (or `body`'s
+    /// root when `root` is `None`): the one way to rewrite a stored record without losing what
+    /// it carries (A-R426 M1, #80 S5n). `None` when `body` is not a record, or `root` is given for a
     /// layout-2 body, which has none.
     #[must_use]
     pub fn encode_over(&self, body: &[u8], root: Option<&PartitionRoot>) -> Option<Bytes> {
@@ -388,7 +521,10 @@ impl PartitionRecord {
             None => PartitionRoot::decode(body),
         };
         match (root, RecordMember::decode_all(body)) {
-            (Some(root), Some(members)) => Some(self.encode_with_members(&root, &members)),
+            (Some(root), Some(members)) => {
+                let note = committed_without_of(body)?;
+                Some(self.encode_with_members(&root, &members, Some(&note)))
+            }
             (Some(root), None) if body[0] == ROOTED_LAYOUT_VERSION => Some(self.encode_with(&root)),
             (None, None) if body[0] == LAYOUT_VERSION => Some(self.encode()),
             _ => None,
@@ -433,7 +569,10 @@ impl PartitionRecord {
         let valid = match body.first() {
             Some(&LAYOUT_VERSION) => body.len() == ENCODED_LEN,
             Some(&ROOTED_LAYOUT_VERSION) => body.len() == ROOTED_LEN,
-            Some(&MEMBERED_LAYOUT_VERSION) => members_tail_valid(body),
+            Some(&MEMBERED_LAYOUT_VERSION) => members_end(body) == Some(body.len()),
+            Some(&NOTED_LAYOUT_VERSION) => {
+                members_end(body).is_some_and(|end| decode_note(&body[end..]).is_some())
+            }
             _ => false,
         };
         if !valid {
@@ -549,13 +688,13 @@ mod tests {
     /// Layout 4 reads back as the same record, the same root and the same members in order.
     #[test]
     fn layout_4_round_trips_its_record_root_and_members() {
-        let bytes = record().encode_with_members(&root(), &members());
+        let bytes = record().encode_with_members(&root(), &members(), None);
         assert_eq!(bytes[0], 4, "the layout byte");
         assert_eq!(bytes.len(), ROOTED_LEN + 1 + 3 * MEMBER_LEN);
         assert_eq!(PartitionRecord::decode(&bytes), Some(record()));
         assert_eq!(PartitionRoot::decode(&bytes), Some(root()));
         assert_eq!(RecordMember::decode_all(&bytes), Some(members()));
-        let none = record().encode_with_members(&root(), &[]);
+        let none = record().encode_with_members(&root(), &[], None);
         assert_eq!(
             RecordMember::decode_all(&none),
             Some(Vec::new()),
@@ -582,7 +721,9 @@ mod tests {
     /// an unknown layout byte is no record at all, never a partial one (A-R426 A1, row (d)).
     #[test]
     fn a_bad_count_role_length_or_layout_is_no_record() {
-        let good = record().encode_with_members(&root(), &members()).to_vec();
+        let good = record()
+            .encode_with_members(&root(), &members(), None)
+            .to_vec();
         let undecodable = |bytes: &[u8], why: &str| {
             assert_eq!(PartitionRecord::decode(bytes), None, "{why}");
             assert_eq!(PartitionRoot::decode(bytes), None, "{why}");
@@ -613,12 +754,136 @@ mod tests {
         bytes
     }
 
+    fn note() -> CommittedWithout {
+        CommittedWithout::default().with(crate::contracts::recovery::WithoutEntry {
+            generation: Generation(4),
+            cutoff: Seq(9),
+            copies: vec![(CopyId(0), NodeId(1)), (CopyId(2), NodeId(3))],
+        })
+    }
+
+    /// #80 S5n row 36: rewriting the head of a layout-5 body keeps the note, with the record's
+    /// root moved or kept. Cut: `encode_over` passes `None`: the rewrite is layout 4, red.
+    #[test]
+    fn s5n_36_encode_over_keeps_the_note_of_a_layout_5_body() {
+        let mut moved = record();
+        moved.owner = NodeId(3);
+        let five = record().encode_with_members(&root(), &members(), Some(&note()));
+        assert_eq!(five[0], NOTED_LAYOUT_VERSION);
+        assert_eq!(committed_without_of(&five), Some(note()));
+        let over = moved.encode_over(&five, None).expect("layout 5");
+        assert_eq!(over[0], NOTED_LAYOUT_VERSION);
+        assert_eq!(PartitionRecord::decode(&over), Some(moved));
+        assert_eq!(committed_without_of(&over), Some(note()));
+        assert_eq!(RecordMember::decode_all(&over), Some(members()));
+        let rerooted = PartitionRoot {
+            run: Revision(99),
+            ..root()
+        };
+        let over = moved.encode_over(&five, Some(&rerooted)).expect("layout 5");
+        assert_eq!(PartitionRoot::decode(&over), Some(rerooted));
+        assert_eq!(committed_without_of(&over), Some(note()));
+    }
+
+    /// #80 S5n: an empty or absent note is layout 4, and a layout-4 body reads as an empty note.
+    /// A layout-5 body with no entries, or with bytes left over, is no record.
+    #[test]
+    fn s5n_36_an_empty_note_is_layout_4_and_a_malformed_note_is_no_record() {
+        let empty = CommittedWithout::default();
+        for body in [
+            record().encode_with_members(&root(), &members(), None),
+            record().encode_with_members(&root(), &members(), Some(&empty)),
+        ] {
+            assert_eq!(body[0], 4);
+            assert_eq!(
+                committed_without_of(&body),
+                Some(CommittedWithout::default())
+            );
+        }
+        let five = record().encode_with_members(&root(), &members(), Some(&note()));
+        assert!(PartitionRecord::decode(&five).is_some());
+        let mut trailing = five.to_vec();
+        trailing.push(0);
+        assert_eq!(PartitionRecord::decode(&trailing), None);
+        assert_eq!(committed_without_of(&trailing), None);
+        let four = record().encode_with_members(&root(), &members(), None);
+        let mut no_entries = four.to_vec();
+        no_entries[0] = NOTED_LAYOUT_VERSION;
+        no_entries.extend_from_slice(&[0; 9]);
+        assert_eq!(PartitionRecord::decode(&no_entries), None);
+    }
+
+    /// PR #103 review: `prior_of` read directly, for each layout and for bytes that are no
+    /// record. Layouts 2 and 3 name no members (`None`, never empty) and hold no note; layout 4
+    /// names its members in order with an empty note; layout 5 names them and its note. A
+    /// truncated body, a layout-5 body with a malformed note, and an unknown layout byte are
+    /// `None`. Cut: `prior_of` reads members only from layout 4, red on layout 5.
+    #[test]
+    fn prior_of_reads_members_and_note_for_each_layout_and_refuses_malformed_bytes() {
+        let prior_members: Vec<PriorMember> = members()
+            .into_iter()
+            .map(|member| PriorMember {
+                copy: member.copy,
+                node: member.node,
+                role: member.role,
+            })
+            .collect();
+        let none = PriorRecord {
+            members: None,
+            note: CommittedWithout::default(),
+        };
+        assert_eq!(prior_of(&record().encode()), Some(none.clone()), "layout 2");
+        assert_eq!(
+            prior_of(&record().encode_with(&root())),
+            Some(none),
+            "layout 3"
+        );
+        assert_eq!(
+            prior_of(&record().encode_with_members(&root(), &members(), None)),
+            Some(PriorRecord {
+                members: Some(prior_members.clone()),
+                note: CommittedWithout::default(),
+            }),
+            "layout 4"
+        );
+        assert_eq!(
+            prior_of(&record().encode_with_members(&root(), &[], None)),
+            Some(PriorRecord {
+                members: Some(Vec::new()),
+                note: CommittedWithout::default(),
+            }),
+            "layout 4 with no members: an empty set, not unknown"
+        );
+        let five = record().encode_with_members(&root(), &members(), Some(&note()));
+        assert_eq!(five[0], NOTED_LAYOUT_VERSION);
+        assert_eq!(
+            prior_of(&five),
+            Some(PriorRecord {
+                members: Some(prior_members),
+                note: note(),
+            }),
+            "layout 5"
+        );
+
+        assert_eq!(prior_of(&[]), None, "empty");
+        assert_eq!(prior_of(&five[..five.len() - 1]), None, "a truncated note");
+        let mut no_entries = record()
+            .encode_with_members(&root(), &members(), None)
+            .to_vec();
+        no_entries[0] = NOTED_LAYOUT_VERSION;
+        no_entries.extend_from_slice(&[0; 9]);
+        assert_eq!(prior_of(&no_entries), None, "a note with no entries");
+        let mut unknown = five.to_vec();
+        unknown[0] = 9;
+        assert_eq!(prior_of(&unknown), None, "an unknown layout");
+    }
+
     /// `encode_over` keeps the body's layout and members while it rewrites the head (A-R426 M1).
     #[test]
     fn encode_over_keeps_the_layout_and_the_members() {
         let mut moved = record();
         moved.owner = NodeId(3);
-        let four = record().encode_with_members(&root(), &members());
+        let four = record().encode_with_members(&root(), &members(), None);
         let over = moved.encode_over(&four, None).expect("layout 4");
         assert_eq!(PartitionRecord::decode(&over), Some(moved));
         assert_eq!(RecordMember::decode_all(&over), Some(members()));

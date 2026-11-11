@@ -11,7 +11,7 @@
 //! | M7A-33 | a resynced kernel serves what an uninterrupted one serves (`partitions_revision` per A-R30) |
 //! | M7A-34 | a watch event never grants; the `Get` it provokes does |
 //! | M7A-35 | no automatic promotion: a frozen then deleted primary grant and 100 ticks produce zero `Cas` |
-//! | M7A-59 | an unavailable control read denies `ControlUnavailable` and does not fence |
+//! | M7A-59 | an unavailable control read still admits to the horizon, then fences `Expired` |
 //! | M7A-119..129 | §6: the fake's CAS, termination, snapshot, delay, drop and staging semantics, and A1's answer to each; M7A-128 is parked on the absent placement/V5 seam |
 //! | M7A-130 | the fake passes the H1 conformance suite, `support::conformance::control_fake`, on every ADR-rdb-0008 §7 requirement it owns |
 //!
@@ -57,7 +57,7 @@ use rdb_core::contracts::ids::{
     TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{CapabilityState, PackageId};
 use rdb_sim::harness::environment_capabilities;
 use rdb_sim::sim::control::{Completion, ControlOp, ControlStore};
@@ -78,6 +78,10 @@ struct Driver {
     /// the clock sample stays [`support::ctx`]'s frozen one either way, so a moved sample never
     /// adds views to a vector a row compares exactly (lead ruling A-R45).
     now: Tick,
+    /// The clock sample runs with [`Self::now`] instead of staying frozen. Only a row that walks
+    /// a grant to its horizon sets it: a frozen sample goes stale at `max_sample_age_millis`, and
+    /// that deny would stand in front of `Expired`.
+    sample_moves: bool,
     next_event: u64,
     /// Every `ControlEffect::Reload` the kernel has returned since the last `take_reloads`.
     reloads: Vec<ControlPrefix>,
@@ -105,6 +109,7 @@ impl Driver {
             store: ControlStore::new(),
             node,
             now: Tick::ZERO,
+            sample_moves: false,
             next_event: 1,
             reloads: Vec::new(),
             gets: Vec::new(),
@@ -114,10 +119,20 @@ impl Driver {
 
     /// [`support::ctx`] on this driver's node at this driver's tick.
     fn ctx(&self) -> StepCtx<'static> {
+        let frozen = support::ctx();
         StepCtx {
             now: self.now,
             node: self.node,
-            ..support::ctx()
+            control_time: if self.sample_moves {
+                ControlTime {
+                    estimate: self.now,
+                    sampled_at: self.now,
+                    ..frozen.control_time
+                }
+            } else {
+                frozen.control_time
+            },
+            ..frozen
         }
     }
 
@@ -1682,52 +1697,42 @@ fn m7a_35_no_automatic_promotion() {
     );
 }
 
-/// M7A-59 — control unavailable denies `ControlUnavailable`, and does not fence.
+/// M7A-59 — a control read answering `Unavailable` leaves admission on the proved grant.
 ///
-/// Plan row: `Held`; `PlanReadUnavailable` on the pending `Get`; `Check{StorageDispatch}` answers
-/// `Deny(ControlUnavailable)`; no `Fence`. Twin in the same test: after `Value{Found{ours}}` the
-/// next `Check` answers `Admit`.
+/// Rewritten for issue #80 (design row 18; ADR-rdb-0007 as amended), which supersedes lead
+/// rulings A-R44 and A-R77a on this point: an rEtcd leader election answers `Unavailable` for
+/// about a second, and denying through it stopped writes on every node while every grant was
+/// still good. No-overlap never rested on that deny. A1 stops at `E - ε - δ` on its own, and a
+/// new owner waits for `E + ε + δ` whatever this node can read.
 ///
-/// Lead ruling A-R44 found this row unwritable: an unavailable read of our own grant answered
-/// `Ignored(AdmissionSuspended)` and changed nothing, so the next check admitted. `design.md`
-/// §2.4 property 6 — a control Unavailable denies without ending the grant — is what the row
-/// asserts, and A1 now remembers the unavailable read until a read of our record answers. Lead
-/// ruling A-R77a accepts that and supersedes A-R44. The deny is check-time only: A1 republishes
-/// no view on the unavailable read (A-R77a; ADR-rdb-0008 "Control-quorum loss denies" — existing
-/// service ends at conservative local expiry), and the row asserts the delivery's whole vector.
+/// Plan row: `Held`; `PlanReadUnavailable` on the pending `Get`; every check that a write or a
+/// read passes still answers `Admit` while `local_ok` and `utc_ok` hold; no fence up to the last
+/// admitted tick; one tick later the check answers `Deny(Expired)` and the wake fences `Expired`.
 ///
-/// Two paths clear the deny: a read that finds our record (the plan's twin), and a matched
-/// committed renewal (A-R78 F1) — both are linearizable answers from control on our own key.
-/// Nothing else does: sending a renewal, a renewal CAS that answers `Unavailable`, and a
-/// completion for no CAS in flight all leave it standing (A-R78 R1).
-///
-/// Known window, accepted (A-R77a; tester-ka-a1 A2 / PROBE-8): a watch `Unavailable`
-/// termination does not set the deny by itself. Only the `Get` it provokes does, when that read
-/// answers `Unavailable`, so checks can admit for one read round trip after the termination.
-/// The grant's local expiry still bounds that window.
-///
-/// The pending `Get` is a real one: a committed renewal's watch echo on `grants/{us}`. The twin's
-/// `Found` is the same `Get` answered again, which is what a retry of it returns.
+/// The pending `Get` is a real one: a committed renewal's watch echo on `grants/{us}`.
 #[retcd_test]
-fn m7a_59_control_unavailable_denies_control_unavailable_no_fence() {
+fn m7a_59_control_unavailable_admits_to_the_horizon_then_fences_expired() {
+    /// Every checkpoint a write or a read passes. `OutboxDispatch` is declared and never admits.
+    const CHECKPOINTS: [Checkpoint; 5] = [
+        Checkpoint::Admission,
+        Checkpoint::StorageDispatch,
+        Checkpoint::Publication,
+        Checkpoint::Reply,
+        Checkpoint::Read,
+    ];
     support::preamble();
     let mut driver = Driver::new();
+    driver.sample_moves = true;
     driver
         .store
         .seed(ControlKey::Partition(PartitionId(1)), record(1, A).encode())
         .expect("seed p1");
     driver.become_held();
     driver.now = Tick(10);
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Admit,
-        "M7A-59 fixture: p1 is served and admits before the read fails"
-    );
-
     let renew = driver.fire(AuthorityTimer::Renew);
     let _ = driver.submit_and_complete(&renew);
-    let echo = driver.emit();
-    let gets: Vec<Effect> = echo
+    let gets: Vec<Effect> = driver
+        .emit()
         .into_iter()
         .filter(|effect| {
             anon(&effect.kind)
@@ -1749,109 +1754,231 @@ fn m7a_59_control_unavailable_denies_control_unavailable_no_fence() {
         .expect("plan");
     let unavailable = driver.submit_and_complete(&gets);
     assert_eq!(
-        (unavailable.len(), Driver::ignores(&unavailable)),
-        (1, vec![AuthorityIgnoreReason::AdmissionSuspended]),
-        "M7A-59: the unavailable read is answered by one ignore and nothing else — no view \
-         (A-R77a): {unavailable:?}"
+        Driver::ignores(&unavailable),
+        vec![AuthorityIgnoreReason::AdmissionSuspended],
+        "M7A-59: the unavailable read is answered by one ignore: {unavailable:?}"
     );
-    let (verdict, answered) = driver.check(Checkpoint::StorageDispatch, lineage_of(1));
+    assert_eq!(
+        fences(&unavailable),
+        Vec::new(),
+        "M7A-59: an unavailable read does not fence"
+    );
+
+    // Renewed at tick 10, so `E - δ` and `renewed_at + grant - δ` are both this tick.
+    let stops_at = 10 + support::BUDGETS.grant_millis - support::BUDGETS.dispatch_margin_millis;
+    for tick in [11, 1_000, stops_at - 1] {
+        driver.now = Tick(tick);
+        let wake = driver.fire(AuthorityTimer::ClockWake);
+        assert_eq!(
+            fences(&wake),
+            Vec::new(),
+            "M7A-59: no fence before the horizon, tick {tick}"
+        );
+        for checkpoint in CHECKPOINTS {
+            assert_eq!(
+                driver.check(checkpoint, lineage_of(1)).0,
+                Verdict::Admit,
+                "M7A-59: {checkpoint:?} still admits on the proved grant, tick {tick}"
+            );
+        }
+        assert!(driver.kernel.state().is_held(), "M7A-59: still Held");
+    }
+
+    driver.now = Tick(stops_at);
+    let (verdict, at_horizon) = driver.check(Checkpoint::StorageDispatch, lineage_of(1));
     assert_eq!(
         verdict,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59: an unavailable control read denies, with its own reason"
+        Verdict::Deny(DenyReason::Expired),
+        "M7A-59: at the horizon the check refuses, with the grant's own reason"
     );
     assert_eq!(
-        fences(&unavailable)
-            .into_iter()
-            .chain(fences(&answered))
-            .collect::<Vec<_>>(),
-        Vec::new(),
-        "M7A-59: and does not fence — the grant has not ended, we cannot see it"
+        fences(&at_horizon),
+        vec![(FenceScope::Node, DenyReason::Expired)],
+        "M7A-59: and the node fences Expired on that step: {at_horizon:?}"
     );
-    assert!(driver.kernel.state().is_held(), "M7A-59: still Held");
+}
 
-    let found = driver.submit_and_complete(&gets);
-    assert_eq!(
-        fences(&found),
-        Vec::new(),
-        "M7A-59 twin fixture: the retry reads our own record"
-    );
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Admit,
-        "M7A-59 twin: once a read of our record answers, the next check admits again"
-    );
+/// Design row 24 (critic R4-2, R5-2). An `Unknown` renewal issues only a `Get` and arms nothing,
+/// so a `Get` answering `Unavailable` is the last event of that path. With nothing armed there
+/// the grant runs out on a store that has come back.
+///
+/// Three facts, from one held grant: past its due time the read arms `now + renew` and that
+/// renewal succeeds; before its due time the read keeps the renewal's deadline and does not push
+/// it back; with a renewal in flight it arms nothing.
+#[retcd_test]
+fn a_read_answering_unavailable_re_arms_the_renewal_an_unknown_cas_left_unarmed() {
+    support::preamble();
+    let renew_millis = support::BUDGETS.renew_millis;
+    let mut driver = Driver::new();
+    driver.sample_moves = true;
+    driver.become_held();
 
-    // A second clear path (A-R78 F1): a matched committed renewal is a linearizable CAS on our
-    // own key, so control answers again. Without it a latched watch leaves the deny standing
-    // across renewal after renewal (tester-ka-a1 PROBE-6/6b).
-    driver
-        .store
-        .inject(ControlOp::PlanReadUnavailable)
-        .expect("plan");
-    let _ = driver.submit_and_complete(&gets);
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59 fixture: denied again"
-    );
-
+    driver.now = Tick(renew_millis);
     let renew = driver.fire(AuthorityTimer::Renew);
-    let committed = driver.submit_and_complete(&renew);
-    assert_eq!(
-        Driver::arms(&committed, AuthorityTimer::Renew).len(),
-        1,
-        "M7A-59 fixture: the renewal committed and re-armed: {committed:?}"
-    );
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Admit,
-        "M7A-59: a committed renewal of our own grant proves control answers, and the next \
-         check admits (A-R78 F1)"
-    );
-
-    // Re-latch the deny, then send the neighbours of a matched commit.
-    driver
-        .store
-        .inject(ControlOp::PlanReadUnavailable)
-        .expect("plan");
-    let _ = driver.submit_and_complete(&gets);
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59 fixture: denied once more"
-    );
-    // Only a matched commit clears it (A-R78 R1; tester-ka-a1 PROBE-9/10, mutants n1, n2, n3).
-    // Under quorum loss a renewal is still sent and its CAS answers `Unavailable`; neither the
-    // send nor that answer is a quorum answer, and neither is a completion for no CAS in flight.
-    let unanswered = driver.fire(AuthorityTimer::Renew);
-    assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59: sending a renewal is not a quorum answer; the deny stands"
-    );
     driver
         .store
         .inject(ControlOp::PlanCas {
             node: A,
-            outcome: CasOutcome::Unavailable,
+            outcome: CasOutcome::Unknown,
         })
         .expect("plan");
-    let _ = driver.submit_and_complete(&unanswered);
+    let unknown = driver.submit_and_complete(&renew);
     assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59: a renewal whose CAS answers Unavailable keeps the deny"
+        Driver::arms(&unknown, AuthorityTimer::Renew),
+        Vec::new(),
+        "fixture: an Unknown renewal arms nothing by itself: {unknown:?}"
     );
-    let stray = driver.deliver(ControlEvent::CasResult {
-        request: ANY,
-        key: ControlKey::Grant(A),
-        outcome: CasOutcome::Committed(Revision(99)),
-    });
+
+    driver.now = Tick(renew_millis + 100);
+    driver
+        .store
+        .inject(ControlOp::PlanReadUnavailable)
+        .expect("plan");
+    let unavailable = driver.submit_and_complete(&unknown);
+    let retry_at = Tick(driver.now.0 + renew_millis);
     assert_eq!(
-        driver.check(Checkpoint::StorageDispatch, lineage_of(1)).0,
-        Verdict::Deny(DenyReason::ControlUnavailable),
-        "M7A-59: a Committed completion for no CAS in flight proves nothing: {stray:?}"
+        Driver::arms(&unavailable, AuthorityTimer::Renew)
+            .iter()
+            .map(|(_, at)| *at)
+            .collect::<Vec<_>>(),
+        vec![retry_at],
+        "past its due time the read arms now + renew: {unavailable:?}"
+    );
+
+    // Control is back. The sim's `Unknown` landed the first CAS, so the armed retry conflicts,
+    // and the read it provokes adopts that landed write.
+    driver.now = retry_at;
+    let retry = driver.fire(AuthorityTimer::Renew);
+    let conflict = driver.submit_and_complete(&retry);
+    let adopted = driver.submit_and_complete(&conflict);
+    assert_eq!(
+        Driver::arms(&adopted, AuthorityTimer::Renew).len(),
+        1,
+        "the landed renewal is adopted and re-armed: {adopted:?}"
+    );
+
+    // The next renewal commits, and the grant moves.
+    driver.now = Tick(retry_at.0 + renew_millis);
+    let committed_at = driver.now;
+    let renew = driver.fire(AuthorityTimer::Renew);
+    let committed = driver.submit_and_complete(&renew);
+    let next_due = Tick(committed_at.0 + renew_millis);
+    assert_eq!(
+        Driver::arms(&committed, AuthorityTimer::Renew)
+            .iter()
+            .map(|(_, at)| *at)
+            .collect::<Vec<_>>(),
+        vec![next_due],
+        "the renewal committed: {committed:?}"
+    );
+
+    // The commit's watch echo is a read; answered `Unavailable` before the renewal is due, it
+    // must leave that deadline where it is.
+    // Two changes are waiting on the watch, the landed `Unknown` and this commit, and each
+    // provokes one read. Either read does; the last is the commit's.
+    let mut gets: Vec<Effect> = driver
+        .emit()
+        .into_iter()
+        .filter(|effect| {
+            anon(&effect.kind)
+                == EffectKind::Control(ControlEffect::Get {
+                    request: ANY,
+                    key: ControlKey::Grant(A),
+                })
+        })
+        .collect();
+    assert_eq!(gets.len(), 2, "fixture: both changes provoke a read");
+    gets.drain(..1);
+    driver.now = Tick(committed_at.0 + 10);
+    driver
+        .store
+        .inject(ControlOp::PlanReadUnavailable)
+        .expect("plan");
+    let early = driver.submit_and_complete(&gets);
+    assert_eq!(
+        Driver::arms(&early, AuthorityTimer::Renew)
+            .iter()
+            .map(|(_, at)| *at)
+            .collect::<Vec<_>>(),
+        vec![next_due],
+        "before its due time the read keeps the deadline: {early:?}"
+    );
+
+    // A renewal in flight owns the next arm: its result arms, so a read answered meanwhile does
+    // not. The same `Get` again, which is what a retry of it returns.
+    driver.now = next_due;
+    let _in_flight = driver.fire(AuthorityTimer::Renew);
+    driver
+        .store
+        .inject(ControlOp::PlanReadUnavailable)
+        .expect("plan");
+    let during = driver.submit_and_complete(&gets);
+    assert_eq!(
+        Driver::ignores(&during),
+        vec![AuthorityIgnoreReason::AdmissionSuspended],
+        "fixture: the read was answered Unavailable: {during:?}"
+    );
+    assert_eq!(
+        Driver::arms(&during, AuthorityTimer::Renew),
+        Vec::new(),
+        "a renewal in flight arms its own successor: {during:?}"
+    );
+}
+
+/// Design row 25 (A-R107). The re-arm cannot turn an outage into a storm: with control answering
+/// `Unavailable` to every CAS and every read for 2 s, renewals stay at most one per
+/// `renew_millis`, and they keep coming.
+#[retcd_test]
+fn renewals_stay_one_per_period_while_control_answers_unavailable_to_everything() {
+    support::preamble();
+    let renew_millis = support::BUDGETS.renew_millis;
+    let mut driver = Driver::new();
+    driver.sample_moves = true;
+    driver.become_held();
+
+    let mut due = Tick(renew_millis);
+    let stop_at = renew_millis + 2_000;
+    let mut sent = Vec::new();
+    while due.0 < stop_at {
+        driver.now = due;
+        let renew = driver.fire(AuthorityTimer::Renew);
+        sent.push(due.0);
+        driver
+            .store
+            .inject(ControlOp::PlanCas {
+                node: A,
+                outcome: CasOutcome::Unavailable,
+            })
+            .expect("plan");
+        let refused = driver.submit_and_complete(&renew);
+        let from_cas = Driver::arms(&refused, AuthorityTimer::Renew);
+        assert_eq!(from_cas.len(), 1, "the CAS refusal arms once: {refused:?}");
+
+        // The read that follows answers a little later, and may move the timer only forward.
+        driver.now = Tick(due.0 + 20);
+        driver
+            .store
+            .inject(ControlOp::PlanReadUnavailable)
+            .expect("plan");
+        let read = driver.submit_and_complete(&refused);
+        let from_read = Driver::arms(&read, AuthorityTimer::Renew);
+        assert_eq!(from_read.len(), 1, "the read re-arms once: {read:?}");
+        due = from_read[0].1;
+        assert!(
+            driver.kernel.state().is_held(),
+            "the grant is still held at {}",
+            driver.now.0
+        );
+    }
+
+    assert!(
+        sent.windows(2)
+            .all(|pair| pair[1] - pair[0] >= renew_millis),
+        "at most one renewal per renew_millis: {sent:?}"
+    );
+    assert!(
+        sent.len() >= 3,
+        "and renewal goes on through the outage: {sent:?}"
     );
 }
 

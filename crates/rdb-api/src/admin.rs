@@ -32,7 +32,7 @@ use config_core::{
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{
-    PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
+    prior_of, PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
@@ -46,7 +46,9 @@ use rdb_core::contracts::ids::{
     OperationId, OwnerEpoch, PartitionId, RangeId, ReplicaRole, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
-use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
+use rdb_core::contracts::recovery::{
+    Candidate, CommittedWithout, LineageAnchor, PriorRecord, RecoveryEvent, RecoveryPlan,
+};
 use rdb_core::contracts::time::Tick;
 use rdb_core::partition_map::RoutesRoot;
 
@@ -161,6 +163,7 @@ pub(crate) fn recovery_plan(
     boot: BootId,
     grant: GrantId,
     generation: AuthorityGeneration,
+    prior: PriorRecord,
 ) -> RecoveryPlan {
     let config = PartitionConfig::new(anchor.lineage.partition, version, members);
     RecoveryPlan {
@@ -190,6 +193,7 @@ pub(crate) fn recovery_plan(
         retention_millis: RETENTION_MILLIS,
         must_hold: std::collections::BTreeSet::new(),
         config,
+        prior,
     }
 }
 
@@ -332,6 +336,7 @@ fn start_recovery(
         boot,
         GrantId(1),
         AuthorityGeneration(1),
+        PriorRecord::fresh(),
     );
     let fence = FencingProof {
         partition,
@@ -1239,9 +1244,10 @@ fn plan_heal(
     read: &HealRead,
 ) -> Result<(Healed, PartitionId, [RecoveryEvent; 2]), HealError> {
     let name = partition.0;
-    let (Some(record), Some(root)) = (
+    let (Some(record), Some(root), Some(prior)) = (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
+        prior_of(&found.value),
     ) else {
         return Err(HealError::Record(format!(
             "the record of partition {name} at revision {} carries no root (layout 3)",
@@ -1282,7 +1288,7 @@ fn plan_heal(
     // bootstrap's. A1 replaces the view at its first acquire either way.
     let (prior_grant, view_grant, view_generation, revocation) = match gone {
         Gone::Deleted(_, held) => {
-            let sample = HostClock::control_time(now, &ctx.budgets);
+            let sample = ctx.clock.sample(now, &ctx.budgets);
             let revocation = Revocation::ExpiryProven {
                 frozen_expiry_utc_ms: held.expiry_utc_ms,
                 authority_utc_ms: i64::try_from(sample.estimate.0).unwrap_or(i64::MAX),
@@ -1322,6 +1328,7 @@ fn plan_heal(
         ctx.boot,
         view_grant,
         view_generation,
+        prior,
     );
     let fence = FencingProof {
         partition,
@@ -1904,7 +1911,7 @@ async fn judge(
     }
     let partitions = list_partitions(store).await?;
     let now = clock.now();
-    let sample = HostClock::control_time(now, &budgets);
+    let sample = clock.sample(now, &budgets);
     let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
         Ok::<_, std::convert::Infallible>(partitions)
     })
@@ -2234,6 +2241,16 @@ pub enum PromoteError {
          promote: open it with Db::open, which connects it to one"
     )]
     NoControlStore,
+    /// This process's clock bound is lost (`clock_bound_lost`): its guard cannot show the clock
+    /// is within epsilon of its peers', so no expiry it reads is a proof. Refused before
+    /// anything is written, so no owner is fenced or frozen on a proof that cannot finish
+    /// (PR #103 review B2).
+    #[error(
+        "this process's clock is not shown to agree with its peers (clock_bound_lost), so it \
+         cannot prove the owner's grant expired; nothing was changed: wait until its clock \
+         agrees with its peers again, then promote again"
+    )]
+    ClockUnbounded,
     /// The promote gave no answer in time, and may have written.
     #[error(
         "the promote of node {node} did not answer in time; it may have written: promote again"
@@ -2261,6 +2278,7 @@ impl PromoteError {
                 | Self::TargetFrozen { .. }
                 | Self::NoSuchPartition { .. }
                 | Self::NoControlStore
+                | Self::ClockUnbounded
         )
     }
 }
@@ -2289,6 +2307,7 @@ impl From<PromoteError> for ApiError {
             PromoteError::PeersUnknown { .. }
             | PromoteError::StaleMembers { .. }
             | PromoteError::Unreachable { .. }
+            | PromoteError::ClockUnbounded
             | PromoteError::Control(_) => RetryRule::BoundedJitter,
         };
         Self {
@@ -2353,6 +2372,9 @@ pub(crate) fn promote_members(
         // `!pinned.is_empty()` is unreachable today (the host fills `pinned` and
         // `config_version` from one committed config, which always has members); kept so a
         // later split refuses here instead of pinning nobody. Defensive, no row.
+        // Only the configuration is read. The target's clock bound is checked where it commits
+        // (`bind_routed_fence`, row 13d), and a qualifying copy says nothing about its members:
+        // neither is a reason to call it unconfigured (PR #103 review question).
         Some(crate::host::NodeStatus {
             pinned,
             config_version: Some(version),
@@ -2429,7 +2451,7 @@ pub(crate) async fn promote_looked(
 ) -> Result<Promoted, PromoteError> {
     let deadline = tokio::time::Instant::now() + ctx.within;
     let partition = ctx.partition.0;
-    let (record, root, stored, mod_revision, _) =
+    let (record, root, stored, mod_revision, _, prior_record) =
         read_partition(&*ctx.store, ctx.partition).await?;
     let (planned, planned_version) = match (&stored, refused) {
         // `to` did not answer at all: it is refused before anything is written whatever the
@@ -2513,6 +2535,10 @@ pub(crate) async fn promote_looked(
         "promote_members_kept"
     );
 
+    // Every expiry below is proved on this process's clock. With no bound it proves nothing,
+    // so refuse before the Fencing write and the freeze, not after them (PR #103 review B2).
+    refuse_unbounded(&ctx)?;
+
     // Above one partition the freeze below is the whole node's, so only a dead owner goes on
     // (issue #79 S3). The grant revision read here is what step 4 must still find.
     let dead_at = if ctx.owner_must_be_dead {
@@ -2532,7 +2558,7 @@ pub(crate) async fn promote_looked(
     let fenced_at = cas(
         &*ctx.store,
         &ControlKey::Partition(ctx.partition).encode(),
-        fencing.encode_with_members(&root, &written),
+        fencing.encode_with_members(&root, &written, Some(&prior_record.note)),
         mod_revision,
     )
     .await?;
@@ -2546,7 +2572,7 @@ pub(crate) async fn promote_looked(
             cas(
                 &*ctx.store,
                 &ControlKey::Partition(ctx.partition).encode(),
-                record.encode_with_members(&root, &written),
+                record.encode_with_members(&root, &written, Some(&prior_record.note)),
                 fenced_at.0,
             )
             .await?;
@@ -2560,7 +2586,7 @@ pub(crate) async fn promote_looked(
     let (revocation, decided) = loop {
         let now = ctx.clock.now();
         let mut view = ClockView::new();
-        view.accept(HostClock::control_time(now, &ctx.budgets));
+        view.accept(ctx.clock.sample(now, &ctx.budgets));
         if let Some(revocation) = expiry_proven(&view, frozen.expiry_utc_ms, now, &ctx.budgets) {
             break (revocation, now);
         }
@@ -2597,7 +2623,7 @@ pub(crate) async fn promote_looked(
         .collect();
 
     // 6. The record again, after the freeze, and the plan.
-    let (fenced, fenced_root, fenced_members, control_revision, read_revision) =
+    let (fenced, fenced_root, fenced_members, control_revision, read_revision, _) =
         read_partition(&*ctx.store, ctx.partition).await?;
     if read_revision < frozen_at.0 {
         return Err(PromoteError::Control(format!(
@@ -2651,6 +2677,7 @@ pub(crate) async fn promote_looked(
         to_boot,
         GrantId(1),
         AuthorityGeneration(1),
+        prior_record,
     );
     store_plan(&*ctx.store, ctx.partition, fenced_at, &plan).await?;
     // What F1 pins in `partitions/1` when it commits this plan (A-R448): step 7 answers Ok only
@@ -2690,7 +2717,8 @@ pub(crate) async fn promote_looked(
     // 7. The commit, and that it is this run's (A-R448): another promote that fenced over this
     // one after it sent may be the one F1 committed.
     loop {
-        let (now, _, pinned, committed_at, _) = read_partition(&*ctx.store, ctx.partition).await?;
+        let (now, _, pinned, committed_at, _, _) =
+            read_partition(&*ctx.store, ctx.partition).await?;
         let committed = pinned.as_deref().map(sorted_nodes);
         let left_out = |committed: &[NodeId]| -> Vec<u32> {
             written
@@ -2776,7 +2804,7 @@ pub(crate) async fn promote_looked(
 }
 
 /// `partitions/{partition}` as a rooted record, the members it pins (`None` for layout 3), its
-/// `mod_revision` and the read's store revision.
+/// `mod_revision`, the read's store revision and what a recovery superseding it needs.
 pub(crate) async fn read_partition(
     store: &dyn ConfigStore,
     partition: PartitionId,
@@ -2787,6 +2815,7 @@ pub(crate) async fn read_partition(
         Option<Vec<RecordMember>>,
         u64,
         u64,
+        PriorRecord,
     ),
     PromoteError,
 > {
@@ -2807,13 +2836,15 @@ pub(crate) async fn read_partition(
     match (
         PartitionRecord::decode(&found.value),
         PartitionRoot::decode(&found.value),
+        prior_of(&found.value),
     ) {
-        (Some(record), Some(root)) => Ok((
+        (Some(record), Some(root), Some(prior)) => Ok((
             record,
             root,
             RecordMember::decode_all(&found.value),
             found.mod_revision,
             read.read_revision,
+            prior,
         )),
         _ => Err(PromoteError::Record(format!(
             "partitions/{} at revision {} carries no root (layout 3 or 4)",
@@ -2858,14 +2889,15 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 /// The first byte of a stored promote plan: the layout of the postcard bytes after it. A build
 /// that reads another refuses it (`plan_unreadable`) instead of guessing at its fields.
 ///
-/// `2` (PR #74 F-001, ruling A-R477) appends [`RecoveryPlan::must_hold`]. postcard is not
-/// self-describing, so a field cannot be defaulted in: this build reads `1` as
-/// [`StoredPlanV1`] with `must_hold` empty, and a build that reads only `1` refuses `2` by this
+/// `2` (PR #74 F-001, ruling A-R477) appends [`RecoveryPlan::must_hold`]. `3` (#80 S5n) appends
+/// [`RecoveryPlan::prior`] after it. postcard is not self-describing, so a field cannot be
+/// defaulted in: this build reads `1` as [`StoredPlanV1`] and `2` as [`StoredPlanV2`], the fields
+/// they lack set by [`StoredPlanV1::with`], and an older build refuses a newer plan by this
 /// byte, naming both versions (`plan version 2, this build reads 1`).
-pub(crate) const PROMOTE_PLAN_VERSION: u8 = 2;
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 3;
 
-/// The stored plan before `must_hold` ([`PROMOTE_PLAN_VERSION`] `1`): every field of
-/// [`RecoveryPlan`] but the last, in its order.
+/// The stored plan before `must_hold` (version `1`): every field of [`RecoveryPlan`] before it,
+/// in order.
 #[derive(serde::Deserialize)]
 struct StoredPlanV1 {
     anchor: LineageAnchor,
@@ -2874,6 +2906,35 @@ struct StoredPlanV1 {
     rebuild_required: std::collections::BTreeSet<CopyId>,
     authority_view: AuthorityView,
     retention_millis: u64,
+}
+
+impl StoredPlanV1 {
+    /// This plan as today's. The build that stored it wrote no note and named no prior members
+    /// in its plan, so `prior` says "not known": F1 judges against the plan's own members and
+    /// warns, as it does for a layout 3 record.
+    fn with(self, must_hold: std::collections::BTreeSet<CopyId>) -> RecoveryPlan {
+        RecoveryPlan {
+            anchor: self.anchor,
+            config: self.config,
+            candidates: self.candidates,
+            rebuild_required: self.rebuild_required,
+            authority_view: self.authority_view,
+            retention_millis: self.retention_millis,
+            must_hold,
+            prior: PriorRecord {
+                members: None,
+                note: CommittedWithout::default(),
+            },
+        }
+    }
+}
+
+/// The stored plan before `prior` (version `2`): version `1` and then `must_hold`. Nesting
+/// changes nothing on the wire, since postcard writes a struct as its fields in order.
+#[derive(serde::Deserialize)]
+struct StoredPlanV2 {
+    v1: StoredPlanV1,
+    must_hold: std::collections::BTreeSet<CopyId>,
 }
 
 /// The `operations/` key of the plan the promote that fenced `partitions/1` at `revision` stored
@@ -2919,20 +2980,16 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
         1 => {
             let (old, rest) = postcard::take_from_bytes::<StoredPlanV1>(body)
                 .map_err(|error| error.to_string())?;
-            let plan = RecoveryPlan {
-                anchor: old.anchor,
-                config: old.config,
-                candidates: old.candidates,
-                rebuild_required: old.rebuild_required,
-                authority_view: old.authority_view,
-                retention_millis: old.retention_millis,
-                must_hold: std::collections::BTreeSet::new(),
-            };
-            (plan, rest)
+            (old.with(std::collections::BTreeSet::new()), rest)
+        }
+        2 => {
+            let (old, rest) = postcard::take_from_bytes::<StoredPlanV2>(body)
+                .map_err(|error| error.to_string())?;
+            (old.v1.with(old.must_hold), rest)
         }
         _ => {
             return Err(format!(
-                "plan version {version}, this build reads 1 and {PROMOTE_PLAN_VERSION}"
+                "plan version {version}, this build reads 1, 2 and {PROMOTE_PLAN_VERSION}"
             ))
         }
     };
@@ -3116,6 +3173,24 @@ async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
         .unwrap_or(false)
 }
 
+/// Refuse a promote run on a clock with no bound ([`PromoteError::ClockUnbounded`]), before it
+/// writes anything. Logged `promote_clock_unbounded`.
+fn refuse_unbounded(ctx: &PromoteCtx) -> Result<(), PromoteError> {
+    if ctx
+        .clock
+        .sample(ctx.clock.now(), &ctx.budgets)
+        .bound_established
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        to = ctx.to.0,
+        partition = ctx.partition.0,
+        "promote_clock_unbounded"
+    );
+    Err(PromoteError::ClockUnbounded)
+}
+
 /// Refuse `ctx.to` when its grant is frozen: a promote there would commit, and the new owner
 /// could never admit (#61 critic Y3).
 async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
@@ -3227,9 +3302,11 @@ async fn owner_dead(
             );
             return Err(alive("its grant is still being renewed"));
         }
+        // The guarded sample, never `control_time`: a clock with no bound proves no expiry,
+        // so a fast caller cannot read a live owner's grant as run out (PR #103 review B2).
         let now = ctx.clock.now();
         let mut view = ClockView::new();
-        view.accept(HostClock::control_time(now, &ctx.budgets));
+        view.accept(ctx.clock.sample(now, &ctx.budgets));
         if expiry_proven(&view, held.expiry_utc_ms, now, &ctx.budgets).is_some() {
             tracing::info!(
                 owner = prior.0,
@@ -3312,7 +3389,7 @@ async fn freeze(
                     return Err(returned());
                 }
                 let now = ctx.clock.now();
-                let sample = HostClock::control_time(now, &ctx.budgets);
+                let sample = ctx.clock.sample(now, &ctx.budgets);
                 (
                     GrantRecord {
                         grant: GrantId(0),
@@ -4714,6 +4791,117 @@ mod tests {
         unfrozen_and_serving(&store.inner, &rt);
     }
 
+    /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying
+    /// copy, still holds a configuration, so its members are planned with and it is not called
+    /// `Unconfigured`. A lost target bound refuses later, where the target commits (row 13d).
+    /// Cut: match `clock_bound_lost: false` or `qualifying_copy: None` again, red.
+    #[test]
+    fn a_target_with_a_lost_clock_bound_or_a_qualifying_copy_is_still_configured() {
+        let configured = |qualifying_copy, clock_bound_lost| crate::host::NodeStatus {
+            node: NodeId(2),
+            boot: OPEN_2,
+            fault: None,
+            holds: None,
+            authority: "none".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "secondary",
+            protection: None,
+            admits: None,
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+            pinned: members(),
+            config_version: Some(CONFIG_VERSION),
+            qualifying_copy,
+            clock_bound_lost,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
+        };
+        for (qualifying_copy, clock_bound_lost) in
+            [(None, true), (Some(true), false), (Some(false), true)]
+        {
+            let planned = promote_members(
+                PARTITION,
+                NodeId(2),
+                Some(configured(qualifying_copy, clock_bound_lost)),
+                Duration::from_secs(1),
+            );
+            assert_eq!(
+                planned.ok(),
+                Some((members(), CONFIG_VERSION)),
+                "qualifying_copy={qualifying_copy:?} clock_bound_lost={clock_bound_lost}"
+            );
+        }
+    }
+
+    /// A clock `ahead_millis` fast whose guard has no bound: attached in a cluster of three, with
+    /// no Agree heard.
+    fn lost_bound_clock(ahead_millis: i64) -> HostClock {
+        let clock = HostClock::guarded(ahead_millis);
+        clock.guard().expect("a guarded clock").attach(3);
+        assert!(
+            !clock
+                .sample(clock.now(), &Budgets::SPEC_DEFAULTS)
+                .bound_established,
+            "the bound is lost"
+        );
+        clock
+    }
+
+    /// PR #103 review (B2): a promote run on a clock with no bound cannot prove an expiry, so it
+    /// must not fence the partition or freeze the owner's grant first, then time out with the
+    /// freeze standing. Here the caller is a minute fast, the owner is unreachable and its grant
+    /// is three seconds from expiry on an honest clock. Above one partition (the unguarded time
+    /// `owner_dead` used would read the grant as expired and go on to freeze a live owner) and at
+    /// one, the promote is refused `ClockUnbounded` with `partitions/1` and `grants/1` untouched.
+    /// Cut: no bound check before the writes, red on the moved revision.
+    /// Unit (~20 ms): `MemStore`.
+    #[test]
+    fn b2_a_promote_on_a_clock_with_no_bound_fences_and_freezes_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        old_grant(&*store, &rt, GrantId(4));
+        let honest = i64::try_from(HostClock::start().now().0).expect("a tick");
+        put_grant_expiry(&*store, &rt, honest + 3_000);
+        let before = promote_marks(&*store, &rt);
+        for owner_must_be_dead in [true, false] {
+            let ctx = PromoteCtx {
+                partition: PARTITION,
+                owner_must_be_dead,
+                look_within: Duration::from_millis(1),
+                store: Arc::clone(&store),
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: lost_bound_clock(60_000),
+                to: NodeId(2),
+                drop: None,
+                within: Duration::from_secs(1),
+                members: members(),
+                members_version: CONFIG_VERSION,
+                member_boot: all_known(),
+                send: Arc::new(|_, _| Err(NodeStopped(OWNER))),
+            };
+            let refused = rt.block_on(promote(ctx)).expect_err("refused");
+            assert!(
+                matches!(refused, PromoteError::ClockUnbounded),
+                "owner_must_be_dead={owner_must_be_dead}: {refused:?}"
+            );
+            assert!(refused.no_mutation(), "{refused:?}");
+            assert_eq!(
+                promote_marks(&*store, &rt),
+                before,
+                "owner_must_be_dead={owner_must_be_dead}: nothing written"
+            );
+            unfrozen_and_serving(&*store, &rt);
+        }
+    }
+
     /// A target's `grants/` record that does not decode says nothing about whether it is frozen,
     /// so it is refused as the other grant reads refuse it, not read as "not frozen". Nothing is
     /// written and nothing sent. Cut: an undecodable record reads as not frozen, and the promote
@@ -5575,6 +5763,7 @@ mod tests {
             OPEN_2,
             GrantId(1),
             AuthorityGeneration(1),
+            PriorRecord::fresh(),
         ));
         let written = rt
             .block_on(taken.put(PutRequest {
@@ -5620,6 +5809,75 @@ mod tests {
                 && !refused.contains("write access"),
             "(d) {refused}"
         );
+    }
+
+    /// #80 S5n row 32: a promote stopped after its `Fencing` write and before its plan leaves
+    /// the note on the record. Cut: the `Fencing` CAS passes `None`: layout 4, red.
+    /// Unit (<500 ms): the freeze after it is refused.
+    #[test]
+    fn s5n_32_a_promote_stopped_after_its_fencing_write_keeps_the_note() {
+        use rdb_core::authority::partition::committed_without_of;
+        use rdb_core::contracts::recovery::WithoutEntry;
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script {
+            pass_puts: 1,
+            drop_puts: u32::MAX,
+            ..Script::default()
+        }));
+        let mem = scripted.mem();
+        rooted(mem, &rt, BootId(5));
+        let found = rt
+            .block_on(mem.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        let note = CommittedWithout::default().with(WithoutEntry {
+            generation: Generation(3),
+            cutoff: Seq(7),
+            copies: vec![(CopyId(0), NodeId(1))],
+        });
+        let head = PartitionRecord::decode(&found.value).expect("a record");
+        let root = PartitionRoot::decode(&found.value).expect("a root");
+        let pinned: Vec<RecordMember> = members().iter().map(RecordMember::of).collect();
+        let noted = head.encode_with_members(&root, &pinned, Some(&note));
+        rt.block_on(mem.put(PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: noted,
+            expected_mod_revision: Some(found.mod_revision),
+            dedup: None,
+        }))
+        .expect("the noted record");
+        put_grant(mem, &rt, expired_grant());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+
+        let (promoted, sent) = promote_once(
+            &store,
+            &rt,
+            NodeId(2),
+            None,
+            members(),
+            all_known(),
+            crate::host::test_patience(Duration::from_secs(1)),
+        );
+
+        assert!(promoted.is_err(), "{promoted:?}");
+        assert!(sent.is_empty(), "no plan went out: {sent:?}");
+        let after = rt
+            .block_on(mem.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        assert_eq!(
+            PartitionRecord::decode(&after.value).map(|r| r.lifecycle),
+            Some(PartitionLifecycle::Fencing),
+            "the Fencing write landed"
+        );
+        assert_eq!(after.value[0], 5);
+        assert_eq!(committed_without_of(&after.value), Some(note));
     }
 
     /// A-R447 step 6: another promote fences `partitions/1` again between this run's `Fencing`
@@ -5801,7 +6059,7 @@ mod tests {
                 value: if layout_3 {
                     committed.encode_with(&root)
                 } else {
-                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config))
+                    committed.encode_with_members(&root, &RecordMember::pinned(&plan.config), None)
                 },
                 expected_mod_revision: Some(revision.0),
                 dedup: None,
@@ -6009,7 +6267,7 @@ mod tests {
         fenced
             .recv_timeout(patience)
             .expect("(5) the run sends its fence");
-        let (record, root, pinned, fenced_at, _) = rt
+        let (record, root, pinned, fenced_at, _, _) = rt
             .block_on(read_partition(&*store, PARTITION))
             .expect("(5) partitions/1");
         let readded = PartitionRecord {
@@ -6022,7 +6280,7 @@ mod tests {
         let put = rt
             .block_on(store.put(PutRequest {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                value: readded.encode_with_members(&root, &pinned.expect("(5) layout 4")),
+                value: readded.encode_with_members(&root, &pinned.expect("(5) layout 4"), None),
                 expected_mod_revision: Some(fenced_at),
                 dedup: None,
             }))

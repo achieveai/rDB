@@ -168,6 +168,7 @@ fn recovery_plan() -> RecoveryPlan {
         },
         retention_millis: 1_000,
         must_hold: std::collections::BTreeSet::new(),
+        prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
     }
 }
 

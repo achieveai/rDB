@@ -813,7 +813,7 @@ impl Budgets {
         pause_age_millis: 2_000,
         resume_lag_millis: 250,
         resume_hold_millis: 5_000,
-        grant_millis: 3_000,
+        grant_millis: 6_000,
         renew_millis: 500,
         resume_gap_tolerance_millis: 500,
         clock_sample_period_millis: 500,

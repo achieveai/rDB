@@ -57,8 +57,8 @@ use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
-    DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
-    SurvivorInventory,
+    CommittedWithout, DurableProof, LineageAnchor, NoteState, PriorMember, PriorRecord,
+    RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult, SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
     CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
@@ -89,7 +89,7 @@ use rdb_value::repair::Cleared;
 use rdb_value::value::Value;
 use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 
-use crate::clock::HostClock;
+use crate::clock::{ClockGuard, HostClock};
 use crate::control::ControlAdapter;
 use crate::db::ApiError;
 use crate::transport::Links;
@@ -445,6 +445,20 @@ pub enum Msg {
         /// Whether this is the one re-read after a refusal by this node's clock alone
         /// ([`fence_recheck_millis`]; A-R446b).
         rechecked: bool,
+    },
+    /// #80 S5n: the note `partitions/{partition}` held when a re-plan whose held note was behind
+    /// read it ([`ControlAdapter::read_replan_note`]). Dropped unless `boot` is the node's own.
+    ReplanNote {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// The epoch the re-plan is revoking.
+        epoch: OwnerEpoch,
+        /// The generation the re-plan is planning from.
+        generation: Generation,
+        /// The note read, at or past `generation`.
+        note: CommittedWithout,
     },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
@@ -1110,6 +1124,18 @@ pub struct NodeStatus {
     /// The version of the configuration `pinned` belongs to; `None` before it holds one.
     /// `admin::promote` refuses when it is not `partitions/1`'s (A-R415 C-2). Crosses the wire.
     pub config_version: Option<ConfigVersion>,
+    /// Whether at least one copy can acknowledge a write now: L1's `qualifies_now` at head.
+    /// `None` while L1 is not live. `false` on a primary under `OVERLOADED` or
+    /// `PROTECTION_PAUSED` means it is cut off, not merely under pressure (R4-7). Crosses the
+    /// wire (#80 S2c).
+    pub qualifying_copy: Option<bool>,
+    /// Whether this node's clock bound is reported lost: `clock_bound_lost` in its log, Breaches
+    /// not outnumbered, or no Agree since start while a Breach stands. Crosses the wire (#80 S2c).
+    pub clock_bound_lost: bool,
+    /// "A recovery committed without these copies" (#80 S5n): `Known` only when this node
+    /// committed the generation it has adopted. `Unknown` is not "no note"; ask the primary.
+    /// Crosses the wire.
+    pub committed_without: NoteState,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -2043,6 +2069,10 @@ struct Host {
     recoveries: BTreeMap<PartitionId, Recovery>,
 
     adopted: BTreeMap<PartitionId, Adopted>,
+    /// #80 S5n: per partition, the note this node's F1 last committed, with its generation and
+    /// instance, set on every commit (an empty note included, R8-1). `Self::land` does not set
+    /// it, and a restart starts empty: status then says `Unknown`, never "no note".
+    without: BTreeMap<PartitionId, (Generation, [u8; 16], CommittedWithout)>,
     /// `(id) -> (version, due, site)`, sim `Clock` semantics.
     timers: BTreeMap<TimerId, (TimerVersion, Tick, Site)>,
     queue: VecDeque<Queued>,
@@ -2325,6 +2355,7 @@ impl Host {
             l1: BTreeMap::new(),
             recoveries: BTreeMap::new(),
             adopted: BTreeMap::new(),
+            without: BTreeMap::new(),
             timers: BTreeMap::new(),
             queue: VecDeque::new(),
             delayed: BTreeMap::new(),
@@ -2598,6 +2629,22 @@ impl Host {
         std::thread::sleep(pause);
     }
 
+    /// #80 S2c, design 7.1: while `Fenced` with the bound lost, and no recovery here defers it,
+    /// let the clock guard move this clock forward if a majority of the cluster is proved ahead.
+    /// Forward only and never while `Held`: a Held node's checks end in a fence first.
+    fn reanchor_clock(&mut self) {
+        let Some(guard) = self.clock.guard() else {
+            return;
+        };
+        if !guard.lost() || !self.authority.state().is_fenced() {
+            return;
+        }
+        if crate::clock::reanchor_deferred(self.recoveries.values().map(Recovery::phase)) {
+            return;
+        }
+        guard.reanchor_if_behind();
+    }
+
     /// How long to wait for mail: until the next due duty, at most [`IDLE_WAIT`].
     fn wait(&self) -> Duration {
         if self.fault.is_some() {
@@ -2638,6 +2685,7 @@ impl Host {
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
             Msg::FenceBound { .. } => "fence_bound".to_owned(),
+            Msg::ReplanNote { .. } => "replan_note".to_owned(),
             _ => "other".to_owned(),
         };
         tracing::info!(
@@ -2687,6 +2735,7 @@ impl Host {
             | Msg::Activated { boot, .. }
             | Msg::OwnerLearned { boot, .. }
             | Msg::FenceBound { boot, .. }
+            | Msg::ReplanNote { boot, .. }
                 if boot != self.boot =>
             {
                 self.drop_stale(&msg, boot);
@@ -2878,6 +2927,13 @@ impl Host {
                 }
                 Ok(())
             }
+            Msg::ReplanNote {
+                partition,
+                epoch,
+                generation,
+                note,
+                ..
+            } => self.replan_note_read(partition, epoch, generation, note),
             Msg::FenceBound {
                 partition,
                 correlation,
@@ -2892,7 +2948,18 @@ impl Host {
                     .ok()
                     .and_then(|facts| facts.grant.as_ref())
                     .map(|grant| grant.expiry_utc_ms);
-                match bind_routed_fence(partition, &proof, facts, now, &self.budgets) {
+                // #80 S2c: this node's clock is out of bound, so no proof made on it holds, and
+                // waiting by the 2-epsilon re-check would only name the wrong cause.
+                let bound = self.clock.sample(now, &self.budgets).bound_established;
+                let bound = if bound {
+                    bind_routed_fence(partition, &proof, facts, now, &self.budgets)
+                } else {
+                    Err((
+                        "clock_bound_lost",
+                        format!("node {}'s clock bound is lost", self.node.0),
+                    ))
+                };
+                match bound {
                     Ok(plan) => {
                         tracing::info!(
                             node = self.node.0,
@@ -3154,6 +3221,7 @@ impl Host {
         if self.stuck_sync() {
             return;
         }
+        self.reanchor_clock();
         let now = self.clock.now();
         let due: Vec<TimerId> = self
             .timers
@@ -4546,7 +4614,7 @@ impl Host {
         };
         let ctx = StepCtx {
             now,
-            control_time: HostClock::control_time(now, &self.budgets),
+            control_time: self.clock.sample(now, &self.budgets),
             node: self.node,
             boot: self.boot,
             partition,
@@ -5011,6 +5079,14 @@ impl Host {
                         authority_seq = ?decision.authority_seq,
                         at = self.stepped_at.0,
                         "authority_check_denied"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "rdb_api::authority_check",
+                        node,
+                        partition = site.partition.0,
+                        checkpoint = ?decision.checkpoint,
+                        "authority_check_admitted"
                     );
                 }
             }
@@ -5567,12 +5643,93 @@ impl Host {
                 partition.0, epoch.0, root.owner_epoch.0
             )));
         }
+        // R8-3: the held note only for the generation this plan supersedes. Any other, and the
+        // plan could write an older note than the record's, so it waits for the record's.
+        let generation = committed.new_generation;
+        match self.without.get(&partition) {
+            Some((held, _, note)) if *held == generation => {
+                let note = note.clone();
+                self.rejoin_plan(partition, replan, note)
+            }
+            // An unbound F1 fires no note and its layout carries none: nothing to read or to lose.
+            None if self.instance.is_none() => {
+                self.rejoin_plan(partition, replan, CommittedWithout::default())
+            }
+            held => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    held = ?held.map(|(held, _, _)| held.0),
+                    "replan_note_reread"
+                );
+                self.control
+                    .read_replan_note(self.node, self.boot, partition, epoch, generation);
+                Ok(())
+            }
+        }
+    }
+
+    /// The record's note, read for a re-plan whose held one was behind: the re-plan goes on
+    /// when it is still the one that asked.
+    fn replan_note_read(
+        &mut self,
+        partition: PartitionId,
+        epoch: OwnerEpoch,
+        generation: Generation,
+        note: CommittedWithout,
+    ) -> Result<(), Fault> {
+        let replan = match self.rejoins.get(&partition).copied() {
+            Some(Rejoin::Revoking {
+                epoch: revoking,
+                replan,
+            }) if revoking == epoch
+                && self
+                    .committed
+                    .get(&partition)
+                    .is_some_and(|committed| committed.new_generation == generation) =>
+            {
+                replan
+            }
+            other => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    rejoin = ?other,
+                    "replan_note_stale"
+                );
+                return Ok(());
+            }
+        };
+        self.rejoin_plan(partition, replan, note)
+    }
+
+    /// The re-plan of a drained epoch, carrying `note` (#80 S5n): `Plan` and the fence to a
+    /// fresh F1.
+    fn rejoin_plan(
+        &mut self,
+        partition: PartitionId,
+        replan: Replan,
+        note: CommittedWithout,
+    ) -> Result<(), Fault> {
+        let committed = self.committed.get(&partition).ok_or_else(|| {
+            Fault::from(format!(
+                "re-plan of partition {} with no commit to plan from",
+                partition.0
+            ))
+        })?;
+        let root = committed.selected.root;
         let anchor = LineageAnchor {
             lineage: root,
             base_seq: committed.selected.cutoff_seq,
             base_digest: committed.selected.cutoff_digest,
         };
         let pinned = &committed.committed.pinned_config;
+        let prior = PriorRecord {
+            members: Some(pinned.members.iter().map(PriorMember::of).collect()),
+            note,
+        };
         let shadowed = self.restart_shadowed(committed, replan);
         let mut members: Vec<Member> = pinned
             .members
@@ -5668,6 +5825,7 @@ impl Host {
             self.boot,
             view.grant_id,
             view.authority_generation,
+            prior,
         );
         plan.must_hold = must_hold;
         let fence = FencingProof {
@@ -7601,6 +7759,7 @@ impl Host {
             self.boot,
             plan.authority_view.grant_id,
             plan.authority_view.authority_generation,
+            plan.prior.clone(),
         );
         tracing::info!(
             node = self.node.0,
@@ -8952,6 +9111,31 @@ impl Host {
                 }
                 Ok(())
             }
+            // #80 S5n: this recovery's own copies are named once, at error: the operator's line.
+            // The note is held whole, so `status` can say it for every entry, empty included.
+            RecoveryEffect::CommittedWithout {
+                generation,
+                instance,
+                note,
+            } => {
+                let new = note.entries.iter().find(|e| e.generation == *generation);
+                for (copy, missing) in new.iter().flat_map(|entry| &entry.copies) {
+                    tracing::error!(
+                        node,
+                        partition = site.partition.0,
+                        generation = generation.0,
+                        cutoff = new.map_or(0, |entry| entry.cutoff.0),
+                        copy = copy.0,
+                        missing_node = missing.0,
+                        "recovery_committed_without"
+                    );
+                }
+                self.without.insert(
+                    site.partition,
+                    (*generation, *instance, note.as_ref().clone()),
+                );
+                Ok(())
+            }
             RecoveryEffect::RebuildStalled { copy } => {
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
                 self.rebuild_stalled(site.partition, *copy);
@@ -9947,6 +10131,10 @@ impl Host {
         anchor: LineageAnchor,
     ) -> RecoveryEvent {
         if anchor.lineage.generation > Generation(0) {
+            // #80 R4-1: first, so a failed inventory seals too. What this copy acknowledges
+            // from here on would not be in the head it reports.
+            self.replication
+                .seal(self.node, partition, anchor.lineage.generation);
             #[cfg(test)]
             let survived = if self.refuse_inventories {
                 Err("refused_by_test")
@@ -11255,8 +11443,8 @@ impl Host {
         // Admitting takes both halves: L1 admitting and A1 admitting. L1 alone said
         // `admits=true` on a fenced owner whose puts answered `LEASE_EXPIRED` (M9 S2b, e). A1's
         // half is its own verdict on the adopted lineage, not "holds a grant": a held grant
-        // still denies while the control store is unavailable, or before it serves the
-        // partition (review F-001).
+        // still denies past its horizon before the fence, on a revoked epoch, or before it
+        // serves the partition (review F-001).
         let lineage = Lineage {
             partition,
             generation: adopted.generation,
@@ -11380,6 +11568,20 @@ impl Host {
                 .committed
                 .get(&partition)
                 .map(|result| result.committed.pinned_config.config_version),
+            qualifying_copy: l1
+                .filter(|l1| l1.mode().is_some())
+                .map(Protection::qualifies_now_at_head),
+            clock_bound_lost: self.clock.guard().is_some_and(ClockGuard::lost),
+            committed_without: match self.without.get(&partition) {
+                Some((generation, instance, note)) if *generation == adopted.generation => {
+                    NoteState::Known {
+                        generation: *generation,
+                        instance: *instance,
+                        note: note.clone(),
+                    }
+                }
+                _ => NoteState::Unknown,
+            },
         }
     }
 }
@@ -12118,6 +12320,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Activated { .. } => "activated",
         Msg::OwnerLearned { .. } => "owner_learned",
         Msg::FenceBound { .. } => "fence_bound",
+        Msg::ReplanNote { .. } => "replan_note",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",
@@ -12369,6 +12572,10 @@ fn head(debug: &str) -> &str {
 mod catchup_tests;
 #[cfg(test)]
 mod drop_tests;
+#[cfg(test)]
+mod note_tests;
+#[cfg(test)]
+mod seal_tests;
 #[cfg(test)]
 mod sync_tests;
 #[cfg(test)]

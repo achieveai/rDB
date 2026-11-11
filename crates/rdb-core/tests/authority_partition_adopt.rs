@@ -79,7 +79,11 @@ impl SnapshotRead for NoSnapshot {
 }
 
 const SNAPSHOT: NoSnapshot = NoSnapshot;
-const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
+// #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+const BUDGETS: Budgets = Budgets {
+    grant_millis: 3_000,
+    ..Budgets::SPEC_DEFAULTS
+};
 
 /// One fixed, bounded sample for every step, so no effect vector below carries a view published
 /// because the sample moved (lead ruling A-R45).
@@ -2842,12 +2846,19 @@ fn horizon_install(budgets: &Budgets) -> (Authority, AuthorityView, Vec<Effect>)
 /// and the inequality gives 1999 where `floor(2001 / 1.0005)` would give 2000. (c) No solution
 /// (`E − utc == ε + δ`, grant 120): the view is `now − 1`. **It arrives as a fence** — the same
 /// comparison is the expiry conjunct, so the node fences `Expired` before any horizon is asked
-/// for, and the fence's view carries `now − 1`.
+/// for, and the fence's view carries `now − 1`. (d) The product default grant, 6000 since issue
+/// #80, sample age 7000 so the sample does not bind: `a_max` is 5877 (`5877 < 5880 − 2`, and 5878
+/// is not), inside the local horizon 5899.
+///
+/// (a) to (c) state their arithmetic at grant 3000, so the row pins that, not the product default.
 ///
 /// Every view is also checked against `may_admit` on both sides of its horizon.
 #[retcd_test]
 fn m7a_143_authority_view_valid_through_tick_formula() {
-    let spec = Budgets::SPEC_DEFAULTS;
+    let spec = Budgets {
+        grant_millis: 3_000,
+        ..Budgets::SPEC_DEFAULTS
+    };
     let cases = [
         ("(a)", spec, 2_000, DenyReason::ClockSampleStale),
         (
@@ -2866,6 +2877,15 @@ fn m7a_143_authority_view_valid_through_tick_formula() {
                 ..spec
             },
             1_999,
+            DenyReason::Expired,
+        ),
+        (
+            "(d) the product default grant",
+            Budgets {
+                max_sample_age_millis: 7_000,
+                ..Budgets::SPEC_DEFAULTS
+            },
+            5_877,
             DenyReason::Expired,
         ),
     ];
@@ -4949,5 +4969,136 @@ fn a_revocation_of_the_served_epoch_fences_it() {
     assert_eq!(
         kernel.may_admit_at(p2_at(3), Tick(6), &BUDGETS),
         Verdict::Admit
+    );
+}
+
+/// The clock sample of a host whose clock reads `skew` from true time, at true tick `now`: fresh
+/// on every step, at the product's error bound. Issue #80's no-overlap rows run on it.
+fn skewed_sample(now: u64, skew: i64) -> ControlTime {
+    ControlTime {
+        estimate: Tick(
+            5_000_000u64
+                .checked_add_signed(now as i64 + skew)
+                .expect("in range"),
+        ),
+        error_millis: Budgets::SPEC_DEFAULTS.clock_error_millis,
+        bound_established: true,
+        sampled_at: Tick(now),
+    }
+}
+
+/// An owner on a clock reading `skew`, acquired at true tick 0 at the product default grant and
+/// `p1` installed, and then cut off from control: no renewal ever goes out. Returns its grant's
+/// expiry `E` and the last true tick its dispatch check admitted.
+fn cut_off_owner_stops_at(skew: i64) -> (i64, u64) {
+    use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, Checkpoint, Verdict};
+    use rdb_core::contracts::event::KernelEvent;
+    let budgets = Budgets::SPEC_DEFAULTS;
+    let at = |now: u64| StepCtx {
+        now: Tick(now),
+        control_time: skewed_sample(now, skew),
+        budgets: &budgets,
+        ..ctx(now)
+    };
+    let (mut kernel, _) = acquired_under(&at(0));
+    let expiry = kernel
+        .e_new(Tick(0), &budgets)
+        .expect("a fresh in-bound sample gives an E_new");
+    kernel
+        .step(&at(1), &snapshot(2, 10, &[record(P1, NODE, 1)]))
+        .expect("the install is built");
+    let mut last_admitted = 0;
+    for now in 10..=8_000 {
+        let check = event_of(
+            now,
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Check {
+                checkpoint: Checkpoint::StorageDispatch,
+                lineage: p1_at(1),
+                correlation: CorrelationId(now),
+            })),
+        );
+        let effects = kernel.step(&at(now), &check).expect("a check is answered");
+        let verdict = effects.iter().find_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Answer(decision))) => {
+                Some(decision.verdict)
+            }
+            _ => None,
+        });
+        if verdict == Some(Verdict::Admit) {
+            last_admitted = now;
+        }
+    }
+    (expiry, last_admitted)
+}
+
+/// The first true tick a promoter on a clock reading `skew` may treat the frozen `expiry` as
+/// proven passed: the only takeover comparison in the workspace (`expiry_proven`).
+fn promoter_first_proves_at(expiry: i64, skew: i64) -> u64 {
+    use rdb_core::authority::clock::{expiry_proven, ClockView};
+    let budgets = Budgets::SPEC_DEFAULTS;
+    (0..=20_000)
+        .find(|now| {
+            let mut clock = ClockView::new();
+            clock.accept(skewed_sample(*now, skew));
+            expiry_proven(&clock, expiry, Tick(*now), &budgets).is_some()
+        })
+        .expect("a proof arrives")
+}
+
+/// Issue #80, an acquisition at the product default. Pinned fixtures elsewhere run at 3 000 ms for
+/// their arithmetic; this one says what the default buys: a grant of 6 000 ms, and, cut off from
+/// control, 5 799 ms of admission on a clock in bound (`G - ε - δ - 1`).
+#[retcd_test]
+fn an_owner_acquired_at_the_default_grant_admits_5799_ms_when_cut_off_from_control() {
+    let budgets = Budgets::SPEC_DEFAULTS;
+    assert_eq!(budgets.grant_millis, 6_000);
+    let (expiry, last_admitted) = cut_off_owner_stops_at(0);
+    assert_eq!(expiry, 5_006_000, "E is the sample plus the default grant");
+    assert_eq!(
+        last_admitted,
+        budgets.grant_millis - budgets.clock_error_millis - budgets.dispatch_margin_millis - 1
+    );
+    assert_eq!(last_admitted, 5_799);
+}
+
+/// Issue #80, design row 20: no overlap at G = 6 s, with A1 admitting straight through a control
+/// outage. The old owner, cut off from control, keeps admitting and a promoter takes over on a
+/// clock skewed just under 2ε from it, the worst the clock bound allows. Its last admission has
+/// `C < E - ε - δ`, the first proof has `C > E + ε + δ`, and no true tick has both.
+///
+/// Positive control: at a relative skew beyond 2(ε + δ), which only S2c's guard will refuse, the
+/// same two comparisons do overlap, so this row can see an overlap when there is one.
+#[retcd_test]
+fn the_old_owner_stops_before_a_new_owner_starts_at_the_default_grant() {
+    let budgets = Budgets::SPEC_DEFAULTS;
+    assert_eq!(budgets.grant_millis, 6_000, "the row is about the default");
+    let epsilon = budgets.clock_error_millis as i64;
+    let delta = budgets.dispatch_margin_millis as i64;
+
+    // The worst in-bound pair: the old clock slow, so `E` is early, and the new clock fast.
+    let (old_skew, new_skew) = (-(epsilon - 1), epsilon - 1);
+    let (expiry, last_old) = cut_off_owner_stops_at(old_skew);
+    let first_new = promoter_first_proves_at(expiry, new_skew);
+    let clock_at = |tick: u64, skew: i64| 5_000_000 + tick as i64 + skew;
+    assert!(
+        clock_at(last_old, old_skew) < expiry - epsilon - delta,
+        "last old admission {last_old} is inside E - ε - δ"
+    );
+    assert!(
+        clock_at(first_new, new_skew) > expiry + epsilon + delta,
+        "first new proof {first_new} is past E + ε + δ"
+    );
+    assert!(
+        last_old < first_new,
+        "no overlap: last old {last_old}, first new {first_new}"
+    );
+
+    // Positive control.
+    let beyond = epsilon + delta + 5;
+    let (expiry, last_old) = cut_off_owner_stops_at(-beyond);
+    let first_new = promoter_first_proves_at(expiry, beyond);
+    assert!(
+        first_new <= last_old,
+        "skew past 2(ε + δ) must overlap, or the row is blind: last {last_old}, first {first_new}"
     );
 }

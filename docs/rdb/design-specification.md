@@ -375,6 +375,8 @@ stateDiagram-v2
 
 **Amended 2026-10-23 (M10 S2, lead ruling A-R285): a write refused because the control quorum is lost answers `PROTECTION_PAUSED` before apply, and `LEASE_EXPIRED` after.** (After apply it is `UNKNOWN_OUTCOME` since 2026-10-24, below.) The node still holds its grant and is not fenced; it only cannot prove the grant right now (an election in the control plane, say). Before apply nothing was handed to storage, so the refusal proves no mutation. The retry rule is unchanged. `DenyReason::client_error_kind` is the one place the mapping is written.
 
+**Amended for issue #80.** Control-quorum loss no longer refuses a write while the grant lasts, so A1 gives no `ControlUnavailable` deny at a write's or a read's checks. Writes stop at the grant's horizon with `LEASE_EXPIRED`. The mapping above stays for the reason itself.
+
 **Amended 2026-10-24 (M10 S2, lead rulings A-R342 and A-R343): `LEASE_EXPIRED` proves no mutation by this submission.** Every `LEASE_EXPIRED` is a refusal before apply: admission's authority check, a freeze for a lost grant, the dispatch check, or a refused read. After apply, every authority deny answers `UNKNOWN_OUTCOME` instead, `ControlUnavailable` included, so the proof can never cover a batch that may have landed. The retry rule is unchanged, and the proof covers this send only (client rule above). [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §5 holds the full amendment and its rows.
 
 **Amended 2026-10-24 (M10 S2, lead ruling A-R401 F4): `RECOVERY_READ_ONLY` proves no mutation by this submission.** Its one producer refuses before apply: admission, a frozen queue's dispatch reply, an undispatched check, or a drain of the queue. A dispatched write is never answered with it. The retry rule is unchanged, and the proof covers this send only (client rule above). [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §5 holds the full amendment and its row.
@@ -521,12 +523,16 @@ stateDiagram-v2
   SelfFenced --> [*]: fresh grant required
 ```
 
-**Takeaway:** a node keeps rights only through successful revision-checked renewal; uncertainty, freeze or expiry removes admission rights.
+**Takeaway:** a node keeps rights only through successful revision-checked renewal; clock uncertainty, a freeze or expiry removes admission rights.
+
+**Amended for issue #80: control-plane uncertainty does not remove admission.** A node that cannot reach rEtcd, or does not know whether a renewal committed, keeps serving writes and reads on the grant it has already proved, up to that grant's horizon: `renewed_at + grant_millis − dispatch_margin_millis − 1`, about 5.9 s after its last committed renewal at the defaults. There it fences `Expired`. Meanwhile it takes no new grant and no promote runs. No-overlap rests on the grant alone: the old owner stops at `E − ε − δ` whatever it can read, and a new owner waits for `E + ε + δ`. [ADR-rdb-0007](../ADRs/rdb/0007-fenced-grants-and-epochs.md) "A control-plane `Unavailable` and an unknown CAS outcome neither deny nor fence" holds the full rule and what it costs.
+
+**Clock uncertainty is the clock guard's word (issue #80 S2c).** A node's clock bound holds only while the node and the peers whose fresh verdict (at most 5 s old) is Agree are a majority of the cluster, and outnumber the fresh Breaches. A node without one has no bound: it admits nothing (`ClockUnbounded`), and a promote run on its clock is refused before it writes anything.
 
 
 The selected design requires new fenced-grant semantics; inspected rDB surfaces do not establish an existing implementation. A grant service uses rDB consensus to serialize grant/renew/revoke state; it is not a separate authority outside rDB.
 
-Default grant duration is 3 s, renewed every 500 ms. Grant expiry `E` is persisted in control metadata, qualified by cluster authority generation and node boot UUID. Renewal is CAS against the unfrozen grant revision; delayed renewals after freeze/revocation cannot resurrect it.
+Default grant duration is 6 s (3 s until issue #80), renewed every 500 ms. Grant expiry `E` is persisted in control metadata, qualified by cluster authority generation and node boot UUID. Renewal is CAS against the unfrozen grant revision; delayed renewals after freeze/revocation cannot resurrect it.
 
 **Bounded-clock mode:** configure verified maximum UTC error `ε=100 ms` and dispatch margin `δ=100 ms`. Old owner admission requires its clock `C_old < E−ε−δ`; new activation requires authority clock `C_auth > E+ε+δ` after a linearizable read of the final frozen expiry.
 
@@ -550,10 +556,10 @@ A renewal sent before a fence can still commit after quorum returns (seen in M9 
 
 `control failover + renew_millis < grant_millis − dispatch_margin_millis − clock_error_millis − 1 − renew_millis`
 
-- With the defaults (3000, 100, 100, 500) the right side is 2299 ms.
-- rEtcd's default timers allow a failover of up to about 3000 ms (two `election_timeout_max`), so they break it. Measured in M9 S2a: the voters elected 2338 ms after the stop, 3 ms past the horizon, and the owner fenced `Expired`.
-- `rdb_dev`'s control timers give 1000 + 500 = 1500 ms, which leaves 799 ms for the renewal's RPC and commit. Row `control_failover_leaves_a_renewal_inside_the_write_horizon` holds that.
-- Owed to M10: a startup check against the voters' real timers (needs `--control ENDPOINTS`; `dyn ConfigStore` hides them) and A1's quicker renewal retry. Until then, with default rEtcd timers one leader failover fences every owner. Writes then stop until the same-boot fresh grant (above) proves the old grant expired and replaces it, which takes at least the rest of that grant plus `clock_error_millis + dispatch_margin_millis` once the new leader answers.
+- With the defaults (6000, 100, 100, 500) the right side is 5299 ms. It was 2299 ms at the 3000 ms grant before issue #80.
+- rEtcd's default timers allow a failover of up to about 3000 ms (two `election_timeout_max`). With `renew_millis` that is 3500 ms, 1799 ms inside the horizon. At the 3000 ms grant it broke the rule. Measured in M9 S2a: the voters elected 2338 ms after the stop, 3 ms past the horizon, and the owner fenced `Expired`. Row `the_grant_covers_a_control_failover_under_default_timers` holds this.
+- `rdb_dev`'s control timers give 1000 + 500 = 1500 ms, which leaves 3799 ms for the renewal's RPC and commit. Row `control_failover_leaves_a_renewal_inside_the_write_horizon` holds that.
+- Owed to M10: a startup check against the voters' real timers (needs `--control ENDPOINTS`; `dyn ConfigStore` hides them). A failover longer than the horizon still fences every owner, and writes then stop until the same-boot fresh grant (above) proves the old grant expired and replaces it, which takes at least the rest of that grant plus `clock_error_millis + dispatch_margin_millis` once the new leader answers.
 
 **M9 note: a node restart stops writes, safely, for the life of the `Db` (added 2026-10-12, M9 S2b; achieveai/rDB#42).** `Db::restart_node` starts the node again at boot + 1. Peers' membership pins the old boot (`Member::boot`), so they refuse the new process's acknowledgements, and the new process holds no role, no grant and no pending acquire.
 - Restarting a **secondary**: its copy is never durable again, so L1 pauses writes within about 2 s of the next write (§6.2). With no fence that is about 2 s after the restart. After a fence nothing is unsafe until the next write, so it is about 2 s after that write (tester q8).

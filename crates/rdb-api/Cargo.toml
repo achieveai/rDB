@@ -52,6 +52,8 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 # A host row writes an unframed value straight into a closed copy (M10, A-R164).
 rocksdb = { workspace = true }
+# Row 13j reads the `@t` of a log line, to place a peer's clock at the first admission.
+chrono = { workspace = true }
 
 [build-dependencies]
 protox = { workspace = true }

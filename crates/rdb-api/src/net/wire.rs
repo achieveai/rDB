@@ -96,6 +96,24 @@ pub enum Frame {
         /// The answer.
         reply: WireReply,
     },
+    /// A clock probe on a link's own timer (#80 S2c): the application keepalive of the link
+    /// and one `Tick` round. `sent` is the prober's clock when it left.
+    ClockProbe {
+        /// The prober's own count on this link.
+        id: u64,
+        /// The prober's clock when it left.
+        sent: Tick,
+    },
+    /// The answer to a [`Frame::ClockProbe`]: its `id` and `sent`, and `at`, the answering
+    /// clock when it echoed.
+    ClockEcho {
+        /// The probe's id.
+        id: u64,
+        /// The probe's `sent`.
+        sent: Tick,
+        /// The answering clock.
+        at: Tick,
+    },
 }
 
 /// The answer to a proxied call.
@@ -374,6 +392,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Activated { .. }
         | Msg::OwnerLearned { .. }
         | Msg::FenceBound { .. }
+        | Msg::ReplanNote { .. }
         | Msg::Inject { .. }
         | Msg::PeerBooted { .. }
         | Msg::Rebuild { .. }
@@ -398,6 +417,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Activated { .. } => "Activated",
         Msg::OwnerLearned { .. } => "OwnerLearned",
         Msg::FenceBound { .. } => "FenceBound",
+        Msg::ReplanNote { .. } => "ReplanNote",
         Msg::Inject { .. } => "Inject",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Rebuild { .. } => "Rebuild",
@@ -1677,6 +1697,12 @@ pub struct WireNodeStatus {
     pub pinned: Vec<rdb_core::contracts::membership::Member>,
     /// Added under version 3 (A-R415 C-2), as `pinned` was.
     pub config_version: Option<rdb_core::contracts::ids::ConfigVersion>,
+    /// Added under protocol 6 (#80 S2c): L1's `qualifies_now`, when L1 is live.
+    pub qualifying_copy: Option<bool>,
+    /// Added under protocol 6 (#80 S2c): the node's clock bound is reported lost.
+    pub clock_bound_lost: bool,
+    /// Added under protocol 6 (#80 S5n), with S2c's two fields.
+    pub committed_without: rdb_core::contracts::recovery::NoteState,
 }
 
 /// The role words a host reports (`host::Node::status`).
@@ -1710,6 +1736,9 @@ impl From<&NodeStatus> for WireNodeStatus {
             reload_pending: status.reload_pending,
             pinned: status.pinned.clone(),
             config_version: status.config_version,
+            qualifying_copy: status.qualifying_copy,
+            clock_bound_lost: status.clock_bound_lost,
+            committed_without: status.committed_without.clone(),
         }
     }
 }
@@ -1748,6 +1777,9 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             reload_pending: status.reload_pending,
             pinned: status.pinned,
             config_version: status.config_version,
+            qualifying_copy: status.qualifying_copy,
+            clock_bound_lost: status.clock_bound_lost,
+            committed_without: status.committed_without,
             lengths: None,
         })
     }

@@ -613,7 +613,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | Refusal | Why | When to retry |
 |---|---|---|
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
-| `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd answers this for as long as it is cut. | After `db.wait_ready(..)`. |
+| `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` re-reads the owner on this answer, so the retry goes to the new one. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |

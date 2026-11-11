@@ -157,7 +157,14 @@ fn queue(runner: &mut Runner, at: u64, correlation: u64, kind: EventKind) {
 fn a1p1_plan() -> RunPlan {
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
     cases::without_activation(&mut scenario);
-    scenario_run::lower(&scenario).expect("the A1/P1 case lowers")
+    let mut plan = scenario_run::lower(&scenario).expect("the A1/P1 case lowers");
+    // #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+    plan.overrides
+        .push(rdb_sim::harness::manifest::BudgetOverride {
+            name: rdb_core::contracts::trace::BudgetName::Grant,
+            millis: 3_000,
+        });
+    plan
 }
 
 /// Run to `to` inclusive and return the replies the segment produced.

@@ -75,7 +75,11 @@ impl SnapshotRead for NoSnapshot {
 }
 
 const SNAPSHOT: NoSnapshot = NoSnapshot;
-const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
+// #80 S2d: pinned. These rows' arithmetic is about relationships between budgets; it does not state the product default.
+const BUDGETS: Budgets = Budgets {
+    grant_millis: 3_000,
+    ..Budgets::SPEC_DEFAULTS
+};
 
 /// One fixed, bounded sample taken at tick zero, so no effect vector below carries a view
 /// published because the sample moved (lead ruling A-R45). Fresh until `max_sample_age_millis`.
