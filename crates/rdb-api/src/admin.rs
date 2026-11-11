@@ -2241,6 +2241,16 @@ pub enum PromoteError {
          promote: open it with Db::open, which connects it to one"
     )]
     NoControlStore,
+    /// This process's clock bound is lost (`clock_bound_lost`): its guard cannot show the clock
+    /// is within epsilon of its peers', so no expiry it reads is a proof. Refused before
+    /// anything is written, so no owner is fenced or frozen on a proof that cannot finish
+    /// (PR #103 review B2).
+    #[error(
+        "this process's clock is not shown to agree with its peers (clock_bound_lost), so it \
+         cannot prove the owner's grant expired; nothing was changed: wait until its clock \
+         agrees with its peers again, then promote again"
+    )]
+    ClockUnbounded,
     /// The promote gave no answer in time, and may have written.
     #[error(
         "the promote of node {node} did not answer in time; it may have written: promote again"
@@ -2268,6 +2278,7 @@ impl PromoteError {
                 | Self::TargetFrozen { .. }
                 | Self::NoSuchPartition { .. }
                 | Self::NoControlStore
+                | Self::ClockUnbounded
         )
     }
 }
@@ -2296,6 +2307,7 @@ impl From<PromoteError> for ApiError {
             PromoteError::PeersUnknown { .. }
             | PromoteError::StaleMembers { .. }
             | PromoteError::Unreachable { .. }
+            | PromoteError::ClockUnbounded
             | PromoteError::Control(_) => RetryRule::BoundedJitter,
         };
         Self {
@@ -2360,11 +2372,12 @@ pub(crate) fn promote_members(
         // `!pinned.is_empty()` is unreachable today (the host fills `pinned` and
         // `config_version` from one committed config, which always has members); kept so a
         // later split refuses here instead of pinning nobody. Defensive, no row.
+        // Only the configuration is read. The target's clock bound is checked where it commits
+        // (`bind_routed_fence`, row 13d), and a qualifying copy says nothing about its members:
+        // neither is a reason to call it unconfigured (PR #103 review question).
         Some(crate::host::NodeStatus {
             pinned,
             config_version: Some(version),
-            qualifying_copy: None,
-            clock_bound_lost: false,
             ..
         }) if !pinned.is_empty() => return Ok((pinned, version)),
         Some(_) => PromoteError::Unconfigured {
@@ -2521,6 +2534,10 @@ pub(crate) async fn promote_looked(
         members = ?members.iter().map(|m| (m.node.0, m.boot.0, m.role)).collect::<Vec<_>>(),
         "promote_members_kept"
     );
+
+    // Every expiry below is proved on this process's clock. With no bound it proves nothing,
+    // so refuse before the Fencing write and the freeze, not after them (PR #103 review B2).
+    refuse_unbounded(&ctx)?;
 
     // Above one partition the freeze below is the whole node's, so only a dead owner goes on
     // (issue #79 S3). The grant revision read here is what step 4 must still find.
@@ -3156,6 +3173,24 @@ async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
         .unwrap_or(false)
 }
 
+/// Refuse a promote run on a clock with no bound ([`PromoteError::ClockUnbounded`]), before it
+/// writes anything. Logged `promote_clock_unbounded`.
+fn refuse_unbounded(ctx: &PromoteCtx) -> Result<(), PromoteError> {
+    if ctx
+        .clock
+        .sample(ctx.clock.now(), &ctx.budgets)
+        .bound_established
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        to = ctx.to.0,
+        partition = ctx.partition.0,
+        "promote_clock_unbounded"
+    );
+    Err(PromoteError::ClockUnbounded)
+}
+
 /// Refuse `ctx.to` when its grant is frozen: a promote there would commit, and the new owner
 /// could never admit (#61 critic Y3).
 async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
@@ -3267,9 +3302,11 @@ async fn owner_dead(
             );
             return Err(alive("its grant is still being renewed"));
         }
+        // The guarded sample, never `control_time`: a clock with no bound proves no expiry,
+        // so a fast caller cannot read a live owner's grant as run out (PR #103 review B2).
         let now = ctx.clock.now();
         let mut view = ClockView::new();
-        view.accept(HostClock::control_time(now, &ctx.budgets));
+        view.accept(ctx.clock.sample(now, &ctx.budgets));
         if expiry_proven(&view, held.expiry_utc_ms, now, &ctx.budgets).is_some() {
             tracing::info!(
                 owner = prior.0,
@@ -4752,6 +4789,117 @@ mod tests {
             "{refused:?}"
         );
         unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying
+    /// copy, still holds a configuration, so its members are planned with and it is not called
+    /// `Unconfigured`. A lost target bound refuses later, where the target commits (row 13d).
+    /// Cut: match `clock_bound_lost: false` or `qualifying_copy: None` again, red.
+    #[test]
+    fn a_target_with_a_lost_clock_bound_or_a_qualifying_copy_is_still_configured() {
+        let configured = |qualifying_copy, clock_bound_lost| crate::host::NodeStatus {
+            node: NodeId(2),
+            boot: OPEN_2,
+            fault: None,
+            holds: None,
+            authority: "none".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "secondary",
+            protection: None,
+            admits: None,
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+            pinned: members(),
+            config_version: Some(CONFIG_VERSION),
+            qualifying_copy,
+            clock_bound_lost,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
+        };
+        for (qualifying_copy, clock_bound_lost) in
+            [(None, true), (Some(true), false), (Some(false), true)]
+        {
+            let planned = promote_members(
+                PARTITION,
+                NodeId(2),
+                Some(configured(qualifying_copy, clock_bound_lost)),
+                Duration::from_secs(1),
+            );
+            assert_eq!(
+                planned.ok(),
+                Some((members(), CONFIG_VERSION)),
+                "qualifying_copy={qualifying_copy:?} clock_bound_lost={clock_bound_lost}"
+            );
+        }
+    }
+
+    /// A clock `ahead_millis` fast whose guard has no bound: attached in a cluster of three, with
+    /// no Agree heard.
+    fn lost_bound_clock(ahead_millis: i64) -> HostClock {
+        let clock = HostClock::guarded(ahead_millis);
+        clock.guard().expect("a guarded clock").attach(3);
+        assert!(
+            !clock
+                .sample(clock.now(), &Budgets::SPEC_DEFAULTS)
+                .bound_established,
+            "the bound is lost"
+        );
+        clock
+    }
+
+    /// PR #103 review (B2): a promote run on a clock with no bound cannot prove an expiry, so it
+    /// must not fence the partition or freeze the owner's grant first, then time out with the
+    /// freeze standing. Here the caller is a minute fast, the owner is unreachable and its grant
+    /// is three seconds from expiry on an honest clock. Above one partition (the unguarded time
+    /// `owner_dead` used would read the grant as expired and go on to freeze a live owner) and at
+    /// one, the promote is refused `ClockUnbounded` with `partitions/1` and `grants/1` untouched.
+    /// Cut: no bound check before the writes, red on the moved revision.
+    /// Unit (~20 ms): `MemStore`.
+    #[test]
+    fn b2_a_promote_on_a_clock_with_no_bound_fences_and_freezes_nothing() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        old_grant(&*store, &rt, GrantId(4));
+        let honest = i64::try_from(HostClock::start().now().0).expect("a tick");
+        put_grant_expiry(&*store, &rt, honest + 3_000);
+        let before = promote_marks(&*store, &rt);
+        for owner_must_be_dead in [true, false] {
+            let ctx = PromoteCtx {
+                partition: PARTITION,
+                owner_must_be_dead,
+                look_within: Duration::from_millis(1),
+                store: Arc::clone(&store),
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: lost_bound_clock(60_000),
+                to: NodeId(2),
+                drop: None,
+                within: Duration::from_secs(1),
+                members: members(),
+                members_version: CONFIG_VERSION,
+                member_boot: all_known(),
+                send: Arc::new(|_, _| Err(NodeStopped(OWNER))),
+            };
+            let refused = rt.block_on(promote(ctx)).expect_err("refused");
+            assert!(
+                matches!(refused, PromoteError::ClockUnbounded),
+                "owner_must_be_dead={owner_must_be_dead}: {refused:?}"
+            );
+            assert!(refused.no_mutation(), "{refused:?}");
+            assert_eq!(
+                promote_marks(&*store, &rt),
+                before,
+                "owner_must_be_dead={owner_must_be_dead}: nothing written"
+            );
+            unfrozen_and_serving(&*store, &rt);
+        }
     }
 
     /// A target's `grants/` record that does not decode says nothing about whether it is frozen,
