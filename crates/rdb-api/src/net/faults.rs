@@ -4,7 +4,10 @@
 //! state: a line removed is a fault lifted. One fault per line:
 //!
 //! * `hold <n>` / `hold all`: every frame to or from node `n` (or any peer, apps included)
-//!   waits, in order, until the line goes; then it is delivered. A delay, never a loss.
+//!   waits, in order, until the line goes; then it is delivered. A delay, never a loss. The
+//!   clock probes and their echoes are the one exception: they pass at once both ways, so
+//!   neither end's silence timer closes the link under a hold and loses what it holds, and
+//!   neither end's clock guard loses its bound to one.
 //! * `drop-request N`: the `N`-th client call this node receives (counted from 1) is lost
 //!   before the node sees it.
 //! * `drop-reply N`: the `N`-th client call is served, and its answer is lost.

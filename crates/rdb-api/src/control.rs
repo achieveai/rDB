@@ -1633,6 +1633,127 @@ mod tests {
         assert_eq!(gaps, [50, 100, 200, 400, 800, 1600, 2000]);
     }
 
+    /// PR #103 review: a re-plan's note read that finds the record behind the generation it
+    /// plans from retries, and answers nothing until the record reaches it. `partitions/1` is at
+    /// generation 4 holding note A when node 1 asks for generation 5's; through 10 s of paused
+    /// retries nothing is posted. The record moves to generation 5 holding note B, and the one
+    /// answer is note B. Cut: break on any read, red (note A, at once).
+    /// Unit (no wall time): paused clock, `MemStore`.
+    #[test]
+    fn a_replan_note_read_below_the_generation_retries_until_the_record_reaches_it() {
+        use rdb_core::authority::partition::{
+            PartitionLifecycle, PartitionRoot, RecordMember, RecordMode,
+        };
+        use rdb_core::contracts::ids::{ConfigVersion, Seq};
+        use rdb_core::contracts::membership::CopyId;
+        use rdb_core::contracts::recovery::WithoutEntry;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let store = Arc::new(config_testkit::MemStore::new());
+        let key = Bytes::from(ControlKey::Partition(PartitionId(1)).encode());
+        let root = PartitionRoot {
+            mode: RecordMode::Active,
+            owner_boot: crate::host::BOOT,
+            base_seq: Seq(0),
+            base_digest: rdb_core::contracts::digest::Digest::ROOT,
+            predecessor_generation: Generation(0),
+            predecessor_cutoff: Seq(0),
+            instance: [7; rdb_core::authority::partition::INSTANCE_LEN],
+            run: Revision(1),
+        };
+        let members = [RecordMember {
+            copy: CopyId(0),
+            node: NodeId(1),
+            role: rdb_core::contracts::ids::ReplicaRole::Primary,
+        }];
+        let note = |generation: u64, node: u32| {
+            CommittedWithout::default().with(WithoutEntry {
+                generation: Generation(generation),
+                cutoff: Seq(generation),
+                copies: vec![(CopyId(1), NodeId(node))],
+            })
+        };
+        let body = |generation: u64, note: &CommittedWithout| {
+            PartitionRecord {
+                partition: PartitionId(1),
+                owner: NodeId(1),
+                generation: Generation(generation),
+                owner_epoch: OwnerEpoch(1),
+                config_version: ConfigVersion(1),
+                lifecycle: PartitionLifecycle::Serving,
+            }
+            .encode_with_members(&root, &members, Some(note))
+        };
+        let (note_a, note_b) = (note(4, 2), note(5, 3));
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: key.clone(),
+                value: body(4, &note_a),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("generation 4")
+            .revision;
+
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx, crate::host::BOOT);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        adapter.read_replan_note(
+            NodeId(1),
+            crate::host::BOOT,
+            PartitionId(1),
+            OwnerEpoch(1),
+            Generation(5),
+        );
+        rt.block_on(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        assert!(
+            rx.try_recv().is_err(),
+            "no answer while the record is behind the generation"
+        );
+
+        rt.block_on(store.put(PutRequest {
+            key,
+            value: body(5, &note_b),
+            expected_mod_revision: Some(written),
+            dedup: None,
+        }))
+        .expect("generation 5");
+        let answer = rt.block_on(async {
+            let mailbox = async {
+                loop {
+                    if let Ok(msg) = rx.try_recv() {
+                        return msg;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(60), mailbox).await
+        });
+        adapter.shutdown();
+        match answer {
+            Ok(Msg::ReplanNote {
+                generation, note, ..
+            }) => {
+                assert_eq!(generation, Generation(5));
+                assert_eq!(
+                    note, note_b,
+                    "the note at the generation, not the older one"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "one answer");
+    }
+
     /// PR #38 review F-002, follow-up: a replaced reload that is still retrying stops listing.
     /// The newer one's check keeps the older one from answering; `abort` is what stops it from
     /// listing a down store every 2 s until the store answers. On paused time, with every list

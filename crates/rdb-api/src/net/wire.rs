@@ -1795,11 +1795,11 @@ pub struct WireNodeStatus {
     pub pinned: Vec<rdb_core::contracts::membership::Member>,
     /// Added under version 3 (A-R415 C-2), as `pinned` was.
     pub config_version: Option<rdb_core::contracts::ids::ConfigVersion>,
-    /// Added under version 4 (#80 S2c): L1's `qualifies_now`, when L1 is live.
+    /// Added under protocol 6 (#80 S2c): L1's `qualifies_now`, when L1 is live.
     pub qualifying_copy: Option<bool>,
-    /// Added under version 4 (#80 S2c): the node's clock bound is reported lost.
+    /// Added under protocol 6 (#80 S2c): the node's clock bound is reported lost.
     pub clock_bound_lost: bool,
-    /// Added under version 4 (#80 S5n), with S2c's two fields: no released build speaks 4.
+    /// Added under protocol 6 (#80 S5n), with S2c's two fields.
     pub committed_without: rdb_core::contracts::recovery::NoteState,
 }
 

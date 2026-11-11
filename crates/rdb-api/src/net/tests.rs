@@ -2556,9 +2556,10 @@ async fn row_13f_a_silent_peer_with_no_fin_is_closed_after_about_five_seconds() 
     drop(silent);
 }
 
-/// 13f's other side: a link held on both ends is delayed, not silent. Neither end sends a probe
-/// or counts a silence, so it outlives `PROBE_SILENCE` and no `net_link_down` comes. Cut: drop
-/// the hold branch from the reader's probe tick, red on the closed link.
+/// 13f's other side: a link held on both ends is delayed, not silent. The clock probes and
+/// echoes pass outside the hold, so both ends keep hearing each other; it outlives
+/// `PROBE_SILENCE` and no `net_link_down` comes. Cut: send the probe through the hold
+/// (`conn.out`), red on the closed link.
 /// Integration (~6 s): the wait past the silence limit is the row's subject.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_13f_a_link_held_on_both_ends_outlives_the_silence_limit() {
@@ -2580,6 +2581,139 @@ async fn row_13f_a_link_held_on_both_ends_outlives_the_silence_limit() {
         .filter(|line| line["@m"] == "net_link_down")
         .collect();
     assert!(closed.is_empty(), "a hold is a delay: {closed:?}");
+}
+
+/// PR #103 review: a hold on one end only, longer than `PROBE_SILENCE`, is still a delay. Node
+/// 1 holds node 2; node 2 holds nothing, so its silence timer runs. An `Inspect` node 2 sends
+/// waits in node 1's hold past the silence limit, is delivered when the hold lifts, and is
+/// answered: the link never closed. Cut: answer a probe only through the hold, red: node 2
+/// closes the link after ~5 s and the `Inspect` is lost with it.
+/// Integration (~7 s): the wait past the silence limit is the row's subject.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_held_on_one_end_past_the_silence_limit_delivers_what_it_held() {
+    const METHOD: &str = "a_link_held_on_one_end_past_the_silence_limit_delivers_what_it_held";
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    one.net
+        .wait_up(&[NodeId(2)], PATIENCE)
+        .await
+        .expect("the link comes up");
+    two.net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("the link comes up");
+    one.faults.apply("hold 2\n");
+    let (inspect, inspected) = mpsc::channel();
+    two.links
+        .post(
+            NodeId(1),
+            Msg::Inspect {
+                partition: PartitionId(1),
+                reply: inspect,
+            },
+        )
+        .expect("posted");
+    tokio::time::sleep(super::PROBE_SILENCE + Duration::from_secs(1)).await;
+    one.faults.apply("");
+    let mail = one.mail;
+    let host = tokio::task::spawn_blocking(move || loop {
+        match mail
+            .recv_timeout(PATIENCE)
+            .expect("the held Inspect arrives")
+        {
+            Msg::Inspect { reply, .. } => {
+                reply.send(status()).expect("caller waits");
+                return;
+            }
+            _ => continue,
+        }
+    });
+    let answered = tokio::task::spawn_blocking(move || inspected.recv_timeout(PATIENCE))
+        .await
+        .expect("join");
+    host.await.expect("host");
+    assert!(
+        answered.is_ok(),
+        "the held Inspect was answered: {answered:?}"
+    );
+    let closed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "net_link_down")
+        .collect();
+    assert!(closed.is_empty(), "a hold is a delay: {closed:?}");
+}
+
+/// PR #103 review: an echo for a probe never sent (a future id) or already echoed (a duplicate)
+/// is not a round. It neither refreshes the link's liveness nor changes a verdict, and a valid
+/// echo after them is still taken. Cut: drop the id check in `Frame::ClockEcho`, red on the
+/// Breach the duplicate would record. Unit: no sockets.
+#[config_log::retcd_test]
+fn a_future_or_duplicate_clock_echo_is_not_a_round() {
+    use rdb_core::contracts::time::Tick;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let clock = crate::clock::HostClock::guarded(0);
+    let guard = clock.guard().expect("a guard");
+    guard.attach(3);
+    let shared = Arc::new(super::Shared {
+        label: Label::Node(NodeId(1)),
+        clock,
+        admin_apps: admin_apps(),
+        boot: BootId(1),
+        protocol_version: PROTOCOL_VERSION,
+        faults: Faults::new(),
+        links: std::sync::Weak::new(),
+        routes: std::sync::Mutex::new(BTreeMap::new()),
+        conns: std::sync::Mutex::new(BTreeMap::new()),
+        next_conn: std::sync::atomic::AtomicU64::new(0),
+        rt: rt.handle().clone(),
+        span: tracing::Span::current(),
+        on_boot: std::sync::Mutex::new(None),
+    });
+    let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
+    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    let long_ago = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .expect("an instant 3 s back");
+    let answered_at = || *super::lock(&conn.answered_at);
+    *super::lock(&conn.answered_at) = long_ago;
+    let echo = |id: u64, offset_ms: u64| {
+        let sent = shared.clock.now();
+        Frame::ClockEcho {
+            id,
+            sent,
+            at: Tick(sent.0 + offset_ms),
+        }
+    };
+    let agree = Some(crate::clock::Verdict::Agree);
+
+    // Probe 1 is out and echoed, agreeing.
+    conn.probe_sent
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    super::handle(&shared, &conn, echo(1, 0)).expect("handled");
+    assert_eq!(guard.verdict_of(NodeId(2)), agree);
+    assert!(answered_at() > long_ago, "a matched echo is liveness");
+
+    // Its duplicate, 5 s ahead, and an echo of probe 2, never sent: neither counts.
+    *super::lock(&conn.answered_at) = long_ago;
+    super::handle(&shared, &conn, echo(1, 5_000)).expect("handled");
+    super::handle(&shared, &conn, echo(2, 5_000)).expect("handled");
+    assert_eq!(guard.verdict_of(NodeId(2)), agree, "no Breach recorded");
+    assert_eq!(answered_at(), long_ago, "no liveness either");
+
+    // Probe 2 goes out; its echo is a round again.
+    conn.probe_sent
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    super::handle(&shared, &conn, echo(2, 5_000)).expect("handled");
+    assert_eq!(
+        guard.verdict_of(NodeId(2)),
+        Some(crate::clock::Verdict::Breach)
+    );
+    assert!(answered_at() > long_ago);
 }
 
 /// The id of the link node `net` routes node 2 by, read on a thread of its own so a lock that

@@ -479,10 +479,16 @@ fn row_13i_a_paused_owner_whose_grant_was_frozen_stops_and_never_replaces() {
 
 /// 13j: after a re-anchor the grant is new, and the first admission is proved against the
 /// peers' clocks: the old expiry, `epsilon` and `delta` are past on node 2's clock before node
-/// 1 admits again. Runs the 13h flow and reads node 2's clock at the first accepted put.
+/// 1 admits again. Runs the 13h flow and reads node 2's clock at node 1's first admitted
+/// authority check after the fence (PR #103 review): not when the put returns, which an early
+/// admission with a slow reply would pass. Node 2's clock at that line is the line's `@t` plus
+/// node 2's offset from the wall clock, measured at the end; the offset is fixed at start, so
+/// it is the same then.
 /// Integration (~8 s).
 #[config_log::retcd_test]
 fn row_13j_the_first_admission_after_a_reanchor_is_past_the_old_expiry_on_a_peers_clock() {
+    const METHOD: &str =
+        "row_13j_the_first_admission_after_a_reanchor_is_past_the_old_expiry_on_a_peers_clock";
     let budgets = short_grant();
     let rig = rig([0, 0, 0], budgets);
     rig.ready(0);
@@ -500,13 +506,42 @@ fn row_13j_the_first_admission_after_a_reanchor_is_past_the_old_expiry_on_a_peer
     });
     let (.., grant, _) = partition_and_grant(&rig.rt, &rig.store);
     put_lands(&rig.procs[0].db, Duration::from_secs(30));
-    let peer = rig.procs[1].links.clock().now().0;
+
+    let wall = |at: &serde_json::Value| {
+        chrono::DateTime::parse_from_rfc3339(at.as_str().expect("an @t"))
+            .expect("an RFC 3339 @t")
+            .timestamp_millis()
+    };
+    let wall_now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_millis(),
+    )
+    .expect("in range");
+    let node_2_now = i64::try_from(rig.procs[1].links.clock().now().0).expect("a tick");
+    let node_2_ahead_of_wall = node_2_now - wall_now;
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let of_node_1 = |message: &'static str| {
+        lines
+            .iter()
+            .filter(move |line| line["@m"] == message && line["node"] == 1)
+    };
+    let fenced = of_node_1("authority_fence")
+        .find(|line| line["reason"] == "ClockUnbounded")
+        .map(|line| wall(&line["@t"]))
+        .expect("node 1 fenced ClockUnbounded");
+    let first = of_node_1("authority_check_admitted")
+        .map(|line| wall(&line["@t"]))
+        .filter(|at| *at > fenced)
+        .min()
+        .expect("an admitted check after the fence");
+    let peer = first + node_2_ahead_of_wall;
     let margin =
         i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis).expect("small");
-    let peer = i64::try_from(peer).expect("a tick");
     assert!(
         peer > grant.expiry_utc_ms + margin,
-        "admitted at {peer} on node 2's clock, old expiry {} + {margin}",
+        "first admitted at {peer} on node 2's clock, old expiry {} + {margin}",
         grant.expiry_utc_ms
     );
 }

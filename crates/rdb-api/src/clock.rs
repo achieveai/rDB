@@ -19,9 +19,10 @@
 //! **Inconclusive**: delay and load widen the doubt and never make a Breach.
 //!
 //! [`HostClock::sample`] is where a [`ControlTime`] now comes from. With no `Net` attached
-//! it is always established, as it was before this guard. A node with no Agree since start,
-//! or whose Breaches are not outnumbered, has no bound: A1 retracts the sample and fails
-//! closed. A node `Fenced` and behind a majority of the cluster moves its clock forward
+//! it is always established, as it was before this guard. A node has a bound only while it,
+//! with the peers whose fresh verdict is Agree, is a majority of the K-node cluster and
+//! outnumbers the fresh Breaches. Otherwise A1 retracts the sample and fails closed. So delay
+//! and load that leave every round Inconclusive for [`VERDICT_FRESH_MILLIS`] cost the bound. A node `Fenced` and behind a majority of the cluster moves its clock forward
 //! ([`ClockGuard::reanchor_if_behind`]) and recovers with no restart.
 
 use std::collections::BTreeMap;
@@ -184,12 +185,20 @@ impl Verdicts {
             .map(|(node, seen)| (*node, seen))
     }
 
-    /// The node's bound: an Agree since start, and counting this node as one agreement, fresh
-    /// Agrees outnumber fresh Breaches.
-    fn established(&self, now: u64) -> bool {
+    /// The node's bound in a cluster of `k`: an Agree since start, and counting this node as one
+    /// agreement, fresh Agrees are at least `floor(k/2)+1` and outnumber fresh Breaches.
+    ///
+    /// The majority is of the fixed membership, not of the verdicts that happen to be fresh
+    /// (PR #103 review B1). Without it, a minority whose clocks agree with each other regains
+    /// a bound once a partition lets the other side's Breaches age out, and two established
+    /// nodes need no longer share an agreeing node: the 2-epsilon the promote proof rests on is
+    /// gone. Two majorities always meet. The cost is that a node which has heard no fresh
+    /// Agree from a majority for [`VERDICT_FRESH_MILLIS`] has no bound, however few Breaches
+    /// stand against it: it cannot show its clock is within epsilon, so A1 fails closed.
+    fn established(&self, k: usize, now: u64) -> bool {
         let agrees = self.fresh(Verdict::Agree, now).count() + 1;
         let breaches = self.fresh(Verdict::Breach, now).count();
-        self.agreed && agrees > breaches
+        self.agreed && agrees > breaches && agrees > k / 2
     }
 
     /// Whether any fresh Breach stands against this node.
@@ -203,7 +212,7 @@ impl Verdicts {
     /// Agree. The rule for which K applies is the caller's: the guard reads it as one number
     /// (ruling R8-7 for the union that must land before S4's add-node).
     fn reanchor(&mut self, k: usize, epsilon: u64, now: u64) -> Option<Reanchor> {
-        if self.established(now) {
+        if self.established(k, now) {
             return None;
         }
         let ahead: Vec<(NodeId, u64)> = self
@@ -284,6 +293,10 @@ impl ClockGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn k(&self) -> usize {
+        self.cluster.load(Ordering::Relaxed)
+    }
+
     fn mono(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -298,6 +311,12 @@ impl ClockGuard {
     #[cfg(test)]
     pub(crate) fn disable(&self) {
         self.attached.store(false, Ordering::Relaxed);
+    }
+
+    /// The last conclusive verdict on `peer`, fresh or not, for rows.
+    #[cfg(test)]
+    pub(crate) fn verdict_of(&self, peer: NodeId) -> Option<Verdict> {
+        self.lock().peers.get(&peer).map(|seen| seen.verdict)
     }
 
     /// Fold one peer's round in, and report a change of the bound.
@@ -315,18 +334,18 @@ impl ClockGuard {
                 tracing::debug!(peer = peer.0, verdict = ?judged, offset_ms, rtt_ms, "clock_sample");
             }
         }
-        Self::report(&mut verdicts, now);
+        Self::report(&mut verdicts, self.k(), now);
     }
 
     /// Re-judge the bound as verdicts age. Called from the links' probe tick.
     pub(crate) fn refresh(&self) {
         let now = self.mono();
-        Self::report(&mut self.lock(), now);
+        Self::report(&mut self.lock(), self.k(), now);
     }
 
     /// Log a change of the bound once, at error for a loss.
-    fn report(verdicts: &mut Verdicts, now: u64) {
-        let established = verdicts.established(now);
+    fn report(verdicts: &mut Verdicts, k: usize, now: u64) {
+        let established = verdicts.established(k, now);
         let lost = !established && (verdicts.agreed || verdicts.any_breach(now));
         if lost && !verdicts.reported_lost {
             verdicts.reported_lost = true;
@@ -341,7 +360,7 @@ impl ClockGuard {
     /// Whether the bound holds now. Always true with no `Net` attached.
     #[must_use]
     pub fn established(&self) -> bool {
-        !self.attached.load(Ordering::Relaxed) || self.lock().established(self.mono())
+        !self.attached.load(Ordering::Relaxed) || self.lock().established(self.k(), self.mono())
     }
 
     /// Whether a loss of the bound has been reported and has not ended: the operator's word,
@@ -652,26 +671,74 @@ mod tests {
         );
 
         // No Agree yet: no bound, however few the Breaches.
-        assert!(!Verdicts::default().established(0));
+        assert!(!Verdicts::default().established(3, 0));
         // One Agree, nothing against it.
-        assert!(table(&[(2, offset_by(0, 10))], 0).established(0));
+        assert!(table(&[(2, offset_by(0, 10))], 0).established(3, 0));
         // K=3, one Agree one Breach: 2 > 1.
         let split = table(&[(2, offset_by(0, 10)), (3, offset_by(500, 10))], 0);
-        assert!(split.established(0));
+        assert!(split.established(3, 0));
         // Two Breaches outvote self and an Agree that has aged out.
         let mut lost = table(&[(2, offset_by(0, 10))], 0);
         lost.record(NodeId(3), offset_by(500, 10), EPS, 5_000);
         lost.record(NodeId(4), offset_by(500, 10), EPS, 5_000);
         assert!(
-            !lost.established(5_001),
+            !lost.established(3, 5_001),
             "the Agree has aged out, 1 > 2 is false"
         );
-        // A Breach ages out too, and the latch stands: the bound comes back.
-        assert!(lost.established(10_001));
+        // A Breach ages out too, but the latch alone is no bound: self is one of three, not a
+        // majority (PR #103 review B1). A fresh Agree from either peer brings it back.
+        assert!(!lost.any_breach(10_001));
+        assert!(!lost.established(3, 10_001));
+        lost.record(NodeId(2), offset_by(0, 10), EPS, 10_001);
+        assert!(lost.established(3, 10_001));
         // The peer's table never counts a peer twice: its newest verdict replaces the last.
         let mut once = table(&[(2, offset_by(500, 10))], 0);
         once.record(NodeId(2), offset_by(0, 10), EPS, 1);
         assert_eq!(once.fresh(Verdict::Breach, 1).count(), 0);
+    }
+
+    /// PR #103 review (B1): K=5, nodes 1 and 2 are 500 ms fast and agree with each other; 3, 4
+    /// and 5 are honest. Each side Breaches the other, then a partition between the groups
+    /// stops those rounds and the cross-group Breaches age out. The fast pair must not get a
+    /// bound back on the strength of each other and the latch: two of five is no majority. The
+    /// honest three still are one. Cut: drop the majority from `established`, red on the pair.
+    #[test]
+    fn b1_a_minority_clock_group_cannot_establish_once_cross_group_breaches_age_out() {
+        const K: usize = 5;
+        // Node 1's table: node 2 agrees, the honest three are 500 ms behind it.
+        let mut fast = table(
+            &[
+                (2, offset_by(0, 10)),
+                (3, offset_by(-500, 10)),
+                (4, offset_by(-500, 10)),
+                (5, offset_by(-500, 10)),
+            ],
+            0,
+        );
+        // Node 3's table: 4 and 5 agree, the fast pair is 500 ms ahead.
+        let mut honest = table(
+            &[
+                (1, offset_by(500, 10)),
+                (2, offset_by(500, 10)),
+                (4, offset_by(0, 10)),
+                (5, offset_by(0, 10)),
+            ],
+            0,
+        );
+        assert!(!fast.established(K, 0), "three Breaches outvote two");
+        assert!(honest.established(K, 0));
+
+        // The partition: only rounds inside each group go on.
+        let later = VERDICT_FRESH_MILLIS + 500;
+        fast.record(NodeId(2), offset_by(0, 10), EPS, later);
+        honest.record(NodeId(4), offset_by(0, 10), EPS, later);
+        honest.record(NodeId(5), offset_by(0, 10), EPS, later);
+        assert!(!fast.any_breach(later), "the cross-group Breaches aged out");
+        assert!(
+            !fast.established(K, later),
+            "two fast nodes are no majority of five"
+        );
+        assert!(honest.established(K, later), "three honest ones are");
     }
 
     /// 13b: a round whose delay exceeds what it could prove is Inconclusive, at any offset the
@@ -704,23 +771,26 @@ mod tests {
         assert!(three.peers.is_empty(), "those verdicts are cleared");
         assert!(!three.agreed, "the latch is reset");
         assert!(
-            !three.established(1),
+            !three.established(3, 1),
             "the bound stays lost until a new Agree"
         );
         assert_eq!(three.reanchor(3, EPS, 1), None, "and it cannot fire twice");
         three.record(NodeId(2), offset_by(0, 10), EPS, 2);
-        assert!(three.established(2), "a new Agree restores it");
+        assert!(three.established(3, 2), "a new Agree restores it");
 
         // A node that had an Agree before it fell behind: the re-anchor clears that latch too,
         // or the empty table would read as a bound with nothing behind it.
         let mut latched = table(&[(2, offset_by(0, 10))], 0);
         latched.record(NodeId(2), offset_by(800, 10), EPS, 1);
         latched.record(NodeId(3), offset_by(800, 10), EPS, 1);
-        assert!(latched.agreed && !latched.established(1));
+        assert!(latched.agreed && !latched.established(3, 1));
         latched.reanchor(3, EPS, 1).expect("two of three ahead");
-        assert!(!latched.established(1), "no Agree since the move");
+        assert!(!latched.established(3, 1), "no Agree since the move");
         latched.record(NodeId(2), offset_by(40, 2_000), EPS, 2);
-        assert!(!latched.established(2), "an Inconclusive round is no Agree");
+        assert!(
+            !latched.established(3, 2),
+            "an Inconclusive round is no Agree"
+        );
 
         // K=5: three ahead are enough, two are not.
         let ahead3: Vec<_> = (2..=4).map(|n| (n, offset_by(800, 10))).collect();
@@ -732,7 +802,7 @@ mod tests {
         // it does not move, however lost its bound.
         let cut = [(4, offset_by(1_000, 10)), (5, offset_by(1_000, 10))];
         let mut verdicts = table(&cut, 0);
-        assert!(!verdicts.established(0));
+        assert!(!verdicts.established(5, 0));
         assert_eq!(verdicts.reanchor(5, EPS, 0), None);
 
         // K is a parameter: the same two peers are a majority of 3 and not of 4.
