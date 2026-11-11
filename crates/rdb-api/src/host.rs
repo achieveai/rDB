@@ -2198,6 +2198,33 @@ pub(crate) fn fault_next_commit(node_dir: &std::path::Path) {
         .push(node_dir.to_path_buf());
 }
 
+/// Test-only: node directories whose running host sends no recovery catch-up record past the
+/// `Seq` given, until [`clear_recovery_send_cap`], as a holder whose link is cut part-way through
+/// would. Every send is capped, not only the first: a catch-up opens with a send of the head
+/// record alone and then re-sends record by record (observed, 2026-11-10). So a row can stop a
+/// catch-up strictly inside a tail without racing it (issue #105 unit 2, critic-s15 M2 (2)).
+#[cfg(test)]
+static CAP_RECOVERY_SEND: Mutex<Vec<(PathBuf, Seq)>> = Mutex::new(Vec::new());
+
+/// Arm [`CAP_RECOVERY_SEND`] for the host on `node_dir`, as `DbConfig::dir` joined with
+/// `nodes/<n>`.
+#[cfg(test)]
+pub(crate) fn cap_recovery_send(node_dir: &std::path::Path, through: Seq) {
+    CAP_RECOVERY_SEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), through));
+}
+
+/// Disarm [`CAP_RECOVERY_SEND`] for `node_dir`.
+#[cfg(test)]
+pub(crate) fn clear_recovery_send_cap(node_dir: &std::path::Path) {
+    CAP_RECOVERY_SEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(dir, _)| dir != node_dir);
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -10269,6 +10296,28 @@ impl Host {
             partition: credential.partition,
             generation: credential.prior_generation,
             owner_epoch: credential.prior_owner_epoch,
+        };
+        #[cfg(test)]
+        let through = {
+            let cap = CAP_RECOVERY_SEND
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|(dir, _)| self.engine.path().starts_with(dir))
+                .map(|(_, cap)| *cap);
+            match cap {
+                Some(cap) => {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        through = through.0,
+                        cap = cap.0,
+                        "recovery_send_capped"
+                    );
+                    through.min(cap)
+                }
+                None => through,
+            }
         };
         let mut sent = 0u64;
         for seq in first.0..=through.0 {

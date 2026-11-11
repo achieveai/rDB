@@ -1389,8 +1389,14 @@ fn u2_c1_an_owner_restarted_after_its_catch_up_and_before_the_cas_commits_at_the
     mem.failing_with(config_core::ConfigError::Unavailable {
         reason: "the control store is down".to_owned(),
     });
-    wait_for("node 2 caught up to K2", patience, || {
-        applied_on_two(&nodes) >= k2.0
+    // Node 2 holds K2 once its sync of the catch-up proves K2 durable. Not `NodeStatus::holds`:
+    // under full-gate load node 2's repair can stand it down before it adopts G3's authority, and
+    // with the control store down it never adopts one, so `holds` stays `None` while its engine
+    // has K2 (observed 2026-11-10: `sync_proven` node 2 durable 3, then 180 s of `holds` None).
+    wait_for("node 2 holds K2 durably", patience, || {
+        lines_of(METHOD, "sync_proven")
+            .iter()
+            .any(|line| line["node"] == 2 && line["durable"].as_u64() >= Some(k2.0))
     });
     assert!(
         !committed_past(METHOD, stood_down),
@@ -1502,7 +1508,10 @@ fn u2_c5_an_owner_faulted_between_the_cas_and_recovered_rolls_forward() {
 
 /// critic-s15 M2 (2): node 2, the owner, restarts part-way through a multi-record catch-up from
 /// node 3. Its plan was memory only and is gone; its anchor lineage keeps the records it staged.
-/// Link 2-3 is held as soon as node 2 is strictly inside the tail, and node 2 restarts there. The
+/// Node 3 sends no catch-up record past four records into the tail (`host::cap_recovery_send`),
+/// as a link cut part-way through would; link 2-3 is then held with node 2 strictly inside the
+/// tail, the cap cleared, and node 2 restarts there. Polling the catch-up instead
+/// raced it: under full-lib load all 40 records landed before the hold (observed, 2026-11-10). The
 /// next run reports node 2's partial head, keeps its plan again on the receiver it installs
 /// (B1), and finishes the tail from there: every tail key reads `two` and the next write follows
 /// the tail.
@@ -1529,13 +1538,15 @@ fn u2_m2_2_an_owner_restarted_part_way_through_its_catch_up_finishes_from_its_pa
     let (first, last) = (tail[0].seq.0, tail[tail.len() - 1].seq.0);
     let base = applied_on_two(&nodes);
     assert!(base < first, "node 2 was promoted without the tail: {base}");
+    let cap = first + 4;
+    let holder = dir.path().join("nodes").join("3");
+    crate::host::cap_recovery_send(&holder, Seq(cap));
     links.heal(NodeId(2), NodeId(3));
-    let deadline = Instant::now() + patience;
-    while applied_on_two(&nodes) < first {
-        assert!(Instant::now() < deadline, "node 2 began its catch-up");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_for("node 2 took the catch-up up to the cap", patience, || {
+        applied_on_two(&nodes) >= cap
+    });
     links.hold(NodeId(2), NodeId(3));
+    crate::host::clear_recovery_send_cap(&holder);
     let partial = applied_on_two(&nodes);
     assert!(
         first <= partial && partial < last,
