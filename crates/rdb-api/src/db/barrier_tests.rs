@@ -1542,12 +1542,20 @@ fn u2_m2_2_an_owner_restarted_part_way_through_its_catch_up_finishes_from_its_pa
     let holder = dir.path().join("nodes").join("3");
     crate::host::cap_recovery_send(&holder, Seq(cap));
     links.heal(NodeId(2), NodeId(3));
+    // Node 2 took the catch-up through the cap once node 3 opens a window past it: node 3 moves
+    // its window on node 2's acknowledgements. Not `NodeStatus::holds`: under load node 2's repair
+    // can stand it down before it adopts G3's authority, and `holds` then reads the adopted
+    // generation, not the receiver taking the catch-up (observed 2026-11-11: node 3 sending from
+    // seq 8 for 180 s while `holds` read 2, the same race as C1's).
     wait_for("node 2 took the catch-up up to the cap", patience, || {
-        applied_on_two(&nodes) >= cap
+        lines_of(METHOD, "recovery_envelopes_sent")
+            .iter()
+            .any(|line| line["node"] == 3 && line["to"] == 2 && line["from"].as_u64() > Some(cap))
     });
     links.hold(NodeId(2), NodeId(3));
     crate::host::clear_recovery_send_cap(&holder);
-    let partial = applied_on_two(&nodes);
+    // Node 3 sent nothing past the cap but the head record, which stays above the gap.
+    let partial = cap;
     assert!(
         first <= partial && partial < last,
         "held strictly inside the tail {first}..={last}: {partial}"

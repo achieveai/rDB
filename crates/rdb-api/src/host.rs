@@ -2201,8 +2201,11 @@ pub(crate) fn fault_next_commit(node_dir: &std::path::Path) {
 /// Test-only: node directories whose running host sends no recovery catch-up record past the
 /// `Seq` given, until [`clear_recovery_send_cap`], as a holder whose link is cut part-way through
 /// would. Every send is capped, not only the first: a catch-up opens with a send of the head
-/// record alone and then re-sends record by record (observed, 2026-11-10). So a row can stop a
-/// catch-up strictly inside a tail without racing it (issue #105 unit 2, critic-s15 M2 (2)).
+/// record alone and then re-sends record by record (observed, 2026-11-10). The head record itself
+/// still goes: it is the probe whose gap the receiver asks to have filled, and capping it too
+/// stalled the catch-up at its start (observed 2026-11-11, every send `from=42 through=7`). It
+/// stays unapplied above the gap. So a row can stop a catch-up strictly inside a tail without
+/// racing it (issue #105 unit 2, critic-s15 M2 (2)).
 #[cfg(test)]
 static CAP_RECOVERY_SEND: Mutex<Vec<(PathBuf, Seq)>> = Mutex::new(Vec::new());
 
@@ -10298,7 +10301,7 @@ impl Host {
             owner_epoch: credential.prior_owner_epoch,
         };
         #[cfg(test)]
-        let through = {
+        let cap = {
             let cap = CAP_RECOVERY_SEND
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10314,13 +10317,20 @@ impl Host {
                         cap = cap.0,
                         "recovery_send_capped"
                     );
-                    through.min(cap)
+                    Some((
+                        cap,
+                        Seq(self.engine.buffered_applied(partition, stored.generation).0),
+                    ))
                 }
-                None => through,
+                None => None,
             }
         };
         let mut sent = 0u64;
         for seq in first.0..=through.0 {
+            #[cfg(test)]
+            if cap.is_some_and(|(cap, head)| cap.0 < seq && seq < head.0) {
+                continue;
+            }
             let Some(record) = self.stored_record(stored, Seq(seq)) else {
                 break;
             };
