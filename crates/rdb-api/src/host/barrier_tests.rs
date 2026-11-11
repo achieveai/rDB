@@ -297,6 +297,64 @@ fn s5d_40_a_fenced_stale_owner_refuses_a_new_barrier_with_the_new_owner() {
     assert!(trio.nodes[0].0.barriers.is_empty());
 }
 
+/// PR #104 review iteration 5, blocker 1: the same stale tracker before node 1 has learned the
+/// replacement. Node 1's control store is cut before the promote, so it never reads the new
+/// owner and has no hint to name. A new barrier there is still refused by A1, as
+/// `LEASE_EXPIRED` provably mutating nothing, and is never registered. Cut: drop the A1 check
+/// in `barrier_copies`, and the barrier is registered on the stale tracker.
+/// Integration (~6 s): the promote waits out the grant.
+#[config_log::retcd_test]
+fn s5d_40_a_fenced_stale_owner_with_no_owner_hint_refuses_a_new_barrier() {
+    const METHOD: &str = "s5d_40_a_fenced_stale_owner_with_no_owner_hint_refuses_a_new_barrier";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tune);
+    let faults = super::seal_tests::control_behind_a_cut(&mut trio);
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &super::note_tests::INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.ready();
+    let (generation, through) = written(&mut trio, 1, b"a");
+
+    faults.apply("cut-control");
+    let promote = spawn_promote(&trio, 2);
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    assert!(
+        trio.nodes[0].0.replication.primary(NodeId(1), P).is_some(),
+        "the row needs node 1's stale primary tracker"
+    );
+
+    let answer = trio.ask(wait_durable(generation, through, 400));
+    assert!(
+        !matches!(
+            trio.nodes[0].0.owner_after_fence.get(&P),
+            Some(Some(NodeId(2)))
+        ),
+        "node 1 must not have learned the new owner: {:?}",
+        trio.nodes[0].0.owner_after_fence.get(&P)
+    );
+    let error = refused(answer);
+    assert_eq!(error.kind, ErrorKind::LeaseExpired, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(error.detail.contains("no barrier was started"), "{error:?}");
+    assert!(trio.nodes[0].0.barriers.is_empty());
+    let lines = logged!(METHOD, "durable_barrier_refused");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["node"], 1, "{lines:?}");
+    faults.apply("");
+}
+
 /// PR #104 review blocker 2: node 3's real proof of the write, held on its way to node 1 while
 /// a promote drops node 1 and commits a newer generation, is delivered after that commit. Node 1
 /// is cut from rEtcd, so it cannot read the new owner, and its grant no longer admits: the last
