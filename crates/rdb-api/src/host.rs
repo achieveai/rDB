@@ -9108,14 +9108,19 @@ impl Host {
             // Unit 2 (lead ruling on the narrowing): only a tail that could come back, adoptable
             // or not ready yet, needs giving up named. One whose adoption proof failed can
             // restore nothing.
+            // Lead ruling R8: the refusal says what is true of the tail's state.
             let restorable = live.iter().find(|(_, _, adoption)| adoption.could_return());
-            if let Some((node, head, _)) = restorable.filter(|_| !give_up_live_copy) {
+            if let Some((node, head, adoption)) = restorable.filter(|_| !give_up_live_copy) {
+                let state = if matches!(adoption, TailAdoption::Unchecked) {
+                    "; it has not been checked whether that copy can bring them back"
+                } else {
+                    " and can bring them back; no operator action is needed"
+                };
                 return refuse(
                     InvalidArgument,
                     format!(
-                        "node {} holds seqs {} to {} of partition {} on a live copy; this release \
-                         cannot bring them back on its own. To give them up, for good, add \
-                         --give-up-live-copy",
+                        "node {} holds seqs {} to {} of partition {} on a live copy{state}. To \
+                         give them up anyway, for good, add --give-up-live-copy",
                         node.0,
                         cutoff.0 + 1,
                         head.0,
@@ -12327,7 +12332,7 @@ impl Host {
     /// anchor's generation onto the child, logged `from` the child (design section 16 G4).
     /// At [`MAX_CHAIN_DEPTH`] the link is a flatten, a full copy run here on the host thread, so
     /// other partitions' events wait for it: accepted, at most one per 32 levels (section 16 F7,
-    /// R4). `how` says `link` for it too; `flatten` is owed.
+    /// R4). `how` says `flatten` for it, and for a crashed flatten the same link resumes.
     /// Either way a receiver held here is removed (N2): a catch-up this copy sources then restores a
     /// dormant receiver with a full ladder from the engine.
     fn adopt(
@@ -12343,7 +12348,9 @@ impl Host {
         self.views.remove(&partition);
         let mut from = hit.from;
         let how = match how {
+            // A link at the depth ceiling is a full copy (`Copied`): say so (lead ruling R8).
             Adopt::Link => match self.engine.inherit(partition, hit.from, to, hit.head) {
+                Ok(Inherited::Copied { .. }) => "flatten",
                 Ok(_) => "link",
                 Err(_) => return Err("adopt_link_refused"),
             },

@@ -2425,6 +2425,8 @@ fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
         reason: "tail_on_older_lineage",
         adoption,
     };
+    // Lead ruling R8: the refusal says what is true of the tail's state. One that can come
+    // back by itself says so; an unchecked one says it was not checked. Neither says it cannot.
     let needs_flag = |answer: Result<String, ApiError>, node: u64, state: &str| {
         let error = answer.expect_err(state);
         assert_eq!(error.kind, ErrorKind::InvalidArgument, "{state}: {error:?}");
@@ -2432,6 +2434,16 @@ fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
         assert!(
             error.detail.contains("add --give-up-live-copy")
                 && error.detail.contains(&format!("node {node} holds seqs")),
+            "{state}: {error:?}"
+        );
+        let says = if state.starts_with("Unchecked") {
+            "not been checked"
+        } else {
+            "can bring them back; no operator action is needed"
+        };
+        assert!(error.detail.contains(says), "{state}: {error:?}");
+        assert!(
+            !error.detail.contains("cannot bring them back"),
             "{state}: {error:?}"
         );
     };
@@ -3214,7 +3226,8 @@ fn u2_r7_3_a_flattened_child_ties_with_its_parent_and_is_linked_onto() {
     );
     assert_eq!(
         adoptions(METHOD),
-        [(32, 33, "link".to_owned()), (33, 34, "link".to_owned())]
+        [(32, 33, "flatten".to_owned()), (33, 34, "link".to_owned())],
+        "the copy says flatten (lead ruling R8); the link onto it says link"
     );
 }
 
@@ -3429,10 +3442,13 @@ fn u2_r7_8_a_tail_whose_set_aside_is_still_copying_is_not_ready_until_it_finishe
 }
 
 /// R7-9 (design section 16, F7): a tail whose lineage reads through 32 levels is adopted, the
-/// child flattened (`copied` at base = head 3), and the copy reports head 3.
+/// child flattened (`copied` at base = head 3), and the copy reports head 3. `tail_adopted`
+/// says `how=flatten` (lead ruling R8): the link became a full copy.
 /// Cut c6 (refuse at the ceiling, `NotReady`): red, `TailHeld`. Red under c1 too, as R7-3.
+/// Cut: `how` says `link` for a copy, red on the `how` assertion.
 #[config_log::retcd_test]
 fn u2_r7_9_a_tail_at_the_depth_ceiling_is_adopted_by_a_flatten() {
+    const METHOD: &str = "u2_r7_9_a_tail_at_the_depth_ceiling_is_adopted_by_a_flatten";
     let dir = config_testkit::fs::temp_dir();
     let path = dir.path().join("node");
     let digests = tail_at_the_ceiling(&path);
@@ -3458,12 +3474,17 @@ fn u2_r7_9_a_tail_at_the_depth_ceiling_is_adopted_by_a_flatten() {
         Some((Seq(3), true)),
         "flattened at the head"
     );
+    assert_eq!(
+        adoptions(METHOD),
+        [(32, 33, "flatten".to_owned())],
+        "a link that became a full copy says so"
+    );
 }
 
 /// R7-10 (design section 16, G4): the flatten of R7-9 faults on its copy batch, so generation 33
 /// is left staging a copy of the whole tail, and the node restarts.
-/// (a) The same ask again: adoption resumes the copy into 33 (`tail_adopted from=32 to=33`), and
-/// 33 is `copied` at base = head 3.
+/// (a) The same ask again: adoption resumes the copy into 33 (`tail_adopted from=32 to=33`,
+/// `how=flatten`, lead ruling R8), and 33 is `copied` at base = head 3.
 /// (b) Variant, the next ask is at anchor 34: the staged child 33 is finished, not aborted, and
 /// 34 links onto it (`tail_adopted from=33 to=34`, `how=resume`); no `tail_parent_copying`.
 /// Cuts: c7 (no same-anchor arm), red in (a), `NotReady("replay_not_ready")`; c8 (no
@@ -3513,7 +3534,7 @@ fn u2_r7_10_a_flatten_that_crashed_part_way_is_resumed_by_the_next_ask() {
             "33 holds the whole tail, copied"
         );
         let expected = if next == 33 {
-            (32, 33, "link".to_owned())
+            (32, 33, "flatten".to_owned())
         } else {
             (33, 34, "resume".to_owned())
         };

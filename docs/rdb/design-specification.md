@@ -794,7 +794,7 @@ A holder adopts the tail inside its inventory answer. It then reports as an ordi
 - **Resume.** An earlier adoption's full copy crashed part way. The copy finishes it with the same arguments, then links.
 - **Replay.** The copy already holds the anchor's lineage, linked, with its head at or above the base. It appends the tail's records with `record_batch`, as a receiver would. The first record must chain from that head. At most `ADOPT_REPLAY_MAX` (1,024) records are replayed.
 
-After any of them, a receiver held on that copy is dropped. A catch-up it then sources rebuilds a full ladder from the engine. The copy logs `tail_adopted` with `from`, `to`, `head`, `stamp` and `how` (`link`, `resume` or `replay`).
+After any of them, a receiver held on that copy is dropped. A catch-up it then sources rebuilds a full ladder from the engine. The copy logs `tail_adopted` with `from`, `to`, `head`, `stamp` and `how` (`link`, `flatten` for a link that became a full copy, `resume` or `replay`).
 
 **What an adopted tail can hold.** A record cannot show whether its client got a reply (§8.1). So an adopted tail may hold a write whose client saw an error or no answer. That write becomes visible. A resend with the same identity is deduplicated: the dedup row travels with the record.
 
@@ -884,7 +884,7 @@ It is refused, giving up nothing, when:
 
 - H is at or below the committed cutoff;
 - no copy holds a tail above the cutoff;
-- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given;
+- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
 - `--no-intact-copy` is given and the intact rule did not cap the owner's last commit;
 - another re-plan is running.
 
@@ -906,7 +906,6 @@ What is given up is gone for good. Being accepted does not mean writable: the re
 - A copy left read-only by a dead holder stays read-only until the holder returns or `forget-tail` runs.
 - Adoption does not restart the dedup retirement clock. A tail adopted about a day after a `ReadOnly` landing can lose its dedup rows soon after, so a resend could apply twice.
 - Catch-up sends one record per round trip. A 500-record tail took about 4.5 s.
-- `tail_adopted` says `how=link` for a link that became a full copy.
 - The simulator does not model the tail scan or adoption yet.
 - A barrier landing's crashed full copy looks like a resumable adoption, so it also reports `Adoptable`. If its proofs then fail, the repair re-plans in a loop that only its back-off slows.
 - A rebuild source's snapshot merge across a link above the root base is not traced.

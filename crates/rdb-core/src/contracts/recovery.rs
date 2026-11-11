@@ -772,7 +772,10 @@ pub enum RecoveryEvent {
         head: Seq,
         /// The generation that wrote the record at `head`; `None` when it could not be read.
         stamp: Option<Generation>,
-        /// Why it cannot report it: one of the host's closed set of reasons.
+        /// Why it cannot report it, as diagnostic text; F1 does not read it. Usually the host's
+        /// tail-scan reason (`rdb_api`'s `TAIL_REFUSED_REASONS`). When the copy adopted or
+        /// released the tail and its survivor check then refused, it is that check's own refusal
+        /// instead (for example `copy_ahead_of_anchor`), which no closed set lists.
         reason: String,
     },
     /// A source is still sending its advertised prefix (`design.md` §5.5).

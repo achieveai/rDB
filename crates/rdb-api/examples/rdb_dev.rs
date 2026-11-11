@@ -422,9 +422,11 @@
 //!                                         re-plans from generation G: <what is given
 //!                                         up>`. Refused, nothing given up, for H at or
 //!                                         below the cutoff, a live copy reporting a tail
-//!                                         (unless --give-up-live-copy), or the intact rule
-//!                                         not holding the partition. Under `--nodes`,
-//!                                         only an admin app may run it
+//!                                         that could come back (adoptable, not ready or
+//!                                         unchecked; unless --give-up-live-copy; a tail
+//!                                         whose adoption was refused needs no flag), or
+//!                                         the intact rule not holding the partition.
+//!                                         Under `--nodes`, only an admin app may run it
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
