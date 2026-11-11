@@ -509,6 +509,29 @@ fn s5d_40_no_answer_from_the_owner_is_unconfirmed_and_says_to_call_again() {
     assert!(!explained.contains("send the same request"), "{explained}");
 }
 
+/// The `q` quantile of `sorted`, in ms, for row 42's report. A run where every tick failed has
+/// no latency to report: `n/a`, and the report still prints the rest.
+fn percentile(sorted: &[f64], q: f64) -> String {
+    sorted.len().checked_sub(1).map_or_else(
+        || "n/a".to_owned(),
+        |last| format!("{:.1}ms", sorted[(last as f64 * q) as usize]),
+    )
+}
+
+/// Row 42's report helper, forced empty: no measurement gives `n/a` at every quantile, not a
+/// panic on an empty slice. Cut: index `sorted[0]` unconditionally, and this panics.
+/// Unit (<1 ms).
+#[config_log::retcd_test]
+fn s5d_42_percentile_of_no_measurement_is_n_a() {
+    for q in [0.0, 0.50, 0.99, 1.0] {
+        assert_eq!(percentile(&[], q), "n/a", "q={q}");
+    }
+    let sorted = [1.0, 2.0, 3.0, 4.0, 5.0];
+    assert_eq!(percentile(&sorted, 0.0), "1.0ms");
+    assert_eq!(percentile(&sorted, 0.50), "3.0ms");
+    assert_eq!(percentile(&sorted, 1.0), "5.0ms");
+}
+
 /// Row 42's measurement. Not a pass/fail on this host: the 250 ms target is on a dedicated SSD.
 /// Run alone with `--ignored --nocapture`. 256 partitions, each with a copy on all three nodes, so
 /// 256 on every node's disk (design 5.6, "one sync covers every partition on the node"). Each has
@@ -604,13 +627,7 @@ fn s5d_42_barrier_latency_at_256_partitions_per_node() {
         *kinds.entry(kind.as_str()).or_insert(0_u32) += 1;
     }
     println!("s5d_42 failed_ticks={} {kinds:?}", failed.len());
-    // A run where every tick failed has no latency to report; it still prints the rest.
-    let at = |q: f64| {
-        millis.len().checked_sub(1).map_or_else(
-            || "n/a".to_owned(),
-            |last| format!("{:.1}ms", millis[(last as f64 * q) as usize]),
-        )
-    };
+    let at = |q: f64| percentile(&millis, q);
     let over = |limit: f64| millis.iter().filter(|m| **m > limit).count();
     let per_node: Vec<f64> = (1..=3)
         .map(|n| {
