@@ -7294,12 +7294,15 @@ fn u2_m2_1_a_divergent_record_below_the_cutoff_is_caught_at_the_cutoff() {
     );
 }
 
-/// critic-s15 M2 (3): a superseded plan. Run 2 kept a plan with cutoff 3 under the same
-/// credential run 1 used for cutoff 4; run 1's source retransmits record 4. It is above the
+/// critic-s15 M2 (3): a superseded plan. Run 1 kept a plan with cutoff 4; run 2 keeps one with
+/// cutoff 3 under the same credential; run 1's source retransmits record 4. It is above the
 /// kept plan's cutoff, so `StaleGeneration`, and nothing is quarantined.
+/// Cut: `keep_recovery_plan` keeping the earlier plan's cutoff (PR #110 review), red (record 4
+/// is at that cutoff and accepted).
 #[retcd_test]
 fn u2_m2_3_a_retransmit_above_a_superseding_plans_cutoff_is_stale_not_proof() {
-    let mut module = target_holding(plan_to(3, d(3)));
+    let mut module = target_holding(plan_to(4, d(4)));
+    module.keep_recovery_plan(B, P, plan_to(3, d(3)));
     let (batch, _, _) = staged_batch(&older_from_c(&mut module, &chain(3)[2]));
     step(&mut module, &committed(batch.0, 3));
     let effects = older_from_c(&mut module, &chain(4)[3]);
