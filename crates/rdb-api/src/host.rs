@@ -9210,16 +9210,18 @@ impl Host {
             // Lead ruling R8: the refusal says what is true of the tail's state.
             let restorable = live.iter().find(|(_, _, adoption)| adoption.could_return());
             if let Some((node, head, adoption)) = restorable.filter(|_| !give_up_live_copy) {
+                // An Unchecked holder may be one only the ledger names, possibly down, so its
+                // refusal says it holds the seqs, not that a live copy does.
                 let state = if matches!(adoption, TailAdoption::Unchecked) {
                     "; it has not been checked whether that copy can bring them back"
                 } else {
-                    " and can bring them back; no operator action is needed"
+                    " on a live copy and can bring them back; no operator action is needed"
                 };
                 return refuse(
                     InvalidArgument,
                     format!(
-                        "node {} holds seqs {} to {} of partition {} on a live copy{state}. To \
-                         give them up anyway, for good, add --give-up-live-copy",
+                        "node {} holds seqs {} to {} of partition {}{state}. To give them up \
+                         anyway, for good, add --give-up-live-copy",
                         node.0,
                         cutoff.0 + 1,
                         head.0,
@@ -9881,10 +9883,12 @@ impl Host {
     /// receiver it already holds is kept only at the linked head or while quarantined, and is
     /// replaced at the link otherwise (check A, issue #105 unit 1).
     ///
-    /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. In a
-    /// commit that takes writes it also drops any live receiver it holds (check A), so it walks
-    /// up from seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the
-    /// receiver stays, as the held tail does. A copy refused past the cutoff whose tail is
+    /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. A copy
+    /// refused `not_a_member` or `held_at_or_above_generation` is refused before any receiver
+    /// handling and keeps whatever receiver it holds. For the refusals after those, in a commit
+    /// that takes writes it also drops any live receiver it holds (check A), so it walks up from
+    /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
+    /// stays, as the held tail does. A copy refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
     /// writes: the drop duty leaves it out, and once it restarts it is re-added as a shadow and
     /// walked up from the root (#59,
@@ -10003,7 +10007,9 @@ impl Host {
                     .member(copy)
                     .is_some_and(|member| member.role == ReplicaRole::Primary)
                 {
-                    // The pin's primary holds no receiver: it appends. Linked, nothing to send
+                    // The pin's primary appends rather than receives. It holds no live receiver,
+                    // though a primary promoted from a secondary may still hold that side's
+                    // retired one (D10, A-R398; see `Self::restore_receiver`). Linked, nothing to send
                     // (#59 item 5: before, `AppendReceiver::new` refused it, logged as an error).
                     tracing::info!(
                         node,
