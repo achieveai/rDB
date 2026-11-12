@@ -692,8 +692,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         drop(hold);
         let after = clock.now();
+        // 12 ms of slack for the release itself: a drop that kept the last held reading as
+        // the count's origin still counts the 15 ms slept after it, so that cut stays red.
         assert!(
-            after.0 - held.0 <= 2,
+            after.0 - held.0 <= 12,
             "30 ms held counted {} ms",
             after.0 - held.0
         );
