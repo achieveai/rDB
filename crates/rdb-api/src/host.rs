@@ -9090,7 +9090,8 @@ impl Host {
     /// - `--through H` at or below the committed cutoff, or with no held tail to give up;
     /// - `--through H` while a live copy reports a tail above the cutoff that could come back
     ///   ([`TailAdoption::could_return`]: adoptable, not ready yet, or unchecked), unless
-    ///   `give_up_live_copy`. A tail whose adoption proof failed needs no flag;
+    ///   `give_up_live_copy`. A tail whose adoption proof failed needs no flag. A holder the
+    ///   committed ledger marks that no probe has reported on yet counts as unchecked;
     /// - `--no-intact-copy` when the intact rule did not cap this owner's last commit;
     /// - while another re-plan runs.
     fn forget_tail_asked(
@@ -9169,6 +9170,15 @@ impl Host {
             )
             .filter(|(_, head, _)| *head > cutoff)
             .collect();
+        // PR #110 review blocker 1: a holder the committed ledger marks, that no probe has
+        // reported on yet (a partial Replay failed, and repair's first probe has not run), is
+        // `Unchecked`. Counting only the status cache would give its tail up unasked. A probe's
+        // answer, `Refused` included, stands over the ledger's mark.
+        for held in &committed.ledger.held {
+            if held.head > cutoff && !live.iter().any(|(node, _, _)| *node == held.node) {
+                live.push((held.node, held.head, TailAdoption::Unchecked));
+            }
+        }
         live.sort_unstable_by_key(|(node, head, _)| (*node, *head));
         live.dedup_by_key(|(node, head, _)| (*node, *head));
         let mut given_up = Vec::new();
@@ -12274,6 +12284,8 @@ impl Host {
     ///   unreadable, or L unknown, is not usable.
     /// * Not set aside: a released run (section 13) sealed the tail's lineage under a `Copied`
     ///   child based below the head. The operator gave that tail up.
+    /// * In the Replay shape (below), a gap over [`ADOPT_REPLAY_MAX`] is `tail_too_long`, decided
+    ///   before P1 and P2 so that a tail the limit refuses is never walked.
     /// * P1: the digest at the anchor's base on the tail's chain is the anchor's.
     /// * P2: every record from the base through the head reads, verifies, and chains from that
     ///   digest ([`Self::chain`]).
@@ -12317,6 +12329,19 @@ impl Host {
             }
         }
         let base = anchor.base_seq;
+        let to = anchor.lineage.generation;
+        // PR #110 review blocker 2: a Replay gap over the limit is refused before P1 and P2, so
+        // the node thread never walks a tail it would refuse anyway. Only the Replay shape: a
+        // linked, settled lineage at the anchor's generation, replaying from at or above the base.
+        if self.engine.generations(partition).contains(&to)
+            && self.engine.staging(partition, to).is_none()
+            && self.engine.link(partition, to).is_some()
+        {
+            let from = Seq(self.engine.buffered_applied(partition, to).0);
+            if from >= base && from < hit.head && hit.head.0 - from.0 > ADOPT_REPLAY_MAX {
+                return Err("tail_too_long");
+            }
+        }
         let at_base = if base == Seq::ZERO {
             Digest::ROOT
         } else {
@@ -12328,7 +12353,6 @@ impl Host {
             return Err("base_digest_differs");
         }
         self.chain(partition, hit.from, base, anchor.base_digest, hit.head)?;
-        let to = anchor.lineage.generation;
         // G4 (same anchor): a lineage at the anchor's generation staging a copy of the whole
         // tail is this adoption's own flatten, crashed part way; the same link resumes it.
         if !self.engine.generations(partition).contains(&to)
@@ -12346,9 +12370,6 @@ impl Host {
         }
         if from >= hit.head {
             return Err("anchor_lineage_differs");
-        }
-        if hit.head.0 - from.0 > ADOPT_REPLAY_MAX {
-            return Err("tail_too_long");
         }
         let at_head = if from == Seq::ZERO {
             Digest::ROOT

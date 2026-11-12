@@ -2503,6 +2503,87 @@ fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
     assert_eq!(logged!(METHOD, "forget_tail_planned").len(), 1);
 }
 
+/// PR #110 review blocker 1: a tail the committed ledger marks on a member, before any repair
+/// probe has reported on it, is `Unchecked`, so a bare `--through` over it is refused naming
+/// that member. A partial Replay that failed leaves exactly this: the ledger names the holder,
+/// and the status cache is empty until repair's first probe. Once a probe reports the tail
+/// `Refused` (a failed proof), the probe's word stands and the same bare ask is accepted.
+/// Cut: `forget_tail_asked` reads only the status cache, red (the bare ask is accepted).
+#[config_log::retcd_test]
+fn pr110_forget_tail_counts_a_ledger_held_tail_no_probe_has_checked_as_unchecked() {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::recovery::HeldTail;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (before, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let through = || TailRelease {
+        through: Some(Seq(cutoff.0 + 5)),
+        no_intact_copy: false,
+    };
+    let owner = &mut trio.nodes[0].0;
+    assert!(
+        owner.tail_holds.get(&p).is_none_or(Vec::is_empty) && !owner.tail_refused.contains_key(&p),
+        "control: no probe has reported a tail"
+    );
+    owner
+        .committed
+        .get_mut(&p)
+        .expect("committed")
+        .ledger
+        .held
+        .push(HeldTail {
+            node: NodeId(3),
+            head: Seq(cutoff.0 + 3),
+        });
+    let error = owner
+        .forget_tail_asked(p, through(), false)
+        .expect_err("a ledger-held tail no probe has checked needs the flag");
+    assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains(&format!(
+            "node 3 holds seqs {} to {}",
+            cutoff.0 + 1,
+            cutoff.0 + 3
+        )) && error.detail.contains("not been checked")
+            && error.detail.contains("add --give-up-live-copy"),
+        "{error:?}"
+    );
+    // A probe that found the proof failed has the last word: that tail can restore nothing.
+    owner.tail_holds.insert(
+        p,
+        vec![TailHold {
+            node: NodeId(3),
+            copy: CopyId(2),
+            refused: TailRefused {
+                generation: before,
+                head: Seq(cutoff.0 + 3),
+                base: cutoff,
+                reason: "tail_on_older_lineage",
+                adoption: TailAdoption::Refused("base_digest_differs"),
+            },
+        }],
+    );
+    owner
+        .forget_tail_asked(p, through(), false)
+        .expect("a tail a probe found Refused needs no flag");
+    owner.tail_holds.remove(&p);
+    trio.until("node 1 committed a later generation", |trio| {
+        trio.nodes[0]
+            .0
+            .committed
+            .get(&p)
+            .map(|committed| committed.new_generation)
+            .filter(|generation| *generation > before)
+    });
+}
+
 /// Issue #105 (design section 3.3, assumption A7): the tail scan over 512 partitions, as a
 /// whole-node recovery runs it. 256 healthy copies (generation 2 linked at generation 1's
 /// head) read no record; 256 with a two-record tail on generation 1 read one each and are hits.
@@ -3291,6 +3372,77 @@ fn u2_r7_4_after_a_replay_the_next_anchor_links_onto_the_replayed_lineage() {
         adoptions(METHOD),
         [(3, 4, "replay".to_owned()), (4, 5, "link".to_owned())],
         "the next anchor links onto the replayed lineage"
+    );
+}
+
+/// PR #110 review blocker 2: a Replay gap over [`ADOPT_REPLAY_MAX`] is refused before the
+/// chain walk. R7-4's shape, with the tail on generation 3 running 1,026 records past the base
+/// (head 1,028), and its chain broken at seq 10 (that record names a `prev_digest` no record
+/// has). The walk from base to head would stop at seq 10 with `tail_not_contiguous`; refused
+/// first, the answer is `tail_too_long`, so no walk ran. A hit within the limit over the same
+/// break (head 20) still walks and answers `tail_not_contiguous`: Replay keeps its chain check.
+/// Cut: the gap check after the walk, as before, red (`tail_not_contiguous` for head 1,028).
+#[test]
+fn pr110_an_oversized_replay_is_refused_before_the_chain_walk() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let p = PartitionId(1);
+    let below = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let below = write_chain(&mut engine, Generation(1), 2);
+        for seq in 1..=2 {
+            let (record, _) = engine
+                .history_at(p, Generation(1), Seq(seq))
+                .expect("read")
+                .expect("a record");
+            let envelope = ReplicationEnvelope::decode(&record).expect("decode");
+            engine
+                .commit(record_batch(
+                    BatchId(seq),
+                    p,
+                    Generation(2),
+                    &envelope,
+                    record,
+                ))
+                .expect("the same record in generation 2");
+        }
+        engine
+            .inherit(p, Generation(1), Generation(3), Seq(2))
+            .expect("the tail's lineage");
+        let mut tail = write_chain_after(&mut engine, Generation(3), below.clone(), 7);
+        *tail.last_mut().expect("seq 9") = Digest([9; 32]);
+        let tail = write_chain_after(&mut engine, Generation(3), tail, 1);
+        let tail = write_chain_after(&mut engine, Generation(3), tail, 1_018);
+        assert_eq!(tail.len(), 1_028, "head 1,028");
+        engine
+            .inherit(p, Generation(2), Generation(4), Seq(2))
+            .expect("the anchor's lineage");
+        below
+    };
+    let rt = current_thread();
+    let host = host_over(&path, &rt);
+    assert_eq!(
+        host.engine.buffered_applied(p, Generation(4)).0,
+        2,
+        "control: the anchor lineage replays from the base"
+    );
+    let hit = |head: u64| TailHit {
+        from: Generation(3),
+        head: Seq(head),
+        stamp: Some(Generation(3)),
+        digest: None,
+        reason: "missed_generation_held_past_base",
+    };
+    let l = Some(Generation(3));
+    assert_eq!(
+        host.adoption(p, anchor_at(4, 2, below[1]), l, hit(1_028)),
+        Err("tail_too_long"),
+        "refused before the walk reaches the break"
+    );
+    assert_eq!(
+        host.adoption(p, anchor_at(4, 2, below[1]), l, hit(20)),
+        Err("tail_not_contiguous"),
+        "a gap within the limit still walks the chain"
     );
 }
 
