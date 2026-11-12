@@ -800,7 +800,7 @@ A holder adopts the tail inside its inventory answer. It then reports as an ordi
 
 After any of them, a receiver held on that copy is dropped. A catch-up it then sources rebuilds a full ladder from the engine. The copy logs `tail_adopted` with `from`, `to`, `head`, `stamp` and `how` (`link`, `flatten` for a link that became a full copy, `resume` or `replay`).
 
-**What an adopted tail can hold.** A record cannot show whether its client got a reply (§8.1). So an adopted tail may hold a write whose client saw an error or no answer. That write becomes visible. A resend with the same identity is deduplicated while it falls inside the dedup retention window (24 h by default, `DbConfig::dedup_retention`): the dedup row travels with the record, and adoption does not restart the window (§8.5.10). A resend after the window is applied again.
+**What an adopted tail can hold.** A record cannot show whether its client got a reply (§8.1). So an adopted tail may hold a write whose client saw an error or no answer. That write becomes visible. A resend with the same identity is deduplicated while it falls inside the dedup retention window (24 h by default, `DbConfig::dedup_retention`): the dedup row travels with the record, and adoption does not restart the window (§8.5.10). Past the window, a resend with the same identity is admitted as a new request and may apply again (§5.3).
 
 #### 8.5.5 The intact rule
 
