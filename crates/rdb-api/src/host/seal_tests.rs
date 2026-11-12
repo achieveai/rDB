@@ -303,9 +303,9 @@ fn s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok() {
     });
 
     // The precondition is a deadline on the counted clock: node 1 admits only until its grant
-    // runs out, about 570 ms after node 3's inventory (567 to 574 ms in 22 runs, PR #104 it10).
-    // Held, the clock reads one tick until node 1 has taken the call, so the admission checked
-    // here is A1's verdict at the barrier, however long the thread stalls in between.
+    // runs out, which the `grant_left_ms` line below reports. Held, the clock reads one tick
+    // until node 1 has taken the call, so the admission checked here is A1's verdict at the
+    // barrier, however long the thread stalls in between.
     let hold = trio.clock.hold();
     assert_eq!(
         trio.status(0).admits,
