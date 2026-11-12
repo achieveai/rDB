@@ -562,6 +562,9 @@ impl Default for Opened {
 /// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299).
 const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
 
+/// How long past a barrier's own timeout a `Db` waits for the owner to say so (#90).
+const BARRIER_ANSWER_MARGIN: Duration = Duration::from_secs(1);
+
 /// Where a `Db` sends its calls (ruling A-R226 h2): the owner `partitions/1` names, and, for a
 /// `Db` that can look again, the store and runtime it reads the record with.
 struct Route {
@@ -2704,6 +2707,82 @@ impl Db {
         self.finished(identity.request, answer)
     }
 
+    /// Wait until every regular copy of `group`'s partition holds `written` on disk: a
+    /// generation and seq from [`PutOk::generation`] and [`PutOk::seq`]. Every copy is asked to
+    /// sync, so this does not wait for the background flush. It writes nothing and does not
+    /// hold up any write.
+    ///
+    /// `Ok` proves every record in the current history at or below the position. It says
+    /// nothing about a record a recovery cut. After `GENERATION_CHANGED`, read back. A caller
+    /// that must know a set of keys is durable finishes a pass only when each key's
+    /// [`ReadOk::generation`], each rewrite's [`PutOk::generation`] and the marker's
+    /// [`PutOk::generation`] are equal and the barrier on the marker answers `Ok`. A read
+    /// reports the generation its node adopted. On any mismatch, or any `Err` from the barrier,
+    /// the pass starts again; how many passes that takes is not fixed. The comparison is not a
+    /// fence. Reject a read with [`ReadOk::recovery_mode`] true.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` always has `no_mutation` false. It says nothing about the write: settle the
+    /// write from the write's own answer. There is nothing to resend. Its next step says to call
+    /// this again, except where it keeps a step of its own: `INVALID_ARGUMENT` and a host fault,
+    /// and a refusal whose message already ends with a prerequisite step, such as opening the
+    /// folder again or rebuilding a quarantined node, including the step this `Db` adds while
+    /// the owner's recovery is stuck for this open. Do that step first.
+    ///
+    /// `DURABILITY_UNCONFIRMED` at `timeout` when the owner answers it, in one of two cases. A
+    /// regular copy has not proved the position: the message names the copies still owed. A
+    /// copy whose fsync failed is named only as owed: the cause is in that copy's log. Or every
+    /// regular copy proved it, but the owner's grant stopped admitting before it could answer
+    /// `Ok`: the message says so, names no copy, and warns that a newer owner may have replaced
+    /// it, so read back. When the owner does not answer by `timeout` plus a second, this side
+    /// reports `DURABILITY_UNCONFIRMED` itself, "no barrier answer from the owner", and cannot
+    /// name the copies.
+    /// `GENERATION_CHANGED` at once when `written` is not the partition's current generation.
+    /// While this waits, a new generation ends it as soon as the owner learns of it: at once when
+    /// the owner is a member of the new generation and hears it land, or when it recovers it
+    /// itself. A promote that drops the owner tells it nothing; the owner, fenced, learns from
+    /// rEtcd's partition record (A-R399), which needs a link to rEtcd. An owner cut off from rEtcd
+    /// cannot learn it, gives no `Ok` once its grant stops admitting, and ends at the timeout.
+    /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now. On
+    /// either, this `Db` tries to re-read the owner from rEtcd, best effort: at most once per
+    /// partition every 250 ms and within the read timeout. A re-read inside that gap is skipped,
+    /// one can fail or time out, and a `Db` whose route is fixed (one running every node itself)
+    /// never re-reads. The route changes only after a re-read that succeeds, so only then does a
+    /// retry go to the new owner; until then it reaches the same node. `RECOVERY_READ_ONLY`
+    /// from the node asked. `OVERLOADED` when the node holds too many barriers.
+    /// `INVALID_ARGUMENT` when `written` is above what the primary has applied.
+    pub fn wait_durable(
+        &self,
+        group: AffinityId,
+        written: (Generation, Seq),
+        timeout: Duration,
+    ) -> Result<(), ApiError> {
+        let (generation, through) = written;
+        let call = ClientCall::WaitDurable {
+            generation,
+            through,
+            remaining_millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        };
+        let wait = timeout.saturating_add(BARRIER_ANSWER_MARGIN);
+        let answered = match self.call(self.partition_for(group), call, wait) {
+            Some(Answer::Durable) => Ok(()),
+            Some(Answer::Error { error, .. }) => Err(self.explained(error)),
+            Some(other) => Err(ApiError::host(&format!(
+                "a barrier was answered with {other:?}"
+            ))),
+            // The owner never answered: this side cannot know which copies are owed.
+            None => Err(ApiError::new(
+                ErrorKind::DurabilityUnconfirmed,
+                format!(
+                    "no barrier answer from the owner in {wait:?}, so which copies are owed is \
+                     not known here"
+                ),
+            )),
+        };
+        answered.map_err(ApiError::for_barrier)
+    }
+
     /// [`Self::put`] under the app's request id `request`, which this client may have used
     /// already. A fresh compile, so a changed payload under a used id meets the dedup rules
     /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
@@ -3402,17 +3481,57 @@ impl Db {
 
     /// Each node's state for partition 1, in node order. A node that does not answer within
     /// the read timeout is left out.
+    ///
+    /// Only the nodes this process runs are asked. An app-only `Db` runs none, so this is always
+    /// empty there: an empty list does not mean the database has no nodes.
     #[must_use]
     pub fn node_status(&self) -> Vec<NodeStatus> {
+        let statuses = self.statuses_of(PARTITION);
+        if statuses
+            .iter()
+            .any(|status| status.node == OWNER && status.admits == Some(true))
+        {
+            self.ready_seen.store(true, Ordering::Relaxed);
+        }
+        statuses
+    }
+
+    /// Each node's state for `partition`, as [`Self::node_status`] answers for partition 1: in
+    /// node order, with a node that does not answer within the read timeout left out.
+    /// [`NodeStatus::committed_without`] is per partition, and this is how to read it on any
+    /// partition but the first.
+    ///
+    /// Only the nodes this process runs are asked, as for [`Self::node_status`]. An app-only `Db`
+    /// runs none, so this is `Ok` and empty there for every partition it has: an empty list
+    /// says nothing about the partition's nodes or its note.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for a partition this `Db` does not have, as
+    /// [`Self::promote_partition`] refuses one. An empty list never means no such partition.
+    pub fn node_status_in(&self, partition: PartitionId) -> Result<Vec<NodeStatus>, ApiError> {
+        if self.owner_of(partition).is_none() {
+            return Err(ApiError::invalid(format!(
+                "partition {} is not one of this database's {} partitions",
+                partition.0,
+                self.route.partitions()
+            )));
+        }
+        // Partition 1 keeps `ready_seen`. That latch says node 1 has admitted on partition 1, for
+        // `Self::ready`: another partition's `admits` says nothing about it.
+        if partition == PARTITION {
+            return Ok(self.node_status());
+        }
+        Ok(self.statuses_of(partition))
+    }
+
+    fn statuses_of(&self, partition: PartitionId) -> Vec<NodeStatus> {
         let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
         nodes
             .into_iter()
             .filter_map(|node| {
-                let mut status = self.inspect(node)?;
+                let mut status = self.look_in(partition, node).ok()?;
                 status.reload_pending = self.control.reload_pending(status.node);
-                if status.node == OWNER && status.admits == Some(true) {
-                    self.ready_seen.store(true, Ordering::Relaxed);
-                }
                 Some(status)
             })
             .collect()
@@ -4876,7 +4995,8 @@ fn carries(call: &ClientCall) -> Carries {
         ClientCall::Compile { .. }
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
-        | ClientCall::GetPrevious { .. } => Carries::Nothing,
+        | ClientCall::GetPrevious { .. }
+        | ClientCall::WaitDurable { .. } => Carries::Nothing,
     }
 }
 
@@ -5778,7 +5898,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Resend { .. }
         | ClientCall::Status { .. }
         | ClientCall::Move { .. }
-        | ClientCall::Rebuild { .. } => return None,
+        | ClientCall::Rebuild { .. }
+        | ClientCall::WaitDurable { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
@@ -5914,10 +6035,13 @@ fn wipe_crashes(folder: &Path, at: WipeCrash) -> bool {
 #[cfg(test)]
 mod clock_guard_tests;
 #[cfg(test)]
-mod reopen_tests;
+pub(crate) mod reopen_tests;
 
 #[cfg(test)]
 mod rebuild_tests;
+
+#[cfg(test)]
+mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;

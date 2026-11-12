@@ -26,6 +26,8 @@ public enum RdbErrorKind
     Unavailable = 19,
     UploadChunkConflict = 20,
     CorruptBlob = 21,
+    /// <summary>A durability barrier ended without confirming the position: a regular copy had not proved it (the message names the copies still owed), or every copy proved it but the owner's grant stopped admitting before it could confirm (the message names no copy; read back). Both cases are owner answers. A third producer is not an owner: when no owner answer arrives in time, the embedded Rust client's <c>Db::wait_durable</c> reports this code itself, and its message says which copies are owed is not known. This .NET client has no barrier call, so it never produces this code; it only reads it. Says nothing about the write.</summary>
+    DurabilityUnconfirmed = 22,
 }
 
 /// <summary>What the caller may do after an error. Numbered as on the wire.</summary>

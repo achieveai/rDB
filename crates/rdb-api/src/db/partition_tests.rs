@@ -2146,3 +2146,84 @@ fn d2_d_a_frame_that_beats_its_plan_is_put_right_by_the_barrier_retry() {
     drop((back, two, three));
     assert_digests_match(dir.path(), at);
 }
+
+/// #80, for the gateway: a note a recovery wrote on a partition other than 1 reads through
+/// `node_status_in` on that partition and on no other, and a partition this `Db` does not have is
+/// `INVALID_ARGUMENT`. An app-only `Db` over the same nodes runs none of them (PR #104 review):
+/// while node 3 holds that note, the app's `node_status_in` is `Ok` and empty on that partition
+/// and on one with no note, its `node_status` is empty, and an unknown partition is still
+/// `INVALID_ARGUMENT`. Integration (~13 s): the promote waits out the dead owner's grant.
+#[config_log::retcd_test]
+fn node_status_in_shows_a_partitions_own_note_and_refuses_an_unknown_partition() {
+    use rdb_core::contracts::recovery::NoteState;
+
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut db = ready(&rt, dir.path(), &store, Some(8));
+    let app_dir = config_testkit::fs::temp_dir();
+    let mut app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(db.links())),
+                client: ClientId(2),
+                ..config(app_dir.path(), None)
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the app opens");
+    let moved = group_in(&db, PART2);
+    db.put_in(moved, b"before", b"1", None).expect("before");
+    stop_node(&db, 2);
+    stop_node(&db, 1);
+    db.promote_partition(PART2, NodeId(3), None)
+        .unwrap_or_else(|error| panic!("nodes 1 and 2 are dead: {error}"));
+
+    let entries = |partition: PartitionId| {
+        let statuses = db.node_status_in(partition).expect("a partition it has");
+        let status = statuses
+            .iter()
+            .find(|status| status.node == NodeId(3))
+            .unwrap_or_else(|| panic!("node 3 answers: {statuses:?}"))
+            .clone();
+        match status.committed_without {
+            NoteState::Known { note, .. } => note.entries,
+            NoteState::Unknown => Vec::new(),
+        }
+    };
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(15));
+    let note = loop {
+        let note = entries(PART2);
+        if !note.is_empty() {
+            break note;
+        }
+        assert!(Instant::now() < until, "no note on partition 2");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let missing: Vec<NodeId> = note[0].copies.iter().map(|(_, node)| *node).collect();
+    assert_eq!(missing, vec![NodeId(1), NodeId(2)], "{note:?}");
+    assert_eq!(entries(PART3), Vec::new(), "partition 3 left nobody out");
+
+    let unknown = db
+        .node_status_in(PartitionId(99))
+        .expect_err("no such partition");
+    assert_eq!(unknown.kind, ErrorKind::InvalidArgument, "{unknown:?}");
+
+    // The note is there on node 3 (above); the app runs no node, so it sees none of it.
+    for partition in [PART2, PART3] {
+        let statuses = app
+            .node_status_in(partition)
+            .unwrap_or_else(|error| panic!("partition {} is known: {error}", partition.0));
+        assert_eq!(statuses, Vec::new(), "partition {}", partition.0);
+    }
+    assert_eq!(app.node_status(), Vec::new());
+    let unknown = app
+        .node_status_in(PartitionId(99))
+        .expect_err("no such partition, app-only too");
+    assert_eq!(unknown.kind, ErrorKind::InvalidArgument, "{unknown:?}");
+    app.shutdown();
+    db.shutdown();
+}

@@ -258,7 +258,7 @@ impl ControlAdapter {
                 tokio::time::sleep(after).await;
                 let key = ControlKey::Partition(partition).encode();
                 let mut attempt = 0_u32;
-                let owner = loop {
+                let found = loop {
                     let read = store
                         .get(GetRequest {
                             key: Bytes::from(key.clone()),
@@ -270,7 +270,7 @@ impl ControlAdapter {
                                 rdb_core::authority::partition::PartitionRecord::decode(
                                     &found.value,
                                 )
-                                .map(|record| record.owner)
+                                .map(|record| (record.owner, record.generation))
                             });
                         }
                         // critic-d3 A1: an error retrying cannot cure is said once, and the
@@ -302,7 +302,8 @@ impl ControlAdapter {
                     boot,
                     partition,
                     fence,
-                    owner,
+                    owner: found.map(|(owner, _)| owner),
+                    generation: found.map(|(_, generation)| generation),
                 };
                 if links.post(node, msg).is_err() {
                     tracing::debug!(node = node.0, "control_completion_unclaimed");

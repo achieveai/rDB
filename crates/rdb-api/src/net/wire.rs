@@ -197,6 +197,16 @@ pub enum WireMsg {
         asked: LineageAnchor,
         kind: KernelEvent,
     },
+    /// Appended (protocol 7, #90): a copy's proof for a barrier. Last, so no earlier kind's
+    /// encoded index moves (`net::tests::kind` pins them).
+    DurableProved {
+        to: NodeId,
+        partition: PartitionId,
+        barrier: u64,
+        copy: CopyId,
+        generation: Generation,
+        through: Seq,
+    },
 }
 
 impl WireMsg {
@@ -209,6 +219,7 @@ impl WireMsg {
             | Self::CatchUp { to, .. }
             | Self::Restore { to, .. }
             | Self::Routed { to, .. }
+            | Self::DurableProved { to, .. }
             | Self::Landed { to, .. }
             | Self::Client { to, .. }
             | Self::Inspect { to, .. }
@@ -225,6 +236,7 @@ impl WireMsg {
             Self::CatchUp { .. } => "catch_up",
             Self::Restore { .. } => "restore",
             Self::Routed { .. } => "routed",
+            Self::DurableProved { .. } => "durable_proved",
             Self::Landed { .. } => "landed",
             Self::Client { .. } => "client",
             Self::Inspect { .. } => "inspect",
@@ -332,6 +344,20 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             to,
             partition,
             seed: WireSeed::from(*seed),
+        },
+        Msg::DurableProved {
+            partition,
+            barrier,
+            copy,
+            generation,
+            through,
+        } => WireMsg::DurableProved {
+            to,
+            partition,
+            barrier,
+            copy,
+            generation,
+            through,
         },
         Msg::Routed {
             partition,
@@ -516,6 +542,23 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 seed: Box::new(seed.into()),
             },
         ),
+        WireMsg::DurableProved {
+            to,
+            partition,
+            barrier,
+            copy,
+            generation,
+            through,
+        } => Inbound::Plain(
+            to,
+            Msg::DurableProved {
+                partition,
+                barrier,
+                copy,
+                generation,
+                through,
+            },
+        ),
         WireMsg::Restore {
             to,
             partition,
@@ -650,6 +693,12 @@ pub enum WirePeerAsk {
         generation: Generation,
         post_commit: bool,
     },
+    DurableThrough {
+        copy: CopyId,
+        through: Seq,
+        generation: Generation,
+        barrier: u64,
+    },
 }
 
 impl From<PeerAsk> for WirePeerAsk {
@@ -666,6 +715,17 @@ impl From<PeerAsk> for WirePeerAsk {
                 cutoff,
                 generation,
                 post_commit,
+            },
+            PeerAsk::DurableThrough {
+                copy,
+                through,
+                generation,
+                barrier,
+            } => Self::DurableThrough {
+                copy,
+                through,
+                generation,
+                barrier,
             },
         }
     }
@@ -685,6 +745,17 @@ impl From<WirePeerAsk> for PeerAsk {
                 cutoff,
                 generation,
                 post_commit,
+            },
+            WirePeerAsk::DurableThrough {
+                copy,
+                through,
+                generation,
+                barrier,
+            } => Self::DurableThrough {
+                copy,
+                through,
+                generation,
+                barrier,
             },
         }
     }
@@ -763,12 +834,18 @@ pub enum WireCall {
         identity: RequestIdentity,
         node: NodeId,
     },
+    WaitDurable {
+        generation: Generation,
+        through: Seq,
+        remaining_millis: u64,
+    },
 }
 
 impl WireCall {
-    /// The identity the call is made under: the client and request a node logs it by.
+    /// The identity the call is made under: the client and request a node logs it by. `None`
+    /// for [`Self::WaitDurable`], which writes nothing and has no request to name (#90).
     #[must_use]
-    pub fn identity(&self) -> RequestIdentity {
+    pub fn identity(&self) -> Option<RequestIdentity> {
         match self {
             Self::Put { identity, .. }
             | Self::Compile { identity, .. }
@@ -776,8 +853,9 @@ impl WireCall {
             | Self::GetPrevious { identity, .. }
             | Self::Status { identity, .. }
             | Self::Move { identity, .. }
-            | Self::Rebuild { identity, .. } => *identity,
-            Self::Resend { request } => request.identity,
+            | Self::Rebuild { identity, .. } => Some(*identity),
+            Self::Resend { request } => Some(request.identity),
+            Self::WaitDurable { .. } => None,
         }
     }
 
@@ -793,6 +871,7 @@ impl WireCall {
             Self::Status { .. } => "status",
             Self::Move { .. } => "move",
             Self::Rebuild { .. } => "rebuild",
+            Self::WaitDurable { .. } => "wait_durable",
         }
     }
 }
@@ -861,6 +940,15 @@ impl TryFrom<&ClientCall> for WireCall {
                 identity: *identity,
                 node: *node,
             },
+            ClientCall::WaitDurable {
+                generation,
+                through,
+                remaining_millis,
+            } => Self::WaitDurable {
+                generation: *generation,
+                through: *through,
+                remaining_millis: *remaining_millis,
+            },
         })
     }
 }
@@ -917,6 +1005,15 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::WaitDurable {
+                generation,
+                through,
+                remaining_millis,
+            } => Self::WaitDurable {
+                generation,
+                through,
+                remaining_millis,
+            },
         })
     }
 }
@@ -1577,6 +1674,7 @@ pub enum WireAnswer {
     Rebuilt {
         line: String,
     },
+    Durable,
 }
 
 impl WireAnswer {
@@ -1616,6 +1714,7 @@ impl WireAnswer {
                 line: moved.line.clone(),
             },
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
+            Answer::Durable => Self::Durable,
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),
@@ -1653,6 +1752,7 @@ impl WireAnswer {
             Self::Status(status) => Answer::Status(status),
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
             Self::Rebuilt { line } => Answer::Rebuilt(line),
+            Self::Durable => Answer::Durable,
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
                 request,

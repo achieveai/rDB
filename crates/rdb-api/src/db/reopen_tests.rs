@@ -12,7 +12,7 @@ use super::tests::stored_root;
 use super::tests::{digest_at, owner_status, owner_when, put_through_pauses};
 use super::*;
 
-pub(super) fn config(dir: &Path) -> DbConfig {
+pub(crate) fn config(dir: &Path) -> DbConfig {
     DbConfig {
         partitions: None,
         ack_floor: true,
@@ -29,7 +29,7 @@ pub(super) fn config(dir: &Path) -> DbConfig {
     }
 }
 
-pub(super) fn runtime() -> tokio::runtime::Runtime {
+pub(crate) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -44,7 +44,7 @@ pub(super) fn runtime() -> tokio::runtime::Runtime {
 /// is, so the window is the spec's 2 s times `deadline_scale()`. Unscaled, one 3.2 s mail step
 /// on node 2 under gate load closed it and a reopen went `Blocked` (k435). The product default
 /// stays the spec's.
-pub(super) fn fast() -> Budgets {
+pub(crate) fn fast() -> Budgets {
     Budgets {
         discovery_window_millis: Budgets::SPEC_DEFAULTS.discovery_window_millis
             * u64::from(config_testkit::poll::deadline_scale()),

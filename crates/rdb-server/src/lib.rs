@@ -117,7 +117,8 @@ pub const fn code_for(kind: ErrorKind) -> Code {
         | ErrorKind::LeaseExpired
         | ErrorKind::ProtectionPaused
         | ErrorKind::RecoveryReadOnly
-        | ErrorKind::Unavailable => Code::Unavailable,
+        | ErrorKind::Unavailable
+        | ErrorKind::DurabilityUnconfirmed => Code::Unavailable,
         ErrorKind::DeadlineBeforeAdmission => Code::DeadlineExceeded,
         ErrorKind::CorruptHistory
         | ErrorKind::CorruptBlob
@@ -152,6 +153,7 @@ pub const fn wire_kind(kind: ErrorKind) -> pb::ErrorKind {
         ErrorKind::Unavailable => W::Unavailable,
         ErrorKind::UploadChunkConflict => W::UploadChunkConflict,
         ErrorKind::CorruptBlob => W::CorruptBlob,
+        ErrorKind::DurabilityUnconfirmed => W::DurabilityUnconfirmed,
     }
 }
 
@@ -284,6 +286,9 @@ pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> 
         }
         ErrorKind::UploadChunkConflict => "start the upload again under a new upload id",
         ErrorKind::CorruptBlob => "write the blob again",
+        ErrorKind::DurabilityUnconfirmed => {
+            "the barrier wrote nothing and says nothing about the write: wait for it again"
+        }
     }
 }
 

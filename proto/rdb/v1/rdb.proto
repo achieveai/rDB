@@ -144,6 +144,7 @@ enum ErrorKind {
   UNAVAILABLE = 19;
   UPLOAD_CHUNK_CONFLICT = 20;
   CORRUPT_BLOB = 21;
+  DURABILITY_UNCONFIRMED = 22;
 }
 
 // What the caller may do, one per `rdb_api::RetryRule`.

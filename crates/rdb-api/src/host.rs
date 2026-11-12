@@ -104,6 +104,13 @@ pub const BOOT: BootId = BootId(1);
 /// and L1 never resumes (L-R177gf; s0-probe, control D).
 pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 
+/// #90: how often a primary looks for copies a barrier can now ask.
+const BARRIER_DUTY_MILLIS: u64 = 5;
+
+/// #90: the most barriers one node holds at once: 256 partitions at a 5 s timeout hold 1280. A
+/// bound, so a stalled disk cannot grow the table without limit.
+pub(crate) const MAX_BARRIERS: usize = 4096;
+
 /// The trim duty's period, in milliseconds: how often the host looks for published writes
 /// older than [`Budgets::dedup_retention_millis`] and lets T1 and P1 drop their retained
 /// answers (achieveai/rDB#34).
@@ -426,6 +433,9 @@ pub enum Msg {
         fence: u64,
         /// The owner the record names.
         owner: Option<NodeId>,
+        /// The generation the record names, with `owner`. #90 (PR #104 review): a newer one ends
+        /// this node's barriers below it.
+        generation: Option<Generation>,
     },
     /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
     /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
@@ -525,6 +535,23 @@ pub enum Msg {
         correlation: CorrelationId,
         /// The event.
         kind: KernelEvent,
+    },
+    /// #90: `copy` holds `through` of `generation` on disk, for the asker's barrier `barrier`.
+    /// Credited only if `generation` and `through` still match it: the barrier table restarts
+    /// with the process and a link queue can deliver an old frame after that, so the id alone
+    /// proves nothing.
+    DurableProved {
+        /// The partition the barrier is on: a barrier id and a generation are per host and per
+        /// partition, so a queued frame could otherwise match another partition's barrier.
+        partition: PartitionId,
+        /// The asker's barrier.
+        barrier: u64,
+        /// The copy that synced.
+        copy: CopyId,
+        /// The lineage it synced in.
+        generation: Generation,
+        /// How far.
+        through: Seq,
     },
     /// A copy's answer to an inventory ask, stamped with the anchor it was asked about. The
     /// asker drops it when that is not its current plan's anchor: a late answer to an older
@@ -672,6 +699,18 @@ pub enum PeerAsk {
         /// landed the generation waits for the landing before it answers (D7).
         post_commit: bool,
     },
+    /// #90: prove this copy's WAL is synced through `through` in `generation`, for barrier
+    /// `barrier` on the asker. Answered with [`Msg::DurableProved`], or not at all.
+    DurableThrough {
+        /// The copy.
+        copy: CopyId,
+        /// Through this sequence.
+        through: Seq,
+        /// In this lineage.
+        generation: Generation,
+        /// The asker's barrier.
+        barrier: u64,
+    },
 }
 
 /// What a node restores its dormant R1 receiver from (lead ruling A-R173): the asking F1's
@@ -801,6 +840,17 @@ pub enum ClientCall {
         identity: RequestIdentity,
         /// The node to take back.
         node: NodeId,
+    },
+    /// #90: answer [`Answer::Durable`] once every regular copy pinned now has proved its WAL
+    /// synced through `through` in `generation`. Carries no identity, so it never queues behind
+    /// a call and never blocks a write.
+    WaitDurable {
+        /// The generation of the write.
+        generation: Generation,
+        /// The write's position.
+        through: Seq,
+        /// How long the barrier may wait.
+        remaining_millis: u64,
     },
 }
 
@@ -1027,6 +1077,8 @@ pub enum Answer {
     Moved(MoveAnswer),
     /// A [`ClientCall::Rebuild`] was taken: the operator's line.
     Rebuilt(String),
+    /// A [`ClientCall::WaitDurable`] was proved on every regular copy.
+    Durable,
     /// The call failed.
     Error {
         /// Why.
@@ -1646,6 +1698,81 @@ const fn slow_sync_pause(_path: &std::path::Path) -> Option<Duration> {
     None
 }
 
+/// The WAL lengths recorded just before each fsync, by watched node directory (row 44 of #80
+/// S5d). Each file keeps its last recorded length.
+#[cfg(test)]
+static WAL_LENGTHS: Mutex<Vec<(PathBuf, BTreeMap<PathBuf, u64>)>> = Mutex::new(Vec::new());
+
+/// Start recording the WAL lengths of the host on `node_dir`. The lengths now are the first
+/// record, so a run in which no fsync follows cuts back to this moment, not to nothing.
+#[cfg(test)]
+pub(crate) fn watch_wal_lengths(node_dir: &std::path::Path) {
+    let mut lengths = BTreeMap::new();
+    read_wal_lengths(node_dir, &mut lengths);
+    WAL_LENGTHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), lengths));
+}
+
+/// Stop recording for `node_dir`, and what was recorded: each WAL file's last pre-fsync length.
+#[cfg(test)]
+pub(crate) fn watched_wal_lengths(node_dir: &std::path::Path) -> BTreeMap<PathBuf, u64> {
+    let mut watched = WAL_LENGTHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = watched
+        .iter()
+        .position(|(dir, _)| dir == node_dir)
+        .expect("this directory was watched");
+    watched.remove(at).1
+}
+
+/// WAL syncs run per node, for row 42's report.
+#[cfg(test)]
+static WAL_SYNCS: Mutex<BTreeMap<NodeId, u64>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn count_wal_sync(node: NodeId) {
+    *WAL_SYNCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(node)
+        .or_default() += 1;
+}
+
+/// WAL syncs run on `node` so far, across this process.
+#[cfg(test)]
+pub(crate) fn wal_sync_count(node: NodeId) -> u64 {
+    WAL_SYNCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&node)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_wal_lengths(path: &std::path::Path) {
+    let mut watched = WAL_LENGTHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, lengths)) = watched.iter_mut().find(|(dir, _)| path.starts_with(dir)) {
+        read_wal_lengths(path, lengths);
+    }
+}
+
+#[cfg(test)]
+fn read_wal_lengths(path: &std::path::Path, lengths: &mut BTreeMap<PathBuf, u64>) {
+    for entry in std::fs::read_dir(path).expect("the engine directory") {
+        let entry = entry.expect("a directory entry");
+        if entry.path().extension().is_some_and(|ext| ext == "log") {
+            let length = entry.metadata().expect("the WAL's metadata").len();
+            lengths.insert(entry.path(), length);
+        }
+    }
+}
+
 /// Run one WAL sync's fsync on this thread, after any [`SLOW_SYNC`] sleep: `(result, millis)`.
 fn run_wal_sync(
     node: NodeId,
@@ -1658,6 +1785,10 @@ fn run_wal_sync(
         tracing::info!(node = node.0, millis, "test_sync_slowed");
         std::thread::sleep(pause);
     }
+    #[cfg(test)]
+    record_wal_lengths(path);
+    #[cfg(test)]
+    count_wal_sync(node);
     let flushed = sync.flush();
     (flushed, millis(started))
 }
@@ -1770,6 +1901,42 @@ enum Reply {
     },
     /// This node's own F1 (D10's own asks).
     Here(Site),
+    /// #90: a barrier's asker, which takes [`Msg::DurableProved`] and not a kernel event.
+    Barrier { asker: NodeId, proof: BarrierProof },
+}
+
+/// #90: what one copy proves to one barrier.
+#[derive(Debug, Clone, Copy)]
+struct BarrierProof {
+    partition: PartitionId,
+    barrier: u64,
+    copy: CopyId,
+    generation: Generation,
+    through: Seq,
+}
+
+/// #90: one [`ClientCall::WaitDurable`] in progress, on the primary.
+#[derive(Debug)]
+struct Barrier {
+    partition: PartitionId,
+    generation: Generation,
+    /// The tracker's lineage when it started: what A1 must still admit for the barrier to
+    /// answer `Ok` (PR #104 review).
+    lineage: Lineage,
+    through: Seq,
+    deadline: Tick,
+    started: Instant,
+    /// How many copies were required when it started, for the log line.
+    copies: usize,
+    /// The regular copies not yet proved, fixed when the barrier starts. Nothing removes one
+    /// but its own proof: not a dead peer, and not a majority.
+    owed: BTreeMap<CopyId, NodeId>,
+    /// The owed copies already asked. One ask, no retry: a lost one ends in the timeout.
+    asked: BTreeSet<CopyId>,
+    /// Every copy proved it while A1 did not admit: the `Ok` waits for A1 to admit again, for
+    /// a newer generation, or for the timeout. Logged once.
+    withheld: bool,
+    reply: Sender<Answer>,
 }
 
 /// A-R326: one landing's acquire, waiting in [`Host::link_pending`] for its link sync.
@@ -2139,6 +2306,12 @@ struct Host {
     /// not landed. Answered right after the landing's inherit, so the proof is of a generation
     /// this copy holds; the latest ask wins.
     deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
+    /// #90: the barriers this node's primaries are waiting on, by id.
+    barriers: BTreeMap<u64, Barrier>,
+    /// #90: the id of the next barrier.
+    next_barrier: u64,
+    /// #90: when [`Self::barrier_duty`] next runs. Only matters while `barriers` holds any.
+    next_barrier_duty: Tick,
     /// D7: each recovery catch-up this node sources, by `(partition, target copy)`: the node
     /// and correlation of the F1 that asked, where R1's `CopyCaughtUp` for that copy goes (the
     /// sim's `catch_ups`, B-R59). A newer ask for the same copy replaces it, as R1's cursor does.
@@ -2388,6 +2561,9 @@ impl Host {
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             deferred_syncs: BTreeMap::new(),
+            barriers: BTreeMap::new(),
+            next_barrier: 1,
+            next_barrier_duty: now,
             catch_ups: BTreeMap::new(),
             ladders: BTreeSet::new(),
             dormant_ladders: BTreeMap::new(),
@@ -2662,6 +2838,7 @@ impl Host {
                 .values()
                 .map(|resend| resend.next)
                 .min(),
+            (!self.barriers.is_empty()).then_some(self.next_barrier_duty),
         ]
         .into_iter()
         .flatten()
@@ -2769,6 +2946,7 @@ impl Host {
                 partition,
                 fence,
                 owner,
+                generation,
                 ..
             } => {
                 // A read begun under an earlier fence, or answering after A1 left Fenced, says
@@ -2805,10 +2983,17 @@ impl Host {
                         node = self.node.0,
                         partition = partition.0,
                         owner = owner.map(|owner| owner.0),
+                        generation = generation.map(|generation| generation.0),
                         fence,
                         "host_owner_learned"
                     );
                     self.owner_after_fence.insert(partition, owner);
+                    // #90 (PR #104 review): a promote replaced this node and told it nothing.
+                    // The record names the generation it committed, so this node's barriers
+                    // below it end now, not at their timeout.
+                    if let Some(generation) = generation {
+                        self.end_barriers_below(partition, generation);
+                    }
                 }
                 Ok(())
             }
@@ -2881,6 +3066,22 @@ impl Host {
             }
             Msg::Restore { partition, seed } => {
                 self.restore_dormant(partition, &seed, false);
+                Ok(())
+            }
+            Msg::DurableProved {
+                partition,
+                barrier,
+                copy,
+                generation,
+                through,
+            } => {
+                self.durable_proved(BarrierProof {
+                    partition,
+                    barrier,
+                    copy,
+                    generation,
+                    through,
+                });
                 Ok(())
             }
             Msg::Routed {
@@ -3210,6 +3411,13 @@ impl Host {
         for (key, (asker, _, _)) in std::mem::take(&mut self.deferred_syncs) {
             self.drop_deferred_sync(key, asker, "fault");
         }
+        for (barrier, waiting) in std::mem::take(&mut self.barriers) {
+            tracing::info!(node = self.node.0, barrier, "barrier_failed_by_fault");
+            let _ = waiting.reply.send(Answer::Error {
+                error: fault.error(),
+                request: None,
+            });
+        }
         self.queue.clear();
         self.fault = Some(fault);
     }
@@ -3260,6 +3468,13 @@ impl Host {
                 correlation: CorrelationId::default(),
             };
             self.push(site, EventKind::Timer(fired), false, None);
+        }
+        if self.next_barrier_duty <= now {
+            self.next_barrier_duty = now.plus_millis(BARRIER_DUTY_MILLIS);
+            self.barrier_duty(now);
+            if self.fault.is_some() {
+                return;
+            }
         }
         if self.next_flush <= now {
             self.next_flush = now.plus_millis(HOST_FLUSH_EVERY_MILLIS);
@@ -3737,6 +3952,435 @@ impl Host {
             self.set_fault(Fault::from(format!(
                 "the WAL sync in flight at stop failed: {fault:?}"
             )));
+        }
+    }
+
+    // ------------------------------------------------------------------ barriers (#90)
+
+    /// Start one barrier, or answer why it cannot start. Nothing here waits.
+    fn start_barrier(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        through: Seq,
+        remaining_millis: u64,
+        reply: Sender<Answer>,
+    ) {
+        match self.barrier_copies(partition, generation, through) {
+            Err(error) => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    through = through.0,
+                    kind = ?error.kind,
+                    "durable_barrier_refused"
+                );
+                // A refusal for a grant that ran out names the new owner once this node has read
+                // it, as a write's does, so `Db` re-reads the route either way.
+                let refused = Answer::Error {
+                    error,
+                    request: None,
+                };
+                let _ = reply.send(self.redirect(partition, refused));
+            }
+            Ok((owed, lineage)) => {
+                let barrier = self.next_barrier;
+                self.next_barrier += 1;
+                self.barriers.insert(
+                    barrier,
+                    Barrier {
+                        partition,
+                        generation,
+                        lineage,
+                        through,
+                        deadline: self.clock.now().plus_millis(remaining_millis),
+                        started: Instant::now(),
+                        copies: owed.len(),
+                        owed,
+                        asked: BTreeSet::new(),
+                        withheld: false,
+                        reply,
+                    },
+                );
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    through = through.0,
+                    barrier,
+                    "durable_barrier_started"
+                );
+                // Now, not at the next duty: a copy that has already applied it is asked in the
+                // step that took the call.
+                self.barrier_duty(self.clock.now());
+            }
+        }
+    }
+
+    /// The regular copies a barrier at `(generation, through)` must hear from, and the lineage it
+    /// runs under, or why it is refused. Every primary and regular secondary pinned now: not a
+    /// majority and not "live" copies, because losing the copies that were proved leaves the one
+    /// that was not.
+    fn barrier_copies(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        through: Seq,
+    ) -> Result<(BTreeMap<CopyId, NodeId>, Lineage), ApiError> {
+        let Some(primary) = self.replication.primary(self.node, partition) else {
+            let mut error = ApiError::from_kernel(&RdbError::NotPrimary {
+                partition,
+                hint: self.owner_after_fence.get(&partition).copied().flatten(),
+            });
+            error.detail = format!(
+                "node {} is not the primary of partition {}",
+                self.node.0, partition.0
+            );
+            return Err(error);
+        };
+        let tracker = primary.tracker();
+        // The tracker, not `committed`: `land` inserts `committed` with no generation check,
+        // so a late `Landed` can lower it.
+        let current = tracker.lineage().generation;
+        if generation != current {
+            return Err(barrier_generation_changed(generation, current));
+        }
+        // PR #104 review: a promote that drops this node leaves its primary tracker here, at the
+        // old generation and fenced. A1's verdict is the one a write gets, so the refusal is too:
+        // `LEASE_EXPIRED`, or `NOT_PRIMARY` naming the new owner once this node has read it
+        // (`Self::redirect`). `Db` re-reads the route on both, so a retry leaves this node.
+        let lineage = tracker.lineage();
+        if let Verdict::Deny(reason) =
+            self.authority
+                .may_admit_at(lineage, self.clock.now(), &self.budgets)
+        {
+            let mut refused = crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+            refused.detail = format!(
+                "node {} may not answer for partition {} now ({reason:?}); no barrier was started",
+                self.node.0, partition.0
+            );
+            refused.no_mutation = true;
+            return Err(refused);
+        }
+        if self.committed.get(&partition).is_some_and(|committed| {
+            // `committed` can be stale (above): only the current generation's mode counts.
+            committed.new_generation == current && committed.mode == PartitionMode::ReadOnly
+        }) {
+            return Err(ApiError::from_kernel(&RdbError::RecoveryReadOnly {
+                partition,
+                generation,
+            }));
+        }
+        if through > tracker.head() {
+            return Err(ApiError::invalid(format!(
+                "seq {} is above what partition {} has applied here ({}): no such write was \
+                 published here",
+                through.0,
+                partition.0,
+                tracker.head().0
+            )));
+        }
+        if self.barriers.len() >= MAX_BARRIERS {
+            return Err(ApiError::from_kernel(&RdbError::Overloaded { partition }));
+        }
+        let owed = tracker
+            .config()
+            .members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .map(|member| (member.copy, member.node))
+            .collect();
+        Ok((owed, lineage))
+    }
+
+    /// Ask every owed copy that has applied its barrier's position, and time out the barriers
+    /// past their deadline.
+    fn barrier_duty(&mut self, now: Tick) {
+        let mut expired = Vec::new();
+        let mut asks = Vec::new();
+        let mut proved = Vec::new();
+        for (id, barrier) in &mut self.barriers {
+            if barrier.deadline <= now {
+                expired.push(*id);
+                continue;
+            }
+            if barrier.owed.is_empty() {
+                proved.push(*id);
+                continue;
+            }
+            let Some(primary) = self.replication.primary(self.node, barrier.partition) else {
+                continue;
+            };
+            let tracker = primary.tracker();
+            if tracker.lineage().generation != barrier.generation {
+                continue;
+            }
+            for (copy, node) in &barrier.owed {
+                let applied = tracker
+                    .peer(*copy)
+                    .is_some_and(|peer| peer.progress.buffered_applied.0 >= barrier.through.0);
+                if applied && barrier.asked.insert(*copy) {
+                    let site = Site {
+                        partition: barrier.partition,
+                        correlation: CorrelationId(*id),
+                    };
+                    let ask = PeerAsk::DurableThrough {
+                        copy: *copy,
+                        through: barrier.through,
+                        generation: barrier.generation,
+                        barrier: *id,
+                    };
+                    asks.push((*node, site, ask));
+                }
+            }
+        }
+        for (node, site, ask) in asks {
+            self.ask(node, site, ask);
+        }
+        self.answer_own_asks();
+        for id in proved {
+            self.finish_barrier(id);
+        }
+        for id in expired {
+            let Some(barrier) = self.barriers.remove(&id) else {
+                continue;
+            };
+            let owed = barrier
+                .owed
+                .iter()
+                .map(|(copy, node)| format!("copy {} on node {}", copy.0, node.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                node = self.node.0,
+                partition = barrier.partition.0,
+                generation = barrier.generation.0,
+                through = barrier.through.0,
+                millis = millis(barrier.started),
+                owed = owed.as_str(),
+                "durable_barrier_unconfirmed"
+            );
+            let detail = if barrier.owed.is_empty() {
+                format!(
+                    "generation {} seq {} of partition {} not confirmed in time: every regular \
+                     copy proved it, but node {}'s grant stopped admitting before it could answer, \
+                     and a newer owner may have replaced it; read back",
+                    barrier.generation.0, barrier.through.0, barrier.partition.0, self.node.0
+                )
+            } else {
+                format!(
+                    "generation {} seq {} of partition {} not proved durable in time; still owed: \
+                     {owed}",
+                    barrier.generation.0, barrier.through.0, barrier.partition.0
+                )
+            };
+            let _ = barrier.reply.send(Answer::Error {
+                error: ApiError::new(ErrorKind::DurabilityUnconfirmed, detail),
+                request: None,
+            });
+        }
+    }
+
+    /// At a copy: prove `proof` to `asker`, or stay silent. A copy that may not answer sends
+    /// nothing, and the barrier ends in its timeout.
+    fn durable_through(&mut self, partition: PartitionId, asker: NodeId, proof: BarrierProof) {
+        if let Some(reason) = self.durable_refused(partition, proof.generation) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = proof.copy.0,
+                generation = proof.generation.0,
+                through = proof.through.0,
+                reason,
+                "durable_through_refused"
+            );
+            return;
+        }
+        if self.engine.durable(partition, proof.generation).0 >= proof.through.0 {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                through = proof.through.0,
+                "durable_through_fast"
+            );
+            self.send_proof(partition, asker, proof);
+            return;
+        }
+        let requested = self.request_sync(AfterSync::Answer {
+            reply: Reply::Barrier { asker, proof },
+            copy: proof.copy,
+            post_commit: false,
+            captured: [CapturedPrefix {
+                partition,
+                generation: proof.generation,
+                through: AppliedSeq(proof.through.0),
+            }],
+        });
+        if let Err(fault) = requested {
+            self.set_fault(fault);
+        }
+    }
+
+    /// Why this node may not speak for its copy at `generation`, or `None`. A sealed copy has
+    /// told a recovery its head; a restarted one holds no copy until a catch-up restores a
+    /// dormant receiver; neither may add to a barrier that a recovery has overtaken.
+    fn durable_refused(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<&'static str> {
+        if let Some(primary) = self.replication.primary(self.node, partition) {
+            return (primary.tracker().lineage().generation != generation)
+                .then_some("primary_at_another_generation");
+        }
+        let Some(receiver) = self.replication.receiver(self.node, partition) else {
+            return Some("no_copy");
+        };
+        if receiver.is_dormant() {
+            Some("dormant")
+        } else if receiver.retired() {
+            Some("retired")
+        } else if receiver.sealed() {
+            Some("sealed")
+        } else if receiver.lineage().generation != generation {
+            Some("receiver_at_another_generation")
+        } else {
+            None
+        }
+    }
+
+    fn send_proof(&mut self, partition: PartitionId, asker: NodeId, proof: BarrierProof) {
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = proof.copy.0,
+            generation = proof.generation.0,
+            through = proof.through.0,
+            barrier = proof.barrier,
+            "durable_through_proved"
+        );
+        if asker == self.node {
+            self.durable_proved(proof);
+            return;
+        }
+        let msg = Msg::DurableProved {
+            partition,
+            barrier: proof.barrier,
+            copy: proof.copy,
+            generation: proof.generation,
+            through: proof.through,
+        };
+        if let Err(fault) = self.links.send(self.node, asker, msg) {
+            tracing::warn!(
+                node = self.node.0,
+                asker = asker.0,
+                ?fault,
+                "durable_proof_unreachable"
+            );
+        }
+    }
+
+    /// At the primary: credit one proof, and answer the barrier when none is owed.
+    fn durable_proved(&mut self, proof: BarrierProof) {
+        let Some(barrier) = self.barriers.get_mut(&proof.barrier) else {
+            tracing::debug!(
+                node = self.node.0,
+                barrier = proof.barrier,
+                "durable_proof_for_no_barrier"
+            );
+            return;
+        };
+        if proof.partition != barrier.partition
+            || proof.generation != barrier.generation
+            || proof.through < barrier.through
+        {
+            tracing::warn!(
+                node = self.node.0,
+                barrier = proof.barrier,
+                copy = proof.copy.0,
+                generation = proof.generation.0,
+                through = proof.through.0,
+                "durable_proof_not_credited"
+            );
+            return;
+        }
+        barrier.owed.remove(&proof.copy);
+        if barrier.owed.is_empty() {
+            self.finish_barrier(proof.barrier);
+        }
+    }
+
+    /// Answer `Ok` for barrier `id`, whose every copy has proved it, only while A1 still admits
+    /// its lineage (PR #104 review). A promote commits a newer generation only after this node's
+    /// grant is proved expired (`admin::promote_looked` step 5), and from that point A1 admits
+    /// nothing here, so a genuine proof delayed past the commit cannot give `Ok`. Withheld, the
+    /// barrier waits for A1 to admit again ([`Self::barrier_duty`] retries), for a newer
+    /// generation ([`Self::end_barriers_below`]), or for its timeout.
+    fn finish_barrier(&mut self, id: u64) {
+        let Some(barrier) = self.barriers.get_mut(&id) else {
+            return;
+        };
+        if let Verdict::Deny(reason) =
+            self.authority
+                .may_admit_at(barrier.lineage, self.clock.now(), &self.budgets)
+        {
+            if !barrier.withheld {
+                barrier.withheld = true;
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = barrier.partition.0,
+                    generation = barrier.generation.0,
+                    through = barrier.through.0,
+                    barrier = id,
+                    ?reason,
+                    "durable_barrier_withheld"
+                );
+            }
+            return;
+        }
+        let Some(barrier) = self.barriers.remove(&id) else {
+            return;
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = barrier.partition.0,
+            generation = barrier.generation.0,
+            through = barrier.through.0,
+            millis = millis(barrier.started),
+            copies = barrier.copies,
+            "durable_barrier"
+        );
+        let _ = barrier.reply.send(Answer::Durable);
+    }
+
+    /// A generation at or above `new` serves `partition` now: every barrier below it ends in
+    /// `GENERATION_CHANGED`. Below, not different: a late `Recovered` for an older generation
+    /// must not end a newer barrier.
+    fn end_barriers_below(&mut self, partition: PartitionId, new: Generation) {
+        let ended: Vec<u64> = self
+            .barriers
+            .iter()
+            .filter(|(_, barrier)| barrier.partition == partition && barrier.generation < new)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ended {
+            let Some(barrier) = self.barriers.remove(&id) else {
+                continue;
+            };
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = barrier.generation.0,
+                new = new.0,
+                through = barrier.through.0,
+                millis = millis(barrier.started),
+                "durable_barrier_generation_changed"
+            );
+            let _ = barrier.reply.send(Answer::Error {
+                error: barrier_generation_changed(barrier.generation, new),
+                request: None,
+            });
         }
     }
 
@@ -4767,15 +5411,19 @@ impl Host {
                 EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site, effects)?,
             }
         }
-        // D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
-        // its own fsync never delays theirs.
+        self.answer_own_asks();
+        self.report_unproven();
+        Ok(())
+    }
+
+    /// D10 (A-R196(1)): this node's own answers last, once every ask to a peer is sent, so
+    /// its own fsync never delays theirs.
+    fn answer_own_asks(&mut self) {
         for (site, ask) in std::mem::take(&mut self.own_asks) {
             if let Some(answer) = self.answer(site.partition, &ask, Reply::Here(site)) {
                 self.answer_here(site, answer);
             }
         }
-        self.report_unproven();
-        Ok(())
     }
 
     fn send(&mut self, to: NodeId, frame: Frame, site: Site) {
@@ -5143,6 +5791,7 @@ impl Host {
             mode = ?result.mode,
             "recovered"
         );
+        self.end_barriers_below(partition, result.new_generation);
         self.inherit(partition, result)?;
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
@@ -8309,6 +8958,8 @@ impl Host {
             in_barrier = barrier,
             "recovered_landed"
         );
+        // #90: outside the `first` guard: a landing repeats, and a barrier may start between.
+        self.end_barriers_below(partition, landed_generation);
         if first && barrier {
             self.inherit(partition, &result)?;
         }
@@ -10073,6 +10724,8 @@ impl Host {
     fn send_answer(&mut self, reply: Reply, partition: PartitionId, answer: RecoveryEvent) {
         match reply {
             Reply::Here(site) => self.answer_here(site, answer),
+            // #90: `sync_answer` passed it, so the proof goes out; the event it built is F1's.
+            Reply::Barrier { asker, proof } => self.send_proof(partition, asker, proof),
             Reply::Peer { asker, correlation } => {
                 let msg = Msg::Routed {
                     partition,
@@ -10108,6 +10761,26 @@ impl Host {
                 post_commit,
             } => {
                 self.request_holder_sync(partition, copy, cutoff, generation, post_commit, reply);
+                None
+            }
+            PeerAsk::DurableThrough {
+                copy,
+                through,
+                generation,
+                barrier,
+            } => {
+                let asker = match reply {
+                    Reply::Peer { asker, .. } | Reply::Barrier { asker, .. } => asker,
+                    Reply::Here(_) => self.node,
+                };
+                let proof = BarrierProof {
+                    partition,
+                    barrier,
+                    copy,
+                    generation,
+                    through,
+                };
+                self.durable_through(partition, asker, proof);
                 None
             }
         }
@@ -10621,7 +11294,8 @@ impl Host {
             ClientCall::Compile { .. }
             | ClientCall::Status { .. }
             | ClientCall::Move { .. }
-            | ClientCall::Rebuild { .. } => None,
+            | ClientCall::Rebuild { .. }
+            | ClientCall::WaitDurable { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -10776,6 +11450,15 @@ impl Host {
                     },
                 };
                 let _ = reply.send(answer);
+                return Ok(());
+            }
+            // #90: recorded and left; nothing here waits, so a later write is never held.
+            ClientCall::WaitDurable {
+                generation,
+                through,
+                remaining_millis,
+            } => {
+                self.start_barrier(partition, generation, through, remaining_millis, reply);
                 return Ok(());
             }
             ClientCall::Get {
@@ -11656,6 +12339,15 @@ const fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
+/// A barrier's generation-changed answer. Unlike a write's it proves nothing about the record
+/// (`no_mutation: false`), and the caller's next step waits for the recovery (design 5.6).
+fn barrier_generation_changed(expected: Generation, current: Generation) -> ApiError {
+    let mut error = ApiError::from_kernel(&RdbError::GenerationChanged { expected, current });
+    error.retry = rdb_core::RetryRule::RetryAfterRecovery;
+    error.no_mutation = false;
+    error
+}
+
 fn holder_of(members: &[rdb_core::contracts::membership::Member], copy: CopyId) -> Option<NodeId> {
     members
         .iter()
@@ -12327,6 +13019,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::CatchUp { .. } => "catch_up",
         Msg::Restore { .. } => "restore",
         Msg::Routed { .. } => "routed",
+        Msg::DurableProved { .. } => "durable_proved",
         Msg::Answered { .. } => "answered",
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
@@ -12568,6 +13261,8 @@ fn head(debug: &str) -> &str {
     &debug[..end]
 }
 
+#[cfg(test)]
+mod barrier_tests;
 #[cfg(test)]
 mod catchup_tests;
 #[cfg(test)]
