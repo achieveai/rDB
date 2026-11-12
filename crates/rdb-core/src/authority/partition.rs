@@ -78,9 +78,11 @@ const NOTED_LAYOUT_VERSION: u8 = 5;
 /// The version byte of a record that also carries a [`TailLedger`] (issue #105): layout 4, then
 /// the ledger, then the note when it has an entry. Every commit by this build writes it.
 ///
-/// The upgrade is one-way (spec §8.5.10). A build that knows only layouts 2 to 5 reads a layout-6
-/// record as no record at all, so the whole cluster stops and restarts together, and there is no
-/// rollback. A record written before this layout reads its ledger as unknown (see [`ledger_of`])
+/// The upgrade is one-way (spec §8.5.10). A build that knows only layouts 2 to 5 cannot decode a
+/// layout-6 record: its `PartitionRecord::decode` answers `None`, and its readers refuse the record
+/// as unreadable (not a partition record, or one that carries no root), rather than reading the
+/// partition as having no record. So the whole cluster stops and restarts together, and there is
+/// no rollback. A record written before this layout reads its ledger as unknown (see [`ledger_of`])
 /// until the partition's first writable commit on this build.
 const LEDGER_LAYOUT_VERSION: u8 = 6;
 
@@ -883,6 +885,96 @@ mod tests {
             assert_eq!(ledger_of(older), Some(unknown.clone()), "layout {layout}");
         }
         assert_eq!(ledger_of(&[6, 0, 0]), None, "not a record");
+    }
+
+    /// PR #110 review: a layout-6 ledger at its bounds. Eight regulars and eight holders read
+    /// back; nine of either is not a record. So is a ledger cut short at any byte, and one
+    /// followed by bytes that are not a note, alone or after a note. Each refusal is `None` from
+    /// `PartitionRecord::decode` and from `ledger_of`, never a partial ledger.
+    /// Cuts: the `MAX_RECORD_MEMBERS` checks in `decode_ledger` removed, red (nine decode); the
+    /// note-or-empty check in `PartitionRecord::decode` removed, red (trailing bytes decode).
+    #[test]
+    fn pr110_layout_6_refuses_nine_regulars_nine_holders_a_short_ledger_and_trailing_bytes() {
+        use crate::contracts::recovery::{CommittedWithout, HeldTail, TailLedger, WithoutEntry};
+        // Layout 4's bytes under layout 6's byte: the record, root and members, then `ledger`.
+        let six_with = |ledger: &[u8]| {
+            let mut body = record()
+                .encode_with_members(&root(), &members(), None, None)
+                .to_vec();
+            body[0] = LEDGER_LAYOUT_VERSION;
+            body.extend_from_slice(ledger);
+            body
+        };
+        // A ledger's bytes with the counts as given, whatever they are.
+        let ledger_bytes = |regulars: u32, held: u32| {
+            let mut out = 4_u64.to_le_bytes().to_vec();
+            out.push(u8::try_from(regulars).expect("a count"));
+            for node in 0..regulars {
+                out.extend_from_slice(&(node + 1).to_le_bytes());
+            }
+            out.push(u8::try_from(held).expect("a count"));
+            for node in 0..held {
+                out.extend_from_slice(&(node + 1).to_le_bytes());
+                out.extend_from_slice(&u64::from(40 + node).to_le_bytes());
+            }
+            out
+        };
+        let full = TailLedger {
+            last_writable: Some(Generation(4)),
+            last_writable_regulars: (1..=8).map(NodeId).collect(),
+            held: (0..8)
+                .map(|node| HeldTail {
+                    node: NodeId(node + 1),
+                    head: Seq(u64::from(40 + node)),
+                })
+                .collect(),
+        };
+        let eight = six_with(&ledger_bytes(8, 8));
+        assert_eq!(
+            eight,
+            record()
+                .encode_with_members(&root(), &members(), None, Some(&full))
+                .to_vec(),
+            "control: the hand-built bytes are the encoder's"
+        );
+        assert_eq!(PartitionRecord::decode(&eight), Some(record()));
+        assert_eq!(ledger_of(&eight), Some(full.clone()), "eight of each");
+        for (why, body) in [
+            ("nine regulars", six_with(&ledger_bytes(9, 0))),
+            ("nine holders", six_with(&ledger_bytes(0, 9))),
+        ] {
+            assert_eq!(PartitionRecord::decode(&body), None, "{why}");
+            assert_eq!(ledger_of(&body), None, "{why}");
+        }
+        let bytes = ledger_bytes(8, 8);
+        for len in 0..bytes.len() {
+            let short = six_with(&bytes[..len]);
+            assert_eq!(PartitionRecord::decode(&short), None, "ledger cut at {len}");
+            assert_eq!(ledger_of(&short), None, "ledger cut at {len}");
+        }
+        let mut trailing = eight.clone();
+        trailing.push(0xAB);
+        assert_eq!(PartitionRecord::decode(&trailing), None, "a stray byte");
+        assert_eq!(ledger_of(&trailing), None, "a stray byte");
+        let note = CommittedWithout {
+            entries: vec![WithoutEntry {
+                generation: Generation(4),
+                cutoff: Seq(7),
+                copies: vec![(CopyId(2), NodeId(3))],
+            }],
+            dropped_through: Generation(0),
+        };
+        let mut noted = record()
+            .encode_with_members(&root(), &members(), Some(&note), Some(&full))
+            .to_vec();
+        assert_eq!(ledger_of(&noted), Some(full), "control: ledger then note");
+        noted.push(0xAB);
+        assert_eq!(
+            PartitionRecord::decode(&noted),
+            None,
+            "a byte after the note"
+        );
+        assert_eq!(ledger_of(&noted), None, "a byte after the note");
     }
 
     /// Layouts 2 and 3 decode as before and name no members (A-R426: must not change).
