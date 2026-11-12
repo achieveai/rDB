@@ -9877,13 +9877,21 @@ impl Host {
     /// generation onto it at the cutoff ([`Self::land_at`]), and answers the `CopyCaughtUp` to
     /// send: caught up at the cutoff, nothing to copy. When it holds less (arm 3, A-R224 item
     /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
-    /// answers nothing: its `Recovered` asks the primary for the rest. Otherwise it writes
-    /// nothing, sends nothing and logs `land_link_refused{reason}`. A copy refused past the
-    /// cutoff does not stall writes: the drop duty leaves it out, and once it restarts it is
-    /// re-added as a shadow and walked up from the root (#59,
-    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`). Called once per
-    /// (partition, generation):
-    /// `landed` dedups the landing.
+    /// answers nothing: its `Recovered` asks the primary for the rest. Linked either way, a live
+    /// receiver it already holds is kept only at the linked head or while quarantined, and is
+    /// replaced at the link otherwise (check A, issue #105 unit 1).
+    ///
+    /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. In a
+    /// commit that takes writes it also drops any live receiver it holds (check A), so it walks
+    /// up from seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the
+    /// receiver stays, as the held tail does. A copy refused past the cutoff whose tail is
+    /// stamped below the last writable generation holds nothing (issue #105) and does not stall
+    /// writes: the drop duty leaves it out, and once it restarts it is re-added as a shadow and
+    /// walked up from the root (#59,
+    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`). One whose tail is
+    /// stamped by the last writable generation can hold the partition `ReadOnly` until that
+    /// tail is adopted ([`Self::adoption`]) or given up (`forget-tail`). Called once per
+    /// (partition, generation): `landed` dedups the landing.
     ///
     /// # Errors
     ///
@@ -11260,7 +11268,8 @@ impl Host {
                 },
             ),
             // Critic-s1b A1: a cold ladder (every one after a reopen) starts at the generation's
-            // base, as the inventory reads from there; below it is never asked for.
+            // link base, or at the inventory's floor when that is lower (issue #105 M1, an
+            // adopted lineage linked above the anchor's base); below that it is never asked for.
             None => {
                 let linked = self
                     .engine
@@ -12554,16 +12563,18 @@ impl Host {
     /// The survivor inventory of a copy holding `anchor`'s generation: what `rdb_sim`'s
     /// `Dispatcher::current_inventory` reports, read from this engine alone.
     ///
-    /// The copy must hold the anchor: its lineage at `anchor`'s generation starts at or below
-    /// `anchor.base_seq` (its stored link), and the digest it stores at the base is
-    /// `anchor.base_digest` (`Digest::ROOT` at seq 0). The digest chains every record before
-    /// it, so a match there proves the prefix. A copy that linked the generation below the
-    /// base (`land_link_behind`) and stored the base's record since holds the anchor too (D8,
-    /// A-R337). A link above the base has no producer and is refused. A copy holding a newer
-    /// generation of the
-    /// partition is ahead of the plan and answers nothing; roll-forward is decided before the
-    /// plan is made, never here. Its ladder is the kept one, extended through the head
-    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
+    /// The copy must hold the anchor: the digest it stores at `anchor.base_seq` in `anchor`'s
+    /// generation is `anchor.base_digest` (`Digest::ROOT` at seq 0). The digest chains every
+    /// record before it, so a match there proves the prefix. A copy that linked the generation
+    /// below the base (`land_link_behind`) and stored the base's record since holds the anchor
+    /// too (D8, A-R337). A link above the base is an adopted tail's (issue #105 unit 2, design
+    /// section 5.1, M1): it passes only when the chain from the base through the link verifies
+    /// record by record from the anchor's digest ([`Self::chain`]), and is refused
+    /// `base_differs` otherwise. A copy missing the anchor's generation, or holding it staged
+    /// under a release, links it first ([`Self::inherit_missed_link`]). A copy holding a newer
+    /// generation of the partition is ahead of the plan and answers nothing; roll-forward is
+    /// decided before the plan is made, never here. Its ladder is the kept one, extended through
+    /// the head ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
