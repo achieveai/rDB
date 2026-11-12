@@ -585,6 +585,7 @@ mod tests {
     #[test]
     fn a_catch_up_is_for_r1_by_name() {
         use crate::contracts::authority::FenceCredential;
+        use crate::contracts::digest::Digest;
         use crate::contracts::event::KernelEvent;
         use crate::contracts::ids::{Generation, OwnerEpoch, PartitionId, Revision, Seq};
         use crate::contracts::membership::CopyId;
@@ -592,6 +593,7 @@ mod tests {
             from: CopyId(1),
             to: CopyId(2),
             through: Seq(1),
+            through_digest: Digest::ROOT,
             credential: FenceCredential {
                 partition: PartitionId(1),
                 prior_generation: Generation(1),

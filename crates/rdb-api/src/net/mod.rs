@@ -102,7 +102,18 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// free number at that merge, and any build handed to a customer counts as released. No branch
 /// reserves a number. The same number with different types passes the handshake, and a frame
 /// that does not decode ends the connection.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// `8` came with #79 S4d: `WireNodeStatus::tail_refused`.
+///
+/// `9` came with issue #105: `WirePeerAsk::Inventory::last_writable` and `release_through`,
+/// `SurvivorInventory::holds_last_writable`, `RecoveryEvent::TailHeld`, `RecoveryResult::ledger`,
+/// `RecoveryPlan::release`, `WireCall::ForgetTail`, `WireAnswer::TailForgotten` and (unit 2)
+/// `WireTailRefused::adoption` (one of `adoptable`, `not_ready`, `refused`, `unchecked`) with
+/// `WireTailRefused::adoption_reason`, and `WireSeed::cutoff`, the selected cutoff and its digest that
+/// a routed `CatchUp` or `Restore` seed carries (unit 2, architect section 15.3). It ships with
+/// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts
+/// the whole cluster.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -638,7 +649,7 @@ impl Net {
             &conn,
             Frame::Reply {
                 correlation,
-                reply: WireReply::Status(status),
+                reply: WireReply::Status(Box::new(status)),
             },
         );
         (handled, rx)
@@ -918,7 +929,7 @@ fn handle(shared: &Arc<Shared>, conn: &Arc<Conn>, frame: Frame) -> Result<(), St
                     let _ = tx.send(answer.land());
                 }
                 (Waiter::Status(tx), WireReply::Status(status)) => {
-                    match NodeStatus::try_from(status) {
+                    match NodeStatus::try_from(*status) {
                         Ok(status) => {
                             let _ = tx.send(status);
                         }
@@ -979,15 +990,20 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         (
             Label::App(app),
             WireMsg::Client {
-                call: call @ (wire::WireCall::Move { .. } | wire::WireCall::Rebuild { .. }),
+                call:
+                    call @ (wire::WireCall::Move { .. }
+                    | wire::WireCall::Rebuild { .. }
+                    | wire::WireCall::ForgetTail { .. }),
                 to,
                 ..
             },
         ) if !admin_apps.contains(app) => {
-            let (verb, step) = if matches!(call, wire::WireCall::Move { .. }) {
-                ("move", crate::db::error::MOVE_STEP)
-            } else {
-                ("rebuild", crate::db::error::REBUILD_STEP)
+            let (verb, step) = match call {
+                wire::WireCall::Move { .. } => ("move", crate::db::error::MOVE_STEP),
+                wire::WireCall::ForgetTail { .. } => {
+                    ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
+                }
+                _ => ("rebuild", crate::db::error::REBUILD_STEP),
             };
             // App `admin` refused here is on a node whose list leaves it out: telling it to
             // run as `admin` would be false (critic-479 A6).
@@ -998,8 +1014,9 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             };
             return Some(format!(
                 "app {app} is not an admin app on node {}: only an admin app may move or \
-                 rebuild a copy, and the node's operator names them; add {app} to the node's \
-                 admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`){instead}; {step}",
+                 rebuild a copy or forget a tail, and the node's operator names them; add {app} \
+                 to the node's admin apps (`rdb_node --admin-apps`, \
+                 `NetConfig::admin_apps`){instead}; {step}",
                 to.0
             ));
         }
@@ -1183,7 +1200,7 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
             shared.rt.spawn_blocking(move || {
                 let _entered = span.enter();
                 let reply_frame = match rx.recv() {
-                    Ok(status) => WireReply::Status(wire::WireNodeStatus::from(&status)),
+                    Ok(status) => WireReply::Status(Box::new(wire::WireNodeStatus::from(&status))),
                     Err(_) => WireReply::Dropped,
                 };
                 conn.out(Frame::Reply {

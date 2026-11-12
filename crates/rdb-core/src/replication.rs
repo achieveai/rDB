@@ -81,7 +81,7 @@ use crate::contracts::transport::{PeerLabel, TransportEvent};
 use append::{AppendReceiver, Head, ReceiverInit};
 use catchup::{retransmit_timer, RETRANSMIT_MS};
 use primary::{keepalive_timer, shadow_timer, Primary};
-use progress::{DigestLadder, ProgressTracker, TrackerInit};
+use progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use source::Source;
 use wire::R1Frame;
 
@@ -122,6 +122,16 @@ impl Replication {
     pub fn install_receiver(&mut self, receiver: AppendReceiver) {
         self.receivers
             .insert((receiver.node(), receiver.partition()), receiver);
+    }
+
+    /// Remove the receiver for `(node, partition)`, returning it, if one is installed. The next
+    /// `Recovered` then builds a fresh one at the root, which only a catch-up from seq 1 fills.
+    pub fn remove_receiver(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+    ) -> Option<AppendReceiver> {
+        self.receivers.remove(&(node, partition))
     }
 
     /// The receiver for `(node, partition)`, if one is installed.
@@ -282,6 +292,7 @@ impl Module for Replication {
             to,
             through,
             credential,
+            ..
         }) = &event.kind
         {
             let mut kinds = self.catch_up(key, *from, *to, *through, *credential);
@@ -561,6 +572,33 @@ impl Replication {
         let mut refused = None;
         match own {
             Some(own) if own.role == ReplicaRole::Primary => {
+                // Issue #105 unit 2 (architect section 14, B1): a primary that stood down in an
+                // older generation and holds no rung at the new cutoff (adoption put it behind)
+                // is removed, so the fresh primary below builds at the cutoff the barrier proved.
+                // A rung that matches takes today's rebuild; one that differs, today's alert.
+                let behind = self.primaries.get(&key).is_some_and(|primary| {
+                    let tracker = primary.tracker();
+                    let selected = &result.selected;
+                    tracker
+                        .stood_down()
+                        // Strictly newer (critic-s15 m1): a late, older `Recovered` must not
+                        // replace a stood-down primary with one at an older generation.
+                        .is_some_and(|generation| result.new_generation > generation)
+                        && tracker
+                            .history()
+                            .lookup(selected.cutoff_seq, selected.cutoff_digest)
+                            == DigestLookup::NotRetained
+                });
+                if behind {
+                    self.primaries.remove(&key);
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        generation = result.new_generation.0,
+                        cutoff = result.selected.cutoff_seq.0,
+                        "stood_down_primary_replaced"
+                    );
+                }
                 if !self.primaries.contains_key(&key) {
                     match fresh_primary(own.copy, result) {
                         Ok(tracker) => self.install_primary(tracker),

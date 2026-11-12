@@ -117,7 +117,10 @@ fn s5n_31_34_a_recovery_without_the_primary_and_a_secondary_says_so_on_the_owner
     let generation = lost_primary_and_silent_secondary(&mut trio);
 
     let (_, body) = record(&trio);
-    assert_eq!(body[0], 5, "the commit's record carries the note");
+    assert_eq!(
+        body[0], 6,
+        "the commit's record carries the ledger, then the note"
+    );
     let note = committed_without_of(&body).expect("a record");
     assert_eq!(note.entries.len(), 1, "{note:?}");
     assert_eq!(note.entries[0].generation, generation);
@@ -221,7 +224,10 @@ fn s5n_32_33_the_note_survives_activation_and_a_move_and_nothing_else_writes_the
         (planned && trio.status(1).admits == Some(true)).then_some(())
     });
     let (_, body) = record(&trio);
-    assert_eq!(body[0], 5, "the activation's record still carries the note");
+    assert_eq!(
+        body[0], 6,
+        "the activation's record still carries the ledger and the note"
+    );
     assert_eq!(
         committed_without_of(&body).expect("a record").entries[0],
         original.entries[0]
@@ -382,6 +388,7 @@ fn s5n_35_a_replan_note_for_another_generation_builds_no_plan() {
             rejoiner: None,
             promote: false,
             since: Tick(0),
+            release: rdb_core::contracts::recovery::TailRelease::default(),
         },
     };
     host.rejoins.insert(P, waiting);

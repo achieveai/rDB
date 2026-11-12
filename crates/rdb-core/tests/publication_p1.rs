@@ -2307,6 +2307,7 @@ fn recovered(
             discarded_from: discarded_from.map(Seq),
             uncertain,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     })))
 }
 
@@ -2333,6 +2334,7 @@ fn recovered_maps_every_partition_mode_and_withholds_owed_replies() {
         assert_eq!(
             rig.step(recovered(mode.clone(), 5, false, None)),
             vec![
+                unknown_reply(5),
                 ignored(AuthorityIgnoreReason::ReplyWithheld),
                 release(1),
                 open(2)
@@ -2374,6 +2376,8 @@ fn recovered_folds_rebases_drops_the_candidate_and_answers_its_waiters() {
         assert_eq!(
             rig.step(recovered(mode.clone(), 5, false, Some(6))),
             vec![
+                unknown_reply(6),
+                unknown_reply(7),
                 ignored(AuthorityIgnoreReason::ReplyWithheld),
                 release(2),
                 open(3),
@@ -3353,6 +3357,8 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
                 assert_eq!(
                     rig.step(recovered(PartitionMode::ReadOnly, 5, false, Some(6))),
                     vec![
+                        unknown_reply(5),
+                        unknown_reply(6),
                         ignored(AuthorityIgnoreReason::ReplyWithheld),
                         ignored(AuthorityIgnoreReason::ReplyWithheld),
                         release(2),
@@ -8030,5 +8036,148 @@ fn m10_s2_p1_c_the_status_seed_learns_the_floor_from_t1s_floor_record() {
             (2, usize::from(with_record)),
             "record {with_record}: two entries, and the floor is not one"
         );
+    }
+}
+
+// ---- S4c: a new lineage answers the writes it strands -------------------------------------------
+
+/// The state the rejoin left seven puts in: applied, in `pending`, and no check or deadline of
+/// this generation left to answer it. A new lineage answers `UNKNOWN_OUTCOME` once, whether the
+/// candidate was still waiting or A1 had already quarantined it at the `Publication` check.
+/// Cut: remove the emit in `recovery_unknown_replies`, red.
+#[retcd_test]
+fn s4c_a_new_lineage_answers_an_unreplied_candidate_unknown_once() {
+    for quarantined in [false, true] {
+        let mut rig = Rig::new();
+        let c = rig.pending_with_recheck(5);
+        if quarantined {
+            let denied = rig.step(answer(
+                Checkpoint::Publication,
+                c,
+                Verdict::Deny(DenyReason::Expired),
+            ));
+            assert_eq!(replies_for(&denied, 5), 0, "{denied:?}");
+        }
+        let effects = rig.step(recovered(PartitionMode::Active, START, false, None));
+        assert_eq!(replies_for(&effects, 5), 1, "{quarantined}: {effects:?}");
+        assert!(
+            effects.contains(&unknown_reply(5)),
+            "{quarantined}: {effects:?}"
+        );
+        assert!(!published_any(&effects), "{quarantined}: {effects:?}");
+        assert!(rig.view().pending.is_none(), "{quarantined}");
+    }
+}
+
+/// A candidate the post-apply deadline already answered gets no second answer from the recovery.
+/// Cut: drop the `replied` test on `pending` in `recovery_unknown_replies`, red.
+#[retcd_test]
+fn s4c_a_candidate_the_deadline_answered_is_not_answered_again() {
+    let mut rig = Rig::new();
+    rig.step(candidate(5, 5));
+    let at_deadline = rig.step(deadline(P, 1));
+    assert_eq!(replies_for(&at_deadline, 5), 1, "{at_deadline:?}");
+    let effects = rig.step(recovered(PartitionMode::Active, START, false, None));
+    assert_eq!(replies_for(&effects, 5), 0, "{effects:?}");
+}
+
+/// The kernel's own start record has no client to answer (M9 S0 rule 5).
+/// Cut: drop the `START_RECORD` test in `recovery_unknown_replies`, red.
+#[retcd_test]
+fn s4c_the_start_record_is_answered_to_nobody_by_a_recovery() {
+    let mut rig = Rig::new();
+    rig.step(start_candidate(5));
+    assert!(rig.view().pending.is_some(), "the start record is pending");
+    let effects = rig.step(recovered(PartitionMode::Active, START, false, None));
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            EffectKind::Reply(ReplyEffect::Failed { identity, .. })
+                if *identity == RequestIdentity::START_RECORD
+        )),
+        "{effects:?}"
+    );
+    assert!(rig.view().pending.is_none(), "the new lineage drops it");
+}
+
+/// F1's re-emit of the lineage P1 already serves strands nothing: the candidate is still
+/// pending and still answerable, so nobody is told `Unknown`.
+/// Cut: move the emit above the `self.lineage == result.selected.root` test, red.
+#[retcd_test]
+fn s4c_a_re_emit_of_the_served_lineage_answers_nobody() {
+    let mut rig = Rig::new();
+    rig.pending_with_recheck(5);
+    let effects = rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(replies_for(&effects, 5), 0, "{effects:?}");
+    assert!(rig.view().pending.is_some(), "the candidate is kept");
+}
+
+/// A published write whose `Reply` check is outstanding is stranded the same way: the answer
+/// that would have released it is asked under a lineage nothing serves any more. Each such
+/// entry answers `Unknown`, unless the deadline already answered it, and each still leaves its
+/// `ReplyWithheld` fact. The check's late answer then finds nothing to reply to.
+/// Cut: leave `awaiting_reply` out of `recovery_unknown_replies`, red.
+#[retcd_test]
+fn s4c_a_new_lineage_answers_an_unreplied_published_write_and_keeps_the_fact() {
+    let mut rig = Rig::new();
+    // r5: the deadline answers it, and only then does it publish.
+    rig.step(candidate(5, 5));
+    assert_eq!(replies_for(&rig.step(deadline(P, 1)), 5), 1);
+    rig.qualify(5);
+    let check = match rig.step(gained(5)).as_slice() {
+        [EffectKind::Kernel(KernelEffect::AuthorityCheck { correlation, .. })] => *correlation,
+        other => panic!("expected one Publication check, got {other:?}"),
+    };
+    rig.snapshot_at(5);
+    let published = rig.step(answer(Checkpoint::Publication, check, Verdict::Admit));
+    assert!(published_any(&published), "{published:?}");
+    let (opened, _) = snapshot_ledger(&published);
+    assert_eq!(rig.step(ready_of(opened[0], 5)), vec![]);
+    // r6: published the plain way, its reply still owed.
+    let c6 = rig.published(6);
+    assert_eq!(rig.view().awaiting_reply.len(), 2);
+
+    let effects = rig.step(recovered(PartitionMode::Active, 6, false, None));
+    assert_eq!(replies_for(&effects, 5), 0, "the deadline answered r5");
+    assert_eq!(replies_for(&effects, 6), 1, "{effects:?}");
+    assert!(effects.contains(&unknown_reply(6)), "{effects:?}");
+    let withheld = effects
+        .iter()
+        .filter(|e| **e == ignored(AuthorityIgnoreReason::ReplyWithheld))
+        .count();
+    assert_eq!(withheld, 2, "one fact per entry: {effects:?}");
+
+    let late = rig.step(answer(Checkpoint::Reply, c6, Verdict::Admit));
+    assert_eq!(replies_for(&late, 6), 0, "a single answer: {late:?}");
+}
+
+/// `Unknown` means "ask", and asking must not settle `Published` for a write no check admitted.
+/// Inside the cutoff it answers `RecoveredApplied`, past it `Unknown`, quarantined or not.
+/// Cut: `fold_recovered`'s `Unknown` arm writes the `Published` outcome, red.
+#[retcd_test]
+fn s4c_a_candidate_the_recovery_answered_never_settles_published() {
+    let applied = TxnStatus::Resolved(TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    });
+    for quarantined in [false, true] {
+        for (cutoff, want) in [(4, TxnStatus::Unknown), (5, applied)] {
+            let mut rig = Rig::new();
+            let c = rig.pending_with_recheck(5);
+            if quarantined {
+                rig.step(answer(
+                    Checkpoint::Publication,
+                    c,
+                    Verdict::Deny(DenyReason::Expired),
+                ));
+            }
+            let effects = rig.step(recovered(PartitionMode::Active, cutoff, false, None));
+            assert!(
+                effects.contains(&unknown_reply(5)),
+                "{quarantined} {cutoff}: {effects:?}"
+            );
+            assert!(!published_any(&effects), "{quarantined} {cutoff}");
+            status_is(&mut rig, 5, want);
+        }
     }
 }

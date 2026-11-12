@@ -334,6 +334,73 @@ fn b3_a467_a_copy_dropped_by_an_outage_is_named_at_the_reopen() {
     reopens_with_members_1_2_3(reopened, &rt, dir.path(), &store, "after");
 }
 
+/// S4f (#94): `Timeouts::unreachable_drop_after` reaches the owner's unreachable clock. Idle
+/// partition, node 3's links held: the owner drops it on the unreachable clock at the configured
+/// 2 s, well before the 10 s of `PEER_DROP_AFTER_MILLIS`, which stays the paused clock. The
+/// upper bound reads the host's own count, not the test's wall clock.
+/// Cut: `unreachable_past_clock` reads `peer_drop_after_millis`, red (`blamed_ms` 10 s).
+/// Integration (~4 s): one open, the configured clock.
+#[config_log::retcd_test]
+fn s4f_the_configured_unreachable_clock_drops_the_copy() {
+    const METHOD: &str = "s4f_the_configured_unreachable_clock_drops_the_copy";
+    const CONFIGURED_MILLIS: u64 = 2_000;
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                timeouts: Timeouts {
+                    unreachable_drop_after: Duration::from_millis(CONFIGURED_MILLIS),
+                    ..Timeouts::default()
+                },
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("a fresh open");
+    db.wait_ready(patience).expect("the fresh open is ready");
+    assert!(put_acked(&db, "pre", patience).is_some(), "pre");
+    db.links().hold(NodeId(1), NodeId(3));
+    db.links().hold(NodeId(2), NodeId(3));
+    let started = Instant::now();
+    let dropped = loop {
+        let pinned = db.pinned_members().map(|(_, pinned)| {
+            pinned
+                .iter()
+                .map(|member| member.node.0)
+                .collect::<Vec<_>>()
+        });
+        if pinned.as_ref().is_ok_and(|nodes| !nodes.contains(&3)) || started.elapsed() > patience {
+            break pinned;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        dropped.as_ref().is_ok_and(|nodes| !nodes.contains(&3)),
+        "node 3 was never dropped: {dropped:?}"
+    );
+    config_log::layer::flush_test_logs();
+    let planned: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "membership_drop_planned")
+        .collect();
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "unreachable", "{planned:?}");
+    let blamed_ms = planned[0]["blamed_ms"].as_u64().expect("blamed_ms");
+    assert!(
+        (CONFIGURED_MILLIS..crate::host::PEER_DROP_AFTER_MILLIS).contains(&blamed_ms),
+        "dropped after {blamed_ms} ms: {planned:?}"
+    );
+    db.links().heal(NodeId(1), NodeId(3));
+    db.links().heal(NodeId(2), NodeId(3));
+    let mut db = db;
+    db.shutdown();
+}
+
 /// A-R469 (tester D-R3-1): the open names a local copy as left out only when it held one. Node
 /// 3 held data and is out; node 4's folder holds no partition 1 data, so it is a spare and is
 /// never named; node 2 is pinned. Cut: the held-a-copy filter in `left_out_copies`: red.

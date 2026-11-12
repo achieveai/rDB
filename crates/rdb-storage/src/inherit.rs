@@ -40,6 +40,32 @@ use crate::snapshot::MAX_CHAIN_DEPTH;
 /// Keys per full-copy batch.
 pub const COPY_BATCH_KEYS: usize = 1024;
 
+/// Debug builds only: directories whose engines flatten a link at a depth below
+/// [`MAX_CHAIN_DEPTH`] ([`flatten_at_depth`]).
+#[cfg(debug_assertions)]
+static FLATTEN_DEPTHS: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Debug builds only: from now on, an engine whose directory is under `dir` flattens a link
+/// onto a parent read through `depth` levels or more, instead of [`MAX_CHAIN_DEPTH`], so a row on
+/// a few generations reaches the flatten (issue #105 row R7-11: an adoption's flatten that
+/// crashes part way). Only the ceiling moves; the copy is the same as at [`MAX_CHAIN_DEPTH`].
+///
+/// # Panics
+///
+/// When `depth` is 0 or above [`MAX_CHAIN_DEPTH`].
+#[cfg(debug_assertions)]
+pub fn flatten_at_depth(dir: &std::path::Path, depth: usize) {
+    assert!(
+        (1..=MAX_CHAIN_DEPTH).contains(&depth),
+        "a flatten depth from 1 to {MAX_CHAIN_DEPTH}: {depth}"
+    );
+    FLATTEN_DEPTHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((dir.to_path_buf(), depth));
+}
+
 /// The namespaces a full copy writes. `History` falls through instead; `Meta` cannot exist in
 /// format 1 (commit and open refuse it).
 const COPIED_NAMESPACES: [Namespace; 3] = [Namespace::User, Namespace::Dedup, Namespace::Progress];
@@ -231,7 +257,8 @@ impl RocksEngine {
         }
         // A link would make the child one level deeper than its parent; past the ceiling, copy
         // the parent's merged state instead, so the child reads at depth 1 (M10 ruling A-R166).
-        let flatten = held.0 == base.0 && self.levels(partition, from).len() >= MAX_CHAIN_DEPTH;
+        let flatten =
+            held.0 == base.0 && self.levels(partition, from).len() >= self.flatten_depth();
         if flatten {
             tracing::info!(
                 target: LOG_TARGET,
@@ -270,6 +297,22 @@ impl RocksEngine {
         };
         self.switch(partition, from, to, link)?;
         Ok(Inherited::Copied { keys })
+    }
+
+    /// The depth at which a link flattens: [`MAX_CHAIN_DEPTH`], or in debug builds a lower one
+    /// [`flatten_at_depth`] set for this engine's directory.
+    fn flatten_depth(&self) -> usize {
+        #[cfg(debug_assertions)]
+        if let Some(depth) = FLATTEN_DEPTHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(dir, _)| self.path().starts_with(dir))
+            .map(|(_, depth)| *depth)
+        {
+            return depth;
+        }
+        MAX_CHAIN_DEPTH
     }
 
     /// The parent's User, Dedup and Progress state as of `base` (design R2 §2):

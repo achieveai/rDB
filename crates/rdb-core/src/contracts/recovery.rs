@@ -276,6 +276,10 @@ pub enum UnavailableReason {
     /// the budget" and "stopped" have the same consequence, and both must set
     /// [`LossRecord::uncertain`].
     Stalled,
+    /// The copy answered [`RecoveryEvent::TailHeld`]: it holds records above the anchor's base
+    /// that it cannot report as a survivor (issue #105). It answered, so it does not hold the
+    /// window open, and the head it named caps the commit's mode.
+    TailHeld,
 }
 
 /// What happened to one survivor's inventory (team kernel-b `design.md` §5.2 to §5.5).
@@ -440,6 +444,67 @@ pub struct RecoveryResult {
     pub committed: CommittedRoot,
     /// The bounds P1 needs for a status query against the previous generation.
     pub retained_status_map: RetainedStatusMap,
+    /// The ledger the commit wrote (issue #105): a plan built from memory carries it on, so a
+    /// mark survives a re-plan with its holder dead (M2).
+    pub ledger: TailLedger,
+}
+
+/// One node the ledger marks as holding records above a cutoff that no commit since has kept
+/// (issue #105). Keyed by node: one entry per holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HeldTail {
+    /// The node holding the tail.
+    pub node: NodeId,
+    /// The highest such record it named.
+    pub head: Seq,
+}
+
+/// What `partitions/{p}` says about the last writable generation and the tails held above it
+/// (issue #105, layout 6). Written on every commit; a record that carries none says "unknown",
+/// never "none".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TailLedger {
+    /// The last generation that committed writable, L. `None` is unknown: a record written by an
+    /// older build, or a partition that has not committed writable on this one.
+    pub last_writable: Option<Generation>,
+    /// The nodes pinned as regulars in L, in the order pinned.
+    pub last_writable_regulars: Vec<NodeId>,
+    /// One entry per node holding a tail above a cutoff, by node.
+    pub held: Vec<HeldTail>,
+}
+
+impl TailLedger {
+    /// The ledger of a record that carries none: L unknown, nothing marked.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            last_writable: None,
+            last_writable_regulars: Vec::new(),
+            held: Vec::new(),
+        }
+    }
+
+    /// The entry for `node`, if it is marked.
+    #[must_use]
+    pub fn held_by(&self, node: NodeId) -> Option<Seq> {
+        self.held
+            .iter()
+            .find(|entry| entry.node == node)
+            .map(|entry| entry.head)
+    }
+}
+
+/// What an operator gave up for one run with `admin forget-tail` (issue #105, section 8.1).
+/// Neither field is set by an automatic plan.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct TailRelease {
+    /// `--through H`: every held tail at or below `H`, reported or marked, is exempt for this run
+    /// and its entry clears. A tail above `H` still caps. Does not waive the intact rule.
+    pub through: Option<Seq>,
+    /// `--no-intact-copy`: the intact rule is waived for this run. Held tails still cap.
+    pub no_intact_copy: bool,
 }
 
 // ---- F1 event and effect vocabulary (lead ruling B-R35, 2026-09-22) ------------------------
@@ -479,6 +544,10 @@ pub struct SurvivorInventory {
     pub ladder: Vec<(Seq, Digest)>,
     /// Set when the copy holds a quarantined history. Kept as evidence, never selectable.
     pub quarantined: Option<QuarantineReason>,
+    /// Whether the copy holds the last writable generation's history intact (issue #105, the
+    /// intact rule): lineage L, not staging, and a record at seq 1 when L applied any. `false`
+    /// when L is unknown to it. F1 counts it only for a node in L's regulars.
+    pub holds_last_writable: bool,
 }
 
 /// Placement's view of one copy as a leader candidate (`design.md` §5.4). Data, not logic.
@@ -520,6 +589,9 @@ pub struct RecoveryPlan {
     pub must_hold: BTreeSet<CopyId>,
     /// What the record this plan supersedes said: whom it pinned and its note (#80 S5n).
     pub prior: PriorRecord,
+    /// What an operator gave up for this run (issue #105, `admin forget-tail`). Empty for every
+    /// automatic plan. After [`Self::prior`], so a stored plan of version 3 is a prefix of today's.
+    pub release: TailRelease,
 }
 
 /// The most recoveries a [`CommittedWithout`] names. The oldest beyond this is trimmed and its
@@ -606,6 +678,8 @@ pub struct PriorRecord {
     pub members: Option<Vec<PriorMember>>,
     /// The old record's note, carried into the new record.
     pub note: CommittedWithout,
+    /// The old record's ledger (issue #105): unknown for a record before layout 6.
+    pub ledger: TailLedger,
 }
 
 impl PriorRecord {
@@ -618,6 +692,7 @@ impl PriorRecord {
                 entries: Vec::new(),
                 dropped_through: Generation(0),
             },
+            ledger: TailLedger::unknown(),
         }
     }
 }
@@ -684,6 +759,24 @@ pub enum RecoveryEvent {
     InventoryFailed {
         /// The copy.
         copy: CopyId,
+    },
+    /// A queried copy holds records above the anchor's base on a lineage it cannot report as a
+    /// survivor, so it answers with the tail instead of failing (issue #105). Writes that took
+    /// one of those records may have been acknowledged. F1 counts the copy as answered, not
+    /// verified, and while the head is above the selected cutoff no commit is writable and no
+    /// rebuild arms. Recorded in every phase before the CAS is built.
+    TailHeld {
+        /// The copy.
+        copy: CopyId,
+        /// The highest such record it holds.
+        head: Seq,
+        /// The generation that wrote the record at `head`; `None` when it could not be read.
+        stamp: Option<Generation>,
+        /// Why it cannot report it, as diagnostic text; F1 does not read it. Usually the host's
+        /// tail-scan reason (`rdb_api`'s `TAIL_REFUSED_REASONS`). When the copy adopted or
+        /// released the tail and its survivor check then refused, it is that check's own refusal
+        /// instead (for example `copy_ahead_of_anchor`), which no closed set lists.
+        reason: String,
     },
     /// A source is still sending its advertised prefix (`design.md` §5.5).
     TransferProgress {
@@ -777,6 +870,9 @@ pub enum RecoveryEffect {
         to: CopyId,
         /// Through this position.
         through: Seq,
+        /// The selected digest at `through` (`SelectedLineage::cutoff_digest`). The target's
+        /// catch-up plan pins it (issue #105 unit 2, architect section 15.3, amending K-B-37).
+        through_digest: Digest,
         /// Minted with `sender == from` (K-B-42).
         credential: FenceCredential,
     },
@@ -788,6 +884,8 @@ pub enum RecoveryEffect {
         to: CopyId,
         /// Through this position.
         through: Seq,
+        /// The selected digest at `through`, as [`Self::CatchUp`]'s: the host routes both alike.
+        through_digest: Digest,
         /// Minted with `sender == from` (K-B-42).
         credential: FenceCredential,
     },

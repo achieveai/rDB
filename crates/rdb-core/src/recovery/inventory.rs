@@ -77,6 +77,16 @@ pub(crate) struct Collecting {
     lost: BTreeMap<CopyId, InventoryOutcome>,
     transfers: BTreeMap<CopyId, TransferWatch>,
     highest_advertised: Seq,
+    /// Each copy that answered `TailHeld`, with the head it named (issue #105).
+    held: BTreeMap<CopyId, Seq>,
+    /// Each copy whose inventory said it holds the last writable generation intact (issue #105,
+    /// the intact rule). Read only for copies still verified.
+    intact: BTreeSet<CopyId>,
+    /// The copies of L's regulars the plan pins, when the intact rule applies to this run: the
+    /// window waits once for one of them when none has verified intact (issue #105, A8).
+    awaits_intact: BTreeSet<CopyId>,
+    /// Whether that one wait was used.
+    extended_for_intact: bool,
 }
 
 impl Collecting {
@@ -98,7 +108,31 @@ impl Collecting {
             lost: BTreeMap::new(),
             transfers: BTreeMap::new(),
             highest_advertised: Seq(0),
+            held: BTreeMap::new(),
+            intact: BTreeSet::new(),
+            awaits_intact: BTreeSet::new(),
+            extended_for_intact: false,
         }
+    }
+
+    /// The copies of L's regulars this run's intact rule needs one of (issue #105): the window
+    /// waits once more while each is silent and none has verified intact.
+    pub(crate) fn await_intact(&mut self, copies: BTreeSet<CopyId>) {
+        self.awaits_intact = copies;
+    }
+
+    /// The verified copies that said they hold the last writable generation intact.
+    pub(crate) fn intact_verified(&self) -> BTreeSet<CopyId> {
+        self.intact
+            .iter()
+            .copied()
+            .filter(|copy| self.verified.contains_key(copy))
+            .collect()
+    }
+
+    /// The copies that answered `TailHeld`, and the head each named.
+    pub(crate) fn held(&self) -> &BTreeMap<CopyId, Seq> {
+        &self.held
     }
 
     /// `Fenced` until the first report or transfer arrives.
@@ -166,6 +200,11 @@ impl Collecting {
             Ok(verified) => {
                 self.highest_advertised = self.highest_advertised.max(verified.head_seq());
                 self.verified.insert(inv.copy, verified);
+                if inv.holds_last_writable {
+                    self.intact.insert(inv.copy);
+                } else {
+                    self.intact.remove(&inv.copy);
+                }
                 emit.ignored(ReplicaIgnoreReason::Recorded);
                 None
             }
@@ -190,6 +229,34 @@ impl Collecting {
             return self.shadows.contains(&copy);
         }
         false
+    }
+
+    /// A queried copy answered with a tail it cannot report as a survivor (issue #105). Its head
+    /// is kept for the mode whenever it lands, even after the copy was recorded lost or the
+    /// window closed: a tail is never dropped for being late. It counts as advertised, so the
+    /// loss record says the cut is uncertain. Admitted, the copy has answered: it is recorded
+    /// ineligible and does not hold the window.
+    pub(crate) fn tail_held(&mut self, copy: CopyId, head: Seq, emit: &mut Emit<'_>) {
+        if !self.queried.contains(&copy) {
+            emit.ignored(ReplicaIgnoreReason::NotASource);
+            return;
+        }
+        let held = self.held.entry(copy).or_insert(head);
+        *held = (*held).max(head);
+        self.highest_advertised = self.highest_advertised.max(head);
+        if matches!(self.window, Window::Probing { .. }) || self.lost.contains_key(&copy) {
+            emit.ignored(ReplicaIgnoreReason::Recorded);
+            return;
+        }
+        self.verified.remove(&copy);
+        self.transfers.remove(&copy);
+        let reason = UnavailableReason::TailHeld;
+        self.record_lost(
+            copy,
+            InventoryOutcome::Ineligible { copy, reason },
+            reason,
+            emit,
+        );
     }
 
     /// A source is still delivering its advertised prefix.
@@ -276,6 +343,32 @@ impl Collecting {
             self.window = Window::Open {
                 deadline,
                 extensions_used: extensions_used + 1,
+            };
+            return Deadline::Extended(deadline);
+        }
+        // Issue #105 (A8): one more window for a silent regular of the last writable generation,
+        // when no copy has verified intact yet. Without one the commit is capped `ReadOnly`.
+        let intact = self.intact_verified();
+        let silent_regulars: Vec<CopyId> = self
+            .awaits_intact
+            .iter()
+            .copied()
+            .filter(|copy| !self.verified.contains_key(copy) && !self.lost.contains_key(copy))
+            .collect();
+        if !self.extended_for_intact
+            && !silent_regulars.is_empty()
+            && self.awaits_intact.intersection(&intact).next().is_none()
+        {
+            self.extended_for_intact = true;
+            let deadline = now.plus_millis(window_millis);
+            tracing::info!(
+                partition = emit.event().partition.0,
+                silent = ?silent_regulars.iter().map(|copy| copy.0).collect::<Vec<_>>(),
+                "recovery_window_extended_for_intact"
+            );
+            self.window = Window::Open {
+                deadline,
+                extensions_used,
             };
             return Deadline::Extended(deadline);
         }

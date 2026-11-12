@@ -859,6 +859,7 @@ fn recovery_plan(
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
         config,
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 
@@ -1223,6 +1224,7 @@ fn place_survivors(plan: &mut RunPlan, state: &Lowering, topology: &Topology) {
                     .map(|seq| (Seq(seq), history.digest(seq)))
                     .collect(),
                 quarantined: None,
+                holds_last_writable: false,
             },
         ));
     }

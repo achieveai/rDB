@@ -176,6 +176,10 @@ pub struct CatchUpPlan {
     pub lineage: Lineage,
     /// The control revision of the fence.
     pub revision: Revision,
+    /// The selected cutoff and its digest (issue #105 unit 2, architect section 15.3, amending
+    /// K-B-37 and A-R223). Under a credential this plan names, a record from an older generation
+    /// at or below it is historical, and the digest is pinned at it as the root's is at its floor.
+    pub cutoff: (Seq, Digest),
 }
 
 impl CatchUpPlan {
@@ -309,7 +313,8 @@ impl AppendReceiver {
 
     /// Keep F1's `plan` for the recovery in flight, replacing any plan held (#79 S3b). A
     /// credentialed append that plan names is checked against the plan's boots instead of the
-    /// pin; nothing else reads it.
+    /// pin, and against the plan's cutoff for the historical rule (issue #105 unit 2); a plain
+    /// append never reads it.
     pub fn keep_recovery_plan(&mut self, plan: CatchUpPlan) {
         self.recovery_plan = Some(plan);
     }
@@ -606,7 +611,8 @@ impl AppendReceiver {
             return refuse(AppendReject::WrongPartition);
         }
         // Rows 4-6 on the record. A historical record skips them; the fence never is.
-        let historical = self.is_historical(&header);
+        let plan_cutoff = self.plan_cutoff(fence.as_ref());
+        let historical = self.is_historical(&header, plan_cutoff);
         if !historical {
             let sender = fence.is_none().then_some(frame);
             if let Some(reject) = self.record_rows(&header, sender) {
@@ -619,7 +625,17 @@ impl AppendReceiver {
             Ok(_) => return Verdict::Quarantine(AppendReject::CorruptHistory { at: header.seq }),
             Err(error) => return Verdict::Malformed(error.kind()),
         }
-        self.sequence_row(envelope, body, historical)
+        self.sequence_row(envelope, body, historical, plan_cutoff)
+    }
+
+    /// The kept plan's cutoff, for a frame whose credential that plan names; `None` for a plain
+    /// append, or a credential the plan does not name (issue #105 unit 2, architect section 15.3).
+    fn plan_cutoff(&self, fence: Option<&FenceCredential>) -> Option<(Seq, Digest)> {
+        let fence = fence?;
+        self.recovery_plan
+            .as_ref()
+            .filter(|plan| plan.names(fence))
+            .map(|plan| plan.cutoff)
     }
 
     /// K-B-37: a record at or below the history floor, sealed under any generation older than
@@ -633,10 +649,19 @@ impl AppendReceiver {
     /// at the floor and every other record must chain on the one beneath it, so a forged record
     /// is proof, never data. This also answers a held head sealed generations back as a repeat
     /// (`AlreadyHave` and an ACK), which A-R169 had needed a separate rule for.
-    fn is_historical(&self, header: &EnvelopeHeader) -> bool {
-        header.seq <= self.root.floor
-            && self.root.predecessor.is_some()
-            && header.generation < self.lineage.generation
+    ///
+    /// Issue #105 unit 2 (architect section 15.3, critic-s15 M1): **or** the plan rule. Adoption
+    /// puts a record from an older generation above the prior generation's floor, so the
+    /// pre-commit catch-up target, whose root is still the prior generation's, refused it. Under
+    /// a credential the kept plan names, a record at or below that plan's cutoff is historical
+    /// too: the plan is the root that recovery will install. It adds to the root rule and never
+    /// replaces it. Exactly one check widens: row 4, the generation. A credentialed frame passes
+    /// no sender to [`Self::record_rows`], so rows 5 and 6 are not checked for it anyway, and
+    /// row 8 pins the digest at the plan's cutoff as it does at the root's floor.
+    fn is_historical(&self, header: &EnvelopeHeader, plan_cutoff: Option<(Seq, Digest)>) -> bool {
+        let by_root = header.seq <= self.root.floor && self.root.predecessor.is_some();
+        let by_plan = plan_cutoff.is_some_and(|(cutoff, _)| header.seq <= cutoff);
+        (by_root || by_plan) && header.generation < self.lineage.generation
     }
 
     /// The frame fence (lead ruling B-R58a), on the lineage the sender holds as it sends — never
@@ -773,10 +798,22 @@ impl AppendReceiver {
         envelope: ReplicationEnvelope,
         record: Bytes,
         historical: bool,
+        plan_cutoff: Option<(Seq, Digest)>,
     ) -> Verdict {
         let seq = envelope.header.seq;
-        if historical && seq == self.root.floor && envelope.record_digest != self.root.base_digest {
-            // The committed root pins this pair; a record that does not match it is proof.
+        // The committed root pins its floor, and a kept plan named by this frame's credential
+        // pins its cutoff (issue #105 unit 2): a historical record that does not match either
+        // pin it sits on is proof.
+        let root_pin = self
+            .root
+            .predecessor
+            .is_some()
+            .then_some((self.root.floor, self.root.base_digest));
+        let diverges = [root_pin, plan_cutoff]
+            .into_iter()
+            .flatten()
+            .any(|(at, digest)| seq == at && envelope.record_digest != digest);
+        if historical && diverges {
             return Verdict::Quarantine(AppendReject::DivergentHistory { at: seq });
         }
         let accept = self.accept_head();
@@ -848,26 +885,13 @@ impl AppendReceiver {
             credentialed,
         });
         self.received = ReceivedSeq(head.seq.0);
-        let mut progress = head.seq.0.to_le_bytes().to_vec();
-        progress.extend_from_slice(&head.digest.0);
-        let mut writes = envelope.mutations.clone();
-        writes.push(Write {
-            ns: Namespace::History,
-            key: Bytes::copy_from_slice(&head.seq.0.to_be_bytes()),
-            value: Some(record),
-        });
-        writes.push(Write {
-            ns: Namespace::Progress,
-            key: Bytes::from_static(PROGRESS_KEY),
-            value: Some(Bytes::from(progress)),
-        });
-        EffectKind::Store(StoreEffect::Commit(Batch {
-            id: batch,
-            partition: self.lineage.partition,
-            generation: self.lineage.generation,
-            seq: head.seq,
-            writes,
-        }))
+        EffectKind::Store(StoreEffect::Commit(record_batch(
+            batch,
+            self.lineage.partition,
+            self.lineage.generation,
+            envelope,
+            record,
+        )))
     }
 
     /// An `AppendReply` to `to`, correlated by `request` (or [`UNSOLICITED`]).
@@ -910,4 +934,39 @@ fn well_formed(envelope: &ReplicationEnvelope) -> bool {
 /// `Busy`: one record is already in flight; resume after `accepted_through`.
 const fn busy(accepted_through: Seq) -> Verdict {
     Verdict::Reply(AppendOutcome::Busy { accepted_through })
+}
+
+/// The one atomic batch that applies `record` at its seq in lineage `(partition, generation)`:
+/// the envelope's mutations, the history record and the progress record (design section 1.2,
+/// ADR-0019's same-batch rule). The receiver stages it; issue #105's adoption replays a held
+/// tail with it, so both write a record the same way.
+#[must_use]
+pub fn record_batch(
+    id: BatchId,
+    partition: PartitionId,
+    generation: Generation,
+    envelope: &ReplicationEnvelope,
+    record: Bytes,
+) -> Batch {
+    let seq = envelope.header.seq;
+    let mut progress = seq.0.to_le_bytes().to_vec();
+    progress.extend_from_slice(&envelope.record_digest.0);
+    let mut writes = envelope.mutations.clone();
+    writes.push(Write {
+        ns: Namespace::History,
+        key: Bytes::copy_from_slice(&seq.0.to_be_bytes()),
+        value: Some(record),
+    });
+    writes.push(Write {
+        ns: Namespace::Progress,
+        key: Bytes::from_static(PROGRESS_KEY),
+        value: Some(Bytes::from(progress)),
+    });
+    Batch {
+        id,
+        partition,
+        generation,
+        seq,
+        writes,
+    }
 }

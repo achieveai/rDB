@@ -202,6 +202,7 @@ fn inv_on(copy: CopyId, head: u64, branch: u8, fork: u64) -> SurvivorInventory {
             .map(|s| (Seq(s), on(branch, fork, s)))
             .collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -264,6 +265,7 @@ fn plan(extra: &[Member]) -> RecoveryPlan {
         retention_millis: RETENTION,
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 
@@ -335,6 +337,7 @@ fn on_new_root(copy: CopyId, head: u64) -> SurvivorInventory {
         head: (Seq(head), dg(0, head)),
         ladder: (20..=head).map(|s| (Seq(s), dg(0, s))).collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -395,6 +398,7 @@ fn catch_up(from: CopyId, to: CopyId, through: u64) -> EffectKind {
         from,
         to,
         through: Seq(through),
+        through_digest: dg(0, through),
         credential: proof().credential_for(from),
     })
 }
@@ -1300,6 +1304,7 @@ fn a_shadow_never_leads_and_a_lagging_leader_catches_up_before_grant() {
                 from: D,
                 to: A,
                 through: Seq(25),
+                through_digest: dg(0, 25),
                 credential: proof().credential_for(D),
             }),
             catch_up(D, B, 25),
@@ -2387,6 +2392,7 @@ fn tester_a_holder_without_a_valid_grant_does_not_lead() {
             from: A,
             to: B,
             through: Seq(20),
+            through_digest: dg(0, 20),
             credential: proof().credential_for(A),
         })),
         "{close:?}"
@@ -3260,6 +3266,7 @@ fn m7b_98_holder_that_cannot_lead_gets_catch_up_before_grant() {
                 from: B,
                 to: C,
                 through: Seq(30),
+                through_digest: dg(0, 30),
                 credential: proof().credential_for(B),
             }),
             arm(2, 2 * WINDOW),
@@ -3824,6 +3831,7 @@ fn result_carries_bounds_mode_and_status_map(
         loss,
         committed,
         retained_status_map,
+        ledger: _,
     } = result;
     assert_eq!(fenced_prior, proof());
     assert_eq!(
@@ -3906,6 +3914,7 @@ fn m7b_118_verified_shadow_source_is_never_leader() {
             from: D,
             to: A,
             through: Seq(25),
+            through_digest: dg(0, 25),
             credential: proof().credential_for(D),
         })),
         "{close:?}"
@@ -4161,7 +4170,8 @@ fn m7b_146_cas_unknown_blocks_and_is_the_worse_case_to_retry() {
 /// M7B-148 (D §5.1 `ActivationProposed --CasResult--> Committed{Active}`, "re-emit `Recovered`";
 /// ADR 0009; T-B-03 / Q-B-2): the activation's `Committed(revision)` step re-emits `Recovered`
 /// with `mode: Active` and that revision. It differs from the `ReadOnly` result in exactly
-/// `mode`, `control_revision` and `barrier`. F1 never emits `SetAdmission`: admission is L1's.
+/// `mode`, `control_revision`, `barrier` and, since issue #105, `ledger`: the activation makes
+/// its generation the last writable one, with the pin's regulars. F1 never emits `SetAdmission`: admission is L1's.
 #[retcd_test]
 fn m7b_148_activation_commit_re_emits_recovered_with_mode_active() {
     let (mut f1, read_only) = activating();
@@ -4176,6 +4186,20 @@ fn m7b_148_activation_commit_re_emits_recovered_with_mode_active() {
     only_those_three.mode = read_only.mode.clone();
     only_those_three.committed.revision = read_only.committed.revision;
     only_those_three.barrier = read_only.barrier.clone();
+    assert_eq!(
+        read_only.ledger.last_writable, None,
+        "a ReadOnly commit carries L"
+    );
+    assert_eq!(
+        only_those_three.ledger.last_writable,
+        Some(read_only.new_generation),
+        "the activation moves L to its generation"
+    );
+    assert_eq!(
+        only_those_three.ledger.last_writable_regulars,
+        vec![NodeId(1), NodeId(2), NodeId(3)]
+    );
+    only_those_three.ledger = read_only.ledger.clone();
     assert_eq!(only_those_three, read_only);
     assert!(!f1
         .log
@@ -4921,6 +4945,7 @@ fn m7b_138_holder_that_cannot_lead_transfers_under_a_credential_naming_the_holde
                 from: B,
                 to: C,
                 through: Seq(30),
+                through_digest: dg(0, 30),
                 credential: proof().credential_for(B),
             }),
             catch_up(B, D, 30),
@@ -6272,6 +6297,7 @@ fn from_root_inv(copy: CopyId, head: u64) -> SurvivorInventory {
         head: (Seq(head), from_root(head)),
         ladder: (0..=head).map(|s| (Seq(s), from_root(s))).collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -7191,7 +7217,8 @@ fn m10_s1_5_a_resolving_recovery_cas_blocks_on_any_other_record() {
 }
 
 /// Bug bash #64 (rulings A-R426 M1, A-R430): a bound F1's commit CAS and its activation CAS both
-/// write layout 4 with the plan's members, so a promote after a full restart can read them from
+/// write the plan's members (layout 4 then, layout 6 since issue #105 writes the ledger on every
+/// commit), so a promote after a full restart can read them from
 /// `partitions/1`. A survives alone, commits `ReadOnly`, rebuilds B and activates. Cuts: either
 /// `Cas::new` site passes no members, red (the first or the second assert).
 #[retcd_test]
@@ -7221,7 +7248,7 @@ fn bb_64_the_commit_and_the_activation_cas_both_pin_the_plans_members() {
     let commit = proposed_bytes(&f1);
     assert_eq!(
         (commit[0], RecordMember::decode_all(&commit)),
-        (4, Some(pinned.clone())),
+        (6, Some(pinned.clone())),
         "the commit CAS"
     );
     recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
@@ -7238,7 +7265,7 @@ fn bb_64_the_commit_and_the_activation_cas_both_pin_the_plans_members() {
     );
     assert_eq!(
         (activation[0], RecordMember::decode_all(&activation)),
-        (4, Some(pinned)),
+        (6, Some(pinned)),
         "the activation CAS"
     );
 }
@@ -7612,6 +7639,7 @@ fn prior_with(note: CommittedWithout) -> PriorRecord {
     PriorRecord {
         members: Some(old_members()),
         note,
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }
 }
 
@@ -7698,7 +7726,13 @@ fn own_lines(method: &str, message: &str) -> usize {
 #[retcd_test]
 fn s5n_31_every_old_member_verified_commits_layout_4_and_fires_an_empty_note() {
     let (_, commit, effects) = run_over(prior_with(CommittedWithout::default()), &[A, B, C]);
-    assert_eq!(commit[0], 4, "no note, no layout 5");
+    // Issue #105: every commit writes layout 6, the ledger; the note follows only with an entry.
+    assert_eq!(commit[0], 6, "the ledger's layout");
+    assert_eq!(
+        committed_without_of(&commit),
+        Some(CommittedWithout::default()),
+        "no note"
+    );
     let (generation, note) = note_effect(&effects);
     assert_eq!(generation, recovered(&effects).new_generation);
     assert_eq!(note, CommittedWithout::default());
@@ -7711,7 +7745,10 @@ fn s5n_31_every_old_member_verified_commits_layout_4_and_fires_an_empty_note() {
 #[retcd_test]
 fn s5n_31_a_lost_member_commits_layout_5_and_names_each_copy_and_node() {
     let (_, commit, effects) = run_over(prior_with(CommittedWithout::default()), &[A]);
-    assert_eq!(commit[0], 5, "the commit's record carries the note");
+    assert_eq!(
+        commit[0], 6,
+        "the commit's record carries the ledger, then the note"
+    );
     let (generation, note) = note_effect(&effects);
     assert_eq!(generation, recovered(&effects).new_generation);
     assert_eq!(note.entries.len(), 1);
@@ -7746,13 +7783,14 @@ fn s5n_31_a_shadow_is_not_missed_and_a_copy_on_another_node_is() {
         PriorRecord {
             members: Some(members),
             note: CommittedWithout::default(),
+            ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
         },
         &[A, B, C],
     );
     let (_, note) = note_effect(&effects);
     assert_eq!(note.entries.len(), 1, "{note:?}");
     assert_eq!(note.entries[0].copies, vec![(B, NodeId(77))]);
-    assert_eq!(commit[0], 5);
+    assert_eq!(commit[0], 6);
 }
 
 /// Row 32: the activation CAS writes the same note the commit did.
@@ -7766,7 +7804,7 @@ fn s5n_32_the_activation_cas_keeps_the_note() {
     }
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
     let activation = proposed_bytes(&f1);
-    assert_eq!(activation[0], 5);
+    assert_eq!(activation[0], 6);
     assert_eq!(committed_without_of(&activation), Some(note));
 }
 
@@ -7818,11 +7856,16 @@ fn s5n_32_a_prior_with_no_members_logs_unknown_and_reads_the_plan() {
     let unknown = PriorRecord {
         members: None,
         note: CommittedWithout::default(),
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     };
     let (_, commit, effects) = run_over(unknown.clone(), &[A, B, C]);
     config_log::layer::flush_test_logs();
     assert_eq!(own_lines(METHOD, "committed_without_prior_unknown"), 1);
-    assert_eq!(commit[0], 4);
+    assert_eq!(commit[0], 6);
+    assert_eq!(
+        committed_without_of(&commit),
+        Some(CommittedWithout::default())
+    );
     assert_eq!(note_effect(&effects).1, CommittedWithout::default());
     let (_, _, effects) = run_over(unknown, &[A]);
     let (_, note) = note_effect(&effects);
@@ -7833,12 +7876,13 @@ fn s5n_32_a_prior_with_no_members_logs_unknown_and_reads_the_plan() {
     );
 }
 
-/// Row 35: a recovery that left nobody out writes the earlier entries back, at layout 5.
+/// Row 35: a recovery that left nobody out writes the earlier entries back (layout 5 then; layout
+/// 6, after the ledger, since issue #105).
 #[retcd_test]
 fn s5n_35_a_recovery_that_left_nobody_out_keeps_earlier_entries() {
     let earlier = CommittedWithout::default().with(without(1, &[(A, 1)]));
     let (_, commit, effects) = run_over(prior_with(earlier.clone()), &[A, B, C]);
-    assert_eq!(commit[0], 5);
+    assert_eq!(commit[0], 6);
     assert_eq!(committed_without_of(&commit), Some(earlier.clone()));
     assert_eq!(note_effect(&effects).1, earlier);
 }
@@ -7917,5 +7961,442 @@ fn s5n_w_a_forced_fifth_entry_sets_dropped_through_and_leads_to_a_full_scan() {
     assert_eq!(
         gateway_pass(&mut at, &note),
         GatewayScan::Entries(note.entries.iter().map(|e| e.generation).collect())
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #105 unit 1: a held tail and the intact rule cap the mode; the ledger is written on every
+// commit (design `ws-79-tail-architect.md` Revision 3, sections 3.4, 3.6, 3.7, 4.3 and 8.1).
+// ---------------------------------------------------------------------------------------------
+
+use rdb_core::authority::partition::ledger_of;
+use rdb_core::contracts::recovery::{HeldTail, TailLedger, TailRelease};
+
+/// What one copy answers in [`tail_run`].
+#[derive(Debug, Clone, Copy)]
+enum Says {
+    /// `InventoryReported` at head 20, saying whether it holds L intact.
+    Reports { intact: bool },
+    /// `TailHeld` naming this head, stamped generation 6.
+    Holds(u64),
+    /// `InventoryFailed`.
+    Fails,
+}
+
+/// A ledger whose L is generation 6 with regulars `regulars`, holding `held` as (node, head).
+fn ledger(regulars: &[u32], held: &[(u32, u64)]) -> TailLedger {
+    TailLedger {
+        last_writable: Some(Generation(6)),
+        last_writable_regulars: regulars.iter().copied().map(NodeId).collect(),
+        held: held
+            .iter()
+            .map(|(node, head)| HeldTail {
+                node: NodeId(*node),
+                head: Seq(*head),
+            })
+            .collect(),
+    }
+}
+
+/// One bound run of [`plan`] over a prior record carrying `prior_ledger`, with `release`, in
+/// which A, B and C answer as `says` does, in that order, and `late` (a copy and the head it
+/// holds) answers `TailHeld` once the barrier began, before its proofs. Every copy that reported
+/// proves seq 20. The run, its phase, and the commit's bytes and recovered result if it
+/// committed.
+fn tail_run(
+    prior_ledger: TailLedger,
+    release: TailRelease,
+    says: [Says; 3],
+    late: Option<(CopyId, u64)>,
+) -> (F1, Option<(Bytes, RecoveryResult)>) {
+    let mut f1 = F1 {
+        module: Recovery::bound_to(Some([7; INSTANCE_LEN])),
+        log: Vec::new(),
+        requests: Vec::new(),
+    };
+    let mut planned = plan(&[]);
+    planned.prior = PriorRecord {
+        members: Some(old_members()),
+        note: CommittedWithout::default(),
+        ledger: prior_ledger,
+    };
+    planned.release = release;
+    f1.rec(0, RecoveryEvent::Plan(Box::new(planned)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    if matches!(f1.phase(), RecoveryPhase::Blocked(_)) {
+        return (f1, None);
+    }
+    let mut reported = Vec::new();
+    for (copy, says) in [A, B, C].into_iter().zip(says) {
+        match says {
+            Says::Reports { intact } => {
+                reported.push(copy);
+                f1.report(
+                    WINDOW,
+                    SurvivorInventory {
+                        holds_last_writable: intact,
+                        ..inv(copy, 20)
+                    },
+                );
+            }
+            Says::Holds(head) => {
+                f1.rec(
+                    WINDOW,
+                    RecoveryEvent::TailHeld {
+                        copy,
+                        head: Seq(head),
+                        stamp: Some(Generation(6)),
+                        reason: "tail_on_older_lineage".to_owned(),
+                    },
+                );
+            }
+            Says::Fails => {
+                f1.rec(WINDOW, RecoveryEvent::InventoryFailed { copy });
+            }
+        }
+    }
+    let mut version = 1;
+    while matches!(
+        f1.phase(),
+        RecoveryPhase::Collecting | RecoveryPhase::Fenced
+    ) && version <= 3
+    {
+        f1.step(WINDOW * (version + 1), fired(version));
+        version += 1;
+    }
+    if f1.phase() != RecoveryPhase::Barrier {
+        return (f1, None);
+    }
+    if let Some((copy, head)) = late {
+        f1.rec(
+            2_900 + WINDOW * 4,
+            RecoveryEvent::TailHeld {
+                copy,
+                head: Seq(head),
+                stamp: Some(Generation(6)),
+                reason: "tail_on_older_lineage".to_owned(),
+            },
+        );
+    }
+    for copy in &reported {
+        f1.rec(3_000 + WINDOW * 4, durable(*copy, 20, dg(0, 20)));
+    }
+    if f1.phase() != RecoveryPhase::Proposing {
+        return (f1, None);
+    }
+    let commit = proposed_bytes(&f1);
+    let effects = f1.step(
+        3_100 + WINDOW * 4,
+        cas_result(CasOutcome::Committed(Revision(9))),
+    );
+    let result = recovered(&effects);
+    (f1, Some((commit, result)))
+}
+
+/// The run committed: its bytes and result.
+fn committed_run(run: (F1, Option<(Bytes, RecoveryResult)>)) -> (F1, Bytes, RecoveryResult) {
+    let (f1, done) = run;
+    let phase = f1.phase();
+    let (bytes, result) = done.unwrap_or_else(|| panic!("the run did not commit: {phase:?}"));
+    (f1, bytes, result)
+}
+
+/// F1 caps on `TailHeld` (issue #105, section 3.4): B holds seqs past the cutoff on a live copy,
+/// so the commit is `ReadOnly` though A and C, two regulars, verified, and no rebuild arms.
+/// The ledger keeps L and marks node 2 at its head, durably. Cut: `mode_after` answers
+/// `mode_for`, red (`DegradedRf2`).
+#[retcd_test]
+fn issue105_a_held_tail_caps_the_commit_to_read_only_and_marks_its_node() {
+    let (f1, bytes, result) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: true },
+            Says::Holds(25),
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(result.mode, PartitionMode::ReadOnly);
+    let marked = ledger(&[1, 2, 3], &[(2, 25)]);
+    assert_eq!(result.ledger, marked, "L carried, node 2 marked");
+    assert_eq!(ledger_of(&bytes), Some(marked), "and stored");
+    assert_eq!(f1.phase(), RecoveryPhase::Committed, "no rebuild arms");
+}
+
+/// M6: a `TailHeld` that arrives while the barrier runs, before the CAS is built, still caps the
+/// commit. Cut: the Barrier arm drops a `TailHeld`, red (`DegradedRf2`).
+#[retcd_test]
+fn issue105_a_tail_held_during_the_barrier_caps_the_commit() {
+    let (_, _, result) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: true },
+            Says::Fails,
+            Says::Reports { intact: true },
+        ],
+        Some((B, 25)),
+    ));
+    assert_eq!(result.mode, PartitionMode::ReadOnly);
+    assert_eq!(
+        result.ledger.held,
+        vec![HeldTail {
+            node: NodeId(2),
+            head: Seq(25)
+        }]
+    );
+}
+
+/// M2 and M3: a mark stays while its node does not verify, whatever else answers, and clears
+/// only when that node verifies at or below the cutoff. A bare failure never clears it. Cut:
+/// `held_above_cutoff` reads only this run's facts, red (the first run commits `DegradedRf2`).
+#[retcd_test]
+fn issue105_a_mark_stays_until_its_node_verifies_and_a_failure_never_clears_it() {
+    let (_, _, failed) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[(2, 25)]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: true },
+            Says::Fails,
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(failed.mode, PartitionMode::ReadOnly, "node 2 silent: held");
+    assert_eq!(
+        failed.ledger,
+        ledger(&[1, 2, 3], &[(2, 25)]),
+        "the mark stays"
+    );
+
+    let (_, _, verified) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[(2, 25)]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: true },
+            Says::Reports { intact: false },
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(
+        verified.mode,
+        PartitionMode::Active,
+        "node 2 verified at the cutoff"
+    );
+    assert_eq!(verified.ledger.held, Vec::new(), "the mark cleared");
+    assert_eq!(
+        verified.ledger.last_writable,
+        Some(verified.new_generation),
+        "a writable commit moves L"
+    );
+}
+
+/// M4: a plan whose configuration leaves out a marked node blocks, naming it, before anything
+/// is asked. Cut: `fence` skips `drops_marked`, red (the run collects).
+#[retcd_test]
+fn issue105_a_plan_dropping_a_marked_node_blocks() {
+    let mut f1 = F1 {
+        module: Recovery::bound_to(Some([7; INSTANCE_LEN])),
+        log: Vec::new(),
+        requests: Vec::new(),
+    };
+    let mut planned = plan(&[]);
+    let members = planned
+        .config
+        .members
+        .iter()
+        .filter(|member| member.node != NodeId(3))
+        .cloned()
+        .collect();
+    planned.config = PartitionConfig::new(PARTITION, C1, members);
+    planned.candidates.retain(|candidate| candidate.copy != C);
+    planned.rebuild_required.remove(&C);
+    planned.prior.ledger = ledger(&[1, 2, 3], &[(3, 25)]);
+    f1.rec(0, RecoveryEvent::Plan(Box::new(planned)));
+    let effects = f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    let reason = BlockReason::DropsMarkedHolder { node: NodeId(3) };
+    assert!(effects.contains(&block(reason.clone())), "{effects:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason));
+}
+
+/// M5, `--through`: every held tail at or below H is given up for that run, a live one and a
+/// marked one alike, so two holders cannot re-cap each other. The commit is writable, the marks
+/// clear and L moves. A tail above H still caps. Cut: `released` answers false, red (the first
+/// run keeps both entries).
+#[retcd_test]
+fn issue105_forget_tail_through_releases_every_tail_at_or_below_it() {
+    let through = TailRelease {
+        through: Some(Seq(30)),
+        no_intact_copy: false,
+    };
+    let (_, _, released) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[(3, 28)]),
+        through,
+        [Says::Reports { intact: true }, Says::Holds(25), Says::Fails],
+        None,
+    ));
+    assert_eq!(
+        released.mode,
+        PartitionMode::ReadOnly,
+        "one regular: ReadOnly by count"
+    );
+    assert_eq!(released.ledger.held, Vec::new(), "both tails given up");
+
+    let (_, _, writable) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[(3, 28)]),
+        through,
+        [
+            Says::Reports { intact: true },
+            Says::Holds(25),
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    // Node 3 verified, so its mark is gone anyway; node 2's live tail at 25 is released.
+    assert_eq!(writable.mode, PartitionMode::DegradedRf2);
+    assert_eq!(writable.ledger.held, Vec::new());
+    assert_eq!(writable.ledger.last_writable, Some(writable.new_generation));
+
+    let (_, _, above) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        through,
+        [
+            Says::Reports { intact: true },
+            Says::Holds(31),
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(
+        above.mode,
+        PartitionMode::ReadOnly,
+        "a tail above H still caps"
+    );
+    assert_eq!(
+        above.ledger.held,
+        vec![HeldTail {
+            node: NodeId(2),
+            head: Seq(31)
+        }]
+    );
+}
+
+/// The intact rule (section 3.7): with L known, a commit is writable only when a verified copy
+/// on one of L's regulars holds L intact. Two regulars verified, neither intact (both wiped and
+/// walked back, say): `ReadOnly`, and L stays. `--through` does not waive it;
+/// `--no-intact-copy` does, with an empty ledger. Cut: `intact_holds` answers true, red (the
+/// first run commits `DegradedRf2`).
+#[retcd_test]
+fn issue105_the_intact_rule_caps_and_only_no_intact_copy_waives_it() {
+    let says = [
+        Says::Reports { intact: false },
+        Says::Fails,
+        Says::Reports { intact: false },
+    ];
+    let (f1, _, capped) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease::default(),
+        says,
+        None,
+    ));
+    assert_eq!(capped.mode, PartitionMode::ReadOnly);
+    assert_eq!(capped.ledger, ledger(&[1, 2, 3], &[]), "L stays");
+    assert_eq!(f1.module.intact_rule_capped(), Some(true));
+
+    let (_, _, through) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease {
+            through: Some(Seq(30)),
+            no_intact_copy: false,
+        },
+        says,
+        None,
+    ));
+    assert_eq!(
+        through.mode,
+        PartitionMode::ReadOnly,
+        "--through keeps the rule"
+    );
+
+    let (f1, _, waived) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease {
+            through: None,
+            no_intact_copy: true,
+        },
+        says,
+        None,
+    ));
+    assert_eq!(waived.mode, PartitionMode::DegradedRf2);
+    assert_eq!(waived.ledger.last_writable, Some(waived.new_generation));
+    assert_eq!(f1.module.intact_rule_capped(), Some(false));
+
+    // One intact copy on an L-regular is enough.
+    let (_, _, one) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: false },
+            Says::Fails,
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(one.mode, PartitionMode::DegradedRf2);
+    // An intact copy on a node that was not one of L's regulars is not.
+    let (_, _, outsider) = committed_run(tail_run(
+        ledger(&[1, 2], &[]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: false },
+            Says::Fails,
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(outsider.mode, PartitionMode::ReadOnly);
+}
+
+/// N3(b): after the upgrade, a prior record with no ledger (layout 5 or below) has L unknown, so
+/// the intact rule is waived and the first commit is writable; it then sets L and its
+/// regulars. A normal recovery (no `TailHeld`, every copy intact) is writable too (N3(a) at F1).
+/// Cut: `intact_applies` ignores an unknown L, red (`ReadOnly`).
+#[retcd_test]
+fn issue105_the_first_commit_after_the_upgrade_is_writable_and_sets_l() {
+    let (_, bytes, result) = committed_run(tail_run(
+        TailLedger::unknown(),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: false },
+            Says::Reports { intact: false },
+            Says::Reports { intact: false },
+        ],
+        None,
+    ));
+    assert_eq!(result.mode, PartitionMode::Active);
+    let set = TailLedger {
+        last_writable: Some(result.new_generation),
+        last_writable_regulars: vec![NodeId(1), NodeId(2), NodeId(3)],
+        held: Vec::new(),
+    };
+    assert_eq!(result.ledger, set);
+    assert_eq!(ledger_of(&bytes), Some(set));
+
+    let (_, _, normal) = committed_run(tail_run(
+        ledger(&[1, 2, 3], &[]),
+        TailRelease::default(),
+        [
+            Says::Reports { intact: true },
+            Says::Reports { intact: true },
+            Says::Reports { intact: true },
+        ],
+        None,
+    ));
+    assert_eq!(
+        normal.mode,
+        PartitionMode::Active,
+        "a normal recovery is not held"
     );
 }

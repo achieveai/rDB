@@ -196,6 +196,7 @@ fn recovered(pinned: PartitionConfig, cutoff: u64, generation: Generation) -> Ke
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }))
 }
 

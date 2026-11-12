@@ -657,6 +657,7 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
             discarded_from: None,
             uncertain: false,
         },
+        ledger: rdb_core::contracts::recovery::TailLedger::unknown(),
     }))
 }
 

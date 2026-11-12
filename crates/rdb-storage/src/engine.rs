@@ -906,6 +906,26 @@ impl RocksEngine {
         self.lineages.keys().copied().collect()
     }
 
+    /// The newest generation held for `partition`, without cloning every other key, as
+    /// [`Self::lineages`] does. A staged lineage counts (#79 S4d).
+    #[must_use]
+    pub fn newest_generation(&self, partition: PartitionId) -> Option<Generation> {
+        self.lineages
+            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
+            .next_back()
+            .map(|(&(_, generation), _)| generation)
+    }
+
+    /// Every generation held for `partition`, oldest first, without cloning any other
+    /// partition's key, as [`Self::lineages`] does. A staged lineage counts.
+    #[must_use]
+    pub fn generations(&self, partition: PartitionId) -> Vec<Generation> {
+        self.lineages
+            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
+            .map(|(&(_, generation), _)| generation)
+            .collect()
+    }
+
     /// The instance id this copy is bound to (M10, arch R3b), or `None` when it is unbound.
     /// Read at open; a marker of the wrong length was refused there.
     #[must_use]

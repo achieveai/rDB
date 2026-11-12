@@ -116,7 +116,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::authority::AuthorityView;
+use crate::contracts::authority::{AuthorityView, DenyReason, PartitionMode};
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, AppendOutcome};
 use crate::contracts::errors::RdbError;
@@ -197,6 +197,9 @@ pub struct Primary {
     /// The shadows a cursor has started for since the last `Recovered`: the first start for
     /// each is logged at info, so a tester can see a shadow begin to catch up.
     shadows_started: BTreeSet<CopyId>,
+    /// The mode of the last `Recovered` this primary was rebuilt from (issue #105 unit 2, architect section
+    /// 14, M1): only a `ReadOnly` one stands down when its epoch is revoked. `None` before any.
+    mode: Option<PartitionMode>,
 }
 
 /// A record the stream shipped to one copy and no admitted ACK has reached: what the
@@ -223,6 +226,7 @@ impl Primary {
             shadow_probe: None,
             shadow_armed: 0,
             shadows_started: BTreeSet::new(),
+            mode: None,
         }
     }
 
@@ -414,7 +418,17 @@ impl Primary {
     /// A-R228): armed when the pin names a shadow and none is armed, cancelled when the pin
     /// names none — a re-add that made the shadow regular hands it to the stream — or retires
     /// this primary.
+    ///
+    /// The mode is recorded here for every `Recovered` the tracker rebuilds from, A-R197's
+    /// re-emit included: it is what the stand-down in [`Self::on_view`] reads (issue #105 unit
+    /// 2, M1). A refused one is not recorded (critic-s15 m4).
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
+        // Only a `Recovered` the tracker rebuilds from sets the mode the stand-down trigger
+        // reads (critic-s15 m4). A refused or `NotRequired` one leaves the mode of the
+        // generation this primary still holds, so it cannot arm or disarm a stand-down.
+        if self.tracker.accepts_recovered(result) {
+            self.mode = Some(result.mode.clone());
+        }
         self.cursors.clear();
         self.shipped.clear();
         self.shadows_started.clear();
@@ -683,8 +697,40 @@ impl Primary {
     /// A1's `View`: the tracker installs it or refuses it (lead ruling B-R53). No cursor is
     /// touched, because none reads the epoch: a cursor walks the ladder, and the append it asks
     /// for is built elsewhere.
+    ///
+    /// Issue #105 unit 2 (architect section 14): a primary whose last `Recovered` committed
+    /// `ReadOnly` stands down when A1 revokes its own epoch, so a catch-up can reach this node's
+    /// store once adoption has left it behind the cutoff. The trigger is read before the view is
+    /// adopted, and needs all of: the view accepted, for this generation, `past_horizon`
+    /// `EpochRevoked`, an owner epoch at or above the tracker's, and the recorded mode
+    /// `ReadOnly`. `SetAdmission` is never read, so a lag-paused `Active` primary stays. Standing
+    /// down retires the tracker, marks it ([`ProgressTracker::stood_down`]), and does what
+    /// [`Self::on_recovered`] does at retirement: cursors, shipped records and started shadows
+    /// cleared, the keepalive and the shadow probe stopped.
     pub fn on_view(&mut self, view: &AuthorityView) -> Vec<EffectKind> {
-        self.tracker.on_view(view)
+        let lineage = self.tracker.lineage();
+        let stands_down = self.tracker.accepts_view(view)
+            && view.lineage.generation == lineage.generation
+            && view.past_horizon == DenyReason::EpochRevoked
+            && view.lineage.owner_epoch >= lineage.owner_epoch
+            && self.mode == Some(PartitionMode::ReadOnly);
+        let mut effects = self.tracker.on_view(view);
+        if stands_down {
+            tracing::info!(
+                partition = lineage.partition.0,
+                generation = lineage.generation.0,
+                epoch = view.lineage.owner_epoch.0,
+                head = self.tracker.head().0,
+                "primary_stood_down"
+            );
+            self.tracker.stand_down();
+            self.cursors.clear();
+            self.shipped.clear();
+            self.shadows_started.clear();
+            effects.extend(self.stop_keepalive());
+            effects.extend(self.stop_shadow_probe());
+        }
+        effects
     }
 
     /// `Flushed` on this node: the tracker's own durable watermark. `None` when no prefix names

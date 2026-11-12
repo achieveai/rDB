@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::{DenyReason, FenceCredential, Lineage};
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::KernelEvent;
 use rdb_core::contracts::ids::{
@@ -26,7 +27,7 @@ use rdb_core::contracts::ids::{
     RequestIdentity, Revision, Seq,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
-use rdb_core::contracts::recovery::{LineageAnchor, RecoveryResult};
+use rdb_core::contracts::recovery::{LineageAnchor, RecoveryResult, TailRelease};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::transport::{Frame as PeerFrame, PeerLabel};
@@ -122,7 +123,7 @@ pub enum WireReply {
     /// A client call's answer.
     Answer(WireAnswer),
     /// An `Inspect`'s answer.
-    Status(WireNodeStatus),
+    Status(Box<WireNodeStatus>),
     /// The node dropped the call's waiter unanswered. The caller sees its channel close, as it
     /// would in one process.
     Dropped,
@@ -686,6 +687,8 @@ pub enum WirePeerAsk {
     Inventory {
         copy: CopyId,
         anchor: LineageAnchor,
+        last_writable: Option<Generation>,
+        release_through: Option<Seq>,
     },
     Sync {
         copy: CopyId,
@@ -704,7 +707,17 @@ pub enum WirePeerAsk {
 impl From<PeerAsk> for WirePeerAsk {
     fn from(ask: PeerAsk) -> Self {
         match ask {
-            PeerAsk::Inventory { copy, anchor } => Self::Inventory { copy, anchor },
+            PeerAsk::Inventory {
+                copy,
+                anchor,
+                last_writable,
+                release_through,
+            } => Self::Inventory {
+                copy,
+                anchor,
+                last_writable,
+                release_through,
+            },
             PeerAsk::Sync {
                 copy,
                 cutoff,
@@ -734,7 +747,17 @@ impl From<PeerAsk> for WirePeerAsk {
 impl From<WirePeerAsk> for PeerAsk {
     fn from(ask: WirePeerAsk) -> Self {
         match ask {
-            WirePeerAsk::Inventory { copy, anchor } => Self::Inventory { copy, anchor },
+            WirePeerAsk::Inventory {
+                copy,
+                anchor,
+                last_writable,
+                release_through,
+            } => Self::Inventory {
+                copy,
+                anchor,
+                last_writable,
+                release_through,
+            },
             WirePeerAsk::Sync {
                 copy,
                 cutoff,
@@ -768,6 +791,7 @@ pub struct WireSeed {
     pub config: PartitionConfig,
     pub lineage: Lineage,
     pub revision: Revision,
+    pub cutoff: (Seq, Digest),
 }
 
 impl From<DormantSeed> for WireSeed {
@@ -776,6 +800,7 @@ impl From<DormantSeed> for WireSeed {
             config: seed.config,
             lineage: seed.lineage,
             revision: seed.revision,
+            cutoff: seed.cutoff,
         }
     }
 }
@@ -786,6 +811,7 @@ impl From<WireSeed> for DormantSeed {
             config: seed.config,
             lineage: seed.lineage,
             revision: seed.revision,
+            cutoff: seed.cutoff,
         }
     }
 }
@@ -839,6 +865,13 @@ pub enum WireCall {
         through: Seq,
         remaining_millis: u64,
     },
+    // Issue #105: added last, so the variants above keep their encoded index.
+    ForgetTail {
+        identity: RequestIdentity,
+        through: Option<Seq>,
+        no_intact_copy: bool,
+        give_up_live_copy: bool,
+    },
 }
 
 impl WireCall {
@@ -853,7 +886,8 @@ impl WireCall {
             | Self::GetPrevious { identity, .. }
             | Self::Status { identity, .. }
             | Self::Move { identity, .. }
-            | Self::Rebuild { identity, .. } => Some(*identity),
+            | Self::Rebuild { identity, .. }
+            | Self::ForgetTail { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -872,6 +906,7 @@ impl WireCall {
             Self::Move { .. } => "move",
             Self::Rebuild { .. } => "rebuild",
             Self::WaitDurable { .. } => "wait_durable",
+            Self::ForgetTail { .. } => "forget_tail",
         }
     }
 }
@@ -940,6 +975,16 @@ impl TryFrom<&ClientCall> for WireCall {
                 identity: *identity,
                 node: *node,
             },
+            ClientCall::ForgetTail {
+                identity,
+                release,
+                give_up_live_copy,
+            } => Self::ForgetTail {
+                identity: *identity,
+                through: release.through,
+                no_intact_copy: release.no_intact_copy,
+                give_up_live_copy: *give_up_live_copy,
+            },
             ClientCall::WaitDurable {
                 generation,
                 through,
@@ -1005,6 +1050,19 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::ForgetTail {
+                identity,
+                through,
+                no_intact_copy,
+                give_up_live_copy,
+            } => Self::ForgetTail {
+                identity,
+                release: TailRelease {
+                    through,
+                    no_intact_copy,
+                },
+                give_up_live_copy,
+            },
             WireCall::WaitDurable {
                 generation,
                 through,
@@ -1675,6 +1733,10 @@ pub enum WireAnswer {
         line: String,
     },
     Durable,
+    // Issue #105: added last, so the variants above keep their encoded index.
+    TailForgotten {
+        line: String,
+    },
 }
 
 impl WireAnswer {
@@ -1714,6 +1776,7 @@ impl WireAnswer {
                 line: moved.line.clone(),
             },
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
+            Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
             Answer::Durable => Self::Durable,
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
@@ -1752,6 +1815,7 @@ impl WireAnswer {
             Self::Status(status) => Answer::Status(status),
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
             Self::Rebuilt { line } => Answer::Rebuilt(line),
+            Self::TailForgotten { line } => Answer::TailForgotten(line),
             Self::Durable => Answer::Durable,
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
@@ -1803,6 +1867,73 @@ pub struct WireNodeStatus {
     pub clock_bound_lost: bool,
     /// Added under protocol 6 (#80 S5n), with S2c's two fields.
     pub committed_without: rdb_core::contracts::recovery::NoteState,
+    /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
+    pub tail_refused: Option<WireTailRefused>,
+}
+
+/// [`crate::host::TailRefused`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireTailRefused {
+    pub generation: Generation,
+    pub head: Seq,
+    pub base: Seq,
+    pub reason: String,
+    /// Added under version 9 (issue #105 unit 2): where the tail stands against adoption, one
+    /// of `adoptable`, `not_ready`, `refused` and `unchecked`; `adoption_reason` names why for `not_ready` and `refused`.
+    pub adoption: String,
+    /// One of [`crate::host::ADOPTION_REFUSALS`], present exactly for `not_ready` and `refused`.
+    pub adoption_reason: Option<String>,
+}
+
+/// A [`crate::host::TailAdoption`] as [`WireTailRefused::adoption`] and its reason.
+fn adoption_to_wire(adoption: crate::host::TailAdoption) -> (String, Option<String>) {
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    let (state, reason) = match adoption {
+        Adoptable => ("adoptable", None),
+        NotReady(reason) => ("not_ready", Some(reason)),
+        Refused(reason) => ("refused", Some(reason)),
+        Unchecked => ("unchecked", None),
+    };
+    (state.to_owned(), reason.map(str::to_owned))
+}
+
+/// [`WireTailRefused::adoption`] and its reason back to a [`crate::host::TailAdoption`]; an
+/// unknown word, an unknown reason, or a reason on the wrong state is refused.
+fn adoption_from_wire(
+    state: &str,
+    reason: Option<&str>,
+) -> Result<crate::host::TailAdoption, WireError> {
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    let known = |reason: &str| {
+        crate::host::ADOPTION_REFUSALS
+            .iter()
+            .copied()
+            .find(|known| *known == reason)
+            .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
+    };
+    let mismatch = |state: &str, reason: Option<&str>| {
+        Err(WireError::Value(format!(
+            "adoption {state:?} with reason {reason:?}"
+        )))
+    };
+    // PR #110 review: a reason belongs to one state, the one `TailAdoption::of` gives it; a
+    // `not_ready` naming a failed proof, or a `refused` naming a wait, is refused.
+    let adoption = match (state, reason) {
+        ("adoptable", None) => Adoptable,
+        ("unchecked", None) => Unchecked,
+        ("not_ready", Some(reason)) => NotReady(known(reason)?),
+        ("refused", Some(reason)) => Refused(known(reason)?),
+        (state, reason) => return mismatch(state, reason),
+    };
+    match adoption {
+        NotReady(reason) | Refused(reason)
+            if crate::host::TailAdoption::of::<()>(&Err(reason)) != adoption =>
+        {
+            mismatch(state, Some(reason))
+        }
+        _ => Ok(adoption),
+    }
 }
 
 /// The role words a host reports (`host::Node::status`).
@@ -1839,6 +1970,17 @@ impl From<&NodeStatus> for WireNodeStatus {
             qualifying_copy: status.qualifying_copy,
             clock_bound_lost: status.clock_bound_lost,
             committed_without: status.committed_without.clone(),
+            tail_refused: status.tail_refused.map(|tail| {
+                let (adoption, adoption_reason) = adoption_to_wire(tail.adoption);
+                WireTailRefused {
+                    generation: tail.generation,
+                    head: tail.head,
+                    base: tail.base,
+                    reason: tail.reason.to_owned(),
+                    adoption,
+                    adoption_reason,
+                }
+            }),
         }
     }
 }
@@ -1880,6 +2022,27 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             qualifying_copy: status.qualifying_copy,
             clock_bound_lost: status.clock_bound_lost,
             committed_without: status.committed_without,
+            tail_refused: status
+                .tail_refused
+                .map(|tail| {
+                    let reason = crate::host::TAIL_REFUSED_REASONS
+                        .iter()
+                        .find(|reason| **reason == tail.reason)
+                        .ok_or_else(|| {
+                            WireError::Value(format!("unknown tail reason {:?}", tail.reason))
+                        })?;
+                    Ok(crate::host::TailRefused {
+                        generation: tail.generation,
+                        head: tail.head,
+                        base: tail.base,
+                        reason,
+                        adoption: adoption_from_wire(
+                            &tail.adoption,
+                            tail.adoption_reason.as_deref(),
+                        )?,
+                    })
+                })
+                .transpose()?,
             lengths: None,
         })
     }

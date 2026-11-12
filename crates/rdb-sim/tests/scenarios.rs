@@ -1012,7 +1012,8 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 /// - Then the held `Reply` check decides in generation 2, at
 ///   `A1_P1_SUBMIT_AT + A1_P1_HOLD_MILLIS`, and not `Valid`. The outcome is `Fenced`; the case doc
 ///   predicted `Deny(GenerationChanged)`.
-/// - No client outcome is reported, and no reply leaves the run.
+/// - The client hears `UNKNOWN_OUTCOME` for the write, once, when the recovery lands (S4c), and
+///   never `Success`. It is the only reply that leaves the run.
 ///
 /// **Oracle half**: [`oracle_half`], with INV-AUTH `Proven`.
 ///
@@ -1028,9 +1029,11 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 #[retcd_test]
 fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_runner() {
     use rdb_core::contracts::authority::{AuthorityIgnoreReason, Checkpoint};
+    use rdb_core::contracts::errors::{ErrorKind, RdbError};
+    use rdb_core::contracts::event::ReplyEffect;
     use rdb_core::contracts::ids::Generation;
     use rdb_core::contracts::ignore::KernelIgnoredReason;
-    use rdb_core::contracts::trace::{AuthorityGate, AuthorityOutcome};
+    use rdb_core::contracts::trace::{AuthorityGate, AuthorityOutcome, ClientOutcome};
     support::preamble();
     let scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
     assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
@@ -1179,12 +1182,24 @@ fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_r
         publish < created && created < withheld && withheld < reply_at,
         "publish {publish} < generation 3 {created} < withheld {withheld} < reply check {reply_at}"
     );
+    let heard = client_outcomes(&run.trace);
     assert_eq!(
-        client_outcomes(&run.trace),
-        vec![],
-        "the client hears nothing from generation 2"
+        heard
+            .iter()
+            .map(|(_, request, outcome, generation, seq)| (*request, *outcome, *generation, *seq))
+            .collect::<Vec<_>>(),
+        vec![(11, ClientOutcome::Error(ErrorKind::UnknownOutcome), 2, None)],
+        "generation 2's only word to the client is UNKNOWN_OUTCOME, never Success: {heard:?}"
     );
-    assert!(run.report.replies.is_empty(), "{:?}", run.report.replies);
+    assert!(
+        matches!(
+            run.report.replies.as_slice(),
+            [(node, ReplyEffect::Failed { error: RdbError::UnknownOutcome { .. }, .. })]
+                if *node == cases::B_NODE
+        ),
+        "{:?}",
+        run.report.replies
+    );
 
     // Oracle half.
     let verdicts = oracle_half(&run);

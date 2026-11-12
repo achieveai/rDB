@@ -410,6 +410,23 @@
 //!                                         and starts n. Under `--nodes`, only an admin
 //!                                         app may run it (`rdb_node --admin-apps`); `lr`
 //!                                         runs as `admin`
+//! admin forget-tail --partition 1 --through <H> [--give-up-live-copy]
+//! admin forget-tail --partition 1 --no-intact-copy
+//!                                         issue #105: the only way out of a read-only
+//!                                         partition no live copy can bring back. The owner
+//!                                         re-plans once, giving up, for good: with
+//!                                         --through, every held tail at or below seq H;
+//!                                         with --no-intact-copy, the rule that a copy of
+//!                                         the last writable generation must answer. Both
+//!                                         may be given. Prints `forget-tail: partition 1
+//!                                         re-plans from generation G: <what is given
+//!                                         up>`. Refused, nothing given up, for H at or
+//!                                         below the cutoff, a live copy reporting a tail
+//!                                         that could come back (adoptable, not ready or
+//!                                         unchecked; unless --give-up-live-copy; a tail
+//!                                         whose adoption was refused needs no flag), or
+//!                                         the intact rule not holding the partition.
+//!                                         Under `--nodes`, only an admin app may run it
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
@@ -2223,11 +2240,23 @@ fn repl<'scope, 'env>(
                 bad |= !answer_all(&admin_status_lines(rt, db, store));
                 Ok(())
             }
+            ["admin", "forget-tail", rest @ ..] => {
+                parse_forget_tail(rest).map(|(release, give_up_live_copy)| {
+                    match db.forget_tail(release, give_up_live_copy) {
+                        Ok(line) => say(&line),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "repl_forget_tail_refused");
+                            say(&format!("err admin forget-tail: {error}"));
+                            bad = true;
+                        }
+                    }
+                })
+            }
             ["admin", "move", from, to] => parse_any_node(from).and_then(|from| {
                 parse_any_node(to).map(|to| bad |= !move_lines(db, from, to, &say))
             }),
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | {FORGET_TAIL_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -2635,6 +2664,61 @@ fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore)
 /// `admin rebuild`'s usage (#65).
 const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is a node of the cluster, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
 
+/// `admin forget-tail`'s usage (issue #105).
+const FORGET_TAIL_USAGE: &str = "admin forget-tail --partition 1 (--through <H> [--give-up-live-copy] | --no-intact-copy | both)";
+
+/// `admin forget-tail`'s words after `forget-tail`: the release and `--give-up-live-copy`.
+/// `--partition` is required and must be 1, the one partition this tool runs.
+fn parse_forget_tail(
+    rest: &[&str],
+) -> Result<(rdb_core::contracts::recovery::TailRelease, bool), String> {
+    let usage = |why: &str| format!("{why}; {FORGET_TAIL_USAGE}");
+    let mut release = rdb_core::contracts::recovery::TailRelease::default();
+    let mut give_up_live_copy = false;
+    let mut partition = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "--partition" => {
+                let value = words
+                    .next()
+                    .ok_or_else(|| usage("--partition takes a number"))?;
+                partition = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| usage(&format!("--partition {value} is not a number")))?,
+                );
+            }
+            "--through" => {
+                let value = words.next().ok_or_else(|| usage("--through takes a seq"))?;
+                let seq = value
+                    .parse::<u64>()
+                    .map_err(|_| usage(&format!("--through {value} is not a seq")))?;
+                release.through = Some(rdb_core::contracts::ids::Seq(seq));
+            }
+            "--no-intact-copy" => release.no_intact_copy = true,
+            "--give-up-live-copy" => give_up_live_copy = true,
+            other => return Err(usage(&format!("unknown word {other}"))),
+        }
+    }
+    match partition {
+        Some(1) => {}
+        Some(other) => {
+            return Err(usage(&format!(
+                "partition {other}: this tool runs partition 1"
+            )))
+        }
+        None => return Err(usage("--partition is required")),
+    }
+    if release.through.is_none() && !release.no_intact_copy {
+        return Err(usage("name what is given up"));
+    }
+    if give_up_live_copy && release.through.is_none() {
+        return Err(usage("--give-up-live-copy goes with --through"));
+    }
+    Ok((release, give_up_live_copy))
+}
+
 /// What `admin rebuild` was asked: in this process, or the fence `lr rebuild N --wipe` checks
 /// once it has stopped N.
 #[derive(Debug, PartialEq, Eq)]
@@ -2851,7 +2935,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
     ];
-    const SUBVERBS: [&str; 27] = [
+    const SUBVERBS: [&str; 28] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -2873,6 +2957,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "control stop",
         "admin promote",
         "admin rebuild",
+        "admin forget-tail",
         "admin damage-copy",
         "node stop",
         "control cut",
@@ -5756,6 +5841,7 @@ mod tests {
             qualifying_copy: None,
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
+            tail_refused: None,
         }
     }
 
@@ -8415,7 +8501,7 @@ mod tests {
         let why = "node 1 (the owner) did not answer its status look";
         assert_eq!(
             record_members_line(
-                &record.encode_with_members(&root, &members, None),
+                &record.encode_with_members(&root, &members, None, None),
                 &known,
                 true,
                 why

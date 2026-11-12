@@ -18,8 +18,8 @@ use crate::contracts::envelope::{AppendAck, ReplicaProgress};
 use crate::contracts::errors::RdbError;
 use crate::contracts::event::{EffectKind, KernelEffect};
 use crate::contracts::ids::{
-    AppliedSeq, BootId, ConfigVersion, DurableSeq, NodeId, PartitionId, ReceivedSeq, ReplicaRole,
-    Seq,
+    AppliedSeq, BootId, ConfigVersion, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq,
+    ReplicaRole, Seq,
 };
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -125,6 +125,12 @@ pub struct ProgressTracker {
     /// A `Recovered` pinned this node something other than the primary (lead ruling on the kept
     /// primary, B-R58a): it serves nothing until a `Recovered` pins it primary again.
     retired: bool,
+    /// Issue #105 unit 2 (architect section 14): the generation this primary stood down in,
+    /// when its own epoch was revoked while its last `Recovered` committed `ReadOnly`. It is
+    /// also [`Self::retired`], so routing treats it as absent; the marker is what tells it from
+    /// a primary a pin retired, for `Recovered`'s rule (B1) and the host's D10 `stale` (M3).
+    /// Any rebuild, or a pin that retires it, clears it.
+    stood_down: Option<Generation>,
     /// Where this lineage's history begins: the cutoff of the `Recovered` that last rebuilt the
     /// tracker, 0 for one [`Self::new`] built and nothing rebuilt (lead rulings B-R71, B-R71a).
     base_seq: Seq,
@@ -203,6 +209,7 @@ impl ProgressTracker {
             anchor: Seq(local.buffered_applied.0),
             authority_seq: 0,
             retired: false,
+            stood_down: None,
             base_seq: Seq::ZERO,
         }
     }
@@ -734,17 +741,35 @@ impl ProgressTracker {
     /// A pin for this partition that names this node anything but the primary retires the
     /// tracker (lead ruling on the kept primary, B-R58a): routing treats it as absent until a
     /// `Recovered` pins it primary again, and that rebuild starts it unretired.
+    ///
+    /// Issue #105 unit 2 (architect section 14, B1): a stood-down tracker answers a `Recovered`
+    /// for the generation it stood down in (A-R197's activation re-emit) `NotRequired` and stays
+    /// stood down; without that, [`Self::restates`]' rebuild would revive it under a revoked
+    /// epoch. A pin that retires it clears the marker and keeps it retired.
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
+        if self.stood_down == Some(result.new_generation) {
+            return vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::NotRequired,
+            ))];
+        }
         if let Some(refusal) = self.refuses(result) {
             let config = &result.committed.pinned_config;
             if config.partition == self.lineage.partition && !self.leads(config) {
                 self.retired = true;
+                self.stood_down = None;
             }
             return vec![refusal];
         }
         let before = self.views();
         *self = self.rebuilt(result);
         self.edges(&before, QualificationCause::ConfigChanged, tick)
+    }
+
+    /// Whether [`Self::on_recovered`] would rebuild this tracker from `result`, rather than
+    /// answer it with a refusal or `NotRequired`. `Primary` records a `Recovered`'s mode only
+    /// then (critic-s15 m4).
+    pub(crate) fn accepts_recovered(&self, result: &RecoveryResult) -> bool {
+        self.stood_down != Some(result.new_generation) && self.refuses(result).is_none()
     }
 
     /// Whether `config` makes this copy the primary, on this node.
@@ -908,9 +933,37 @@ impl ProgressTracker {
 
     /// Whether a `Recovered` retired this primary: its pin names this node something other than
     /// the primary. Routing treats a retired primary as absent for everything but `Recovered`.
+    /// A stood-down primary is retired too ([`Self::stood_down`]).
     #[must_use]
     pub const fn retired(&self) -> bool {
         self.retired
+    }
+
+    /// The generation this primary stood down in, if it did (issue #105 unit 2, architect
+    /// section 14).
+    #[must_use]
+    pub const fn stood_down(&self) -> Option<Generation> {
+        self.stood_down
+    }
+
+    /// Stand down (issue #105 unit 2, architect section 14): retired, and marked with the
+    /// generation served. The caller, [`crate::replication::primary::Primary`], decides when
+    /// and does retirement's cleanup in the same step.
+    pub(crate) fn stand_down(&mut self) {
+        self.retired = true;
+        self.stood_down = Some(self.lineage.generation);
+    }
+
+    /// Whether [`view_refusal`] accepts `view` (issue #105 unit 2): the stand-down trigger is
+    /// read before the view is adopted, since afterwards its epoch is always this tracker's.
+    #[must_use]
+    pub(crate) fn accepts_view(&self, view: &AuthorityView) -> bool {
+        let held = HeldView {
+            lineage: self.lineage,
+            config_version: self.config().config_version,
+            authority_seq: self.authority_seq,
+        };
+        view_refusal(&held, view).is_none()
     }
 
     /// Where this lineage's history begins (lead ruling B-R71).

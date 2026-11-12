@@ -115,6 +115,7 @@ fn survivor(copy: u8, history: &CanonicalHistory, head: u64) -> SurvivorInventor
             .map(|seq| (Seq(seq), history.digest(seq)))
             .collect(),
         quarantined: None,
+        holds_last_writable: false,
     }
 }
 
@@ -169,6 +170,7 @@ fn recovery_plan() -> RecoveryPlan {
         retention_millis: 1_000,
         must_hold: std::collections::BTreeSet::new(),
         prior: rdb_core::contracts::recovery::PriorRecord::fresh(),
+        release: rdb_core::contracts::recovery::TailRelease::default(),
     }
 }
 

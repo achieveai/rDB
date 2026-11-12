@@ -7,7 +7,7 @@
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
-//!          [--clock-offset-ms M] [--clock-step-file F]
+//!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -30,6 +30,8 @@
 //!   passes `--admin-apps admin`, the app `lr` and `rdb_dev` run as; a production node lists
 //!   its operator apps. Any other app's move or rebuild is refused before the node sees it.
 //!   Names are trimmed, so `ops, admin` lists `ops` and `admin`.
+//!   `--unreachable-drop-after-ms` is how long this node, as an owner, waits with no link to a
+//!   copy before it drops that copy (default 10000, least 2000; `Timeouts::unreachable_drop_after`).
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -81,6 +83,8 @@ struct Args {
     partitions: Option<u32>,
     clock_offset_ms: i64,
     clock_step_file: Option<PathBuf>,
+    /// `--unreachable-drop-after-ms`; `None` is `Timeouts::default()`'s.
+    unreachable_drop_after_ms: Option<u64>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -95,7 +99,7 @@ const USAGE: &str = "usage:
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
-           [--clock-offset-ms M] [--clock-step-file F]
+           [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -193,6 +197,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| "--clock-offset-ms takes whole milliseconds".to_owned())?;
             }
             "--clock-step-file" => args.clock_step_file = Some(value("--clock-step-file")?.into()),
+            "--unreachable-drop-after-ms" => {
+                args.unreachable_drop_after_ms =
+                    Some(value("--unreachable-drop-after-ms")?.parse().map_err(|_| {
+                        "--unreachable-drop-after-ms takes whole milliseconds".to_owned()
+                    })?);
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -437,7 +447,13 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
-        timeouts: Timeouts::default(),
+        timeouts: Timeouts {
+            unreachable_drop_after: args.unreachable_drop_after_ms.map_or(
+                Timeouts::default().unreachable_drop_after,
+                Duration::from_millis,
+            ),
+            ..Timeouts::default()
+        },
         dedup_cap: None,
         dedup_retention: None,
         local: vec![node],

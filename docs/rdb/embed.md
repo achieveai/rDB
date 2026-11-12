@@ -634,6 +634,9 @@ Both ask only the nodes this process runs. **An app-only `Db` runs none, so both
 list there, every time.** That does not mean the database has no nodes, and it says nothing about
 a partition's note. In a `Db` that runs nodes, an empty list means none of them answered.
 
+`committed_without` is `Known` only on the partition's owner. Any other node answers `Unknown`,
+which never means "no note": read it from a process that runs the owner.
+
 **To know a write is on disk, use `db.wait_durable(group, (generation, seq), timeout)`** with the
 `generation` and `seq` of a `PutOk`. It makes every regular copy sync and answers `Ok` when all
 have. `Ok` proves every record in the current history at or below that position, and says nothing
@@ -660,6 +663,22 @@ Some limits of what a barrier's error can tell you:
   itself has a fixed route and never re-reads. The route changes only after a re-read that
   succeeds, so only then does the next call go to the new owner. Until then it reaches the
   same node and is refused again.
+
+A copy that stops answering ends a barrier in `DURABILITY_UNCONFIRMED` at its timeout if that comes
+before the copy is dropped. With a timeout under the drop time, expect that, not
+`GENERATION_CHANGED`, and treat either as "read back".
+
+Two clocks decide when a copy is dropped:
+
+| Clock | Default | Set by | Applies to |
+|---|---|---|---|
+| `Timeouts::unreachable_drop_after` | 10 s | `DbConfig::timeouts`, or `rdb_node --unreachable-drop-after-ms` | The owner has no link to a copy, because its process died or its links are cut. An idle partition drops it too. |
+| `PEER_DROP_AFTER_MILLIS` | 10 s | Fixed | A copy that is still linked but holds writes up. |
+
+`Timeouts::unreachable_drop_after` under 2,000 ms is refused at open with `OpenError::Config`.
+Set it to the same value on every node. A lower value pauses writes for less when a node dies,
+but a restart or link loss longer than the value drops the copy from every partition that owner
+holds, and that copy comes back only when its node restarts.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -703,6 +722,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
   three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,
   then as a full copy.
+  The same goes for a copy that drops while nothing is being written: rDB no longer waits for a
+  write to pause before it stops waiting for an unreachable copy. The owner logs
+  `copy_left_out_until_restart` once, naming the node. **Restart the left-out node after the
+  owner is up:** an owner that restarted relearns who is left out from the live boot it sees
+  (`left_out_restored`), so a node that restarted before that needs one more restart.
 - **A restarted copy waits about 5 s before it counts again.** Once it has caught up, it must
   stay within 250 ms of the owner for 5 s in a row before writes resume (`resume_hold_millis`
   and `resume_lag_millis`). Falling behind again restarts the 5 s. That wait was most of the
@@ -791,6 +815,32 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     the loss may be missing.
   - Seen in an embedded run with node 1's links to 2 and 3 held (`rdb_dev --hold 1-2,1-3`):
     `get` answered, `put` was refused as above.
+- **A copy holding writes no other copy has keeps the partition read-only until they are
+  back** (issue #105). After a failure, a live copy can hold records above the recovery's
+  cutoff, and a client may have been told those writes succeeded. Writes then stay refused
+  `RECOVERY_READ_ONLY`, naming the copy and its seqs, and `Db::node_status` shows
+  `tail_refused` with an `adoption` state. Reads keep working.
+  - `Adoptable`: the copy brings the records back by itself at the next re-plan, and writes
+    return. Nothing to do. The refusal says "writes will return on their own".
+  - `NotReady`: it should become `Adoptable` after a later re-plan. Wait.
+  - `Refused` or `Unchecked`, or the copy is gone: writes stay refused until it returns or an
+    operator runs `admin forget-tail --partition 1 --through H` (`Db::forget_tail`). That gives
+    up seqs up to H **for good**. Giving up a tail that could still come back, `Adoptable`,
+    `NotReady` or `Unchecked`, also needs `--give-up-live-copy`; forget-tail refuses it
+    without that flag. Only a `Refused` tail needs no flag. A holder the ledger names that no
+    repair has checked yet counts as `Unchecked`. Design specification §8.5.9 has every form
+    and refusal.
+  - **Do not wipe or rebuild the node named**, or those seqs may be gone.
+  - A brought-back record may be a write whose client saw an error or no answer. It becomes
+    visible. A resend with `db.resend` is deduplicated only inside the dedup retention window
+    (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
+    so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
+    apply twice (design specification §8.5.10).
+- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
+  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
+  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
+  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
+  separate issue.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -830,6 +880,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
   newer one. After an `admin move`, do not roll back to a build before moves (M11) either: it
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
+- **This build's upgrade is one-way, and the whole cluster stops and restarts together**
+  (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
+  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  Roll back only by restoring a backup taken before the upgrade. A partition that already held
+  such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
