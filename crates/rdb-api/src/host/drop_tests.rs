@@ -6012,6 +6012,153 @@ fn s4d_a_tail_past_the_cutoff_holds_the_repair_and_names_the_copy() {
     assert!(!text.contains("lost copies are back"), "{text}");
 }
 
+/// PR #110 review (the real consent path): node 2's tail is `NotReady` (`replay_not_ready`, its
+/// proofs fixed by `crate::host::refuse_adoption`), and node 1 learns that only through its
+/// repair probe of node 2's status; no status is planted. A bare `forget-tail --through` over
+/// that tail is refused naming node 2 and saying it can come back; the consenting retry is
+/// accepted and node 1 re-plans with the release.
+/// Cut: `forget_tail_asked` ignores member holds (reads only its own tail), red (the bare ask is
+/// refused as having nothing to give up, naming no node).
+/// Integration (~4 s): b1's pause and drop, then the repair probe.
+#[config_log::retcd_test]
+fn pr110_forget_tail_over_a_not_ready_tail_a_repair_probe_found_needs_consent() {
+    const METHOD: &str =
+        "pr110_forget_tail_over_a_not_ready_tail_a_repair_probe_found_needs_consent";
+    use rdb_core::contracts::errors::ErrorKind;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.repair_retry_first_millis = 100;
+    crate::host::refuse_adoption(trio.nodes[1].0.engine.path(), "replay_not_ready");
+    let read_only = read_only_with_a_tail(&mut trio, before);
+    trio.links.heal(NodeId(1), NodeId(2));
+    let p = PartitionId(1);
+    let hold = trio.until("node 1's repair probe found node 2's tail", |trio| {
+        trio.nodes[0]
+            .0
+            .tail_holds
+            .get(&p)
+            .and_then(|holds| holds.iter().find(|hold| hold.node == NodeId(2)).copied())
+    });
+    assert_eq!(
+        hold.refused.adoption,
+        TailAdoption::NotReady("replay_not_ready"),
+        "{hold:?}"
+    );
+    assert!(
+        !logged!(METHOD, "membership_repair_held").is_empty(),
+        "the hold came from a repair probe"
+    );
+    let owner = &mut trio.nodes[0].0;
+    let cutoff = owner.committed[&p].selected.cutoff_seq;
+    assert!(
+        hold.refused.head > cutoff,
+        "{hold:?} over cutoff {cutoff:?}"
+    );
+    let through = TailRelease {
+        through: Some(hold.refused.head),
+        no_intact_copy: false,
+    };
+    let error = owner
+        .forget_tail_asked(p, through, false)
+        .expect_err("a NotReady tail needs consent");
+    assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains(&format!(
+            "node 2 holds seqs {} to {}",
+            cutoff.0 + 1,
+            hold.refused.head.0
+        )) && error.detail.contains("can bring them back")
+            && error.detail.contains("add --give-up-live-copy"),
+        "{error:?}"
+    );
+    let line = owner
+        .forget_tail_asked(p, through, true)
+        .expect("the consenting retry is accepted");
+    assert!(
+        line.starts_with(&format!(
+            "forget-tail: partition 1 re-plans from generation {}: seqs up to {} ",
+            read_only.0, hold.refused.head.0
+        )),
+        "{line}"
+    );
+    assert_eq!(logged!(METHOD, "forget_tail_planned").len(), 1);
+}
+
+/// PR #110 review (the real consent path, `Unchecked`): node 2's newest lineage is a staged copy
+/// of its tail's lineage below that lineage's head (a copy that faulted part way), which its
+/// status reports as `interrupted_copy`, `Unchecked`. Node 1 learns it through its repair probe;
+/// no status is planted. A bare `forget-tail --through` over it is refused naming node 2 and
+/// saying it was not checked.
+/// Cut: `TailAdoption::could_return` false for `Unchecked`, red (the bare ask is accepted).
+/// Integration (~4 s): b1's pause and drop, then the repair probe.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn pr110_forget_tail_over_an_unchecked_tail_a_repair_probe_found_needs_consent() {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_storage::InjectedFault;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    trio.nodes[0].0.repair_retry_first_millis = 100;
+    crate::host::refuse_adoption(trio.nodes[1].0.engine.path(), "tail_not_contiguous");
+    let read_only = read_only_with_a_tail(&mut trio, before);
+    let p = PartitionId(1);
+    let two = &mut trio.nodes[1].0;
+    let held = two
+        .engine
+        .newest_generation(p)
+        .expect("node 2 holds a generation");
+    let head = Seq(two.engine.buffered_applied(p, held).0);
+    two.engine.inject_fault(InjectedFault::CopyBatch);
+    assert!(
+        two.engine
+            .inherit(p, held, read_only.next(), Seq(head.0 - 10))
+            .is_err(),
+        "the copy faults part way"
+    );
+    assert_eq!(
+        two.engine.staging(p, read_only.next()),
+        Some((held, Seq(head.0 - 10)))
+    );
+    trio.links.heal(NodeId(1), NodeId(2));
+    let hold = trio.until("node 1's repair probe found node 2's tail", |trio| {
+        trio.nodes[0]
+            .0
+            .tail_holds
+            .get(&p)
+            .and_then(|holds| holds.iter().find(|hold| hold.node == NodeId(2)).copied())
+    });
+    assert_eq!(
+        (hold.refused.reason, hold.refused.adoption),
+        ("interrupted_copy", TailAdoption::Unchecked),
+        "{hold:?}"
+    );
+    let owner = &mut trio.nodes[0].0;
+    let cutoff = owner.committed[&p].selected.cutoff_seq;
+    assert!(
+        hold.refused.head > cutoff,
+        "{hold:?} over cutoff {cutoff:?}"
+    );
+    let error = owner
+        .forget_tail_asked(
+            p,
+            TailRelease {
+                through: Some(hold.refused.head),
+                no_intact_copy: false,
+            },
+            false,
+        )
+        .expect_err("an Unchecked tail needs consent");
+    assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains("node 2 holds seqs")
+            && error.detail.contains("not been checked")
+            && error.detail.contains("add --give-up-live-copy"),
+        "{error:?}"
+    );
+}
+
 /// Row "other reason" (#79 S4d): an inventory refused for a reason that can pass is no tail, so
 /// the repair keeps its A-R353 back-off: it runs again after its short wait, no
 /// `membership_repair_held` names a reason, and node 2 reports no `tail_refused`.
