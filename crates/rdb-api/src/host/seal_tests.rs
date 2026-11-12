@@ -154,18 +154,29 @@ fn formed(dir: &std::path::Path) -> (Trio, Arc<Faults>) {
     (trio, faults)
 }
 
-/// Stop node 1's renewals and let the one already armed land (row 26's R7).
+/// Let node 1's next renewal land, then stop its renewals (row 26's R7), so its grant has a
+/// fresh window when the row's schedule starts.
+///
+/// The renewal is awaited under the normal budget and the budget raised only after it lands.
+/// Raising it first (PR #104 review, B1) lost the precondition whenever a read of `grants/1`
+/// came back before the armed renewal fired: the trio's store serves no watches, so A1 reads the
+/// record after each refused watch, and a record no newer than the one held re-arms `Renew` at
+/// `renewed_at + renew_millis` (`Authority::on_held_grant_record`) with the raised budget. No
+/// renewal landed, the old wait was then met only by the `Expired` fence's view (its
+/// `valid_through` is one tick before the fence), and the promote started after node 1 had
+/// already fenced. Every s5_26, s5_26b and s5d_39 failure in the it8 runs had that read.
 fn renewal_landed_then_no_more(trio: &mut Trio) {
-    let valid = |trio: &Trio| {
-        trio.nodes[0].0.authority_views[&PartitionId(1)]
-            .valid_through_tick
-            .0
-    };
-    let before = valid(trio);
-    trio.nodes[0].0.budgets.renew_millis = NO_RENEWAL_MILLIS;
-    trio.until("node 1's armed renewal lands", |trio| {
-        (valid(trio) > before).then_some(())
+    let renewed_at = |trio: &Trio| trio.nodes[0].0.authority.view().renewed_at;
+    let before = renewed_at(trio);
+    trio.until("node 1's next renewal lands", |trio| {
+        (renewed_at(trio) > before).then_some(())
     });
+    trio.nodes[0].0.budgets.renew_millis = NO_RENEWAL_MILLIS;
+    assert_eq!(
+        trio.status(0).admits,
+        Some(true),
+        "node 1 still admits after its last renewal"
+    );
 }
 
 /// The row 26 schedule's result, everything F1 and the promote have finished.
@@ -284,8 +295,8 @@ fn s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok() {
     });
     assert!(!matches!(got, Answer::Durable), "{got:?}");
     // PR #104 review: a node 1 whose grant already stopped admitting refuses the barrier
-    // before asking anyone, so node 3 never sees it. That is row 26's precondition lost (a
-    // busy host stretched the schedule past the grant), not this row's claim failing.
+    // before asking anyone, so node 3 never sees it. That is row 26's precondition lost, not
+    // this row's claim failing; `renewal_landed_then_no_more` now makes it deterministic.
     if let Answer::Error { error, .. } = &got {
         assert!(
             !error.detail.contains("no barrier was started"),
