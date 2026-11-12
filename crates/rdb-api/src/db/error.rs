@@ -28,16 +28,22 @@ pub struct ApiError {
 /// the stuck-recovery step). A detail that ends with it already says what to do next.
 const OPEN_AGAIN: &str = "open the folder again";
 
-/// The tail `admin.rs` ends a store error with when a delete may have applied: it already says
-/// to run the call again, which a "retrying will not help" step would contradict (rdb_dev row
-/// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
-/// The next step of every `Err` of `Db::wait_durable` (#90, S5d-9). It replaces `step_for`,
-/// whose text for a kind with `no_mutation` false says to `Db::resend`: a barrier has nothing to
-/// resend.
+/// What every `Err` of `Db::wait_durable` says about the write (#90): a barrier wrote nothing,
+/// proves nothing about the write, and has no request to resend.
+const BARRIER_NOTE: &str = "the barrier wrote nothing and says nothing about the write; there \
+     is nothing to `Db::resend`";
+
+/// The next step of a `Db::wait_durable` `Err` a later call can end (#90, S5d-9): it replaces
+/// `step_for`, whose text for a kind with `no_mutation` false says to `Db::resend`. An `Err`
+/// that needs something else first (a fixed argument, a report, a reopen) keeps that step
+/// instead ([`ApiError::for_barrier`]).
 pub(crate) const BARRIER_STEP: &str = "the barrier wrote nothing and says nothing about the \
      write; there is nothing to `Db::resend`; call `Db::wait_durable` again, or after \
      `GENERATION_CHANGED` read back and write what is missing as new writes";
 
+/// The tail `admin.rs` ends a store error with when a delete may have applied: it already says
+/// to run the call again, which a "retrying will not help" step would contradict (rdb_dev row
+/// `an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did` pins the text).
 const RUN_AGAIN: &str = "run it again to read where it stands";
 
 /// The tail of [`ApiError::owner_lost_admin`]: its detail names the step, and an admin call has
@@ -355,6 +361,27 @@ impl ApiError {
             return None;
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))
+    }
+
+    /// This error as `Db::wait_durable` answers it (#90): `no_mutation` false, since a barrier is
+    /// not a write and proves nothing about one. A detail that already ends with its own step
+    /// (a reopen, a quarantine) keeps it. An error no later call ends, a bad argument
+    /// (`Definitive`) or a host fault (`NotWired`), says what the barrier did and keeps its own
+    /// step, so "call `Db::wait_durable` again" never hides "fix the argument" or "report this".
+    /// Anything else ends with [`BARRIER_STEP`].
+    #[must_use]
+    pub(crate) fn for_barrier(mut self) -> Self {
+        self.no_mutation = false;
+        if self.next_step().is_none() {
+            return self;
+        }
+        let own_step = matches!(
+            self.retry,
+            RetryRule::Definitive | RetryRule::NotWired | RetryRule::Quarantine
+        );
+        let tail = if own_step { BARRIER_NOTE } else { BARRIER_STEP };
+        self.detail = format!("{}; {tail}", self.detail);
+        self
     }
 
     /// [`Self::detail`] with its next step: `detail; next: step`. This is the text to show an
@@ -950,6 +977,60 @@ mod tests {
     }
 
     /// A host fault (`NotWired`) says no retry helps, whatever its kind.
+    /// PR #104 review: a barrier's `Err` keeps the step that fits it. A retryable one says to call
+    /// the barrier again and never to resend; a bad argument says to fix it, and a host fault to
+    /// report it, and neither says to call again; a detail that already ends with its own step
+    /// gets no second one. Cut: append [`BARRIER_STEP`] to every `Err`, and the argument and the
+    /// host fault are told to call again.
+    #[test]
+    fn a_barrier_error_keeps_the_step_that_fits_it() {
+        let retryable = [
+            ApiError::new(ErrorKind::DurabilityUnconfirmed, "not proved"),
+            ApiError::from_kernel(&RdbError::GenerationChanged {
+                expected: rdb_core::contracts::ids::Generation(1),
+                current: rdb_core::contracts::ids::Generation(2),
+            }),
+            ApiError::from_kernel(&RdbError::NotPrimary {
+                partition: rdb_core::contracts::ids::PartitionId(1),
+                hint: None,
+            }),
+        ];
+        for error in retryable {
+            let error = error.for_barrier();
+            assert!(!error.no_mutation, "{error:?}");
+            assert!(error.detail.ends_with(BARRIER_STEP), "{error:?}");
+            assert_eq!(error.next_step(), None, "{error:?}");
+            assert!(
+                !error.explain().contains("send the same request"),
+                "{error:?}"
+            );
+        }
+
+        let argument =
+            ApiError::invalid("seq 9 is above what partition 1 has applied").for_barrier();
+        let explained = argument.explain();
+        assert!(explained.contains(BARRIER_NOTE), "{explained}");
+        assert!(explained.contains("fix the argument"), "{explained}");
+        assert!(
+            !explained.contains("call `Db::wait_durable` again"),
+            "{explained}"
+        );
+
+        let host = ApiError::host("the owner's node thread has stopped").for_barrier();
+        let explained = host.explain();
+        assert!(explained.contains(BARRIER_NOTE), "{explained}");
+        assert!(explained.contains("retrying will not help"), "{explained}");
+        assert!(
+            !explained.contains("call `Db::wait_durable` again"),
+            "{explained}"
+        );
+
+        let mut reopen = ApiError::new(ErrorKind::Unavailable, "stuck");
+        reopen.detail = format!("stuck; {OPEN_AGAIN}");
+        let kept = reopen.clone().for_barrier();
+        assert_eq!(kept.detail, reopen.detail, "its own step stays last");
+    }
+
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {
         let error = ApiError::host("storage read fault");

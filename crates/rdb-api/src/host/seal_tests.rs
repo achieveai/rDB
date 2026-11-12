@@ -154,18 +154,42 @@ fn formed(dir: &std::path::Path) -> (Trio, Arc<Faults>) {
     (trio, faults)
 }
 
-/// Stop node 1's renewals and let the one already armed land (row 26's R7).
+/// Let node 1's next renewal land, then stop its renewals (row 26's R7), so its grant has a
+/// fresh window when the row's schedule starts.
+///
+/// The renewal is awaited under the normal budget and the budget raised only after it lands.
+/// Raising it first (PR #104 review, B1) lost the precondition whenever a read of `grants/1`
+/// came back before the armed renewal fired: the trio's store serves no watches, so A1 reads the
+/// record after each refused watch, and a record no newer than the one held re-arms `Renew` at
+/// `renewed_at + renew_millis` (`Authority::on_held_grant_record`) with the raised budget. No
+/// renewal landed, the old wait was then met only by the `Expired` fence's view (its
+/// `valid_through` is one tick before the fence), and the promote started after node 1 had
+/// already fenced. Every s5_26, s5_26b and s5d_39 failure in the it8 runs had that read.
 fn renewal_landed_then_no_more(trio: &mut Trio) {
-    let valid = |trio: &Trio| {
-        trio.nodes[0].0.authority_views[&PartitionId(1)]
-            .valid_through_tick
-            .0
-    };
-    let before = valid(trio);
-    trio.nodes[0].0.budgets.renew_millis = NO_RENEWAL_MILLIS;
-    trio.until("node 1's armed renewal lands", |trio| {
-        (valid(trio) > before).then_some(())
+    let renewed_at = |trio: &Trio| trio.nodes[0].0.authority.view().renewed_at;
+    let before = renewed_at(trio);
+    trio.until("node 1's next renewal lands", |trio| {
+        (renewed_at(trio) > before).then_some(())
     });
+    trio.nodes[0].0.budgets.renew_millis = NO_RENEWAL_MILLIS;
+    assert_eq!(
+        trio.status(0).admits,
+        Some(true),
+        "node 1 still admits after its last renewal"
+    );
+    tracing::info!(
+        grant_left_ms = grant_left(trio),
+        "seal_row_last_renewal_admits"
+    );
+}
+
+/// Counted milliseconds left on node 1's grant, by node 1's own clock.
+fn grant_left(trio: &Trio) -> Option<u64> {
+    let host = &trio.nodes[0].0;
+    let now = host.clock.now().0;
+    host.authority_views
+        .get(&PartitionId(1))
+        .map(|view| view.valid_through_tick.0.saturating_sub(now))
 }
 
 /// The row 26 schedule's result, everything F1 and the promote have finished.
@@ -278,11 +302,43 @@ fn s5d_39_a_barrier_from_the_old_owner_after_the_seal_is_never_ok() {
             .then_some(())
     });
 
+    // The precondition is a deadline on the counted clock: node 1 admits only until its grant
+    // runs out, which the `grant_left_ms` line below reports. Held, the clock reads one tick
+    // until node 1 has taken the call, so the admission checked here is A1's verdict at the
+    // barrier, however long the thread stalls in between.
+    let hold = trio.clock.hold();
+    assert_eq!(
+        trio.status(0).admits,
+        Some(true),
+        "precondition lost: node 1 stopped admitting before the barrier ({:?} ms of grant left)",
+        grant_left(&trio)
+    );
+    tracing::info!(grant_left_ms = grant_left(&trio), "s5d_39_barrier_admits");
     let answer = trio.call(super::barrier_tests::wait_durable(generation, through, 400));
+    step_only(&mut trio, &[0]);
+    assert!(
+        logged!(METHOD, "durable_barrier_started")
+            .iter()
+            .any(|line| line["node"] == 1),
+        "node 1 started the barrier at the tick it admitted at"
+    );
+    drop(hold);
     let got = only_until(&mut trio, &[0, 2], "node 1 answered the barrier", |_| {
         answer.try_recv().ok()
     });
     assert!(!matches!(got, Answer::Durable), "{got:?}");
+    // PR #104 review: a node 1 whose grant already stopped admitting refuses the barrier
+    // before asking anyone, so node 3 never sees it. That is row 26's precondition lost, not
+    // this row's claim failing. `renewal_landed_then_no_more` closes one way to lose it: no
+    // renewal landing before the schedule, so the grant ran out before the promote. The hold
+    // above closes the other: the time from node 3's inventory to node 1 taking the call.
+    if let Answer::Error { error, .. } = &got {
+        assert!(
+            !error.detail.contains("no barrier was started"),
+            "precondition lost: node 1's grant stopped admitting before the barrier, so node 3 \
+             was never asked: {got:?}"
+        );
+    }
     let lines = logged!(METHOD, "durable_through_refused");
     assert!(
         lines

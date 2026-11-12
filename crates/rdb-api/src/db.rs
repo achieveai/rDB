@@ -2750,22 +2750,44 @@ impl Db {
     ///
     /// `Ok` proves every record in the current history at or below the position. It says
     /// nothing about a record a recovery cut. After `GENERATION_CHANGED`, read back. A caller
-    /// that must know a set of keys is durable finishes only when each key's
+    /// that must know a set of keys is durable finishes a pass only when each key's
     /// [`ReadOk::generation`], each rewrite's [`PutOk::generation`] and the marker's
-    /// [`PutOk::generation`] are equal and the barrier on the marker answers `Ok`. That
-    /// comparison is not a fence, and can cost one extra pass at seq 0. Reject a read with
-    /// [`ReadOk::recovery_mode`] true.
+    /// [`PutOk::generation`] are equal and the barrier on the marker answers `Ok`. A read
+    /// reports the generation its node adopted. On any mismatch, or any `Err` from the barrier,
+    /// the pass starts again; how many passes that takes is not fixed. The comparison is not a
+    /// fence. Reject a read with [`ReadOk::recovery_mode`] true.
     ///
     /// # Errors
     ///
     /// An `Err` always has `no_mutation` false. It says nothing about the write: settle the
-    /// write from the write's own answer. There is nothing to resend.
+    /// write from the write's own answer. There is nothing to resend. Its next step says to call
+    /// this again, except where it keeps a step of its own: `INVALID_ARGUMENT` and a host fault,
+    /// and a refusal whose message already ends with a prerequisite step, such as opening the
+    /// folder again or rebuilding a quarantined node, including the step this `Db` adds while
+    /// the owner's recovery is stuck for this open. Do that step first.
     ///
-    /// `DURABILITY_UNCONFIRMED` at `timeout`, naming the copies still owed.
-    /// `GENERATION_CHANGED` at once when `written` is not the partition's current generation or
-    /// a new one lands while this waits. `NOT_PRIMARY`, `ROUTE_CHANGED` or
-    /// `RECOVERY_READ_ONLY` from the node asked. `OVERLOADED` when the node holds too many
-    /// barriers. `INVALID_ARGUMENT` when `written` is above what the primary has applied.
+    /// `DURABILITY_UNCONFIRMED` at `timeout` when the owner answers it, in one of two cases. A
+    /// regular copy has not proved the position: the message names the copies still owed. A
+    /// copy whose fsync failed is named only as owed: the cause is in that copy's log. Or every
+    /// regular copy proved it, but the owner's grant stopped admitting before it could answer
+    /// `Ok`: the message says so, names no copy, and warns that a newer owner may have replaced
+    /// it, so read back. When the owner does not answer by `timeout` plus a second, this side
+    /// reports `DURABILITY_UNCONFIRMED` itself, "no barrier answer from the owner", and cannot
+    /// name the copies.
+    /// `GENERATION_CHANGED` at once when `written` is not the partition's current generation.
+    /// While this waits, a new generation ends it as soon as the owner learns of it: at once when
+    /// the owner is a member of the new generation and hears it land, or when it recovers it
+    /// itself. A promote that drops the owner tells it nothing; the owner, fenced, learns from
+    /// rEtcd's partition record (A-R399), which needs a link to rEtcd. An owner cut off from rEtcd
+    /// cannot learn it, gives no `Ok` once its grant stops admitting, and ends at the timeout.
+    /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now. On
+    /// either, this `Db` tries to re-read the owner from rEtcd, best effort: at most once per
+    /// partition every 250 ms and within the read timeout. A re-read inside that gap is skipped,
+    /// one can fail or time out, and a `Db` whose route is fixed (one running every node itself)
+    /// never re-reads. The route changes only after a re-read that succeeds, so only then does a
+    /// retry go to the new owner; until then it reaches the same node. `RECOVERY_READ_ONLY`
+    /// from the node asked. `OVERLOADED` when the node holds too many barriers.
+    /// `INVALID_ARGUMENT` when `written` is above what the primary has applied.
     pub fn wait_durable(
         &self,
         group: AffinityId,
@@ -2785,16 +2807,16 @@ impl Db {
             Some(other) => Err(ApiError::host(&format!(
                 "a barrier was answered with {other:?}"
             ))),
+            // The owner never answered: this side cannot know which copies are owed.
             None => Err(ApiError::new(
                 ErrorKind::DurabilityUnconfirmed,
-                format!("no barrier answer from the owner in {wait:?}"),
+                format!(
+                    "no barrier answer from the owner in {wait:?}, so which copies are owed is \
+                     not known here"
+                ),
             )),
         };
-        answered.map_err(|mut error| {
-            error.no_mutation = false;
-            error.detail = format!("{}; {}", error.detail, error::BARRIER_STEP);
-            error
-        })
+        answered.map_err(ApiError::for_barrier)
     }
 
     /// [`Self::put`] under the app's request id `request`, which this client may have used

@@ -480,6 +480,7 @@ impl HostClock {
         let capped: &'static Capped = Box::leak(Box::new(Capped {
             max_step_millis,
             read: Mutex::new((clock.start, 0)),
+            held: AtomicBool::new(false),
         }));
         Self {
             capped: Some(capped),
@@ -501,6 +502,27 @@ impl HostClock {
             lag_millis: millis,
             ..self
         }
+    }
+
+    /// Stop this capped clock, every copy of it, until the returned hold drops: readings in
+    /// between all return the tick of the call, and the real time held counts nothing.
+    ///
+    /// For a row whose precondition is a deadline on the counted clock and whose claim needs
+    /// one node's decision taken before it: under the hold, a check of the precondition and the
+    /// decision read the same tick, so the check is the precondition at the decision.
+    ///
+    /// # Panics
+    ///
+    /// On a clock that is not capped, or one already held.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> ClockHold {
+        let capped = self.capped.expect("only a capped clock holds");
+        capped.elapsed();
+        assert!(
+            !capped.held.swap(true, Ordering::SeqCst),
+            "the clock is already held"
+        );
+        ClockHold { capped }
     }
 
     /// Now, as a tick.
@@ -552,6 +574,29 @@ impl HostClock {
 struct Capped {
     max_step_millis: u64,
     read: Mutex<(Instant, u64)>,
+    /// Set while a [`ClockHold`] lives: readings count nothing.
+    held: AtomicBool,
+}
+
+/// [`HostClock::hold`]'s guard: the clock counts again from the drop, the time held dropped.
+#[cfg(test)]
+#[derive(Debug)]
+#[must_use = "the clock is held only while this lives"]
+pub(crate) struct ClockHold {
+    capped: &'static Capped,
+}
+
+#[cfg(test)]
+impl Drop for ClockHold {
+    fn drop(&mut self) {
+        let mut read = self
+            .capped
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.0 = Instant::now();
+        self.capped.held.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +611,10 @@ impl Capped {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (counted_to, counted) = *read;
         let now = Instant::now();
+        if self.held.load(Ordering::SeqCst) {
+            read.0 = now;
+            return counted;
+        }
         let real = u64::try_from(now.saturating_duration_since(counted_to).as_millis())
             .unwrap_or(u64::MAX);
         let (to, step) = if real <= self.max_step_millis {
@@ -620,6 +669,35 @@ mod tests {
         assert!(
             counted >= real / 2 && counted <= real + 1,
             "{real} ms of close readings count {counted} ms"
+        );
+    }
+
+    /// A held clock reads one tick on every copy, a lagging one included, and counts none of
+    /// the time held once released. Cuts: ignore the hold, red on the first comparison; count
+    /// the held time on release, red on the last.
+    /// Unit, ~0.1 s.
+    #[test]
+    fn a_held_clock_stands_still_on_every_copy_and_counts_nothing_held() {
+        let clock = HostClock::capped(20);
+        let behind = clock.lagging(1_000);
+        let hold = clock.hold();
+        let held = clock.now();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(clock.now(), held, "a held clock stands still");
+        assert_eq!(
+            behind.now().0,
+            held.0 - 1_000,
+            "and so does its lagging copy"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+        drop(hold);
+        let after = clock.now();
+        // 12 ms of slack for the release itself: a drop that kept the last held reading as
+        // the count's origin still counts the 15 ms slept after it, so that cut stays red.
+        assert!(
+            after.0 - held.0 <= 12,
+            "30 ms held counted {} ms",
+            after.0 - held.0
         );
     }
 

@@ -58,7 +58,9 @@ fn int(v: i128) -> Value {
 }
 
 /// Which [`WireMsg`] kind a message is. No wildcard: a new kind fails to compile here until a
-/// row covers it.
+/// row covers it. The number is also the variant's postcard index, which [`across`] checks on
+/// every message: a variant inserted above another shifts that one's index, so a new kind goes
+/// last (PR #104 review; protocol 6's nine keep 0 to 8).
 const fn kind(msg: &WireMsg) -> usize {
     match msg {
         WireMsg::Frame { .. } => 0,
@@ -96,6 +98,13 @@ fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
             reply: 8,
         },
     };
+    let index = postcard::to_stdvec(&wire).expect("encodes")[0];
+    assert_eq!(
+        usize::from(index),
+        kind(&wire),
+        "{} travels at another index",
+        wire.name()
+    );
     let bytes = wire::encode(&Frame::Msg(wire));
     let Frame::Msg(wire) = wire::decode(&bytes).expect("decodes") else {
         panic!("not a message frame");

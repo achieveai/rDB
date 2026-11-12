@@ -163,14 +163,6 @@ pub enum WireMsg {
         partition: PartitionId,
         seed: WireSeed,
     },
-    DurableProved {
-        to: NodeId,
-        partition: PartitionId,
-        barrier: u64,
-        copy: CopyId,
-        generation: Generation,
-        through: Seq,
-    },
     Routed {
         to: NodeId,
         partition: PartitionId,
@@ -205,6 +197,16 @@ pub enum WireMsg {
         correlation: CorrelationId,
         asked: LineageAnchor,
         kind: KernelEvent,
+    },
+    /// Appended (protocol 7, #90): a copy's proof for a barrier. Last, so no earlier kind's
+    /// encoded index moves (`net::tests::kind` pins them).
+    DurableProved {
+        to: NodeId,
+        partition: PartitionId,
+        barrier: u64,
+        copy: CopyId,
+        generation: Generation,
+        through: Seq,
     },
 }
 
