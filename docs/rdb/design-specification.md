@@ -796,7 +796,7 @@ A holder adopts the tail inside its inventory answer. It then reports as an ordi
 
 - **Link.** The copy holds no lineage at the anchor's generation. `inherit` links it onto the tail's lineage at the tail's head. At the chain depth ceiling (32 levels) the link is a full copy instead. That copy runs on the host thread, at most once per 32 levels.
 - **Resume.** An earlier adoption's full copy crashed part way. The copy finishes it with the same arguments, then links.
-- **Replay.** The copy already holds the anchor's lineage, linked, with its head at or above the base. It appends the tail's records with `record_batch`, as a receiver would. The first record must chain from that head. At most `ADOPT_REPLAY_MAX` (1,024) records are replayed.
+- **Replay.** The copy already holds the anchor's lineage, linked, with its head at or above the base. It appends the tail's records with `record_batch`, as a receiver would. The first record must chain from that head. At most `ADOPT_REPLAY_MAX` (1,024) records are replayed. A longer gap is refused `tail_too_long` before the tail's chain is walked, so the holder never reads a tail it would refuse.
 
 After any of them, a receiver held on that copy is dropped. A catch-up it then sources rebuilds a full ladder from the engine. The copy logs `tail_adopted` with `from`, `to`, `head`, `stamp` and `how` (`link`, `flatten` for a link that became a full copy, `resume` or `replay`).
 
@@ -888,7 +888,7 @@ It is refused, giving up nothing, when:
 
 - H is at or below the committed cutoff;
 - no copy holds a tail above the cutoff;
-- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
+- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given. A holder the committed ledger marks that no repair probe has reported on yet counts as `Unchecked`; a probe's report, `Refused` included, stands over the mark. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
 - `--no-intact-copy` is given and the intact rule did not cap the owner's last commit;
 - another re-plan is running.
 

@@ -825,11 +825,17 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `NotReady`: it should become `Adoptable` after a later re-plan. Wait.
   - `Refused` or `Unchecked`, or the copy is gone: writes stay refused until it returns or an
     operator runs `admin forget-tail --partition 1 --through H` (`Db::forget_tail`). That gives
-    up seqs up to H **for good**. Giving up a tail that could still come back also needs
-    `--give-up-live-copy`. Design specification §8.5.9 has every form and refusal.
+    up seqs up to H **for good**. Giving up a tail that could still come back, `Adoptable`,
+    `NotReady` or `Unchecked`, also needs `--give-up-live-copy`; forget-tail refuses it
+    without that flag. Only a `Refused` tail needs no flag. A holder the ledger names that no
+    repair has checked yet counts as `Unchecked`. Design specification §8.5.9 has every form
+    and refusal.
   - **Do not wipe or rebuild the node named**, or those seqs may be gone.
   - A brought-back record may be a write whose client saw an error or no answer. It becomes
-    visible. A resend with `db.resend` is deduplicated.
+    visible. A resend with `db.resend` is deduplicated only inside the dedup retention window
+    (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
+    so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
+    apply twice (design specification §8.5.10).
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
   the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
   lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
