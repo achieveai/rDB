@@ -1039,6 +1039,118 @@ async fn a_status_reply_that_does_not_decode_closes_the_link_with_the_reason() {
     );
 }
 
+/// A status reporting a tail in `adoption`, through the wire's bytes and back.
+fn status_through_the_wire(
+    adoption: crate::host::TailAdoption,
+) -> Result<NodeStatus, wire::WireError> {
+    let mut status = status();
+    status.tail_refused = status
+        .tail_refused
+        .map(|tail| crate::host::TailRefused { adoption, ..tail });
+    let bytes = wire::encode(&Frame::Reply {
+        correlation: 2,
+        reply: WireReply::Status(Box::new(wire::WireNodeStatus::from(&status))),
+    });
+    let Ok(Frame::Reply {
+        reply: WireReply::Status(back),
+        ..
+    }) = wire::decode(&bytes)
+    else {
+        panic!("not a status reply");
+    };
+    NodeStatus::try_from(*back)
+}
+
+/// PR #110 review: a status naming a tail crosses the wire unchanged in each of the four
+/// adoption states, `Adoptable`, `NotReady`, `Refused` and `Unchecked`. Unit.
+/// Cut: `adoption_to_wire` sends `unchecked` for every state, red.
+#[test]
+fn pr110_a_tail_status_round_trips_in_every_adoption_state() {
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    for adoption in [
+        Adoptable,
+        NotReady("replay_not_ready"),
+        Refused("base_digest_differs"),
+        Unchecked,
+    ] {
+        let back = status_through_the_wire(adoption).expect("lands");
+        assert_eq!(
+            back.tail_refused.map(|tail| tail.adoption),
+            Some(adoption),
+            "{adoption:?}"
+        );
+    }
+}
+
+/// A status whose tail says `state` and `reason` on the wire, refused on landing, with the
+/// error naming both.
+fn odd_adoption_is_refused(state: &str, reason: Option<&str>) {
+    let mut odd = wire::WireNodeStatus::from(&status());
+    let tail = odd.tail_refused.as_mut().expect("a tail");
+    tail.adoption = state.to_owned();
+    tail.adoption_reason = reason.map(str::to_owned);
+    let error = NodeStatus::try_from(odd).expect_err("an odd state and reason pair");
+    let wire::WireError::Value(text) = error else {
+        panic!("not a value error: {error:?}");
+    };
+    assert_eq!(text, format!("adoption {state:?} with reason {reason:?}"));
+}
+
+/// PR #110 review, wire decoder: `not_ready` naming a failed proof is refused. Unit.
+/// Cut: the state check after `known` removed, red.
+#[test]
+fn pr110_wire_refuses_not_ready_naming_a_failed_proof() {
+    odd_adoption_is_refused("not_ready", Some("base_digest_differs"));
+}
+
+/// PR #110 review, wire decoder: `refused` naming a wait (`replay_not_ready`) is refused. Unit.
+/// Cut: the state check after `known` removed, red.
+#[test]
+fn pr110_wire_refuses_refused_naming_a_wait() {
+    odd_adoption_is_refused("refused", Some("replay_not_ready"));
+}
+
+/// PR #110 review, wire decoder: `adoptable` with a reason is refused. Unit.
+#[test]
+fn pr110_wire_refuses_adoptable_with_a_reason() {
+    odd_adoption_is_refused("adoptable", Some("replay_not_ready"));
+}
+
+/// PR #110 review, wire decoder: `unchecked` with a reason is refused. Unit.
+#[test]
+fn pr110_wire_refuses_unchecked_with_a_reason() {
+    odd_adoption_is_refused("unchecked", Some("base_digest_differs"));
+}
+
+/// PR #110 review, wire decoder: `not_ready` with no reason is refused. Unit.
+#[test]
+fn pr110_wire_refuses_not_ready_without_a_reason() {
+    odd_adoption_is_refused("not_ready", None);
+}
+
+/// PR #110 review, wire decoder: `refused` with no reason is refused. Unit.
+#[test]
+fn pr110_wire_refuses_refused_without_a_reason() {
+    odd_adoption_is_refused("refused", None);
+}
+
+/// PR #110 review, wire decoder: an unknown state word is refused. Unit.
+#[test]
+fn pr110_wire_refuses_an_unknown_adoption_state() {
+    odd_adoption_is_refused("maybe", None);
+}
+
+/// PR #110 review, wire decoder: a reason not in `ADOPTION_REFUSALS` is refused. Unit.
+#[test]
+fn pr110_wire_refuses_an_unknown_adoption_reason() {
+    let mut odd = wire::WireNodeStatus::from(&status());
+    let tail = odd.tail_refused.as_mut().expect("a tail");
+    tail.adoption = "refused".to_owned();
+    tail.adoption_reason = Some("no_such_reason".to_owned());
+    let error = NodeStatus::try_from(odd).expect_err("an unknown reason");
+    assert!(format!("{error:?}").contains("no_such_reason"), "{error:?}");
+}
+
 /// A frame for partition 1 that claims to come from `node`.
 fn frame_from(node: u32) -> Msg {
     let mut frame: rdb_core::contracts::transport::Frame = zero();

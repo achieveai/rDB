@@ -1912,14 +1912,27 @@ fn adoption_from_wire(
             .find(|known| *known == reason)
             .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
     };
-    match (state, reason) {
-        ("adoptable", None) => Ok(Adoptable),
-        ("unchecked", None) => Ok(Unchecked),
-        ("not_ready", Some(reason)) => Ok(NotReady(known(reason)?)),
-        ("refused", Some(reason)) => Ok(Refused(known(reason)?)),
-        (state, reason) => Err(WireError::Value(format!(
+    let mismatch = |state: &str, reason: Option<&str>| {
+        Err(WireError::Value(format!(
             "adoption {state:?} with reason {reason:?}"
-        ))),
+        )))
+    };
+    // PR #110 review: a reason belongs to one state, the one `TailAdoption::of` gives it; a
+    // `not_ready` naming a failed proof, or a `refused` naming a wait, is refused.
+    let adoption = match (state, reason) {
+        ("adoptable", None) => Adoptable,
+        ("unchecked", None) => Unchecked,
+        ("not_ready", Some(reason)) => NotReady(known(reason)?),
+        ("refused", Some(reason)) => Refused(known(reason)?),
+        (state, reason) => return mismatch(state, reason),
+    };
+    match adoption {
+        NotReady(reason) | Refused(reason)
+            if crate::host::TailAdoption::of::<()>(&Err(reason)) != adoption =>
+        {
+            mismatch(state, Some(reason))
+        }
+        _ => Ok(adoption),
     }
 }
 

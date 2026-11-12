@@ -1235,7 +1235,7 @@ pub enum TailAdoption {
 
 impl TailAdoption {
     /// The state [`Host::adoption`]'s answer names.
-    fn of<T>(answer: &Result<T, &'static str>) -> Self {
+    pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
             Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
