@@ -6611,7 +6611,7 @@ impl Host {
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
     /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
-    /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
+    /// a shadow, which L1 never counts and R1 catches up by its probe and catch-up cursor; [`Self::shadow_duty`]
     /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
     /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
@@ -6978,8 +6978,8 @@ impl Host {
             })
             .collect();
         // A-R329: a rejoiner that is not pinned is a member a drop left out, linked again as a
-        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it off the
-        // stream; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
+        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it by its
+        // probe and catch-up cursor; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
         let readded = replan.rejoiner.and_then(|node| {
             let left = self
                 .left_out
@@ -8135,7 +8135,7 @@ impl Host {
 
     /// M11 thin slice: move the copy on `from` to `to`, or say where that move stands. Only the
     /// pinned primary takes it. The move is two re-plans through the restart machinery: the
-    /// first pins `to` as a shadow (R1 catches it up off the stream, from seq 1), and once it
+    /// first pins `to` as a shadow (R1 catches it up by its probe and catch-up cursor, from seq 1), and once it
     /// reaches the cutoff [`Self::shadow_duty`] pins it regular and leaves `from` out in one
     /// commit. Membership changes only by those commits. Asking again resumes: the intent is
     /// in memory, and once `to` is pinned as a shadow the pin itself says what is moving (D2).
@@ -8466,7 +8466,7 @@ impl Host {
 
     /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
     /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
-    /// [`move_copy_id`]; R1 feeds it off the stream and F1's barrier skips it.
+    /// [`move_copy_id`]; R1 feeds it by its probe and catch-up cursor, and F1's barrier skips it.
     fn move_shadow(
         &self,
         partition: PartitionId,

@@ -2080,7 +2080,7 @@ fn role_of_three(trio: &Trio) -> Option<ReplicaRole> {
 /// b15 (A-R329, A-R336 option 3): node 3 restarts after node 1 has decided to drop it. The
 /// drop commits without node 3, and since it left out a member that has started again while
 /// the commit pins two regular copies, node 1 re-plans with node 3 as a shadow. L1 never
-/// counts it, so writes go on at rf2 while R1 catches it up off the stream. Once it has applied
+/// counts it, so writes go on at rf2 while R1 catches it up by its probe and catch-up cursor. Once it has applied
 /// the cutoff, node 1 promotes it: the next commit pins it as a regular secondary, synced in
 /// the barrier, and a put lands there. It is never dropped again. Node 3 restarts as a new
 /// host ([`restart`]), so the frames it sends carry the boot the commit pins.
