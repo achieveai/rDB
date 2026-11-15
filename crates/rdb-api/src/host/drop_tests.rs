@@ -8076,9 +8076,11 @@ fn issue107_r_a_paused_drop_with_no_link_loss_stays_restart_only() {
 }
 
 /// Seeds node 1 with a second due return beside node 3's on partition 1: partition 2, a copy
-/// of partition 1's commit, with `left` (pinned on partition 1) left out of it at the boot it
-/// runs and recorded as a clocked drop. Its link hold starts at `older`, partition 1's 100 ms
-/// later, so partition 2 is the one linked longest. Returns partition 2.
+/// of partition 1's commit, with `left` left out of it at the boot it runs and recorded as a
+/// clocked drop. Node 3 is already left out of partition 1, so for `left == NodeId(3)` the
+/// commit is copied as it is and partition 1's left-out entry with it; any other `left` must be
+/// pinned on partition 1, and is removed from the copied pin. Its link hold starts at `older`,
+/// partition 1's 100 ms later, so partition 2 is the one linked longest. Returns partition 2.
 fn seed_second_return(trio: &mut Trio, left: NodeId, older: Tick) -> PartitionId {
     let p2 = PartitionId(2);
     let one = &mut trio.nodes[0].0;

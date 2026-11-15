@@ -455,16 +455,20 @@ is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logge
 runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
 
 **Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
-receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default) is
-the only way in to the first two: with it off, neither runs on any node, and `db_open` and
-`membership_drop_planned` carry the fields they had before slice 2a.
+receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default)
+gates the new parts of the first two. With it off, no owner starts a same-boot return and no
+node marks a refused receiver, and `db_open` and `membership_drop_planned` carry the fields they
+had before slice 2a. Check A, at the start of the second rule, is not gated: it runs on every
+node whatever the setting, as check B does (slice 1, above).
 
 - **Same-boot return.** An owner whose own drop clock left a copy out (the unreachable clock, or
   the paused clock with the copy's link seen down) may pin it again at the boot it still runs,
   not only at a newer one. The copy's link must have stayed up on one connection for 5 s (a
   reconnect starts that again), no re-plan, rebuild or move may be under way, the commit must
-  take writes with a slot free, and the copy must answer an `Inspect` within two drop checks
-  (400 ms) with no fault. It is pinned as a shadow, lands, is caught up and is promoted exactly
+  take writes with a slot free, and the copy must answer an `Inspect` with no fault. The owner
+  reads the answer at its next drop check (every 200 ms), so the answer must be queued by then;
+  400 ms after the probe was sent is the cutoff for a late read, past which a queued answer is
+  refused as stale. It is pinned as a shadow, lands, is caught up and is promoted exactly
   as a restarted copy is: the landing guards above, and check B, apply unchanged. One attempt
   per drop. A copy whose probe cannot be sent, is not answered in time, answers a fault, or is
   not taken waits a whole 5 s again.
@@ -484,8 +488,10 @@ the only way in to the first two: with it off, neither runs on any node, and `db
   `on_recovered` runs and builds a fresh receiver from the barrier's proof of this copy, or at
   the root. So the mark on a dormant receiver matters only when an earlier generation's
   `Recovered`, delivered in the same due batch as the later refused landing, rebuilds the copy
-  first; the fresh receiver takes over the dormant one's marks for later generations. Marks are
-  kept per generation; a `Recovered` clears its own and every older one, so two refusals before
+  first; the fresh receiver takes over the dormant one's marks for later generations. Rows:
+  rdb-core `issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild`, and
+  host `issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_due_batch`,
+  which runs the due batch through the host's own landing. Marks are kept per generation; a `Recovered` clears its own and every older one, so two refusals before
   either `Recovered` keep both.
 
   **With the setting off** nothing is marked, and a receiver kept in a `ReadOnly` commit

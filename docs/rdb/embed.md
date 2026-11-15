@@ -683,8 +683,9 @@ on (below).
 
 **`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
 it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
-its own, as an owner. With it on, a copy the owner dropped on one of the two clocks above comes
-back by itself once its link is back:
+its own, both as an owner (to re-add a copy it dropped) and as a returning copy (to mark a
+landing it refused, see below). With it on, a copy the owner dropped on one of the two clocks
+above comes back by itself once its link is back:
 
 - **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
   copy's link go down. A copy that stayed linked while it held writes up (a slow disk, say)
@@ -704,9 +705,16 @@ back by itself once its link is back:
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
 - **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
   it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. A copy whose node has it off, or runs an older build, can be added back by an
-  owner that has it on; if that happens while the partition is read-only, the partition can stay
-  read-only until that copy's node restarts (ADR-rdb-0009 section 7).
+  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
+  older build. The re-add itself needs a partition that takes writes. But if the partition goes
+  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
+  and the partition can then stay read-only until that copy's node restarts. A build older than
+  check B can also be left holding a lineage with a hole in it, which nothing refuses
+  (ADR-rdb-0009 section 7).
+- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
+  them apart. Turning it on by default first needs the protocol version raised to 10, or a
+  capability bit that gates the re-add, so a node without these guards is refused or never
+  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
