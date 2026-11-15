@@ -112,7 +112,9 @@ impl AppendReceiver {
     pub fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<EffectKind> {
         self.recovery_plan = None;
         // #107 slice 2a: a generation the host refused to link never anchors below its cutoff.
-        let refused = self.refused_landing.take() == Some(result.new_generation);
+        let refused = self.refused_landings.contains(&result.new_generation);
+        self.refused_landings
+            .retain(|generation| *generation > result.new_generation);
         let config = &result.committed.pinned_config;
         let invalid = || {
             vec![ignored(KernelIgnoredReason::Replica(

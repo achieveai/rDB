@@ -7240,3 +7240,122 @@ fn issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_an
     let faults = logged!(METHOD, "host_fault");
     assert!(faults.is_empty(), "{faults:?}");
 }
+
+/// #107 slice 2a review: node 3 dropped by the unreachable clock with the live re-add on, every
+/// link healed, and the trio no longer stepped, so a row calls node 1's
+/// [`Host::live_readd_duty`] itself at the ticks it names and reads node 3's mail by hand.
+/// Node 1 passes every check but the link hold. Returns the trio and the tick to start from.
+fn due_return(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> (Trio, Tick) {
+    let (mut trio, before) = started(dir, |host| {
+        live(host);
+        tune(host);
+    });
+    blip_three(&mut trio, before, false);
+    trio.links.heal_all();
+    let one = &trio.nodes[0].0;
+    assert!(
+        one.drop_clocked.contains_key(&(P1, NodeId(3))),
+        "a drop to return"
+    );
+    assert_eq!(one.live_readd_refusal(P1, NodeId(3)), None);
+    assert!(one.live_readd_since.is_empty(), "no hold started yet");
+    // Node 3's mail so far: what the hold kept back. None of it is asked for here.
+    while trio.nodes[2].2.try_recv().is_ok() {}
+    let now = trio.clock.now();
+    (trio, now)
+}
+
+/// The `Inspect`s node 3 was sent since the last call, unanswered, in order. Everything else
+/// in its mailbox is thrown away: the trio is not stepped again.
+fn inspects_on_three(trio: &Trio) -> Vec<(PartitionId, Sender<NodeStatus>)> {
+    std::iter::from_fn(|| trio.nodes[2].2.try_recv().ok())
+        .filter_map(|msg| match msg {
+            Msg::Inspect { partition, reply } => Some((partition, reply)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Answer `asked` as node 3 would, with `fault` in its status.
+fn answer_as_three(
+    trio: &Trio,
+    asked: Vec<(PartitionId, Sender<NodeStatus>)>,
+    fault: Option<&str>,
+) {
+    for (partition, reply) in asked {
+        let mut status = trio.nodes[2].0.status(partition);
+        status.fault = fault.map(str::to_owned);
+        reply.send(status).expect("node 1 holds the probe");
+    }
+}
+
+/// The partition node 1's one live re-add probe is out for, if any.
+fn probed(trio: &Trio) -> Option<PartitionId> {
+    trio.nodes[0]
+        .0
+        .live_readd_probe
+        .as_ref()
+        .map(|(_, partition, _)| *partition)
+}
+
+/// Whether node 1 runs the re-plan that re-adds node 3 to `partition`.
+fn readd_started(trio: &Trio, partition: PartitionId) -> bool {
+    matches!(
+        trio.nodes[0].0.rejoins.get(&partition),
+        Some(Rejoin::Revoking { replan, .. }) if replan.rejoiner == Some(NodeId(3))
+    )
+}
+
+/// Blocker 1 (#107 slice 2a review), two keys: a copy whose `Inspect` goes unanswered sits out a
+/// whole hold, so the other due copy is probed and started. Node 1 left out node 3 on
+/// partition 1 and, seeded beside it, on a partition 2 that copies partition 1's commit and
+/// left-out entry; partition 2's link hold is the older, so it is picked first. Its probe is
+/// withheld: at the next check node 1 logs `live_readd_unanswered` and holds no probe, at the
+/// check after it probes partition 1, and once that is answered it starts partition 1's re-add.
+/// Cut: no hold restart on an unanswered probe, red (partition 2 is probed again at the third
+/// check, and partition 1 never is).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r1_an_unanswered_copy_sits_out_a_hold_and_another_partition_starts() {
+    const METHOD: &str =
+        "issue107_r1_an_unanswered_copy_sits_out_a_hold_and_another_partition_starts";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = PartitionId(2);
+    let one = &mut trio.nodes[0].0;
+    let committed = one.committed[&P1].clone();
+    one.committed.insert(p2, committed);
+    let left = one.left_out[&P1].clone();
+    one.left_out.insert(p2, left);
+    let why = one.drop_clocked[&(P1, NodeId(3))];
+    one.drop_clocked.insert((p2, NodeId(3)), why);
+    one.live_readd_since.insert((p2, NodeId(3)), t0);
+    one.live_readd_since
+        .insert((P1, NodeId(3)), t0.plus_millis(100));
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    assert_eq!(probed(&trio), Some(p2), "the older hold first");
+    let withheld = inspects_on_three(&trio);
+    assert_eq!(withheld.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [p2]);
+
+    trio.nodes[0].0.live_readd_duty(at(200));
+    let unanswered = logged!(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(unanswered[0]["partition"], 2, "{unanswered:?}");
+    assert_eq!(probed(&trio), None, "partition 2 sits out a hold");
+    assert!(inspects_on_three(&trio).is_empty());
+    drop(withheld);
+
+    trio.nodes[0].0.live_readd_duty(at(400));
+    assert_eq!(probed(&trio), Some(P1), "the healthy copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(600));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    let planned = logged!(METHOD, "live_readd_planned");
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["partition"], 1, "{planned:?}");
+}

@@ -535,10 +535,20 @@ fn declined(module: &mut Replication, ev: &Event) {
 /// A committed takeover to `NEW_GEN`/`NEW_EPOCH` at revision `REVISION`, pinning `pinned`,
 /// whose selected prefix ends at `(cutoff, cutoff_digest)` of generation `GEN`.
 fn recovered(cutoff: u64, cutoff_digest: Digest, pinned: PartitionConfig) -> Event {
+    recovered_at(NEW_GEN, cutoff, cutoff_digest, pinned)
+}
+
+/// [`recovered`] to `generation` instead of `NEW_GEN`.
+fn recovered_at(
+    generation: Generation,
+    cutoff: u64,
+    cutoff_digest: Digest,
+    pinned: PartitionConfig,
+) -> Event {
     let cutoff = Seq(cutoff);
     let root = Lineage {
         partition: P,
-        generation: NEW_GEN,
+        generation,
         owner_epoch: NEW_EPOCH,
     };
     let result = RecoveryResult {
@@ -561,7 +571,7 @@ fn recovered(cutoff: u64, cutoff_digest: Digest, pinned: PartitionConfig) -> Eve
             cutoff_digest,
             source: CopyId(2),
         },
-        new_generation: NEW_GEN,
+        new_generation: generation,
         mode: PartitionMode::Active,
         barrier: RecoveryBarrier::try_new(&[], &Default::default(), cutoff, cutoff_digest)
             .expect("an empty required set needs no proof"),
@@ -1573,6 +1583,42 @@ fn issue107_31b_a_receiver_refused_at_a_generation_never_anchors_below_its_cutof
     let effects = step(&mut other, &recovered(13, d(13), takeover_config()));
     asks_new_primary(&effects, 12);
     assert_eq!(rx(&other).applied_head(), head(12));
+}
+
+/// Blocker 2 (#107 slice 2a review): refusal evidence is kept per generation. B's host refuses two
+/// `ReadOnly` landings in one due batch, at `NEW_GEN` and at the generation after it, before
+/// either `Recovered` arrives. `NEW_GEN`'s cutoff is 11, which B holds (`Match`): it anchors there,
+/// a proved cutoff. The next generation's cutoff is 13, which B does not hold (`NotRetained`):
+/// it anchors at the root, and not at 11, the rung the first `Recovered` left it on.
+/// Cut: one slot for the mark (the second refusal overwrites the first, and the first
+/// `Recovered` clears it), red (the second anchors at `have: Seq(11)`).
+#[retcd_test]
+fn issue107_b2_two_refusals_in_one_batch_each_keep_their_own_anchor() {
+    let next = Generation(NEW_GEN.0 + 1);
+    let mut module = applied_to(12);
+    assert!(module.refuse_landing(B, P, NEW_GEN));
+    assert!(module.refuse_landing(B, P, next));
+
+    let effects = step(&mut module, &recovered(11, d(11), takeover_config()));
+    asks_new_primary(&effects, 11);
+    assert_eq!(rx(&module).applied_head(), head(11), "the proved cutoff");
+
+    let effects = step(
+        &mut module,
+        &recovered_at(next, 13, d(13), takeover_config()),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        }),
+        "the second refusal anchors at the root"
+    );
+    let rx_ = rx(&module);
+    assert_eq!(rx_.applied_head(), root_head());
+    assert_eq!(rx_.lineage().generation, next);
 }
 
 /// The plan's fixture: B at `(15, d15)`, 16 staged, durable 12, quarantined; the takeover's

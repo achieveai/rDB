@@ -7143,7 +7143,9 @@ impl Host {
     /// the partition, and the copy is left out at the boot its link reports. Then its link
     /// must have stayed up for `live_readd_hold_millis`, and it must answer an `Inspect` within
     /// one check with no fault. Rev 5 m4: one due copy per check, the one linked longest, so
-    /// at most one probe per check reaches a peer's Host thread.
+    /// at most one probe per check reaches a peer's Host thread. A copy whose probe is not
+    /// sent or not answered, or answers a fault, sits out a whole hold again
+    /// ([`Self::live_readd_unanswered`]), so it cannot keep the other due copies from a probe.
     ///
     /// One attempt per drop: the plan's start spends the entry, so a re-add F1 blocks, or a
     /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
@@ -7193,32 +7195,41 @@ impl Host {
             self.live_readd_probe = None;
             return;
         };
-        // The answer to last check's probe of this same copy. In this process the answer comes
-        // back over its own channel, not over `Links`, so a dropped direction back to this node
-        // counts as no answer, as in [`Self::repair_duty`].
-        let answer = match self.live_readd_probe.take() {
+        // Last check's probe, when it was of this same copy.
+        let probe = match self.live_readd_probe.take() {
             Some((sent, probed, (probed_node, answer)))
-                if (probed, probed_node) == (partition, node)
-                    && HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS
-                    && !self.links.dropped().contains(&(node, self.node)) =>
+                if (probed, probed_node) == (partition, node) =>
             {
-                answer.try_recv().ok()
+                Some((sent, answer))
             }
             _ => None,
         };
-        let Some(status) = answer else {
+        let Some((sent, answer)) = probe else {
             let (reply, answer) = mpsc::channel();
             let probe = Msg::Inspect { partition, reply };
-            if self.links.send(self.node, node, probe).is_ok() {
-                tracing::debug!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    probed = node.0,
-                    linked_ms,
-                    "live_readd_probed"
-                );
-                self.live_readd_probe = Some((now, partition, (node, answer)));
+            if self.links.send(self.node, node, probe).is_err() {
+                self.live_readd_unanswered(partition, node, now, "send_failed");
+                return;
             }
+            tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                probed = node.0,
+                linked_ms,
+                "live_readd_probed"
+            );
+            self.live_readd_probe = Some((now, partition, (node, answer)));
+            return;
+        };
+        // Its answer, within one check. In this process the answer comes back over its own
+        // channel, not over `Links`, so a dropped direction back to this node counts as no
+        // answer, as in [`Self::repair_duty`].
+        let answer = (HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS
+            && !self.links.dropped().contains(&(node, self.node)))
+        .then(|| answer.try_recv().ok())
+        .flatten();
+        let Some(status) = answer else {
+            self.live_readd_unanswered(partition, node, now, "no_answer");
             return;
         };
         if let Some(fault) = status.fault {
@@ -7263,6 +7274,28 @@ impl Host {
             linked_ms,
             "live_readd_planned"
         );
+    }
+
+    /// #107 (review blocker 1): the probe of a due copy went unsent or unanswered, so the copy
+    /// sits out a whole link hold from `now` before it is probed again. Without that it stays
+    /// the copy linked longest, and every check probes it again while no other due copy, on any
+    /// partition, is ever probed.
+    fn live_readd_unanswered(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        now: Tick,
+        why: &'static str,
+    ) {
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            left_out = node.0,
+            why,
+            retry_in_ms = self.live_readd_hold_millis,
+            "live_readd_unanswered"
+        );
+        self.live_readd_since.insert((partition, node), now);
     }
 
     /// #107: why [`Self::live_readd_duty`] may not re-add `node` to `partition` now, or `None`.
