@@ -3680,6 +3680,9 @@ impl Host {
     /// reported, and any waiter still open is answered with it; a later fault is only logged
     /// (PR #60 review F4).
     fn set_fault(&mut self, fault: Fault) {
+        // #84 review: a faulted node admits nothing, so its owner views go before any waiter
+        // reads the fault below.
+        self.owner_views.revoke();
         let fault = match self.fault.take() {
             Some(first) => {
                 tracing::error!(
@@ -5304,6 +5307,7 @@ impl Host {
         let pending = waiter.remove();
         let PendingKind::Txn(request) = pending.kind else {
             return Err(fail_waiter(
+                &self.owner_views,
                 &pending.reply,
                 format!(
                     "a put's expiry met request {}'s {:?}",
@@ -5390,7 +5394,7 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
-        self.owner_views.publish(*view, self.clock);
+        self.owner_views.publish(*view, self.clock, at);
         // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
         // history; a later fence of either scope must not reuse it.
         if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
@@ -5588,6 +5592,7 @@ impl Host {
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
             return Err(fail_waiter(
+                &self.owner_views,
                 &reply,
                 format!(
                     "no module answered request {}'s status query",
@@ -13143,7 +13148,7 @@ impl Host {
                     }],
                     remaining_millis,
                 )
-                .map_err(|detail| fail_waiter(&reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &reply, detail))?
             {
                 Ok(Some(request)) => (
                     identity,
@@ -13172,7 +13177,7 @@ impl Host {
             } => {
                 let answer = match self
                     .compile(partition, identity, &puts, remaining_millis)
-                    .map_err(|detail| fail_waiter(&reply, detail))?
+                    .map_err(|detail| fail_waiter(&self.owner_views, &reply, detail))?
                 {
                     Ok(Some(request)) => Answer::Compiled(request),
                     Ok(None) => Answer::Unchanged,
@@ -13701,6 +13706,7 @@ impl Host {
                 },
                 ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => {
                     return Err(fail_waiter(
+                        &self.owner_views,
                         &waiter,
                         format!("reply {} to a status query", reply_name(reply)),
                     ));
@@ -13736,10 +13742,11 @@ impl Host {
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
                 .read_answer(partition, *outcome, *value, &root, &look)
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &pending.reply, detail))?
                 .in_mode(self.recovery_mode(partition)),
             (reply, kind) => {
                 return Err(fail_waiter(
+                    &self.owner_views,
                     &pending.reply,
                     format!(
                         "reply {} does not answer a pending {kind:?}",
@@ -13818,6 +13825,7 @@ impl Host {
         };
         let PendingKind::Previous(root) = pending.kind else {
             return Err(fail_waiter(
+                &self.owner_views,
                 &pending.reply,
                 format!(
                     "a previous-view answer for request {} that asked {:?}",
@@ -13836,6 +13844,7 @@ impl Host {
             Ok(handle) => {
                 let view = self.bound.get(&handle).ok_or_else(|| {
                     fail_waiter(
+                        &self.owner_views,
                         &pending.reply,
                         format!("previous view {} is not bound", handle.0),
                     )
@@ -13847,7 +13856,7 @@ impl Host {
                     &Look::Doc,
                     ReadServiceOutcome::Served,
                 )
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &pending.reply, detail))?
                 .in_mode(self.recovery_mode(partition))
             }
         };
@@ -14328,8 +14337,10 @@ fn unsupported(node: NodeId, kind: &str) -> Fault {
 
 /// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
 /// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
-/// `fault`, for the node.
-fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+/// `fault`, for the node. `owner_views` is revoked first, as `set_fault` does, so a waiter that
+/// reads the fault and then asks `still_owner` reads false (#84 review).
+fn fail_waiter(owner_views: &OwnerViews, reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+    owner_views.revoke();
     let fault = fault.into();
     let _ = reply.send(Answer::Error {
         error: fault.error(),

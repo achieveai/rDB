@@ -60,7 +60,7 @@ use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{Db, DbConfig, NodeId, OwnerToken, PartitionId, Timeouts};
+use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, PartitionId, Timeouts};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -365,19 +365,70 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 /// How often [`watch_ownership`] reads each partition's ownership.
 const OWNERSHIP_POLL: Duration = Duration::from_millis(10);
 
+/// One change [`poll_ownership`] saw for a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipSeen {
+    /// This node started leading it, or leads it again after a lapse.
+    Held(Ownership),
+    /// `still_owner` turned false for the token last held.
+    Lapsed(PartitionId, OwnerToken),
+}
+
+/// One poll of partitions `1..=partitions`: a held token whose `still_owner` reads false is
+/// reported lapsed and forgotten, then a partition not held whose `ownership` answers is
+/// reported held. `held` carries the tokens from poll to poll.
+fn poll_ownership(
+    held: &mut BTreeMap<PartitionId, OwnerToken>,
+    partitions: u32,
+    ownership: impl Fn(PartitionId) -> Option<Ownership>,
+    still_owner: impl Fn(PartitionId, OwnerToken) -> bool,
+) -> Vec<OwnershipSeen> {
+    let mut seen = Vec::new();
+    for partition in (1..=partitions).map(PartitionId) {
+        if let Some(token) = held.get(&partition).copied() {
+            if still_owner(partition, token) {
+                continue;
+            }
+            held.remove(&partition);
+            seen.push(OwnershipSeen::Lapsed(partition, token));
+        }
+        if let Some(owned) = ownership(partition) {
+            held.insert(partition, owned.token);
+            seen.push(OwnershipSeen::Held(owned));
+        }
+    }
+    seen
+}
+
+/// Poll every [`OWNERSHIP_POLL`] until `done`, handing each change to `report`.
+fn watch_ownership_with(
+    done: &AtomicBool,
+    partitions: impl Fn() -> u32,
+    ownership: impl Fn(PartitionId) -> Option<Ownership>,
+    still_owner: impl Fn(PartitionId, OwnerToken) -> bool,
+    mut report: impl FnMut(OwnershipSeen),
+) {
+    let mut held: BTreeMap<PartitionId, OwnerToken> = BTreeMap::new();
+    while !done.load(Ordering::Relaxed) {
+        for seen in poll_ownership(&mut held, partitions(), &ownership, &still_owner) {
+            report(seen);
+        }
+        std::thread::sleep(OWNERSHIP_POLL);
+    }
+}
+
 /// #84's manual entry point: log each partition this node starts leading, `ownership_held`
 /// with its owner token, and the first poll at which `Db::still_owner` is false for that token,
 /// `ownership_lapsed`. Polled every [`OWNERSHIP_POLL`], so a lapse line is up to that much after
 /// the tick write admission stopped; the lapse itself is never later than admission's.
 fn watch_ownership(db: &Db, node: NodeId, done: &AtomicBool) {
-    let mut held: BTreeMap<PartitionId, OwnerToken> = BTreeMap::new();
-    while !done.load(Ordering::Relaxed) {
-        for partition in (1..=db.partition_count()).map(PartitionId) {
-            if let Some(token) = held.get(&partition).copied() {
-                if db.still_owner(partition, token) {
-                    continue;
-                }
-                held.remove(&partition);
+    watch_ownership_with(
+        done,
+        || db.partition_count(),
+        |partition| db.ownership(partition),
+        |partition, token| db.still_owner(partition, token),
+        |seen| match seen {
+            OwnershipSeen::Lapsed(partition, token) => {
                 tracing::warn!(
                     node = node.0,
                     partition = partition.0,
@@ -391,11 +442,10 @@ fn watch_ownership(db: &Db, node: NodeId, done: &AtomicBool) {
                     node.0, partition.0
                 );
             }
-            if let Some(owned) = db.ownership(partition) {
-                held.insert(partition, owned.token);
+            OwnershipSeen::Held(owned) => {
                 tracing::info!(
                     node = node.0,
-                    partition = partition.0,
+                    partition = owned.partition.0,
                     generation = owned.token.generation.0,
                     owner_epoch = owned.token.owner_epoch.0,
                     token = %owned.token,
@@ -404,12 +454,11 @@ fn watch_ownership(db: &Db, node: NodeId, done: &AtomicBool) {
                 );
                 println!(
                     "rdb_node ownership node={} partition={} token={}",
-                    node.0, partition.0, owned.token
+                    node.0, owned.partition.0, owned.token
                 );
             }
-        }
-        std::thread::sleep(OWNERSHIP_POLL);
-    }
+        },
+    );
 }
 
 /// Run node `--node` of the database in `--dir` until `--stop-file` appears.
@@ -585,5 +634,98 @@ mod tests {
         assert_eq!(apps(&["--admin-apps", "ops, admin"]), ["admin", "ops"]);
         assert_eq!(apps(&["--admin-apps", " ops ,  admin "]), ["admin", "ops"]);
         assert_eq!(apps(&["--admin-apps", " , "]), Vec::<String>::new());
+    }
+
+    /// own84_10 (#84 review): the watcher's transitions. A partition is reported held once, then
+    /// lapsed at the first poll `still_owner` reads false, then held again on reacquire, with
+    /// the same token after a self-replace or a higher one after a promote. Unit.
+    #[test]
+    fn own84_10_the_watcher_reports_held_lapsed_and_reacquired() {
+        use super::{poll_ownership, OwnershipSeen};
+        use rdb_api::{Generation, NodeId, OwnerEpoch, OwnerToken, Ownership, PartitionId};
+        use std::cell::Cell;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let p = PartitionId(1);
+        let token = |g, e| OwnerToken {
+            generation: Generation(g),
+            owner_epoch: OwnerEpoch(e),
+        };
+        let owned = |t| Ownership {
+            node: NodeId(1),
+            partition: p,
+            token: t,
+            remaining: Duration::from_millis(5),
+        };
+        // What the node owns now; `still_owner` is true for exactly that token.
+        let now: Cell<Option<OwnerToken>> = Cell::new(None);
+        let mut held = BTreeMap::new();
+        let mut poll = || {
+            poll_ownership(
+                &mut held,
+                1,
+                |q| now.get().filter(|_| q == p).map(owned),
+                |q, t| q == p && now.get() == Some(t),
+            )
+        };
+        assert_eq!(poll(), [], "nothing owned");
+        now.set(Some(token(1, 1)));
+        assert_eq!(poll(), [OwnershipSeen::Held(owned(token(1, 1)))]);
+        assert_eq!(poll(), [], "held: no repeat");
+        now.set(None);
+        assert_eq!(poll(), [OwnershipSeen::Lapsed(p, token(1, 1))]);
+        assert_eq!(poll(), [], "lapsed: no repeat");
+        now.set(Some(token(1, 1)));
+        assert_eq!(
+            poll(),
+            [OwnershipSeen::Held(owned(token(1, 1)))],
+            "the same token again"
+        );
+        now.set(Some(token(2, 2)));
+        assert_eq!(
+            poll(),
+            [
+                OwnershipSeen::Lapsed(p, token(1, 1)),
+                OwnershipSeen::Held(owned(token(2, 2)))
+            ],
+            "a higher token in one poll: the old lapses first"
+        );
+    }
+
+    /// own84_10b: the watcher thread ends once `done` is set, so `serve`'s scope joins it at
+    /// shutdown; within a few polls. Unit (~20 ms).
+    #[test]
+    fn own84_10b_the_watcher_stops_when_done_and_is_joined() {
+        use super::{watch_ownership_with, OWNERSHIP_POLL};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::Instant;
+
+        let done = AtomicBool::new(false);
+        let polls = AtomicU32::new(0);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_ownership_with(
+                    &done,
+                    || {
+                        polls.fetch_add(1, Ordering::Relaxed);
+                        4
+                    },
+                    |_| None,
+                    |_, _| false,
+                    |seen| panic!("nothing is owned: {seen:?}"),
+                );
+            });
+            while polls.load(Ordering::Relaxed) < 2 {
+                std::thread::yield_now();
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        assert!(
+            started.elapsed() < OWNERSHIP_POLL * 50,
+            "joined after {:?}",
+            started.elapsed()
+        );
     }
 }

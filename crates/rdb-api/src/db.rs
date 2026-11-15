@@ -3534,11 +3534,13 @@ impl Db {
     /// Whether a node this process runs still leads `partition` under `token`: write
     /// admission's own view test (check 6), on that node's clock. False from the tick write
     /// admission stops for `token`, and after a fence (frozen grant, revoked epoch) before the
-    /// node admits another write. Never true for a token older than the one the node serves.
+    /// node admits another write, however its clock is stepped after. False for good once the
+    /// node faults, before any caller is answered with the fault. Never true for a token older
+    /// than the one the node serves.
     ///
     /// Fails closed. `true` means no other node can hold `token`'s partition now; it does not
-    /// mean the partition takes writes (a frozen or read-only partition refuses them under a
-    /// view that still admits). It is a filter, not a proof: a process paused between this check
+    /// mean the partition takes writes (a frozen queue, an L1 pause or a read-only recovery
+    /// refuses them under a view that still admits: checks 7 and 8). It is a filter, not a proof: a process paused between this check
     /// and its effect can still act late, so the destination must reject a lower token. After a
     /// lapse with no promote, the node takes a new grant and the same token is owned again, as
     /// write admission admits it again.

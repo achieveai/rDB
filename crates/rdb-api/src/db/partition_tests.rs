@@ -2230,7 +2230,9 @@ fn node_status_in_shows_a_partitions_own_note_and_refuses_an_unknown_partition()
 
 /// own84_5 (#84): the owner token grows across a promote. Node 2's token for partition 2 is
 /// lower than node 3's after the move; once node 2 stops, no node here owns its old token, and
-/// the token the new owner holds is the one it writes under.
+/// the token the new owner holds is the one it writes under. Both public calls fail closed on
+/// what no local node leads: an app-only `Db` over the same nodes, partition 0, and a partition
+/// this `Db` does not have.
 /// Integration (~10 s): a promote waits out node 2's grant.
 #[config_log::retcd_test]
 fn own84_5_token_grows_across_a_promote() {
@@ -2244,6 +2246,32 @@ fn own84_5_token_grows_across_a_promote() {
     assert_eq!(old.node, NodeId(2), "{old:?}");
     assert!(db.still_owner(PART2, old.token));
     assert!(db.ownership(PART3).is_some_and(|o| o.node == NodeId(3)));
+    for partition in [PartitionId(0), PartitionId(99)] {
+        assert_eq!(db.ownership(partition), None, "{partition:?}");
+        assert!(!db.still_owner(partition, old.token), "{partition:?}");
+    }
+    let app_dir = config_testkit::fs::temp_dir();
+    let mut app = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::clone(db.links())),
+                client: ClientId(2),
+                ..config(app_dir.path(), None)
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            crate::host::test_budgets(),
+        ))
+        .expect("the app opens");
+    for partition in [PART2, PART3, PartitionId(0), PartitionId(99)] {
+        assert_eq!(app.ownership(partition), None, "app-only: {partition:?}");
+        assert!(
+            !app.still_owner(partition, old.token),
+            "app-only: {partition:?}"
+        );
+    }
+    app.shutdown();
 
     stop_node(&db, 2);
     assert!(
