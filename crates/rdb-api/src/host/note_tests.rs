@@ -480,7 +480,7 @@ fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
 
 /// How long [`s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit`] holds node 2
 /// cut, in milliseconds on the trio's counted clock. An unheld repair asks its revoke well inside
-/// it (`membership_repair_planned` at `linked_ms` 402 on the red run).
+/// it.
 const REPAIR_WINDOW_MILLIS: u64 = 3_000;
 
 fn generation_of(trio: &Trio) -> u64 {
