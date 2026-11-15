@@ -1621,6 +1621,46 @@ fn issue107_b2_two_refusals_in_one_batch_each_keep_their_own_anchor() {
     assert_eq!(rx_.lineage().generation, next);
 }
 
+/// #107 slice 2a review, round 2 (an earlier barrier and a refused landing in one due batch),
+/// through `Replication`: a refusal mark on a dormant receiver outlives the earlier
+/// generation's `Recovered`, which removes that dormant receiver and builds a fresh one. B
+/// holds a dormant receiver at `(10, d10)`. Its host refuses the landing of the generation
+/// after `NEW_GEN` and marks it; then both `Recovered`s arrive, oldest first. `NEW_GEN`'s has
+/// a barrier over B at cutoff 10, so B is rebuilt fresh at the proved `(10, d10)`. The next
+/// one's cutoff is 13, which B does not hold (`NotRetained`): it answers from the root, as
+/// its mark says, and not from 10, the rung the rebuild left it on.
+/// Cut: the dormant receiver's marks not carried to the receiver built in its place, red
+/// (`have: Seq(10)`).
+#[retcd_test]
+fn issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild() {
+    let next = Generation(NEW_GEN.0 + 1);
+    let mut module = dormant_module();
+    assert!(
+        module.refuse_landing(B, P, next),
+        "the dormant receiver is marked"
+    );
+
+    let barrier = requiring(recovered(10, d(10), takeover_config()), &[1], B);
+    step(&mut module, &barrier);
+    assert!(!rx(&module).is_dormant(), "rebuilt fresh");
+    assert_eq!(rx(&module).applied_head(), head(10), "at the proved cutoff");
+
+    let effects = step(
+        &mut module,
+        &recovered_at(next, 13, d(13), takeover_config()),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        }),
+        "the mark set on the dormant receiver holds"
+    );
+    assert_eq!(rx(&module).applied_head(), root_head());
+}
+
 /// The plan's fixture: B at `(15, d15)`, 16 staged, durable 12, quarantined; the takeover's
 /// cutoff is `(15, d15)`, the `Match` arm. Every field the receiver holds is asserted. The
 /// design table's `authority` and `known_boot` rows have no receiver field: the receiver keeps

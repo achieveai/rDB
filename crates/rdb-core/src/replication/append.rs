@@ -334,6 +334,11 @@ impl AppendReceiver {
         self.refused_landings.insert(generation);
     }
 
+    /// The generations [`Self::refuse_landing`] marked that no `Recovered` has cleared yet.
+    pub(crate) fn refused_landings(&self) -> impl Iterator<Item = Generation> + '_ {
+        self.refused_landings.iter().copied()
+    }
+
     /// Keep F1's `plan` for the recovery in flight, replacing any plan held (#79 S3b). A
     /// credentialed append that plan names is checked against the plan's boots instead of the
     /// pin, and against the plan's cutoff for the historical rule (issue #105 unit 2); a plain

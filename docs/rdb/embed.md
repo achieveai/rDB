@@ -702,8 +702,11 @@ back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** Turn it on only once every node runs a build that has it. Older builds
-  speak the same wire version, so nothing refuses the pairing for you.
+- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
+  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
+  pairing for you. A copy whose node has it off, or runs an older build, can be added back by an
+  owner that has it on; if that happens while the partition is read-only, the partition can stay
+  read-only until that copy's node restarts (ADR-rdb-0009 section 7).
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote

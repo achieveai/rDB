@@ -3798,11 +3798,13 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
 /// removed, quarantined or not, and `land_receiver_dropped` names the reason, so the copy
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
-/// receiver stays, as the held tail does, with no `land_receiver_dropped`; it is only marked
-/// refused at this generation (`AppendReceiver::refuse_landing`, #107 row 31b), so its
-/// `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at the root.
-/// Nothing links in any case.
-/// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a).
+/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With `live_readd`
+/// off it stays unchanged. With it on (#107 slice 2a, row 31b) it is also marked refused at
+/// this generation (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused` per
+/// case), so its `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at
+/// the root. Nothing links in any case.
+/// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a);
+/// the mark set whatever the setting, red (an OFF receiver marked).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
 fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() {
@@ -3810,11 +3812,13 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
         "issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit";
     let rt = current_thread();
     let mut writable: Option<RecoveryResult> = None;
-    for (mode, quarantined) in [
-        (PartitionMode::DegradedRf2, false),
-        (PartitionMode::DegradedRf2, true),
-        (PartitionMode::ReadOnly, false),
-        (PartitionMode::ReadOnly, true),
+    for (mode, quarantined, live) in [
+        (PartitionMode::DegradedRf2, false, false),
+        (PartitionMode::DegradedRf2, true, false),
+        (PartitionMode::ReadOnly, false, false),
+        (PartitionMode::ReadOnly, true, false),
+        (PartitionMode::ReadOnly, false, true),
+        (PartitionMode::ReadOnly, true, true),
     ] {
         let dir = config_testkit::fs::temp_dir();
         let path = dir.path().join("node");
@@ -3839,18 +3843,21 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
             quarantine(&mut receiver, &result.committed.pinned_config);
         }
         let mut host = host_over(&path, &rt);
+        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        let case = format!("{mode:?}, quarantined {quarantined}");
+        let case = format!("{mode:?}, quarantined {quarantined}, live_readd {live}");
         assert_eq!(host.land_link(PartitionId(1), &result), Ok(None), "{case}");
         assert_eq!(host.engine.lineages(), held, "{case}: nothing linked");
         let after = host.replication.receiver(NodeId(2), PartitionId(1));
         if mode == PartitionMode::ReadOnly {
-            // #107 slice 2a (lead ruling on row 31b): kept, and marked so it claims nothing of
-            // the lineage it refused; otherwise unchanged.
-            let mut marked = receiver.clone();
-            marked.refuse_landing(result.new_generation);
-            assert_eq!(after, Some(&marked), "{case}: the receiver stays");
+            // #107 slice 2a (lead ruling on row 31b): kept; with the setting on, also marked so
+            // it claims nothing of the lineage it refused. Otherwise unchanged.
+            let mut kept = receiver.clone();
+            if live {
+                kept.refuse_landing(result.new_generation);
+            }
+            assert_eq!(after, Some(&kept), "{case}: the receiver stays");
         } else {
             assert_eq!(after, None, "{case}: the live receiver is dropped");
         }
@@ -3876,7 +3883,13 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
         "one drop per writable case, none in ReadOnly"
     );
     let refused = logged!(METHOD, "land_link_refused");
-    assert_eq!(refused.len(), 4, "every case refused: {refused:?}");
+    assert_eq!(refused.len(), 6, "every case refused: {refused:?}");
+    let marked = logged!(METHOD, "land_receiver_marked_refused");
+    assert_eq!(
+        marked.len(),
+        2,
+        "the two ReadOnly cases with the setting on: {marked:?}"
+    );
 }
 
 /// Issue #107 slice 1, row 5 (#107, check A): check A's success arm. Node 2
@@ -4086,12 +4099,16 @@ fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
 /// takes writes (`DegradedRf2`). The dormant receiver stays installed and no
-/// `land_receiver_dropped` is logged. Nothing links. #107 slice 2a: the receiver it keeps is
-/// marked refused at generation 2 (`AppendReceiver::refuse_landing`, one
-/// `land_receiver_marked_refused`) and is otherwise unchanged: `on_recovered` anchors a dormant
-/// receiver as it does a live one, so generation 2's `Recovered` must not anchor it on a rung
-/// below the cutoff either.
-/// Cut: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is removed).
+/// `land_receiver_dropped` is logged. Nothing links. With `live_readd` off it stays unchanged.
+/// With it on (#107 slice 2a) it is also marked refused at generation 2
+/// (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused`). Generation 2's own
+/// `Recovered` does not read that mark: `Replication::recovered` removes a dormant receiver
+/// first and builds a fresh one from the barrier's proof or the root. The mark matters when an
+/// earlier generation's `Recovered` in the same due batch rebuilds the copy first: the fresh
+/// receiver takes the mark over (rdb-core
+/// `issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild`).
+/// Cuts: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is
+/// removed); the mark set whatever the setting, red (the OFF receiver marked).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
 fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
@@ -4120,26 +4137,38 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
     )
     .expect("a dormant receiver");
     assert!(receiver.is_dormant());
-    let mut host = host_over(&path, &rt);
-    host.replication.install_receiver(receiver.clone());
-    let held = host.engine.lineages();
-    assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
-    assert_eq!(host.engine.lineages(), held, "nothing linked");
-    let mut marked = receiver.clone();
-    marked.refuse_landing(Generation(2));
-    assert_eq!(
-        host.replication.receiver(NodeId(2), PartitionId(1)),
-        Some(&marked),
-        "the dormant receiver stays installed, marked refused at generation 2"
-    );
-    assert_eq!(host.fault, None);
+    for live in [false, true] {
+        let mut host = host_over(&path, &rt);
+        host.live_readd.on = live;
+        host.replication.install_receiver(receiver.clone());
+        let held = host.engine.lineages();
+        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
+        assert_eq!(host.engine.lineages(), held, "nothing linked");
+        let mut kept = receiver.clone();
+        if live {
+            kept.refuse_landing(Generation(2));
+        }
+        assert_eq!(
+            host.replication.receiver(NodeId(2), PartitionId(1)),
+            Some(&kept),
+            "live_readd {live}: the dormant receiver stays installed"
+        );
+        assert_eq!(host.fault, None);
+        assert_eq!(
+            logged!(METHOD, "land_receiver_marked_refused").len(),
+            usize::from(live),
+            "live_readd {live}"
+        );
+    }
     assert_eq!(logged!(METHOD, "land_receiver_dropped").len(), 0);
-    assert_eq!(logged!(METHOD, "land_receiver_marked_refused").len(), 1);
     let refused: Vec<_> = logged!(METHOD, "land_link_refused")
         .into_iter()
         .map(|line| line["reason"].clone())
         .collect();
-    assert_eq!(refused, [serde_json::Value::from("held_past_base")]);
+    assert_eq!(
+        refused,
+        ["held_past_base", "held_past_base"].map(serde_json::Value::from)
+    );
 }
 
 /// Generation 1 of partition 1 at `path`, seqs 1 to 3, with the stored `History` value at seq 1

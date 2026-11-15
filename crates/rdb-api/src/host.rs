@@ -7212,12 +7212,16 @@ impl Host {
     /// One attempt per drop: the plan's start spends the entry, so a re-add F1 blocks, or a
     /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
     ///
-    /// Protocol (Rev 5 m5): the same-boot landing this starts is safe only because every peer
-    /// that completes a handshake at [`crate::net::PROTOCOL_VERSION`] 9 has check A in
-    /// [`Self::land_link`]: a refused landing in a commit that takes writes drops the live
-    /// receiver, so the copy is walked from the root and never turns regular over a hole. Any
-    /// change that weakens check A takes a protocol bump. Check B (`from_has_no_floor`) is a
-    /// backstop; a peer of 1eb3fe0 lacks it, and safety then rests on check A alone.
+    /// Protocol (Rev 5 m5, ADR-rdb-0009 section 7): every peer that completes a handshake at
+    /// [`crate::net::PROTOCOL_VERSION`] 9 has check A in [`Self::land_link`]: a refused landing
+    /// in a commit that takes writes drops the live receiver, so the copy is walked from the root
+    /// and never turns regular over a hole. That covers a writable commit only. A `ReadOnly`
+    /// return keeps the receiver, and is safe only with the copy's refusal mark
+    /// (`AppendReceiver::refuse_landing`) and check B (`from_has_no_floor`), which a peer of
+    /// 1eb3fe0 lacks at the same protocol. Hence the prerequisites there: the setting goes on
+    /// only once every node runs a build with both, on every node (an operator rule while it is
+    /// off by default), and a bump to 10 or a capability bit before it is on by default. Any
+    /// change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none.
@@ -7328,11 +7332,14 @@ impl Host {
             Some(Rejoin::Revoking { replan, .. }) if replan.rejoiner == Some(node)
         );
         if !started {
+            // `rejoin_if_stale` answers `None` when it started a re-plan: here, one for another
+            // member (one at a newer boot than its pin, which the restart path takes first).
+            let why = why.unwrap_or("a re-plan for another member started");
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 left_out = node.0,
-                why = ?why,
+                why,
                 retry_in_ms = self.live_readd.hold_millis,
                 "live_readd_not_planned"
             );
@@ -7410,7 +7417,9 @@ impl Host {
         now: Tick,
         why: &'static str,
     ) {
-        tracing::info!(
+        // Review round 2: a warning, so a copy whose link is up but whose host never answers
+        // stays visible while it keeps the restart warning ([`Self::warn_left_out`]) hidden.
+        tracing::warn!(
             node = self.node.0,
             partition = partition.0,
             left_out = node.0,
@@ -9131,7 +9140,8 @@ impl Host {
             unreachable_ms = ?unreachable_ms,
             unreachable_since = ?unreachable_since.map(|since| since.0),
             durable = blame.durable.0,
-            link_lost = blame.link_lost,
+            // #107 review: a field only with the live re-add on, so the line is unchanged off.
+            link_lost = self.live_readd.on.then_some(blame.link_lost),
             "membership_drop_planned"
         );
         self.blamed.remove(&partition);
@@ -10513,9 +10523,10 @@ impl Host {
     /// handling and keeps whatever receiver it holds. For the refusals after those, in a commit
     /// that takes writes it also drops any live receiver it holds (check A), so it walks up from
     /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
-    /// stays, as the held tail does, but never anchors below the cutoff on this generation's
-    /// `Recovered` (`AppendReceiver::refuse_landing`, #107 row 31b): at the cutoff it holds, or
-    /// at the root, so it is never walked from inside the new prefix. A copy
+    /// stays, as the held tail does; with `live_readd` on it is marked so it never anchors below
+    /// the cutoff on this generation's `Recovered` (`AppendReceiver::refuse_landing`, #107 row
+    /// 31b): at the cutoff it holds, or at the root, so it is never walked from inside the new
+    /// prefix. A copy
     /// refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
     /// writes: the drop duty leaves it out, and it is re-added as a shadow and walked up from the
@@ -10724,10 +10735,15 @@ impl Host {
                 // anchors at the cutoff it holds, or at the root, as a restarted copy's fresh
                 // receiver does, so R1 never walks it from inside the new generation's prefix.
                 // Which of the two is known only at the `Recovered`, so the line says marked,
-                // not where it anchors.
-                if self
-                    .replication
-                    .refuse_landing(self.node, partition, generation)
+                // not where it anchors. Review round 2: only with `live_readd` on. Off, nothing
+                // new happens here, and the receiver anchors as before slice 2a. The owner that
+                // re-adds a copy cannot tell it its own setting (neither the plan nor the result
+                // carries one), so this copy's setting stands in for it: set it the same on
+                // every node (ADR-rdb-0009 section 7).
+                if self.live_readd.on
+                    && self
+                        .replication
+                        .refuse_landing(self.node, partition, generation)
                 {
                     tracing::info!(
                         node,

@@ -137,7 +137,15 @@ pub struct Timeouts {
     /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
     /// operator, a move or a promote still returns only when its node restarts. One attempt per
     /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
-    /// until the 512-partition acceptance run passes. Read by each node process, as an owner.
+    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
+    /// owner and as a returning copy (which marks a refused landing only with it on).
+    ///
+    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
+    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
+    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
+    /// setting off, a read-only return can leave the partition read-only until that copy
+    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
+    /// moves to 10, or a capability bit gates the re-add.
     pub live_readd: bool,
 }
 
@@ -1254,6 +1262,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The `db_open` line. #107 review: `live_readd` is a field only when the setting is on (a
+/// `None` field is not recorded), so with it off the line keeps the fields it had before the
+/// setting existed.
+fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, live_readd: bool) {
+    tracing::info!(
+        dedup_cap = limits.dedup_cap,
+        dedup_retention_ms = budgets.dedup_retention_millis,
+        unreachable_drop_after_ms,
+        live_readd = live_readd.then_some(true),
+        "db_open"
+    );
+}
+
 impl Db {
     /// Open `config.dir` against `store`: start three nodes on it and serve partition 1.
     ///
@@ -1320,13 +1341,7 @@ impl Db {
         };
         let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
         let live_readd = config.timeouts.live_readd;
-        tracing::info!(
-            dedup_cap = limits.dedup_cap,
-            dedup_retention_ms = budgets.dedup_retention_millis,
-            unreachable_drop_after_ms = unreachable_drop_after_millis,
-            live_readd,
-            "db_open"
-        );
+        log_open(&limits, &budgets, unreachable_drop_after_millis, live_readd);
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
@@ -7593,6 +7608,50 @@ mod tests {
         let empty = db.txn(&[], deadline).expect_err("an empty txn");
         assert_eq!(empty.error.kind, ErrorKind::InvalidArgument, "{empty:?}");
         db.shutdown();
+    }
+
+    /// #107 review: with `Timeouts::live_readd` off, `db_open` carries exactly the fields it had
+    /// before the setting existed; on, the same fields and `live_readd: true`, and no other.
+    /// Cut: the field logged whatever the setting, red (an OFF line with `live_readd`).
+    #[config_log::retcd_test]
+    fn db_open_names_live_readd_only_with_it_on() {
+        const METHOD: &str = "db_open_names_live_readd_only_with_it_on";
+        let fields = |line: &serde_json::Value| -> BTreeSet<String> {
+            let context = [
+                "testModule",
+                "testMethod",
+                "testRun",
+                "application",
+                "file",
+                "line",
+                "span",
+                "thread",
+            ];
+            line.as_object()
+                .expect("an object")
+                .keys()
+                .filter(|key| !key.starts_with('@') && !context.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        };
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open")
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let off = [
+            "dedup_cap",
+            "dedup_retention_ms",
+            "unreachable_drop_after_ms",
+        ]
+        .map(str::to_owned);
+        assert_eq!(fields(&lines[0]), BTreeSet::from(off.clone()), "{lines:?}");
+        let mut on = BTreeSet::from(off);
+        on.insert("live_readd".to_owned());
+        assert_eq!(fields(&lines[1]), on, "{lines:?}");
+        assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn

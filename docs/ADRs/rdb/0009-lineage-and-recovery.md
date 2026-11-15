@@ -455,34 +455,57 @@ is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logge
 runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
 
 **Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
-receiver's anchor, and protocol 9.** Three rules, all with `Timeouts::live_readd` (off by
-default) as the only way in:
+receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default) is
+the only way in to the first two: with it off, neither runs on any node, and `db_open` and
+`membership_drop_planned` carry the fields they had before slice 2a.
 
 - **Same-boot return.** An owner whose own drop clock left a copy out (the unreachable clock, or
   the paused clock with the copy's link seen down) may pin it again at the boot it still runs,
   not only at a newer one. The copy's link must have stayed up on one connection for 5 s (a
   reconnect starts that again), no re-plan, rebuild or move may be under way, the commit must
-  take writes with a slot free, and the copy must answer an `Inspect` with no fault. It is
-  pinned as a shadow, lands, is caught up and is promoted exactly as a restarted copy is: the
-  landing guards above, and check B, apply unchanged. One attempt per drop. A copy that does
-  not answer, answers a fault, or is not taken waits a whole 5 s again.
+  take writes with a slot free, and the copy must answer an `Inspect` within two drop checks
+  (400 ms) with no fault. It is pinned as a shadow, lands, is caught up and is promoted exactly
+  as a restarted copy is: the landing guards above, and check B, apply unchanged. One attempt
+  per drop. A copy whose probe cannot be sent, is not answered in time, answers a fault, or is
+  not taken waits a whole 5 s again.
 - **A refused receiver's anchor.** Check A drops a refused copy's live receiver only in a commit
-  that takes writes. A receiver it keeps (any receiver in a `ReadOnly` commit, and a dormant
-  one in any commit) stays, and its host marks it refused at that generation (logged
-  `land_receiver_marked_refused`): a dormant receiver's `Recovered` anchors it as a live one's
-  does. That generation's `Recovered` then
-  anchors the receiver at the cutoff when it holds the cutoff with its digest (a proved prefix),
-  and otherwise at the root, `NeedPrefix { have: 0, ROOT }`, as a receiver built fresh after a
-  restart does. It never anchors on a rung below the cutoff: R1 would start the walk inside the
-  new generation's prefix and leave it no seq 1. Marks are kept per generation; a `Recovered`
-  clears its own and every older one, so two refusals before either `Recovered` keep both.
+  that takes writes. With the setting on, a receiver it keeps (a live one in a `ReadOnly`
+  commit, or a dormant one in any commit) is marked refused at that generation (logged
+  `land_receiver_marked_refused`). That generation's `Recovered` then anchors a live marked
+  receiver by its digest lookup at the cutoff:
+  - `Match`: at the cutoff, as any copy does (a proved prefix, which issue #105's tail adoption
+    relies on);
+  - `NotRetained`: at the root, `NeedPrefix { have: 0, ROOT }`, as a receiver built fresh after
+    a restart does, never on a rung below the cutoff, where R1 would start the walk inside the
+    new generation's prefix and leave it no seq 1;
+  - `Differs`: unchanged, no anchor and the receiver is quarantined. The mark plays no part.
+
+  A dormant receiver is not anchored at all: `Replication::recovered` removes it before
+  `on_recovered` runs and builds a fresh receiver from the barrier's proof of this copy, or at
+  the root. So the mark on a dormant receiver matters only when an earlier generation's
+  `Recovered`, delivered in the same due batch as the later refused landing, rebuilds the copy
+  first; the fresh receiver takes over the dormant one's marks for later generations. Marks are
+  kept per generation; a `Recovered` clears its own and every older one, so two refusals before
+  either `Recovered` keep both.
+
+  **With the setting off** nothing is marked, and a receiver kept in a `ReadOnly` commit
+  re-anchors on its `Recovered` as before slice 2a: at the cutoff on `Match`, on its own highest
+  rung at or below the cutoff on `NotRetained`, quarantined on `Differs`. The receiving node
+  reads its own setting: neither the plan nor the result tells it the re-adding owner's, so an
+  owner with the setting on can re-add a copy whose node has it off. Then that copy keeps no
+  mark, and a `ReadOnly` return can leave it the holed lineage row 31b showed; check B refuses
+  that lineage at its next landing, so the partition stays `ReadOnly` until the copy restarts
+  (availability, not data). So set the setting the same on every node, as for
+  `Timeouts::unreachable_drop_after`.
 - **Protocol 9.** No wire type changed, so `PROTOCOL_VERSION` stays 9. Every build at 9 has check
   A. Check B and the refusal mark are newer than some builds at 9 (main at 1eb3fe0 has neither),
-  and the handshake does not tell them apart. So turn the setting on for an owner only once
-  every node runs a build with both: with a receiver of such an older build, a `ReadOnly` return
-  can leave that copy a holed lineage that nothing refuses. Nothing enforces this order yet. By the lead's
-  ruling on PR #126 it stays an operator rule while the setting is off by default; a bump to 10,
-  or a capability bit, is a precondition for turning it on by default (issue #107). Any change that weakens check A takes a bump.
+  and the handshake does not tell them apart. Upgrade prerequisite: turn the setting on only
+  once every node runs a build with check B and the mark, and on every node at once; with a
+  receiver of an older build, a `ReadOnly` return can leave that copy a holed lineage that
+  nothing refuses. Nothing enforces this yet. By the lead's ruling on PR #126 it stays an
+  operator rule while the setting is off by default. Default-on prerequisite: a bump to 10, or a
+  capability bit that gates the re-add, so a peer without both guards refuses or is never
+  re-added live (issue #107). Any change that weakens check A takes a bump.
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 

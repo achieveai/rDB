@@ -569,13 +569,22 @@ impl Replication {
         self.sources
             .retain(|&(at, of, _), _| (at, of) != (node, partition));
         // A dormant receiver was restored from the stored lineage for the catch-up before this
-        // commit; drop it, so today's path builds the side the pin gives (A-R173, F3).
+        // commit; drop it, so today's path builds the side the pin gives (A-R173, F3). #107
+        // slice 2a review: the refusal marks it holds for later generations go to the receiver
+        // built in its place, since its host refused those landings before this `Recovered`
+        // arrived (one due batch), and the next `Recovered` reads them.
+        let mut carried = Vec::new();
         if self
             .receivers
             .get(&key)
             .is_some_and(AppendReceiver::is_dormant)
         {
-            self.receivers.remove(&key);
+            if let Some(dormant) = self.receivers.remove(&key) {
+                carried = dormant
+                    .refused_landings()
+                    .filter(|generation| *generation > result.new_generation)
+                    .collect();
+            }
         }
         let config = &result.committed.pinned_config;
         let own = config
@@ -622,7 +631,12 @@ impl Replication {
             }
             Some(own) if !self.receivers.contains_key(&key) => {
                 match fresh_receiver(own.copy, result) {
-                    Some(receiver) => self.install_receiver(receiver),
+                    Some(mut receiver) => {
+                        for generation in carried {
+                            receiver.refuse_landing(generation);
+                        }
+                        self.install_receiver(receiver);
+                    }
                     None => refused = Some(ReplicaIgnoreReason::InvalidConfig),
                 }
             }

@@ -115,9 +115,15 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// the whole cluster.
 ///
 /// Issue #107 (Rev 5 m5), a rule with no frame of its own: an owner's live re-add
-/// (`Host::live_readd_duty`) re-adds a copy at the boot it still runs, and that is safe only
-/// because every peer speaking 9 has check A in `Host::land_link` (a refused landing in a commit
-/// that takes writes drops the live receiver). Any change that weakens check A takes a bump.
+/// (`Host::live_readd_duty`) re-adds a copy at the boot it still runs. Every peer speaking 9 has
+/// check A in `Host::land_link` (a refused landing in a commit that takes writes drops the live
+/// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
+/// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
+/// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
+/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
+/// once every node runs a build with both, and on every node, an operator rule while it is off by
+/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// weakens check A takes a bump.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
