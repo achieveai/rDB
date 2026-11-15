@@ -24,6 +24,11 @@ pub struct ApiError {
     pub retry_after: Option<Duration>,
 }
 
+/// How the detail of a host fault ([`ApiError::host`]) starts. A `NotWired` error whose detail
+/// starts with it is an owner fault, and gets [`owner_fault_step`]; the other `NotWired`
+/// refusals (admin, an undecodable call) keep `step_for`'s (#134).
+const HOST_FAULT: &str = "host fault: ";
+
 /// The tail every "open the folder again" step in `db.rs` ends with ([`super::REOPEN_STEP`] and
 /// the stuck-recovery step). A detail that ends with it already says what to do next.
 const OPEN_AGAIN: &str = "open the folder again";
@@ -295,7 +300,7 @@ impl ApiError {
             kind: ErrorKind::Unavailable,
             retry: RetryRule::NotWired,
             no_mutation: false,
-            detail: format!("host fault: {detail}"),
+            detail: format!("{HOST_FAULT}{detail}"),
             retry_after: None,
         }
     }
@@ -360,6 +365,9 @@ impl ApiError {
         {
             return None;
         }
+        if self.retry == RetryRule::NotWired && self.detail.starts_with(HOST_FAULT) {
+            return Some(owner_fault_step(self.no_mutation));
+        }
         Some(step_for(self.kind, self.retry, self.no_mutation))
     }
 
@@ -392,6 +400,30 @@ impl ApiError {
             Some(step) => format!("{}; next: {step}", self.detail),
             None => self.detail.clone(),
         }
+    }
+}
+
+/// The next step of a host fault, in the gateway's words (`rdb_server::wire_step`, PR #129
+/// review, #134). Retrying at this node will not help, but another node can take a faulted
+/// owner's partition over (an operator promote today, #122 later), so the takeover clause opens
+/// "if the owner faulted": a host fault also covers a node that answered nonsense. This `Db`
+/// keeps routing to the old owner until it reads the owner again, which `Db::wait_ready` does,
+/// so that comes first. `no_mutation` true: the send wrote nothing, so a write goes again as a
+/// new write. False: it may have applied, so a write asks its status first and a read, which
+/// has no request, reads again.
+const fn owner_fault_step(no_mutation: bool) -> &'static str {
+    if no_mutation {
+        "retrying at this node will not help: keep this Db's log and report this message; if \
+         the owner faulted, once another node takes over (an operator promote does that), call \
+         `Db::wait_ready` until it returns `Ok`; then a read reads again, and a write is sent \
+         again as a new write (`Db::put`, `Db::txn` or `Db::write`), not with `Db::resend`: \
+         this send wrote nothing"
+    } else {
+        "retrying at this node will not help: keep this Db's log and report this message; if \
+         the owner faulted, once another node takes over (an operator promote does that), call \
+         `Db::wait_ready` until it returns `Ok`; then, for a write, ask `Db::status` with its \
+         request id before writing again, and never send it under a new request id; for a \
+         read, read again"
     }
 }
 
@@ -976,7 +1008,7 @@ mod tests {
         assert!(!error.to_string().contains("try again"), "{error}");
     }
 
-    /// A host fault (`NotWired`) says no retry helps, whatever its kind.
+    /// A host fault (`NotWired`) says retrying at this node will not help, whatever its kind.
     /// PR #104 review: a barrier's `Err` keeps the step that fits it. A retryable one says to call
     /// the barrier again and never to resend; a bad argument says to fix it, and a host fault to
     /// report it, and neither says to call again; a detail that already ends with its own step
@@ -1019,9 +1051,21 @@ mod tests {
         let host = ApiError::host("the owner's node thread has stopped").for_barrier();
         let explained = host.explain();
         assert!(explained.contains(BARRIER_NOTE), "{explained}");
-        assert!(explained.contains("retrying will not help"), "{explained}");
+        assert_eq!(
+            host.next_step(),
+            Some(owner_fault_step(false)),
+            "{explained}"
+        );
+        assert!(
+            explained.contains("retrying at this node will not help"),
+            "{explained}"
+        );
         assert!(
             !explained.contains("call `Db::wait_durable` again"),
+            "{explained}"
+        );
+        assert!(
+            !explained.contains("send the same request again"),
             "{explained}"
         );
 
@@ -1031,14 +1075,50 @@ mod tests {
         assert_eq!(kept.detail, reopen.detail, "its own step stays last");
     }
 
+    /// PR #129 review, #134: a host fault says retrying at this node will not help, and, if the
+    /// owner faulted, that a call can succeed once another node takes over, after
+    /// `Db::wait_ready` returns `Ok` (this `Db` routes to the old owner until it reads the owner
+    /// again). `no_mutation` true sends a write again as a new write; false asks its status
+    /// first, and a read reads again. A `NotWired` refusal that is not a host fault keeps its
+    /// plain step. Cuts: `next_step` without its host-fault arm: red on the takeover clause;
+    /// `owner_fault_step` false reusing true's words: red on `Db::status`.
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {
-        let error = ApiError::host("storage read fault");
-        assert!(
-            error
-                .explain()
-                .starts_with("host fault: storage read fault; next: retrying will not help"),
-            "{error}"
+        for no_mutation in [false, true] {
+            let mut error = ApiError::host("storage read fault");
+            error.no_mutation = no_mutation;
+            let text = error.explain();
+            let case = format!("no_mutation={no_mutation}: {text}");
+            assert!(
+                text.starts_with(
+                    "host fault: storage read fault; next: retrying at this node will not help: \
+                     keep this Db's log and report this message; if the owner faulted, once \
+                     another node takes over (an operator promote does that), call \
+                     `Db::wait_ready` until it returns `Ok`; then"
+                ),
+                "{case}"
+            );
+            assert_eq!(text.contains("as a new write"), no_mutation, "{case}");
+            assert_eq!(
+                text.contains(
+                    "for a write, ask `Db::status` with its request id before writing again, and \
+                     never send it under a new request id; for a read, read again"
+                ),
+                !no_mutation,
+                "{case}"
+            );
+        }
+
+        // Not a host fault: an undecodable call or an admin refusal keeps its own step.
+        let refusal = ApiError {
+            retry: RetryRule::NotWired,
+            no_mutation: true,
+            ..ApiError::new(ErrorKind::Unavailable, "the call could not be decoded")
+        };
+        assert_eq!(
+            refusal.next_step(),
+            Some("retrying will not help: keep this Db's log and report this message"),
+            "{refusal}"
         );
     }
 
