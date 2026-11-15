@@ -29,6 +29,97 @@ struct Rig {
     addrs: BTreeMap<NodeId, String>,
     procs: Vec<Proc>,
     partitions: u32,
+    /// The [`GrantCut`] of each node [`opened_cut`] cut, installed before that node opened.
+    grant_cuts: BTreeMap<NodeId, Arc<GrantCut>>,
+}
+
+/// A node's control store with its own `grants/{node}` writes cut: every put or delete of that
+/// one key fails `Unavailable`, as `cut-control` fails them, and every other call passes, so
+/// the node opens. Installed before the node opens (PR #119 review), so the node can take no
+/// grant of its own at its boot, however long the rest of the setup takes, until the row lifts
+/// it.
+struct GrantCut {
+    inner: Arc<dyn ConfigStore>,
+    key: Bytes,
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl GrantCut {
+    fn new(inner: Arc<dyn ConfigStore>, node: NodeId) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+            cut: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    fn check(&self, key: &[u8], call: &'static str) -> Result<(), config_core::ConfigError> {
+        if key == self.key && self.cut.load(Ordering::SeqCst) {
+            tracing::info!(call, "own81_grant_write_cut");
+            return Err(config_core::ConfigError::Unavailable {
+                reason: "this node's own grant writes are cut (own81 GrantCut)".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for GrantCut {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.check(&request.key, "put")?;
+        self.inner.put(request).await
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.check(&request.key, "delete")?;
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
 }
 
 impl Drop for Rig {
@@ -91,6 +182,13 @@ fn rig_with(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
 /// [`rig_with`] up to every process open, before any is ready: no node has recovered its
 /// partitions, so `grants/{node}` still holds the forming open's record, at that open's boot.
 fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
+    opened_cut(partitions, failovers, None)
+}
+
+/// [`opened`], with `cut`'s own grant writes cut ([`GrantCut`]) from before it opens. Ordinary
+/// callers pass `None` and start without faults.
+fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<NodeId>) -> Rig {
+    let mut grant_cuts = BTreeMap::new();
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
@@ -138,8 +236,13 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
                     Some(listener),
                 )
                 .expect("the node's net starts");
-                let cut: Arc<dyn ConfigStore> =
+                let mut control: Arc<dyn ConfigStore> =
                     CutStore::new(Arc::clone(&store), Arc::clone(&faults));
+                if cut == Some(node) {
+                    let grant_cut = GrantCut::new(control, node);
+                    grant_cuts.insert(node, Arc::clone(&grant_cut));
+                    control = grant_cut;
+                }
                 let db = rt
                     .block_on(Db::open_with(
                         DbConfig {
@@ -149,7 +252,7 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
                             failover,
                             ..config(dir.path())
                         },
-                        cut,
+                        control,
                         rt.handle().clone(),
                         budgets(),
                     ))
@@ -171,6 +274,7 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
         addrs,
         procs,
         partitions,
+        grant_cuts,
     };
     rig
 }
@@ -212,6 +316,11 @@ impl Rig {
     /// `kill -CONT`.
     fn resume(&self, i: usize) {
         self.procs[i].faults.apply("");
+    }
+
+    /// Let `node` write its own grant again ([`opened_cut`]).
+    fn lift_grant_cut(&self, node: NodeId) {
+        self.grant_cuts[&node].cut.store(false, Ordering::SeqCst);
     }
 
     /// `planner/grant`, read from the store. Rows wait on the store, never by polling the log:
@@ -703,6 +812,67 @@ fn own81_v8_an_owner_resumed_after_one_fence_still_has_its_other_partitions_move
     );
 }
 
+/// V8 on the frozen node's own planner (PR #119 review, `frozen_self_v8`): as V8, but the planner
+/// that starts runs on node 1, the frozen owner itself, and so holds `planner/grant`. A planner
+/// skips its own node only while that node's grant is not frozen, so its other 3 partitions
+/// still move, to the two healthy peers.
+/// Integration (~15 s): waits out the grant, a hand promote, then a failover.
+/// Cut: skip the planner's own node whatever its grant (`if owner == self.node`); the 3 stay on
+/// node 1, red at the wait.
+#[config_log::retcd_test]
+fn own81_frozen_self_v8_a_frozen_planner_moves_its_own_remaining_partitions() {
+    const METHOD: &str = "own81_frozen_self_v8_a_frozen_planner_moves_its_own_remaining_partitions";
+    let mut rig = rig(12, None);
+    let moving = rig.owned_by(NodeId(1));
+    assert_eq!(moving.len(), 4, "{moving:?}");
+    rig.stop(0);
+    let promoted = rig.procs[1]
+        .db
+        .promote_partition(PartitionId(moving[0]), NodeId(2), None)
+        .unwrap_or_else(|error| panic!("node 1 is stopped: {error}"));
+    assert_eq!(promoted.owner, NodeId(2), "{promoted:?}");
+    assert!(
+        rig.grants()[&NodeId(1)].frozen,
+        "the promote froze grants/1"
+    );
+    rig.resume(0);
+    let rest = &moving[1..];
+    assert!(rest.iter().all(|p| rig.owner(*p) == NodeId(1)), "{rest:?}");
+
+    rig.procs[0].db.start_planner(Failover {
+        max_concurrent: 2,
+        ..failover()
+    });
+    until(
+        "node 1's planner holds planner/grant",
+        Duration::from_secs(30),
+        || {
+            rig.planner_grant()
+                .is_some_and(|grant| grant.node == NodeId(1) && !grant.frozen)
+        },
+    );
+    until(
+        "node 1's other partitions move",
+        Duration::from_secs(60),
+        || rest.iter().all(|p| rig.owner(*p) != NodeId(1)),
+    );
+    for p in rest {
+        assert!(
+            matches!(rig.owner(*p), NodeId(2 | 3)),
+            "partition {p} moved to a healthy peer"
+        );
+    }
+    assert_eq!(
+        rig.planner_grant().map(|grant| grant.node),
+        Some(NodeId(1)),
+        "the frozen node's planner did the moves"
+    );
+    let silent = logged_at_least(METHOD, "planner_node_silent", 1);
+    assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    assert_eq!(silent[0]["reason"], "grant_frozen", "{silent:?}");
+    assert!(rig.grants()[&NodeId(1)].frozen, "grants/1 stays frozen");
+}
+
 /// D1, then V9. With `failover: None` nothing promotes: node 1 stops, and after 3 x G nothing
 /// has changed and no planner ran. Then a planner starts on node 2, which never heard node 1
 /// at its start, and every partition node 1 owned moves.
@@ -784,20 +954,23 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
 /// until the node's recovery replaces it, and that record runs out first. An owner whose only
 /// grant is a past boot's is not an owner that stopped serving.
 ///
-/// The row holds node 2 in that state on purpose: cut from rEtcd (`cut-control`) once every
-/// process is open and before any is ready, so its recovery cannot replace the old record,
-/// while its links still answer. Left to the start's own timing the state lasts from none to a
-/// few hundred ms, and the row saw it or not by chance (lead's gate at dc2b1b4). Then node 2
-/// is let go and takes its grant, and still no alert.
-/// Integration (~15 s): the old grant runs out, a few sweeps, then the owners' grants.
+/// The row holds node 2 in that state on purpose: its own grant writes are cut ([`GrantCut`])
+/// from before it opens, so its recovery cannot replace the old record, while its links still
+/// answer. Left to the start's own timing the state lasts from none to a few hundred ms, and
+/// the row saw it or not by chance (lead's gate at dc2b1b4). The setup is then delayed by one
+/// grant lifetime before the first check, and the state still holds (PR #119 review: a cut
+/// applied after the opens let node 2's first grant land first). Then node 2 is let go and
+/// takes its grant, and still no alert.
+/// Integration (~18 s): the old grant runs out, the delay, a few sweeps, the owners' grants.
 /// Cut: drop the "no grant of its own" check in `sweep`; node 2's old record runs out while it
 /// answers, the alert is said for it, red. Or judge "of its own" by the record's presence, not
 /// its boot (as before this row): the same, red.
 #[config_log::retcd_test]
 fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
     const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
-    let rig = opened(3, [Some(failover()); 3]);
-    rig.procs[1].faults.apply("cut-control\n");
+    let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
+    // Inside the grace: the row asserts no alert, and past the grace one is due.
+    std::thread::sleep(Duration::from_millis(budgets().grant_millis));
     let node2_boot = rig.procs[1].boot;
     assert_eq!(rig.owned_by(NodeId(2)), vec![2], "node 2 owns partition 2");
     assert!(
@@ -837,7 +1010,7 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
         "node 2 stayed without a grant of its own while cut"
     );
 
-    rig.resume(1);
+    rig.lift_grant_cut(NodeId(2));
     rig.wait_ready();
     rig.wait_for_owner_grants();
     std::thread::sleep(5 * failover().poll);
@@ -849,10 +1022,11 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
 }
 
 /// Lead ruling on PR #119 item 9: an owner heard on its links that has had its chance to take a
-/// grant and has none of its own is the Q2 case. Node 2 is cut from rEtcd once every process is
-/// open, as in the cold-start row, and stays cut. Past [`crate::planner::no_grant_grace`] the
-/// planner raises `planner_owner_alive_not_serving` for node 2 once (`no_grant_of_own`), and
-/// moves nothing.
+/// grant and has none of its own is the Q2 case. Node 2's own grant writes are cut from before
+/// it opens, as in the cold-start row, and stay cut. The setup is delayed past the ~6.3 s a
+/// start takes to its own grant before the first check (PR #119 review), and node 2 still has
+/// none. Past [`crate::planner::no_grant_grace`] the planner raises
+/// `planner_owner_alive_not_serving` for node 2 once (`no_grant_of_own`), and moves nothing.
 /// Integration (~20 s): the old record runs out, then the grace, 9 s at the rig's 3 s grants.
 /// The grace follows the grant, and a shorter grant in this rig would also shorten every
 /// host's lease and renewals, which the other rows here are tuned to.
@@ -862,8 +1036,9 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
 fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved() {
     const METHOD: &str =
         "own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved";
-    let rig = opened(3, [Some(failover()); 3]);
-    rig.procs[1].faults.apply("cut-control\n");
+    let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
+    // Longer than an uncut start takes to its own grant: a cut that came late would show here.
+    std::thread::sleep(Duration::from_secs(8));
     let node2_boot = rig.procs[1].boot;
     assert_eq!(rig.owned_by(NodeId(2)), vec![2], "node 2 owns partition 2");
     assert!(
@@ -980,4 +1155,201 @@ fn own81_a_planner_on_a_faulted_host_gives_up_its_grant_and_another_fails_over()
     let released = logged(METHOD, "planner_grant_released_host_faulted");
     assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
     assert_eq!(released[0]["node"], 1, "{released:?}");
+}
+
+/// PR #119 review (`stopped_host_releases`): as the faulted-host row, but node 1's host thread
+/// ends (`Msg::Stop`) while its process stays up, on its links and on its rEtcd. Its mailbox is
+/// closed, so the planner gives the grant up (`planner_grant_released_host_stopped`, once), and
+/// node 2's planner takes it once it lapses, before any mute. Node 1 is still heard, so it is
+/// alerted and not moved. Then node 1 goes silent on its links and node 2 fails its partition
+/// over.
+/// Integration (~20 s): a grant lapse, the alert, then a failover.
+/// Cut: treat a closed local mailbox as no answer in `hold`; node 1 keeps renewing and node 2
+/// never holds the grant, red at the first wait.
+#[config_log::retcd_test]
+fn own81_stopped_host_releases_its_planner_grant_and_another_fails_over() {
+    const METHOD: &str = "own81_stopped_host_releases_its_planner_grant_and_another_fails_over";
+    let mut rig = rig_with(3, [Some(failover()), None, None]);
+    assert_eq!(rig.owner(1), NodeId(1));
+    until(
+        "node 1's planner holds its grant",
+        Duration::from_secs(20),
+        || {
+            rig.planner_grant()
+                .is_some_and(|grant| grant.node == NodeId(1))
+        },
+    );
+    rig.procs[1].db.start_planner(failover());
+
+    rig.procs[0]
+        .db
+        .send_to(NodeId(1), Msg::Stop)
+        .expect("node 1's host takes the stop");
+    until(
+        "node 2's planner takes the grant",
+        Duration::from_secs(30),
+        || {
+            rig.planner_grant()
+                .is_some_and(|grant| grant.node == NodeId(2))
+        },
+    );
+    let released = logged(METHOD, "planner_grant_released_host_stopped");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["node"], 1, "{released:?}");
+    let lost = logged(METHOD, "planner_grant_lost");
+    assert!(
+        lost.iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "host_stopped"),
+        "{lost:?}"
+    );
+    let alert = logged_at_least(METHOD, "planner_owner_alive_not_serving", 1);
+    assert_eq!(alert[0]["node"], 1, "{alert:?}");
+    assert_eq!(
+        rig.owner(1),
+        NodeId(1),
+        "an owner still heard keeps its partition"
+    );
+
+    rig.procs[0].faults.apply("mute\n");
+    until("node 1's partition moves", Duration::from_secs(60), || {
+        rig.owner(1) != NodeId(1)
+    });
+    let silent = logged_at_least(METHOD, "planner_node_silent", 1);
+    assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    let released = logged(METHOD, "planner_grant_released_host_stopped");
+    assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
+}
+
+/// `config` refused with [`OpenError::Config`] whose text starts with `starts`, by `check` and
+/// by `open`, and no node created: `nodes/` does not exist after the open.
+fn refused_before_creation(config: &DbConfig, starts: &str) {
+    let refused = |what: &str, result: Result<(), OpenError>| match result {
+        Err(OpenError::Config(text)) => assert!(
+            text.starts_with(starts) && text.ends_with("; nothing was created"),
+            "{what}: {text}"
+        ),
+        other => panic!("{what} of {:?}: {other:?}", config.failover),
+    };
+    refused("check", config.check());
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let opened = rt.block_on(Db::open(config.clone(), store, rt.handle().clone()));
+    refused("open", opened.map(|_db| ()));
+    assert!(
+        !config.dir.join("nodes").exists(),
+        "a refused open created nodes/: {:?}",
+        config.failover
+    );
+}
+
+/// A node process's config for node 1, running `failover`.
+fn node_with(dir: &Path, failover: Failover) -> DbConfig {
+    DbConfig {
+        local: vec![NodeId(1)],
+        failover: Some(failover),
+        ..config(dir)
+    }
+}
+
+/// PR #119 review: a zero poll is refused before anything is created, by `check` and `open`:
+/// it would remove the spacing between the planner's control-store reads and its grant
+/// writes. A 1 ms poll is taken.
+/// Cut: drop the poll test in `failover_refusal`; `check` answers `Ok`, red.
+#[test]
+fn own81_zero_poll_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    let poll = |millis| {
+        node_with(
+            dir.path(),
+            Failover {
+                poll: Duration::from_millis(millis),
+                ..Failover::default()
+            },
+        )
+    };
+    refused_before_creation(&poll(0), "failover poll must be above 0 ms");
+    assert!(poll(1).check().is_ok(), "a 1 ms poll is taken");
+}
+
+/// PR #119 review: a zero silence window is refused before anything is created: every link
+/// would read as silent. The default 2 s is taken.
+/// Cut: drop the silence test in `failover_refusal`; `check` answers `Ok`, red.
+#[test]
+fn own81_zero_silence_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    refused_before_creation(
+        &node_with(
+            dir.path(),
+            Failover {
+                silent_after: Duration::ZERO,
+                ..Failover::default()
+            },
+        ),
+        "failover silent_after 0 ms is under one clock-probe period (1000 ms)",
+    );
+    assert_eq!(Failover::default().silent_after, Duration::from_secs(2));
+    assert!(
+        node_with(dir.path(), Failover::default()).check().is_ok(),
+        "the default 2 s silence is taken"
+    );
+}
+
+/// PR #119 review: a silence window under one clock-probe period is refused: a healthy link
+/// echoes once a period, so it could read as silent between echoes. One period is the least
+/// taken. Boundary rows at 999 ms and 1,000 ms.
+/// Cut: compare against zero instead of the probe period; 999 ms is taken, red.
+#[test]
+fn own81_subprobe_silence_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    let silent = |millis| {
+        node_with(
+            dir.path(),
+            Failover {
+                silent_after: Duration::from_millis(millis),
+                ..Failover::default()
+            },
+        )
+    };
+    assert_eq!(crate::net::PROBE_PERIOD, Duration::from_millis(1_000));
+    refused_before_creation(
+        &silent(999),
+        "failover silent_after 999 ms is under one clock-probe period (1000 ms)",
+    );
+    assert!(silent(1_000).check().is_ok(), "one probe period is taken");
+}
+
+/// PR #119 review: each invalid failover config is refused with `Config` before any node is
+/// created, by `check` and by `open`, one row each: no local node (an app open), two distinct
+/// nodes, a duplicated node, and zero promotes at once. Controls: failover off with all three
+/// nodes, and a valid single-node failover, are taken.
+/// Cut: accept any `local` in `failover_refusal`; the first row's `check` answers `Ok`, red.
+#[test]
+fn own81_invalid_failover_is_refused_before_creation() {
+    let dir = config_testkit::fs::temp_dir();
+    let local = |nodes: &[u32]| DbConfig {
+        local: nodes.iter().copied().map(NodeId).collect(),
+        ..node_with(dir.path(), Failover::default())
+    };
+    let one_node = "failover runs only in a node process, one node in DbConfig::local";
+    for (nodes, names) in [(&[][..], 0), (&[1, 2][..], 2), (&[1, 1][..], 2)] {
+        refused_before_creation(
+            &local(nodes),
+            &format!("{one_node}, and this open names {names}"),
+        );
+    }
+    refused_before_creation(
+        &node_with(
+            dir.path(),
+            Failover {
+                max_concurrent: 0,
+                ..Failover::default()
+            },
+        ),
+        "failover max_concurrent 0 must be at least 1",
+    );
+    assert!(config(dir.path()).check().is_ok(), "failover off is taken");
+    assert!(
+        local(&[1]).check().is_ok(),
+        "one node with failover is taken"
+    );
 }

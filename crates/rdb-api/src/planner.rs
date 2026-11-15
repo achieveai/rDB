@@ -213,6 +213,18 @@ enum Verdict {
     Dead(&'static str),
 }
 
+/// What one look at a node got back.
+#[derive(Debug)]
+enum Asked {
+    /// Its state.
+    Answered(Box<NodeStatus>),
+    /// Nothing within the read timeout: busy or stalled, not known to be gone.
+    NoAnswer,
+    /// Its mailbox refused the question or dropped it unanswered: the node's thread is gone,
+    /// or the node is not registered.
+    Stopped,
+}
+
 /// The planner's grant while held: the record it last wrote.
 #[derive(Debug, Clone, Copy)]
 struct Held {
@@ -228,6 +240,8 @@ pub(crate) struct Memory {
     unbounded: bool,
     /// Whether the last hold found this planner's own host faulted: the warn is said once.
     host_faulted: bool,
+    /// Whether the last hold found this planner's own host's mailbox closed: said once.
+    host_stopped: bool,
     /// `planner_grant_read_failed`, once per [`REPEAT_EVERY`] per cause.
     read_failed: Repeats,
     /// Owners heard but holding no grant of their own: the boot the links knew and when the
@@ -284,14 +298,32 @@ impl Planner {
     ///
     /// A planner whose own host has faulted holds nothing: it stops renewing, so the record
     /// lapses within the grant's length and another node's planner takes it (lead ruling on
-    /// PR #119). A host that does not answer the look in time is not taken for faulted: a
-    /// stalled node thread still renews, as V6 shows.
+    /// PR #119). So does one whose own host's mailbox is closed (PR #119 review): that thread
+    /// has ended. A host that does not answer the look in time is neither: a stalled node
+    /// thread still renews, as V6 shows.
     pub(crate) async fn hold(&self, memory: &mut Memory) -> bool {
-        if let Some(fault) = self
-            .look(PartitionId(1), self.node)
-            .await
-            .and_then(|status| status.fault)
-        {
+        let own = self.ask(PartitionId(1), self.node).await;
+        if matches!(own, Asked::Stopped) {
+            // The local host's mailbox is closed: its thread has ended and never answers
+            // again, so this process serves nothing. Read as "no answer", it kept the grant
+            // renewing for good (PR #119 review). Released like a faulted host's.
+            if !memory.host_stopped {
+                tracing::warn!(
+                    node = self.node.0,
+                    held = memory.held.is_some(),
+                    lapses_within_ms = self.budgets.grant_millis,
+                    "planner_grant_released_host_stopped"
+                );
+                memory.host_stopped = true;
+            }
+            self.lose(memory, "host_stopped");
+            return false;
+        }
+        memory.host_stopped = false;
+        if let Some(fault) = match own {
+            Asked::Answered(status) => status.fault,
+            Asked::Stopped | Asked::NoAnswer => None,
+        } {
             if !memory.host_faulted {
                 tracing::warn!(
                     node = self.node.0,
@@ -453,7 +485,11 @@ impl Planner {
             .collect();
         let mut todo = Vec::new();
         for (owner, records) in owned {
-            if owner == self.node {
+            // A planner does not judge its own node while that node's grant stands: its own
+            // host answers for itself. A frozen grant never comes back for this process, so
+            // its own remaining partitions go through the judgment like any owner's (PR #119
+            // review): otherwise a frozen node holding `planner/grant` strands them.
+            if owner == self.node && !frozen.contains(&owner) {
                 continue;
             }
             let verdict = self
@@ -605,15 +641,29 @@ impl Planner {
 
     /// `node`'s state for `partition`, or `None` when it does not answer in the read timeout.
     async fn look(&self, partition: PartitionId, node: NodeId) -> Option<NodeStatus> {
+        match self.ask(partition, node).await {
+            Asked::Answered(status) => Some(*status),
+            Asked::NoAnswer | Asked::Stopped => None,
+        }
+    }
+
+    /// [`Self::look`], telling a mailbox that refused the question, or dropped it unanswered,
+    /// from one that did not answer in the read timeout.
+    async fn ask(&self, partition: PartitionId, node: NodeId) -> Asked {
         let (reply, answer) = std::sync::mpsc::channel();
-        self.links
+        if self
+            .links
             .post(node, Msg::Inspect { partition, reply })
-            .ok()?;
+            .is_err()
+        {
+            return Asked::Stopped;
+        }
         let within = self.look_within;
-        tokio::task::spawn_blocking(move || answer.recv_timeout(within).ok())
-            .await
-            .ok()
-            .flatten()
+        match tokio::task::spawn_blocking(move || answer.recv_timeout(within)).await {
+            Ok(Ok(status)) => Asked::Answered(Box::new(status)),
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => Asked::Stopped,
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) | Err(_) => Asked::NoAnswer,
+        }
     }
 
     /// Choose a target for `partition` and promote it, dropping `dead`.

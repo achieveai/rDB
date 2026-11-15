@@ -780,24 +780,44 @@ fn unreachable_drop_refusal(after: Duration) -> Result<(), OpenError> {
 }
 
 /// [`DbConfig::failover`], refused unless the open runs exactly one node: the planner holds its
-/// grant as that node, and judges peers by that process's links (#81 C1).
+/// grant as that node, and judges peers by that process's links (#81 C1). Also refused (PR #119
+/// review): no promotes at once; a zero poll, which would remove the spacing between the
+/// planner's control-store reads and grant writes; and a silence window under one clock-probe
+/// period, zero included, in which a healthy link echoes nothing and so reads as silent.
 fn failover_refusal(
     failover: Option<crate::planner::Failover>,
     local: &[NodeId],
 ) -> Result<Option<crate::planner::Failover>, OpenError> {
-    match (failover, local) {
-        (Some(failover), [_]) if failover.max_concurrent > 0 => Ok(Some(failover)),
-        (Some(failover), [_]) => Err(OpenError::Config(format!(
-            "failover max_concurrent {} must be at least 1; nothing was created",
-            failover.max_concurrent
-        ))),
-        (Some(_), _) => Err(OpenError::Config(format!(
+    let Some(failover) = failover else {
+        return Ok(None);
+    };
+    let probe = crate::net::PROBE_PERIOD;
+    let refused = if local.len() != 1 {
+        format!(
             "failover runs only in a node process, one node in DbConfig::local, and this open \
-             names {}; nothing was created",
+             names {}",
             local.len()
-        ))),
-        (None, _) => Ok(None),
-    }
+        )
+    } else if failover.max_concurrent == 0 {
+        format!(
+            "failover max_concurrent {} must be at least 1",
+            failover.max_concurrent
+        )
+    } else if failover.poll.is_zero() {
+        "failover poll must be above 0 ms: it spaces the planner's control-store reads and \
+         grant writes"
+            .to_owned()
+    } else if failover.silent_after < probe {
+        format!(
+            "failover silent_after {} ms is under one clock-probe period ({} ms): a healthy \
+             link would read as silent",
+            failover.silent_after.as_millis(),
+            probe.as_millis()
+        )
+    } else {
+        return Ok(Some(failover));
+    };
+    Err(OpenError::Config(format!("{refused}; nothing was created")))
 }
 
 /// What `routes/0` says the partition count is, `None` when the store holds no such key.

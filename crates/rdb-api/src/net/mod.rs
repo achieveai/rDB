@@ -122,7 +122,7 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 const HANDSHAKE: Duration = Duration::from_secs(5);
 
 /// How often a link's reader probes the peer's clock (#80 S2c): also the link keepalive.
-const PROBE_PERIOD: Duration = Duration::from_secs(1);
+pub(crate) const PROBE_PERIOD: Duration = Duration::from_secs(1);
 
 /// A link with no echo for this long is closed: the peer stopped answering without a FIN.
 const PROBE_SILENCE: Duration = Duration::from_secs(5);

@@ -183,6 +183,31 @@ fn own81_ties_spread_by_partition() {
     assert_eq!(chosen, [3, 2, 3, 2]);
 }
 
+/// Links on which `node` is a healthy local host: it answers every look, with no fault, until
+/// it is sent `Msg::Stop`, and then its mailbox is closed. A planner looks at its own host
+/// before it holds, and a closed or absent mailbox releases the grant.
+fn healthy(node: u32) -> (Arc<Links>, std::thread::JoinHandle<()>) {
+    let links = Links::new();
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    links.register(NodeId(node), tx, BootId(1));
+    let host = std::thread::spawn(move || {
+        for msg in rx {
+            match msg {
+                Msg::Inspect { reply, .. } => {
+                    let _ = reply.send(status(node, None));
+                }
+                Msg::Stop => return,
+                _ => {}
+            }
+        }
+    });
+    (links, host)
+}
+
+fn healthy_links(node: u32) -> Arc<Links> {
+    healthy(node).0
+}
+
 /// A planner for `node` over `store`, on a clock no `Net` is attached to (so its bound holds)
 /// unless a row attaches one. `grant_millis` short enough for a row to wait out.
 fn planner(node: u32, store: &Arc<dyn ConfigStore>, links: Arc<Links>) -> Planner {
@@ -238,8 +263,8 @@ fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
     let gated = Arc::new(crate::test_store::Scripted::gated());
     let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
     let (a, b) = (
-        planner(2, &store, Links::new()),
-        planner(3, &store, Links::new()),
+        planner(2, &store, healthy_links(2)),
+        planner(3, &store, healthy_links(3)),
     );
     let (mut ma, mut mb) = (Memory::default(), Memory::default());
     let (held_a, held_b, ()) = rt.block_on(async {
@@ -296,7 +321,7 @@ fn own81_c1_no_clock_bound_no_grant_written() {
     const METHOD: &str = "own81_c1_no_clock_bound_no_grant_written";
     let rt = crate::db::reopen_tests::runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let links = Links::new();
+    let links = healthy_links(2);
     // A Net attached in a cluster of three, and no peer ever sampled: no bound.
     links.clock().guard().expect("a guarded clock").attach(3);
     let unbounded = planner(2, &store, links);
@@ -345,7 +370,7 @@ fn own81_a_failing_grant_read_is_warned_once_per_window() {
             ..crate::test_store::Script::default()
         },
     ));
-    let cut = planner(2, &store, Links::new());
+    let cut = planner(2, &store, healthy_links(2));
     let mut memory = Memory::default();
     for _ in 0..5 {
         assert!(!rt.block_on(cut.hold(&mut memory)));
@@ -354,4 +379,67 @@ fn own81_a_failing_grant_read_is_warned_once_per_window() {
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(said[0]["suppressed"], 0, "{said:?}");
     assert!(rt.block_on(cut.hold(&mut memory)), "the sixth read answers");
+}
+
+/// PR #119 review (`stopped_host_releases`, the planner's half): the planner holds its grant,
+/// then its own host's thread ends and its mailbox closes. The next hold releases the grant
+/// (`planner_grant_released_host_stopped`, said once; `planner_grant_lost`, `host_stopped`),
+/// and later holds write nothing. Before the review a closed mailbox read as "no answer", the
+/// same as a stalled host, and the planner kept renewing.
+/// Cut: treat `Asked::Stopped` as no answer in `hold`; the first hold after the stop renews, red.
+#[config_log::retcd_test]
+fn own81_a_planner_whose_host_mailbox_closed_releases_its_grant() {
+    const METHOD: &str = "own81_a_planner_whose_host_mailbox_closed_releases_its_grant";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let (links, host) = healthy(2);
+    let stopping = planner(2, &store, Arc::clone(&links));
+    let mut memory = Memory::default();
+    assert!(
+        rt.block_on(stopping.hold(&mut memory)),
+        "a healthy host holds"
+    );
+    links
+        .post(NodeId(2), Msg::Stop)
+        .expect("the host takes the stop");
+    host.join().expect("the host thread ends");
+    let renewed = planner_grant(&rt, &store).expect("the grant written while healthy");
+    for _ in 0..3 {
+        assert!(
+            !rt.block_on(stopping.hold(&mut memory)),
+            "a stopped host holds nothing"
+        );
+    }
+    assert_eq!(
+        planner_grant(&rt, &store),
+        Some(renewed),
+        "no renewal after the stop"
+    );
+    let released = messages(METHOD, "planner_grant_released_host_stopped");
+    assert_eq!(released.len(), 1, "said once: {released:?}");
+    let lost = messages(METHOD, "planner_grant_lost");
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert_eq!(lost[0]["reason"], "host_stopped", "{lost:?}");
+}
+
+/// The control for the row above: a host whose mailbox is open but that never answers (a
+/// stalled thread, V6) is no answer, not a stop, and the planner keeps its grant.
+/// Cut: treat `Asked::NoAnswer` as a stop in `hold`; red at the first hold.
+#[config_log::retcd_test]
+fn own81_a_planner_whose_host_does_not_answer_keeps_its_grant() {
+    const METHOD: &str = "own81_a_planner_whose_host_does_not_answer_keeps_its_grant";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let links = Links::new();
+    let (tx, _unread) = std::sync::mpsc::channel::<Msg>();
+    links.register(NodeId(2), tx, BootId(1));
+    let stalled = planner(2, &store, links);
+    let mut memory = Memory::default();
+    for _ in 0..2 {
+        assert!(
+            rt.block_on(stalled.hold(&mut memory)),
+            "a host that does not answer in time still renews"
+        );
+    }
+    assert!(messages(METHOD, "planner_grant_released_host_stopped").is_empty());
 }
