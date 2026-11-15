@@ -249,7 +249,10 @@ pub const LIVE_READD_HOLD_MILLIS: u64 = 5_000;
 /// host rows 123 records behind paused writes 717 ms; at 32 the pause measured 133-193 ms
 /// (2026-10-26), under the 0.5 s goal with the re-plan's own cost. A shadow that keeps up
 /// trails by the records in flight, far below this; one that trails more is still catching up,
-/// and waits. If writes land faster than it catches up, it waits until they slow.
+/// and waits. The owner judges it when the shadow's `CopyCaughtUp` arrives, at the head, as
+/// well as at each drop duty (issue #113, promote at catch-up). Between R1's shadow probes a
+/// shadow trails by one probe interval of writes, so under nonstop writes a drop duty alone
+/// always found it past this bound and never promoted it.
 pub const PROMOTE_LAG_RECORDS: u64 = 32;
 
 /// A-R458, A-R461: the most records a node reads ahead into its kept ladders in one duty: an
@@ -6203,6 +6206,7 @@ impl Host {
             } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                self.shadow_at_head(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -6632,7 +6636,7 @@ impl Host {
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
     /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
-    /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
+    /// a shadow, which L1 never counts and R1 catches up by its probe and catch-up cursor; [`Self::shadow_duty`]
     /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
     /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
@@ -6999,8 +7003,8 @@ impl Host {
             })
             .collect();
         // A-R329: a rejoiner that is not pinned is a member a drop left out, linked again as a
-        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it off the
-        // stream; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
+        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it by its
+        // probe and catch-up cursor; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
         let readded = replan.rejoiner.and_then(|node| {
             let left = self
                 .left_out
@@ -7221,8 +7225,9 @@ impl Host {
     /// #107 slice 2a: re-add, at the boot it still runs, a copy this owner's own drop clock left
     /// out ([`LiveReadd::clocked`]), once its link is back. `Links::install` tells nobody of a
     /// same-boot reconnect, so this runs at every drop check, and ends in the restart path's
-    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up off the
-    /// stream, and promoted by [`Self::shadow_duty`]. With `live_readd` off it does nothing.
+    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up by R1's probe
+    /// and catch-up cursor, and promoted by [`Self::shadow_duty`] when its catch-up arrives
+    /// ([`Self::shadow_at_head`]) or at a drop duty. With `live_readd` off it does nothing.
     ///
     /// The gate ([`Self::live_readd_refusal`]): this node is the pinned primary, no re-plan
     /// runs, the committed mode takes writes (`Active` or `DegradedRf2`, the test
@@ -8156,7 +8161,7 @@ impl Host {
 
     /// M11 thin slice: move the copy on `from` to `to`, or say where that move stands. Only the
     /// pinned primary takes it. The move is two re-plans through the restart machinery: the
-    /// first pins `to` as a shadow (R1 catches it up off the stream, from seq 1), and once it
+    /// first pins `to` as a shadow (R1 catches it up by its probe and catch-up cursor, from seq 1), and once it
     /// reaches the cutoff [`Self::shadow_duty`] pins it regular and leaves `from` out in one
     /// commit. Membership changes only by those commits. Asking again resumes: the intent is
     /// in memory, and once `to` is pinned as a shadow the pin itself says what is moving (D2).
@@ -8487,7 +8492,7 @@ impl Host {
 
     /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
     /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
-    /// [`move_copy_id`]; R1 feeds it off the stream and F1's barrier skips it.
+    /// [`move_copy_id`]; R1 feeds it by its probe and catch-up cursor, and F1's barrier skips it.
     fn move_shadow(
         &self,
         partition: PartitionId,
@@ -8783,12 +8788,34 @@ impl Host {
         );
     }
 
+    /// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): `copy` sent `CopyCaughtUp`
+    /// for `partition`, so if the commit pins it as the shadow, judge its promote now with
+    /// [`Self::shadow_duty`] and every guard there: the owner, no re-plan running, the link,
+    /// the move and member checks, and A-R442's lag bound. R1 feeds a shadow by its probe, not
+    /// the stream, so between probes it trails by one probe interval of writes; judged only at
+    /// the drop duty, a writer that never slows found it behind at every duty for good.
+    fn shadow_at_head(&mut self, partition: PartitionId, copy: CopyId) {
+        let shadow = self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| member.copy == copy && member.role == ReplicaRole::Shadow)
+        });
+        if shadow {
+            let now = self.clock.now();
+            self.shadow_duty(partition, now);
+        }
+    }
+
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
     /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
     /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
     /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
     /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
-    /// while a re-plan runs, or on a node that is not the commit's pinned primary.
+    /// while a re-plan runs, or on a node that is not the commit's pinned primary. Runs at each
+    /// drop duty and when the shadow reports it caught up ([`Self::shadow_at_head`], #113).
     fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
         // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
         let lagging = self.move_catching_up.remove(&partition);
