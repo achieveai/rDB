@@ -2683,6 +2683,10 @@ struct Host {
     /// Crate tests only (A-R346 M1).
     #[cfg(test)]
     refuse_inventories: bool,
+    /// Whether [`Self::repair_duty`] does nothing, so a row can wait for this host to adopt a
+    /// `ReadOnly` commit before a repair re-plans past it (issue #112). Crate tests only.
+    #[cfg(test)]
+    hold_repairs: bool,
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
@@ -2900,6 +2904,8 @@ impl Host {
             drain_proofs_to_lose: 0,
             #[cfg(test)]
             refuse_inventories: false,
+            #[cfg(test)]
+            hold_repairs: false,
             repair_since: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
@@ -7269,6 +7275,10 @@ impl Host {
     /// logged `membership_repair_held` once per change, and the check runs again a hold later.
     /// Other refusals keep the back-off above.
     fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
+        #[cfg(test)]
+        if self.hold_repairs {
+            return;
+        }
         let read_only = self
             .committed
             .get(&partition)

@@ -79,6 +79,11 @@ fn lost_primary_and_silent_secondary(trio: &mut Trio) -> Generation {
     );
     let before = committed_generation(trio, 0).expect("the bootstrap committed");
     trio.nodes[2].0.refuse_inventories = true;
+    // Issue #112: node 2's commit is `ReadOnly` with node 3 answering, so its repair may re-plan
+    // to the next generation before node 2 adopts this one, and then never serves it. That is
+    // the product's order to take; the rows are about the note, so the repair waits until
+    // node 2 serves what it committed.
+    trio.nodes[1].0.hold_repairs = true;
     let promote = spawn_promote(trio, 2);
     let generation = only_until(trio, &[1, 2], "node 2 committed", |trio| {
         committed_generation(trio, 1).filter(|committed| *committed > before)
@@ -93,6 +98,7 @@ fn lost_primary_and_silent_secondary(trio: &mut Trio) -> Generation {
     only_until(trio, &[1, 2], "node 2 serves what it committed", |trio| {
         known(&trio.status(1)).filter(|(held, _, _)| *held == generation)
     });
+    trio.nodes[1].0.hold_repairs = false;
     generation
 }
 
