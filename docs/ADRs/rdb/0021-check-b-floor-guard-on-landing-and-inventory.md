@@ -1,6 +1,6 @@
 # ADR-rdb-0021: Check B — a floor guard on landing and on the inventory link
 
-**Status:** Proposed. Records the lead ruling on PR #118, 2026-11-15, product stage Development.
+**Status:** Accepted by the owner, 2026-11-15 ([#81 comment](https://github.com/achieveai/rDB/issues/81#issuecomment-6894324501)). Records the lead ruling on PR #118, 2026-11-15, product stage Development.
 **Date:** 2026-11-15
 **Spec:** `docs/rdb/design-specification.md` §8.1, §8.2
 **Decided by:** lead ruling on PR #118, 2026-11-15, product stage Development
