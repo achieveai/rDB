@@ -12,6 +12,7 @@ use super::*;
 use crate::net::faults::{CutStore, Faults};
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
 use crate::planner::Failover;
+use crate::test_store::{CutCalls, PrefixCut};
 
 /// One node process.
 struct Proc {
@@ -29,97 +30,9 @@ struct Rig {
     addrs: BTreeMap<NodeId, String>,
     procs: Vec<Proc>,
     partitions: u32,
-    /// The [`GrantCut`] of each node [`opened_cut`] cut, installed before that node opened.
-    grant_cuts: BTreeMap<NodeId, Arc<GrantCut>>,
-}
-
-/// A node's control store with its own `grants/{node}` writes cut: every put or delete of that
-/// one key fails `Unavailable`, as `cut-control` fails them, and every other call passes, so
-/// the node opens. Installed before the node opens (PR #119 review), so the node can take no
-/// grant of its own at its boot, however long the rest of the setup takes, until the row lifts
-/// it.
-struct GrantCut {
-    inner: Arc<dyn ConfigStore>,
-    key: Bytes,
-    cut: std::sync::atomic::AtomicBool,
-}
-
-impl GrantCut {
-    fn new(inner: Arc<dyn ConfigStore>, node: NodeId) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            key: Bytes::from(ControlKey::Grant(node).encode()),
-            cut: std::sync::atomic::AtomicBool::new(true),
-        })
-    }
-
-    fn check(&self, key: &[u8], call: &'static str) -> Result<(), config_core::ConfigError> {
-        if key == self.key && self.cut.load(Ordering::SeqCst) {
-            tracing::info!(call, "own81_grant_write_cut");
-            return Err(config_core::ConfigError::Unavailable {
-                reason: "this node's own grant writes are cut (own81 GrantCut)".to_owned(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl ConfigStore for GrantCut {
-    async fn get(
-        &self,
-        request: config_core::GetRequest,
-    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
-        self.inner.get(request).await
-    }
-
-    async fn list(
-        &self,
-        request: config_core::ListRequest,
-    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
-        self.inner.list(request).await
-    }
-
-    async fn list_page(
-        &self,
-        request: config_core::PageRequest,
-    ) -> Result<config_core::ListPage, config_core::ConfigError> {
-        self.inner.list_page(request).await
-    }
-
-    async fn put(
-        &self,
-        request: config_core::PutRequest,
-    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
-        self.check(&request.key, "put")?;
-        self.inner.put(request).await
-    }
-
-    async fn delete(
-        &self,
-        request: config_core::DeleteRequest,
-    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
-        self.check(&request.key, "delete")?;
-        self.inner.delete(request).await
-    }
-
-    fn capabilities(&self) -> config_core::Capabilities {
-        self.inner.capabilities()
-    }
-
-    async fn watch(
-        &self,
-        request: config_core::WatchRequest,
-    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
-        self.inner.watch(request).await
-    }
-
-    async fn watch_leader(
-        &self,
-        request: config_core::WatchRequest,
-    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
-        self.inner.watch_leader(request).await
-    }
+    /// The cut of each node [`opened_cut`] cut: its own `grants/{node}` writes, installed
+    /// before that node opened.
+    grant_cuts: BTreeMap<NodeId, Arc<PrefixCut>>,
 }
 
 impl Drop for Rig {
@@ -185,8 +98,10 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
     opened_cut(partitions, failovers, None)
 }
 
-/// [`opened`], with `cut`'s own grant writes cut ([`GrantCut`]) from before it opens. Ordinary
-/// callers pass `None` and start without faults.
+/// [`opened`], with `cut`'s own `grants/{cut}` writes cut ([`PrefixCut`]) from before it
+/// opens, so the node can take no grant of its own at its boot, however long the rest of the
+/// setup takes, until the row lifts it; every other call passes, so it opens (PR #119 review).
+/// Ordinary callers pass `None` and start without faults.
 fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<NodeId>) -> Rig {
     let mut grant_cuts = BTreeMap::new();
     let rt = runtime();
@@ -239,7 +154,11 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
                 let mut control: Arc<dyn ConfigStore> =
                     CutStore::new(Arc::clone(&store), Arc::clone(&faults));
                 if cut == Some(node) {
-                    let grant_cut = GrantCut::new(control, node);
+                    let grant_cut = PrefixCut::new(
+                        control,
+                        &ControlKey::Grant(node).encode(),
+                        CutCalls::Writes,
+                    );
                     grant_cuts.insert(node, Arc::clone(&grant_cut));
                     control = grant_cut;
                 }
@@ -320,7 +239,7 @@ impl Rig {
 
     /// Let `node` write its own grant again ([`opened_cut`]).
     fn lift_grant_cut(&self, node: NodeId) {
-        self.grant_cuts[&node].cut.store(false, Ordering::SeqCst);
+        self.grant_cuts[&node].lift();
     }
 
     /// `planner/grant`, read from the store. Rows wait on the store, never by polling the log:
@@ -954,7 +873,7 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
 /// until the node's recovery replaces it, and that record runs out first. An owner whose only
 /// grant is a past boot's is not an owner that stopped serving.
 ///
-/// The row holds node 2 in that state on purpose: its own grant writes are cut ([`GrantCut`])
+/// The row holds node 2 in that state on purpose: its own grant writes are cut ([`opened_cut`])
 /// from before it opens, so its recovery cannot replace the old record, while its links still
 /// answer. Left to the start's own timing the state lasts from none to a few hundred ms, and
 /// the row saw it or not by chance (lead's gate at dc2b1b4). The setup is then delayed by one
@@ -1352,4 +1271,77 @@ fn own81_invalid_failover_is_refused_before_creation() {
         local(&[1]).check().is_ok(),
         "one node with failover is taken"
     );
+}
+
+/// PR #119 review (`promote_failure_warns_once`): node 1 stops, and every promote of its
+/// partition is refused, stably: the planner's `partitions/` writes are cut, so each `Fencing`
+/// CAS fails. Each sweep still retries, but the decision and the failure are said once for the
+/// window (later decisions at debug). Once the cut is lifted the next sweep promotes,
+/// `planner_promoted` is said, and `planner_warn_recovered` names the 3 failures held back.
+/// Integration (~15 s): waits out the grant, then four sweeps whose looks wait the read
+/// timeout.
+/// Cut: `Repeats::note` says every occurrence; four failures, red.
+#[config_log::retcd_test]
+fn own81_promote_failure_warns_once() {
+    const METHOD: &str = "own81_promote_failure_warns_once";
+    let rig = rig(3, None);
+    let moving = rig.owned_by(NodeId(1));
+    let p = *moving.first().expect("node 1 owns a partition");
+    let planner = rig.procs[1]
+        .db
+        .planner(failover())
+        .expect("a node process's planner");
+    let cut = PrefixCut::new(
+        Arc::clone(&planner.store),
+        ControlPrefix::Partitions.encode(),
+        CutCalls::Writes,
+    );
+    let planner = crate::planner::Planner {
+        store: Arc::clone(&cut) as Arc<dyn ConfigStore>,
+        ..planner
+    };
+    rig.stop(0);
+    let mut memory = crate::planner::Memory::default();
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+    let mut failed = 0;
+    while failed < 4 {
+        let answers = rig.rt.block_on(planner.sweep(&mut memory));
+        for (partition, answer) in &answers {
+            assert_eq!(partition.0, p, "{answers:?}");
+            assert!(answer.is_err(), "the Fencing write is cut: {answers:?}");
+            failed += 1;
+        }
+        assert!(Instant::now() < deadline, "no promote was tried");
+        if answers.is_empty() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let said = |message: &str| -> Vec<serde_json::Value> {
+        logged(METHOD, message)
+            .into_iter()
+            .filter(|line| line["partition"] == p && line["@l"] != "Debug")
+            .collect()
+    };
+    let failures = said("planner_promote_failed");
+    assert_eq!(failures.len(), 1, "said once in the window: {failures:?}");
+    assert_eq!(failures[0]["suppressed"], 0, "{failures:?}");
+    let decisions = said("planner_promote_decision");
+    assert_eq!(decisions.len(), 1, "the pair, once: {decisions:?}");
+
+    cut.lift();
+    let answers = rig.rt.block_on(planner.sweep(&mut memory));
+    assert!(
+        answers
+            .iter()
+            .any(|(partition, answer)| partition.0 == p && answer.is_ok()),
+        "{answers:?}"
+    );
+    assert_eq!(said("planner_promoted").len(), 1);
+    let recovered: Vec<_> = logged(METHOD, "planner_warn_recovered")
+        .into_iter()
+        .filter(|line| line["warn"] == "planner_promote_failed")
+        .collect();
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert_eq!(recovered[0]["suppressed"], 3, "{recovered:?}");
+    assert_ne!(rig.owner(p), NodeId(1));
 }

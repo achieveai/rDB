@@ -1,7 +1,8 @@
 //! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read or a
 //! list, hold every put at a gate (F-003, F-004), hold a list's answer after it has read
 //! (M9 S2a review F-002), or block the list's worker thread there (PR #38 review F-002), or
-//! hold a watch at a gate (M9 S2b review F-005), or fail a delete (F-024). It records when each
+//! hold a watch at a gate (M9 S2b review F-005), or fail a delete (F-024), or apply a put and
+//! hold its reply (PR #119 review). It records when each
 //! list arrived (PR #38 review F-001).
 //!
 //! Written out by hand because `async-trait` is not a dependency of this crate.
@@ -77,6 +78,9 @@ pub(crate) struct Script {
     /// When set, only puts on a key that starts with this take the put steps above (`pass_puts`, `drop_puts`,
     /// `lose_put_replies`); a put on any other key goes straight through (A-R184).
     pub(crate) only_prefix: Option<Vec<u8>>,
+    /// Puts still to apply and then hold their reply until [`Scripted::release_replies`]: a
+    /// write that has landed whose answer has not (PR #119 review). Keyed by `only_prefix`.
+    pub(crate) hold_put_replies: u32,
 }
 
 /// Whether a blocked list has read, and whether blocked lists may answer.
@@ -103,6 +107,10 @@ pub(crate) struct Scripted {
     /// Notified when a held list has read and parked at its shut gate (from the poll that
     /// parks it).
     pub(crate) list_held: Notify,
+    /// A held put reply takes a permit before it answers. Starts closed.
+    reply_gate: Semaphore,
+    /// Notified when a held put has applied and parked at its shut reply gate.
+    pub(crate) reply_held: Notify,
     /// The gate a blocked list waits at, on its worker thread.
     blocked: (Mutex<Blocked>, Condvar),
     /// When each list arrived, failed ones included, on tokio's clock (paused in a test that
@@ -121,6 +129,8 @@ impl Scripted {
             watch_gate: Semaphore::new(0),
             watch_held: Notify::new(),
             list_held: Notify::new(),
+            reply_gate: Semaphore::new(0),
+            reply_held: Notify::new(),
             blocked: (Mutex::new(Blocked::default()), Condvar::new()),
             lists: Mutex::new(Vec::new()),
         }
@@ -167,6 +177,11 @@ impl Scripted {
     /// Let held lists answer, one at a time.
     pub(crate) fn release_lists(&self) {
         self.list_gate.add_permits(1);
+    }
+
+    /// Let held put replies answer, one at a time.
+    pub(crate) fn release_replies(&self) {
+        self.reply_gate.add_permits(1);
     }
 
     /// Let held watches open, one at a time.
@@ -283,6 +298,9 @@ impl ConfigStore for Scripted {
             if scripted && self.take(|script| &mut script.lose_put_replies) {
                 return Err(ConfigError::DeadlineExceededUnknownOutcome);
             }
+            if scripted && self.take(|script| &mut script.hold_put_replies) {
+                let _permit = park_at(&self.reply_gate, &self.reply_held).await;
+            }
             Ok(response)
         })
     }
@@ -315,5 +333,100 @@ impl ConfigStore for Scripted {
             let _permit = park_at(&self.watch_gate, &self.watch_held).await;
             self.inner.watch(request).await
         })
+    }
+}
+
+/// What a [`PrefixCut`] cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutCalls {
+    /// Every put or delete of a key under the prefix.
+    Writes,
+    /// Every list whose prefix starts with it.
+    Lists,
+}
+
+/// Any control store with the calls on one key prefix cut: each fails `Unavailable`, as
+/// `cut-control` fails them, until [`PrefixCut::lift`]. Every other call passes, so a node
+/// behind it opens (PR #119 review: a cut installed before the node opens).
+pub(crate) struct PrefixCut {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    prefix: Vec<u8>,
+    calls: CutCalls,
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl PrefixCut {
+    /// `inner`, with `calls` under `prefix` cut from the start.
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        prefix: &str,
+        calls: CutCalls,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            calls,
+            cut: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Let the cut calls through from now on.
+    pub(crate) fn lift(&self) {
+        self.cut.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check(&self, calls: CutCalls, key: &[u8]) -> Result<(), ConfigError> {
+        if calls == self.calls
+            && key.starts_with(&self.prefix)
+            && self.cut.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::info!(prefix = %String::from_utf8_lossy(&self.prefix), ?calls, "test_prefix_cut");
+            return Err(ConfigError::Unavailable {
+                reason: "scripted: this prefix is cut (PrefixCut)".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PrefixCut {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.check(CutCalls::Lists, &request.prefix)?;
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.check(CutCalls::Lists, &request.list.prefix)?;
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        self.check(CutCalls::Writes, &request.key)?;
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.check(CutCalls::Writes, &request.key)?;
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
     }
 }

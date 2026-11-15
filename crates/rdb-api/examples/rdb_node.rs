@@ -25,7 +25,7 @@
 //!   `next_boot(--dir)`, the same value in the handshake and in the `Db` (ruling A-R227).
 //!   `--protocol-version` makes it speak another wire version, to walk the refusal.
 //!   `--faults` names the fault file it polls every 50 ms (`hold <n>|hold all|drop-request N|
-//!   drop-reply N|cut-control`). It stops cleanly when `--stop-file` appears.
+//!   drop-reply N|cut-control|mute`). It stops cleanly when `--stop-file` appears.
 //!   `--admin-apps` names the apps whose certificate may send `admin move` and `admin rebuild`
 //!   (ruling A-R479). Unset or empty, no app may (ruling A-R480), as in the library. `lr`
 //!   passes `--admin-apps admin`, the app `lr` and `rdb_dev` run as; a production node lists
@@ -41,7 +41,9 @@
 //!   `DbConfig::failover`): while it holds `planner/grant` it promotes each partition of a node
 //!   whose link has echoed no clock probe for `--failover-silent-ms` (default 2000), that
 //!   answers no look, and whose grant has run out; or of a node whose grant is frozen. At most
-//!   `--failover-max-concurrent` (default 16) promotes run at once. Off by default.
+//!   `--failover-max-concurrent` (default 16) promotes run at once. Off by default. Either
+//!   knob without `--failover` is refused, and so is `--failover` with `--form` or
+//!   `--gen-certs`: neither runs a planner.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -232,7 +234,36 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    failover_refusal(&args)?;
     Ok(args)
+}
+
+/// `--failover` and its knobs where nothing would read them, refused rather than ignored (PR
+/// #119 review): `--form` and `--gen-certs` run no planner, and a knob does nothing without
+/// `--failover`.
+fn failover_refusal(args: &Args) -> Result<(), String> {
+    if args.failover {
+        for (given, mode) in [(args.form, "--form"), (args.gen_certs, "--gen-certs")] {
+            if given {
+                return Err(format!(
+                    "--failover runs only in a node process, not with {mode}"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    for (given, knob) in [
+        (args.failover_silent_ms.is_some(), "--failover-silent-ms"),
+        (
+            args.failover_max_concurrent.is_some(),
+            "--failover-max-concurrent",
+        ),
+    ] {
+        if given {
+            return Err(format!("{knob} needs --failover"));
+        }
+    }
+    Ok(())
 }
 
 /// Poll `file`: whole milliseconds in it step this process's `Tick` back once. A file that
@@ -567,5 +598,62 @@ mod tests {
         assert_eq!(apps(&["--admin-apps", "ops, admin"]), ["admin", "ops"]);
         assert_eq!(apps(&["--admin-apps", " ops ,  admin "]), ["admin", "ops"]);
         assert_eq!(apps(&["--admin-apps", " , "]), Vec::<String>::new());
+    }
+
+    fn parsed(argv: &[&str]) -> Result<super::Args, String> {
+        parse(argv.iter().map(|a| (*a).to_owned()))
+    }
+
+    /// PR #119 review: `--failover` with `--form` is a parse error, since forming runs no
+    /// planner; plain `--form` parses. Unit.
+    /// Cut: drop the mode check in `failover_refusal`; the pair parses, red.
+    #[test]
+    fn own81_form_rejects_failover() {
+        assert_eq!(
+            parsed(&["--form", "--failover"]).map(|_| ()),
+            Err("--failover runs only in a node process, not with --form".to_owned())
+        );
+        assert!(parsed(&["--form"]).is_ok_and(|args| args.form && !args.failover));
+    }
+
+    /// PR #119 review: `--failover` with `--gen-certs` is a parse error; plain `--gen-certs`
+    /// parses. Unit.
+    /// Cut: as above.
+    #[test]
+    fn own81_certs_reject_failover() {
+        assert_eq!(
+            parsed(&["--gen-certs", "--failover"]).map(|_| ()),
+            Err("--failover runs only in a node process, not with --gen-certs".to_owned())
+        );
+        assert!(parsed(&["--gen-certs"]).is_ok_and(|args| args.gen_certs));
+    }
+
+    /// PR #119 review: `--failover-silent-ms` without `--failover` is a parse error; with it,
+    /// the knob is taken. Unit.
+    /// Cut: drop the knob check in `failover_refusal`; the orphan parses, red.
+    #[test]
+    fn own81_silent_knob_needs_failover() {
+        assert_eq!(
+            parsed(&["--failover-silent-ms", "3000"]).map(|_| ()),
+            Err("--failover-silent-ms needs --failover".to_owned())
+        );
+        let args = parsed(&["--failover", "--failover-silent-ms", "3000"]).expect("parses");
+        assert_eq!(
+            super::failover(&args).map(|f| f.silent_after),
+            Some(std::time::Duration::from_millis(3_000))
+        );
+    }
+
+    /// PR #119 review: `--failover-max-concurrent` without `--failover` is a parse error; with
+    /// it, the knob is taken. Unit.
+    /// Cut: as above.
+    #[test]
+    fn own81_concurrency_knob_needs_failover() {
+        assert_eq!(
+            parsed(&["--failover-max-concurrent", "4"]).map(|_| ()),
+            Err("--failover-max-concurrent needs --failover".to_owned())
+        );
+        let args = parsed(&["--failover-max-concurrent", "4", "--failover"]).expect("parses");
+        assert_eq!(super::failover(&args).map(|f| f.max_concurrent), Some(4));
     }
 }

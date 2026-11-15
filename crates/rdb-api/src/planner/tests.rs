@@ -443,3 +443,434 @@ fn own81_a_planner_whose_host_does_not_answer_keeps_its_grant() {
     }
     assert!(messages(METHOD, "planner_grant_released_host_stopped").is_empty());
 }
+
+/// A script whose put steps apply to `planner/grant` only: every other key's put goes straight
+/// through (the fault is scoped to the planner's grant).
+fn on_planner_grant(script: crate::test_store::Script) -> crate::test_store::Script {
+    crate::test_store::Script {
+        only_prefix: Some(ControlKey::PlannerGrant.encode().into_bytes()),
+        ..script
+    }
+}
+
+/// `planner/grant`'s record and its store revision.
+fn planner_grant_at(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> Option<(GrantRecord, u64)> {
+    rt.block_on(store.get(GetRequest {
+        key: Bytes::from(ControlKey::PlannerGrant.encode()),
+    }))
+    .expect("the store answers")
+    .record
+    .map(|found| {
+        (
+            GrantRecord::decode(&found.value).expect("a grant record"),
+            found.mod_revision,
+        )
+    })
+}
+
+/// Put `grants/9` through `store`: a put on another key, which a scoped fault must not take.
+fn put_other_key(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) {
+    let put = rt
+        .block_on(store.put(PutRequest {
+            key: Bytes::from_static(b"grants/9"),
+            value: Bytes::from_static(b"other"),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("a put on another key is not faulted");
+    assert_eq!(put.outcome, MutationOutcome::Applied);
+}
+
+/// PR #119 review (`lost_grant_reply_is_not_held`): the planner's grant write applies and its
+/// reply is lost. The hold answers false, and holds nothing, although the record is in the
+/// store; the next hold renews it with a fresh CAS at that record's exact revision and only
+/// then holds. The fault is scoped to `planner/grant`: a put on another key passes first.
+/// Cut: hold on a failed write as on an applied one (`memory.held` set before the put); the
+/// first hold answers true, red.
+#[config_log::retcd_test]
+fn own81_lost_grant_reply_is_not_held() {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            lose_put_replies: 1,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    put_other_key(&rt, &store);
+    let lost = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    assert!(
+        !rt.block_on(lost.hold(&mut memory)),
+        "a lost reply holds nothing"
+    );
+    assert!(memory.held.is_none(), "{:?}", memory.held);
+    let (applied, at) = planner_grant_at(&rt, &store).expect("the write applied");
+    assert_eq!((applied.node, applied.boot), (NodeId(2), BootId(1)));
+    assert!(rt.block_on(lost.hold(&mut memory)), "a fresh CAS holds");
+    let (renewed, renewed_at) = planner_grant_at(&rt, &store).expect("renewed");
+    assert!(renewed_at > at, "a new write: {at} -> {renewed_at}");
+    assert_eq!(
+        renewed.grant, applied.grant,
+        "the same grant, renewed in place"
+    );
+    assert!(renewed.expiry_utc_ms >= applied.expiry_utc_ms);
+    let held = memory.held.expect("held");
+    assert_eq!(
+        held.expiry_utc_ms, renewed.expiry_utc_ms,
+        "held at the fresh write"
+    );
+}
+
+/// PR #119 review (`dropped_grant_write_is_not_held`): two grant writes in a row fail without
+/// applying. Neither makes the planner hold, nothing is in the store, and the third, which
+/// applies, holds.
+/// Cut: as the lost-reply row; the first hold answers true, red.
+#[config_log::retcd_test]
+fn own81_dropped_grant_write_is_not_held() {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            drop_puts: 2,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    put_other_key(&rt, &store);
+    let dropped = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    for attempt in 1..=2 {
+        assert!(!rt.block_on(dropped.hold(&mut memory)), "write {attempt}");
+        assert!(memory.held.is_none(), "write {attempt}: {:?}", memory.held);
+        assert_eq!(planner_grant_at(&rt, &store), None, "write {attempt}");
+    }
+    assert!(
+        rt.block_on(dropped.hold(&mut memory)),
+        "the third write applies"
+    );
+    assert_eq!(
+        planner_grant_at(&rt, &store).map(|(grant, _)| grant.grant),
+        Some(GrantId(1))
+    );
+}
+
+/// PR #119 review (`cancel_before_grant_write`): the hold is cancelled while its grant write
+/// waits at a gate before it applies. Nothing is in the store and nothing is held. A planner
+/// that restarts with a fresh `Memory` then acquires `GrantId(1)` at once: no record stands in
+/// its way.
+/// Cut: `memory.held` set before the put; the cancelled hold leaves one held, red.
+#[config_log::retcd_test]
+fn own81_cancel_before_grant_write() {
+    let rt = crate::db::reopen_tests::runtime();
+    let gated = Arc::new(crate::test_store::Scripted::gated());
+    let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let cancelled = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    rt.block_on(async {
+        tokio::select! {
+            held = cancelled.hold(&mut memory) => panic!("the write is gated: {held}"),
+            () = gated.put_arrived.notified() => {}
+        }
+    });
+    assert!(memory.held.is_none(), "{:?}", memory.held);
+    assert_eq!(planner_grant_at(&rt, &store), None, "nothing applied");
+
+    gated.rescript(crate::test_store::Script {
+        pass_gate: u32::MAX,
+        ..crate::test_store::Script::default()
+    });
+    let mut fresh = Memory::default();
+    assert!(
+        rt.block_on(cancelled.hold(&mut fresh)),
+        "a restart acquires"
+    );
+    assert_eq!(
+        planner_grant_at(&rt, &store).map(|(grant, _)| grant.grant),
+        Some(GrantId(1))
+    );
+}
+
+/// PR #119 review (`cancel_after_grant_write`): the planner holds, then a renewal is cancelled
+/// after it applied and before its reply came back. The cancelled renewal does not extend what
+/// the planner holds: its `Held` is still the first write's. A fresh boot of the same node is
+/// refused until the applied record's expiry is proven past, `G + eps + delta` after the
+/// cancelled write, not after the first.
+/// Cut: `memory.held` set before the put; the cancelled renewal moves the held horizon, red.
+#[config_log::retcd_test]
+fn own81_cancel_after_grant_write() {
+    let rt = crate::db::reopen_tests::runtime();
+    let scripted = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            pass_puts: 1,
+            hold_put_replies: 1,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+    let old = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    assert!(rt.block_on(old.hold(&mut memory)), "the first write holds");
+    let first = memory.held.expect("held");
+    std::thread::sleep(Duration::from_millis(50));
+    rt.block_on(async {
+        tokio::select! {
+            held = old.hold(&mut memory) => panic!("the reply is held: {held}"),
+            () = scripted.reply_held.notified() => {}
+        }
+    });
+    let written = Instant::now();
+    let held = memory.held.expect("still the first write's");
+    assert_eq!(
+        (held.expiry_utc_ms, held.dispatched),
+        (first.expiry_utc_ms, first.dispatched),
+        "the cancelled renewal extended the held horizon"
+    );
+    let (applied, _) = planner_grant_at(&rt, &store).expect("the renewal applied");
+    assert!(applied.expiry_utc_ms > first.expiry_utc_ms, "{applied:?}");
+
+    let fresh = Planner {
+        boot: BootId(2),
+        ..planner(2, &store, healthy_links(2))
+    };
+    let mut fresh_memory = Memory::default();
+    assert!(
+        !rt.block_on(fresh.hold(&mut fresh_memory)),
+        "a fresh boot refuses before the expiry is proven"
+    );
+    let deadline = written + Duration::from_secs(5);
+    while !rt.block_on(fresh.hold(&mut fresh_memory)) {
+        assert!(Instant::now() < deadline, "no takeover");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let budgets = fresh.budgets;
+    let floor = budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis;
+    let waited = u64::try_from(written.elapsed().as_millis()).unwrap_or(u64::MAX);
+    assert!(
+        waited + 50 >= floor,
+        "taken {waited} ms after the cancelled write, before G+eps+delta={floor}"
+    );
+    let taken = planner_grant_at(&rt, &store).expect("taken").0;
+    assert_eq!(
+        (taken.boot, taken.grant),
+        (BootId(2), GrantId(applied.grant.0 + 1))
+    );
+}
+
+/// PR #119 review (`late_grant_reply_keeps_dispatch_horizon`): a grant write applies, and its
+/// reply comes back only after the write's local horizon (`G - delta` from its dispatch) has
+/// passed. The hold answers false: the horizon runs from the dispatch, not from the reply. The
+/// next hold's fresh CAS holds.
+/// Cut: hold whatever was last written (drop the validity filter after the write); the late
+/// hold answers true, red. Taking only `dispatched` at the reply stays green: the UTC rule on
+/// the written expiry refuses too, and is the stricter of A1's two by `eps`.
+#[config_log::retcd_test]
+fn own81_late_grant_reply_keeps_dispatch_horizon() {
+    const METHOD: &str = "own81_late_grant_reply_keeps_dispatch_horizon";
+    let rt = crate::db::reopen_tests::runtime();
+    let scripted = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            hold_put_replies: 1,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+    let late = planner(2, &store, healthy_links(2));
+    let horizon = Duration::from_millis(late.budgets.grant_millis);
+    let mut memory = Memory::default();
+    let (held, ()) = rt.block_on(async {
+        tokio::join!(late.hold(&mut memory), async {
+            scripted.reply_held.notified().await;
+            tokio::time::sleep(horizon).await;
+            scripted.release_replies();
+        })
+    });
+    assert!(!held, "a reply after the horizon holds nothing");
+    assert!(messages(METHOD, "planner_grant_acquired").is_empty());
+    assert!(planner_grant_at(&rt, &store).is_some(), "the write applied");
+    assert!(rt.block_on(late.hold(&mut memory)), "a fresh CAS holds");
+}
+
+/// Write `value` at `key` straight into `store`.
+fn put_raw(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, key: &str, value: &[u8]) {
+    rt.block_on(store.put(PutRequest {
+        key: Bytes::from(key.to_owned()),
+        value: Bytes::copy_from_slice(value),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("the raw put lands");
+}
+
+fn delete_raw(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, key: &str) {
+    rt.block_on(store.delete(config_core::DeleteRequest {
+        key: Bytes::from(key.to_owned()),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("the raw delete lands");
+}
+
+/// The one `planner_warn_recovered` line for `warn`, with how many it held back.
+fn recovered_once(method: &str, warn: &str, suppressed: u64) {
+    let lines: Vec<_> = messages(method, "planner_warn_recovered")
+        .into_iter()
+        .filter(|line| line["warn"] == warn)
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["suppressed"], suppressed, "{lines:?}");
+}
+
+/// `n` sweeps by `planner`, each refused: nothing promoted.
+fn sweeps_refused(rt: &tokio::runtime::Runtime, planner: &Planner, memory: &mut Memory, n: u32) {
+    for _ in 0..n {
+        assert!(rt.block_on(planner.sweep(memory)).is_empty());
+    }
+}
+
+/// PR #119 review (`bad_planner_grant_warns_once`): `planner/grant` holds bytes that are no
+/// grant record. Five holds in a row, well inside one window, say `planner_grant_undecodable`
+/// once and hold nothing; each still retries the read. Once the record is gone the next hold
+/// acquires and says `planner_warn_recovered` with the 4 held back.
+/// Cut: `Repeats::note` says every occurrence; five lines, red.
+#[config_log::retcd_test]
+fn own81_bad_planner_grant_warns_once() {
+    const METHOD: &str = "own81_bad_planner_grant_warns_once";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    put_raw(
+        &rt,
+        &store,
+        &ControlKey::PlannerGrant.encode(),
+        b"not a grant",
+    );
+    let bad = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    for _ in 0..5 {
+        assert!(!rt.block_on(bad.hold(&mut memory)));
+    }
+    let said = messages(METHOD, "planner_grant_undecodable");
+    assert_eq!(said.len(), 1, "{said:?}");
+    delete_raw(&rt, &store, &ControlKey::PlannerGrant.encode());
+    assert!(
+        rt.block_on(bad.hold(&mut memory)),
+        "acquired once it decodes"
+    );
+    recovered_once(METHOD, "planner_grant_undecodable", 4);
+}
+
+/// PR #119 review (`grant_write_warns_once`): five grant writes in a row fail. Each hold still
+/// writes again, and `planner_grant_write_failed` is said once; the sixth write applies, and
+/// `planner_warn_recovered` names the 4 held back.
+/// Cut: `Repeats::note` says every occurrence; five lines, red.
+#[config_log::retcd_test]
+fn own81_grant_write_warns_once() {
+    const METHOD: &str = "own81_grant_write_warns_once";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            drop_puts: 5,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    let failing = planner(2, &store, healthy_links(2));
+    let mut memory = Memory::default();
+    for _ in 0..5 {
+        assert!(!rt.block_on(failing.hold(&mut memory)));
+    }
+    let said = messages(METHOD, "planner_grant_write_failed");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        rt.block_on(failing.hold(&mut memory)),
+        "the sixth write applies"
+    );
+    recovered_once(METHOD, "planner_grant_write_failed", 4);
+}
+
+/// [`list_warns_once`] and [`bad_entry_warns_once`]: five sweeps on `store` are refused and say
+/// `planner_sweep_unread` with `cause` once; `heal` then clears it, and the next sweep says
+/// `planner_warn_recovered` with the 4 held back.
+fn sweep_unread_once(
+    method: &str,
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    cause: &str,
+    heal: impl FnOnce(),
+) {
+    let planner = planner(2, store, healthy_links(2));
+    let mut memory = Memory::default();
+    sweeps_refused(rt, &planner, &mut memory, 5);
+    let said = messages(method, "planner_sweep_unread");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0]["cause"], cause, "{said:?}");
+    heal();
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    recovered_once(method, "planner_sweep_unread", 4);
+    assert_eq!(messages(method, "planner_sweep_unread").len(), 1);
+}
+
+/// Five sweeps whose `prefix` list fails, then lists that answer.
+fn list_warns_once(method: &str, prefix: &str, cause: &str) {
+    let rt = crate::db::reopen_tests::runtime();
+    let cut = crate::test_store::PrefixCut::new(
+        Arc::new(config_testkit::MemStore::new()),
+        prefix,
+        crate::test_store::CutCalls::Lists,
+    );
+    let store: Arc<dyn ConfigStore> = Arc::clone(&cut) as Arc<dyn ConfigStore>;
+    sweep_unread_once(method, &rt, &store, cause, || cut.lift());
+}
+
+/// Five sweeps that find bytes at `key` that are no record of its family, then none.
+fn bad_entry_warns_once(method: &str, key: &str, cause: &str) {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    put_raw(&rt, &store, key, b"not a record");
+    sweep_unread_once(method, &rt, &store, cause, || delete_raw(&rt, &store, key));
+}
+
+/// PR #119 review (`grant_list_warns_once`): the `grants/` list fails on five sweeps; each is
+/// refused and the warn said once. Recovery is said.
+/// Cut: `Repeats::note` says every occurrence; five lines, red.
+#[config_log::retcd_test]
+fn own81_grant_list_warns_once() {
+    list_warns_once(
+        "own81_grant_list_warns_once",
+        ControlPrefix::Grants.encode(),
+        "grants_list_failed",
+    );
+}
+
+/// PR #119 review (`partition_list_warns_once`): as above, the `partitions/` list.
+/// Cut: as above.
+#[config_log::retcd_test]
+fn own81_partition_list_warns_once() {
+    list_warns_once(
+        "own81_partition_list_warns_once",
+        ControlPrefix::Partitions.encode(),
+        "partitions_list_failed",
+    );
+}
+
+/// PR #119 review (`bad_grant_entry_warns_once`): `grants/5` is no grant record; five sweeps
+/// are refused whole and the warn said once. Recovery is said.
+/// Cut: as above.
+#[config_log::retcd_test]
+fn own81_bad_grant_entry_warns_once() {
+    bad_entry_warns_once(
+        "own81_bad_grant_entry_warns_once",
+        &ControlKey::Grant(NodeId(5)).encode(),
+        "grant_entry_undecodable",
+    );
+}
+
+/// PR #119 review (`bad_partition_entry_warns_once`): as above, `partitions/5`.
+/// Cut: as above.
+#[config_log::retcd_test]
+fn own81_bad_partition_entry_warns_once() {
+    bad_entry_warns_once(
+        "own81_bad_partition_entry_warns_once",
+        &ControlKey::Partition(PartitionId(5)).encode(),
+        "partition_entry_undecodable",
+    );
+}
