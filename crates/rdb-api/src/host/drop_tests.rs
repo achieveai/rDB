@@ -6296,26 +6296,10 @@ fn u2_a_member_answering_clean_repairs_when_the_other_members_tail_is_adoptable(
     assert!(held.is_empty(), "held for an adoptable tail: {held:?}");
 }
 
-/// Issue #106: A-R383 holds a `ReadOnly` commit's repair while a copy F1's stall named still
-/// answers, since that copy can still prove the rebuild. A copy whose status reports a tail past
-/// the pinned cutoff cannot: it withholds its post-commit proof (`sync_withheld`,
-/// `reason=tail_held`), so on real nodes the hold never ended and every put answered
-/// `RECOVERY_READ_ONLY` with no way out. Planted input as
-/// `s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail`: node 1's commit
-/// marked `ReadOnly`, its rebuild pinned, F1's latest stall naming node 3's copy. While node 3
-/// answers clean the repair waits on the rebuild (one Information line,
-/// `membership_repair_rebuild_hold_started`); once node 3 reports `held_past_base` above the
-/// cutoff the hold ends (`membership_repair_rebuild_hold_ended`, reason
-/// `stalled_copy_withholds_proof`) and S4d's tail hold takes over and names node 3, so
-/// `forget-tail` can see it. `repair_duty`, the probes and the `Inspect` answers are real.
-/// Cut: a stalled copy reporting a tail still holds in `repair_duty`, red (no hold end, no
-/// `membership_repair_held`).
-/// Integration (~2 s): the trio's start and a few repair checks.
-#[config_log::retcd_test]
-fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
-    const METHOD: &str = "i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold";
-    let dir = config_testkit::fs::temp_dir();
-    let (mut trio, before) = started(dir.path(), tuned);
+/// The issue #106 rows' planted input: node 1's commit of partition 1 marked `ReadOnly`, its
+/// rebuild pinned, and F1's latest stall naming node 3's copy, so A-R383 holds the repair while
+/// node 3 answers. Answers the commit's generation and cutoff.
+fn pin_a_stalled_rebuild(trio: &mut Trio) -> (Generation, Seq) {
     let p = PartitionId(1);
     let owner = &mut trio.nodes[0].0;
     let committed = owner.committed.get_mut(&p).expect("node 1's commit");
@@ -6339,6 +6323,31 @@ fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
     owner
         .latest_stall
         .insert(p, (generation, BTreeSet::from([CopyId(2)])));
+    (generation, cutoff)
+}
+
+/// Issue #106: A-R383 holds a `ReadOnly` commit's repair while a copy F1's stall named still
+/// answers, since that copy can still prove the rebuild. A copy whose status reports a tail past
+/// the pinned cutoff cannot: it withholds its post-commit proof (`sync_withheld`,
+/// `reason=tail_held`), so on real nodes the hold never ended and every put answered
+/// `RECOVERY_READ_ONLY` with no way out. Planted input as
+/// `s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail`: node 1's commit
+/// marked `ReadOnly`, its rebuild pinned, F1's latest stall naming node 3's copy. While node 3
+/// answers clean the repair waits on the rebuild (one Information line,
+/// `membership_repair_rebuild_hold_started`); once node 3 reports `held_past_base` above the
+/// cutoff the hold ends (`membership_repair_rebuild_hold_ended`, reason
+/// `stalled_copy_withholds_proof`) and S4d's tail hold takes over and names node 3, so
+/// `forget-tail` can see it. `repair_duty`, the probes and the `Inspect` answers are real.
+/// Cut: a stalled copy reporting a tail still holds in `repair_duty`, red (no hold end, no
+/// `membership_repair_held`).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
+    const METHOD: &str = "i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, cutoff) = pin_a_stalled_rebuild(&mut trio);
 
     // Five drop checks with node 3 answering clean, so a probe is sent and its answers read at
     // least twice: the rebuild may still finish, so the repair waits.
@@ -6415,28 +6424,7 @@ fn i106_a_rebuild_hold_ends_when_no_member_outside_is_linked() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, _) = started(dir.path(), tuned);
     let p = PartitionId(1);
-    let owner = &mut trio.nodes[0].0;
-    let committed = owner.committed.get_mut(&p).expect("node 1's commit");
-    committed.mode = PartitionMode::ReadOnly;
-    let generation = committed.new_generation;
-    let cutoff = committed.selected.cutoff_seq;
-    let since = owner.clock.now();
-    owner.rebuilds.insert(
-        p,
-        RebuildWatch {
-            generation,
-            mode: PartitionMode::ReadOnly,
-            cutoff,
-            required: vec![CopyId(0), CopyId(1), CopyId(2)],
-            since,
-            pinned: true,
-            unproven: BTreeSet::from([CopyId(2)]),
-            unreported: false,
-        },
-    );
-    owner
-        .latest_stall
-        .insert(p, (generation, BTreeSet::from([CopyId(2)])));
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
 
     trio.until("the rebuild hold started", |_| {
         (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
@@ -6456,6 +6444,102 @@ fn i106_a_rebuild_hold_ends_when_no_member_outside_is_linked() {
     assert!(
         !trio.nodes[0].0.rebuild_hold.contains_key(&p),
         "the hold is forgotten"
+    );
+}
+
+/// Issue #106 review round 2: the A-R383 hold also ends when a probe is read and no member
+/// answered it, since no stalled copy then answers to hold the repair (`stalled_copy_silent`).
+/// Planted input from [`pin_a_stalled_rebuild`]; once the hold has started, the directions from
+/// nodes 2 and 3 back to node 1 are dropped, so both stay linked (a half-open link) and every
+/// later probe reads empty. The check that only sends the first probe must not end it, so there
+/// is exactly one end line.
+/// Cut: `repair_duty` no longer ends the hold when a probe read has no answer, red (no end line).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rebuild_hold_ends_when_a_probe_reads_no_answer() {
+    const METHOD: &str = "i106_a_rebuild_hold_ends_when_a_probe_reads_no_answer";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.links.drop_direction(NodeId(2), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    // Two more drop checks: a second end, or one that came early, would show here.
+    let until = trio.clock.now();
+    trio.until("two more drop checks passed", |trio| {
+        (HostClock::millis_until(until, trio.clock.now()) >= 2 * DROP_CHECK_EVERY_MILLIS)
+            .then_some(())
+    });
+    let ended_after = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+    assert_eq!(ended_after.len(), 1, "the hold ended once: {ended_after:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "stalled_copy_silent", "{ended:?}");
+    assert!(
+        logged!(METHOD, "membership_repair_planned").is_empty(),
+        "a repair ran with nobody answering"
+    );
+    assert!(
+        trio.nodes[0].0.committed[&p].mode == PartitionMode::ReadOnly,
+        "still read-only"
+    );
+}
+
+/// Issue #106 review round 2: when a rejoin empties the outside set of a commit that is still
+/// `ReadOnly`, the A-R383 hold ends with `no_member_outside`, not `not_read_only`, since the mode
+/// did not change. Planted input from [`pin_a_stalled_rebuild`]; once the hold has started, node 1
+/// is given a restart re-plan (`Rejoin::Planned`, for a later generation), which
+/// `read_only_outside` answers with no member.
+/// Cut: the empty-outside reason is `not_read_only` whatever the mode, red (wrong reason).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rejoin_on_a_read_only_commit_ends_the_rebuild_hold_with_no_member_outside() {
+    const METHOD: &str =
+        "i106_a_rejoin_on_a_read_only_commit_ends_the_rebuild_hold_with_no_member_outside";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.nodes[0].0.rejoins.insert(
+        p,
+        Rejoin::Planned {
+            generation: Generation(generation.0 + 1),
+            replan: Replan {
+                drop: None,
+                rejoiner: None,
+                promote: false,
+                since: Tick(0),
+                release: rdb_core::contracts::recovery::TailRelease::default(),
+            },
+        },
+    );
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "no_member_outside", "{ended:?}");
+    assert!(
+        trio.nodes[0].0.committed[&p].mode == PartitionMode::ReadOnly,
+        "the commit is still read-only, so the mode did not end the hold"
     );
 }
 
