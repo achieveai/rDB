@@ -5107,6 +5107,67 @@ mod guide_sample {
     }
 }
 
+/// embed.md's ownership events sample (`events_sample.rs`), compiled into this module.
+#[allow(dead_code)]
+mod events_sample {
+    use crate as rdb_api;
+    include!("events_sample.rs");
+
+    use super::{embed_block, ready_nodes, runtime, GUIDE};
+    use std::sync::Arc;
+
+    /// #83 B1: embed.md's ownership events block is the marked span of `events_sample.rs`, so
+    /// the guide's code is the code this module compiles and runs. Unit.
+    #[test]
+    fn the_ownership_events_sample_in_embed_md_is_the_one_that_compiles() {
+        let block = embed_block(include_str!("events_sample.rs"));
+        assert!(block.contains("fn follow"), "{block}");
+        assert!(
+            GUIDE.replace("\r\n", "\n").contains(&block),
+            "embed.md lacks, verbatim:\n{block}"
+        );
+    }
+
+    /// Counts what `follow` hands it, and shuts down after the first start.
+    #[derive(Default)]
+    struct Started(Vec<(PartitionId, OwnerToken)>);
+
+    impl OnOwnership for Started {
+        fn start(&mut self, partition: PartitionId, token: OwnerToken) {
+            self.0.push((partition, token));
+        }
+        fn wind_down(&mut self, partition: PartitionId, _: OwnerToken, _: Instant) {
+            panic!("a quiet database warns nothing: {partition:?}");
+        }
+        fn stop(&mut self, partition: PartitionId, _: OwnerToken) {
+            panic!("a quiet database stops nothing: {partition:?}");
+        }
+        fn shutting_down(&self) -> bool {
+            !self.0.is_empty()
+        }
+    }
+
+    /// #83 B1: on a ready database, `follow` hears the current state first: `Activated` for
+    /// the partition, under the token `ownership` reports. Integration (~1 s): one fresh open
+    /// until ready.
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_runs_against_a_db() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let mut app = Started::default();
+        follow(&db, &mut app);
+        let partition = crate::admin::PARTITION;
+        let held = db
+            .ownership(partition)
+            .expect("a ready partition is owned")
+            .token;
+        assert_eq!(app.0, [(partition, held)]);
+        db.shutdown();
+    }
+}
+
 /// local-cluster.md section 3's app, compiled here as the guide prints it (critic-w5g A4). Its
 /// `main` needs a running `lr` cluster, so no row runs it (a gated multi-process walk is
 /// achieveai/rDB#72); the compile and the byte check below are what keep the guide's code

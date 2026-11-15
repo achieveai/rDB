@@ -165,8 +165,26 @@ impl OwnerViews {
 
 // ------------------------------------------------------------------ #83: the ownership stream
 
-/// How long before a partition's admission horizon its owner warns `Deactivating`, at the spec's
-/// budgets (#83, ruling B-2). The arithmetic, with `Budgets::SPEC_DEFAULTS`:
+/// How long before a partition's admission horizon its owner warns `Deactivating`, for a host
+/// with `budgets` (#83, lead ruling on B1 item 8):
+///
+/// ```text
+/// lead = max_sample_age - 2 x clock_sample_period      (spec: 2000 - 2 x 500 = 1000 ms)
+///        and at most a quarter of the grant            (spec: 1500, so 1000 binds)
+/// ```
+///
+/// **Why the clock settings.** `Authority::admission_horizon` stops at the last tick `utc_ok`
+/// holds, and `effective_epsilon` calls a sample stale past `max_sample_age`. Every A1 step
+/// takes a fresh local sample, A1 is stepped every `clock_sample_period`, and a store stall does
+/// not stop it (the sample is local). So in steady state the horizon is the last sample +
+/// `max_sample_age`, and the time left swings between 2000 and 1500 ms at the spec's budgets.
+/// A lead of `max_sample_age - clock_sample_period` (1500) sits on that edge with one tick to
+/// spare, and anything above it warns and recovers on every sample (measured: 1600 flaps). The
+/// second `clock_sample_period` is the slack the ruling asks for: a sample late by up to one
+/// whole period still sends nothing. If samples stop altogether, ownership really ends at the
+/// horizon, and the warning comes `lead` before it.
+///
+/// **Why it still rides out an rEtcd stall.** The grant's bound, at `Budgets::SPEC_DEFAULTS`:
 ///
 /// ```text
 /// horizon after a committed renewal = dispatch + G - eps - delta - 1 = dispatch + 5799 ms
@@ -175,39 +193,29 @@ impl OwnerViews {
 ///                                     500 ms, old when a control stall S starts)
 ///   S measured 2.4-2.9 s (ws-lease-pause, 2 runs); spec bound for an rEtcd failover 3000 ms
 ///   worst case = 500 + 3000 + 300 (commit round trip under load, assumed) = 3800 ms
-/// Deactivating fires when the time left < lead, i.e. at 5799 - lead ms after the dispatch
-/// no warning on a stall rDB rides out  <=>  5799 - lead > 3800  <=>  lead < 1999 ms
-/// lead = 1500 ms: fires 4299 ms after the dispatch, 499 ms beyond the worst stall still renewed
+/// Deactivating fires when the time left <= lead, i.e. at 5800 - lead ms after the dispatch
+/// no warning on a stall rDB rides out  <=>  5800 - lead > 3800  <=>  lead < 2000 ms
+/// lead = 1000 ms: fires 4800 ms after the dispatch, 1000 ms beyond the worst stall renewed
 /// ```
 ///
-/// The horizon has a second bound, and in steady state it is the one that binds:
-/// `Authority::admission_horizon` stops at the last tick `utc_ok` holds, and `effective_epsilon`
-/// calls a sample stale past `max_sample_age` (2000 ms). Every A1 step takes a fresh local
-/// sample, so with A1 stepped every `clock_sample_period` (500 ms) the time left swings
-/// between 2000 and 1500 ms, and a store stall does not stop it (the sample is local):
-///
-/// ```text
-/// no warning between two A1 steps  <=>  max_sample_age - clock_sample_period >= lead
-///                                  <=>  2000 - 500 >= lead  <=>  lead <= 1500 ms
-/// ```
-///
-/// 1500 sits on that edge. The `Active` due tick is the sample + 501, one tick after A1's own
-/// timer, and the turn runs that timer before the ownership duty, so the two never cross on a
-/// turn. A lead above 1500 warns and recovers on every sample (measured: 1600 flaps).
-///
-/// So a 2-3 s rEtcd stall, which renews before the horizon, warns nothing; a stall long enough
-/// to warn leaves the app 1.5 s before writes stop. If a measured stall grows, this shrinks.
-pub const DEACTIVATING_LEAD_MILLIS: u64 = 1_500;
-
-/// The lead a host with `budgets` warns by: [`DEACTIVATING_LEAD_MILLIS`] at the spec's grant or
-/// a longer one, and the same share of a shorter grant (crate tests run 600 ms grants, which
-/// warn 150 ms ahead), so a partition there still activates and still warns before its horizon.
+/// **The grant cap** is for grants far shorter than the spec's (crate tests run 600 ms grants,
+/// which warn 150 ms ahead), so a partition there still activates and still warns before its
+/// horizon. At the spec's grant it never binds.
 #[must_use]
-pub(crate) fn deactivating_lead_millis(budgets: &Budgets) -> u64 {
-    let spec = Budgets::SPEC_DEFAULTS.grant_millis;
-    DEACTIVATING_LEAD_MILLIS
-        .min(DEACTIVATING_LEAD_MILLIS.saturating_mul(budgets.grant_millis) / spec)
+pub const fn deactivating_lead_millis(budgets: &Budgets) -> u64 {
+    let clock = budgets
+        .max_sample_age_millis
+        .saturating_sub(budgets.clock_sample_period_millis.saturating_mul(2));
+    let grant = budgets.grant_millis / 4;
+    if clock < grant {
+        clock
+    } else {
+        grant
+    }
 }
+
+/// [`deactivating_lead_millis`] at `Budgets::SPEC_DEFAULTS`: 1000 ms.
+pub const DEACTIVATING_LEAD_MILLIS: u64 = deactivating_lead_millis(&Budgets::SPEC_DEFAULTS);
 
 /// An ownership change on one node of this process (#83), from [`crate::Db::ownership_events`].
 ///

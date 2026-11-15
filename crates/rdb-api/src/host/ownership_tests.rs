@@ -550,11 +550,12 @@ fn stall_after_a_renewal(
 
 /// own83_8 on three hosts at the spec's budgets (ruling B-2): the control store fails for 3 s
 /// right after a renewal of node 1 lands, then answers again. Node 1 sends nothing: the
-/// renewal after the stall lands before the 1.5 s lead. Then a 4.5 s stall: `Deactivating`,
-/// then `Activated` again with the same token when the renewal lands, and never `Deactivated`.
-/// Cuts: `DEACTIVATING_LEAD_MILLIS = 1600`, red: the 3 s stall's window hears `Deactivating`,
-/// `Activated` pairs, one per clock sample (the steady-state horizon is the sample's, 2000 ms,
-/// see the constant's doc). `= 3000` (G/2), red: nothing ever activates.
+/// renewal after the stall lands before the lead (1 s). Then a 4.9 s stall, which passes the
+/// lead's start (4.8 s after the renewal's dispatch) and still renews before the horizon
+/// (5.8 s): `Deactivating`, then `Activated` again with the same token, never `Deactivated`.
+/// Cuts (on `deactivating_lead_millis`): 1600, red: the 3 s stall's window hears
+/// `Deactivating`, `Activated` pairs, one per clock sample (the steady-state horizon is the
+/// sample's, 2000 ms, see its doc). 3000 (G/2), red: nothing ever activates.
 /// Integration (~15 s): bootstrap, then two stalls each run on past the old horizon.
 #[config_log::retcd_test]
 fn own83_8_a_3s_control_stall_gives_no_deactivating_on_three_hosts() {
@@ -570,9 +571,9 @@ fn own83_8_a_3s_control_stall_gives_no_deactivating_on_three_hosts() {
         "a 3 s stall is ridden out silently"
     );
     assert_eq!(
-        stall_after_a_renewal(&mut trio, 4_500, &events),
+        stall_after_a_renewal(&mut trio, 4_900, &events),
         [("deactivating", held), ("activated", held)],
-        "a 4.5 s stall warns, then resumes under the same token"
+        "a 4.9 s stall warns, then resumes under the same token"
     );
 }
 

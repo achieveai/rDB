@@ -430,7 +430,7 @@ this process. Each event names its `node`, `partition` and `token` (an `OwnerTok
 |---|---|---|
 | `Activated` | The node is the partition's writable primary and its data is readable there. | Start work. Stamp `token` on every side effect. |
 | `Deactivating { deadline }` | No renewal has landed. The node stops taking writes at `deadline` (an `Instant`) unless one lands. | Start no effect that cannot finish before `deadline`. Checkpoint. |
-| `Activated` again, same token | The renewal landed in time. | Carry on. Nothing to rebuild. |
+| `Activated` again, same token | The warning is withdrawn: the renewal landed in time. | Resume. Nothing to rebuild. |
 | `Deactivated` | The node no longer owns the partition under `token`. | Stop everything stamped with `token`. |
 
 **When `Activated` comes.** Only when every one of these holds:
@@ -438,14 +438,31 @@ this process. Each event names its `node`, `partition` and `token` (an `OwnerTok
 - the node is the partition's primary, and rDB admits writes there under `token`;
 - the partition's data is readable (its generation is marked activated);
 - its commit is not read-only, and its queue is open;
-- more than 1.5 s is left before the write permission ends.
+- more than the lead (1 s, below) is left before the write permission ends.
 
 A read-only (capped) commit never sends `Activated`, however long it serves reads.
 
-**The 1.5 s warning.** `Deactivating` comes `DEACTIVATING_LEAD_MILLIS` (1500 ms) before the
-node's last write tick. That number is chosen so that an rEtcd stall rDB rides out (2-3 s, then
-the renewal lands) sends **nothing**. A stall long enough to warn gives you 1.5 s. Use the
-`deadline`, not your own guess: it already counts the clock margin from "The clock rule".
+**The warning's lead.** `Deactivating` comes a fixed lead before the node's last write tick:
+
+```text
+lead = max_sample_age - 2 x clock_sample_period    (defaults: 2000 - 2 x 500 = 1000 ms)
+```
+
+`rdb_api::deactivating_lead_millis(&budgets)` computes it; `DEACTIVATING_LEAD_MILLIS` is its value
+at the defaults (1000 ms). Why the clock settings: a node's write permission also ends when its
+clock sample is older than `max_sample_age`, and it takes a new sample every
+`clock_sample_period`. The second period is slack, so a sample up to one whole period late sends
+**nothing**. If samples stop altogether, ownership really ends, and you get the full lead. An
+rEtcd stall rDB rides out (2-3 s, then the renewal lands) also sends nothing. Use the `deadline`,
+not your own guess: it already counts the clock margin from "The clock rule".
+
+**A withdrawn warning.** When the renewal lands after a `Deactivating`, the node sends
+`Activated` again with the **same** token. That always means the warning is withdrawn: no other
+node owned the partition in between, so SBX may resume where it was, with nothing to rebuild.
+The same holds after a `Deactivated` when the next `Activated` carries the same token (a node
+cut off from rEtcd, with no promote, that took its grant back). A real handover always comes
+with a **new, higher** token. Compare the whole token: a different token means a different
+owner's term, and the destinations' fencing (below) is what keeps the old one out.
 
 **When `Deactivated` comes.** At the first tick past the node's last write tick, on the node's
 own timer. It does not wait for rEtcd to answer, so a node cut off from rEtcd still sends it on
@@ -472,20 +489,37 @@ time. It also comes at once on a fence or a promote. It gives no reason.
   you lose nothing but the history.
 
 ```rust
-use rdb_api::OwnershipEvent;
+use rdb_api::{Db, OwnerToken, OwnershipEvent, PartitionId};
+use std::time::Instant;
 
-while !shutting_down() {
-    let events = db.ownership_events();
-    for event in events.iter() {
-        match event {
-            OwnershipEvent::Activated { partition, token, .. } => start(partition, token),
-            OwnershipEvent::Deactivating { partition, token, deadline, .. } => {
-                wind_down(partition, token, deadline)
+/// What your app does on each event: start, wind down and stop its own work.
+pub trait OnOwnership {
+    fn start(&mut self, partition: PartitionId, token: OwnerToken);
+    fn wind_down(&mut self, partition: PartitionId, token: OwnerToken, deadline: Instant);
+    fn stop(&mut self, partition: PartitionId, token: OwnerToken);
+    fn shutting_down(&self) -> bool;
+}
+
+/// Follows `db`'s ownership events until `app` shuts down. A subscriber ends when it falls
+/// behind or a node stops; the next one starts with the current state, so nothing is missed.
+pub fn follow(db: &Db, app: &mut impl OnOwnership) {
+    while !app.shutting_down() {
+        for event in db.ownership_events().iter() {
+            match event {
+                OwnershipEvent::Activated { partition, token, .. } => app.start(partition, token),
+                OwnershipEvent::Deactivating {
+                    partition,
+                    token,
+                    deadline,
+                    ..
+                } => app.wind_down(partition, token, deadline),
+                OwnershipEvent::Deactivated { partition, token, .. } => app.stop(partition, token),
             }
-            OwnershipEvent::Deactivated { partition, token, .. } => stop(partition, token),
+            if app.shutting_down() {
+                return;
+            }
         }
     }
-    // The iterator ended: dropped for lag, or the node stopped. Subscribe again.
 }
 ```
 

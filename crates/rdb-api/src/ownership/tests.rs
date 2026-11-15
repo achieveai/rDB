@@ -146,7 +146,8 @@ fn own83_1_ownership_state_table() {
     use OwnState::{Active, Deactivating, Inactive};
     let t = token(2, 2);
     let newer = token(3, 3);
-    // Horizon 10_000: the lead (1.5 s) starts at 8_501, `Deactivated` is due at 10_001.
+    // Horizon 10_000: the lead (1 s at the spec's budgets) starts at 9_001, `Deactivated` is
+    // due at 10_001.
     let live = Some(view(t, 10_000));
     let fenced = Some(view(t, 4_999));
     let rows: Vec<(&str, OwnState, Judged, OwnState, Vec<Step>)> = vec![
@@ -181,7 +182,7 @@ fn own83_1_ownership_state_table() {
         (
             "inside the lead does not activate",
             Inactive,
-            judged(live, 8_501, true, true),
+            judged(live, 9_001, true, true),
             Inactive,
             vec![],
         ),
@@ -195,14 +196,14 @@ fn own83_1_ownership_state_table() {
         (
             "active, one tick before the lead",
             Active(t),
-            judged(live, 8_500, true, true),
+            judged(live, 9_000, true, true),
             Active(t),
             vec![],
         ),
         (
             "the lead starts: Deactivating with the stop tick",
             Active(t),
-            judged(live, 8_501, true, true),
+            judged(live, 9_001, true, true),
             Deactivating(t),
             vec![Step::Deactivating(t, Tick(10_001))],
         ),
@@ -223,7 +224,7 @@ fn own83_1_ownership_state_table() {
         (
             "a renewal while deactivating: resume, same token",
             Deactivating(t),
-            judged(Some(view(t, 15_000)), 9_000, false, false),
+            judged(Some(view(t, 15_000)), 9_500, false, false),
             Active(t),
             vec![Step::Activated(t)],
         ),
@@ -271,7 +272,7 @@ fn own83_1_ownership_state_table() {
     assert_eq!(ownership_step(Inactive, &faulted), (Inactive, vec![]));
     let lead = deactivating_lead_millis(&Budgets::SPEC_DEFAULTS);
     let at = view(t, 10_000);
-    assert_eq!(ownership_due(Active(t), Some(&at), lead), Some(Tick(8_501)));
+    assert_eq!(ownership_due(Active(t), Some(&at), lead), Some(Tick(9_001)));
     assert_eq!(
         ownership_due(Deactivating(t), Some(&at), lead),
         Some(Tick(10_001)),
@@ -308,7 +309,8 @@ fn stall_steps(dispatch: u64, lands: u64, until: u64) -> Vec<(u64, Step)> {
 
 /// own83_8 at the pure layer (ruling B-2): a 3 s control stall that starts 499 ms after a
 /// committed renewal, whose next renewal is dispatched as it ends and lands 300 ms later, sends
-/// nothing. A 4.5 s stall sends `Deactivating` 1.5 s before the old horizon, then `Activated`
+/// nothing. A 4.5 s stall sends `Deactivating` the lead (1 s) before the old horizon, then
+/// `Activated`
 /// with the same token when its renewal lands, and never `Deactivated`. Driven tick by tick
 /// on the spec's budgets. It models the grant's bound on the horizon only; the clock sample's
 /// bound, which binds in steady state, is the host row's (`own83_8_..._on_three_hosts`, a
@@ -340,6 +342,80 @@ fn own83_8_a_3s_control_stall_gives_no_deactivating() {
         deactivating_lead_millis(&Budgets::SPEC_DEFAULTS),
         DEACTIVATING_LEAD_MILLIS
     );
+    assert_eq!(
+        DEACTIVATING_LEAD_MILLIS, 1_000,
+        "2000 - 2 x 500 at the spec's budgets"
+    );
+}
+
+/// Every transition an active partition sends, tick by tick from 0 to `until`, at the spec's
+/// budgets, with A1 stepped at each tick in `samples` (each step a fresh local sample) and every
+/// renewal landing on time. The horizon is `Authority::admission_horizon`'s: the grant's
+/// (`spec_horizon` of the last renewal, one per `renew_millis`) or the sample's (the last sample
+/// plus `max_sample_age`, past which `effective_epsilon` calls it stale), whichever is first. A1
+/// runs before the ownership duty on a turn, so a sample at `now` counts at `now`.
+fn sampled_steps(samples: &[u64], until: u64) -> Vec<(u64, Step)> {
+    let b = Budgets::SPEC_DEFAULTS;
+    let t = token(2, 2);
+    let mut state = OwnState::Active(t);
+    let mut sent = Vec::new();
+    for now in 0..=until {
+        let renewed = now - now % b.renew_millis;
+        let sampled = samples
+            .iter()
+            .copied()
+            .filter(|at| *at <= now)
+            .max()
+            .expect("a sample at 0");
+        let horizon = spec_horizon(renewed).min(sampled + b.max_sample_age_millis);
+        let (next, steps) = ownership_step(state, &judged(Some(view(t, horizon)), now, true, true));
+        state = next;
+        sent.extend(steps.into_iter().map(|step| (now, step)));
+    }
+    sent
+}
+
+/// own83_10 (lead ruling on B1 item 8, row a): in steady state, an A1 step late by one whole
+/// `clock_sample_period` (samples at 3000 then 4000, not 3500) sends no event. The steady-state
+/// horizon is the sample's, 2000 ms ahead, so a false `Deactivating` here is what SBX would
+/// act on. Cut: the old lead, `min(1500, G/4)`, red: `Deactivating` at 3501, `Activated` at
+/// 4000. Unit.
+#[test]
+fn own83_10_a_sample_late_by_one_period_gives_no_deactivating() {
+    let period = Budgets::SPEC_DEFAULTS.clock_sample_period_millis;
+    let mut samples: Vec<u64> = (0..=6).map(|i| i * period).collect();
+    samples.extend((8..=16).map(|i| i * period));
+    assert!(!samples.contains(&3_500), "the late one");
+    assert_eq!(
+        sampled_steps(&samples, 8_000),
+        vec![],
+        "a late sample warns nothing"
+    );
+}
+
+/// own83_10 row b: when A1's samples stop altogether (the last at 3000), ownership really ends at
+/// that sample + `max_sample_age`, and `Deactivating` comes at least the lead before
+/// `Deactivated`. Cut: `Judged::low` always false, red: `Deactivating` and `Deactivated` on the
+/// same tick. Unit.
+#[test]
+fn own83_10b_samples_stopping_still_warn_the_lead_ahead() {
+    let t = token(2, 2);
+    let period = Budgets::SPEC_DEFAULTS.clock_sample_period_millis;
+    let samples: Vec<u64> = (0..=6).map(|i| i * period).collect();
+    let stop = 3_000 + Budgets::SPEC_DEFAULTS.max_sample_age_millis + 1;
+    let sent = sampled_steps(&samples, 8_000);
+    assert_eq!(
+        sent,
+        vec![
+            (
+                stop - DEACTIVATING_LEAD_MILLIS,
+                Step::Deactivating(t, Tick(stop))
+            ),
+            (stop, Step::Deactivated(t)),
+        ],
+        "warned, then stopped at the sample's horizon + 1"
+    );
+    assert!(sent[1].0 - sent[0].0 >= DEACTIVATING_LEAD_MILLIS);
 }
 
 /// own83_7b: a subscriber that falls [`SUBSCRIBER_CAPACITY`] events behind is dropped for every
