@@ -10012,7 +10012,10 @@ impl Host {
     /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
     /// answers nothing: its `Recovered` asks the primary for the rest. Linked either way, a live
     /// receiver it already holds is kept only at the linked head or while quarantined, and is
-    /// replaced at the link otherwise (check A, issue #105 unit 1).
+    /// replaced at the link otherwise (check A, issue #105 unit 1). Either arm links only onto a
+    /// lineage that reaches seq 1, or one that applied nothing (check B, #107, in
+    /// [`Self::land_at`] after its depth guard; only seq 1 is read): a holed one is refused
+    /// `from_has_no_floor`, and one whose seq 1 read fails `history_read_failed`.
     ///
     /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. A copy
     /// refused `not_a_member` or `held_at_or_above_generation` is refused before any receiver
@@ -11896,7 +11899,14 @@ impl Host {
     ///   the base through the head. Anything it cannot prove from what it stores answers
     ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
     ///   A copy that missed the anchor's generation while it was silent links it first, when
-    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177).
+    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177), and only onto a
+    ///   lineage that reaches seq 1 or applied nothing (check B, #107, after the depth guard;
+    ///   only seq 1 is read). A holed one answers `InventoryFailed` with
+    ///   `missed_generation_from_has_no_floor`, and one whose seq 1 read fails with
+    ///   `missed_generation_history_read_failed`. When a tail above the base was released
+    ///   (or adopted) for this ask, the same refusal answers `TailHeld` instead, with that
+    ///   reason, logged `tail_release_refused` (or `tail_adopted_refused`), never a bare
+    ///   `InventoryFailed` once a tail was found.
     fn inventory(
         &mut self,
         partition: PartitionId,
@@ -12330,11 +12340,8 @@ impl Host {
         {
             return false;
         }
-        if self.engine.buffered_applied(partition, l).0 == 0 {
-            return true;
-        }
-        match self.engine.history_at(partition, l, Seq(1)) {
-            Ok(found) => found.is_some(),
+        match self.has_floor(partition, l) {
+            Ok(floor) => floor,
             Err(fault) => {
                 tracing::error!(
                     node = self.node.0,
@@ -12346,6 +12353,26 @@ impl Host {
                 false
             }
         }
+    }
+
+    /// Whether `generation`'s lineage of `partition` reaches seq 1 through its chain, or applied
+    /// nothing: the one read behind both the intact rule ([`Self::holds_last_writable`]) and
+    /// check B (`from_has_no_floor`, issue #107 slice 1), which refuses to link a new generation
+    /// onto a lineage holed below its head. `history_at` walks the chain to the bottom, and
+    /// `History` falls through a copied level, so one read answers for every level. Depends on
+    /// seq 1 being kept: a history trim (#61) must revisit both callers.
+    fn has_floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<bool, StorageFault> {
+        if self.engine.buffered_applied(partition, generation).0 == 0 {
+            return Ok(true);
+        }
+        Ok(self
+            .engine
+            .history_at(partition, generation, Seq(1))?
+            .is_some())
     }
 
     /// Answer `TailHeld` for `hit` (issue #105), and report the refusal in this node's status,
@@ -12822,7 +12849,14 @@ impl Host {
     /// the base exactly, never above (a tail above the base is uncertain data an ask must not
     /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
     /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
-    /// window, so it is refused. A refusal writes nothing and names its reason.
+    /// window, so it is refused. Then check B (#107, after the depth guard): the parent's lineage
+    /// must reach seq 1 through its chain ([`Self::has_floor`]), so the anchor's generation is
+    /// never linked over a hole; a holed parent is refused `missed_generation_from_has_no_floor`.
+    /// A lineage that applied nothing has no seq 1 and passes. Only seq 1 is read: the read walks
+    /// the chain, so it answers for every level. A read that fails refuses
+    /// `missed_generation_history_read_failed`, logged first as
+    /// `missed_generation_floor_read_failed` with the fault. A refusal writes nothing and names
+    /// its reason.
     ///
     /// Issue #105 (design section 13): when this ask's `release_through` covers the head, the
     /// tail above the base was given up for this run. The same checks run in the same order,
@@ -12874,6 +12908,22 @@ impl Host {
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("missed_generation_link_depth_ceiling");
         }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("missed_generation_from_has_no_floor"),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    ?fault,
+                    "missed_generation_floor_read_failed"
+                );
+                return Err("missed_generation_history_read_failed");
+            }
+        }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, base) {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
@@ -12910,6 +12960,19 @@ impl Host {
     /// Answers the generation linked from, the head and the digest there. A refusal writes
     /// nothing and names its reason, as [`Self::inherit_missed_link`] does; that one stays the
     /// survivor's exact-base guard (A-R177), and this one is never called from `survivor`.
+    ///
+    /// Choosing `from` can refuse first: `anchor_generation_absent` (lineages held, none below
+    /// the anchor's generation), and for a copy holding no lineage of the partition
+    /// `publish_marks_unreadable` or `publish_marks_held`. After choosing `from`, guards, in
+    /// this order: the head at or below the base (`held_past_base`); the record at the
+    /// head reads and verifies ([`Self::checked`]), and at the base its digest is the anchor's
+    /// (`base_digest_differs`); the depth guard
+    /// (`link_depth_ceiling`); then check B (#107): `from`'s lineage must reach seq 1 through its
+    /// chain ([`Self::has_floor`]), so the new generation is never linked over a hole
+    /// (`from_has_no_floor`). A lineage that applied nothing, as an empty copy's generation 0,
+    /// has no seq 1 and passes. Only seq 1 is read: the read walks the chain, so it answers for
+    /// every level. A read that fails refuses `history_read_failed`, logged first as
+    /// `land_floor_read_failed` with the fault.
     fn land_at(
         &mut self,
         partition: PartitionId,
@@ -12975,6 +13038,22 @@ impl Host {
         }
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("link_depth_ceiling");
+        }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("from_has_no_floor"),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    ?fault,
+                    "land_floor_read_failed"
+                );
+                return Err("history_read_failed");
+            }
         }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, head) {
