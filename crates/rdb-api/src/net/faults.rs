@@ -53,6 +53,10 @@ pub struct FaultSet {
     pub drop_reply: BTreeSet<u64>,
     /// `cut-control`.
     pub cut_control: bool,
+    /// `mute`: every link reads nothing, answers no probe and writes nothing, as a stopped
+    /// process looks from outside (#81: the planner's silence test). Pair it with
+    /// `cut-control` so the grant stops renewing too.
+    pub mute: bool,
 }
 
 /// Parse a fault file. Returns the faults and the lines refused.
@@ -84,6 +88,10 @@ pub fn parse(text: &str) -> (FaultSet, Vec<String>) {
             ["drop-reply", n] => count(n).map(|n| set.drop_reply.insert(n)).is_some(),
             ["cut-control"] => {
                 set.cut_control = true;
+                true
+            }
+            ["mute"] => {
+                set.mute = true;
                 true
             }
             _ => false,
@@ -134,7 +142,7 @@ impl Faults {
         for line in &refused {
             tracing::error!(
                 %line,
-                "net_fault_line_refused: want hold <n>|hold all|drop-request N|drop-reply N|cut-control"
+                "net_fault_line_refused: want hold <n>|hold all|drop-request N|drop-reply N|cut-control|mute"
             );
         }
         tracing::info!(
@@ -143,6 +151,7 @@ impl Faults {
             drop_request = ?set.drop_request,
             drop_reply = ?set.drop_reply,
             cut_control = set.cut_control,
+            mute = set.mute,
             "net_faults"
         );
         self.cut.store(set.cut_control, Ordering::SeqCst);
@@ -154,6 +163,12 @@ impl Faults {
     pub fn holds(&self, peer: &Label) -> bool {
         let set = self.lock();
         set.hold_all || matches!(peer, Label::Node(node) if set.held.contains(node))
+    }
+
+    /// Whether every link is mute: nothing read, nothing written.
+    #[must_use]
+    pub fn muted(&self) -> bool {
+        self.lock().mute
     }
 
     /// Count one client call received; its number, from 1.
@@ -345,6 +360,7 @@ mod tests {
         assert!(set.cut_control);
         assert_eq!(refused, ["hold", "drop-request 0", "freeze 2"]);
         assert!(parse("hold all").0.hold_all);
+        assert!(parse("mute").0.mute);
     }
 
     /// `hold all` holds apps too; `hold <n>` only that node.

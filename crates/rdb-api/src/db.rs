@@ -238,6 +238,12 @@ pub struct DbConfig {
     /// `false` sends no floor: every answer is kept for [`Self::dedup_retention`], as before
     /// M10.
     pub ack_floor: bool,
+    /// Automatic failover (#81 slice C1): this node process runs a planner that, while it holds
+    /// `planner/grant`, promotes each partition of a node whose process is silent and whose
+    /// grant has run out ([`crate::planner`]). Only a node process may set it: exactly one node
+    /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
+    /// default, never promotes: failover stays the operator's `promote`.
+    pub failover: Option<crate::planner::Failover>,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -267,6 +273,7 @@ impl DbConfig {
     pub fn check(&self) -> Result<(), OpenError> {
         partitions_refusal(self.partitions).map_err(open_refused)?;
         unreachable_drop_refusal(self.timeouts.unreachable_drop_after).map_err(open_refused)?;
+        failover_refusal(self.failover, &self.local).map_err(open_refused)?;
         limits(self.dedup_cap, self.ack_floor)
             .map(|_| ())
             .map_err(open_refused)
@@ -532,6 +539,8 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
+    planner_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
@@ -561,6 +570,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            planner_task: None,
             stuck: Mutex::new(None),
             control: None,
             instance: None,
@@ -767,6 +777,27 @@ fn unreachable_drop_refusal(after: Duration) -> Result<(), OpenError> {
         )));
     }
     Ok(())
+}
+
+/// [`DbConfig::failover`], refused unless the open runs exactly one node: the planner holds its
+/// grant as that node, and judges peers by that process's links (#81 C1).
+fn failover_refusal(
+    failover: Option<crate::planner::Failover>,
+    local: &[NodeId],
+) -> Result<Option<crate::planner::Failover>, OpenError> {
+    match (failover, local) {
+        (Some(failover), [_]) if failover.max_concurrent > 0 => Ok(Some(failover)),
+        (Some(failover), [_]) => Err(OpenError::Config(format!(
+            "failover max_concurrent {} must be at least 1; nothing was created",
+            failover.max_concurrent
+        ))),
+        (Some(_), _) => Err(OpenError::Config(format!(
+            "failover runs only in a node process, one node in DbConfig::local, and this open \
+             names {}; nothing was created",
+            local.len()
+        ))),
+        (None, _) => Ok(None),
+    }
 }
 
 /// What `routes/0` says the partition count is, `None` when the store holds no such key.
@@ -1292,6 +1323,7 @@ impl Db {
     ) -> Result<Self, OpenError> {
         partitions_refusal(config.partitions).map_err(open_refused)?;
         unreachable_drop_refusal(config.timeouts.unreachable_drop_after).map_err(open_refused)?;
+        let failover = failover_refusal(config.failover, &config.local).map_err(open_refused)?;
         if config.local.is_empty() {
             return Self::open_app(config, store, rt, budgets)
                 .await
@@ -1344,7 +1376,53 @@ impl Db {
         .await
         .map_err(open_refused)?;
         db.respawn = Some(respawn);
+        if let Some(failover) = failover {
+            db.start_planner(failover);
+        }
         Ok(db)
+    }
+
+    /// Start the failover planner of this node process ([`DbConfig::failover`]).
+    fn start_planner(&mut self, failover: crate::planner::Failover) {
+        let Some(planner) = self.planner(failover) else {
+            return;
+        };
+        let PromoteStore(_, rt, _) = self
+            .opened
+            .control
+            .clone()
+            .expect("an open with a node has a control store");
+        self.opened.planner_task = Some(rt.spawn(tracing::Instrument::instrument(
+            planner.run(),
+            tracing::Span::current(),
+        )));
+    }
+
+    /// The planner this node process would run with `failover`: `None` in a `Db` with no
+    /// control store or not exactly one node.
+    pub(crate) fn planner(
+        &self,
+        failover: crate::planner::Failover,
+    ) -> Option<crate::planner::Planner> {
+        let PromoteStore(store, _, budgets) = self.opened.control.clone()?;
+        let (node, boot) = {
+            let nodes = lock(&self.nodes);
+            match nodes.as_slice() {
+                [handle] => (handle.node, handle.boot),
+                _ => return None,
+            }
+        };
+        Some(crate::planner::Planner {
+            node,
+            boot,
+            store,
+            budgets,
+            clock: self.clock,
+            links: Arc::clone(&self.links),
+            failover,
+            look_within: self.timeouts.read,
+            promote_within: heal_within(&budgets),
+        })
     }
 
     /// An app-only open, `DbConfig::local` empty (ruling A-R226 h2, amended by A-R231(b)): this
@@ -4963,6 +5041,10 @@ impl Db {
 
     /// Stop every node and every control call. The control store stays the caller's.
     pub fn shutdown(&mut self) {
+        if let Some(task) = self.opened.planner_task.take() {
+            task.abort();
+            tracing::info!("planner_stopped");
+        }
         if let Some(task) = self.opened.heal_task.take() {
             task.abort();
         }
@@ -6126,6 +6208,8 @@ fn wipe_crashes(folder: &Path, at: WipeCrash) -> bool {
 #[cfg(test)]
 mod clock_guard_tests;
 #[cfg(test)]
+mod failover_tests;
+#[cfg(test)]
 pub(crate) mod reopen_tests;
 
 #[cfg(test)]
@@ -6277,6 +6361,7 @@ mod tests {
             client: DEFAULT_CLIENT,
             boot: None,
             storage: crate::StorageOptions::default(),
+            failover: None,
         }
     }
 
@@ -6318,6 +6403,7 @@ mod tests {
             client: DEFAULT_CLIENT,
             boot: None,
             storage: crate::StorageOptions::default(),
+            failover: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -6412,6 +6498,7 @@ mod tests {
             client: DEFAULT_CLIENT,
             boot: None,
             storage: crate::StorageOptions::default(),
+            failover: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -6546,6 +6633,7 @@ mod tests {
             client: DEFAULT_CLIENT,
             boot: None,
             storage: crate::StorageOptions::default(),
+            failover: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))

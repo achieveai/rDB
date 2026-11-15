@@ -8,6 +8,7 @@
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
+//!          [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
 //! ```
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
@@ -36,6 +37,11 @@
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
 //!   `kill -CONT` is a frozen-clock pause.
+//!   `--failover` runs the automatic-failover planner in this process (#81 C1,
+//!   `DbConfig::failover`): while it holds `planner/grant` it promotes each partition of a node
+//!   whose link has echoed no clock probe for `--failover-silent-ms` (default 2000), that
+//!   answers no look, and whose grant has run out; or of a node whose grant is frozen. At most
+//!   `--failover-max-concurrent` (default 16) promotes run at once. Off by default.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -85,6 +91,10 @@ struct Args {
     clock_step_file: Option<PathBuf>,
     /// `--unreachable-drop-after-ms`; `None` is `Timeouts::default()`'s.
     unreachable_drop_after_ms: Option<u64>,
+    /// `--failover`, with its two knobs: `DbConfig::failover` (#81 C1).
+    failover: bool,
+    failover_silent_ms: Option<u64>,
+    failover_max_concurrent: Option<usize>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -100,6 +110,7 @@ const USAGE: &str = "usage:
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
+           [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -203,6 +214,20 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                         "--unreachable-drop-after-ms takes whole milliseconds".to_owned()
                     })?);
             }
+            "--failover" => args.failover = true,
+            "--failover-silent-ms" => {
+                args.failover_silent_ms = Some(
+                    value("--failover-silent-ms")?
+                        .parse()
+                        .map_err(|_| "--failover-silent-ms wants whole milliseconds".to_owned())?,
+                );
+            }
+            "--failover-max-concurrent" => {
+                args.failover_max_concurrent =
+                    Some(value("--failover-max-concurrent")?.parse().map_err(|_| {
+                        "--failover-max-concurrent wants a count of at least 1".to_owned()
+                    })?);
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -227,6 +252,20 @@ fn watch_clock_step(file: PathBuf, links: Arc<Links>) {
         }
         std::thread::sleep(Duration::from_millis(20));
     });
+}
+
+/// `DbConfig::failover` from `--failover` and its knobs; `None` without `--failover`.
+fn failover(args: &Args) -> Option<rdb_api::Failover> {
+    let default = rdb_api::Failover::default();
+    args.failover.then(|| rdb_api::Failover {
+        silent_after: args
+            .failover_silent_ms
+            .map_or(default.silent_after, Duration::from_millis),
+        max_concurrent: args
+            .failover_max_concurrent
+            .unwrap_or(default.max_concurrent),
+        ..default
+    })
 }
 
 fn need<T: Clone>(value: Option<&T>, name: &str) -> Result<T, String> {
@@ -333,6 +372,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let dir = need(args.dir.as_ref(), "--dir")?;
     let store = control(args)?;
     let config = DbConfig {
+        failover: None,
         partitions: args.partitions,
         ack_floor: true,
         dir: dir.clone(),
@@ -461,6 +501,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         client: DEFAULT_CLIENT,
         boot: Some(boot),
         storage: rdb_api::StorageOptions::default(),
+        failover: failover(args),
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))

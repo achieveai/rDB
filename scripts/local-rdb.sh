@@ -6,6 +6,7 @@
 #   scripts/local-rdb.sh down | clean | status                   [--run DIR]
 #   scripts/local-rdb.sh kill N | stop N | start N [--wipe] | restart N   [--run DIR]
 #   scripts/local-rdb.sh suspend N | resume N                     [--run DIR]
+#   scripts/local-rdb.sh sigstop N | sigcont N                    [--run DIR]
 #   scripts/local-rdb.sh hold A-B | heal A-B                      [--run DIR]
 #   scripts/local-rdb.sh drop-request N [--node M] | drop-reply N [--node M]   [--run DIR]
 #   scripts/local-rdb.sh cut-control N | uncut-control N          [--run DIR]
@@ -53,7 +54,11 @@
 # Faults act inside the node processes after TLS, through the fault file:
 #   hold A-B        node A holds every frame to/from B, and B to/from A (a delay, never a loss)
 #   suspend N       node N holds every link and is cut from rEtcd: a stand-in for a frozen
-#                   process (Windows has no SIGSTOP). `resume N` lifts both.
+#                   process (Windows has no SIGSTOP). `resume N` lifts both. Clock probes pass a
+#                   hold, so a suspended node is still heard on its links, and the #81 planner
+#                   does not fail it over (customer answer 3).
+#   sigstop N       kill -STOP node N's process: silent on every link and to rEtcd, as a frozen
+#                   process is (not on Windows). `sigcont N` resumes it.
 #   drop-request N  the N-th client call node M (default 1) receives is lost
 #   drop-reply N    the N-th client call is served and its answer lost
 #   cut-control N   node N's rEtcd calls fail Unavailable and its watches end
@@ -645,7 +650,9 @@ status() {
     "$REPO/scripts/local-cluster.sh" status --dir "$RUN/ctl" 2>/dev/null || true
 }
 
-# Failover is a control-plane action (A-R240), so no node process promotes itself: rdb_dev runs
+# Failover is a control-plane action (A-R240). Unless the nodes run the #81 planner
+# (`LR_NODE_ARGS=--failover`, passed to every rdb_node this script starts), no node process
+# promotes itself: rdb_dev runs
 # as an app with no copy of its own (--nodes, local=[]) and sends `admin promote N [--drop M]`.
 # The surviving rdb_node processes take the new plan from their control watch. rdb_dev's own
 # answer and exit code are passed through. rdb_dev is built in the run's profile (run.env), so
@@ -782,6 +789,13 @@ case "$COMMAND" in
     restart) pick_run; check_node_arg "$ARG"; stop_node "$ARG"; start_node "$ARG" stopped; await_ready "$ARG" || not_ready "$ARG" ;;
     suspend) pick_run; check_node_arg "$ARG"; fault_add "$ARG" "hold all"; fault_add "$ARG" "cut-control" ;;
     resume) pick_run; check_node_arg "$ARG"; fault_remove "$ARG" "hold all"; fault_remove "$ARG" "cut-control" ;;
+    sigstop | sigcont)
+        pick_run; check_node_arg "$ARG"
+        os="$(pid_of "node-$ARG")"
+        os_pid_is "$os" rdb_node || die "node $ARG is not running"
+        sig="$(printf %s "${COMMAND#sig}" | tr '[:lower:]' '[:upper:]')"
+        kill "-$sig" "$os"
+        say "node $ARG: SIG$sig (pid $os)" ;;
     hold) pick_run; read -r a b <<<"$(pair "$ARG")"; fault_add "$a" "hold $b"; fault_add "$b" "hold $a" ;;
     heal) pick_run; read -r a b <<<"$(pair "$ARG")"; fault_remove "$a" "hold $b"; fault_remove "$b" "hold $a" ;;
     drop-request | drop-reply)

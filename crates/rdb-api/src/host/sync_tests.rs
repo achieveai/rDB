@@ -38,6 +38,7 @@ fn config(dir: &std::path::Path) -> DbConfig {
         client: DEFAULT_CLIENT,
         boot: None,
         storage: crate::StorageOptions::default(),
+        failover: None,
     }
 }
 

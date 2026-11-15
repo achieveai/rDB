@@ -39,6 +39,7 @@ pub mod control;
 pub mod db;
 pub mod host;
 pub mod net;
+pub mod planner;
 pub mod transport;
 
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub use db::{
     MAX_TXN_DEADLINE, TENANT,
 };
 pub use host::{Change, ListEdit, Look, Seen};
+pub use planner::Failover;
 pub use rdb_core::partition_map::{affinity_hash, partition_of, MAX_PARTITIONS};
 // The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone
 // (A-R190): request ids, generations, the status answer and the error kinds.
