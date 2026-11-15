@@ -6472,7 +6472,7 @@ fn i106_a_rebuild_hold_ends_when_a_probe_reads_no_answer() {
         let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
         (!ended.is_empty()).then_some(ended)
     });
-    // Two more drop checks: a second end, or one that came early, would show here.
+    // Two more drop checks: a second end of the hold would show here.
     let until = trio.clock.now();
     trio.until("two more drop checks passed", |trio| {
         (HostClock::millis_until(until, trio.clock.now()) >= 2 * DROP_CHECK_EVERY_MILLIS)
