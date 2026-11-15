@@ -423,7 +423,7 @@ impl config_core::ConfigStore for CutAfterCommit {
 /// then waits for node 2 to serve the generation it committed.
 /// Cut: drop the `hold_repairs` return in `repair_duty`: node 2 re-plans past its commit and
 /// never serves it, red ("not within ...: node 2 serves what it committed").
-/// Integration (~6 s): the window, once.
+/// Integration (~6 s): the window, once, on the trio's clock.
 #[config_log::retcd_test]
 fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
     const METHOD: &str = "s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit";
@@ -442,30 +442,46 @@ fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
             .iter()
             .any(|line| line["node"] == 2)
     };
+    let unadopted = |trio: &Trio| {
+        logged!(METHOD, "adopt_authority")
+            .iter()
+            .all(|line| line["node"] != 2 || line["generation"] != generation_of(trio))
+    };
     let generation = lost_primary_and_silent_secondary_then(&mut trio, |trio| {
         assert_eq!(
             logged!(METHOD, "cut_after_commit").len(),
             1,
             "cut at the commit"
         );
+        assert!(faults.control_cut(), "the cut is applied at the commit");
         assert!(
-            logged!(METHOD, "adopt_authority")
-                .iter()
-                .all(|line| line["node"] != 2 || line["generation"] != generation_of(trio)),
+            unadopted(trio),
             "node 2 has not adopted its commit while cut"
         );
-        let window = Instant::now() + test_patience(Duration::from_secs(3));
+        // The window is host time, on the trio's counted clock: a stalled run reads it no
+        // further, so the repair gets the whole window whatever the host's load. The wall-clock
+        // patience of `only_until` stays the failure.
+        let window = trio.clock.now().0 + REPAIR_WINDOW_MILLIS;
         only_until(
             trio,
             &[1, 2],
             "node 2 asked a revoke, or the window ended",
-            |_| (asked() || Instant::now() >= window).then_some(()),
+            |trio| (asked() || trio.clock.now().0 >= window).then_some(()),
+        );
+        assert!(
+            unadopted(trio),
+            "node 2 did not adopt its commit in the window"
         );
         faults.apply("");
     });
     assert!(!asked(), "node 2 did not revoke the commit it serves");
     assert_eq!(committed_generation(&trio, 1), Some(generation));
 }
+
+/// How long [`s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit`] holds node 2
+/// cut, in milliseconds on the trio's counted clock. An unheld repair asks its revoke well inside
+/// it (`membership_repair_planned` at `linked_ms` 402 on the red run).
+const REPAIR_WINDOW_MILLIS: u64 = 3_000;
 
 fn generation_of(trio: &Trio) -> u64 {
     committed_generation(trio, 1).expect("node 2 committed").0
