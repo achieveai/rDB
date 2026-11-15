@@ -40,12 +40,16 @@
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
 //! `rdb_node ready node=N` or `rdb_node not-ready node=N: <why>`, then `rdb_node stopped node=N`.
+//! While it runs, `rdb_node ownership node=N partition=P token=G.E` when this node starts leading
+//! a partition, and `rdb_node ownership-lapsed node=N partition=P token=G.E` when
+//! `Db::still_owner` turns false for that token (#84; logged `ownership_held`, `ownership_lapsed`).
 //! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
 //! step failed, 2 bad arguments.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +60,7 @@ use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{Db, DbConfig, NodeId, Timeouts};
+use rdb_api::{Db, DbConfig, NodeId, OwnerToken, PartitionId, Timeouts};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -358,6 +362,56 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     Ok(())
 }
 
+/// How often [`watch_ownership`] reads each partition's ownership.
+const OWNERSHIP_POLL: Duration = Duration::from_millis(10);
+
+/// #84's manual entry point: log each partition this node starts leading, `ownership_held`
+/// with its owner token, and the first poll at which `Db::still_owner` is false for that token,
+/// `ownership_lapsed`. Polled every [`OWNERSHIP_POLL`], so a lapse line is up to that much after
+/// the tick write admission stopped; the lapse itself is never later than admission's.
+fn watch_ownership(db: &Db, node: NodeId, done: &AtomicBool) {
+    let mut held: BTreeMap<PartitionId, OwnerToken> = BTreeMap::new();
+    while !done.load(Ordering::Relaxed) {
+        for partition in (1..=db.partition_count()).map(PartitionId) {
+            if let Some(token) = held.get(&partition).copied() {
+                if db.still_owner(partition, token) {
+                    continue;
+                }
+                held.remove(&partition);
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    generation = token.generation.0,
+                    owner_epoch = token.owner_epoch.0,
+                    token = %token,
+                    "ownership_lapsed"
+                );
+                println!(
+                    "rdb_node ownership-lapsed node={} partition={} token={token}",
+                    node.0, partition.0
+                );
+            }
+            if let Some(owned) = db.ownership(partition) {
+                held.insert(partition, owned.token);
+                tracing::info!(
+                    node = node.0,
+                    partition = partition.0,
+                    generation = owned.token.generation.0,
+                    owner_epoch = owned.token.owner_epoch.0,
+                    token = %owned.token,
+                    remaining_ms = u64::try_from(owned.remaining.as_millis()).unwrap_or(u64::MAX),
+                    "ownership_held"
+                );
+                println!(
+                    "rdb_node ownership node={} partition={} token={}",
+                    node.0, partition.0, owned.token
+                );
+            }
+        }
+        std::thread::sleep(OWNERSHIP_POLL);
+    }
+}
+
 /// Run node `--node` of the database in `--dir` until `--stop-file` appears.
 /// Prints a wait's outcome. True when it timed out, so `serve` keeps waiting: the
 /// line then ends `(retrying)`, and `lr` reads a not-ready line without it as final.
@@ -472,22 +526,27 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     // keeps waiting, and the late `ready` line says how long it took. Any other refusal ends it.
     let mut retrying = report_ready(node, db.wait_ready(within));
     let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
-    while !stopped() {
-        if !retrying {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        match db.wait_ready(Duration::from_secs(1)) {
-            Ok(()) => {
-                let after = waited.elapsed().as_secs();
-                tracing::info!(node = node.0, after_s = after, "rdb_node_ready_late");
-                println!("rdb_node ready node={} (after {after}s)", node.0);
-                retrying = false;
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| watch_ownership(&db, node, &done));
+        while !stopped() {
+            if !retrying {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
-            Err(ReadyError::TimedOut { .. }) => {}
-            ended => retrying = report_ready(node, ended),
+            match db.wait_ready(Duration::from_secs(1)) {
+                Ok(()) => {
+                    let after = waited.elapsed().as_secs();
+                    tracing::info!(node = node.0, after_s = after, "rdb_node_ready_late");
+                    println!("rdb_node ready node={} (after {after}s)", node.0);
+                    retrying = false;
+                }
+                Err(ReadyError::TimedOut { .. }) => {}
+                ended => retrying = report_ready(node, ended),
+            }
         }
-    }
+        done.store(true, Ordering::Relaxed);
+    });
     if let Some(stop) = &args.stop_file {
         tracing::info!(node = node.0, stop = %stop.display(), "rdb_node_stop_file");
     }

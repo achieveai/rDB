@@ -50,6 +50,7 @@ use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
+use crate::ownership::{OwnerToken, Ownership};
 use crate::transport::Links;
 use ack_floor::AckFloor;
 
@@ -3513,6 +3514,39 @@ impl Db {
             self.settled(request);
         }
         answered.map_err(|error| self.explained(error))
+    }
+
+    /// The owner token of `partition` while a node this process runs leads it, read from that
+    /// node's newest authority view on its own clock (#84). `None` when no node here leads it,
+    /// in an app-only `Db` always, and from the tick write admission stops on the leader.
+    ///
+    /// Stamp [`Ownership::token`] on every side effect made outside rDB for the partition, and
+    /// make the destination refuse a lower token: see `docs/rdb/embed.md`, "Fencing your own
+    /// side effects". Sends no message to the node; one read lock.
+    #[must_use]
+    pub fn ownership(&self, partition: PartitionId) -> Option<Ownership> {
+        lock(&self.nodes)
+            .iter()
+            .filter_map(|handle| handle.owner_views.ownership(partition))
+            .max_by_key(|ownership| ownership.token)
+    }
+
+    /// Whether a node this process runs still leads `partition` under `token`: write
+    /// admission's own view test (check 6), on that node's clock. False from the tick write
+    /// admission stops for `token`, and after a fence (frozen grant, revoked epoch) before the
+    /// node admits another write. Never true for a token older than the one the node serves.
+    ///
+    /// Fails closed. `true` means no other node can hold `token`'s partition now; it does not
+    /// mean the partition takes writes (a frozen or read-only partition refuses them under a
+    /// view that still admits). It is a filter, not a proof: a process paused between this check
+    /// and its effect can still act late, so the destination must reject a lower token. After a
+    /// lapse with no promote, the node takes a new grant and the same token is owned again, as
+    /// write admission admits it again.
+    #[must_use]
+    pub fn still_owner(&self, partition: PartitionId, token: OwnerToken) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.owner_views.still_owner(partition, token))
     }
 
     /// Each node's state for partition 1, in node order. A node that does not answer within

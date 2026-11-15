@@ -369,6 +369,57 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
 
+### Fencing your own side effects
+
+Your app may do things outside rDB for a partition it leads: start a container, upload a
+snapshot. rDB fences its own writes. To fence yours, use the owner token.
+
+- `db.ownership(partition)` returns `Some(Ownership)` while a node in this process leads the
+  partition. It holds `token` (an `OwnerToken`: `generation`, then `owner_epoch`) and
+  `remaining`, the time left on the node's write permission.
+- `db.still_owner(partition, token)` is the same test rDB makes before it admits a write
+  (admission check 6), on the clock of the node that leads it. It sends no message.
+- Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
+
+**What `still_owner` promises.**
+
+- It turns false no later than rDB stops admitting writes for that token. When time runs out,
+  both stop at the same tick. After a fence (a frozen grant, a revoked epoch), it turns false
+  before rDB admits another write.
+- While it is true, no other node can own the partition under this token or a higher one.
+- It does **not** mean the partition takes writes. A paused, frozen or read-only partition
+  refuses writes while `still_owner` is true.
+- After a cut-off with no promote, the node takes a new grant and the **same** token is owned
+  again, as rDB writes again. After a promote, the old token is never owned again.
+
+**The clock rule.** rDB's node stops writing at `E − ε − δ`, where `E` is its grant's expiry,
+`ε` the clock error and `δ` = 100 ms. A new owner starts only after `E + ε + δ`. `remaining`
+already counts that margin, so use it and add nothing:
+
+1. Read the token with `ownership(partition)`.
+2. Right before each irreversible effect, call `still_owner(partition, token)`. If the effect
+   takes `d` to land, also require `remaining > d` (read `ownership` again for a fresh value).
+3. Stamp the token on the effect.
+
+**`still_owner` alone is not enough.** A process paused between the check and the effect (a GC
+pause, a VM suspend) still acts late. The node's clock also stops in a VM or host suspend, as
+rDB's does (ADR-rdb-0007 §3). So the **destination** must fence too:
+
+- It keeps the highest token it has seen, and refuses any effect stamped with a lower one.
+- A key prefix or a label alone refuses nothing: a late writer just writes under its old prefix.
+  The check must compare tokens, for example a conditional write on a stored token.
+
+For a sandbox gateway (SBX):
+
+- Stamp the token on **every** side effect: each container (as a label) and each snapshot upload.
+- The snapshot store keeps the highest token per workspace and refuses an upload with a lower
+  one (a conditional write on that record).
+- When a node starts leading a partition, it stops any container of that partition with a lower
+  token.
+
+`rdb_node` logs `ownership_held` when its node starts leading a partition (with `token` and
+`remaining_ms`) and `ownership_lapsed` when `still_owner` turns false for it.
+
 ## 5. Reopening your folder
 
 Open the same folder against the same rEtcd with the same `Db::open` call. There is nothing

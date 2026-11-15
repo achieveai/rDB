@@ -2227,3 +2227,41 @@ fn node_status_in_shows_a_partitions_own_note_and_refuses_an_unknown_partition()
     app.shutdown();
     db.shutdown();
 }
+
+/// own84_5 (#84): the owner token grows across a promote. Node 2's token for partition 2 is
+/// lower than node 3's after the move; once node 2 stops, no node here owns its old token, and
+/// the token the new owner holds is the one it writes under.
+/// Integration (~10 s): a promote waits out node 2's grant.
+#[config_log::retcd_test]
+fn own84_5_token_grows_across_a_promote() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut db = ready(&rt, dir.path(), &store, Some(8));
+    let moved = group_in(&db, PART2);
+    db.put_in(moved, b"before", b"1", None).expect("before");
+    let old = db.ownership(PART2).expect("node 2 leads partition 2");
+    assert_eq!(old.node, NodeId(2), "{old:?}");
+    assert!(db.still_owner(PART2, old.token));
+    assert!(db.ownership(PART3).is_some_and(|o| o.node == NodeId(3)));
+
+    stop_node(&db, 2);
+    assert!(
+        !db.still_owner(PART2, old.token),
+        "a stopped node owns nothing"
+    );
+    db.promote_partition(PART2, NodeId(3), None)
+        .unwrap_or_else(|error| panic!("node 2 is dead: {error}"));
+    until_ready(&db, PART2);
+    db.put_in(moved, b"after", b"2", None)
+        .expect("the moved partition writes");
+    let new = db.ownership(PART2).expect("node 3 leads partition 2");
+    assert_eq!(new.node, NodeId(3), "{new:?}");
+    assert!(new.token > old.token, "{new:?} after {old:?}");
+    assert!(db.still_owner(PART2, new.token));
+    assert!(
+        !db.still_owner(PART2, old.token),
+        "the old token is never owned after a promote"
+    );
+    db.shutdown();
+}

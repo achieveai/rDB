@@ -94,6 +94,7 @@ use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 use crate::clock::{ClockGuard, HostClock};
 use crate::control::ControlAdapter;
 use crate::db::ApiError;
+use crate::ownership::OwnerViews;
 use crate::transport::Links;
 
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
@@ -1435,6 +1436,8 @@ pub struct NodeHandle {
     pub(crate) start_failed: bool,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
+    /// The node's published views, for `Db::ownership` and `Db::still_owner` (#84).
+    pub(crate) owner_views: Arc<OwnerViews>,
 }
 
 impl NodeHandle {
@@ -1464,6 +1467,7 @@ impl NodeHandle {
                 start_failed: false,
                 tx,
                 join: None,
+                owner_views: OwnerViews::new(node, HostClock::start()),
             },
             rx,
         )
@@ -1477,6 +1481,8 @@ impl NodeHandle {
                 tracing::error!(node = self.node.0, "node_thread_panicked");
             }
         }
+        // A stopped node admits nothing, so it owns nothing (#84).
+        self.owner_views.clear();
     }
 }
 
@@ -1563,6 +1569,7 @@ pub(crate) fn spawn_on(
     links.register(node, tx.clone(), boot);
     let path = engine.path().to_path_buf();
     let mut host = Host::new(node, engine, links, control, clock);
+    let owner_views = Arc::clone(&host.owner_views);
     host.syncer = Some(Syncer::start(node, path, tx.clone())?);
     host.boot = boot;
     host.budgets = budgets;
@@ -1587,6 +1594,7 @@ pub(crate) fn spawn_on(
         start_failed: false,
         tx,
         join: Some(join),
+        owner_views,
     })
 }
 
@@ -2773,6 +2781,9 @@ struct Host {
     /// Per partition, the last view A1 published. `txn_dispatch` and `host_stall` measure the
     /// grant left against its horizon (M9 S2a, critic A2).
     authority_views: BTreeMap<PartitionId, AuthorityView>,
+    /// The same views, shared with [`crate::Db`] for an app's `ownership` and `still_owner`
+    /// (#84). Written in [`Self::report_view`] with `authority_views`, before T1 steps again.
+    pub(crate) owner_views: Arc<OwnerViews>,
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
     frames_received: u64,
@@ -2931,6 +2942,7 @@ impl Host {
             fault: None,
             stepped_at: now,
             authority_views: BTreeMap::new(),
+            owner_views: OwnerViews::new(node, clock),
             frames_received: 0,
             own_asks: Vec::new(),
             syncer: None,
@@ -5378,6 +5390,7 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        self.owner_views.publish(*view, self.clock);
         // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
         // history; a later fence of either scope must not reuse it.
         if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
@@ -15084,6 +15097,8 @@ mod catchup_tests;
 mod drop_tests;
 #[cfg(test)]
 mod note_tests;
+#[cfg(test)]
+mod ownership_tests;
 #[cfg(test)]
 mod seal_tests;
 #[cfg(test)]
