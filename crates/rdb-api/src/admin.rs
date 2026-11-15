@@ -2822,13 +2822,17 @@ pub(crate) async fn promote_looked(
 /// freeze found the owner alive (PR #119 review). What the record holds is read, never
 /// assumed, and the answer is what was found:
 ///
-/// * still `Fencing` (or `FencingDrained`): the partition takes no writes, and a later promote
-///   resumes from it (A-R447). Refused as [`PromoteError::Control`], saying so; logged
-///   `promote_fencing_undo_failed`.
+/// * still `Fencing` (or `FencingDrained`): a later promote resumes from it (A-R447). Refused
+///   as [`PromoteError::Control`], saying so; logged `promote_fencing_undo_failed`. Nothing is
+///   claimed about writes: the owner came back, and its grant may still admit them.
 /// * back to `before`, the record this promote fenced: the undo applied and only its answer
 ///   was lost, so the `alive` refusal stands; logged `promote_fencing_undone`.
-/// * anything else, or a reread that fails: refused as [`PromoteError::Control`] naming what
-///   was found, with no claim that a promote is left to resume.
+/// * the reread fails: whether the partition is still fenced is not known. Refused as
+///   [`PromoteError::Control`] carrying both errors, saying a later promote reads it again;
+///   logged `promote_fencing_undo_unknown`.
+/// * any other record (a newer owner or generation committed meanwhile): the undo was
+///   overtaken. Refused as [`PromoteError::Control`] naming that record, with nothing left to
+///   resume; logged `promote_fencing_undo_overtaken`.
 async fn undo_unproven(
     ctx: &PromoteCtx,
     before: &PartitionRecord,
@@ -2849,7 +2853,10 @@ async fn undo_unproven(
                 "promote_fencing_undo_unknown"
             );
             PromoteError::Control(format!(
-                "partitions/{partition} was fenced at revision {} and node {owner} came back;                  undoing the fence failed ({undo}) and partitions/{partition} could not be read                  again ({read}), so whether it is still fenced is not known: promote again",
+                "partitions/{partition} was fenced at revision {} and node {owner} came back; \
+                 undoing the fence failed ({undo}) and partitions/{partition} could not be read \
+                 again ({read}), so whether it is still fenced is not known: promote again, \
+                 which reads it again",
                 fenced_at.0
             ))
         }
@@ -2865,7 +2872,9 @@ async fn undo_unproven(
                 "promote_fencing_undo_failed"
             );
             PromoteError::Control(format!(
-                "partitions/{partition} is still {:?} at revision {revision}: node {owner} came                  back, and undoing this promote's fence failed ({undo}). Partition {partition}                  takes no writes until a promote finishes: promote again",
+                "partitions/{partition} is still {:?} at revision {revision}: node {owner} came \
+                 back, and undoing this promote's fence failed ({undo}). A later promote resumes \
+                 from it: promote again",
                 now.lifecycle
             ))
         }
@@ -2890,7 +2899,9 @@ async fn undo_unproven(
                 "promote_fencing_undo_overtaken"
             );
             PromoteError::Control(format!(
-                "partitions/{partition} changed while this promote undid its fence ({undo}): it                  now names owner {} at generation {}, {:?}, revision {revision}; this promote has                  nothing left to resume",
+                "partitions/{partition} changed while this promote undid its fence ({undo}): it \
+                 now names owner {} at generation {}, {:?}, revision {revision}; this promote has \
+                 nothing left to resume",
                 now.owner.0, now.generation.0, now.lifecycle
             ))
         }
@@ -3573,6 +3584,8 @@ pub(crate) mod rebuild;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::test_store::{Script, Scripted};
 
@@ -4755,7 +4768,17 @@ mod tests {
         /// What befalls the promote's undo of its `Fencing` write: a put on the partition that
         /// is not `Fencing`.
         undo: UndoFault,
+        /// Replace `grants/1` right after the `Fencing` write with a live, unfrozen grant
+        /// ([`LIVE_GRANT`]): the owner came back and renewed under a new grant id.
+        replace_on_fencing: bool,
+        /// Set once the undo has been tried.
+        undo_tried: AtomicBool,
+        /// [`UndoFault::Overtaken`]: the bytes and `mod_revision` of the record it committed.
+        overtook: std::sync::Mutex<Option<(Bytes, u64)>>,
     }
+
+    /// The grant [`MovingGrant::replace_on_fencing`] writes: a new grant id, a minute to run.
+    const LIVE_GRANT: GrantId = GrantId(9);
 
     /// [`MovingGrant::undo`].
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4766,9 +4789,41 @@ mod tests {
         ReplyLost,
         /// The undo answers `DeadlineExceededUnknownOutcome` without applying.
         Dropped,
+        /// As [`UndoFault::Dropped`], and every read of `partitions/1` after it fails.
+        DroppedUnreadable,
+        /// Just before the undo, another promote commits partition 1 `Serving` under node 3 at
+        /// the next generation; the undo's CAS then conflicts with it.
+        Overtaken,
     }
 
     impl MovingGrant {
+        /// [`UndoFault::Overtaken`]: commit, unconditionally, the record `undo` would restore
+        /// with node 3 as its `Serving` owner at the next generation, and keep its bytes and
+        /// `mod_revision`.
+        async fn overtake(&self, undo: &Bytes) {
+            let before = PartitionRecord::decode(undo).expect("a record");
+            let root = PartitionRoot::decode(undo).expect("a root");
+            let newer = PartitionRecord {
+                owner: NodeId(3),
+                generation: Generation(before.generation.0 + 1),
+                lifecycle: PartitionLifecycle::Serving,
+                ..before
+            };
+            let value = newer.encode_with(&root);
+            let committed = self
+                .inner
+                .put(PutRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                    value: value.clone(),
+                    expected_mod_revision: None,
+                    dedup: None,
+                })
+                .await
+                .expect("overtake partitions/1");
+            assert_eq!(committed.outcome, MutationOutcome::Applied);
+            *self.overtook.lock().expect("overtook") = Some((value, committed.revision));
+        }
+
         async fn renew(&self) {
             let key = Bytes::from(ControlKey::Grant(OWNER).encode());
             let found = self
@@ -4805,6 +4860,14 @@ mod tests {
                 if self.on_get && request.key == ControlKey::Grant(OWNER).encode().as_bytes() {
                     self.renew().await;
                 }
+                if self.undo == UndoFault::DroppedUnreadable
+                    && self.undo_tried.load(Ordering::SeqCst)
+                    && request.key == ControlKey::Partition(PARTITION).encode().as_bytes()
+                {
+                    return Err(ConfigError::Unavailable {
+                        reason: "admin fixture: partitions/1 unreadable".to_owned(),
+                    });
+                }
                 self.inner.get(request).await
             })
         }
@@ -4828,8 +4891,16 @@ mod tests {
                 let lifecycle = PartitionRecord::decode(&request.value).map(|r| r.lifecycle);
                 let fencing = on_partition && lifecycle == Some(PartitionLifecycle::Fencing);
                 let undo = on_partition && !fencing && lifecycle.is_some();
-                if undo && self.undo == UndoFault::Dropped {
+                if undo {
+                    self.undo_tried.store(true, Ordering::SeqCst);
+                }
+                if undo
+                    && matches!(self.undo, UndoFault::Dropped | UndoFault::DroppedUnreadable)
+                {
                     return Err(ConfigError::DeadlineExceededUnknownOutcome);
+                }
+                if undo && self.undo == UndoFault::Overtaken {
+                    self.overtake(&request.value).await;
                 }
                 let answer = self.inner.put(request).await;
                 if undo && self.undo == UndoFault::ReplyLost {
@@ -4838,6 +4909,27 @@ mod tests {
                 }
                 if fencing && self.on_fencing {
                     self.renew().await;
+                }
+                if fencing && self.replace_on_fencing {
+                    let live = GrantRecord {
+                        grant: LIVE_GRANT,
+                        node: OWNER,
+                        boot: BOOT,
+                        authority_generation: AuthorityGeneration(0),
+                        expiry_utc_ms: expiry_ahead(60_000),
+                        frozen: false,
+                    };
+                    let replaced = self
+                        .inner
+                        .put(PutRequest {
+                            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+                            value: live.encode(),
+                            expected_mod_revision: None,
+                            dedup: None,
+                        })
+                        .await
+                        .expect("replace grants/1");
+                    assert_eq!(replaced.outcome, MutationOutcome::Applied);
                 }
                 if fencing && self.clear_on_fencing {
                     let cleared = self
@@ -5007,6 +5099,9 @@ mod tests {
             on_fencing: false,
             clear_on_fencing: false,
             undo: UndoFault::Answers,
+            replace_on_fencing: false,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -5074,6 +5169,9 @@ mod tests {
             on_fencing: false,
             clear_on_fencing: false,
             undo: UndoFault::Answers,
+            replace_on_fencing: false,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -5102,6 +5200,9 @@ mod tests {
             on_fencing: true,
             clear_on_fencing: false,
             undo: UndoFault::Answers,
+            replace_on_fencing: false,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -5129,6 +5230,9 @@ mod tests {
             on_fencing: false,
             clear_on_fencing: true,
             undo: UndoFault::Answers,
+            replace_on_fencing: false,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -5161,6 +5265,9 @@ mod tests {
             on_fencing: false,
             clear_on_fencing: true,
             undo,
+            replace_on_fencing: false,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
         });
         rooted(&store.inner, rt, BootId(5));
         old_grant(&store.inner, rt, GrantId(4));
@@ -5230,6 +5337,143 @@ mod tests {
             "{failed:?}"
         );
         assert!(undo_lines(METHOD, "promote_fencing_undone").is_empty());
+    }
+
+    /// The four outcome logs of [`undo_unproven`] and the plain undo, each by count, so a row can
+    /// say exactly which one it wrote.
+    fn undo_outcomes(method: &str) -> [usize; 4] {
+        [
+            "promote_fencing_undone",
+            "promote_fencing_undo_failed",
+            "promote_fencing_undo_unknown",
+            "promote_fencing_undo_overtaken",
+        ]
+        .map(|message| undo_lines(method, message).len())
+    }
+
+    /// PR #119 review round 3 (spec §7.3): the undo does not answer and the reread of
+    /// `partitions/1` fails too. Nothing is known about the fence, so the refusal says that,
+    /// carries both errors, and tells the operator to promote again, which reads it again. It
+    /// claims neither an undone record nor a still-fenced one. Unit (~20 ms): `MemStore`.
+    /// Cut: take a failed reread as still fenced (the `Err` arm returns the still-`Fencing`
+    /// refusal and logs `promote_fencing_undo_failed`); red.
+    #[config_log::retcd_test]
+    fn undo_and_reread_failure_reports_unknown() {
+        const METHOD: &str = "undo_and_reread_failure_reports_unknown";
+        let rt = runtime();
+        let (store, refused) = promote_with_undo(&rt, UndoFault::DroppedUnreadable);
+        let PromoteError::Control(why) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.contains("whether it is still fenced is not known"),
+            "{why}"
+        );
+        assert!(
+            why.contains(&ConfigError::DeadlineExceededUnknownOutcome.to_string()),
+            "the undo's error: {why}"
+        );
+        assert!(
+            why.contains("admin fixture: partitions/1 unreadable"),
+            "the reread's error: {why}"
+        );
+        assert!(!why.contains("nothing left to resume"), "{why}");
+        assert_eq!(undo_outcomes(METHOD), [0, 0, 1, 0], "only the unknown outcome");
+        let (record, ..) = rt
+            .block_on(read_partition(&store.inner, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Fencing, "{record:?}");
+    }
+
+    /// PR #119 review round 3 (spec §7.3): another promote commits partition 1 `Serving` under
+    /// node 3 at the next generation just before this promote's undo, so the undo's CAS
+    /// conflicts. The reread finds that record: the refusal names its owner, generation and
+    /// revision and says nothing is left to resume, the record is left byte for byte as it was
+    /// committed, and the only undo outcome logged is `promote_fencing_undo_overtaken`.
+    /// Unit (~20 ms): `MemStore`.
+    /// Cut: take any `Serving` reread as undone (`now == *before` becomes a lifecycle test); the
+    /// refusal stays `OwnerAlive`, red.
+    #[config_log::retcd_test]
+    fn serving_commit_overtakes_undo() {
+        const METHOD: &str = "serving_commit_overtakes_undo";
+        let rt = runtime();
+        let (store, refused) = promote_with_undo(&rt, UndoFault::Overtaken);
+        let (bytes, revision) = store
+            .overtook
+            .lock()
+            .expect("overtook")
+            .clone()
+            .expect("the newer record was committed");
+        let PromoteError::Control(why) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.contains(&format!(
+                "now names owner 3 at generation 4, Serving, revision {revision}"
+            )) && why.ends_with("nothing left to resume"),
+            "{why}"
+        );
+        let found = rt
+            .block_on(store.inner.get(GetRequest {
+                key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("partitions/1");
+        assert_eq!(found.value, bytes, "the newer record's bytes are unchanged");
+        assert_eq!(found.mod_revision, revision, "and so is its revision");
+        assert_eq!(undo_outcomes(METHOD), [0, 0, 0, 1], "only the overtaken outcome");
+    }
+
+    /// PR #119 review round 3 (spec §7.3): the owner comes back under a new, live grant right
+    /// after the `Fencing` write, and the undo does not apply. The partition is read still
+    /// `Fencing`, the owner's grant stays live and unfrozen, and the refusal says a promote
+    /// resumes it without claiming the partition takes no writes: that grant may still admit
+    /// them. Unit (~20 ms): `MemStore`.
+    /// Cut: put the "takes no writes until a promote finishes" sentence back in the
+    /// still-`Fencing` refusal; red.
+    #[config_log::retcd_test]
+    fn live_grant_dropped_undo_reports_control_state() {
+        const METHOD: &str = "live_grant_dropped_undo_reports_control_state";
+        let rt = runtime();
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: false,
+            on_fencing: false,
+            clear_on_fencing: false,
+            undo: UndoFault::Dropped,
+            replace_on_fencing: true,
+            undo_tried: AtomicBool::new(false),
+            overtook: std::sync::Mutex::new(None),
+        });
+        rooted(&store.inner, &rt, BootId(5));
+        old_grant(&store.inner, &rt, GrantId(4));
+        let refused = promote_above_one(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        let (record, _, _, revision, _, _) = rt
+            .block_on(read_partition(&store.inner, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Fencing, "{record:?}");
+        let PromoteError::Control(why) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            why.contains(&format!("is still Fencing at revision {revision}"))
+                && why.ends_with("promote again"),
+            "{why}"
+        );
+        assert!(!why.contains("no writes"), "no promise about writes: {why}");
+        let grant = rt
+            .block_on(store.inner.get(GetRequest {
+                key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            }))
+            .expect("get")
+            .record
+            .expect("grants/1");
+        let grant = GrantRecord::decode(&grant.value).expect("a grant");
+        assert_eq!(grant.grant, LIVE_GRANT, "{grant:?}");
+        assert!(!grant.frozen, "unfrozen: {grant:?}");
+        assert!(grant.expiry_utc_ms > expiry_ahead(0), "live: {grant:?}");
+        assert_eq!(undo_outcomes(METHOD), [0, 1, 0, 0], "only the still-fenced outcome");
     }
 
     /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying

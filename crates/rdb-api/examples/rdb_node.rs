@@ -42,11 +42,11 @@
 //!   `kill -CONT` is a frozen-clock pause.
 //!   `--failover` runs the automatic-failover planner in this process (#81 C1,
 //!   `DbConfig::failover`): while it holds `planner/grant` it promotes each partition of a node
-//!   whose link has echoed no clock probe for `--failover-silent-ms` (default 2000), that
-//!   answers no look, and whose grant has run out; or of a node whose grant is frozen. At most
-//!   `--failover-max-concurrent` (default 16) promotes run at once. Off by default. Either
-//!   knob without `--failover` is refused, and so is `--failover` with `--form` or
-//!   `--gen-certs`: neither runs a planner.
+//!   whose link has echoed no clock probe for `--failover-silent-ms` (default 2000, least
+//!   1000), that answers no look, and whose grant has run out; or of a node whose grant is
+//!   frozen. At most `--failover-max-concurrent` (default 16, least 1) promotes run at once.
+//!   Off by default. Either knob without `--failover` is refused, and so is `--failover` with
+//!   `--form` or `--gen-certs`: neither runs a planner.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
