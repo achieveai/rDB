@@ -36,6 +36,7 @@ ADR that supersedes.
 | [0016](0016-ordered-lists.md) | Ordered lists — blocks, change slots and folding | **Accepted** |
 | [0019](0019-validation-gates-evidence-and-release-boundary.md) | Validation gates, evidence and the release boundary | Proposed |
 | [0020](0020-change-feed-for-external-consumers.md) | A change feed for external apps — read every committed change, in order | Proposed (not scheduled; no code in M10) |
+| [0021](0021-check-b-floor-guard-on-landing-and-inventory.md) | Check B — a floor guard on landing and on the inventory link (extends 0010) | Proposed |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
 enables no Merge family. 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
@@ -49,7 +50,7 @@ reached yet.
 | 0000, 0002, 0003 | foundation (the series, the crates, the kernel shape) |
 | 0001 | the accepted architecture, decided by the user |
 | 0004, 0007, 0008 | kernel-a (transaction, authority, control records) |
-| 0005, 0006, 0009 | kernel-b (replication, lag protection, recovery) |
+| 0005, 0006, 0009, 0021 | kernel-b (replication, lag protection, recovery) |
 | 0019 | verification (gates, evidence, the release boundary) |
 
 ## Naming
