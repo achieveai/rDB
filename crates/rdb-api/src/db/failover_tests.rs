@@ -762,3 +762,92 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
         "one new generation: {before:?} -> {after:?}"
     );
 }
+
+/// Lead ruling 2 on PR #119: a cold start raises no `planner_owner_alive_not_serving`. Each
+/// node opens with no grant of its own until its links sync, some 6 s after the planner's
+/// first sweep, and an owner with no grant yet is not an owner that stopped serving.
+/// Integration (~10 s): the rig's own start, then a few more sweeps.
+/// Cut: drop the "no grant yet" check in `sweep`; the alert is said for the owners that had
+/// none, red.
+#[config_log::retcd_test]
+fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
+    const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
+    let rig = rig(3, Some(failover()));
+    until("a planner holds its grant", Duration::from_secs(20), || {
+        rig.planner_grant().is_some()
+    });
+    std::thread::sleep(5 * failover().poll);
+    assert_eq!(
+        logged(METHOD, "planner_owner_alive_not_serving"),
+        Vec::<serde_json::Value>::new()
+    );
+    assert!(
+        !logged(METHOD, "planner_owner_no_grant_yet").is_empty(),
+        "the start had owners with no grant, or this row shows nothing"
+    );
+}
+
+/// Lead ruling 1 on PR #119: the planner on node 1 holds `planner/grant`; node 1's host
+/// faults, and its process stays up, on its links and on its rEtcd. The planner gives the grant
+/// up (`planner_grant_released_host_faulted`, once), node 2's planner takes it once it lapses,
+/// and node 2 is the one that judges node 1: still answering, so the Q2 alert and no move.
+/// Then node 1 goes silent on its links and node 2 fails its partition over.
+/// The first half is what the ruling changes. Once node 1 is muted its clock has no samples,
+/// so its planner stops on `planner_clock_unbounded` with or without the ruling.
+/// Integration (~20 s): a grant lapse, the alert, then a failover.
+/// Cut: skip the own-host check in `hold`; node 1 keeps renewing, nobody judges node 1 (a
+/// planner never judges its own node), and node 2 never holds the grant, red.
+#[config_log::retcd_test]
+fn own81_a_planner_on_a_faulted_host_gives_up_its_grant_and_another_fails_over() {
+    const METHOD: &str =
+        "own81_a_planner_on_a_faulted_host_gives_up_its_grant_and_another_fails_over";
+    let mut rig = rig_with(3, [Some(failover()), None, None]);
+    assert_eq!(rig.owner(1), NodeId(1));
+    until(
+        "node 1's planner holds its grant",
+        Duration::from_secs(20),
+        || {
+            rig.planner_grant()
+                .is_some_and(|grant| grant.node == NodeId(1))
+        },
+    );
+    rig.procs[1].db.start_planner(failover());
+
+    let db = &rig.procs[0].db;
+    let boot = db.boot_of(NodeId(1)).expect("this process runs node 1");
+    db.send_to(
+        NodeId(1),
+        Msg::Fault {
+            boot,
+            kind: "own81_planner_fault",
+            detail: "injected".to_owned(),
+        },
+    )
+    .expect("node 1 takes the fault");
+    until(
+        "node 2's planner takes the grant",
+        Duration::from_secs(30),
+        || {
+            rig.planner_grant()
+                .is_some_and(|grant| grant.node == NodeId(2))
+        },
+    );
+    let alert = logged_at_least(METHOD, "planner_owner_alive_not_serving", 1);
+    assert_eq!(alert.len(), 1, "{alert:?}");
+    assert_eq!(alert[0]["node"], 1, "{alert:?}");
+    assert_eq!(
+        rig.owner(1),
+        NodeId(1),
+        "an answering owner keeps its partition"
+    );
+
+    rig.procs[0].faults.apply("mute\n");
+    until("node 1's partition moves", Duration::from_secs(60), || {
+        rig.owner(1) != NodeId(1)
+    });
+    let silent = logged_at_least(METHOD, "planner_node_silent", 1);
+    assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    let released = logged(METHOD, "planner_grant_released_host_faulted");
+    assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
+    assert_eq!(released[0]["node"], 1, "{released:?}");
+}

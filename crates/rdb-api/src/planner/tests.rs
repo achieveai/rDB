@@ -307,3 +307,51 @@ fn own81_c1_no_clock_bound_no_grant_written() {
     assert_eq!(planner_grant(&rt, &store), None, "nothing written");
     assert_eq!(messages(METHOD, "planner_clock_unbounded").len(), 1);
 }
+
+/// Lead ruling 3 on PR #119, pure: one cause is said at once, held back for [`REPEAT_EVERY`]
+/// with a count, then said again with that count; another cause has its own window.
+/// Cut: say every occurrence (`Some(0)` always); red at the second note.
+#[test]
+fn own81_repeats_say_once_per_window_with_the_count_held_back() {
+    let start = Instant::now();
+    let mut repeats = Repeats::default();
+    assert_eq!(repeats.note("unavailable", start), Some(0));
+    for second in 1..=9 {
+        let now = start + Duration::from_secs(second);
+        assert_eq!(repeats.note("unavailable", now), None, "{second} s");
+    }
+    assert_eq!(
+        repeats.note("not_leader", start + Duration::from_secs(9)),
+        Some(0)
+    );
+    assert_eq!(repeats.note("unavailable", start + REPEAT_EVERY), Some(9));
+    assert_eq!(
+        repeats.note("unavailable", start + REPEAT_EVERY + Duration::from_secs(1)),
+        None
+    );
+}
+
+/// Lead ruling 3 on PR #119, through `hold`: five reads of `planner/grant` fail in a row,
+/// well inside one window, and `planner_grant_read_failed` is said once, holding back none
+/// yet. Before the ruling it was said on every poll, twice a second in the walk.
+/// Cut: drop the `Repeats` check; five lines, red.
+#[config_log::retcd_test]
+fn own81_a_failing_grant_read_is_warned_once_per_window() {
+    const METHOD: &str = "own81_a_failing_grant_read_is_warned_once_per_window";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script {
+            fail_gets: 5,
+            ..crate::test_store::Script::default()
+        },
+    ));
+    let cut = planner(2, &store, Links::new());
+    let mut memory = Memory::default();
+    for _ in 0..5 {
+        assert!(!rt.block_on(cut.hold(&mut memory)));
+    }
+    let said = messages(METHOD, "planner_grant_read_failed");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0]["suppressed"], 0, "{said:?}");
+    assert!(rt.block_on(cut.hold(&mut memory)), "the sixth read answers");
+}

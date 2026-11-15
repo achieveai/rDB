@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::{ConfigError, ConfigStore, GetRequest, ListRequest, MutationOutcome, PutRequest};
@@ -88,6 +88,49 @@ impl NoEligible {
             Self::MembersUnknown => "members_unknown",
             Self::LoneSurvivor { .. } => "lone_survivor",
         }
+    }
+}
+
+/// How often one repeated warn is said per cause; the lines between are counted.
+pub(crate) const REPEAT_EVERY: Duration = Duration::from_secs(10);
+
+/// A warn said at most once per [`REPEAT_EVERY`] per cause, with how many it held back.
+#[derive(Debug, Default)]
+pub(crate) struct Repeats {
+    /// Per cause: when it was last said, and how many were held back since.
+    said: BTreeMap<&'static str, (Instant, u64)>,
+}
+
+impl Repeats {
+    /// Note one occurrence of `cause` at `now`: `Some(held back since the last)` when it is to
+    /// be said, `None` when it is held back.
+    pub(crate) fn note(&mut self, cause: &'static str, now: Instant) -> Option<u64> {
+        match self.said.get_mut(cause) {
+            Some((last, held)) if now.saturating_duration_since(*last) < REPEAT_EVERY => {
+                *held += 1;
+                None
+            }
+            Some((last, held)) => {
+                let suppressed = std::mem::take(held);
+                *last = now;
+                Some(suppressed)
+            }
+            None => {
+                self.said.insert(cause, (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+/// A store error's cause, for [`Repeats`]: its kind, not its text, which can name revisions.
+fn cause(error: &ConfigError) -> &'static str {
+    match error {
+        ConfigError::Unavailable { .. } => "unavailable",
+        ConfigError::NotLeader { .. } => "not_leader",
+        ConfigError::DeadlineExceededUnknownOutcome => "deadline_exceeded",
+        ConfigError::Conflict { .. } => "conflict",
+        _ => "other",
     }
 }
 
@@ -169,6 +212,12 @@ struct Held {
 pub(crate) struct Memory {
     held: Option<Held>,
     unbounded: bool,
+    /// Whether the last hold found this planner's own host faulted: the warn is said once.
+    host_faulted: bool,
+    /// `planner_grant_read_failed`, once per [`REPEAT_EVERY`] per cause.
+    read_failed: Repeats,
+    /// Owners heard but holding no grant yet, each said once (`planner_owner_no_grant_yet`).
+    no_grant_yet: BTreeSet<NodeId>,
     verdicts: BTreeMap<NodeId, Verdict>,
     no_eligible: BTreeMap<PartitionId, &'static str>,
 }
@@ -216,7 +265,31 @@ impl Planner {
 
     /// Acquire or renew `planner/grant`; whether this planner holds it now. Logged
     /// `planner_grant_acquired` and `planner_grant_lost` on each change.
+    ///
+    /// A planner whose own host has faulted holds nothing: it stops renewing, so the record
+    /// lapses within the grant's length and another node's planner takes it (lead ruling on
+    /// PR #119). A host that does not answer the look in time is not taken for faulted: a
+    /// stalled node thread still renews, as V6 shows.
     pub(crate) async fn hold(&self, memory: &mut Memory) -> bool {
+        if let Some(fault) = self
+            .look(PartitionId(1), self.node)
+            .await
+            .and_then(|status| status.fault)
+        {
+            if !memory.host_faulted {
+                tracing::warn!(
+                    node = self.node.0,
+                    %fault,
+                    held = memory.held.is_some(),
+                    lapses_within_ms = self.budgets.grant_millis,
+                    "planner_grant_released_host_faulted"
+                );
+                memory.host_faulted = true;
+            }
+            self.lose(memory, "host_faulted");
+            return false;
+        }
+        memory.host_faulted = false;
         let was = memory.held.is_some();
         let now = self.clock.now();
         let view = self.view(now);
@@ -237,7 +310,11 @@ impl Planner {
             })
             .await
         {
-            Err(error) => tracing::warn!(%error, "planner_grant_read_failed"),
+            Err(error) => {
+                if let Some(suppressed) = memory.read_failed.note(cause(&error), Instant::now()) {
+                    tracing::warn!(%error, suppressed, "planner_grant_read_failed");
+                }
+            }
             Ok(read) => {
                 let found = read
                     .record
@@ -366,6 +443,19 @@ impl Planner {
             let verdict = self
                 .judge(owner, grants.get(&owner), records[0].0.partition)
                 .await;
+            // No alert before the owner's first grant exists: a node just started has none
+            // until its links sync, and it is not "not serving" (lead ruling on PR #119).
+            // Nothing is remembered either, so the alert is still said once a grant expires.
+            if !grants.contains_key(&owner) {
+                if let Verdict::AliveNotServing(evidence) = verdict {
+                    if memory.no_grant_yet.insert(owner) {
+                        tracing::info!(node = owner.0, evidence, "planner_owner_no_grant_yet");
+                    }
+                    memory.verdicts.remove(&owner);
+                    continue;
+                }
+            }
+            memory.no_grant_yet.remove(&owner);
             let changed = memory.verdicts.get(&owner) != Some(&verdict);
             match &verdict {
                 Verdict::Alive => {}
