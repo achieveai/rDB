@@ -218,17 +218,25 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--failover" => args.failover = true,
             "--failover-silent-ms" => {
-                args.failover_silent_ms = Some(
-                    value("--failover-silent-ms")?
-                        .parse()
-                        .map_err(|_| "--failover-silent-ms wants whole milliseconds".to_owned())?,
-                );
+                let millis: u64 = value("--failover-silent-ms")?
+                    .parse()
+                    .map_err(|_| "--failover-silent-ms wants whole milliseconds".to_owned())?;
+                if millis < FAILOVER_SILENT_MIN_MS {
+                    return Err(format!(
+                        "--failover-silent-ms {millis} is under one clock-probe period \
+                         ({FAILOVER_SILENT_MIN_MS} ms): a healthy link would read as silent"
+                    ));
+                }
+                args.failover_silent_ms = Some(millis);
             }
             "--failover-max-concurrent" => {
-                args.failover_max_concurrent =
-                    Some(value("--failover-max-concurrent")?.parse().map_err(|_| {
-                        "--failover-max-concurrent wants a count of at least 1".to_owned()
-                    })?);
+                let count: usize = value("--failover-max-concurrent")?.parse().map_err(|_| {
+                    "--failover-max-concurrent wants a count of at least 1".to_owned()
+                })?;
+                if count == 0 {
+                    return Err("--failover-max-concurrent wants a count of at least 1".to_owned());
+                }
+                args.failover_max_concurrent = Some(count);
             }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
@@ -237,6 +245,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     failover_refusal(&args)?;
     Ok(args)
 }
+
+/// The shortest `--failover-silent-ms` taken: one clock-probe period, the same floor
+/// `Db::open_with` holds `Failover::silent_after` to (`net::PROBE_PERIOD`, 1 s). The CLI
+/// refuses below it while parsing, before this process writes its boot or listens (PR #119
+/// review); `Db::open_with` still refuses it for an embedder.
+const FAILOVER_SILENT_MIN_MS: u64 = 1_000;
 
 /// `--failover` and its knobs where nothing would read them, refused rather than ignored (PR
 /// #119 review): `--form` and `--gen-certs` run no planner, and a knob does nothing without
@@ -655,5 +669,31 @@ mod tests {
         );
         let args = parsed(&["--failover-max-concurrent", "4", "--failover"]).expect("parses");
         assert_eq!(super::failover(&args).map(|f| f.max_concurrent), Some(4));
+    }
+
+    /// PR #119 review: a zero `--failover-max-concurrent` and a `--failover-silent-ms` under
+    /// one clock-probe period are refused while parsing, before the process writes its boot
+    /// or listens; exactly 1000 ms is taken. Unit.
+    /// Cut: drop either parse-time check, red (the flags parse).
+    #[test]
+    fn own81_failover_knobs_refused_while_parsing() {
+        assert_eq!(
+            parsed(&["--failover", "--failover-max-concurrent", "0"]).map(|_| ()),
+            Err("--failover-max-concurrent wants a count of at least 1".to_owned())
+        );
+        for millis in ["0", "999"] {
+            assert_eq!(
+                parsed(&["--failover", "--failover-silent-ms", millis]).map(|_| ()),
+                Err(format!(
+                    "--failover-silent-ms {millis} is under one clock-probe period (1000 ms): \
+                     a healthy link would read as silent"
+                ))
+            );
+        }
+        let args = parsed(&["--failover", "--failover-silent-ms", "1000"]).expect("parses");
+        assert_eq!(
+            super::failover(&args).map(|f| f.silent_after),
+            Some(std::time::Duration::from_millis(1_000))
+        );
     }
 }
