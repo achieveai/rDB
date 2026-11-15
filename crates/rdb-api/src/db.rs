@@ -4075,8 +4075,9 @@ impl Db {
     /// whole node's: it must not answer a look without a host fault, and its grant must not be
     /// renewing (a frozen grant passes at once). A host fault lasts the boot, so a faulted owner
     /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
-    /// for up to its grant's length. The other partitions the
-    /// node owned stay `NoLink` until each has its own promote; the node's next open fails
+    /// until its last grant expiry plus the safety margin is proven past. The other partitions
+    /// the node owned remain not ready until each has its own promote (`Faulted` while the
+    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
     /// for a partition it no longer owns.
     ///

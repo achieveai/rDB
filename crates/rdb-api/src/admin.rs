@@ -4790,7 +4790,7 @@ mod tests {
         NodeStatus {
             node: OWNER,
             boot: BOOT,
-            fault: Some("control adapter: i122: injected".to_owned()),
+            fault: Some("control adapter: admin fixture".to_owned()),
             holds: None,
             authority: "none".to_owned(),
             fence: None,
