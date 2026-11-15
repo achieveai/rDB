@@ -2683,6 +2683,10 @@ struct Host {
     /// Crate tests only (A-R346 M1).
     #[cfg(test)]
     refuse_inventories: bool,
+    /// Whether [`Self::repair_duty`] does nothing, so a row can wait for this host to adopt a
+    /// `ReadOnly` commit before a repair re-plans past it (issue #112). Crate tests only.
+    #[cfg(test)]
+    hold_repairs: bool,
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
@@ -2703,6 +2707,10 @@ struct Host {
     /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
+    /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
+    /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
+    /// to log once per change and to log the hold's end.
+    rebuild_hold: BTreeMap<PartitionId, (Generation, Vec<NodeId>)>,
     /// The copies F1 named in `RebuildStalled` during the step being run, per partition.
     stall_step: BTreeMap<PartitionId, BTreeSet<CopyId>>,
     /// Per partition, the copies F1's latest `RebuildStalled` step named, with the watched
@@ -2900,12 +2908,15 @@ impl Host {
             drain_proofs_to_lose: 0,
             #[cfg(test)]
             refuse_inventories: false,
+            #[cfg(test)]
+            hold_repairs: false,
             repair_since: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
             tail_refused: BTreeMap::new(),
             tail_holds: BTreeMap::new(),
+            rebuild_hold: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
@@ -7255,7 +7266,17 @@ impl Host {
     /// `membership_repair_held`. While F1's rebuild is pinned nothing runs until F1's deadline
     /// reports a stall, and then only when no copy that latest stall named answers (A-R383,
     /// A-R426 M8): at cutoff 0 the pin is set on every commit, so a dead copy would otherwise
-    /// hold a `ReadOnly` partition for good.
+    /// hold a `ReadOnly` partition for good. A stalled copy whose status reports a tail above the
+    /// pinned cutoff counts as not answering (issue #106), and S4d's tail hold decides instead.
+    /// For a recorded tail, [`Self::sync_answer`] withholds the copy's proof (it reads only the
+    /// recorded refusals), so the rebuild can never finish on it. An interrupted copy, read from
+    /// staging, is not withheld there; S4d holds it as it holds any interrupted copy. The hold's
+    /// start and end are logged at info, `membership_repair_rebuild_hold_started` and `_ended`,
+    /// both naming the stalled nodes in `waits_on`. It ends when no member is outside
+    /// (`no_member_outside`, or `not_read_only` once the commit is not `ReadOnly`), when the pin
+    /// changes (`rebuild_not_pinned`), when no outside member is linked (`no_member_linked`),
+    /// when a probe is read with no answer (`stalled_copy_silent`), or when the stalled copies
+    /// stop holding at a check that heard answers.
     ///
     /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
     /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
@@ -7269,6 +7290,10 @@ impl Host {
     /// logged `membership_repair_held` once per change, and the check runs again a hold later.
     /// Other refusals keep the back-off above.
     fn repair_duty(&mut self, partition: PartitionId, now: Tick) {
+        #[cfg(test)]
+        if self.hold_repairs {
+            return;
+        }
         let read_only = self
             .committed
             .get(&partition)
@@ -7291,6 +7316,22 @@ impl Host {
             .get(&partition)
             .map(|committed| committed.committed.pinned_config.members.clone())
             .unwrap_or_default();
+        if outside.is_empty() {
+            // Rejoin, or this node no longer primary, empties the outside set of a partition that
+            // is still read-only: name that, not a mode change.
+            let reason = if read_only {
+                "no_member_outside"
+            } else {
+                "not_read_only"
+            };
+            self.end_rebuild_hold(partition, reason);
+        } else if self
+            .rebuild_hold
+            .get(&partition)
+            .is_some_and(|(held, _)| pinned != Some(*held))
+        {
+            self.end_rebuild_hold(partition, "rebuild_not_pinned");
+        }
         let latest = self.latest_stall.get(&partition);
         if outside.is_empty() || rebuild_holds_repair(pinned, latest, &[], &members) {
             self.repair_since.remove(&partition);
@@ -7302,7 +7343,9 @@ impl Host {
             .filter(|node| self.linked(*node))
             .collect();
         if linked.is_empty() {
-            // Down: the next link is a new one, so the next repair may run.
+            // Down: the next link is a new one, so the next repair may run. No stalled copy is
+            // linked, so none can hold the repair (A-R383): the hold has ended.
+            self.end_rebuild_hold(partition, "no_member_linked");
             self.repair_since.remove(&partition);
             self.repaired.remove(&partition);
             self.repair_probes.remove(&partition);
@@ -7347,25 +7390,29 @@ impl Host {
         // half-open link, a stalled process) is probed again, and nothing is fenced for it. In
         // this process the answer comes back over its own channel, not over `Links`, so a member
         // whose direction back to this node is dropped is counted as not answering (A-R353).
-        let answers: Vec<(NodeId, NodeStatus)> = match self.repair_probes.remove(&partition) {
-            Some((sent, probes))
-                if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
-            {
-                let dropped = self.links.dropped();
-                probes
-                    .into_iter()
-                    .filter(|(node, _)| {
-                        linked.contains(node) && !dropped.contains(&(*node, self.node))
-                    })
-                    .filter_map(|(node, answer)| {
-                        answer.try_recv().ok().map(|status| (node, status))
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+        // `probe_read`: this check read the answers to a probe the previous check sent, so an
+        // empty `answers` then means nobody answered, not that no probe was out yet.
+        let (probe_read, answers): (bool, Vec<(NodeId, NodeStatus)>) =
+            match self.repair_probes.remove(&partition) {
+                Some((sent, probes))
+                    if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
+                {
+                    let dropped = self.links.dropped();
+                    let answers = probes
+                        .into_iter()
+                        .filter(|(node, _)| {
+                            linked.contains(node) && !dropped.contains(&(*node, self.node))
+                        })
+                        .filter_map(|(node, answer)| {
+                            answer.try_recv().ok().map(|status| (node, status))
+                        })
+                        .collect();
+                    (true, answers)
+                }
+                _ => (false, Vec::new()),
+            };
         let answered: Vec<NodeId> = answers.iter().map(|(node, _)| *node).collect();
-        // Issue #105 unit 2 (design section 8.2): A-R383's one exception. A stalled copy that
+        // Issue #105 unit 2 (design section 8.2): A-R383's first exception. A stalled copy that
         // reports an adoptable tail holds nothing, since the re-plan this repair starts is what
         // adopts it; holding would keep it `ReadOnly` for good (walk A).
         let adoptable = |node: &NodeId| {
@@ -7376,12 +7423,41 @@ impl Host {
                         .is_some_and(|tail| tail.adoption.is_adoptable())
             })
         };
+        // Issue #106: nor does a stalled copy whose status reports a tail above the pinned
+        // cutoff. That status is one of two things, held for different reasons:
+        // - A recorded tail (`Host.tail_refused`, from a landing or inventory). `sync_answer`
+        //   reads only that map and withholds the copy's post-commit proof (`sync_withheld`,
+        //   `reason=tail_held`), so it can never prove the rebuild A-R383 waits for.
+        // - An interrupted copy (`interrupted_copy`, read from staging by `tail_refused_of`).
+        //   `sync_answer` does not withhold for it; S4d's tail hold below holds it, as it holds
+        //   any interrupted copy, so A-R383's hold would only hide it from `forget-tail`.
+        // Either way S4d's tail hold below decides for it.
+        let cutoff = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| watch.pinned)
+            .map(|watch| watch.cutoff);
+        let withholds = |node: &NodeId| {
+            answers.iter().any(|(answered, status)| {
+                answered == node
+                    && status
+                        .tail_refused
+                        .zip(cutoff)
+                        .is_some_and(|(tail, cutoff)| tail.head > cutoff)
+            })
+        };
         let holding: Vec<NodeId> = answered
             .iter()
             .copied()
-            .filter(|node| !adoptable(node))
+            .filter(|node| !adoptable(node) && !withholds(node))
             .collect();
         if answered.is_empty() {
+            // A probe read with no answer: no stalled copy answers, so none holds the repair
+            // (A-R383). A check that only sends the first probe has heard nothing yet, and the
+            // hold stands.
+            if probe_read {
+                self.end_rebuild_hold(partition, "stalled_copy_silent");
+            }
             let probes: Vec<RepairProbe> = linked
                 .iter()
                 .filter_map(|&node| {
@@ -7409,6 +7485,34 @@ impl Host {
             &holding,
             &members,
         ) {
+            let stalled = self
+                .latest_stall
+                .get(&partition)
+                .map(|(_, copies)| copies.clone())
+                .unwrap_or_default();
+            let waits_on: Vec<NodeId> = holding
+                .iter()
+                .copied()
+                .filter(|node| {
+                    members
+                        .iter()
+                        .any(|member| member.node == *node && stalled.contains(&member.copy))
+                })
+                .collect();
+            if let Some(pinned) = pinned {
+                let hold = (pinned, waits_on);
+                if self.rebuild_hold.get(&partition) != Some(&hold) {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = pinned.0,
+                        waits_on = ?hold.1.iter().map(|node| node.0).collect::<Vec<_>>(),
+                        reason = "stalled_copy_answers",
+                        "membership_repair_rebuild_hold_started"
+                    );
+                    self.rebuild_hold.insert(partition, hold);
+                }
+            }
             tracing::debug!(
                 node = self.node.0,
                 partition = partition.0,
@@ -7417,6 +7521,18 @@ impl Host {
                 "membership_repair_waits_on_rebuild"
             );
             return;
+        }
+        let ended = self.rebuild_hold.get(&partition).map(|(_, waits_on)| {
+            if waits_on.iter().any(withholds) {
+                "stalled_copy_withholds_proof"
+            } else if waits_on.iter().any(adoptable) {
+                "stalled_copy_tail_adoptable"
+            } else {
+                "stalled_copy_silent"
+            }
+        });
+        if let Some(reason) = ended {
+            self.end_rebuild_hold(partition, reason);
         }
         // #79 S4d, widened by #105: a member that answered holds a tail or an interrupted copy,
         // which no repair can take back. F1 caps any commit while that tail is held, so a repair
@@ -7466,6 +7582,21 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
+    /// `reason`: logged once, `membership_repair_rebuild_hold_ended`. Nothing when none was held.
+    fn end_rebuild_hold(&mut self, partition: PartitionId, reason: &'static str) {
+        if let Some((generation, waits_on)) = self.rebuild_hold.remove(&partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                waits_on = ?waits_on.iter().map(|node| node.0).collect::<Vec<_>>(),
+                reason,
+                "membership_repair_rebuild_hold_ended"
+            );
+        }
     }
 
     /// A repair is held because every member that answered reports a [`TailRefused`] (#79 S4d):
@@ -9881,7 +10012,10 @@ impl Host {
     /// 3) it links at its own head, logged `land_link_behind`, gets a receiver there, and
     /// answers nothing: its `Recovered` asks the primary for the rest. Linked either way, a live
     /// receiver it already holds is kept only at the linked head or while quarantined, and is
-    /// replaced at the link otherwise (check A, issue #105 unit 1).
+    /// replaced at the link otherwise (check A, issue #105 unit 1). Either arm links only onto a
+    /// lineage that reaches seq 1, or one that applied nothing (check B, #107, in
+    /// [`Self::land_at`] after its depth guard; only seq 1 is read): a holed one is refused
+    /// `from_has_no_floor`, and one whose seq 1 read fails `history_read_failed`.
     ///
     /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. A copy
     /// refused `not_a_member` or `held_at_or_above_generation` is refused before any receiver
@@ -11765,7 +11899,14 @@ impl Host {
     ///   the base through the head. Anything it cannot prove from what it stores answers
     ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
     ///   A copy that missed the anchor's generation while it was silent links it first, when
-    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177).
+    ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177), and only onto a
+    ///   lineage that reaches seq 1 or applied nothing (check B, #107, after the depth guard;
+    ///   only seq 1 is read). A holed one answers `InventoryFailed` with
+    ///   `missed_generation_from_has_no_floor`, and one whose seq 1 read fails with
+    ///   `missed_generation_history_read_failed`. When a tail above the base was released
+    ///   (or adopted) for this ask, the same refusal answers `TailHeld` instead, with that
+    ///   reason, logged `tail_release_refused` (or `tail_adopted_refused`), never a bare
+    ///   `InventoryFailed` once a tail was found.
     fn inventory(
         &mut self,
         partition: PartitionId,
@@ -12199,11 +12340,8 @@ impl Host {
         {
             return false;
         }
-        if self.engine.buffered_applied(partition, l).0 == 0 {
-            return true;
-        }
-        match self.engine.history_at(partition, l, Seq(1)) {
-            Ok(found) => found.is_some(),
+        match self.has_floor(partition, l) {
+            Ok(floor) => floor,
             Err(fault) => {
                 tracing::error!(
                     node = self.node.0,
@@ -12215,6 +12353,26 @@ impl Host {
                 false
             }
         }
+    }
+
+    /// Whether `generation`'s lineage of `partition` reaches seq 1 through its chain, or applied
+    /// nothing: the one read behind both the intact rule ([`Self::holds_last_writable`]) and
+    /// check B (`from_has_no_floor`, issue #107 slice 1), which refuses to link a new generation
+    /// onto a lineage holed below its head. `history_at` walks the chain to the bottom, and
+    /// `History` falls through a copied level, so one read answers for every level. Depends on
+    /// seq 1 being kept: a history trim (#61) must revisit both callers.
+    fn has_floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<bool, StorageFault> {
+        if self.engine.buffered_applied(partition, generation).0 == 0 {
+            return Ok(true);
+        }
+        Ok(self
+            .engine
+            .history_at(partition, generation, Seq(1))?
+            .is_some())
     }
 
     /// Answer `TailHeld` for `hit` (issue #105), and report the refusal in this node's status,
@@ -12691,7 +12849,14 @@ impl Host {
     /// the base exactly, never above (a tail above the base is uncertain data an ask must not
     /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
     /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
-    /// window, so it is refused. A refusal writes nothing and names its reason.
+    /// window, so it is refused. Then check B (#107, after the depth guard): the parent's lineage
+    /// must reach seq 1 through its chain ([`Self::has_floor`]), so the anchor's generation is
+    /// never linked over a hole; a holed parent is refused `missed_generation_from_has_no_floor`.
+    /// A lineage that applied nothing has no seq 1 and passes. Only seq 1 is read: the read walks
+    /// the chain, so it answers for every level. A read that fails refuses
+    /// `missed_generation_history_read_failed`, logged first as
+    /// `missed_generation_floor_read_failed` with the fault. A refusal writes nothing and names
+    /// its reason.
     ///
     /// Issue #105 (design section 13): when this ask's `release_through` covers the head, the
     /// tail above the base was given up for this run. The same checks run in the same order,
@@ -12743,6 +12908,22 @@ impl Host {
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("missed_generation_link_depth_ceiling");
         }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("missed_generation_from_has_no_floor"),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    ?fault,
+                    "missed_generation_floor_read_failed"
+                );
+                return Err("missed_generation_history_read_failed");
+            }
+        }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, base) {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
@@ -12779,6 +12960,19 @@ impl Host {
     /// Answers the generation linked from, the head and the digest there. A refusal writes
     /// nothing and names its reason, as [`Self::inherit_missed_link`] does; that one stays the
     /// survivor's exact-base guard (A-R177), and this one is never called from `survivor`.
+    ///
+    /// Choosing `from` can refuse first: `anchor_generation_absent` (lineages held, none below
+    /// the anchor's generation), and for a copy holding no lineage of the partition
+    /// `publish_marks_unreadable` or `publish_marks_held`. After choosing `from`, guards, in
+    /// this order: the head at or below the base (`held_past_base`); the record at the
+    /// head reads and verifies ([`Self::checked`]), and at the base its digest is the anchor's
+    /// (`base_digest_differs`); the depth guard
+    /// (`link_depth_ceiling`); then check B (#107): `from`'s lineage must reach seq 1 through its
+    /// chain ([`Self::has_floor`]), so the new generation is never linked over a hole
+    /// (`from_has_no_floor`). A lineage that applied nothing, as an empty copy's generation 0,
+    /// has no seq 1 and passes. Only seq 1 is read: the read walks the chain, so it answers for
+    /// every level. A read that fails refuses `history_read_failed`, logged first as
+    /// `land_floor_read_failed` with the fault.
     fn land_at(
         &mut self,
         partition: PartitionId,
@@ -12844,6 +13038,22 @@ impl Host {
         }
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("link_depth_ceiling");
+        }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("from_has_no_floor"),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    from = from.0,
+                    to = to.0,
+                    ?fault,
+                    "land_floor_read_failed"
+                );
+                return Err("history_read_failed");
+            }
         }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, head) {
@@ -14205,7 +14415,9 @@ fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
 /// the rebuild may still finish. Pinned and stalled: while a node in `answered` holds one of
 /// the stalled copies, since an answering copy can still prove the point. A stalled copy that
 /// does not answer (dead, half-open) holds nothing: at cutoff 0 the pin is set on every commit,
-/// so it would otherwise keep the partition `ReadOnly` for good.
+/// so it would otherwise keep the partition `ReadOnly` for good. The caller leaves out of
+/// `answered` a copy that cannot prove it either: one whose tail is adoptable (#105) or above the
+/// pinned cutoff (#106).
 fn rebuild_holds_repair(
     pinned: Option<Generation>,
     latest: Option<&(Generation, BTreeSet<CopyId>)>,

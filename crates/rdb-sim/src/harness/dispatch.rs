@@ -2965,7 +2965,10 @@ impl Dispatcher {
     /// nothing, and logs `land_link_refused` with the host's reason. Called once
     /// per `(member, partition, generation)`: [`Self::landed`] dedups the landing.
     ///
-    /// The host's chain-depth guard has no twin: the memory engine has no depth ceiling.
+    /// The host's chain-depth guard has no twin: the memory engine has no depth ceiling. Nor
+    /// has check B (`from_has_no_floor`, #107), which refuses to link onto a lineage that does
+    /// not reach seq 1: the memory engine's `commit` takes any seq, so it can hold a lineage
+    /// holed below its head, and this twin does not refuse a landing onto one.
     fn land_link(
         &mut self,
         member: NodeId,
