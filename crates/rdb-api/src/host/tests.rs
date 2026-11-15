@@ -2682,7 +2682,11 @@ fn a_faulted_node_does_not_say_it_admits_writes() {
 /// A-R178, the pending loop: a put already dispatched, waiting on its copies, when the
 /// node faults on stored damage, is answered with that damage: `CORRUPT_HISTORY`, retry
 /// `Quarantine`, its request named, and `no_mutation` false as before, since it was sent.
-/// Only node 1 steps, so no copy acks and the put stays pending.
+/// Only node 1 steps, so no copy acks and the put stays pending. A put that arrives after the
+/// fault is refused with the same damage and retry, but `no_mutation` true and no request: it
+/// was never admitted (#124).
+/// Cut: `Host::answer_faulted` answers with `Fault::error` (before #124): the later put says
+/// `no_mutation` false, red.
 #[test]
 fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
     let dir = config_testkit::fs::temp_dir();
@@ -2715,6 +2719,28 @@ fn a_dispatched_put_is_refused_with_the_damage_its_node_faulted_on() {
         ),
         other => panic!("the pending put is answered with the damage: {other:?}"),
     }
+
+    let (reply, refused) = mpsc::channel();
+    host.handle(Msg::Client(Client {
+        partition: PartitionId(1),
+        call: put(2, b"b", b"2", None),
+        reply,
+    }));
+    match refused.try_recv() {
+        Ok(Answer::Error {
+            error,
+            request: None,
+        }) => {
+            assert!(error.detail.contains("a damaged read"), "{error:?}");
+            assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, true),
+                "a put after the fault: {error:?}"
+            );
+        }
+        other => panic!("a put after the fault: {other:?}"),
+    }
+    assert!(host.pending.is_empty(), "nothing is left waiting");
 }
 
 /// F-001 (S0 review): a reply whose kind does not answer the waiting call faults the node,
