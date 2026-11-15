@@ -7,10 +7,13 @@
 //! progress is evidence, never qualification.
 
 use crate::contracts::authority::AuthorityView;
+use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendOutcome, AppendReject};
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::event::EffectKind;
-use crate::contracts::ids::{BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq, ReplicaRole};
+use crate::contracts::ids::{
+    BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq, ReplicaRole, Seq,
+};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::recovery::RecoveryResult;
 use crate::contracts::storage::DurablePrefix;
@@ -84,6 +87,11 @@ impl AppendReceiver {
     /// at or below the cutoff — the cutoff pair itself on `Match`, its own older head when it is
     /// behind — and asks the new primary for everything after it.
     ///
+    /// A copy whose host refused to link this generation ([`Self::refuse_landing`], #107 row 31b)
+    /// takes the `Match` arm as any copy does, since the cutoff it holds with the cutoff's digest
+    /// is a proven prefix; on `NotRetained` it anchors at the root, `NeedPrefix { have: Seq(0) }`,
+    /// and never on a rung below the cutoff.
+    ///
     /// One exception keeps a head (M9 S0 D3): F1's re-emit of the generation this copy already
     /// serves, when the copy holds the cutoff (`Match`) and has applied past it, and is neither
     /// quarantined nor retired. Then the copy keeps its applied head, because everything above
@@ -103,6 +111,10 @@ impl AppendReceiver {
     /// member clears that.
     pub fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<EffectKind> {
         self.recovery_plan = None;
+        // #107 slice 2a: a generation the host refused to link never anchors below its cutoff.
+        let refused = self.refused_landings.contains(&result.new_generation);
+        self.refused_landings
+            .retain(|generation| *generation > result.new_generation);
         let config = &result.committed.pinned_config;
         let invalid = || {
             vec![ignored(KernelIgnoredReason::Replica(
@@ -135,6 +147,18 @@ impl AppendReceiver {
             && self.lineage.generation == result.new_generation;
         let anchor = match lookup {
             _ if keeps_head => Some(self.applied_head),
+            // #107 slice 2a (lead ruling on row 31b, narrowed): a copy refused at this
+            // generation that does not hold the cutoff anchors at the root, as a fresh receiver
+            // does, never on an older rung of the lineage it refused: from there the walk would
+            // start inside the new generation's prefix and leave it no seq 1.
+            DigestLookup::NotRetained if refused => {
+                self.history.truncate_above(Seq::ZERO);
+                self.history.insert(Seq::ZERO, Digest::ROOT);
+                Some(Head {
+                    seq: Seq::ZERO,
+                    digest: Digest::ROOT,
+                })
+            }
             DigestLookup::Differs { .. } => None,
             DigestLookup::Match | DigestLookup::NotRetained => {
                 let Some((seq, digest)) = self.history.at_or_below(selected.cutoff_seq) else {

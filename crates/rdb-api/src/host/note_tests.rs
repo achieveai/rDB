@@ -547,6 +547,7 @@ fn s5n_35_a_replan_note_for_another_generation_builds_no_plan() {
             promote: false,
             since: Tick(0),
             release: rdb_core::contracts::recovery::TailRelease::default(),
+            cause: None,
         },
     };
     host.rejoins.insert(P, waiting);

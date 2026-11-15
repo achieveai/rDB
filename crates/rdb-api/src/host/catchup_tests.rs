@@ -3798,8 +3798,13 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
 /// removed, quarantined or not, and `land_receiver_dropped` names the reason, so the copy
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
-/// receiver stays, as the held tail does, and nothing is logged. Nothing links in any case.
-/// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a).
+/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With `live_readd`
+/// off it stays unchanged. With it on (#107 slice 2a, row 31b) it is also marked refused at
+/// this generation (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused` per
+/// case), so its `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at
+/// the root. Nothing links in any case.
+/// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a);
+/// the mark set whatever the setting, red (an OFF receiver marked).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
 fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() {
@@ -3807,11 +3812,13 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
         "issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit";
     let rt = current_thread();
     let mut writable: Option<RecoveryResult> = None;
-    for (mode, quarantined) in [
-        (PartitionMode::DegradedRf2, false),
-        (PartitionMode::DegradedRf2, true),
-        (PartitionMode::ReadOnly, false),
-        (PartitionMode::ReadOnly, true),
+    for (mode, quarantined, live) in [
+        (PartitionMode::DegradedRf2, false, false),
+        (PartitionMode::DegradedRf2, true, false),
+        (PartitionMode::ReadOnly, false, false),
+        (PartitionMode::ReadOnly, true, false),
+        (PartitionMode::ReadOnly, false, true),
+        (PartitionMode::ReadOnly, true, true),
     ] {
         let dir = config_testkit::fs::temp_dir();
         let path = dir.path().join("node");
@@ -3836,14 +3843,21 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
             quarantine(&mut receiver, &result.committed.pinned_config);
         }
         let mut host = host_over(&path, &rt);
+        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        let case = format!("{mode:?}, quarantined {quarantined}");
+        let case = format!("{mode:?}, quarantined {quarantined}, live_readd {live}");
         assert_eq!(host.land_link(PartitionId(1), &result), Ok(None), "{case}");
         assert_eq!(host.engine.lineages(), held, "{case}: nothing linked");
         let after = host.replication.receiver(NodeId(2), PartitionId(1));
         if mode == PartitionMode::ReadOnly {
-            assert_eq!(after, Some(&receiver), "{case}: the receiver stays");
+            // #107 slice 2a (lead ruling on row 31b): kept; with the setting on, also marked so
+            // it claims nothing of the lineage it refused. Otherwise unchanged.
+            let mut kept = receiver.clone();
+            if live {
+                kept.refuse_landing(result.new_generation);
+            }
+            assert_eq!(after, Some(&kept), "{case}: the receiver stays");
         } else {
             assert_eq!(after, None, "{case}: the live receiver is dropped");
         }
@@ -3869,7 +3883,13 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
         "one drop per writable case, none in ReadOnly"
     );
     let refused = logged!(METHOD, "land_link_refused");
-    assert_eq!(refused.len(), 4, "every case refused: {refused:?}");
+    assert_eq!(refused.len(), 6, "every case refused: {refused:?}");
+    let marked = logged!(METHOD, "land_receiver_marked_refused");
+    assert_eq!(
+        marked.len(),
+        2,
+        "the two ReadOnly cases with the setting on: {marked:?}"
+    );
 }
 
 /// Issue #107 slice 1, row 5 (#107, check A): check A's success arm. Node 2
@@ -4078,9 +4098,19 @@ fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
 /// Issue #107 slice 1, row 2a's dormant clause: check A drops only a live receiver. Node 2
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
-/// takes writes (`DegradedRf2`). The dormant receiver stays installed, unchanged, and no
-/// `land_receiver_dropped` is logged. Nothing links.
-/// Cut: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is removed).
+/// takes writes (`DegradedRf2`). The dormant receiver stays installed and no
+/// `land_receiver_dropped` is logged. Nothing links. With `live_readd` off it stays unchanged.
+/// With it on (#107 slice 2a) it is also marked refused at generation 2
+/// (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused`). Generation 2's own
+/// `Recovered` does not read that mark: `Replication::recovered` removes a dormant receiver
+/// first and builds a fresh one from the barrier's proof or the root. The mark matters when an
+/// earlier generation's `Recovered` in the same due batch rebuilds the copy first: the fresh
+/// receiver takes the mark over (rdb-core
+/// `issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild`, and through
+/// the host's due batch
+/// `issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_due_batch`).
+/// Cuts: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is
+/// removed); the mark set whatever the setting, red (the OFF receiver marked).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
 fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
@@ -4109,23 +4139,163 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
     )
     .expect("a dormant receiver");
     assert!(receiver.is_dormant());
-    let mut host = host_over(&path, &rt);
-    host.replication.install_receiver(receiver.clone());
-    let held = host.engine.lineages();
-    assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
-    assert_eq!(host.engine.lineages(), held, "nothing linked");
-    assert_eq!(
-        host.replication.receiver(NodeId(2), PartitionId(1)),
-        Some(&receiver),
-        "the dormant receiver stays installed"
-    );
-    assert_eq!(host.fault, None);
+    for live in [false, true] {
+        let mut host = host_over(&path, &rt);
+        host.live_readd.on = live;
+        host.replication.install_receiver(receiver.clone());
+        let held = host.engine.lineages();
+        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
+        assert_eq!(host.engine.lineages(), held, "nothing linked");
+        let mut kept = receiver.clone();
+        if live {
+            kept.refuse_landing(Generation(2));
+        }
+        assert_eq!(
+            host.replication.receiver(NodeId(2), PartitionId(1)),
+            Some(&kept),
+            "live_readd {live}: the dormant receiver stays installed"
+        );
+        assert_eq!(host.fault, None);
+        assert_eq!(
+            logged!(METHOD, "land_receiver_marked_refused").len(),
+            usize::from(live),
+            "live_readd {live}"
+        );
+    }
     assert_eq!(logged!(METHOD, "land_receiver_dropped").len(), 0);
     let refused: Vec<_> = logged!(METHOD, "land_link_refused")
         .into_iter()
         .map(|line| line["reason"].clone())
         .collect();
-    assert_eq!(refused, [serde_json::Value::from("held_past_base")]);
+    assert_eq!(
+        refused,
+        ["held_past_base", "held_past_base"].map(serde_json::Value::from)
+    );
+}
+
+/// #107 slice 2a review, round 3: the round-2 question (an earlier barrier and a later refused
+/// `ReadOnly` landing in one due batch, over a dormant receiver) through the host's own wiring,
+/// with no mark set by hand. Node 2 holds generation 1 at seqs 3 to 5 only, holed below 5, and
+/// a dormant receiver there, with `live_readd` on. Two `Landed` messages arrive and fall due in
+/// one `run_due`: generation 2, whose barrier node 2 is in, at cutoff 5 (`inherit` links it),
+/// then generation 3, `ReadOnly`, not in its barrier, at cutoff 7. `land_link` refuses 3
+/// `from_has_no_floor` (check B: 2 is linked onto the holed 1) and marks the dormant receiver,
+/// because both `Recovered`s are still queued. The drain then hands them to R1, oldest first:
+/// 2's removes the dormant receiver and builds a fresh one at the barrier's proved `(5, d5)`;
+/// 3's cutoff is not one it holds (`NotRetained`), so with the mark carried over it anchors at
+/// the root, generation 3, and never on rung 5, inside the prefix it refused.
+/// Cuts: `Replication::recovered` carries no marks to the receiver built in the dormant one's
+/// place, red (the receiver anchors at seq 5); `land_link` never marks, red (no
+/// `land_receiver_marked_refused`).
+/// Unit, under a second here (one trio bootstrap, for the commit it lands).
+#[config_log::retcd_test]
+fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_due_batch() {
+    const METHOD: &str =
+        "issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_due_batch";
+    use rdb_core::contracts::ids::Revision;
+    use rdb_core::contracts::recovery::RecoveryBarrier;
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain_after(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        vec![Digest::ROOT; 2],
+        3,
+    );
+    let at_five = Head {
+        seq: Seq(5),
+        digest: digests[4],
+    };
+    // Generation 2 at (5, d5), proved by node 2's copy.
+    let mut barrier = landing_at(5, digests[4]);
+    let own = barrier
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == NodeId(2))
+        .copied()
+        .expect("node 2 is pinned");
+    let proof = DurableProof {
+        copy: own.copy,
+        partition: p,
+        seq: DurableSeq(5),
+        digest: digests[4],
+        boot: own.boot,
+    };
+    barrier.barrier =
+        RecoveryBarrier::try_new(&[proof], &BTreeSet::from([own.copy]), Seq(5), digests[4])
+            .expect("node 2 proved the cutoff");
+    // Generation 3, ReadOnly, at a cutoff above anything node 2 holds; node 2 is outside it.
+    let mut refused = barrier.clone();
+    refused.new_generation = Generation(3);
+    refused.selected.root.generation = Generation(3);
+    refused.selected.cutoff_seq = Seq(7);
+    refused.selected.cutoff_digest = Digest([7; 32]);
+    refused.retained_status_map.predecessor_generation = Generation(2);
+    refused.mode = PartitionMode::ReadOnly;
+    refused.barrier =
+        RecoveryBarrier::try_new(&[], &BTreeSet::new(), Seq(7), Digest([7; 32])).expect("empty");
+
+    let mut host = host_over(&path, &rt);
+    host.live_readd.on = true;
+    let dormant = AppendReceiver::dormant(receiver_init(&barrier, 1, at_five), Revision(1))
+        .expect("a dormant receiver");
+    host.replication.install_receiver(dormant);
+    let now = host.clock.now();
+    for result in [barrier, refused] {
+        host.handle(Msg::Landed {
+            result: Box::new(result),
+            partition: p,
+            correlation: CorrelationId(0),
+            emitter: NodeId(1),
+            not_before: now,
+        });
+    }
+    host.run_due();
+    assert_eq!(
+        logged!(METHOD, "land_receiver_marked_refused").len(),
+        1,
+        "the refusal marked the receiver before either Recovered ran"
+    );
+    assert!(
+        host.replication
+            .receiver(NodeId(2), p)
+            .is_some_and(AppendReceiver::is_dormant),
+        "still dormant: both Recovered events are queued"
+    );
+    host.drain();
+    assert_eq!(host.fault, None);
+    let refusals: Vec<_> = logged!(METHOD, "land_link_refused")
+        .into_iter()
+        .map(|line| (line["generation"].clone(), line["reason"].clone()))
+        .collect();
+    assert_eq!(
+        refusals,
+        [(3.into(), "from_has_no_floor".into())],
+        "only generation 3 is refused"
+    );
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), p)
+        .expect("node 2 holds a receiver");
+    assert!(
+        !receiver.is_dormant(),
+        "rebuilt by generation 2's Recovered"
+    );
+    assert_eq!(
+        (receiver.lineage().generation, receiver.applied_head()),
+        (
+            Generation(3),
+            Head {
+                seq: Seq::ZERO,
+                digest: Digest::ROOT,
+            }
+        ),
+        "generation 3's Recovered anchors it at the root, not at seq 5"
+    );
 }
 
 /// Generation 1 of partition 1 at `path`, seqs 1 to 3, with the stored `History` value at seq 1
