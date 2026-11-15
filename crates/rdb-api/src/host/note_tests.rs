@@ -443,7 +443,11 @@ fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
             .any(|line| line["node"] == 2)
     };
     let generation = lost_primary_and_silent_secondary_then(&mut trio, |trio| {
-        assert_eq!(logged!(METHOD, "cut_after_commit").len(), 1, "cut at the commit");
+        assert_eq!(
+            logged!(METHOD, "cut_after_commit").len(),
+            1,
+            "cut at the commit"
+        );
         assert!(
             logged!(METHOD, "adopt_authority")
                 .iter()
@@ -451,9 +455,12 @@ fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
             "node 2 has not adopted its commit while cut"
         );
         let window = Instant::now() + test_patience(Duration::from_secs(3));
-        only_until(trio, &[1, 2], "node 2 asked a revoke, or the window ended", |_| {
-            (asked() || Instant::now() >= window).then_some(())
-        });
+        only_until(
+            trio,
+            &[1, 2],
+            "node 2 asked a revoke, or the window ended",
+            |_| (asked() || Instant::now() >= window).then_some(()),
+        );
         faults.apply("");
     });
     assert!(!asked(), "node 2 did not revoke the commit it serves");
