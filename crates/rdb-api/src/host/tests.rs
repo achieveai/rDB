@@ -7019,3 +7019,196 @@ fn m10_s2_r447_a_node_pushes_the_stored_plan_never_the_routed_one() {
     }));
     assert_eq!(pushed(&mut host), [], "no stored plan: nothing pushed");
 }
+
+/// Issue #109: a sync on the host's syncer, begun now over partition 1 generation 1 through
+/// what is applied, with its start moved back by `held`: as if the fsync had been in flight
+/// that long. No sleep: the watchdog reads only `InFlight::started`.
+fn backdated_sync(host: &mut Host, held: Duration) -> rdb_storage::WalSync {
+    let (partition, generation) = (PartitionId(1), Generation(1));
+    let captured = vec![CapturedPrefix {
+        partition,
+        generation,
+        through: host.engine.buffered_applied(partition, generation),
+    }];
+    let sync = host.engine.begin_sync(captured.clone());
+    host.syncing = Some(InFlight {
+        started: Instant::now()
+            .checked_sub(held)
+            .expect("a monotonic clock past `held`"),
+        after: vec![AfterSync::Duty {
+            ticket: FlushTicket(1),
+            captured,
+        }],
+        warned: false,
+    });
+    sync
+}
+
+/// Issue #109: commit `seq` (no writes) to partition 1 generation 1.
+fn commit_empty(host: &mut Host, seq: u64) {
+    host.engine
+        .commit(rdb_core::contracts::storage::Batch {
+            id: rdb_core::contracts::ids::BatchId(seq),
+            partition: PartitionId(1),
+            generation: Generation(1),
+            seq: Seq(seq),
+            writes: Vec::new(),
+        })
+        .expect("commit");
+}
+
+/// Issue #109: a WAL sync in flight for 13,058 ms (the restart after the gateway's 54 GB load)
+/// that then returns is a slow disk, not a stuck one. At the default limits the node does not
+/// fault: the watchdog logs `wal_sync_slow_in_flight` (Warn) once it passes the slow limit, the
+/// sync returns and credits its capture, `wal_sync_slow` (Warn) names its duration and both
+/// limits, and the next write is made durable by the next sync. Red before the fix: the node
+/// faulted at 5 s, "WAL sync in flight for 13058 ms, past the 5000 ms stuck limit".
+/// Unit, under a second: one host, no thread, the sync's start moved back instead of a sleep.
+#[config_log::retcd_test]
+fn a_slow_sync_that_returns_warns_and_never_faults_the_node() {
+    const METHOD: &str = "a_slow_sync_that_returns_warns_and_never_faults_the_node";
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    let (partition, generation) = (PartitionId(1), Generation(1));
+    commit_empty(&mut host, 1);
+
+    let sync = backdated_sync(&mut host, Duration::from_millis(13_058));
+    assert!(!host.stuck_sync(), "a 13 s sync is under the stuck limit");
+    assert!(!host.stuck_sync(), "a second look changes nothing");
+    assert!(host.fault.is_none(), "{:?}", host.fault);
+    let in_flight = logged!(METHOD, "wal_sync_slow_in_flight");
+    assert_eq!(in_flight.len(), 1, "warned once per sync: {in_flight:?}");
+    assert_eq!(in_flight[0]["@l"], "Warning", "{:?}", in_flight[0]);
+    assert!(
+        in_flight[0]["held_ms"].as_u64() >= Some(13_058),
+        "{:?}",
+        in_flight[0]
+    );
+    assert_eq!(
+        in_flight[0]["slow_ms"], SYNC_SLOW_WARN_MILLIS,
+        "{:?}",
+        in_flight[0]
+    );
+    assert_eq!(
+        in_flight[0]["stuck_ms"],
+        rdb_storage::DEFAULT_SYNC_STUCK_MILLIS,
+        "{:?}",
+        in_flight[0]
+    );
+
+    let flushed = sync.flush();
+    host.on_synced(SyncDone {
+        sync,
+        flushed,
+        millis: 13_100,
+    })
+    .expect("a slow sync that returns is no fault");
+    assert!(host.fault.is_none(), "{:?}", host.fault);
+    assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
+    let slow = logged!(METHOD, "wal_sync_slow");
+    assert_eq!(slow.len(), 1, "{slow:?}");
+    assert_eq!(slow[0]["@l"], "Warning", "{:?}", slow[0]);
+    assert_eq!(slow[0]["millis"], 13_100, "{:?}", slow[0]);
+    assert_eq!(slow[0]["ok"], true, "{:?}", slow[0]);
+    assert_eq!(slow[0]["slow_ms"], SYNC_SLOW_WARN_MILLIS, "{:?}", slow[0]);
+
+    // Writes go on: the next write is made durable by the next sync.
+    commit_empty(&mut host, 2);
+    host.flush_duty().expect("flush");
+    assert!(host.fault.is_none(), "{:?}", host.fault);
+    assert_eq!(host.engine.durable(partition, generation), DurableSeq(2));
+}
+
+/// Issue #109, the control: a sync still in flight one second past the stuck limit is a stuck
+/// disk, and faults the node as A-R317 rules (`wal_sync_stuck`, Error). Cut: `stuck_sync`
+/// never faults, red. Unit, under a second.
+#[config_log::retcd_test]
+fn a_sync_still_in_flight_past_the_stuck_limit_faults_the_node() {
+    const METHOD: &str = "a_sync_still_in_flight_past_the_stuck_limit_faults_the_node";
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    commit_empty(&mut host, 1);
+
+    let held = Duration::from_millis(rdb_storage::DEFAULT_SYNC_STUCK_MILLIS + 1_000);
+    let _sync = backdated_sync(&mut host, held);
+    assert!(host.stuck_sync(), "past the stuck limit");
+    let fault = host.fault.as_ref().expect("the node faulted");
+    assert!(fault.detail.contains("stuck limit"), "{}", fault.detail);
+    let stuck = logged!(METHOD, "wal_sync_stuck");
+    assert_eq!(stuck.len(), 1, "{stuck:?}");
+    assert_eq!(stuck[0]["@l"], "Error", "{:?}", stuck[0]);
+}
+
+/// Issue #109: a slow sync that returns an error is never credited, as before: the slow limit
+/// changes when the watchdog faults, not what a failed fsync means. The duty's sync answers
+/// `FlushFailed` and the durable mark stays; the slow line says `ok: false`.
+/// Unit, under a second.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn a_slow_sync_that_fails_is_never_credited() {
+    const METHOD: &str = "a_slow_sync_that_fails_is_never_credited";
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    let (partition, generation) = (PartitionId(1), Generation(1));
+    commit_empty(&mut host, 1);
+    host.engine
+        .inject_fault(rdb_storage::InjectedFault::WalFlush);
+
+    let sync = backdated_sync(&mut host, Duration::from_millis(13_058));
+    assert!(!host.stuck_sync());
+    let flushed = sync.flush();
+    assert!(flushed.is_err(), "the armed fault failed the fsync");
+    host.on_synced(SyncDone {
+        sync,
+        flushed,
+        millis: 13_100,
+    })
+    .expect("a failed duty sync is answered, not a host fault");
+    assert_eq!(host.engine.durable(partition, generation), DurableSeq(0));
+    assert!(
+        matches!(
+            host.queue.pop_back().map(|queued| queued.event.kind),
+            Some(EventKind::Storage(StorageEvent::FlushFailed { .. }))
+        ),
+        "the failed sync answers FlushFailed"
+    );
+    let slow = logged!(METHOD, "wal_sync_slow");
+    assert_eq!(slow.len(), 1, "{slow:?}");
+    assert_eq!(slow[0]["ok"], false, "{:?}", slow[0]);
+}
+
+/// Issue #109: the node thread wakes for the slow mark, not only the stuck one, so the
+/// `wal_sync_slow_in_flight` warning comes when the sync passes 5 s and not near 30 s. Once
+/// warned, it next wakes for the stuck limit. Cut: `until_stuck` aims at the stuck limit
+/// alone, red at the first bound. Unit, under a second.
+#[test]
+fn the_watchdog_wakes_for_the_slow_mark_then_the_stuck_limit() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    commit_empty(&mut host, 1);
+    let _sync = backdated_sync(&mut host, Duration::from_millis(1_000));
+    let to_slow = host.until_stuck().expect("a sync in flight");
+    assert!(
+        to_slow <= Duration::from_millis(SYNC_SLOW_WARN_MILLIS - 1_000 + 1),
+        "{to_slow:?}"
+    );
+
+    let _sync = backdated_sync(
+        &mut host,
+        Duration::from_millis(SYNC_SLOW_WARN_MILLIS + 1_000),
+    );
+    assert!(!host.stuck_sync(), "slow, not stuck");
+    let to_stuck = host.until_stuck().expect("a sync in flight");
+    let stuck = Duration::from_millis(rdb_storage::DEFAULT_SYNC_STUCK_MILLIS)
+        .checked_sub(Duration::from_millis(SYNC_SLOW_WARN_MILLIS + 1_000))
+        .expect("the stuck limit is more than a second past the slow mark");
+    assert!(
+        to_stuck > stuck - Duration::from_millis(500)
+            && to_stuck <= stuck + Duration::from_millis(1),
+        "{to_stuck:?}"
+    );
+}

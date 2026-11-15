@@ -89,20 +89,24 @@ pub struct StorageOptions {
     pub block_cache_bytes: Option<usize>,
     /// How long one WAL sync may stay in flight before the node that runs it faults, in
     /// milliseconds (ruling A-R317). The engine does not read it; the host's syncer does. A
-    /// slow sync that returns inside it costs nothing but durable lag; one still running past
-    /// it is a stuck disk, and the node gives up its grant so another can take over. `None`
-    /// keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
+    /// slow sync that returns inside it costs nothing but durable lag (L1 pauses admission on
+    /// unsafe age meanwhile), and past 5 s the host logs it at Warn as a slow disk (issue
+    /// #109); one still running past it is a stuck disk, and the node gives up its grant so
+    /// another can take over. `None` keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
     pub sync_stuck_millis: Option<u64>,
 }
 
 /// The default block cache of one store, all column families together (A-R315): 64 MiB.
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
 
-/// The default of [`StorageOptions::sync_stuck_millis`] (A-R317): 5 s, about 1.7 times the
-/// slowest WAL sync measured under load (2,973 ms, lr6). A stuck disk then costs about 11 s
-/// before another node takes over: this, plus the 5.9 s the last renewed grant still lives at
-/// the default 6 s grant (3 s, and about 8 s in all, until issue #80).
-pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 5_000;
+/// The default of [`StorageOptions::sync_stuck_millis`] (A-R317; issue #109): 30 s, about 2.3
+/// times the longest WAL sync seen in flight (13,058 ms, a restart right after a 54 GB load,
+/// issue #109; whether it would have returned is not known). It was 5 s, about 1.7 times the
+/// slowest measured under load (2,973 ms, lr6), so a busy disk faulted the node for the whole
+/// open. A stuck disk now costs about 36 s before another node takes over: this, plus the
+/// 5.9 s the last renewed grant still lives at the default 6 s grant. Past 5 s a sync in
+/// flight is logged as slow, at Warn.
+pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 30_000;
 
 /// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
 /// one column family's worth at RocksDB's own size.
