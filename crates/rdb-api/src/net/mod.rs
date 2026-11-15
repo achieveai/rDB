@@ -460,6 +460,15 @@ impl Net {
             .and_then(|route| route.boot)
     }
 
+    /// The id of the connection `node`'s link is up on, or `None` with none up. Each
+    /// connection gets a new id, so a reconnect at the same boot answers another one.
+    #[must_use]
+    pub fn connection(&self, node: NodeId) -> Option<u64> {
+        lock(&self.shared.routes)
+            .get(&node)
+            .and_then(|route| route.conn.as_ref().map(|conn| conn.id))
+    }
+
     /// How each node's link stands.
     #[must_use]
     pub fn states(&self) -> BTreeMap<NodeId, LinkState> {

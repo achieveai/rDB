@@ -126,8 +126,9 @@ pub struct Timeouts {
     pub read: Duration,
     /// How long the owner has had no link to a copy before it re-plans the partition without
     /// that copy. Under 2 s ([`host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]) is refused at open
-    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts, so a
-    /// shorter value pauses writes for less and drops more copies over a slow restart. Each
+    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts (unless
+    /// [`Self::live_readd`] is on), so a shorter value pauses writes for less and drops more
+    /// copies over a slow restart. Each
     /// process running a node reads its own; set it to the same value on every node.
     pub unreachable_drop_after: Duration,
     /// Issue #107: whether a copy the owner dropped on its own clock comes back without a

@@ -678,7 +678,32 @@ Two clocks decide when a copy is dropped:
 `Timeouts::unreachable_drop_after` under 2,000 ms is refused at open with `OpenError::Config`.
 Set it to the same value on every node. A lower value pauses writes for less when a node dies,
 but a restart or link loss longer than the value drops the copy from every partition that owner
-holds, and that copy comes back only when its node restarts.
+holds, and that copy comes back only when its node restarts, unless `Timeouts::live_readd` is
+on (below).
+
+**`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
+it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
+its own, as an owner. With it on, a copy the owner dropped on one of the two clocks above comes
+back by itself once its link is back:
+
+- **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
+  copy's link go down. A copy that stayed linked while it held writes up (a slow disk, say)
+  still needs a restart. So does a copy dropped by an operator, a move or a promote, and any
+  copy an owner finds left out after the owner itself restarted.
+- **How.** The copy's link must stay up for 5 s on one connection (a reconnect starts the 5 s
+  again). Then the owner asks the copy for its state. If it answers with no fault, the owner
+  adds it back at the process it still runs, as a standby that catches up while writes go on,
+  then as a full copy. Nothing is restarted: the copy's process is the same one.
+- **What stops it.** The partition being read-only, a re-plan, `admin rebuild` or a move under
+  way, or no free slot: the owner logs `live_readd_refused` once with the reason, and tries
+  again once that clears. A copy that does not answer (`live_readd_unanswered`), answers with a
+  fault, or is not taken (`live_readd_not_planned`) waits another 5 s. Each drop gets one
+  re-add: if that re-add fails, the copy stays out until its node restarts.
+- **Restart warning.** While a return can still come, the owner does not log
+  `copy_left_out_until_restart`. Once the copy's link has stayed down for
+  `Timeouts::unreachable_drop_after` again, it does, naming the node.
+- **Mixed builds.** Turn it on only once every node runs a build that has it. Older builds
+  speak the same wire version, so nothing refuses the pairing for you.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -717,7 +742,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
   walk, 15 s after the kill, while the copy stayed down.
-- **A copy cut off long enough to be dropped stays out after the link heals.** That is the
+- **A copy cut off long enough to be dropped stays out after the link heals,** with
+  `Timeouts::live_readd` off, the default (with it on, see that setting above). That is the
   copy rDB stopped waiting for, in the bullet above. Writes keep working on the other two
   copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
   three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,

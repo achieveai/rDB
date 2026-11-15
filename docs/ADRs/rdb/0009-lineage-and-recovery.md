@@ -446,6 +446,33 @@ hold-honouring send (logged `copy_ahead_reposted`), so a lost landing is retried
 stalling (row `h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold`). A copy
 holding **past** the cutoff in its own generation is still refused by name, as before.
 
+**Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
+receiver's anchor, and protocol 9.** Three rules, all with `Timeouts::live_readd` (off by
+default) as the only way in:
+
+- **Same-boot return.** An owner whose own drop clock left a copy out (the unreachable clock, or
+  the paused clock with the copy's link seen down) may pin it again at the boot it still runs,
+  not only at a newer one. The copy's link must have stayed up on one connection for 5 s (a
+  reconnect starts that again), no re-plan, rebuild or move may be under way, the commit must
+  take writes with a slot free, and the copy must answer an `Inspect` with no fault. It is
+  pinned as a shadow, lands, is caught up and is promoted exactly as a restarted copy is: the
+  landing guards above, and check B, apply unchanged. One attempt per drop. A copy that does
+  not answer, answers a fault, or is not taken waits a whole 5 s again.
+- **A refused receiver's anchor.** Check A drops a refused copy's live receiver only in a commit
+  that takes writes. In a `ReadOnly` commit the receiver stays, and its host marks it refused
+  at that generation (logged `land_receiver_marked_refused`). That generation's `Recovered` then
+  anchors the receiver at the cutoff when it holds the cutoff with its digest (a proved prefix),
+  and otherwise at the root, `NeedPrefix { have: 0, ROOT }`, as a receiver built fresh after a
+  restart does. It never anchors on a rung below the cutoff: R1 would start the walk inside the
+  new generation's prefix and leave it no seq 1. Marks are kept per generation; a `Recovered`
+  clears its own and every older one, so two refusals before either `Recovered` keep both.
+- **Protocol 9.** No wire type changed, so `PROTOCOL_VERSION` stays 9. Every build at 9 has check
+  A. Check B and the refusal mark are newer than some builds at 9 (main at 1eb3fe0 has neither),
+  and the handshake does not tell them apart. So turn the setting on for an owner only once
+  every node runs a build with both: with a receiver of such an older build, a `ReadOnly` return
+  can leave that copy a holed lineage that nothing refuses. Nothing enforces this order yet; the
+  gate for it is an open question on PR #126. Any change that weakens check A takes a bump.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |

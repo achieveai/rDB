@@ -1577,7 +1577,7 @@ pub(crate) fn spawn_on(
     host.boot = boot;
     host.budgets = budgets;
     host.unreachable_drop_after_millis = unreachable_drop_after_millis;
-    host.live_readd = live_readd;
+    host.live_readd.on = live_readd;
     host.partition_count = partitions;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
@@ -1635,13 +1635,13 @@ struct Replan {
     release: TailRelease,
     /// #107: why the drop this re-plan makes may come back without a restart, carried from
     /// [`Host::drop_copy`] to the commit, where [`Host::note_left_out`] records it in
-    /// [`Host::drop_clocked`]. `None` for every other re-plan, and always with the setting off.
+    /// [`LiveReadd::clocked`]. `None` for every other re-plan, and always with the setting off.
     cause: Option<LiveReturn>,
 }
 
 /// #107: what the owner's own drop clock saw when it dropped a copy, so the copy may be re-added
 /// at the boot it still runs once its link is back ([`Host::live_readd_duty`]). Kept in memory
-/// only, per partition and node, in [`Host::drop_clocked`].
+/// only, per partition and node, in [`LiveReadd::clocked`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveReturn {
     /// The clock that fired.
@@ -1652,6 +1652,58 @@ struct LiveReturn {
     /// Whether the owner saw the copy's link down while the clock ran. Always true for the
     /// unreachable clock. A paused drop is recorded only with it (Rev 5 M1).
     link_lost: bool,
+}
+
+/// #107 slice 2a: an owner's live re-add, its setting and what [`Host::live_readd_duty`] keeps
+/// between checks. Memory only: a restarted or new owner starts with nothing recorded, so each
+/// copy it finds left out is restart-only.
+struct LiveReadd {
+    /// `Timeouts::live_readd`. Off by default: then nothing is recorded in [`Self::clocked`]
+    /// and [`Host::live_readd_duty`] does nothing.
+    on: bool,
+    /// [`LIVE_READD_HOLD_MILLIS`]; crate tests set it directly.
+    hold_millis: u64,
+    /// Per partition and node, a copy this owner's own drop clock left out, and why
+    /// ([`LiveReturn`]). Set only by [`Host::note_left_out`] from the committed plan's
+    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none.
+    /// Spent by the one live re-add it allows (slice 2a: one attempt per drop), and removed by
+    /// a commit that pins the node regular, or that leaves it out with no cause.
+    clocked: BTreeMap<(PartitionId, NodeId), LiveReturn>,
+    /// How the link to each [`Self::clocked`] copy has stood since the duty last looked.
+    links: BTreeMap<(PartitionId, NodeId), LinkSeen>,
+    /// Rev 5 m4: the one `Inspect` the duty has out, and when it went.
+    probe: Option<(Tick, PartitionId, RepairProbe)>,
+    /// The partition and node [`Host::readd_candidate`] may re-add at the boot it was left out
+    /// at. Set by the duty only around its own call into [`Host::rejoin_if_stale`], so no
+    /// other caller reaches the same-boot arm.
+    armed: Option<(PartitionId, NodeId)>,
+    /// Each gate refusal ([`Host::live_readd_refusal`]) logged `live_readd_refused`, so the
+    /// line comes once per partition, node and reason while the copy's entry lasts.
+    refusals_logged: BTreeSet<(PartitionId, NodeId, &'static str)>,
+}
+
+impl LiveReadd {
+    fn off() -> Self {
+        Self {
+            on: false,
+            hold_millis: LIVE_READD_HOLD_MILLIS,
+            clocked: BTreeMap::new(),
+            links: BTreeMap::new(),
+            probe: None,
+            armed: None,
+            refusals_logged: BTreeSet::new(),
+        }
+    }
+}
+
+/// #107: how [`Host::live_readd_duty`] last saw the link to a [`LiveReadd::clocked`] copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSeen {
+    /// Up since `since` on the one connection `conn` ([`Links::connection`]). Another
+    /// connection is a reconnect, which starts the hold again.
+    Up { since: Tick, conn: u64 },
+    /// Down since `since`.
+    Down { since: Tick },
 }
 
 /// M11: a copy move the owner was asked for, from its ask to the commit that pins `to`
@@ -2411,6 +2463,23 @@ struct TailHold {
 /// One `Inspect` a repair check sent (A-R350): the node, and where its answer arrives.
 type RepairProbe = (NodeId, Receiver<NodeStatus>);
 
+/// The answer to an `Inspect` sent at `sent` over `(to, from)`'s link, when it came back in
+/// time: within two drop checks of `now`, with the direction `to` -> `from` not `dropped`. In
+/// this process the answer comes back over its own channel, not over `Links`, so a copy whose
+/// direction back is dropped counts as not answering (A-R353). [`Host::repair_duty`] and
+/// [`Host::live_readd_duty`] both read their probes through it.
+fn inspect_answer(
+    sent: Tick,
+    now: Tick,
+    back: (NodeId, NodeId),
+    dropped: &[(NodeId, NodeId)],
+    answer: &Receiver<NodeStatus>,
+) -> Option<NodeStatus> {
+    (HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS && !dropped.contains(&back))
+        .then(|| answer.try_recv().ok())
+        .flatten()
+}
+
 /// The last repair of one partition (A-R346 M1, A-R353): what it saw of its members, when it
 /// ran, how long the next one waits with nothing moved, and whether that wait was logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2685,26 +2754,8 @@ struct Host {
     /// S4a: each left-out copy `copy_left_out_until_restart` has been logged for, so the line
     /// comes once per partition, node and boot.
     left_out_warned: BTreeSet<(PartitionId, NodeId, BootId)>,
-    /// #107: `Timeouts::live_readd`. Off by default: then nothing is recorded in
-    /// [`Self::drop_clocked`] and [`Self::live_readd_duty`] does nothing.
-    live_readd: bool,
-    /// [`LIVE_READD_HOLD_MILLIS`]; crate tests set it directly.
-    live_readd_hold_millis: u64,
-    /// #107: per partition and node, a copy this owner's own drop clock left out, and why
-    /// ([`LiveReturn`]). Set only by [`Self::note_left_out`] from the committed plan's
-    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none.
-    /// Spent by the one live re-add it allows (slice 2a: one attempt per drop), and removed by
-    /// a commit that pins the node regular, or that leaves it out with no cause. Memory only: a
-    /// restarted or new owner has none, so the copy is restart-only.
-    drop_clocked: BTreeMap<(PartitionId, NodeId), LiveReturn>,
-    /// #107: since when the link to each [`Self::drop_clocked`] copy has been up, unbroken.
-    live_readd_since: BTreeMap<(PartitionId, NodeId), Tick>,
-    /// #107 (Rev 5 m4): the one `Inspect` [`Self::live_readd_duty`] has out, and when it went.
-    live_readd_probe: Option<(Tick, PartitionId, RepairProbe)>,
-    /// #107: the partition and node [`Self::readd_candidate`] may re-add at the boot it was
-    /// left out at. Set by [`Self::live_readd_duty`] only around its own call into
-    /// [`Self::rejoin_if_stale`], so no other caller reaches the same-boot arm.
-    live_readd_armed: Option<(PartitionId, NodeId)>,
+    /// #107: the live re-add's setting and state ([`Self::live_readd_duty`]).
+    live_readd: LiveReadd,
     /// Per partition, the spares `admin rebuild` noted in `left_out` for a free slot (M11
     /// A-R456, critic A5). A slot takes one note; a note is pending while its node is still left
     /// out. Memory only: a new owner starts with none, so the operator re-runs the rebuild.
@@ -2950,12 +3001,7 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             left_out_warned: BTreeSet::new(),
-            live_readd: false,
-            live_readd_hold_millis: LIVE_READD_HOLD_MILLIS,
-            drop_clocked: BTreeMap::new(),
-            live_readd_since: BTreeMap::new(),
-            live_readd_probe: None,
-            live_readd_armed: None,
+            live_readd: LiveReadd::off(),
             spare_notes: BTreeMap::new(),
             moves: BTreeMap::new(),
             moved: BTreeMap::new(),
@@ -6578,7 +6624,7 @@ impl Host {
             // at first sight, and only a boot newer than that re-adds.
             // #107: the boot it was left out at, too, for the one partition and node
             // [`Self::live_readd_duty`] armed around its own call.
-            let armed = self.live_readd_armed == Some((partition, left.node));
+            let armed = self.live_readd.armed == Some((partition, left.node));
             left.boot != crate::admin::UNLINKED_BOOT
                 && !pinned
                 && !rebuilding
@@ -6643,13 +6689,13 @@ impl Host {
                         link_lost = why.link_lost,
                         "drop_clocked_recorded"
                     );
-                    self.drop_clocked.insert(key, why);
+                    self.live_readd.clocked.insert(key, why);
                 }
                 None => {
-                    self.drop_clocked.remove(&key);
+                    self.live_readd.clocked.remove(&key);
                 }
             }
-            self.live_readd_since.remove(&key);
+            self.live_readd.links.remove(&key);
         }
         let entry = self.left_out.entry(partition).or_default();
         for left in gone {
@@ -7043,7 +7089,7 @@ impl Host {
             let pinned = &committed.committed.pinned_config.members;
             left.retain(|member| !pinned.iter().any(|pin| pin.node == member.node));
             // #107: a copy pinned regular again has returned; its drop is spent.
-            self.drop_clocked.retain(|(at, node), _| {
+            self.live_readd.clocked.retain(|(at, node), _| {
                 *at != partition
                     || !pinned
                         .iter()
@@ -7090,6 +7136,11 @@ impl Host {
     ///   refuses writes on account of. It starts again on an admit, a membership commit, a
     ///   different blamed copy, or that copy's durable sequence advancing, so a copy still
     ///   catching up is never dropped.
+    ///
+    /// After every partition, #107's [`Self::live_readd_duty`]: with `Timeouts::live_readd` on,
+    /// a copy either clock dropped here (the paused one only with the link seen down) is
+    /// re-added at the boot it still runs once its link is back, one due copy per check. Off,
+    /// it does nothing and a dropped copy returns only at its restart.
     fn drop_duty(&mut self, now: Tick) {
         let partitions: Vec<PartitionId> = self.committed.keys().copied().collect();
         for partition in partitions {
@@ -7102,7 +7153,7 @@ impl Host {
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
             self.restore_left_out(partition);
-            self.warn_left_out(partition);
+            self.warn_left_out(partition, now);
             // D1 (#93): ahead of the gate below, so an idle partition, which L1 never pauses,
             // drops a dead copy too.
             if self.may_drop_unreachable(partition, now) {
@@ -7132,7 +7183,7 @@ impl Host {
     }
 
     /// #107 slice 2a: re-add, at the boot it still runs, a copy this owner's own drop clock left
-    /// out ([`Self::drop_clocked`]), once its link is back. `Links::install` tells nobody of a
+    /// out ([`LiveReadd::clocked`]), once its link is back. `Links::install` tells nobody of a
     /// same-boot reconnect, so this runs at every drop check, and ends in the restart path's
     /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up off the
     /// stream, and promoted by [`Self::shadow_duty`]. With `live_readd` off it does nothing.
@@ -7160,43 +7211,61 @@ impl Host {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none.
         let owned: BTreeSet<PartitionId> = self
-            .drop_clocked
+            .live_readd
+            .clocked
             .keys()
             .map(|(partition, _)| *partition)
             .filter(|partition| self.is_pinned_primary(*partition))
             .collect();
-        self.drop_clocked
+        let live = &mut self.live_readd;
+        live.clocked
             .retain(|(partition, _), _| owned.contains(partition));
-        let keys: Vec<(PartitionId, NodeId)> = self.drop_clocked.keys().copied().collect();
-        self.live_readd_since.retain(|key, _| keys.contains(key));
-        if !self.live_readd {
-            self.live_readd_probe = None;
+        let keys: Vec<(PartitionId, NodeId)> = live.clocked.keys().copied().collect();
+        live.links.retain(|key, _| keys.contains(key));
+        live.refusals_logged
+            .retain(|(partition, node, _)| keys.contains(&(*partition, *node)));
+        if !live.on {
+            live.probe = None;
             return;
         }
         for &key in &keys {
-            if self.linked(key.1) {
-                self.live_readd_since.entry(key).or_insert(now);
-            } else {
-                self.live_readd_since.remove(&key);
+            self.live_readd_link_seen(key, now);
+        }
+        // Rev 5 m4: the due copy linked longest; on a tie, the lowest partition, then node.
+        let mut due: Option<((PartitionId, NodeId), u64)> = None;
+        for &key in &keys {
+            if let Some(reason) = self.live_readd_refusal(key.0, key.1) {
+                if self
+                    .live_readd
+                    .refusals_logged
+                    .insert((key.0, key.1, reason))
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = key.0 .0,
+                        left_out = key.1 .0,
+                        reason,
+                        "live_readd_refused"
+                    );
+                }
+                continue;
+            }
+            let Some(LinkSeen::Up { since, .. }) = self.live_readd.links.get(&key).copied() else {
+                continue;
+            };
+            let linked_ms = HostClock::millis_until(since, now);
+            if linked_ms >= self.live_readd.hold_millis
+                && due.is_none_or(|(_, longest)| linked_ms > longest)
+            {
+                due = Some((key, linked_ms));
             }
         }
-        let due = keys
-            .iter()
-            .filter_map(|key| {
-                let linked_ms = HostClock::millis_until(*self.live_readd_since.get(key)?, now);
-                (linked_ms >= self.live_readd_hold_millis
-                    && self.live_readd_refusal(key.0, key.1).is_none())
-                .then_some((*key, linked_ms))
-            })
-            .max_by_key(|((partition, node), linked_ms)| {
-                (*linked_ms, std::cmp::Reverse((partition.0, node.0)))
-            });
         let Some(((partition, node), linked_ms)) = due else {
-            self.live_readd_probe = None;
+            self.live_readd.probe = None;
             return;
         };
         // Last check's probe, when it was of this same copy.
-        let probe = match self.live_readd_probe.take() {
+        let probe = match self.live_readd.probe.take() {
             Some((sent, probed, (probed_node, answer)))
                 if (probed, probed_node) == (partition, node) =>
             {
@@ -7218,17 +7287,12 @@ impl Host {
                 linked_ms,
                 "live_readd_probed"
             );
-            self.live_readd_probe = Some((now, partition, (node, answer)));
+            self.live_readd.probe = Some((now, partition, (node, answer)));
             return;
         };
-        // Its answer, within one check. In this process the answer comes back over its own
-        // channel, not over `Links`, so a dropped direction back to this node counts as no
-        // answer, as in [`Self::repair_duty`].
-        let answer = (HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS
-            && !self.links.dropped().contains(&(node, self.node)))
-        .then(|| answer.try_recv().ok())
-        .flatten();
-        let Some(status) = answer else {
+        // Its answer, within one check.
+        let dropped = self.links.dropped();
+        let Some(status) = inspect_answer(sent, now, (node, self.node), &dropped, &answer) else {
             self.live_readd_unanswered(partition, node, now, "no_answer");
             return;
         };
@@ -7239,15 +7303,15 @@ impl Host {
                 left_out = node.0,
                 reason = "faulted",
                 fault = %fault,
+                retry_in_ms = self.live_readd.hold_millis,
                 "live_readd_refused"
             );
-            // Probed again only after another whole hold.
-            self.live_readd_since.remove(&(partition, node));
+            self.live_readd_sit_out((partition, node), now);
             return;
         }
-        self.live_readd_armed = Some((partition, node));
+        self.live_readd.armed = Some((partition, node));
         let why = self.rejoin_if_stale(partition);
-        self.live_readd_armed = None;
+        self.live_readd.armed = None;
         let started = matches!(
             self.rejoins.get(&partition),
             Some(Rejoin::Revoking { replan, .. }) if replan.rejoiner == Some(node)
@@ -7258,12 +7322,19 @@ impl Host {
                 partition = partition.0,
                 left_out = node.0,
                 why = ?why,
+                retry_in_ms = self.live_readd.hold_millis,
                 "live_readd_not_planned"
             );
+            // Review: as for a fault, a whole hold before the copy is probed again.
+            self.live_readd_sit_out((partition, node), now);
             return;
         }
-        let cause = self.drop_clocked.remove(&(partition, node));
-        self.live_readd_since.remove(&(partition, node));
+        let key = (partition, node);
+        let cause = self.live_readd.clocked.remove(&key);
+        self.live_readd.links.remove(&key);
+        self.live_readd
+            .refusals_logged
+            .retain(|(at, left, _)| (*at, *left) != key);
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -7274,6 +7345,47 @@ impl Host {
             linked_ms,
             "live_readd_planned"
         );
+    }
+
+    /// #107: record how the link to `key`'s copy stands at `now` ([`LinkSeen`]). The hold
+    /// starts when the link is seen up, and starts again when it is seen down or on another
+    /// connection (review: a same-boot close and reconnect between two checks is a new link,
+    /// which `Links::install` tells nobody of).
+    fn live_readd_link_seen(&mut self, key: (PartitionId, NodeId), now: Tick) {
+        let conn = if self.linked(key.1) {
+            self.links.connection(self.node, key.1)
+        } else {
+            None
+        };
+        let seen = self.live_readd.links.get(&key).copied();
+        let next = match (conn, seen) {
+            (Some(conn), Some(LinkSeen::Up { conn: was, .. })) if was == conn => return,
+            (Some(conn), was) => {
+                if let Some(LinkSeen::Up { since, conn: old }) = was {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = key.0 .0,
+                        left_out = key.1 .0,
+                        old_conn = old,
+                        conn,
+                        held_ms = HostClock::millis_until(since, now),
+                        "live_readd_hold_restarted"
+                    );
+                }
+                LinkSeen::Up { since: now, conn }
+            }
+            (None, Some(LinkSeen::Down { .. })) => return,
+            (None, _) => LinkSeen::Down { since: now },
+        };
+        self.live_readd.links.insert(key, next);
+    }
+
+    /// #107: `key`'s copy is probed again only after a whole hold from `now`. A link that is
+    /// down needs that anyway.
+    fn live_readd_sit_out(&mut self, key: (PartitionId, NodeId), now: Tick) {
+        if let Some(LinkSeen::Up { since, .. }) = self.live_readd.links.get_mut(&key) {
+            *since = now;
+        }
     }
 
     /// #107 (review blocker 1): the probe of a due copy went unsent or unanswered, so the copy
@@ -7292,14 +7404,16 @@ impl Host {
             partition = partition.0,
             left_out = node.0,
             why,
-            retry_in_ms = self.live_readd_hold_millis,
+            retry_in_ms = self.live_readd.hold_millis,
             "live_readd_unanswered"
         );
-        self.live_readd_since.insert((partition, node), now);
+        self.live_readd_sit_out((partition, node), now);
     }
 
     /// #107: why [`Self::live_readd_duty`] may not re-add `node` to `partition` now, or `None`.
-    /// Everything but the link hold and the probe.
+    /// Everything but the link hold and the probe. The slot, rebuild and pinned checks are
+    /// [`Self::readd_candidate`]'s own, so a copy the gate passes is one the re-add takes: a
+    /// gate looser than the candidate probed the copy and planned nothing at every hold.
     fn live_readd_refusal(&self, partition: PartitionId, node: NodeId) -> Option<&'static str> {
         if !self.is_pinned_primary(partition) {
             return Some("not_owner");
@@ -7319,7 +7433,10 @@ impl Host {
         if members.len() >= crate::admin::members().len() {
             return Some("no_free_slot");
         }
-        if self.rebuild_asks.contains_key(&partition) {
+        // A rebuild of this partition, or of this node on any partition (the candidate's).
+        if self.rebuild_asks.contains_key(&partition)
+            || self.rebuild_asks.values().any(|ask| ask.node == node)
+        {
             return Some("rebuild");
         }
         if self
@@ -7336,7 +7453,10 @@ impl Host {
         let Some(left) = left else {
             return Some("not_left_out");
         };
-        if members.iter().any(|member| member.node == node) {
+        if members
+            .iter()
+            .any(|member| member.node == node || member.copy == left.copy)
+        {
             return Some("pinned");
         }
         // A newer boot is a restart, which the restart path re-adds.
@@ -7440,8 +7560,11 @@ impl Host {
 
     /// S4a: say once per partition, node and boot that a left-out copy with a free slot stays
     /// out until it is restarted. Not for a boot [`Self::readd_candidate`] takes (the re-add is
-    /// coming), an `admin rebuild`'s node, or a boot not yet seen.
-    fn warn_left_out(&mut self, partition: PartitionId) {
+    /// coming), an `admin rebuild`'s node, or a boot not yet seen. #107: nor for a copy with a
+    /// live re-add still to come ([`LiveReadd::clocked`]), unless [`Self::live_readd_duty`] has
+    /// seen its link down for `unreachable_drop_after_millis` (review: a link that never
+    /// returns), as long again as the clock that dropped it.
+    fn warn_left_out(&mut self, partition: PartitionId, now: Tick) {
         if !self.is_pinned_primary(partition) {
             return;
         }
@@ -7462,8 +7585,15 @@ impl Host {
                 .links
                 .boot_of(left.node)
                 .is_some_and(|live| live > left.boot);
-            // #107: a copy with a live re-add still to come is not told to restart.
-            let returning = self.drop_clocked.contains_key(&(partition, left.node));
+            // #107: a copy with a live re-add still to come is not told to restart, until its
+            // link has stayed down for the unreachable clock.
+            let key = (partition, left.node);
+            let gone = matches!(
+                self.live_readd.links.get(&key),
+                Some(LinkSeen::Down { since })
+                    if HostClock::millis_until(*since, now) >= self.unreachable_drop_after_millis
+            );
+            let returning = self.live_readd.clocked.contains_key(&key) && !gone;
             if pinned
                 || rebuilding
                 || restarted
@@ -7689,21 +7819,18 @@ impl Host {
         // this process the answer comes back over its own channel, not over `Links`, so a member
         // whose direction back to this node is dropped is counted as not answering (A-R353).
         let answers: Vec<(NodeId, NodeStatus)> = match self.repair_probes.remove(&partition) {
-            Some((sent, probes))
-                if HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS =>
-            {
+            Some((sent, probes)) => {
                 let dropped = self.links.dropped();
                 probes
                     .into_iter()
-                    .filter(|(node, _)| {
-                        linked.contains(node) && !dropped.contains(&(*node, self.node))
-                    })
+                    .filter(|(node, _)| linked.contains(node))
                     .filter_map(|(node, answer)| {
-                        answer.try_recv().ok().map(|status| (node, status))
+                        inspect_answer(sent, now, (node, self.node), &dropped, &answer)
+                            .map(|status| (node, status))
                     })
                     .collect()
             }
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         let answered: Vec<NodeId> = answers.iter().map(|(node, _)| *node).collect();
         // Issue #105 unit 2 (design section 8.2): A-R383's one exception. A stalled copy that
@@ -8878,7 +9005,7 @@ impl Host {
         // #107 (Rev 5 M1): a copy this clock dropped may return at its live boot when the
         // unreachable clock fired, or the paused one with the link seen down. A paused drop on
         // a link that stayed up (a sick disk, say) stays restart-only in slice 2a.
-        let cause = (self.live_readd && (clock == DropClock::Unreachable || blame.link_lost))
+        let cause = (self.live_readd.on && (clock == DropClock::Unreachable || blame.link_lost))
             .then_some(LiveReturn {
                 clock,
                 durable: Some(blame.durable),
@@ -10460,6 +10587,8 @@ impl Host {
                 // refusal never anchors below this generation's cutoff on its `Recovered`: it
                 // anchors at the cutoff it holds, or at the root, as a restarted copy's fresh
                 // receiver does, so R1 never walks it from inside the new generation's prefix.
+                // Which of the two is known only at the `Recovered`, so the line says marked,
+                // not where it anchors.
                 if self
                     .replication
                     .refuse_landing(self.node, partition, generation)
@@ -10469,7 +10598,7 @@ impl Host {
                         partition = partition.0,
                         generation = generation.0,
                         reason,
-                        "land_receiver_from_root"
+                        "land_receiver_marked_refused"
                     );
                 }
                 refused(reason)
