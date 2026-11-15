@@ -451,8 +451,8 @@ holding **past** the cutoff in its own generation is still refused by name, as b
 have applied nothing. That holds at the cutoff (arm 2) and below it (arm 3) alike. A holed parent
 is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logged
 `land_floor_read_failed`), and nothing is written. The guard order and the inventory's twin are in
-ADR-rdb-0010 decision 8's amendment of the same day. Check B is refusal-only and runs whatever the
-#107 live re-add switch says. Adoption does not run it (issue #121).
+[ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md). Check B is refusal-only and
+runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
@@ -499,7 +499,7 @@ nothing, checked after the depth ceiling. A holed one fails the inventory
 `missed_generation_from_has_no_floor`, and a failed seq 1 read
 `missed_generation_history_read_failed`, with nothing written. When a tail above `base` was
 released or adopted for the ask, the same refusal answers `TailHeld` with that reason instead.
-See ADR-rdb-0010 decision 8's amendment of the same day.
+See [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md).
 
 **Ruling 2026-10-24 (M10 S2, lead ruling A-R406; critic-d4 ADV-1): a secondary restarted while
 every copy is up is handled like a dropped copy.** This records existing behaviour; it changes no
