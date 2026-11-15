@@ -50,7 +50,7 @@ reached yet.
 | 0000, 0002, 0003 | foundation (the series, the crates, the kernel shape) |
 | 0001 | the accepted architecture, decided by the user |
 | 0004, 0007, 0008 | kernel-a (transaction, authority, control records) |
-| 0005, 0006, 0009 | kernel-b (replication, lag protection, recovery) |
+| 0005, 0006, 0009, 0021 | kernel-b (replication, lag protection, recovery) |
 | 0019 | verification (gates, evidence, the release boundary) |
 
 ## Naming
