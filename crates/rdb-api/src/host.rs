@@ -236,6 +236,12 @@ pub const UNREACHABLE_DROP_AFTER_MILLIS: u64 = 10_000;
 /// over a restart or a brief link loss, and the copy then waits for a restart to come back.
 pub const MIN_UNREACHABLE_DROP_AFTER_MILLIS: u64 = 2_000;
 
+/// #107: how long the owner's link to a copy its own clock dropped must stay up before
+/// [`Host::live_readd_duty`] probes it for a re-add at its live boot. A link that flaps inside
+/// this costs nothing. The same 5 s as L1's `resume_hold_millis`, but its own value, since L1
+/// reads that budget. Crate tests set the host field directly.
+pub const LIVE_READD_HOLD_MILLIS: u64 = 5_000;
+
 /// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
 /// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
 /// this bounds the pause at promote: the catch-up cursor sends one record a round trip, and in the
@@ -1501,6 +1507,7 @@ pub fn spawn(
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
         UNREACHABLE_DROP_AFTER_MILLIS,
+        false,
         BOOT,
         StorageOptions::default(),
         1,
@@ -1522,6 +1529,7 @@ pub(crate) fn spawn_with(
     budgets: Budgets,
     limits: Limits,
     unreachable_drop_after_millis: u64,
+    live_readd: bool,
     boot: BootId,
     storage: StorageOptions,
     partitions: u32,
@@ -1538,6 +1546,7 @@ pub(crate) fn spawn_with(
         budgets,
         limits,
         unreachable_drop_after_millis,
+        live_readd,
         boot,
         partitions,
     )
@@ -1556,6 +1565,7 @@ pub(crate) fn spawn_on(
     budgets: Budgets,
     limits: Limits,
     unreachable_drop_after_millis: u64,
+    live_readd: bool,
     boot: BootId,
     partitions: u32,
 ) -> Result<NodeHandle, String> {
@@ -1567,6 +1577,7 @@ pub(crate) fn spawn_on(
     host.boot = boot;
     host.budgets = budgets;
     host.unreachable_drop_after_millis = unreachable_drop_after_millis;
+    host.live_readd = live_readd;
     host.partition_count = partitions;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
@@ -1622,6 +1633,25 @@ struct Replan {
     /// Issue #105: what `admin forget-tail` gives up for this re-plan's run, carried into the
     /// plan's [`RecoveryPlan::release`]. Default (nothing) for every automatic re-plan.
     release: TailRelease,
+    /// #107: why the drop this re-plan makes may come back without a restart, carried from
+    /// [`Host::drop_copy`] to the commit, where [`Host::note_left_out`] records it in
+    /// [`Host::drop_clocked`]. `None` for every other re-plan, and always with the setting off.
+    cause: Option<LiveReturn>,
+}
+
+/// #107: what the owner's own drop clock saw when it dropped a copy, so the copy may be re-added
+/// at the boot it still runs once its link is back ([`Host::live_readd_duty`]). Kept in memory
+/// only, per partition and node, in [`Host::drop_clocked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveReturn {
+    /// The clock that fired.
+    clock: DropClock,
+    /// The copy's durable sequence as the owner's tracker last saw it at the drop. Not read in
+    /// slice 2a; slice 3's `Paused` arm with no link loss compares against it.
+    durable: Option<DurableSeq>,
+    /// Whether the owner saw the copy's link down while the clock ran. Always true for the
+    /// unreachable clock. A paused drop is recorded only with it (Rev 5 M1).
+    link_lost: bool,
 }
 
 /// M11: a copy move the owner was asked for, from its ask to the commit that pins `to`
@@ -1743,6 +1773,10 @@ struct Blame {
     durable: DurableSeq,
     /// Whether `membership_drop_refused` was logged for this blame, so it is logged once.
     refused_logged: bool,
+    /// #107 (Rev 5 M1): whether a check while this clock ran found the copy's member with no
+    /// link. A frozen or cut-off copy under writes is dropped on this clock, about 5 s after its
+    /// link closes (`PROBE_SILENCE`); this is what says so.
+    link_lost: bool,
 }
 
 impl Blame {
@@ -1757,7 +1791,16 @@ impl Blame {
                 since: now,
                 durable,
                 refused_logged: false,
+                link_lost: false,
             },
+        }
+    }
+
+    /// #107: this blame with a check's link reading. A loss seen once stays seen for the clock.
+    fn seen_unlinked(self, unlinked: bool) -> Self {
+        Self {
+            link_lost: self.link_lost || unlinked,
+            ..self
         }
     }
 }
@@ -2642,6 +2685,26 @@ struct Host {
     /// S4a: each left-out copy `copy_left_out_until_restart` has been logged for, so the line
     /// comes once per partition, node and boot.
     left_out_warned: BTreeSet<(PartitionId, NodeId, BootId)>,
+    /// #107: `Timeouts::live_readd`. Off by default: then nothing is recorded in
+    /// [`Self::drop_clocked`] and [`Self::live_readd_duty`] does nothing.
+    live_readd: bool,
+    /// [`LIVE_READD_HOLD_MILLIS`]; crate tests set it directly.
+    live_readd_hold_millis: u64,
+    /// #107: per partition and node, a copy this owner's own drop clock left out, and why
+    /// ([`LiveReturn`]). Set only by [`Self::note_left_out`] from the committed plan's
+    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none.
+    /// Spent by the one live re-add it allows (slice 2a: one attempt per drop), and removed by
+    /// a commit that pins the node regular, or that leaves it out with no cause. Memory only: a
+    /// restarted or new owner has none, so the copy is restart-only.
+    drop_clocked: BTreeMap<(PartitionId, NodeId), LiveReturn>,
+    /// #107: since when the link to each [`Self::drop_clocked`] copy has been up, unbroken.
+    live_readd_since: BTreeMap<(PartitionId, NodeId), Tick>,
+    /// #107 (Rev 5 m4): the one `Inspect` [`Self::live_readd_duty`] has out, and when it went.
+    live_readd_probe: Option<(Tick, PartitionId, RepairProbe)>,
+    /// #107: the partition and node [`Self::readd_candidate`] may re-add at the boot it was
+    /// left out at. Set by [`Self::live_readd_duty`] only around its own call into
+    /// [`Self::rejoin_if_stale`], so no other caller reaches the same-boot arm.
+    live_readd_armed: Option<(PartitionId, NodeId)>,
     /// Per partition, the spares `admin rebuild` noted in `left_out` for a free slot (M11
     /// A-R456, critic A5). A slot takes one note; a note is pending while its node is still left
     /// out. Memory only: a new owner starts with none, so the operator re-runs the rebuild.
@@ -2887,6 +2950,12 @@ impl Host {
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
             left_out_warned: BTreeSet::new(),
+            live_readd: false,
+            live_readd_hold_millis: LIVE_READD_HOLD_MILLIS,
+            drop_clocked: BTreeMap::new(),
+            live_readd_since: BTreeMap::new(),
+            live_readd_probe: None,
+            live_readd_armed: None,
             spare_notes: BTreeMap::new(),
             moves: BTreeMap::new(),
             moved: BTreeMap::new(),
@@ -6487,6 +6556,8 @@ impl Host {
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
     /// rejoiner) is re-added at once, and a copy dropped at its live boot waits for a restart.
     /// A left-out entry at `UNLINKED_BOOT` is no proof of a restart and is skipped (S4-20).
+    /// #107: the one exception is the partition and node [`Self::live_readd_duty`] armed for its
+    /// own call, which may be re-added at the boot it was left out at.
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
         // A-R455 (T11): a shadow holds a slot too, so a re-add pins only up to the free slots;
         // an extra left-out node stays out rather than becoming a shadow with no slot to fill.
@@ -6505,13 +6576,16 @@ impl Host {
             // the copy's boot. No process runs at it, so any live boot is "newer" and the
             // comparison would prove nothing. [`Self::restore_left_out`] records the live boot
             // at first sight, and only a boot newer than that re-adds.
+            // #107: the boot it was left out at, too, for the one partition and node
+            // [`Self::live_readd_duty`] armed around its own call.
+            let armed = self.live_readd_armed == Some((partition, left.node));
             left.boot != crate::admin::UNLINKED_BOOT
                 && !pinned
                 && !rebuilding
                 && self
                     .links
                     .boot_of(left.node)
-                    .is_some_and(|live| live > left.boot)
+                    .is_some_and(|live| live > left.boot || (armed && live == left.boot))
         })
     }
 
@@ -6544,6 +6618,39 @@ impl Host {
             left_out = ?gone.iter().map(|member| (member.node.0, member.boot.0)).collect::<Vec<_>>(),
             "commit_left_out"
         );
+        // #107: the cause this node's own plan for this commit carried for the copy it drops.
+        // Any other way out (an operator's drop, a promote, a give-up, a commit planned
+        // elsewhere) makes the copy restart-only again.
+        let cause = match self.rejoins.get(&partition) {
+            Some(Rejoin::Planned { generation, replan })
+                if *generation == result.new_generation =>
+            {
+                replan.drop.zip(replan.cause)
+            }
+            _ => None,
+        };
+        for left in &gone {
+            let key = (partition, left.node);
+            match cause.filter(|(dropped, _)| *dropped == left.node) {
+                Some((_, why)) => {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = result.new_generation.0,
+                        left_out = left.node.0,
+                        boot = left.boot.0,
+                        clock = why.clock.name(),
+                        link_lost = why.link_lost,
+                        "drop_clocked_recorded"
+                    );
+                    self.drop_clocked.insert(key, why);
+                }
+                None => {
+                    self.drop_clocked.remove(&key);
+                }
+            }
+            self.live_readd_since.remove(&key);
+        }
         let entry = self.left_out.entry(partition).or_default();
         for left in gone {
             entry.retain(|member| member.node != left.node);
@@ -6611,6 +6718,7 @@ impl Host {
             promote: false,
             since: self.clock.now(),
             release: TailRelease::default(),
+            cause: None,
         };
         self.start_revoke(partition, epoch, replan);
     }
@@ -6934,6 +7042,13 @@ impl Host {
         ) {
             let pinned = &committed.committed.pinned_config.members;
             left.retain(|member| !pinned.iter().any(|pin| pin.node == member.node));
+            // #107: a copy pinned regular again has returned; its drop is spent.
+            self.drop_clocked.retain(|(at, node), _| {
+                *at != partition
+                    || !pinned
+                        .iter()
+                        .any(|pin| pin.node == *node && pin.role == ReplicaRole::RegularSecondary)
+            });
         }
         let Some(Rejoin::Planned {
             generation: planned,
@@ -7000,13 +7115,202 @@ impl Host {
                 self.blamed.remove(&partition);
                 continue;
             };
-            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now);
+            let unlinked = self
+                .committed
+                .get(&partition)
+                .and_then(|committed| holder_of(&committed.committed.pinned_config.members, copy))
+                .is_some_and(|node| !self.linked(node));
+            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now)
+                .seen_unlinked(unlinked);
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
                 self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
             }
         }
+        self.live_readd_duty(now);
+    }
+
+    /// #107 slice 2a: re-add, at the boot it still runs, a copy this owner's own drop clock left
+    /// out ([`Self::drop_clocked`]), once its link is back. `Links::install` tells nobody of a
+    /// same-boot reconnect, so this runs at every drop check, and ends in the restart path's
+    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up off the
+    /// stream, and promoted by [`Self::shadow_duty`]. With `live_readd` off it does nothing.
+    ///
+    /// The gate ([`Self::live_readd_refusal`]): this node is the pinned primary, no re-plan
+    /// runs, the committed mode takes writes (`Active` or `DegradedRf2`, the test
+    /// `Decided::ledger_for` sets L by), a slot is free, no rebuild or live move is under way on
+    /// the partition, and the copy is left out at the boot its link reports. Then its link
+    /// must have stayed up for `live_readd_hold_millis`, and it must answer an `Inspect` within
+    /// one check with no fault. Rev 5 m4: one due copy per check, the one linked longest, so
+    /// at most one probe per check reaches a peer's Host thread.
+    ///
+    /// One attempt per drop: the plan's start spends the entry, so a re-add F1 blocks, or a
+    /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
+    ///
+    /// Protocol (Rev 5 m5): the same-boot landing this starts is safe only because every peer
+    /// that completes a handshake at [`crate::net::PROTOCOL_VERSION`] 9 has check A in
+    /// [`Self::land_link`]: a refused landing in a commit that takes writes drops the live
+    /// receiver, so the copy is walked from the root and never turns regular over a hole. Any
+    /// change that weakens check A takes a protocol bump. Check B (`from_has_no_floor`) is a
+    /// backstop; a peer of 1eb3fe0 lacks it, and safety then rests on check A alone.
+    fn live_readd_duty(&mut self, now: Tick) {
+        // A node no longer the pinned primary forgets its entries, so ownership coming back
+        // later revives none.
+        let owned: BTreeSet<PartitionId> = self
+            .drop_clocked
+            .keys()
+            .map(|(partition, _)| *partition)
+            .filter(|partition| self.is_pinned_primary(*partition))
+            .collect();
+        self.drop_clocked
+            .retain(|(partition, _), _| owned.contains(partition));
+        let keys: Vec<(PartitionId, NodeId)> = self.drop_clocked.keys().copied().collect();
+        self.live_readd_since.retain(|key, _| keys.contains(key));
+        if !self.live_readd {
+            self.live_readd_probe = None;
+            return;
+        }
+        for &key in &keys {
+            if self.linked(key.1) {
+                self.live_readd_since.entry(key).or_insert(now);
+            } else {
+                self.live_readd_since.remove(&key);
+            }
+        }
+        let due = keys
+            .iter()
+            .filter_map(|key| {
+                let linked_ms = HostClock::millis_until(*self.live_readd_since.get(key)?, now);
+                (linked_ms >= self.live_readd_hold_millis
+                    && self.live_readd_refusal(key.0, key.1).is_none())
+                .then_some((*key, linked_ms))
+            })
+            .max_by_key(|((partition, node), linked_ms)| {
+                (*linked_ms, std::cmp::Reverse((partition.0, node.0)))
+            });
+        let Some(((partition, node), linked_ms)) = due else {
+            self.live_readd_probe = None;
+            return;
+        };
+        // The answer to last check's probe of this same copy. In this process the answer comes
+        // back over its own channel, not over `Links`, so a dropped direction back to this node
+        // counts as no answer, as in [`Self::repair_duty`].
+        let answer = match self.live_readd_probe.take() {
+            Some((sent, probed, (probed_node, answer)))
+                if (probed, probed_node) == (partition, node)
+                    && HostClock::millis_until(sent, now) <= 2 * DROP_CHECK_EVERY_MILLIS
+                    && !self.links.dropped().contains(&(node, self.node)) =>
+            {
+                answer.try_recv().ok()
+            }
+            _ => None,
+        };
+        let Some(status) = answer else {
+            let (reply, answer) = mpsc::channel();
+            let probe = Msg::Inspect { partition, reply };
+            if self.links.send(self.node, node, probe).is_ok() {
+                tracing::debug!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    probed = node.0,
+                    linked_ms,
+                    "live_readd_probed"
+                );
+                self.live_readd_probe = Some((now, partition, (node, answer)));
+            }
+            return;
+        };
+        if let Some(fault) = status.fault {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                left_out = node.0,
+                reason = "faulted",
+                fault = %fault,
+                "live_readd_refused"
+            );
+            // Probed again only after another whole hold.
+            self.live_readd_since.remove(&(partition, node));
+            return;
+        }
+        self.live_readd_armed = Some((partition, node));
+        let why = self.rejoin_if_stale(partition);
+        self.live_readd_armed = None;
+        let started = matches!(
+            self.rejoins.get(&partition),
+            Some(Rejoin::Revoking { replan, .. }) if replan.rejoiner == Some(node)
+        );
+        if !started {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                left_out = node.0,
+                why = ?why,
+                "live_readd_not_planned"
+            );
+            return;
+        }
+        let cause = self.drop_clocked.remove(&(partition, node));
+        self.live_readd_since.remove(&(partition, node));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            readded = node.0,
+            boot = ?self.links.boot_of(node).map(|boot| boot.0),
+            clock = ?cause.map(|cause| cause.clock.name()),
+            link_lost = ?cause.map(|cause| cause.link_lost),
+            linked_ms,
+            "live_readd_planned"
+        );
+    }
+
+    /// #107: why [`Self::live_readd_duty`] may not re-add `node` to `partition` now, or `None`.
+    /// Everything but the link hold and the probe.
+    fn live_readd_refusal(&self, partition: PartitionId, node: NodeId) -> Option<&'static str> {
+        if !self.is_pinned_primary(partition) {
+            return Some("not_owner");
+        }
+        if self.rejoins.contains_key(&partition) {
+            return Some("replan_running");
+        }
+        let committed = self.committed.get(&partition)?;
+        // Rev 5 m1: the test `Decided::ledger_for` sets L by. `Blocked` never passes.
+        if !matches!(
+            committed.mode,
+            PartitionMode::Active | PartitionMode::DegradedRf2
+        ) {
+            return Some("read_only");
+        }
+        let members = &committed.committed.pinned_config.members;
+        if members.len() >= crate::admin::members().len() {
+            return Some("no_free_slot");
+        }
+        if self.rebuild_asks.contains_key(&partition) {
+            return Some("rebuild");
+        }
+        if self
+            .moves
+            .get(&partition)
+            .is_some_and(|mv| mv.abandoned.is_none())
+        {
+            return Some("move");
+        }
+        let left = self
+            .left_out
+            .get(&partition)
+            .and_then(|left| left.iter().find(|left| left.node == node));
+        let Some(left) = left else {
+            return Some("not_left_out");
+        };
+        if members.iter().any(|member| member.node == node) {
+            return Some("pinned");
+        }
+        // A newer boot is a restart, which the restart path re-adds.
+        if self.links.boot_of(node) != Some(left.boot) {
+            return Some("boot_changed");
+        }
+        None
     }
 
     /// Whether this node's last commit of `partition` pins it primary.
@@ -7125,9 +7429,12 @@ impl Host {
                 .links
                 .boot_of(left.node)
                 .is_some_and(|live| live > left.boot);
+            // #107: a copy with a live re-add still to come is not told to restart.
+            let returning = self.drop_clocked.contains_key(&(partition, left.node));
             if pinned
                 || rebuilding
                 || restarted
+                || returning
                 || left.boot == crate::admin::UNLINKED_BOOT
                 || !self
                     .left_out_warned
@@ -7233,6 +7540,7 @@ impl Host {
             since,
             durable,
             refused_logged: false,
+            link_lost: true,
         };
         Some((blame, HostClock::millis_until(since, now)))
     }
@@ -7844,6 +8152,7 @@ impl Host {
             promote: false,
             since: self.clock.now(),
             release: TailRelease::default(),
+            cause: None,
         };
         self.start_revoke(partition, epoch, replan);
         progress(false)
@@ -8262,6 +8571,7 @@ impl Host {
             promote: true,
             since: self.clock.now(),
             release: TailRelease::default(),
+            cause: None,
         };
         self.start_revoke(partition, epoch, replan);
     }
@@ -8528,10 +8838,28 @@ impl Host {
             unreachable_ms = ?unreachable_ms,
             unreachable_since = ?unreachable_since.map(|since| since.0),
             durable = blame.durable.0,
+            link_lost = blame.link_lost,
             "membership_drop_planned"
         );
         self.blamed.remove(&partition);
-        self.revoke(partition, epoch, Some(dropped), None);
+        // #107 (Rev 5 M1): a copy this clock dropped may return at its live boot when the
+        // unreachable clock fired, or the paused one with the link seen down. A paused drop on
+        // a link that stayed up (a sick disk, say) stays restart-only in slice 2a.
+        let cause = (self.live_readd && (clock == DropClock::Unreachable || blame.link_lost))
+            .then_some(LiveReturn {
+                clock,
+                durable: Some(blame.durable),
+                link_lost: blame.link_lost,
+            });
+        let replan = Replan {
+            drop: Some(dropped),
+            rejoiner: None,
+            promote: false,
+            since: self.clock.now(),
+            release: TailRelease::default(),
+            cause,
+        };
+        self.start_revoke(partition, epoch, replan);
     }
 
     /// A-R306: F1 ended `Blocked` on this owner's re-plan, so the commit that would end it is
@@ -9277,6 +9605,7 @@ impl Host {
             promote: false,
             since: self.clock.now(),
             release,
+            cause: None,
         };
         self.start_revoke(partition, epoch, replan);
         Ok(format!(
@@ -9890,9 +10219,12 @@ impl Host {
     /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
     /// stays, as the held tail does. A copy refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
-    /// writes: the drop duty leaves it out, and once it restarts it is re-added as a shadow and
-    /// walked up from the root (#59,
-    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`). One whose tail is
+    /// writes: the drop duty leaves it out, and it is re-added as a shadow and walked up from the
+    /// root once it restarts (#59,
+    /// `m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up`), or, with
+    /// `live_readd` on and the owner's own clock having dropped it, at the boot it still runs
+    /// once its link is back ([`Self::live_readd_duty`], #107). That same-boot landing keeps this
+    /// process's receiver, which is why check A must drop it here. One whose tail is
     /// stamped by the last writable generation can hold the partition `ReadOnly` until that
     /// tail is adopted ([`Self::adoption`]) or given up (`forget-tail`). Called once per
     /// (partition, generation): `landed` dedups the landing.

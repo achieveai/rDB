@@ -113,6 +113,11 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// a routed `CatchUp` or `Restore` seed carries (unit 2, architect section 15.3). It ships with
 /// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts
 /// the whole cluster.
+///
+/// Issue #107 (Rev 5 m5), a rule with no frame of its own: an owner's live re-add
+/// (`Host::live_readd_duty`) re-adds a copy at the boot it still runs, and that is safe only
+/// because every peer speaking 9 has check A in `Host::land_link` (a refused landing in a commit
+/// that takes writes drops the live receiver). Any change that weakens check A takes a bump.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

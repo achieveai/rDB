@@ -130,6 +130,14 @@ pub struct Timeouts {
     /// shorter value pauses writes for less and drops more copies over a slow restart. Each
     /// process running a node reads its own; set it to the same value on every node.
     pub unreachable_drop_after: Duration,
+    /// Issue #107: whether a copy the owner dropped on its own clock comes back without a
+    /// restart. With it on, once the copy's link has been up again for 5 s and the copy answers
+    /// with no fault, the owner adds it back at the boot it still runs, as a shadow that catches
+    /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
+    /// operator, a move or a promote still returns only when its node restarts. One attempt per
+    /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
+    /// until the 512-partition acceptance run passes. Read by each node process, as an owner.
+    pub live_readd: bool,
 }
 
 impl Default for Timeouts {
@@ -138,6 +146,7 @@ impl Default for Timeouts {
             put: Duration::from_secs(5),
             read: Duration::from_secs(1),
             unreachable_drop_after: Duration::from_millis(host::UNREACHABLE_DROP_AFTER_MILLIS),
+            live_readd: false,
         }
     }
 }
@@ -1229,6 +1238,8 @@ struct Respawn {
     budgets: Budgets,
     limits: Limits,
     unreachable_drop_after_millis: u64,
+    /// `Timeouts::live_readd`.
+    live_readd: bool,
     /// The folder a restart takes [`next_boot`] of, when the open was given its boot
     /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
     boots: Option<PathBuf>,
@@ -1307,10 +1318,12 @@ impl Db {
             ..budgets
         };
         let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
+        let live_readd = config.timeouts.live_readd;
         tracing::info!(
             dedup_cap = limits.dedup_cap,
             dedup_retention_ms = budgets.dedup_retention_millis,
             unreachable_drop_after_ms = unreachable_drop_after_millis,
+            live_readd,
             "db_open"
         );
         let respawn = Respawn {
@@ -1318,6 +1331,7 @@ impl Db {
             budgets,
             limits,
             unreachable_drop_after_millis,
+            live_readd,
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
         };
@@ -1336,6 +1350,7 @@ impl Db {
                     budgets,
                     limits,
                     unreachable_drop_after_millis,
+                    live_readd,
                     boot,
                     partitions,
                 )
@@ -3956,6 +3971,7 @@ impl Db {
                 budgets,
                 limits: Limits::default(),
                 unreachable_drop_after_millis: host::UNREACHABLE_DROP_AFTER_MILLIS,
+                live_readd: false,
                 boots: None,
                 storage: StorageOptions::default(),
             }),
@@ -3995,6 +4011,7 @@ impl Db {
                 budgets,
                 limits,
                 unreachable_drop_after_millis: millis_of(config.timeouts.unreachable_drop_after),
+                live_readd: config.timeouts.live_readd,
                 boots: None,
                 storage: config.storage,
             }),
@@ -4020,6 +4037,7 @@ impl Db {
                 budgets,
                 limits,
                 millis_of(config.timeouts.unreachable_drop_after),
+                config.timeouts.live_readd,
                 boot,
                 config.storage,
                 1,
@@ -4329,6 +4347,7 @@ impl Db {
                 respawn.budgets,
                 respawn.limits,
                 respawn.unreachable_drop_after_millis,
+                respawn.live_readd,
                 boot,
                 respawn.storage,
                 self.route.partitions(),
@@ -4443,6 +4462,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             respawn.unreachable_drop_after_millis,
+            respawn.live_readd,
             boot,
             self.route.partitions(),
         )
@@ -7142,6 +7162,7 @@ mod tests {
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
                 host::UNREACHABLE_DROP_AFTER_MILLIS,
+                false,
                 boot,
                 partitions,
             )
@@ -7252,6 +7273,7 @@ mod tests {
                             fast(),
                             Limits::default(),
                             host::UNREACHABLE_DROP_AFTER_MILLIS,
+                            false,
                             boot,
                             partitions,
                         )?;
