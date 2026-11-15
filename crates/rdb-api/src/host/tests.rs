@@ -7141,7 +7141,7 @@ fn a_sync_still_in_flight_past_the_stuck_limit_faults_the_node() {
     assert_eq!(stuck[0]["@l"], "Error", "{:?}", stuck[0]);
 }
 
-/// Issue #109: a slow sync that returns an error is never credited, as before: the slow limit
+/// Issue #109: a slow sync that returns an error is never credited, as before: the stuck limit
 /// changes when the watchdog faults, not what a failed fsync means. The duty's sync answers
 /// `FlushFailed` and the durable mark stays; the slow line says `ok: false`.
 /// Unit, under a second.
@@ -7207,8 +7207,7 @@ fn the_watchdog_wakes_for_the_slow_mark_then_the_stuck_limit() {
 }
 
 /// Issue #109: the default stuck limit is 30 s, pinned as a literal, in the engine's default
-/// options and in a host opened on them. The rows above follow the constant, so they still pass
-/// at 15 s; this one does not. Cut: the default at 15 s, red. Unit, under a second.
+/// options and in a host opened on them. Cut: the default at 15 s, red. Unit, under a second.
 #[test]
 fn the_default_stuck_limit_is_30_s() {
     assert_eq!(rdb_storage::DEFAULT_SYNC_STUCK_MILLIS, 30_000);
@@ -7303,8 +7302,9 @@ fn the_default_stuck_limit_faults_just_past_30_s() {
 
 /// Issue #109: two syncs begun by the real path (`flush_duty` to `start_sync`, onto a syncer
 /// whose job queue this row holds) each warn once while in flight, and a second look at either
-/// adds nothing. Only each flight's start is moved back; `warned` is what `start_sync` set.
-/// Cut: `start_sync` sets `warned: true`, red (no warning). Unit, under a second.
+/// adds nothing. Each look is given a fixed 6 s age, so the row reads no clock and a long pause
+/// cannot fault it; `warned` is what `start_sync` set. Cut: `start_sync` sets `warned: true`,
+/// red (no warning). Unit, under a second.
 #[config_log::retcd_test]
 fn each_sync_the_syncer_runs_warns_once_while_slow() {
     const METHOD: &str = "each_sync_the_syncer_runs_warns_once_while_slow";
@@ -7318,12 +7318,9 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
         commit_empty(&mut host, seq);
         host.flush_duty().expect("flush");
         let sync = queued.try_recv().expect("the duty queued its sync");
-        let flight = host.syncing.as_mut().expect("a sync in flight");
-        flight.started = Instant::now()
-            .checked_sub(Duration::from_millis(6_000))
-            .expect("a monotonic clock past 6 s");
-        assert!(!host.stuck_sync(), "slow, not stuck");
-        assert!(!host.stuck_sync(), "a second look");
+        assert!(host.syncing.is_some(), "a sync in flight");
+        assert!(!host.stuck_sync_held(6_000), "slow, not stuck");
+        assert!(!host.stuck_sync_held(6_000), "a second look");
         assert_eq!(
             logged!(METHOD, "wal_sync_slow_in_flight").len(),
             usize::try_from(seq).expect("small"),
