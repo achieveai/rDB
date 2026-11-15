@@ -342,13 +342,18 @@ its owner, whether it is ready, and if not, why (`NoLink`, `NoAnswer`, `Recoveri
 can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_dev
 `admin promote 3 --partition 2`).
 
-- **It waits out the owner's grant.** About 3.2 s after the owner died, with the default 3 s
-  grant. If the promote is already waiting and the app retries at once, a partition's writes
-  stop for up to the grant plus about 0.45 s (measured 3.0 to 3.4 s). The app's own pause
-  between retries adds to that (measured 3.2 to 3.6 s with one).
+- **It waits out the owner's grant.** About the grant plus 0.2 s after the owner died. The
+  default grant is 6 s (`Budgets::SPEC_DEFAULTS.grant_millis`, which `Db::open` uses), so about
+  6.2 s. If the promote is already waiting and the app retries at once, a partition's writes
+  stop for up to the grant plus about 0.45 s. The app's own pause between retries adds to that.
+  The figures were measured when the default grant was 3 s (3.0 to 3.4 s, and 3.2 to 3.6 s with
+  a pause between retries); they have not been measured again at 6 s.
 - **A live owner is refused**, as `PromoteError::OwnerAlive`, and nothing is written. The owner
   must not answer a look, and its grant must not be renewing. `promote_partition` returns
   `PromoteError`, so match on it: do not retry `OwnerAlive` while that node lives.
+- **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
+  for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
+  for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every

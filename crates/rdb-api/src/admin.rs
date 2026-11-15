@@ -54,7 +54,7 @@ use rdb_core::partition_map::RoutesRoot;
 
 use crate::clock::HostClock;
 use crate::db::{ApiError, Db};
-use crate::host::{Msg, NodeStopped, BOOT};
+use crate::host::{Msg, NodeStatus, NodeStopped, BOOT};
 
 /// The partition S0 serves.
 pub const PARTITION: PartitionId = PartitionId(1);
@@ -2207,10 +2207,11 @@ pub enum PromoteError {
         /// The partition.
         partition: u32,
     },
-    /// Above one partition, the owner is alive: it answered, or its grant is still being
-    /// renewed. A promote freezes the whole node's grant and moves one partition, so it would
-    /// fence the node's other partitions (issue #79 S3). Nothing was changed. A live owner's
-    /// promote is #61 slice S7.
+    /// Above one partition, the owner is alive: it answered a look without a host fault, or
+    /// its grant is still being renewed. An owner that answers with a host fault is not alive
+    /// here (issue #122). A promote freezes the whole node's grant and moves one partition, so
+    /// it would fence the node's other partitions (issue #79 S3). Nothing was changed. A live
+    /// owner's promote is #61 slice S7.
     #[error(
         "node {node} is alive and owns partition {partition} ({evidence}): a promote of one \
          partition from a live node is not built, because it would stop every partition node \
@@ -3201,8 +3202,9 @@ async fn kept_boots(
     }
 }
 
-/// Whether `prior` answers a look at `ctx.partition` within `ctx.look_within`.
-async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
+/// What `prior` answers to a look at `ctx.partition` within `ctx.look_within`; `None` when the
+/// look cannot be sent or no answer comes in time.
+async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> Option<NodeStatus> {
     let (reply, answer) = std::sync::mpsc::channel();
     let asked = (ctx.send)(
         prior,
@@ -3212,12 +3214,13 @@ async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
         },
     );
     if asked.is_err() {
-        return false;
+        return None;
     }
     let within = ctx.look_within;
-    tokio::task::spawn_blocking(move || answer.recv_timeout(within).is_ok())
+    tokio::task::spawn_blocking(move || answer.recv_timeout(within).ok())
         .await
-        .unwrap_or(false)
+        .ok()
+        .flatten()
 }
 
 /// Refuse a promote run on a clock with no bound ([`PromoteError::ClockUnbounded`]), before it
@@ -3277,16 +3280,19 @@ async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
 }
 
 /// Show that `prior`, which owns `ctx.partition` above one partition, is dead: it does not
-/// answer a look, and its grant is not being renewed and has run out. A just-killed owner is
-/// waited out, not refused. Returns the `mod_revision` of the grant record judged, 0 for none.
+/// answer a look, or answers it with a host fault, and its grant is not being renewed and has
+/// run out. A just-killed owner is waited out, not refused. Returns the `mod_revision` of the
+/// grant record judged, 0 for none.
 ///
 /// The freeze is the node's, so this keeps it to nodes with nothing left to stop (issue #79
-/// S3).
+/// S3). A host fault is the whole host's and lasts the boot, so a faulted owner has nothing left
+/// to stop either (issue #122): it goes on to the grant checks as a silent one does.
 ///
 /// # Errors
 ///
-/// [`PromoteError::OwnerAlive`] when it answers or its expiry moves; [`PromoteError::Control`]
-/// when the store does not answer or the wait runs out. Nothing has been written either way.
+/// [`PromoteError::OwnerAlive`] when it answers without a fault or its expiry moves;
+/// [`PromoteError::Control`] when the store does not answer or the wait runs out. Nothing has
+/// been written either way.
 async fn owner_dead(
     ctx: &PromoteCtx,
     prior: NodeId,
@@ -3332,9 +3338,17 @@ async fn owner_dead(
         }
         if !looked {
             looked = true;
-            if owner_answers(ctx, prior).await {
-                tracing::warn!(owner = prior.0, "promote_owner_answered");
-                return Err(alive("it answered a look"));
+            match owner_answers(ctx, prior).await {
+                Some(NodeStatus { fault: None, .. }) => {
+                    tracing::warn!(owner = prior.0, "promote_owner_answered");
+                    return Err(alive("it answered a look"));
+                }
+                Some(NodeStatus {
+                    fault: Some(fault), ..
+                }) => {
+                    tracing::warn!(owner = prior.0, %fault, "promote_owner_faulted");
+                }
+                None => {}
             }
         }
         let Some((revision, held)) = found else {
