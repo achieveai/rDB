@@ -430,3 +430,86 @@ impl ConfigStore for PrefixCut {
         self.inner.watch_leader(request).await
     }
 }
+
+/// Where a [`PutHold`] parks a put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldAt {
+    /// Before the put reaches the store: nothing is written.
+    BeforeApply,
+    /// After the store applied it, before its reply comes back.
+    BeforeReply,
+}
+
+/// Any control store with every put of a key under one prefix parked for good at `at`, after
+/// [`PutHold::arrived`] is notified: a row drops the caller's future there, which is how a
+/// process stopped mid-write leaves it (PR #119 review, interrupted sweeps). Every other call
+/// passes.
+pub(crate) struct PutHold {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    prefix: Vec<u8>,
+    at: HoldAt,
+    /// One permit per parked put.
+    pub(crate) arrived: Notify,
+}
+
+impl PutHold {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        prefix: &str,
+        at: HoldAt,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            at,
+            arrived: Notify::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PutHold {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        if !request.key.starts_with(&self.prefix) {
+            return self.inner.put(request).await;
+        }
+        if self.at == HoldAt::BeforeReply {
+            let applied = self.inner.put(request).await;
+            tracing::info!(?applied, "test_put_hold_applied");
+        }
+        tracing::info!(prefix = %String::from_utf8_lossy(&self.prefix), at = ?self.at, "test_put_held");
+        self.arrived.notify_one();
+        std::future::pending().await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}

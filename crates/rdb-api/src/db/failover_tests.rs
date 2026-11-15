@@ -12,7 +12,8 @@ use super::*;
 use crate::net::faults::{CutStore, Faults};
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
 use crate::planner::Failover;
-use crate::test_store::{CutCalls, PrefixCut};
+use crate::test_store::{CutCalls, HoldAt, PrefixCut, PutHold};
+use rdb_core::authority::partition::PartitionLifecycle;
 
 /// One node process.
 struct Proc {
@@ -1344,4 +1345,200 @@ fn own81_promote_failure_warns_once() {
     assert_eq!(recovered.len(), 1, "{recovered:?}");
     assert_eq!(recovered[0]["suppressed"], 3, "{recovered:?}");
     assert_ne!(rig.owner(p), NodeId(1));
+}
+
+/// `grants/{node}` and the revision it was written at.
+fn grant_at(rig: &Rig, node: NodeId) -> Option<(rdb_core::authority::grant::GrantRecord, u64)> {
+    rig.rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+        }))
+        .expect("the store answers")
+        .record
+        .map(|found| {
+            (
+                rdb_core::authority::grant::GrantRecord::decode(&found.value).expect("a grant"),
+                found.mod_revision,
+            )
+        })
+}
+
+/// Sweep with `planner` until a sweep acts, and return what it did.
+fn sweep_until_acted(
+    rig: &Rig,
+    planner: &crate::planner::Planner,
+    memory: &mut crate::planner::Memory,
+) -> Vec<(
+    PartitionId,
+    Result<crate::admin::Promoted, crate::admin::PromoteError>,
+)> {
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+    loop {
+        let answers = rig.rt.block_on(planner.sweep(memory));
+        if !answers.is_empty() {
+            return answers;
+        }
+        assert!(Instant::now() < deadline, "no sweep acted");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The interrupted-sweep rows (PR #119 review): node 1 stops and node 2's planner fails its
+/// partition over, but that planner is interrupted at its freeze of `grants/1`, `at` the
+/// point the hold names: its sweep is dropped there, as a stopped process leaves it. The next
+/// attempt fails too (its `partitions/` writes are cut). Then the planner restarts with a
+/// fresh `Memory` and nothing cut.
+///
+/// Asserted: no attempt before the restart commits (generation unchanged, the record left
+/// `Fencing`); the restarted planner moves the partition once (one commit, one new
+/// generation, and a further sweep does nothing); `grants/1` is frozen from the first applied
+/// freeze on and never rewritten; and node 1's old boot, resumed, cannot write.
+fn interrupted_sweep(method: &str, at: HoldAt) {
+    let rig = rig(1, None);
+    let before = rig.record(1);
+    assert_eq!(before.owner, NodeId(1), "{before:?}");
+    let planner = || {
+        rig.procs[1]
+            .db
+            .planner(failover())
+            .expect("a node process's planner")
+    };
+    let base = planner();
+    let hold = PutHold::new(
+        Arc::clone(&base.store),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        at,
+    );
+    let interrupted = crate::planner::Planner {
+        store: Arc::clone(&hold) as Arc<dyn ConfigStore>,
+        ..base
+    };
+    rig.stop(0);
+    let mut memory = crate::planner::Memory::default();
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+    loop {
+        let parked = rig.rt.block_on(async {
+            tokio::select! {
+                answers = interrupted.sweep(&mut memory) => {
+                    assert!(answers.is_empty(), "the freeze is held: {answers:?}");
+                    false
+                }
+                () = hold.arrived.notified() => true,
+            }
+        });
+        if parked {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no promote reached the freeze");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let fenced = rig.record(1);
+    assert_eq!(
+        (fenced.generation, fenced.owner, fenced.lifecycle),
+        (before.generation, NodeId(1), PartitionLifecycle::Fencing),
+        "interrupted at the freeze, after Fencing: {fenced:?}"
+    );
+    let frozen = grant_at(&rig, NodeId(1));
+    match at {
+        HoldAt::BeforeApply => assert!(
+            frozen.is_some_and(|(grant, _)| !grant.frozen),
+            "the freeze never applied: {frozen:?}"
+        ),
+        HoldAt::BeforeReply => assert!(
+            frozen.is_some_and(|(grant, _)| grant.frozen),
+            "the freeze applied: {frozen:?}"
+        ),
+    }
+
+    let cut = PrefixCut::new(
+        Arc::clone(&planner().store),
+        ControlPrefix::Partitions.encode(),
+        CutCalls::Writes,
+    );
+    let failing = crate::planner::Planner {
+        store: Arc::clone(&cut) as Arc<dyn ConfigStore>,
+        ..planner()
+    };
+    let answers = sweep_until_acted(&rig, &failing, &mut memory);
+    assert!(
+        answers
+            .iter()
+            .all(|(partition, answer)| partition.0 == 1 && answer.is_err()),
+        "the retry's Fencing write is cut: {answers:?}"
+    );
+    let retried = rig.record(1);
+    assert_eq!(retried.generation, before.generation, "{retried:?}");
+    if at == HoldAt::BeforeReply {
+        assert_eq!(
+            grant_at(&rig, NodeId(1)),
+            frozen,
+            "the frozen grant is not rewritten"
+        );
+    }
+
+    let restarted = planner();
+    let mut fresh = crate::planner::Memory::default();
+    let answers = sweep_until_acted(&rig, &restarted, &mut fresh);
+    let committed: Vec<_> = answers
+        .iter()
+        .filter(|(partition, answer)| partition.0 == 1 && answer.is_ok())
+        .collect();
+    assert_eq!(committed.len(), 1, "one commit: {answers:?}");
+    let after = rig.record(1);
+    assert_ne!(after.owner, NodeId(1), "{after:?}");
+    assert_eq!(after.lifecycle, PartitionLifecycle::Serving, "{after:?}");
+    assert_eq!(
+        after.generation.0,
+        before.generation.0 + 1,
+        "one new generation: {before:?} -> {after:?}"
+    );
+    let promoted: Vec<_> = logged(method, "planner_promoted")
+        .into_iter()
+        .filter(|line| line["partition"] == 1)
+        .collect();
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
+    let again = rig.rt.block_on(restarted.sweep(&mut fresh));
+    assert!(again.is_empty(), "moved once: {again:?}");
+    assert_eq!(rig.record(1).generation, after.generation);
+
+    let last = grant_at(&rig, NodeId(1));
+    assert!(last.is_some_and(|(grant, _)| grant.frozen), "{last:?}");
+    if at == HoldAt::BeforeReply {
+        assert_eq!(last, frozen, "the first freeze's record, never rewritten");
+    }
+
+    rig.resume(0);
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    app.route.owners[0].store(1, Ordering::Relaxed);
+    let refused = app
+        .put(b"interrupted", b"old", None)
+        .expect_err("node 1's old boot cannot write");
+    assert!(refused.error.no_mutation, "{refused}");
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        grant_at(&rig, NodeId(1)),
+        last,
+        "grants/1 stays as the promote left it"
+    );
+}
+
+/// PR #119 review (`sweep_restarts_before_freeze`): the planner is interrupted at `Fencing`,
+/// before its freeze of `grants/1` applies ([`interrupted_sweep`]).
+/// Integration (~15 s): waits out the grant, then three sweeps whose looks wait the read
+/// timeout.
+/// Cut: `promote_looked` refuses a record a stopped run left `Fencing` (A-R447); the restarted
+/// planner never moves the partition, red.
+#[config_log::retcd_test]
+fn own81_sweep_restarts_before_freeze() {
+    interrupted_sweep("own81_sweep_restarts_before_freeze", HoldAt::BeforeApply);
+}
+
+/// PR #119 review (`sweep_restarts_after_freeze`): the planner is interrupted after its freeze
+/// of `grants/1` applied and before the reply came back ([`interrupted_sweep`]). The retry and
+/// the restart find the record frozen and keep it as it is.
+/// Integration (~15 s), as the row above.
+/// Cut: `freeze` rewrites a record it finds frozen; the frozen grant's revision moves, red.
+#[config_log::retcd_test]
+fn own81_sweep_restarts_after_freeze() {
+    interrupted_sweep("own81_sweep_restarts_after_freeze", HoldAt::BeforeReply);
 }
