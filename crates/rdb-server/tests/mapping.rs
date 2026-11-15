@@ -293,6 +293,36 @@ fn a_not_wired_step_says_another_node_can_take_over() {
     }
 }
 
+/// PR #129 review: an undecodable call is `NotWired` and proven unsent too, but no takeover
+/// fixes it, so its step offers the takeover only "if the owner faulted", which keeps it from
+/// contradicting the detail's "sending it again will not help". The detail is the one
+/// `rdb_api`'s `undecodable_call` (net/mod.rs) writes, copied here since that function is
+/// private. Cut: drop "if the owner faulted, " from `wire_step`'s `no_mutation` true step: red.
+#[test]
+fn an_undecodable_call_offers_the_takeover_only_if_the_owner_faulted() {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        "node 2's process could not decode the call (bad frame); it was not run, and sending it \
+         again will not help: check both sides run the same build",
+    );
+    error.retry = RetryRule::NotWired;
+    error.no_mutation = true;
+    let message = wire_message(&error);
+    assert!(
+        message.contains("sending it again will not help"),
+        "the detail is kept: {message}"
+    );
+    let takeovers = message.matches("once another node takes over").count();
+    assert_eq!(takeovers, 1, "{message}");
+    assert_eq!(
+        message
+            .matches("if the owner faulted, once another node takes over")
+            .count(),
+        takeovers,
+        "every takeover clause is conditional: {message}"
+    );
+}
+
 /// C7: a refused conditional write says it changed nothing and is `FAILED_PRECONDITION`.
 #[test]
 fn c7_condition_failed_is_definitive_and_changed_nothing() {

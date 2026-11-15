@@ -1122,6 +1122,37 @@ mod tests {
         );
     }
 
+    /// PR #129 review: a host fault proven to have written nothing tells a read, after
+    /// `Db::wait_ready`, to read again. Cut: drop "a read reads again" from `owner_fault_step`
+    /// true: red.
+    #[test]
+    fn an_unsent_host_fault_says_a_read_reads_again() {
+        let mut error = ApiError::host("storage read fault");
+        error.no_mutation = true;
+        let step = error.next_step().expect("a host fault has a step");
+        assert!(
+            step.contains("call `Db::wait_ready` until it returns `Ok`; then a read reads again"),
+            "{step}"
+        );
+    }
+
+    /// PR #129 review: a host fault proven to have written nothing sends a write again as a new
+    /// write, naming the calls that do that, and never with `Db::resend`. Cut: drop the call
+    /// names or "not with `Db::resend`" from `owner_fault_step` true: red.
+    #[test]
+    fn an_unsent_host_fault_sends_a_write_as_new_never_resend() {
+        let mut error = ApiError::host("storage read fault");
+        error.no_mutation = true;
+        let step = error.next_step().expect("a host fault has a step");
+        assert!(
+            step.contains(
+                "a write is sent again as a new write (`Db::put`, `Db::txn` or `Db::write`), not \
+                 with `Db::resend`: this send wrote nothing"
+            ),
+            "{step}"
+        );
+    }
+
     /// When `db.rs` already ended the detail with "open the folder again", no second step is
     /// added, except `UnknownOutcome`'s, which still holds after the new open.
     #[test]
