@@ -10138,6 +10138,98 @@ mod tests {
         db.shutdown();
     }
 
+    /// #124 (ruling Q15 (b)): a write that reaches node 1 after it faulted was never admitted,
+    /// so its refusal says `no_mutation`. Two ways in: a fresh put, refused at its compile; and
+    /// the first send of a write compiled before the fault, refused by the faulted node. A
+    /// `db.resend` of that same request still says `no_mutation` false, as every resend does,
+    /// and node 1's held head does not move.
+    /// Cut: `Host::answer_faulted` answers with `Fault::error` (before #124): the first send
+    /// says `no_mutation` false, red.
+    #[config_log::retcd_test]
+    fn m10_124_a_write_that_reaches_a_faulted_owner_says_nothing_was_applied() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("put before the fault");
+        let identity = db.write_identity().expect("an id");
+        let compile = ClientCall::Compile {
+            identity,
+            puts: vec![PutOp {
+                group: GROUP,
+                object: Bytes::from_static(b"c"),
+                change: byte_doc(b"3"),
+                expect: None,
+            }],
+            remaining_millis: millis(db.timeouts.put),
+        };
+        let Some(Answer::Compiled(compiled)) = db.call(PARTITION, compile, db.timeouts.put) else {
+            panic!("the compile before the fault is answered");
+        };
+        let owner = |db: &Db| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == OWNER)
+                .expect("node 1 answers a status look")
+        };
+        let boot = db.boot_of(OWNER).expect("this Db runs node 1");
+        db.send_to(
+            OWNER,
+            Msg::Fault {
+                boot,
+                kind: "issue_124",
+                detail: "injected".to_owned(),
+            },
+        )
+        .expect("node 1 takes the fault");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let held = loop {
+            let status = owner(&db);
+            if status.fault.is_some() {
+                break status.holds.map(|held| (held.generation, held.applied));
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 never faulted: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let fresh = db
+            .put(b"b", b"2", None)
+            .expect_err("a faulted node writes nothing");
+        tracing::info!(error = ?fresh.error, "issue_124_fresh_put");
+        assert!(fresh.error.detail.contains("injected"), "{fresh:?}");
+        assert!(fresh.error.no_mutation, "a fresh put: {fresh:?}");
+        assert!(fresh.request.is_none(), "a fresh put: {fresh:?}");
+
+        let first = db
+            .send(
+                ClientCall::Resend {
+                    request: compiled.clone(),
+                },
+                db.timeouts.put,
+            )
+            .expect_err("a faulted node writes nothing");
+        tracing::info!(error = ?first.error, "issue_124_first_send");
+        assert!(first.error.detail.contains("injected"), "{first:?}");
+        assert!(
+            first.error.no_mutation,
+            "a first send that reached the faulted node: {first:?}"
+        );
+
+        let again = db
+            .resend(compiled)
+            .expect_err("a faulted node writes nothing");
+        assert!(!again.error.no_mutation, "a resend: {again:?}");
+        assert_eq!(
+            owner(&db).holds.map(|held| (held.generation, held.applied)),
+            held,
+            "node 1's held head after the refusals"
+        );
+        db.shutdown();
+    }
+
     /// D10 (A-R398, S2-4 `ahead2`): the old owner that a promote dropped is re-added when it
     /// restarts. Node 2 promoted, node 1 dropped; node 1 restarts at a new boot. Node 2 pins it
     /// back as a shadow, promotes it once caught up, and the partition is `Active` on three

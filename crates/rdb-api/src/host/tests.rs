@@ -1694,7 +1694,11 @@ fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
 /// A node that faults answers every waiting caller instead of leaving it hanging, and a
 /// waiting put keeps its request so the caller can resend it elsewhere. Every call after
 /// that is refused at once. The fault here is the control adapter's own (`Msg::Fault`), the
-/// one input that faults a healthy node without a kernel or storage defect.
+/// one input that faults a healthy node without a kernel or storage defect. The waiting put
+/// was admitted, so its answer says `no_mutation` false; a call after the fault was not, so
+/// its answer says true (#124, ruling Q15 (b)).
+/// Cut: `Host::answer_faulted` answers with `Fault::error` (before #124), red on the calls
+/// after the fault. `Fault::error` itself sets `no_mutation`, red on the waiting put.
 #[test]
 fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls() {
     let dir = config_testkit::fs::temp_dir();
@@ -1729,23 +1733,35 @@ fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls
         }) => {
             assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
             assert!(error.detail.contains("injected"), "{error:?}");
+            assert!(!error.no_mutation, "it was admitted: {error:?}");
             assert_eq!(request.identity, identity(1));
         }
         other => panic!("the waiting put: {other:?}"),
     }
 
-    let (reply, refused) = mpsc::channel();
-    host.handle(Msg::Client(Client {
-        partition: PartitionId(1),
-        call: get(2, b"a"),
-        reply,
-    }));
-    match refused.try_recv() {
-        Ok(Answer::Error {
-            error,
-            request: None,
-        }) => assert!(error.detail.contains("injected"), "{error:?}"),
-        other => panic!("a call after the fault: {other:?}"),
+    // #124: a call that arrives after the fault is refused before admission, so it says
+    // `no_mutation`, a put as well as a read.
+    for (name, call) in [("get", get(2, b"a")), ("put", put(3, b"b", b"2", None))] {
+        let (reply, refused) = mpsc::channel();
+        host.handle(Msg::Client(Client {
+            partition: PartitionId(1),
+            call,
+            reply,
+        }));
+        match refused.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: None,
+            }) => {
+                assert!(error.detail.contains("injected"), "{name}: {error:?}");
+                assert_eq!(
+                    (error.kind, error.retry, error.no_mutation),
+                    (ErrorKind::Unavailable, RetryRule::NotWired, true),
+                    "{name}: {error:?}"
+                );
+            }
+            other => panic!("a {name} after the fault: {other:?}"),
+        }
     }
     assert!(host.pending.is_empty(), "nothing is left waiting");
 }
