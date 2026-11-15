@@ -825,7 +825,11 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
         Vec::<serde_json::Value>::new(),
         "while node 2 had no grant of its own"
     );
-    assert_eq!(held.len(), 1, "node 2 heard with no grant of its own, said once: {held:?}");
+    assert_eq!(
+        held.len(),
+        1,
+        "node 2 heard with no grant of its own, said once: {held:?}"
+    );
     assert!(
         rig.grants()
             .get(&NodeId(2))
