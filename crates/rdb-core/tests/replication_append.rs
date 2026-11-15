@@ -535,10 +535,20 @@ fn declined(module: &mut Replication, ev: &Event) {
 /// A committed takeover to `NEW_GEN`/`NEW_EPOCH` at revision `REVISION`, pinning `pinned`,
 /// whose selected prefix ends at `(cutoff, cutoff_digest)` of generation `GEN`.
 fn recovered(cutoff: u64, cutoff_digest: Digest, pinned: PartitionConfig) -> Event {
+    recovered_at(NEW_GEN, cutoff, cutoff_digest, pinned)
+}
+
+/// [`recovered`] to `generation` instead of `NEW_GEN`.
+fn recovered_at(
+    generation: Generation,
+    cutoff: u64,
+    cutoff_digest: Digest,
+    pinned: PartitionConfig,
+) -> Event {
     let cutoff = Seq(cutoff);
     let root = Lineage {
         partition: P,
-        generation: NEW_GEN,
+        generation,
         owner_epoch: NEW_EPOCH,
     };
     let result = RecoveryResult {
@@ -561,7 +571,7 @@ fn recovered(cutoff: u64, cutoff_digest: Digest, pinned: PartitionConfig) -> Eve
             cutoff_digest,
             source: CopyId(2),
         },
-        new_generation: NEW_GEN,
+        new_generation: generation,
         mode: PartitionMode::Active,
         barrier: RecoveryBarrier::try_new(&[], &Default::default(), cutoff, cutoff_digest)
             .expect("an empty required set needs no proof"),
@@ -1528,6 +1538,127 @@ fn recovered_on_a_matching_cutoff_re_anchors_there_and_adopts_the_new_lineage() 
         &taken_over(chain(12).pop().expect("12")),
     );
     assert_eq!(staged_batch(&effects), (BatchId(3), NEW_GEN, Seq(12)));
+}
+
+/// #107 slice 2a (lead ruling on row 31b, narrowed): a receiver its host marked refused at a
+/// generation (`Replication::refuse_landing`) never anchors that generation's `Recovered` on a
+/// rung below the cutoff. B holds through 12 and the cutoff is 13 (`NotRetained`): unmarked it
+/// anchors at 12, marked it answers from the root, `NeedPrefix { have: Seq(0), head_digest:
+/// ROOT }`, exactly as a receiver built fresh after a restart does. Holding the cutoff (11,
+/// `Match`) it anchors there marked or not: a proven prefix, which issue #105's tail adoption
+/// relies on. A mark for another generation changes nothing.
+/// Cut: the refused `NotRetained` arm removed, red (`have: Seq(12)`).
+#[retcd_test]
+fn issue107_31b_a_receiver_refused_at_a_generation_never_anchors_below_its_cutoff() {
+    let mut module = applied_to(12);
+    assert!(module.refuse_landing(B, P, NEW_GEN), "a receiver to mark");
+    assert!(!module.refuse_landing(C, P, NEW_GEN), "no receiver on C");
+    let effects = step(&mut module, &recovered(13, d(13), takeover_config()));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })
+    );
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.applied_head(), rx_.received_seq(), rx_.durable_seq()),
+        (root_head(), ReceivedSeq(0), DurableSeq(0))
+    );
+    assert_eq!(rx_.history().highest(), Some(Seq::ZERO));
+    assert_eq!(rx_.lineage().generation, NEW_GEN);
+
+    // Marked, holding the cutoff: anchored at it, as unmarked.
+    let mut at_cutoff = applied_to(12);
+    assert!(at_cutoff.refuse_landing(B, P, NEW_GEN));
+    let effects = step(&mut at_cutoff, &recovered(11, d(11), takeover_config()));
+    asks_new_primary(&effects, 11);
+    assert_eq!(rx(&at_cutoff).applied_head(), head(11));
+
+    // Marked at another generation: today's anchor at its own head below the cutoff.
+    let mut other = applied_to(12);
+    assert!(other.refuse_landing(B, P, Generation(NEW_GEN.0 + 1)));
+    let effects = step(&mut other, &recovered(13, d(13), takeover_config()));
+    asks_new_primary(&effects, 12);
+    assert_eq!(rx(&other).applied_head(), head(12));
+}
+
+/// Blocker 2 (#107 slice 2a review): refusal evidence is kept per generation. B's host refuses two
+/// `ReadOnly` landings in one due batch, at `NEW_GEN` and at the generation after it, before
+/// either `Recovered` arrives. `NEW_GEN`'s cutoff is 11, which B holds (`Match`): it anchors there,
+/// a proved cutoff. The next generation's cutoff is 13, which B does not hold (`NotRetained`):
+/// it anchors at the root, and not at 11, the rung the first `Recovered` left it on.
+/// Cut: one slot for the mark (the second refusal overwrites the first, and the first
+/// `Recovered` clears it), red (the second anchors at `have: Seq(11)`).
+#[retcd_test]
+fn issue107_b2_two_refusals_in_one_batch_each_keep_their_own_anchor() {
+    let next = Generation(NEW_GEN.0 + 1);
+    let mut module = applied_to(12);
+    assert!(module.refuse_landing(B, P, NEW_GEN));
+    assert!(module.refuse_landing(B, P, next));
+
+    let effects = step(&mut module, &recovered(11, d(11), takeover_config()));
+    asks_new_primary(&effects, 11);
+    assert_eq!(rx(&module).applied_head(), head(11), "the proved cutoff");
+
+    let effects = step(
+        &mut module,
+        &recovered_at(next, 13, d(13), takeover_config()),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        }),
+        "the second refusal anchors at the root"
+    );
+    let rx_ = rx(&module);
+    assert_eq!(rx_.applied_head(), root_head());
+    assert_eq!(rx_.lineage().generation, next);
+}
+
+/// #107 slice 2a review, round 2 (an earlier barrier and a refused landing in one due batch),
+/// through `Replication`: a refusal mark on a dormant receiver outlives the earlier
+/// generation's `Recovered`, which removes that dormant receiver and builds a fresh one. B
+/// holds a dormant receiver at `(10, d10)`. Its host refuses the landing of the generation
+/// after `NEW_GEN` and marks it; then both `Recovered`s arrive, oldest first. `NEW_GEN`'s has
+/// a barrier over B at cutoff 10, so B is rebuilt fresh at the proved `(10, d10)`. The next
+/// one's cutoff is 13, which B does not hold (`NotRetained`): it answers from the root, as
+/// its mark says, and not from 10, the rung the rebuild left it on.
+/// Cut: the dormant receiver's marks not carried to the receiver built in its place, red
+/// (`have: Seq(10)`).
+#[retcd_test]
+fn issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild() {
+    let next = Generation(NEW_GEN.0 + 1);
+    let mut module = dormant_module();
+    assert!(
+        module.refuse_landing(B, P, next),
+        "the dormant receiver is marked"
+    );
+
+    let barrier = requiring(recovered(10, d(10), takeover_config()), &[1], B);
+    step(&mut module, &barrier);
+    assert!(!rx(&module).is_dormant(), "rebuilt fresh");
+    assert_eq!(rx(&module).applied_head(), head(10), "at the proved cutoff");
+
+    let effects = step(
+        &mut module,
+        &recovered_at(next, 13, d(13), takeover_config()),
+    );
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        }),
+        "the mark set on the dormant receiver holds"
+    );
+    assert_eq!(rx(&module).applied_head(), root_head());
 }
 
 /// The plan's fixture: B at `(15, d15)`, 16 staged, durable 12, quarantined; the takeover's
