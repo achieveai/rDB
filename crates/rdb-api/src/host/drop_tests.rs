@@ -6395,10 +6395,67 @@ fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
     assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
     assert_eq!(ended[0]["partition"], 1, "{ended:?}");
     assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
-    assert_eq!(ended[0]["waited_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
     assert_eq!(
         ended[0]["reason"], "stalled_copy_withholds_proof",
         "{ended:?}"
+    );
+}
+
+/// Issue #106 review: the A-R383 hold logged as started also ends when no member outside is
+/// linked any more, since no stalled copy can then hold the repair. Before, `repair_duty` returned
+/// on the empty linked set without ending it, so the hold stayed logged with no end event. Planted
+/// input as `i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold`; once the
+/// hold has started, node 1's links to nodes 2 and 3 are held.
+/// Cut: `repair_duty` no longer ends the hold when `linked` is empty, red (no end line).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rebuild_hold_ends_when_no_member_outside_is_linked() {
+    const METHOD: &str = "i106_a_rebuild_hold_ends_when_no_member_outside_is_linked";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let owner = &mut trio.nodes[0].0;
+    let committed = owner.committed.get_mut(&p).expect("node 1's commit");
+    committed.mode = PartitionMode::ReadOnly;
+    let generation = committed.new_generation;
+    let cutoff = committed.selected.cutoff_seq;
+    let since = owner.clock.now();
+    owner.rebuilds.insert(
+        p,
+        RebuildWatch {
+            generation,
+            mode: PartitionMode::ReadOnly,
+            cutoff,
+            required: vec![CopyId(0), CopyId(1), CopyId(2)],
+            since,
+            pinned: true,
+            unproven: BTreeSet::from([CopyId(2)]),
+            unreported: false,
+        },
+    );
+    owner
+        .latest_stall
+        .insert(p, (generation, BTreeSet::from([CopyId(2)])));
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "no_member_linked", "{ended:?}");
+    assert!(
+        !trio.nodes[0].0.rebuild_hold.contains_key(&p),
+        "the hold is forgotten"
     );
 }
 
