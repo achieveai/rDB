@@ -199,8 +199,22 @@ pub fn wire_message(error: &ApiError) -> String {
 pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'static str {
     const MAY_HAVE: &str = "the write may have applied: call Status with its request id before \
                             writing again, and never send it again as a new write";
+    // `NotWired` wins over the kind. The node that answered cannot serve the call, a faulted
+    // owner above all, so retrying at it will not help. Another node can take the partition
+    // over: an operator promote today, and automatic failover of a faulted owner once #122
+    // lands (ruling Q13). A fresh call then routes to the new owner and can succeed, so the
+    // step says so, and `no_mutation` picks how a write goes again (PR #129 review).
     if matches!(retry, RetryRule::NotWired) {
-        return "retrying will not help: keep the gateway's log and report this message";
+        return if no_mutation {
+            "retrying at this node will not help: keep the gateway's log and report this \
+             message; once another node takes over (an operator promote does that), call it \
+             again; this call wrote nothing, so a write goes again as a new Put or Txn"
+        } else {
+            "retrying at this node will not help: keep the gateway's log and report this \
+             message; once another node takes over (an operator promote does that), call \
+             Status with the write's request id before writing again, and never send it again \
+             as a new write"
+        };
     }
     match kind {
         ErrorKind::NotPrimary | ErrorKind::RouteChanged if no_mutation => {

@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use rdb_api::{ApiError, ErrorKind, Generation, RequestId, RetryRule};
-use rdb_server::{check_listen, code_for, rdb_error_of, to_status, wire_kind, wire_retry};
+use rdb_server::{
+    check_listen, code_for, rdb_error_of, to_status, wire_kind, wire_message, wire_retry,
+};
 
 /// Every kind, in the proto's order. `wire_kind` is exhaustive, so a new kind fails to compile
 /// there first; this list is then one more place to add it.
@@ -238,6 +240,36 @@ fn every_api_error_round_trips_through_the_rich_status() {
                 assert_eq!(unsent.generation, None, "{case}");
             }
         }
+    }
+}
+
+/// PR #129 review: a `NotWired` refusal, a faulted owner's above all, says retrying at that
+/// node will not help, and that a call can succeed once another node takes over. It invites a
+/// new write only when the call wrote nothing; otherwise it says to call Status first.
+/// Cut: the `no_mutation` false step reuses the true one's words: red on "Status".
+#[test]
+fn a_not_wired_step_says_another_node_can_take_over() {
+    for no_mutation in [false, true] {
+        let mut error = ApiError::new(ErrorKind::Unavailable, "host fault: injected");
+        error.retry = RetryRule::NotWired;
+        error.no_mutation = no_mutation;
+        let message = wire_message(&error);
+        let case = format!("no_mutation={no_mutation}: {message}");
+        assert!(
+            message.contains("retrying at this node will not help"),
+            "{case}"
+        );
+        assert!(message.contains("once another node takes over"), "{case}");
+        assert_eq!(
+            message.contains("as a new Put or Txn"),
+            no_mutation,
+            "{case}"
+        );
+        assert_eq!(
+            message.contains("call Status with the write's request id"),
+            !no_mutation,
+            "{case}"
+        );
     }
 }
 
