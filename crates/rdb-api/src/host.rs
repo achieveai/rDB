@@ -12199,11 +12199,8 @@ impl Host {
         {
             return false;
         }
-        if self.engine.buffered_applied(partition, l).0 == 0 {
-            return true;
-        }
-        match self.engine.history_at(partition, l, Seq(1)) {
-            Ok(found) => found.is_some(),
+        match self.has_floor(partition, l) {
+            Ok(floor) => floor,
             Err(fault) => {
                 tracing::error!(
                     node = self.node.0,
@@ -12215,6 +12212,26 @@ impl Host {
                 false
             }
         }
+    }
+
+    /// Whether `generation`'s lineage of `partition` reaches seq 1 through its chain, or applied
+    /// nothing: the one read behind both the intact rule ([`Self::holds_last_writable`]) and
+    /// check B (`from_has_no_floor`, issue #107 slice 1), which refuses to link a new generation
+    /// onto a lineage holed below its head. `history_at` walks the chain to the bottom, and
+    /// `History` falls through a copied level, so one read answers for every level. Depends on
+    /// seq 1 being kept: a history trim (#61) must revisit both callers.
+    fn has_floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<bool, StorageFault> {
+        if self.engine.buffered_applied(partition, generation).0 == 0 {
+            return Ok(true);
+        }
+        Ok(self
+            .engine
+            .history_at(partition, generation, Seq(1))?
+            .is_some())
     }
 
     /// Answer `TailHeld` for `hit` (issue #105), and report the refusal in this node's status,
@@ -12743,6 +12760,12 @@ impl Host {
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("missed_generation_link_depth_ceiling");
         }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("missed_generation_from_has_no_floor"),
+            Err(_) => return Err("missed_generation_history_read_failed"),
+        }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, base) {
             // Inventory cannot reach `AlreadyInherited`: once the link exists the anchor
@@ -12844,6 +12867,12 @@ impl Host {
         }
         if self.engine.chain_depth(partition, from) >= MAX_CHAIN_DEPTH {
             return Err("link_depth_ceiling");
+        }
+        // Check B (issue #107 slice 1): never link onto a lineage holed below its head.
+        match self.has_floor(partition, from) {
+            Ok(true) => {}
+            Ok(false) => return Err("from_has_no_floor"),
+            Err(_) => return Err("history_read_failed"),
         }
         self.views.remove(&partition);
         match self.engine.inherit(partition, from, to, head) {
