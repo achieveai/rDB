@@ -6296,6 +6296,112 @@ fn u2_a_member_answering_clean_repairs_when_the_other_members_tail_is_adoptable(
     assert!(held.is_empty(), "held for an adoptable tail: {held:?}");
 }
 
+/// Issue #106: A-R383 holds a `ReadOnly` commit's repair while a copy F1's stall named still
+/// answers, since that copy can still prove the rebuild. A copy whose status reports a tail past
+/// the pinned cutoff cannot: it withholds its post-commit proof (`sync_withheld`,
+/// `reason=tail_held`), so on real nodes the hold never ended and every put answered
+/// `RECOVERY_READ_ONLY` with no way out. Planted input as
+/// `s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail`: node 1's commit
+/// marked `ReadOnly`, its rebuild pinned, F1's latest stall naming node 3's copy. While node 3
+/// answers clean the repair waits on the rebuild (one Information line,
+/// `membership_repair_rebuild_hold_started`); once node 3 reports `held_past_base` above the
+/// cutoff the hold ends (`membership_repair_rebuild_hold_ended`, reason
+/// `stalled_copy_withholds_proof`) and S4d's tail hold takes over and names node 3, so
+/// `forget-tail` can see it. `repair_duty`, the probes and the `Inspect` answers are real.
+/// Cut: a stalled copy reporting a tail still holds in `repair_duty`, red (no hold end, no
+/// `membership_repair_held`).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
+    const METHOD: &str = "i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let owner = &mut trio.nodes[0].0;
+    let committed = owner.committed.get_mut(&p).expect("node 1's commit");
+    committed.mode = PartitionMode::ReadOnly;
+    let generation = committed.new_generation;
+    let cutoff = committed.selected.cutoff_seq;
+    let since = owner.clock.now();
+    owner.rebuilds.insert(
+        p,
+        RebuildWatch {
+            generation,
+            mode: PartitionMode::ReadOnly,
+            cutoff,
+            required: vec![CopyId(0), CopyId(1), CopyId(2)],
+            since,
+            pinned: true,
+            unproven: BTreeSet::from([CopyId(2)]),
+            unreported: false,
+        },
+    );
+    owner
+        .latest_stall
+        .insert(p, (generation, BTreeSet::from([CopyId(2)])));
+
+    // Five drop checks with node 3 answering clean, so a probe is sent and its answers read at
+    // least twice: the rebuild may still finish, so the repair waits.
+    let until = trio.clock.now();
+    trio.until("five drop checks passed", |trio| {
+        (HostClock::millis_until(until, trio.clock.now()) >= 5 * DROP_CHECK_EVERY_MILLIS)
+            .then_some(())
+    });
+    assert!(
+        logged!(METHOD, "membership_repair_planned").is_empty(),
+        "a repair ran while the stalled copy answers clean"
+    );
+
+    trio.nodes[2].0.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: before,
+            head: Seq(cutoff.0 + 1),
+            base: cutoff,
+            reason: "held_past_base",
+            adoption: TailAdoption::Unchecked,
+        },
+    );
+    let held = trio.until("S4d's tail hold names node 3", |_| {
+        let held: Vec<_> = logged!(METHOD, "membership_repair_held")
+            .into_iter()
+            .filter(|line| line["reason"] == "held_past_base")
+            .collect();
+        (!held.is_empty()).then_some(held)
+    });
+    assert_eq!(held[0]["copy_node"], 3, "{held:?}");
+    assert!(
+        trio.nodes[0].0.tail_holds[&p]
+            .iter()
+            .any(|hold| hold.node == NodeId(3)),
+        "forget-tail can see node 3's tail"
+    );
+
+    let started_lines = logged!(METHOD, "membership_repair_rebuild_hold_started");
+    assert_eq!(
+        started_lines.len(),
+        1,
+        "the hold started once: {started_lines:?}"
+    );
+    assert_eq!(started_lines[0]["@l"], "Information", "{started_lines:?}");
+    assert_eq!(started_lines[0]["partition"], 1, "{started_lines:?}");
+    assert_eq!(
+        started_lines[0]["generation"], generation.0,
+        "{started_lines:?}"
+    );
+    assert_eq!(started_lines[0]["waits_on"], "[3]", "{started_lines:?}");
+    let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waited_on"], "[3]", "{ended:?}");
+    assert_eq!(
+        ended[0]["reason"], "stalled_copy_withholds_proof",
+        "{ended:?}"
+    );
+}
+
 /// #79 S4d: a full copy that stopped part way leaves a staged child, which no landing or inventory
 /// will ever succeed on. The status says so as `interrupted_copy` (so a restart, which loses the
 /// recorded refusals, cannot hide it), for the newest lineage only: a remnant below a newer

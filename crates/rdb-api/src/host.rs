@@ -2703,6 +2703,10 @@ struct Host {
     /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
+    /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
+    /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
+    /// to log once per change and to log the hold's end.
+    rebuild_hold: BTreeMap<PartitionId, (Generation, Vec<NodeId>)>,
     /// The copies F1 named in `RebuildStalled` during the step being run, per partition.
     stall_step: BTreeMap<PartitionId, BTreeSet<CopyId>>,
     /// Per partition, the copies F1's latest `RebuildStalled` step named, with the watched
@@ -2906,6 +2910,7 @@ impl Host {
             repair_probes: BTreeMap::new(),
             tail_refused: BTreeMap::new(),
             tail_holds: BTreeMap::new(),
+            rebuild_hold: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
@@ -7255,7 +7260,10 @@ impl Host {
     /// `membership_repair_held`. While F1's rebuild is pinned nothing runs until F1's deadline
     /// reports a stall, and then only when no copy that latest stall named answers (A-R383,
     /// A-R426 M8): at cutoff 0 the pin is set on every commit, so a dead copy would otherwise
-    /// hold a `ReadOnly` partition for good.
+    /// hold a `ReadOnly` partition for good. A stalled copy reporting a tail above the pinned
+    /// cutoff counts as not answering (issue #106): it withholds its proof, so the rebuild can
+    /// never finish on it, and S4d's tail hold decides instead. The hold's start and end are
+    /// logged at info, `membership_repair_rebuild_hold_started` and `_ended`.
     ///
     /// Answered (A-R350). Once the hold has passed, a check sends each linked member an
     /// `Inspect` and the next check reads the answers: an answer must arrive within one check.
@@ -7291,6 +7299,15 @@ impl Host {
             .get(&partition)
             .map(|committed| committed.committed.pinned_config.members.clone())
             .unwrap_or_default();
+        if outside.is_empty() {
+            self.end_rebuild_hold(partition, "not_read_only");
+        } else if self
+            .rebuild_hold
+            .get(&partition)
+            .is_some_and(|(held, _)| pinned != Some(*held))
+        {
+            self.end_rebuild_hold(partition, "rebuild_not_pinned");
+        }
         let latest = self.latest_stall.get(&partition);
         if outside.is_empty() || rebuild_holds_repair(pinned, latest, &[], &members) {
             self.repair_since.remove(&partition);
@@ -7376,10 +7393,27 @@ impl Host {
                         .is_some_and(|tail| tail.adoption.is_adoptable())
             })
         };
+        // Issue #106: nor does a stalled copy reporting a tail above the pinned cutoff. It
+        // withholds its post-commit proof for that tail (`sync_withheld`, `reason=tail_held`), so
+        // it can never prove the rebuild A-R383 waits for. S4d's tail hold below decides for it.
+        let cutoff = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| watch.pinned)
+            .map(|watch| watch.cutoff);
+        let withholds = |node: &NodeId| {
+            answers.iter().any(|(answered, status)| {
+                answered == node
+                    && status
+                        .tail_refused
+                        .zip(cutoff)
+                        .is_some_and(|(tail, cutoff)| tail.head > cutoff)
+            })
+        };
         let holding: Vec<NodeId> = answered
             .iter()
             .copied()
-            .filter(|node| !adoptable(node))
+            .filter(|node| !adoptable(node) && !withholds(node))
             .collect();
         if answered.is_empty() {
             let probes: Vec<RepairProbe> = linked
@@ -7409,6 +7443,34 @@ impl Host {
             &holding,
             &members,
         ) {
+            let stalled = self
+                .latest_stall
+                .get(&partition)
+                .map(|(_, copies)| copies.clone())
+                .unwrap_or_default();
+            let waits_on: Vec<NodeId> = holding
+                .iter()
+                .copied()
+                .filter(|node| {
+                    members
+                        .iter()
+                        .any(|member| member.node == *node && stalled.contains(&member.copy))
+                })
+                .collect();
+            if let Some(pinned) = pinned {
+                let hold = (pinned, waits_on);
+                if self.rebuild_hold.get(&partition) != Some(&hold) {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        generation = pinned.0,
+                        waits_on = ?hold.1.iter().map(|node| node.0).collect::<Vec<_>>(),
+                        reason = "stalled_copy_answers",
+                        "membership_repair_rebuild_hold_started"
+                    );
+                    self.rebuild_hold.insert(partition, hold);
+                }
+            }
             tracing::debug!(
                 node = self.node.0,
                 partition = partition.0,
@@ -7417,6 +7479,18 @@ impl Host {
                 "membership_repair_waits_on_rebuild"
             );
             return;
+        }
+        let ended = self.rebuild_hold.get(&partition).map(|(_, waited_on)| {
+            if waited_on.iter().any(withholds) {
+                "stalled_copy_withholds_proof"
+            } else if waited_on.iter().any(adoptable) {
+                "stalled_copy_tail_adoptable"
+            } else {
+                "stalled_copy_silent"
+            }
+        });
+        if let Some(reason) = ended {
+            self.end_rebuild_hold(partition, reason);
         }
         // #79 S4d, widened by #105: a member that answered holds a tail or an interrupted copy,
         // which no repair can take back. F1 caps any commit while that tail is held, so a repair
@@ -7466,6 +7540,21 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
+    /// `reason`: logged once, `membership_repair_rebuild_hold_ended`. Nothing when none was held.
+    fn end_rebuild_hold(&mut self, partition: PartitionId, reason: &'static str) {
+        if let Some((generation, waited_on)) = self.rebuild_hold.remove(&partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                waited_on = ?waited_on.iter().map(|node| node.0).collect::<Vec<_>>(),
+                reason,
+                "membership_repair_rebuild_hold_ended"
+            );
+        }
     }
 
     /// A repair is held because every member that answered reports a [`TailRefused`] (#79 S4d):
@@ -14205,7 +14294,9 @@ fn regular_secondaries(members: &[Member]) -> Vec<NodeId> {
 /// the rebuild may still finish. Pinned and stalled: while a node in `answered` holds one of
 /// the stalled copies, since an answering copy can still prove the point. A stalled copy that
 /// does not answer (dead, half-open) holds nothing: at cutoff 0 the pin is set on every commit,
-/// so it would otherwise keep the partition `ReadOnly` for good.
+/// so it would otherwise keep the partition `ReadOnly` for good. The caller leaves out of
+/// `answered` a copy that cannot prove it either: one whose tail is adoptable (#105) or above the
+/// pinned cutoff (#106).
 fn rebuild_holds_repair(
     pinned: Option<Generation>,
     latest: Option<&(Generation, BTreeSet<CopyId>)>,
