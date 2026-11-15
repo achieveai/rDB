@@ -242,7 +242,10 @@ pub const MIN_UNREACHABLE_DROP_AFTER_MILLIS: u64 = 2_000;
 /// host rows 123 records behind paused writes 717 ms; at 32 the pause measured 133-193 ms
 /// (2026-10-26), under the 0.5 s goal with the re-plan's own cost. A shadow that keeps up
 /// trails by the records in flight, far below this; one that trails more is still catching up,
-/// and waits. If writes land faster than it catches up, it waits until they slow.
+/// and waits. The owner judges it when the shadow's `CopyCaughtUp` arrives, at the head, as
+/// well as at each drop duty (issue #113, promote at catch-up). Between R1's shadow probes a
+/// shadow trails by one probe interval of writes, so under nonstop writes a drop duty alone
+/// always found it past this bound and never promoted it.
 pub const PROMOTE_LAG_RECORDS: u64 = 32;
 
 /// A-R458, A-R461: the most records a node reads ahead into its kept ladders in one duty: an
@@ -6063,6 +6066,7 @@ impl Host {
             } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                self.shadow_at_head(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -8278,12 +8282,34 @@ impl Host {
         );
     }
 
+    /// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): `copy` sent `CopyCaughtUp`
+    /// for `partition`, so if the commit pins it as the shadow, judge its promote now with
+    /// [`Self::shadow_duty`] and every guard there: the owner, no re-plan running, the link,
+    /// the move and member checks, and A-R442's lag bound. R1 feeds a shadow by its probe, not
+    /// the stream, so between probes it trails by one probe interval of writes; judged only at
+    /// the drop duty, a writer that never slows found it behind at every duty for good.
+    fn shadow_at_head(&mut self, partition: PartitionId, copy: CopyId) {
+        let shadow = self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| member.copy == copy && member.role == ReplicaRole::Shadow)
+        });
+        if shadow {
+            let now = self.clock.now();
+            self.shadow_duty(partition, now);
+        }
+    }
+
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
     /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
     /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
     /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
     /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
-    /// while a re-plan runs, or on a node that is not the commit's pinned primary.
+    /// while a re-plan runs, or on a node that is not the commit's pinned primary. Runs at each
+    /// drop duty and when the shadow reports it caught up ([`Self::shadow_at_head`], #113).
     fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
         // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
         let lagging = self.move_catching_up.remove(&partition);
