@@ -4894,9 +4894,7 @@ mod tests {
                 if undo {
                     self.undo_tried.store(true, Ordering::SeqCst);
                 }
-                if undo
-                    && matches!(self.undo, UndoFault::Dropped | UndoFault::DroppedUnreadable)
-                {
+                if undo && matches!(self.undo, UndoFault::Dropped | UndoFault::DroppedUnreadable) {
                     return Err(ConfigError::DeadlineExceededUnknownOutcome);
                 }
                 if undo && self.undo == UndoFault::Overtaken {
@@ -5378,7 +5376,11 @@ mod tests {
             "the reread's error: {why}"
         );
         assert!(!why.contains("nothing left to resume"), "{why}");
-        assert_eq!(undo_outcomes(METHOD), [0, 0, 1, 0], "only the unknown outcome");
+        assert_eq!(
+            undo_outcomes(METHOD),
+            [0, 0, 1, 0],
+            "only the unknown outcome"
+        );
         let (record, ..) = rt
             .block_on(read_partition(&store.inner, PARTITION))
             .expect("read");
@@ -5422,7 +5424,11 @@ mod tests {
             .expect("partitions/1");
         assert_eq!(found.value, bytes, "the newer record's bytes are unchanged");
         assert_eq!(found.mod_revision, revision, "and so is its revision");
-        assert_eq!(undo_outcomes(METHOD), [0, 0, 0, 1], "only the overtaken outcome");
+        assert_eq!(
+            undo_outcomes(METHOD),
+            [0, 0, 0, 1],
+            "only the overtaken outcome"
+        );
     }
 
     /// PR #119 review round 3 (spec §7.3): the owner comes back under a new, live grant right
@@ -5473,7 +5479,11 @@ mod tests {
         assert_eq!(grant.grant, LIVE_GRANT, "{grant:?}");
         assert!(!grant.frozen, "unfrozen: {grant:?}");
         assert!(grant.expiry_utc_ms > expiry_ahead(0), "live: {grant:?}");
-        assert_eq!(undo_outcomes(METHOD), [0, 1, 0, 0], "only the still-fenced outcome");
+        assert_eq!(
+            undo_outcomes(METHOD),
+            [0, 1, 0, 0],
+            "only the still-fenced outcome"
+        );
     }
 
     /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying

@@ -274,7 +274,8 @@ fn messages(method: &str, message: &str) -> Vec<serde_json::Value> {
 /// stops renewing, and the loser takes it over only after the expiry is proven, with the next
 /// grant id; the old holder logs the loss on its next pass. On a held clock the takeover
 /// boundary is exact: refused at `E + eps + delta` after the winner's write, taken 1 ms later.
-/// Cut: write the grant unconditionally (`expected_mod_revision: None`), both hold, red.
+/// The race here is not forced, so writing the grant unconditionally does not reliably go red
+/// in this row (issue #133); [`expired_grant_takeovers_race`] forces it.
 /// Cut: take over once `E` alone has passed (drop `eps + delta`); taken at the boundary, red.
 #[config_log::retcd_test]
 fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
@@ -351,6 +352,110 @@ fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
         "{lost:?}"
     );
     assert_eq!(messages(METHOD, "planner_grant_acquired").len(), 2);
+}
+
+/// `planner/grant`'s stored bytes and `mod_revision`, as they are.
+async fn planner_grant_raw(store: &Arc<dyn ConfigStore>) -> Option<(Bytes, u64)> {
+    store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::PlannerGrant.encode()),
+        })
+        .await
+        .expect("the store answers")
+        .record
+        .map(|found| (found.value, found.mod_revision))
+}
+
+/// Issue #133, PR #119 review round 3 (`expired_grant_takeovers_race`): node 4's grant has
+/// expired, and two planners of other identities (nodes 2 and 3) read it at the same nonzero
+/// revision and both decide to take it over. The order is forced: each one's write is held at
+/// the store's gate before either applies. Node 2's is let through first and holds; its record
+/// is snapshotted. Then node 3's stale write is let through: its CAS at the old revision
+/// conflicts, so it holds nothing, its `Memory` stays empty, and node 2's record is byte for
+/// byte and revision for revision as it was. The grant id rose once, 1 to 2. Unit, held clock.
+/// Cut: write the grant unconditionally (`expected_mod_revision: None`); node 3 overwrites
+/// node 2's record and holds too, red.
+#[config_log::retcd_test]
+fn expired_grant_takeovers_race() {
+    let rt = crate::db::reopen_tests::runtime();
+    // Node 4's first write passes the gate; every write after it waits there.
+    let gated = Arc::new(crate::test_store::Scripted::gated_with(
+        crate::test_store::Script {
+            pass_gate: 1,
+            ..crate::test_store::Script::default()
+        },
+    ));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let (clock, hold, start) = held_clock();
+    let [old, first, stale] = [4, 2, 3].map(|node| Planner {
+        clock,
+        ..planner(node, &store, healthy_links(node))
+    });
+    let budgets = old.budgets;
+    let mut mo = Memory::default();
+    assert!(rt.block_on(old.hold(&mut mo)), "node 4 holds");
+    let (expired, expired_at) = planner_grant_at(&rt, &store).expect("node 4's grant");
+    assert_eq!((expired.node, expired.grant), (NodeId(4), GrantId(1)));
+    assert!(expired_at > 0, "a nonzero revision: {expired_at}");
+
+    hold.advance(takeover_floor(&budgets) + 1);
+    let (mut m2, mut m3) = (Memory::default(), Memory::default());
+    let (stale_started, first_done) = (tokio::sync::Notify::new(), tokio::sync::Notify::new());
+    let (held_first, held_stale, snapshot) = rt.block_on(async {
+        tokio::join!(
+            async {
+                let held = first.hold(&mut m2).await;
+                first_done.notify_one();
+                held
+            },
+            async {
+                // Node 2's write is parked at the gate; only now does node 3 read, so it reads
+                // the same expired record at the same revision.
+                gated.put_arrived.notified().await;
+                stale_started.notify_one();
+                stale.hold(&mut m3).await
+            },
+            async {
+                stale_started.notified().await;
+                // Node 3's write is parked behind node 2's.
+                gated.put_arrived.notified().await;
+                gated.release();
+                first_done.notified().await;
+                let snapshot = planner_grant_raw(&store).await.expect("node 2's write");
+                gated.release();
+                snapshot
+            }
+        )
+    });
+    assert!(held_first, "node 2, released first, holds");
+    assert!(!held_stale, "node 3's stale CAS holds nothing");
+    assert!(
+        m3.held.is_none(),
+        "the loser's Memory is empty: {:?}",
+        m3.held
+    );
+    let (bytes, revision) = snapshot;
+    assert!(revision > expired_at, "{expired_at} -> {revision}");
+    assert_eq!(
+        rt.block_on(planner_grant_raw(&store)),
+        Some((bytes, revision)),
+        "node 2's record is not overwritten by the stale write"
+    );
+    let (record, _) = planner_grant_at(&rt, &store).expect("a grant");
+    assert_eq!(
+        (record.node, record.grant, record.expiry_utc_ms),
+        (
+            NodeId(2),
+            GrantId(2),
+            expiry_from(start + takeover_floor(&budgets) + 1, &budgets)
+        ),
+        "one takeover: the grant id rose once"
+    );
+    assert_eq!(
+        m2.held.map(|held| held.grant),
+        Some(GrantId(2)),
+        "node 2 holds what it wrote"
+    );
 }
 
 /// C1, the planner's half: with no clock bound the planner writes nothing, not even its own
@@ -569,7 +674,8 @@ fn own81_lost_grant_reply_is_not_held() {
 /// `r1` and CASes a renewal at `r1`; while that put waits, a second renewal of the same grant
 /// (node 2, boot 1, its own `Memory`) CASes at the same nonzero `r1` first and holds. The
 /// waiting renewal then loses its CAS: it holds nothing and overwrites nothing, so the record
-/// is the competitor's, at the competitor's revision and expiry. Unit, held clock.
+/// is the competitor's, at the competitor's revision and expiry: its bytes and revision are
+/// snapshotted before the late renewal is let go and are the same afterwards. Unit, held clock.
 /// Cut: renew unconditionally (`expected_mod_revision: None`); the late renewal overwrites
 /// the record and holds, red.
 #[config_log::retcd_test]
@@ -603,7 +709,7 @@ fn own81_a_competing_renewal_after_a_lost_reply_wins_and_is_not_overwritten() {
 
     hold.advance(10);
     let mut theirs = Memory::default();
-    let (held, competed) = rt.block_on(async {
+    let (held, (competed, snapshot)) = rt.block_on(async {
         tokio::join!(lost.hold(&mut memory), async {
             gated.put_arrived.notified().await;
             // The late renewal waits at the gate, its CAS at `r1`. The competitor's passes.
@@ -613,11 +719,25 @@ fn own81_a_competing_renewal_after_a_lost_reply_wins_and_is_not_overwritten() {
                 ..crate::test_store::Script::default()
             }));
             let competed = competitor.hold(&mut theirs).await;
+            // The competitor's record as it stands before the late renewal is let go.
+            let snapshot = planner_grant_raw(&store)
+                .await
+                .expect("the competitor's write");
             gated.release();
-            competed
+            (competed, snapshot)
         })
     });
     assert!(competed, "the competing renewal at r1 holds");
+    assert_eq!(
+        rt.block_on(planner_grant_raw(&store)),
+        Some(snapshot.clone()),
+        "the competitor's bytes and revision are unchanged after the late renewal"
+    );
+    assert!(
+        snapshot.1 > r1,
+        "the competitor wrote: {r1} -> {}",
+        snapshot.1
+    );
     assert!(!held, "the renewal that lost its CAS holds nothing");
     assert!(memory.held.is_none(), "{:?}", memory.held);
     let (record, at) = planner_grant_at(&rt, &store).expect("a record");
