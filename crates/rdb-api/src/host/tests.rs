@@ -7057,9 +7057,9 @@ fn commit_empty(host: &mut Host, seq: u64) {
         .expect("commit");
 }
 
-/// Issue #109: a WAL sync in flight for 13,058 ms (the restart after the gateway's 54 GB load)
-/// that then returns is a slow disk, not a stuck one. At the default limits the node does not
-/// fault: the watchdog logs `wal_sync_slow_in_flight` (Warn) once it passes the slow limit, the
+/// Issue #109: a WAL sync in flight for 13,058 ms (as long as the one #109 saw; whether that one
+/// would have returned is not known) that then returns is slow, not stuck. At the default
+/// limits the node does not fault: the watchdog logs `wal_sync_slow_in_flight` (Warn) once it passes the slow limit, the
 /// sync returns and credits its capture, `wal_sync_slow` (Warn) names its duration and both
 /// limits, and the next write is made durable by the next sync. Red before the fix: the node
 /// faulted at 5 s, "WAL sync in flight for 13058 ms, past the 5000 ms stuck limit".
