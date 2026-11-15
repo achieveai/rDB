@@ -467,8 +467,10 @@ default) as the only way in:
   landing guards above, and check B, apply unchanged. One attempt per drop. A copy that does
   not answer, answers a fault, or is not taken waits a whole 5 s again.
 - **A refused receiver's anchor.** Check A drops a refused copy's live receiver only in a commit
-  that takes writes. In a `ReadOnly` commit the receiver stays, and its host marks it refused
-  at that generation (logged `land_receiver_marked_refused`). That generation's `Recovered` then
+  that takes writes. A receiver it keeps (any receiver in a `ReadOnly` commit, and a dormant
+  one in any commit) stays, and its host marks it refused at that generation (logged
+  `land_receiver_marked_refused`): a dormant receiver's `Recovered` anchors it as a live one's
+  does. That generation's `Recovered` then
   anchors the receiver at the cutoff when it holds the cutoff with its digest (a proved prefix),
   and otherwise at the root, `NeedPrefix { have: 0, ROOT }`, as a receiver built fresh after a
   restart does. It never anchors on a rung below the cutoff: R1 would start the walk inside the

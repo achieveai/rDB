@@ -4085,8 +4085,12 @@ fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
 /// Issue #107 slice 1, row 2a's dormant clause: check A drops only a live receiver. Node 2
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
-/// takes writes (`DegradedRf2`). The dormant receiver stays installed, unchanged, and no
-/// `land_receiver_dropped` is logged. Nothing links.
+/// takes writes (`DegradedRf2`). The dormant receiver stays installed and no
+/// `land_receiver_dropped` is logged. Nothing links. #107 slice 2a: the receiver it keeps is
+/// marked refused at generation 2 (`AppendReceiver::refuse_landing`, one
+/// `land_receiver_marked_refused`) and is otherwise unchanged: `on_recovered` anchors a dormant
+/// receiver as it does a live one, so generation 2's `Recovered` must not anchor it on a rung
+/// below the cutoff either.
 /// Cut: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is removed).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
@@ -4121,13 +4125,16 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
     let held = host.engine.lineages();
     assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
     assert_eq!(host.engine.lineages(), held, "nothing linked");
+    let mut marked = receiver.clone();
+    marked.refuse_landing(Generation(2));
     assert_eq!(
         host.replication.receiver(NodeId(2), PartitionId(1)),
-        Some(&receiver),
-        "the dormant receiver stays installed"
+        Some(&marked),
+        "the dormant receiver stays installed, marked refused at generation 2"
     );
     assert_eq!(host.fault, None);
     assert_eq!(logged!(METHOD, "land_receiver_dropped").len(), 0);
+    assert_eq!(logged!(METHOD, "land_receiver_marked_refused").len(), 1);
     let refused: Vec<_> = logged!(METHOD, "land_link_refused")
         .into_iter()
         .map(|line| line["reason"].clone())
