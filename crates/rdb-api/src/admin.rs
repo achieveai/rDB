@@ -2575,7 +2575,7 @@ pub(crate) async fn promote_looked(
         // The owner came back between the look and the Fencing write: nothing is frozen, so
         // the record goes back to what it was and the refusal is true (issue #79 S3).
         Err(alive @ PromoteError::OwnerAlive { .. }) => {
-            cas(
+            let undone = cas(
                 &*ctx.store,
                 &ControlKey::Partition(ctx.partition).encode(),
                 record.encode_with_members(
@@ -2586,7 +2586,10 @@ pub(crate) async fn promote_looked(
                 ),
                 fenced_at.0,
             )
-            .await?;
+            .await;
+            if let Err(undo) = undone {
+                return Err(undo_unproven(&ctx, &record, fenced_at, undo, alive).await);
+            }
             tracing::warn!(owner = prior.0, partition, "promote_fencing_undone");
             return Err(alive);
         }
@@ -2811,6 +2814,85 @@ pub(crate) async fn promote_looked(
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Spec §7.3: the undo of this promote's `Fencing` write failed or did not answer, after the
+/// freeze found the owner alive (PR #119 review). What the record holds is read, never
+/// assumed, and the answer is what was found:
+///
+/// * still `Fencing` (or `FencingDrained`): the partition takes no writes, and a later promote
+///   resumes from it (A-R447). Refused as [`PromoteError::Control`], saying so; logged
+///   `promote_fencing_undo_failed`.
+/// * back to `before`, the record this promote fenced: the undo applied and only its answer
+///   was lost, so the `alive` refusal stands; logged `promote_fencing_undone`.
+/// * anything else, or a reread that fails: refused as [`PromoteError::Control`] naming what
+///   was found, with no claim that a promote is left to resume.
+async fn undo_unproven(
+    ctx: &PromoteCtx,
+    before: &PartitionRecord,
+    fenced_at: Revision,
+    undo: PromoteError,
+    alive: PromoteError,
+) -> PromoteError {
+    let partition = ctx.partition.0;
+    let owner = before.owner.0;
+    match read_partition(&*ctx.store, ctx.partition).await {
+        Err(read) => {
+            tracing::warn!(
+                owner,
+                partition,
+                fenced_at = fenced_at.0,
+                %undo,
+                %read,
+                "promote_fencing_undo_unknown"
+            );
+            PromoteError::Control(format!(
+                "partitions/{partition} was fenced at revision {} and node {owner} came back;                  undoing the fence failed ({undo}) and partitions/{partition} could not be read                  again ({read}), so whether it is still fenced is not known: promote again",
+                fenced_at.0
+            ))
+        }
+        Ok((now, _, _, revision, _, _)) if now.lifecycle != PartitionLifecycle::Serving => {
+            tracing::warn!(
+                owner,
+                partition,
+                fenced_at = fenced_at.0,
+                revision,
+                lifecycle = ?now.lifecycle,
+                ours = revision == fenced_at.0,
+                %undo,
+                "promote_fencing_undo_failed"
+            );
+            PromoteError::Control(format!(
+                "partitions/{partition} is still {:?} at revision {revision}: node {owner} came                  back, and undoing this promote's fence failed ({undo}). Partition {partition}                  takes no writes until a promote finishes: promote again",
+                now.lifecycle
+            ))
+        }
+        Ok((now, ..)) if now == *before => {
+            tracing::warn!(
+                owner,
+                partition,
+                %undo,
+                answer_lost = true,
+                "promote_fencing_undone"
+            );
+            alive
+        }
+        Ok((now, _, _, revision, _, _)) => {
+            tracing::warn!(
+                owner,
+                partition,
+                revision,
+                now_owner = now.owner.0,
+                generation = now.generation.0,
+                %undo,
+                "promote_fencing_undo_overtaken"
+            );
+            PromoteError::Control(format!(
+                "partitions/{partition} changed while this promote undid its fence ({undo}): it                  now names owner {} at generation {}, {:?}, revision {revision}; this promote has                  nothing left to resume",
+                now.owner.0, now.generation.0, now.lifecycle
+            ))
+        }
     }
 }
 
@@ -4656,6 +4738,20 @@ mod tests {
         /// Delete `grants/1` right after the `Fencing` write, as a clearing service
         /// (`clear_grant`, the reopen's heal) whose guard-3 read came first would.
         clear_on_fencing: bool,
+        /// What befalls the promote's undo of its `Fencing` write: a put on the partition that
+        /// is not `Fencing`.
+        undo: UndoFault,
+    }
+
+    /// [`MovingGrant::undo`].
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum UndoFault {
+        /// The undo applies and answers.
+        Answers,
+        /// The undo applies and its answer is lost (`DeadlineExceededUnknownOutcome`).
+        ReplyLost,
+        /// The undo answers `DeadlineExceededUnknownOutcome` without applying.
+        Dropped,
     }
 
     impl MovingGrant {
@@ -4713,10 +4809,19 @@ mod tests {
             Self: 'b,
         {
             Box::pin(async move {
-                let fencing = request.key == ControlKey::Partition(PARTITION).encode().as_bytes()
-                    && PartitionRecord::decode(&request.value)
-                        .is_some_and(|record| record.lifecycle == PartitionLifecycle::Fencing);
+                let on_partition =
+                    request.key == ControlKey::Partition(PARTITION).encode().as_bytes();
+                let lifecycle = PartitionRecord::decode(&request.value).map(|r| r.lifecycle);
+                let fencing = on_partition && lifecycle == Some(PartitionLifecycle::Fencing);
+                let undo = on_partition && !fencing && lifecycle.is_some();
+                if undo && self.undo == UndoFault::Dropped {
+                    return Err(ConfigError::DeadlineExceededUnknownOutcome);
+                }
                 let answer = self.inner.put(request).await;
+                if undo && self.undo == UndoFault::ReplyLost {
+                    answer.expect("the undo applies");
+                    return Err(ConfigError::DeadlineExceededUnknownOutcome);
+                }
                 if fencing && self.on_fencing {
                     self.renew().await;
                 }
@@ -4809,6 +4914,7 @@ mod tests {
             on_get: true,
             on_fencing: false,
             clear_on_fencing: false,
+            undo: UndoFault::Answers,
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -4844,6 +4950,7 @@ mod tests {
             on_get: false,
             on_fencing: true,
             clear_on_fencing: false,
+            undo: UndoFault::Answers,
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -4870,6 +4977,7 @@ mod tests {
             on_get: false,
             on_fencing: false,
             clear_on_fencing: true,
+            undo: UndoFault::Answers,
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -4889,6 +4997,88 @@ mod tests {
             .block_on(read_partition(&store.inner, PARTITION))
             .expect("read");
         assert_eq!(record.lifecycle, PartitionLifecycle::Serving, "{record:?}");
+    }
+
+    /// The grant-cleared-after-`Fencing` promote above one partition, its undo faulted.
+    fn promote_with_undo(
+        rt: &tokio::runtime::Runtime,
+        undo: UndoFault,
+    ) -> (Arc<MovingGrant>, PromoteError) {
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: false,
+            on_fencing: false,
+            clear_on_fencing: true,
+            undo,
+        });
+        rooted(&store.inner, rt, BootId(5));
+        old_grant(&store.inner, rt, GrantId(4));
+        let refused = promote_above_one(Arc::clone(&store) as Arc<dyn ConfigStore>, rt);
+        (store, refused)
+    }
+
+    fn undo_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .collect()
+    }
+
+    /// PR #119 review (spec §7.3, a failed or unknown undo): the owner came back after the
+    /// `Fencing` write, and the undo applies but its answer is lost. The promote reads the
+    /// record again instead of assuming it is still `Fencing`: it finds the record it fenced,
+    /// back to `Serving`, so the `OwnerAlive` refusal stands and nothing is left to resume.
+    /// Unit (~20 ms): `MemStore`.
+    /// Cut: return the undo's error without the reread (the PR's earlier answer); the promote
+    /// says "promote again" over a partition that is serving, red.
+    #[config_log::retcd_test]
+    fn above_one_partition_an_undo_whose_answer_is_lost_is_read_again() {
+        const METHOD: &str = "above_one_partition_an_undo_whose_answer_is_lost_is_read_again";
+        let rt = runtime();
+        let (store, refused) = promote_with_undo(&rt, UndoFault::ReplyLost);
+        assert!(
+            matches!(&refused, PromoteError::OwnerAlive { evidence, .. } if evidence.contains("came back")),
+            "{refused:?}"
+        );
+        let (record, ..) = rt
+            .block_on(read_partition(&store.inner, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Serving, "{record:?}");
+        let undone = undo_lines(METHOD, "promote_fencing_undone");
+        assert!(
+            undone.len() == 1 && undone[0]["answer_lost"] == true,
+            "{undone:?}"
+        );
+        assert!(undo_lines(METHOD, "promote_fencing_undo_failed").is_empty());
+    }
+
+    /// PR #119 review (spec §7.3, a failed or unknown undo): the same, but the undo does not
+    /// apply. Read again, the record is still `Fencing` at this promote's own revision, so the
+    /// refusal says the partition is still fenced and a promote must resume it: only then, and
+    /// never on an assumption, is a later promote told to go on from `Fencing`.
+    /// Unit (~20 ms): `MemStore`.
+    /// Cut: take the reread's `Fencing` as undone (the refusal stays `OwnerAlive`); red.
+    #[config_log::retcd_test]
+    fn above_one_partition_an_undo_that_did_not_apply_is_read_still_fencing() {
+        const METHOD: &str = "above_one_partition_an_undo_that_did_not_apply_is_read_still_fencing";
+        let rt = runtime();
+        let (store, refused) = promote_with_undo(&rt, UndoFault::Dropped);
+        let (record, _, _, revision, _, _) = rt
+            .block_on(read_partition(&store.inner, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Fencing, "{record:?}");
+        assert!(
+            matches!(&refused, PromoteError::Control(why)
+                if why.contains(&format!("is still Fencing at revision {revision}"))
+                    && why.ends_with("promote again")),
+            "{refused:?}"
+        );
+        let failed = undo_lines(METHOD, "promote_fencing_undo_failed");
+        assert!(
+            failed.len() == 1 && failed[0]["ours"] == true && failed[0]["revision"] == revision,
+            "{failed:?}"
+        );
+        assert!(undo_lines(METHOD, "promote_fencing_undone").is_empty());
     }
 
     /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying

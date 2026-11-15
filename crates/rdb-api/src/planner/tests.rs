@@ -230,6 +230,26 @@ fn planner(node: u32, store: &Arc<dyn ConfigStore>, links: Arc<Links>) -> Planne
     }
 }
 
+/// A held test clock and its first tick: every planner given `clock` reads exactly the tick
+/// the row set with `hold.advance`, so an expiry boundary is asserted to the millisecond.
+fn held_clock() -> (HostClock, crate::clock::ClockHold, u64) {
+    let clock = HostClock::capped(1);
+    let hold = clock.hold();
+    let start = clock.now().0;
+    (clock, hold, start)
+}
+
+/// `G + eps + delta`: how long after a grant write's dispatch tick its expiry is proven past
+/// (`expiry_proven` wants the authority time strictly above `E + eps + delta`, `E = t + G`).
+const fn takeover_floor(budgets: &Budgets) -> u64 {
+    budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis
+}
+
+/// `tick + G`, the `expiry_utc_ms` a grant write dispatched at `tick` carries on a held clock.
+fn expiry_from(tick: u64, budgets: &Budgets) -> i64 {
+    i64::try_from(tick + budgets.grant_millis).expect("in range")
+}
+
 fn planner_grant(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
@@ -252,8 +272,10 @@ fn messages(method: &str, message: &str) -> Vec<serde_json::Value> {
 /// R3, the planner's half: two planners racing for a free `planner/grant` give one holder, by
 /// the create-only CAS. The loser stays out while the winner's grant runs. Then the winner
 /// stops renewing, and the loser takes it over only after the expiry is proven, with the next
-/// grant id; the old holder logs the loss on its next pass.
+/// grant id; the old holder logs the loss on its next pass. On a held clock the takeover
+/// boundary is exact: refused at `E + eps + delta` after the winner's write, taken 1 ms later.
 /// Cut: write the grant unconditionally (`expected_mod_revision: None`), both hold, red.
+/// Cut: take over once `E` alone has passed (drop `eps + delta`); taken at the boundary, red.
 #[config_log::retcd_test]
 fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
     const METHOD: &str = "own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry";
@@ -262,9 +284,16 @@ fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
     // race the CAS has to settle, not one hold after the other.
     let gated = Arc::new(crate::test_store::Scripted::gated());
     let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let (clock, hold, written) = held_clock();
     let (a, b) = (
-        planner(2, &store, healthy_links(2)),
-        planner(3, &store, healthy_links(3)),
+        Planner {
+            clock,
+            ..planner(2, &store, healthy_links(2))
+        },
+        Planner {
+            clock,
+            ..planner(3, &store, healthy_links(3))
+        },
     );
     let (mut ma, mut mb) = (Memory::default(), Memory::default());
     let (held_a, held_b, ()) = rt.block_on(async {
@@ -285,24 +314,35 @@ fn own81_r3_two_planners_hold_one_grant_and_take_over_only_after_expiry() {
     } else {
         (b, mb, a, ma)
     };
+    let budgets = loser.budgets;
     let first = planner_grant(&rt, &store).expect("a grant was written");
-    assert_eq!((first.node, first.grant), (winner.node, GrantId(1)));
+    assert_eq!(
+        (first.node, first.grant, first.expiry_utc_ms),
+        (winner.node, GrantId(1), expiry_from(written, &budgets))
+    );
     assert!(!rt.block_on(loser.hold(&mut ml)), "the grant is live");
 
-    let started = std::time::Instant::now();
-    let deadline = started + Duration::from_secs(5);
-    while !rt.block_on(loser.hold(&mut ml)) {
-        assert!(std::time::Instant::now() < deadline, "no takeover");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let taken = planner_grant(&rt, &store).expect("a grant");
-    assert_eq!((taken.node, taken.grant), (loser.node, GrantId(2)));
-    let budgets = loser.budgets;
-    let floor = budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis;
-    let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let floor = takeover_floor(&budgets);
+    hold.advance(floor);
     assert!(
-        waited + 50 >= floor,
-        "taken over {waited} ms after the last renewal, before G+eps+delta={floor}"
+        !rt.block_on(loser.hold(&mut ml)),
+        "at exactly G+eps+delta={floor} ms after the winner's write the expiry is not proven"
+    );
+    assert_eq!(planner_grant(&rt, &store), Some(first), "nothing written");
+    hold.advance(1);
+    assert!(
+        rt.block_on(loser.hold(&mut ml)),
+        "{} ms after the winner's write the expiry is proven",
+        floor + 1
+    );
+    let taken = planner_grant(&rt, &store).expect("a grant");
+    assert_eq!(
+        (taken.node, taken.grant, taken.expiry_utc_ms),
+        (
+            loser.node,
+            GrantId(2),
+            expiry_from(written + floor + 1, &budgets)
+        )
     );
     assert!(!rt.block_on(winner.hold(&mut mw)), "the old holder lost it");
     let lost = messages(METHOD, "planner_grant_lost");
@@ -524,6 +564,129 @@ fn own81_lost_grant_reply_is_not_held() {
     );
 }
 
+/// PR #119 review (a competing renewal after a lost reply): the planner's grant write applies
+/// and its reply is lost, so it holds nothing. Its next hold reads its own record at revision
+/// `r1` and CASes a renewal at `r1`; while that put waits, a second renewal of the same grant
+/// (node 2, boot 1, its own `Memory`) CASes at the same nonzero `r1` first and holds. The
+/// waiting renewal then loses its CAS: it holds nothing and overwrites nothing, so the record
+/// is the competitor's, at the competitor's revision and expiry. Unit, held clock.
+/// Cut: renew unconditionally (`expected_mod_revision: None`); the late renewal overwrites
+/// the record and holds, red.
+#[config_log::retcd_test]
+fn own81_a_competing_renewal_after_a_lost_reply_wins_and_is_not_overwritten() {
+    let rt = crate::db::reopen_tests::runtime();
+    let gated = Arc::new(crate::test_store::Scripted::gated_with(on_planner_grant(
+        crate::test_store::Script {
+            pass_gate: 1,
+            lose_put_replies: 1,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let (clock, hold, start) = held_clock();
+    let lost = Planner {
+        clock,
+        ..planner(2, &store, healthy_links(2))
+    };
+    let competitor = Planner {
+        clock,
+        ..planner(2, &store, healthy_links(2))
+    };
+    let budgets = lost.budgets;
+    let mut memory = Memory::default();
+    assert!(
+        !rt.block_on(lost.hold(&mut memory)),
+        "a lost reply holds nothing"
+    );
+    let (_, r1) = planner_grant_at(&rt, &store).expect("the write applied");
+    assert!(r1 > 0, "a nonzero revision: {r1}");
+
+    hold.advance(10);
+    let mut theirs = Memory::default();
+    let (held, competed) = rt.block_on(async {
+        tokio::join!(lost.hold(&mut memory), async {
+            gated.put_arrived.notified().await;
+            // The late renewal waits at the gate, its CAS at `r1`. The competitor's passes.
+            hold.advance(10);
+            gated.rescript(on_planner_grant(crate::test_store::Script {
+                pass_gate: 1,
+                ..crate::test_store::Script::default()
+            }));
+            let competed = competitor.hold(&mut theirs).await;
+            gated.release();
+            competed
+        })
+    });
+    assert!(competed, "the competing renewal at r1 holds");
+    assert!(!held, "the renewal that lost its CAS holds nothing");
+    assert!(memory.held.is_none(), "{:?}", memory.held);
+    let (record, at) = planner_grant_at(&rt, &store).expect("a record");
+    assert!(at > r1, "the competitor wrote: {r1} -> {at}");
+    assert_eq!(
+        (record.node, record.boot, record.grant, record.expiry_utc_ms),
+        (
+            NodeId(2),
+            BootId(1),
+            GrantId(1),
+            expiry_from(start + 20, &budgets)
+        ),
+        "the competitor's record, not overwritten by the late renewal (dispatched at +10)"
+    );
+    assert_eq!(
+        theirs.held.map(|held| held.expiry_utc_ms),
+        Some(record.expiry_utc_ms)
+    );
+}
+
+/// PR #119 review (a delayed renewal that succeeds): the planner holds, then renews, and the
+/// renewal's reply is held 100 ms on the clock, inside the write's local horizon. The hold
+/// answers true, and what it holds is the renewal's dispatch: `dispatched` is the tick read
+/// before the put, not the tick at the reply, and the expiry is `dispatch + G`. Both of A1's
+/// validity guards in `hold` are unchanged. Unit, held clock.
+/// Cut: take `dispatched` at the reply (`self.clock.now()` after the put); red on the tick.
+#[config_log::retcd_test]
+fn own81_a_delayed_renewal_keeps_its_dispatch_tick() {
+    let rt = crate::db::reopen_tests::runtime();
+    let scripted = Arc::new(crate::test_store::Scripted::new(on_planner_grant(
+        crate::test_store::Script {
+            pass_puts: 1,
+            hold_put_replies: 1,
+            ..crate::test_store::Script::default()
+        },
+    )));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+    let (clock, hold, start) = held_clock();
+    let delayed = Planner {
+        clock,
+        ..planner(2, &store, healthy_links(2))
+    };
+    let budgets = delayed.budgets;
+    let mut memory = Memory::default();
+    assert!(
+        rt.block_on(delayed.hold(&mut memory)),
+        "the first write holds"
+    );
+    hold.advance(10);
+    let dispatched = start + 10;
+    let (held, ()) = rt.block_on(async {
+        tokio::join!(delayed.hold(&mut memory), async {
+            scripted.reply_held.notified().await;
+            hold.advance(100);
+            scripted.release_replies();
+        })
+    });
+    assert!(held, "a reply 100 ms late, inside the horizon, holds");
+    let held = memory.held.expect("held");
+    assert_eq!(
+        (held.dispatched, held.expiry_utc_ms),
+        (Tick(dispatched), expiry_from(dispatched, &budgets)),
+        "the renewal's dispatch tick, not the reply's ({})",
+        dispatched + 100
+    );
+    let (record, _) = planner_grant_at(&rt, &store).expect("renewed");
+    assert_eq!(record.expiry_utc_ms, held.expiry_utc_ms);
+}
+
 /// PR #119 review (`dropped_grant_write_is_not_held`): two grant writes in a row fail without
 /// applying. Neither makes the planner hold, nothing is in the store, and the third, which
 /// applies, holds.
@@ -595,8 +758,10 @@ fn own81_cancel_before_grant_write() {
 /// after it applied and before its reply came back. The cancelled renewal does not extend what
 /// the planner holds: its `Held` is still the first write's. A fresh boot of the same node is
 /// refused until the applied record's expiry is proven past, `G + eps + delta` after the
-/// cancelled write, not after the first.
+/// cancelled write, not after the first. On a held clock that boundary is exact: refused at
+/// `G + eps + delta` after the cancelled write's dispatch tick, taken 1 ms later.
 /// Cut: `memory.held` set before the put; the cancelled renewal moves the held horizon, red.
+/// Cut: take over once `E` alone has passed (drop `eps + delta`); taken at the boundary, red.
 #[config_log::retcd_test]
 fn own81_cancel_after_grant_write() {
     let rt = crate::db::reopen_tests::runtime();
@@ -608,18 +773,23 @@ fn own81_cancel_after_grant_write() {
         },
     )));
     let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
-    let old = planner(2, &store, healthy_links(2));
+    let (clock, hold, start) = held_clock();
+    let old = Planner {
+        clock,
+        ..planner(2, &store, healthy_links(2))
+    };
+    let budgets = old.budgets;
     let mut memory = Memory::default();
     assert!(rt.block_on(old.hold(&mut memory)), "the first write holds");
     let first = memory.held.expect("held");
-    std::thread::sleep(Duration::from_millis(50));
+    hold.advance(50);
+    let written = start + 50;
     rt.block_on(async {
         tokio::select! {
             held = old.hold(&mut memory) => panic!("the reply is held: {held}"),
             () = scripted.reply_held.notified() => {}
         }
     });
-    let written = Instant::now();
     let held = memory.held.expect("still the first write's");
     assert_eq!(
         (held.expiry_utc_ms, held.dispatched),
@@ -627,10 +797,15 @@ fn own81_cancel_after_grant_write() {
         "the cancelled renewal extended the held horizon"
     );
     let (applied, _) = planner_grant_at(&rt, &store).expect("the renewal applied");
-    assert!(applied.expiry_utc_ms > first.expiry_utc_ms, "{applied:?}");
+    assert_eq!(
+        (first.expiry_utc_ms, applied.expiry_utc_ms),
+        (expiry_from(start, &budgets), expiry_from(written, &budgets)),
+        "{applied:?}"
+    );
 
     let fresh = Planner {
         boot: BootId(2),
+        clock,
         ..planner(2, &store, healthy_links(2))
     };
     let mut fresh_memory = Memory::default();
@@ -638,22 +813,27 @@ fn own81_cancel_after_grant_write() {
         !rt.block_on(fresh.hold(&mut fresh_memory)),
         "a fresh boot refuses before the expiry is proven"
     );
-    let deadline = written + Duration::from_secs(5);
-    while !rt.block_on(fresh.hold(&mut fresh_memory)) {
-        assert!(Instant::now() < deadline, "no takeover");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let budgets = fresh.budgets;
-    let floor = budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis;
-    let waited = u64::try_from(written.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let floor = takeover_floor(&budgets);
+    hold.advance(floor);
     assert!(
-        waited + 50 >= floor,
-        "taken {waited} ms after the cancelled write, before G+eps+delta={floor}"
+        !rt.block_on(fresh.hold(&mut fresh_memory)),
+        "at exactly G+eps+delta={floor} ms after the cancelled write the expiry is not proven \
+         (the first write's was proven 50 ms ago)"
+    );
+    hold.advance(1);
+    assert!(
+        rt.block_on(fresh.hold(&mut fresh_memory)),
+        "{} ms after the cancelled write the expiry is proven",
+        floor + 1
     );
     let taken = planner_grant_at(&rt, &store).expect("taken").0;
     assert_eq!(
-        (taken.boot, taken.grant),
-        (BootId(2), GrantId(applied.grant.0 + 1))
+        (taken.boot, taken.grant, taken.expiry_utc_ms),
+        (
+            BootId(2),
+            GrantId(applied.grant.0 + 1),
+            expiry_from(written + floor + 1, &budgets)
+        )
     );
 }
 

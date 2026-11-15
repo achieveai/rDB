@@ -113,6 +113,8 @@ const USAGE: &str = "usage:
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
            [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
+  --faults F: a file of lines, each one of
+           hold N | hold all | drop-request N | drop-reply N | cut-control | mute
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -318,7 +320,20 @@ fn need<T: Clone>(value: Option<&T>, name: &str) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
-    let args = match parse(std::env::args().skip(1)) {
+    run(std::env::args().skip(1), |config| {
+        config_log::init(config)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// `main`, with how logging starts passed in: a row runs this same path under the subscriber
+/// its `#[config_log::retcd_test]` installed, where a second `config_log::init` is refused.
+fn run(
+    argv: impl Iterator<Item = String>,
+    start_logging: impl FnOnce(config_log::LogConfig) -> Result<Option<config_log::LogGuard>, String>,
+) -> ExitCode {
+    let args = match parse(argv) {
         Ok(args) => args,
         Err(message) => {
             if !message.is_empty() {
@@ -338,7 +353,7 @@ fn main() -> ExitCode {
     let mut config = config_log::LogConfig::for_application("rdb_node");
     config.dir.clone_from(&log_dir);
     config.file_name = format!("{name}.jsonl");
-    let guard = match config_log::init(config) {
+    let guard = match start_logging(config) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("rdb_node: log init: {e}");
@@ -675,7 +690,7 @@ mod tests {
     /// one clock-probe period are refused while parsing, before the process writes its boot
     /// or listens; exactly 1000 ms is taken. Unit.
     /// Cut: drop either parse-time check, red (the flags parse).
-    #[test]
+    #[config_log::retcd_test]
     fn own81_failover_knobs_refused_while_parsing() {
         assert_eq!(
             parsed(&["--failover", "--failover-max-concurrent", "0"]).map(|_| ()),
@@ -695,5 +710,119 @@ mod tests {
             super::failover(&args).map(|f| f.silent_after),
             Some(std::time::Duration::from_millis(1_000))
         );
+    }
+
+    /// Runs `main`'s path on a node process's arguments plus `extra`, with node 1's data
+    /// directory, cert dir and log dir under a fresh root, and `--listen` on a port this row
+    /// holds, and asserts it stopped as a bad argument (exit 2) before any startup effect: no
+    /// boot written (`next_boot` creates `--dir`), and no bind tried (the held port would make
+    /// a bind fail, exit 1).
+    fn refused_before_start(extra: &[&str]) {
+        let root = config_testkit::fs::temp_dir();
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let listen = held.local_addr().expect("bound").to_string();
+        let dir = root.path().join("node-1");
+        let path = |p: &std::path::Path| p.display().to_string();
+        let mut argv: Vec<String> = [
+            "--node".to_owned(),
+            "1".to_owned(),
+            "--dir".to_owned(),
+            path(&dir),
+            "--listen".to_owned(),
+            listen.clone(),
+            "--peers".to_owned(),
+            format!("2={listen},3={listen}"),
+            "--control".to_owned(),
+            format!("http://{listen}"),
+            "--cert-dir".to_owned(),
+            path(&root.path().join("certs")),
+            "--log-dir".to_owned(),
+            path(&root.path().join("logs")),
+        ]
+        .into();
+        argv.extend(extra.iter().map(|a| (*a).to_owned()));
+        let code = super::run(argv.into_iter(), |_| Ok(None));
+        assert_eq!(code, std::process::ExitCode::from(2), "{extra:?}: exit 2");
+        assert!(
+            !dir.exists(),
+            "{extra:?}: a boot was written in {}",
+            dir.display()
+        );
+        drop(held);
+    }
+
+    /// PR #119 review: a zero `--failover-max-concurrent` stops the node process before it
+    /// writes its boot or binds `--listen`, and the parse error is the one the parser row pins.
+    /// Unit.
+    /// Cut: move the zero check from `parse` to `serve`, after `next_boot` and the bind; the
+    /// boot is written and the bind fails (exit 1), red.
+    #[config_log::retcd_test]
+    fn own81_zero_concurrency_refused_before_boot_or_listen() {
+        refused_before_start(&["--failover", "--failover-max-concurrent", "0"]);
+        assert_eq!(
+            parsed(&["--failover", "--failover-max-concurrent", "0"]).map(|_| ()),
+            Err("--failover-max-concurrent wants a count of at least 1".to_owned())
+        );
+    }
+
+    /// PR #119 review: a `--failover-silent-ms` of 0 or 999 stops the node process before it
+    /// writes its boot or binds `--listen`; exactly 1000 ms is taken. Unit.
+    /// Cut: move the floor check from `parse` to `serve`, after `next_boot`; red.
+    #[config_log::retcd_test]
+    fn own81_short_silence_refused_before_boot_or_listen() {
+        for millis in ["0", "999"] {
+            refused_before_start(&["--failover", "--failover-silent-ms", millis]);
+        }
+        let args = parsed(&["--failover", "--failover-silent-ms", "1000"]).expect("parses");
+        assert_eq!(
+            super::failover(&args).map(|f| f.silent_after),
+            Some(std::time::Duration::from_millis(1_000))
+        );
+    }
+
+    /// PR #119 review: a value that is no count, or a negative one, is refused for
+    /// `--failover-max-concurrent`; one that is no number, or past `u64`, for
+    /// `--failover-silent-ms`. Each with the flag's existing parse error. Unit.
+    #[config_log::retcd_test]
+    fn own81_failover_knob_values_that_are_no_number_are_refused() {
+        for value in ["abc", "-1"] {
+            assert_eq!(
+                parsed(&["--failover", "--failover-max-concurrent", value]).map(|_| ()),
+                Err("--failover-max-concurrent wants a count of at least 1".to_owned()),
+                "{value}"
+            );
+        }
+        for value in ["abc", "18446744073709551616"] {
+            assert_eq!(
+                parsed(&["--failover", "--failover-silent-ms", value]).map(|_| ()),
+                Err("--failover-silent-ms wants whole milliseconds".to_owned()),
+                "{value}"
+            );
+        }
+    }
+
+    /// PR #119 review: `--help` prints `USAGE`, and it lists every command a `--faults` file
+    /// takes; each listed command is one the fault file accepts. Unit.
+    /// Cut: drop the fault-command line from `USAGE`; red.
+    #[config_log::retcd_test]
+    fn own81_help_lists_the_fault_commands() {
+        assert_eq!(parsed(&["--help"]).map(|_| ()), Err(String::new()));
+        let commands = [
+            "hold N",
+            "hold all",
+            "drop-request N",
+            "drop-reply N",
+            "cut-control",
+            "mute",
+        ];
+        for command in commands {
+            assert!(
+                super::USAGE.contains(command),
+                "{command}: {}",
+                super::USAGE
+            );
+            let (_, refused) = rdb_api::net::faults::parse(&command.replace('N', "2"));
+            assert!(refused.is_empty(), "{command}: {refused:?}");
+        }
     }
 }
