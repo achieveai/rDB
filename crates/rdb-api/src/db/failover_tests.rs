@@ -82,6 +82,15 @@ fn rig(partitions: u32, failover: Option<Failover>) -> Rig {
 
 /// [`rig`], with node `n`'s process running `failovers[n - 1]`.
 fn rig_with(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
+    let rig = opened(partitions, failovers);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    rig
+}
+
+/// [`rig_with`] up to every process open, before any is ready: no node has recovered its
+/// partitions, so `grants/{node}` still holds the forming open's record, at that open's boot.
+fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
@@ -163,32 +172,38 @@ fn rig_with(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
         procs,
         partitions,
     };
-    for proc in &rig.procs {
-        proc.db
-            .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
-            .expect("every process is ready");
-    }
-    // `wait_ready` can answer before an owner has taken its grant (the forming open's are
-    // gone with it): a planner would rightly see it heard but not serving. Wait until each
-    // process that owns a partition holds a grant at its own boot. A node that owns none takes
-    // no grant.
-    until(
-        "every owner holds a grant at its own boot",
-        Duration::from_secs(30),
-        || {
-            let grants = rig.grants();
-            rig.procs.iter().zip(ALL_NODES).all(|(proc, node)| {
-                rig.owned_by(node).is_empty()
-                    || grants
-                        .get(&node)
-                        .is_some_and(|grant| grant.boot == proc.boot && !grant.frozen)
-            })
-        },
-    );
     rig
 }
 
 impl Rig {
+    fn wait_ready(&self) {
+        for proc in &self.procs {
+            proc.db
+                .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+                .expect("every process is ready");
+        }
+    }
+
+    /// `wait_ready` can answer before an owner has taken its grant: `grants/{node}` still holds
+    /// the forming open's record, at that open's boot, until the node's recovery replaces it.
+    /// Wait until each process that owns a partition holds a grant at its own boot. A node
+    /// that owns none takes no grant.
+    fn wait_for_owner_grants(&self) {
+        until(
+            "every owner holds a grant at its own boot",
+            Duration::from_secs(30),
+            || {
+                let grants = self.grants();
+                self.procs.iter().zip(ALL_NODES).all(|(proc, node)| {
+                    self.owned_by(node).is_empty()
+                        || grants
+                            .get(&node)
+                            .is_some_and(|grant| grant.boot == proc.boot && !grant.frozen)
+                })
+            },
+        );
+    }
+
     /// Stop process `i` as `kill -STOP` would, from outside: links silent, grant not renewed.
     fn stop(&self, i: usize) {
         self.procs[i].faults.apply("mute\ncut-control\n");
@@ -763,27 +778,68 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
     );
 }
 
-/// Lead ruling 2 on PR #119: a cold start raises no `planner_owner_alive_not_serving`. Each
-/// node opens with no grant of its own until its links sync, some 6 s after the planner's
-/// first sweep, and an owner with no grant yet is not an owner that stopped serving.
-/// Integration (~10 s): the rig's own start, then a few more sweeps.
-/// Cut: drop the "no grant yet" check in `sweep`; the alert is said for the owners that had
-/// none, red.
+/// Lead ruling 2 on PR #119: a cold start raises no `planner_owner_alive_not_serving`. A node
+/// opens with no grant of its own: `grants/{node}` still holds the record of the boot before,
+/// until the node's recovery replaces it, and that record runs out first. An owner whose only
+/// grant is a past boot's is not an owner that stopped serving.
+///
+/// The row holds node 2 in that state on purpose: cut from rEtcd (`cut-control`) once every
+/// process is open and before any is ready, so its recovery cannot replace the old record,
+/// while its links still answer. Left to the start's own timing the state lasts from none to a
+/// few hundred ms, and the row saw it or not by chance (lead's gate at dc2b1b4). Then node 2
+/// is let go and takes its grant, and still no alert.
+/// Integration (~15 s): the old grant runs out, a few sweeps, then the owners' grants.
+/// Cut: drop the "no grant of its own" check in `sweep`; node 2's old record runs out while it
+/// answers, the alert is said for it, red. Or judge "of its own" by the record's presence, not
+/// its boot (as before this row): the same, red.
 #[config_log::retcd_test]
 fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
     const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
-    let rig = rig(3, Some(failover()));
-    until("a planner holds its grant", Duration::from_secs(20), || {
-        rig.planner_grant().is_some()
-    });
+    let rig = opened(3, [Some(failover()); 3]);
+    rig.procs[1].faults.apply("cut-control\n");
+    let node2_boot = rig.procs[1].boot;
+    assert_eq!(rig.owned_by(NodeId(2)), vec![2], "node 2 owns partition 2");
+    assert!(
+        rig.grants()
+            .get(&NodeId(2))
+            .is_none_or(|grant| grant.boot != node2_boot),
+        "node 2 took its grant before it was cut: the row did not set up its state"
+    );
+
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    let held = loop {
+        let lines: Vec<_> = logged(METHOD, "planner_owner_no_grant_yet")
+            .into_iter()
+            .filter(|line| line["node"] == 2)
+            .collect();
+        if !lines.is_empty() || !logged(METHOD, "planner_owner_alive_not_serving").is_empty() {
+            break lines;
+        }
+        assert!(Instant::now() < deadline, "no planner judged node 2");
+        std::thread::sleep(Duration::from_millis(250));
+    };
     std::thread::sleep(5 * failover().poll);
     assert_eq!(
         logged(METHOD, "planner_owner_alive_not_serving"),
-        Vec::<serde_json::Value>::new()
+        Vec::<serde_json::Value>::new(),
+        "while node 2 had no grant of its own"
     );
+    assert_eq!(held.len(), 1, "node 2 heard with no grant of its own, said once: {held:?}");
     assert!(
-        !logged(METHOD, "planner_owner_no_grant_yet").is_empty(),
-        "the start had owners with no grant, or this row shows nothing"
+        rig.grants()
+            .get(&NodeId(2))
+            .is_none_or(|grant| grant.boot != node2_boot),
+        "node 2 stayed without a grant of its own while cut"
+    );
+
+    rig.resume(1);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    std::thread::sleep(5 * failover().poll);
+    assert_eq!(
+        logged(METHOD, "planner_owner_alive_not_serving"),
+        Vec::<serde_json::Value>::new(),
+        "after node 2 took its grant"
     );
 }
 

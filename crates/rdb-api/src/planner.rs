@@ -443,13 +443,26 @@ impl Planner {
             let verdict = self
                 .judge(owner, grants.get(&owner), records[0].0.partition)
                 .await;
-            // No alert before the owner's first grant exists: a node just started has none
-            // until its links sync, and it is not "not serving" (lead ruling on PR #119).
-            // Nothing is remembered either, so the alert is still said once a grant expires.
-            if !grants.contains_key(&owner) {
+            // No alert before the owner's first grant of its own: a node just started has none
+            // until its recovery takes one, and it is not "not serving" (lead ruling on PR
+            // #119). Until then `grants/{owner}` is absent or still the record of the boot
+            // before, which runs out first. A grant counts as its own when the links know no
+            // other boot for the owner. Nothing is remembered either, so the alert is still
+            // said once a grant of its own expires.
+            let past_boot = grants.get(&owner).is_some_and(|record| {
+                self.links
+                    .boot_of(owner)
+                    .is_some_and(|boot| boot != record.boot)
+            });
+            if past_boot || !grants.contains_key(&owner) {
                 if let Verdict::AliveNotServing(evidence) = verdict {
                     if memory.no_grant_yet.insert(owner) {
-                        tracing::info!(node = owner.0, evidence, "planner_owner_no_grant_yet");
+                        tracing::info!(
+                            node = owner.0,
+                            evidence,
+                            past_boot,
+                            "planner_owner_no_grant_yet"
+                        );
                     }
                     memory.verdicts.remove(&owner);
                     continue;
