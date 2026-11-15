@@ -7200,8 +7200,9 @@ impl Host {
     /// #107 slice 2a: re-add, at the boot it still runs, a copy this owner's own drop clock left
     /// out ([`LiveReadd::clocked`]), once its link is back. `Links::install` tells nobody of a
     /// same-boot reconnect, so this runs at every drop check, and ends in the restart path's
-    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up off the
-    /// stream, and promoted by [`Self::shadow_duty`]. With `live_readd` off it does nothing.
+    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up by R1's probe
+    /// and catch-up cursor, and promoted by [`Self::shadow_duty`] when its catch-up arrives
+    /// ([`Self::shadow_at_head`]) or at a drop duty. With `live_readd` off it does nothing.
     ///
     /// The gate ([`Self::live_readd_refusal`]): this node is the pinned primary, no re-plan
     /// runs, the committed mode takes writes (`Active` or `DegradedRf2`, the test

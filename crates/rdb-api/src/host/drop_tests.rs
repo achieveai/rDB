@@ -7426,6 +7426,97 @@ fn issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot() {
     );
 }
 
+/// Issue #113 with #107 slice 2a: the live re-add's shadow is promoted at catch-up too, not
+/// only a move's. Node 3 is dropped on the unreachable clock while idle, 100 records land
+/// without it, and its link comes back at the boot it still runs, so the live re-add pins it
+/// as a shadow far behind. Once its catch-up walks, the trio's clock is held, so no drop duty
+/// runs and the cursor moves on ACKs alone. In the step node 3 reaches the head, node 1 has
+/// started the promote; then three regular copies, `Active`, one live re-add and one promote at
+/// the head. No move runs, so [`m11_113_a_shadow_is_promoted_in_the_step_its_catch_up_arrives`]
+/// alone cannot tell a hook for every shadow from one for a move's.
+/// Cuts: no `shadow_at_head` call on `CopyCaughtUp`, red; `shadow_at_head` acting only while
+/// `self.moves` holds the partition, red (both: caught up, no promote started).
+/// Integration (~5 s): the drop, 100 puts, the hold, a one-record-a-trip catch-up, the promote.
+#[config_log::retcd_test]
+fn issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives() {
+    const METHOD: &str =
+        "issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, false);
+    trio.ready();
+    for _ in 0..100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    // (head, node 3's acknowledged sequence) on node 1, while node 3 is pinned as a shadow.
+    let seen = |trio: &Trio| {
+        let owner = &trio.nodes[0].0;
+        let copy = owner
+            .committed
+            .get(&P1)?
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            .map(|member| member.copy)?;
+        let tracker = owner.replication.primary(NodeId(1), P1)?.tracker();
+        let acked = tracker
+            .peer(copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        Some((tracker.head().0, acked))
+    };
+    let promoting = |trio: &Trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&P1),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.promote && replan.rejoiner == Some(NodeId(3))
+        )
+    };
+    trio.links.heal_all();
+    let cut_at = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        seen(trio).map(|(_, acked)| acked)
+    });
+    trio.until("the re-add's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&P1)).then_some(())
+    });
+    trio.until("node 3's catch-up walks", |trio| {
+        let (head, acked) = seen(trio)?;
+        assert!(
+            head.saturating_sub(acked) > PROMOTE_LAG_RECORDS,
+            "precondition: node 3 came within the bound before the clock was held"
+        );
+        (acked > cut_at).then_some(())
+    });
+    assert!(!promoting(&trio), "promoted before the clock was held");
+    let hold = trio.clock.hold();
+    let head = trio.until("node 3 acknowledged node 1's head", |trio| {
+        let (head, acked) = seen(trio)?;
+        (acked >= head).then_some(head)
+    });
+    assert!(
+        promoting(&trio),
+        "node 3 reached the head ({head}) and node 1 started no promote"
+    );
+    drop(hold);
+    let promoted = active_with_three(&mut trio, after);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "{promotes:?}");
+    assert_eq!(promotes[0]["acked"], head, "{promotes:?}");
+    assert_eq!(promotes[0]["head"], head, "{promotes:?}");
+    holds_the_cutoff(&mut trio, promoted);
+}
+
 /// Row 30a (#107 slice 2a): with the setting off, only the setting differs from row 1's idle
 /// way: node 3 is dropped on the unreachable clock, its link comes back for many holds, and
 /// nothing is recorded, nothing is probed and nothing re-adds it. It stays out, and node 1
