@@ -369,19 +369,27 @@ async fn planner_grant_raw(store: &Arc<dyn ConfigStore>) -> Option<(Bytes, u64)>
 /// Issue #133, PR #119 review round 3 (`expired_grant_takeovers_race`): node 4's grant has
 /// expired, and two planners of other identities (nodes 2 and 3) read it at the same nonzero
 /// revision and both decide to take it over. The order is forced: each one's write is held at
-/// the store's gate before either applies. Node 2's is let through first and holds; its record
-/// is snapshotted. Then node 3's stale write is let through: its CAS at the old revision
-/// conflicts, so it holds nothing, its `Memory` stays empty, and node 2's record is byte for
-/// byte and revision for revision as it was. The grant id rose once, 1 to 2. Unit, held clock.
+/// the store's gate before either applies, and the gate lets one write through per release
+/// (`one_shot_gate`). Node 2's is let through first and holds; its record is snapshotted while
+/// node 3's write is still parked. Then node 3's stale write is let through: its CAS at the
+/// old revision conflicts, so it holds nothing, its `Memory` stays empty, and node 2's record
+/// is byte for byte and revision for revision as it was. The grant id rose once, 1 to 2. Unit,
+/// held clock.
 /// Cut: write the grant unconditionally (`expected_mod_revision: None`); node 3 overwrites
-/// node 2's record and holds too, red.
+/// node 2's record and holds too, red. Cut: on a conflict, rewrite the record found as it is
+/// (same bytes, a new revision); that write waits at the gate for a release that never comes,
+/// so the row does not finish. Before the one-shot gate, with a few yields before the
+/// snapshot, node 3's writes went through the recycled permit first and that cut passed.
 #[config_log::retcd_test]
 fn expired_grant_takeovers_race() {
     let rt = crate::db::reopen_tests::runtime();
-    // Node 4's first write passes the gate; every write after it waits there.
+    // Node 4's first write passes the gate; every write after it waits there for a release of
+    // its own. A permit is not handed on when its write ends, so node 3's write cannot follow
+    // node 2's before the snapshot (PR #119 review).
     let gated = Arc::new(crate::test_store::Scripted::gated_with(
         crate::test_store::Script {
             pass_gate: 1,
+            one_shot_gate: true,
             ..crate::test_store::Script::default()
         },
     ));
@@ -417,7 +425,8 @@ fn expired_grant_takeovers_race() {
             },
             async {
                 stale_started.notified().await;
-                // Node 3's write is parked behind node 2's.
+                // Node 3's write is parked behind node 2's. One release lets node 2's through
+                // alone; node 3's stays parked until the second, after the snapshot.
                 gated.put_arrived.notified().await;
                 gated.release();
                 first_done.notified().await;

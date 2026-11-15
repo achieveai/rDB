@@ -81,6 +81,10 @@ pub(crate) struct Script {
     /// Puts still to apply and then hold their reply until [`Scripted::release_replies`]: a
     /// write that has landed whose answer has not (PR #119 review). Keyed by `only_prefix`.
     pub(crate) hold_put_replies: u32,
+    /// When set, a [`Scripted::gated`] store's gate lets one parked put through per
+    /// [`Scripted::release`]: the put keeps its permit, so a put parked behind it waits for its
+    /// own release, not for the first to finish (PR #119 review, `expired_grant_takeovers_race`).
+    pub(crate) one_shot_gate: bool,
 }
 
 /// Whether a blocked list has read, and whether blocked lists may answer.
@@ -276,7 +280,13 @@ impl ConfigStore for Scripted {
             let _permit = if self.take(|script| &mut script.pass_gate) {
                 None
             } else {
-                Some(park_at(&self.gate, &self.put_arrived).await)
+                let permit = park_at(&self.gate, &self.put_arrived).await;
+                if self.script.lock().expect("script").one_shot_gate {
+                    permit.forget();
+                    None
+                } else {
+                    Some(permit)
+                }
             };
             let keyed = self
                 .script

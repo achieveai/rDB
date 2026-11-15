@@ -1814,7 +1814,8 @@ pub enum Clearance {
 /// false between them, because a promote (the operator's or the opt-in planner's) writes
 /// `Fencing` to `partitions/{p}`. The race is closed on the promote side, not here (spec §7.3,
 /// "The clearing service does not race a fence"): every `Fencing` write is followed by a
-/// `freeze` of this same grant key.
+/// `freeze` attempt on this same grant key. A freeze that fails for another reason than
+/// [`PromoteError::OwnerAlive`] can return before it writes anything.
 /// - A delete after the freeze cannot apply: the freeze moved the grant's revision, so this
 ///   delete's compare fails, and guard 1 refuses a frozen record on any later pass.
 /// - A delete between the `Fencing` write and the freeze: when the promote judged the owner

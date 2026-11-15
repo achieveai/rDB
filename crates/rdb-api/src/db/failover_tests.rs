@@ -54,6 +54,13 @@ fn budgets() -> Budgets {
     }
 }
 
+/// `n` of the rig's grant lifetimes ([`budgets`]), the unit a row's deadline is counted in:
+/// README's "No fixed sleeps" asks for a multiple of the configured timeout, not a literal.
+/// [`until`] and [`logged_at_least_within`] stretch it by `RETCD_TEST_DEADLINE_SCALE`.
+fn lifetimes(n: u32) -> Duration {
+    Duration::from_millis(budgets().grant_millis) * n
+}
+
 /// The planner the rows run: polls often, so the measured time is the rule's, not the poll's.
 fn failover() -> Failover {
     Failover {
@@ -565,18 +572,14 @@ fn own81_s1_c4_the_old_primary_returns_answering_not_primary() {
 fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
     const METHOD: &str = "own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over";
     let rig = rig(1, Some(failover()));
-    until("a planner holds its grant", Duration::from_secs(20), || {
+    until("a planner holds its grant", lifetimes(7), || {
         rig.planner_grant().is_some()
     });
     rig.stop(0);
-    until(
-        "partition 1 moves and serves",
-        Duration::from_secs(60),
-        || {
-            let record = rig.record(1);
-            record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
-        },
-    );
+    until("partition 1 moves and serves", lifetimes(20), || {
+        let record = rig.record(1);
+        record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
+    });
     let first = rig.record(1);
     let new_owner = first.owner;
     assert!(matches!(new_owner, NodeId(2 | 3)), "{first:?}");
@@ -586,15 +589,23 @@ fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
     // holds one at its own boot.
     rig.wait_for_owner_grants();
 
+    // Only refusals after the second stop count: one said during the first failover would
+    // otherwise satisfy the wait before the second failure is judged at all (PR #119 review).
+    let baseline = logged(METHOD, "planner_no_eligible_copy").len();
     // The old owner has not restarted: node 1 is still stopped.
     rig.stop(new_owner.0 as usize - 1);
     let refused = logged_at_least_within(
         METHOD,
         "planner_no_eligible_copy",
-        1,
-        Duration::from_secs(60),
+        baseline + 1,
+        lifetimes(20),
     );
-    assert_eq!(refused.len(), 1, "logged once: {refused:?}");
+    let refused = &refused[baseline..];
+    assert_eq!(
+        refused.len(),
+        1,
+        "logged once after the second stop: {refused:?}"
+    );
     assert_eq!(
         (&refused[0]["partition"], &refused[0]["reason"]),
         (&serde_json::json!(1), &serde_json::json!("lone_survivor")),
@@ -1033,9 +1044,8 @@ fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_mo
     const METHOD: &str =
         "own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved";
     let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
-    // Nodes 1 and 3 start as node 2 does, uncut, and node 3 opens last: once both hold a grant
-    // at their own boots, an uncut node 2 would hold one too, so a cut that came late would
-    // show here.
+    // Wait for the uncut owners to acquire their own grants; node 2's write cut was installed
+    // before Db::open_with.
     until(
         "nodes 1 and 3 hold a grant at their own boots",
         Duration::from_secs(30),
@@ -1393,7 +1403,7 @@ fn own81_promote_failure_warns_once() {
     rig.stop(0);
     let mut memory = crate::planner::Memory::default();
     let mut failed = 0;
-    until("four promotes are tried", Duration::from_secs(60), || {
+    until("four promotes are tried", lifetimes(20), || {
         let answers = rig.rt.block_on(planner.sweep(&mut memory));
         for (partition, answer) in &answers {
             assert_eq!(partition.0, p, "{answers:?}");
@@ -1458,7 +1468,7 @@ fn sweep_until_acted(
     Result<crate::admin::Promoted, crate::admin::PromoteError>,
 )> {
     let mut answers = Vec::new();
-    until("a sweep acts", Duration::from_secs(60), || {
+    until("a sweep acts", lifetimes(20), || {
         answers = rig.rt.block_on(planner.sweep(memory));
         !answers.is_empty()
     });
@@ -1474,7 +1484,8 @@ fn sweep_until_acted(
 /// Asserted: no attempt before the restart commits (generation unchanged, the record left
 /// `Fencing`); the restarted planner moves the partition once (one commit, one new
 /// generation, and a further sweep does nothing); `grants/1` is frozen from the first applied
-/// freeze on and never rewritten; and node 1's old boot, resumed, cannot write.
+/// freeze on and never rewritten; and node 1's old boot, resumed, reads that grant, stops
+/// replacing it (`replace_stopped`), and cannot write.
 fn interrupted_sweep(method: &str, at: HoldAt) {
     let rig = rig(1, None);
     let before = rig.record(1);
@@ -1588,26 +1599,32 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
     }
 
     rig.resume(0);
-    let (app, _net, _links) = rig.app(&ALL_NODES);
-    // Until node 1 has read rEtcd again it answers LEASE_EXPIRED (as in the S1 row); once it
-    // answers anything else it has, and its grant is still the frozen one.
+    // Node 1 has read rEtcd again once its own status says it found its grant frozen and
+    // stopped replacing it: only then is its grant's state its own answer, not a refusal it
+    // gave before it read, such as an out-of-reach UNAVAILABLE (PR #119 review). The grant is
+    // checked unchanged on every poll.
     until(
-        "node 1 has read rEtcd again",
-        Duration::from_secs(30),
+        "node 1 finds its grant frozen and stops replacing it",
+        lifetimes(10),
         || {
-            app.route.owners[0].store(1, Ordering::Relaxed);
-            let refused = app
-                .put(b"interrupted", b"old", None)
-                .expect_err("node 1's old boot cannot write");
-            assert!(refused.error.no_mutation, "{refused}");
             assert_eq!(
                 grant_at(&rig, NodeId(1)),
                 last,
                 "grants/1 stays as the promote left it"
             );
-            refused.error.kind != ErrorKind::LeaseExpired
+            rig.procs[0]
+                .db
+                .node_status()
+                .pop()
+                .is_some_and(|status| status.replace_stopped)
         },
     );
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    app.route.owners[0].store(1, Ordering::Relaxed);
+    let refused = app
+        .put(b"interrupted", b"old", None)
+        .expect_err("node 1's old boot cannot write");
+    assert!(refused.error.no_mutation, "{refused}");
     assert_eq!(
         grant_at(&rig, NodeId(1)),
         last,
