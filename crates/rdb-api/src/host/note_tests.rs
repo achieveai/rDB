@@ -73,12 +73,26 @@ fn committed_generation(trio: &Trio, at: usize) -> Option<Generation> {
 /// Node 1 is gone (never stepped again) and node 3 answers the inventory with a failure, so
 /// node 2's promote commits on its own copy. Returns the generation committed.
 fn lost_primary_and_silent_secondary(trio: &mut Trio) -> Generation {
+    lost_primary_and_silent_secondary_then(trio, |_| {})
+}
+
+/// [`lost_primary_and_silent_secondary`], running `before_serving` once the promote has
+/// finished and before waiting for node 2 to serve what it committed.
+fn lost_primary_and_silent_secondary_then(
+    trio: &mut Trio,
+    before_serving: impl FnOnce(&mut Trio),
+) -> Generation {
     assert!(
         matches!(trio.ask(put(1, b"a", 5_000)), Answer::Txn { .. }),
         "the put before the loss is answered"
     );
     let before = committed_generation(trio, 0).expect("the bootstrap committed");
     trio.nodes[2].0.refuse_inventories = true;
+    // Issue #112: node 2's commit is `ReadOnly` with node 3 answering, so its repair may re-plan
+    // to the next generation before node 2 adopts this one, and then never serves it. That is
+    // the product's order to take; the rows are about the note, so the repair waits until
+    // node 2 serves what it committed.
+    trio.nodes[1].0.hold_repairs = true;
     let promote = spawn_promote(trio, 2);
     let generation = only_until(trio, &[1, 2], "node 2 committed", |trio| {
         committed_generation(trio, 1).filter(|committed| *committed > before)
@@ -90,9 +104,11 @@ fn lost_primary_and_silent_secondary(trio: &mut Trio) -> Generation {
         .block_on(promote)
         .expect("the promote's task")
         .expect("the promote commits");
+    before_serving(trio);
     only_until(trio, &[1, 2], "node 2 serves what it committed", |trio| {
         known(&trio.status(1)).filter(|(held, _, _)| *held == generation)
     });
+    trio.nodes[1].0.hold_repairs = false;
     generation
 }
 
@@ -327,6 +343,148 @@ fn owner_control_behind_a_cut(trio: &mut Trio) -> Arc<Faults> {
     trio.nodes[1].0.control =
         ControlAdapter::new(cut, trio.rt.handle().clone(), Arc::clone(&trio.links));
     faults
+}
+
+/// Applies `cut-control` to `faults` the moment a put to `partitions/1` is applied through it,
+/// before that put answers. Under a [`CutStore`] on the same `faults`, the commit's CAS goes
+/// through and every call after it, the commit's authority reads first, is cut.
+struct CutAfterCommit {
+    inner: Arc<dyn config_core::ConfigStore>,
+    faults: Arc<Faults>,
+}
+
+#[async_trait::async_trait]
+impl config_core::ConfigStore for CutAfterCommit {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        let commit = request.key == ControlKey::Partition(P).encode();
+        let response = self.inner.put(request).await?;
+        if commit && response.outcome == config_core::MutationOutcome::Applied {
+            tracing::info!(revision = response.revision, "cut_after_commit");
+            self.faults.apply("cut-control");
+        }
+        Ok(response)
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// Issue #112: node 2's repair gets a whole window before node 2 can adopt its `ReadOnly`
+/// commit. Node 2's control store is cut the moment its commit's CAS is applied
+/// ([`CutAfterCommit`]), so none of its authority reads can answer; node 3 is linked and answers
+/// probes, so an unheld repair plans the next generation and asks A1 to revoke the commit
+/// (`revoke_asked_unheld`). The cut lifts once node 2 has asked, or after the window. The helper
+/// then waits for node 2 to serve the generation it committed.
+/// Cut: drop the `hold_repairs` return in `repair_duty`: node 2 re-plans past its commit and
+/// never serves it, red ("not within ...: node 2 serves what it committed").
+/// Integration (~6 s): the window, once, on the trio's clock.
+#[config_log::retcd_test]
+fn s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit() {
+    const METHOD: &str = "s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = formed(dir.path(), tune);
+    let faults = Faults::new();
+    let trigger: Arc<dyn config_core::ConfigStore> = Arc::new(CutAfterCommit {
+        inner: Arc::clone(&trio.store),
+        faults: Arc::clone(&faults),
+    });
+    let cut: Arc<dyn config_core::ConfigStore> = CutStore::new(trigger, Arc::clone(&faults));
+    trio.nodes[1].0.control =
+        ControlAdapter::new(cut, trio.rt.handle().clone(), Arc::clone(&trio.links));
+    let asked = || {
+        logged!(METHOD, "revoke_asked_unheld")
+            .iter()
+            .any(|line| line["node"] == 2)
+    };
+    let unadopted = |trio: &Trio| {
+        logged!(METHOD, "adopt_authority")
+            .iter()
+            .all(|line| line["node"] != 2 || line["generation"] != generation_of(trio))
+    };
+    let generation = lost_primary_and_silent_secondary_then(&mut trio, |trio| {
+        assert_eq!(
+            logged!(METHOD, "cut_after_commit").len(),
+            1,
+            "cut at the commit"
+        );
+        assert!(faults.control_cut(), "the cut is applied at the commit");
+        assert!(
+            unadopted(trio),
+            "node 2 has not adopted its commit while cut"
+        );
+        // The window is host time, on the trio's counted clock: a stalled run reads it no
+        // further, so the repair gets the whole window whatever the host's load. The wall-clock
+        // patience of `only_until` stays the failure.
+        let window = trio.clock.now().0 + REPAIR_WINDOW_MILLIS;
+        only_until(
+            trio,
+            &[1, 2],
+            "node 2 asked a revoke, or the window ended",
+            |trio| (asked() || trio.clock.now().0 >= window).then_some(()),
+        );
+        assert!(
+            unadopted(trio),
+            "node 2 did not adopt its commit in the window"
+        );
+        faults.apply("");
+    });
+    assert!(!asked(), "node 2 did not revoke the commit it serves");
+    assert_eq!(committed_generation(&trio, 1), Some(generation));
+}
+
+/// How long [`s5n_112_a_repair_before_adoption_does_not_skip_the_owners_commit`] holds node 2
+/// cut, in milliseconds on the trio's counted clock. An unheld repair asks its revoke well inside
+/// it.
+const REPAIR_WINDOW_MILLIS: u64 = 3_000;
+
+fn generation_of(trio: &Trio) -> u64 {
+    committed_generation(trio, 1).expect("node 2 committed").0
 }
 
 /// Row 35: with the read failing no plan is built; once it answers, the plan goes on. Cut:
