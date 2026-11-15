@@ -2,7 +2,7 @@
 //! clock. Each row reads `still_owner` and submits a put while the clock is held, so both are
 //! judged at one tick.
 
-use super::trio::Trio;
+use super::trio::{self, current_thread, Trio};
 use super::*;
 use crate::ownership::OwnerToken;
 
@@ -81,35 +81,68 @@ impl Probe {
     }
 }
 
-/// Steps a probe waits for its answer at the held tick, before it lets the clock run: a put
-/// applied before a fence is answered only at the post-apply deadline.
+/// Steps a probe takes at the held tick, at most, before it has the put's admission verdict.
 const HELD_STEPS: usize = 200;
+
+/// Whether node 1's T1 has admitted `identity`: it waits in the queue, is the transaction past
+/// it, or a batch was reserved since `seq_before` (only the probe's put writes in these rows).
+fn admitted(trio: &Trio, identity: RequestIdentity, seq_before: Option<Seq>) -> bool {
+    let Some(kernel) = trio.nodes[0].0.transaction.kernel(NodeId(1), P1) else {
+        return false;
+    };
+    let inflight = match kernel.inflight() {
+        Some(
+            Inflight::AwaitingDispatchCheck { admitted, .. }
+            | Inflight::Dispatched { admitted, .. },
+        ) => admitted.req.identity == identity,
+        None => false,
+    };
+    inflight
+        || kernel.queued().any(|queued| queued == identity)
+        || seq_before.is_some_and(|before| kernel.next_seq() > before)
+}
 
 fn probe(trio: &mut Trio, token: OwnerToken, request: u64) -> Probe {
     let hold = trio.clock.hold();
     let at = trio.clock.now();
     let owner = still_owner(trio, token);
+    let seq_before = trio.nodes[0]
+        .0
+        .transaction
+        .kernel(NodeId(1), P1)
+        .map(TxnKernel::next_seq);
     let answer = trio.call(put(request));
-    let mut answered = None;
+    // The verdict is taken under the hold: an answer at this tick, or T1 holding the put as
+    // admitted. An answer that comes after the hold drops is a later step's (the post-apply
+    // deadline of a put applied before a fence), not admission's (#84 review).
+    let mut verdict = None;
     for _ in 0..HELD_STEPS {
         trio.step();
         if let Ok(found) = answer.try_recv() {
-            answered = Some(found);
+            verdict = Some(Some(found));
+            break;
+        }
+        if admitted(trio, identity(request), seq_before) {
+            verdict = Some(None);
             break;
         }
     }
     let owner_after = still_owner(trio, token);
     assert_eq!(trio.clock.now(), at, "the held clock moved");
+    let verdict = verdict.unwrap_or_else(|| {
+        panic!("put {request}: no admission verdict in {HELD_STEPS} steps at the held tick")
+    });
     drop(hold);
-    let answered = match answered {
-        Some(found) => found,
-        None => trio.answer(&answer),
-    };
-    let refused = match answered {
-        Answer::Txn { .. } => None,
-        Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => None,
-        Answer::Error { error, .. } => Some(error.kind),
-        other => panic!("put {request}: {other:?}"),
+    let refused = match verdict {
+        None => {
+            // Admitted at the held tick; its answer comes when it comes.
+            let _ = trio.answer(&answer);
+            None
+        }
+        Some(Answer::Txn { .. }) => None,
+        Some(Answer::Error { error, .. }) if error.kind == ErrorKind::UnknownOutcome => None,
+        Some(Answer::Error { error, .. }) => Some(error.kind),
+        Some(other) => panic!("put {request}: {other:?}"),
     };
     // The held clock counts nothing, so let it count a step before the next probe.
     std::thread::sleep(PROBE_STEP);
@@ -620,4 +653,274 @@ fn own83_9_a_readonly_capped_commit_sends_no_activated() {
         )),
         "never for the read-only generation: {heard:?}"
     );
+}
+
+/// A live view of partition 1 under `token`, through `valid_through`.
+fn live_view(token: OwnerToken, valid_through: Tick) -> AuthorityView {
+    use rdb_core::contracts::authority::DenyReason;
+    use rdb_core::contracts::ids::{AuthorityGeneration, BootId, ConfigVersion, GrantId};
+    AuthorityView {
+        lineage: token.lineage(P1),
+        grant_id: GrantId(1),
+        boot_id: BootId(1),
+        authority_generation: AuthorityGeneration(1),
+        config_version: ConfigVersion(1),
+        authority_seq: 1,
+        valid_through_tick: valid_through,
+        past_horizon: DenyReason::Expired,
+    }
+}
+
+/// own84_6: a terminal fault revokes the host's ownership before any caller hears of it. A
+/// waiter answered by `fail_waiter` (a compile or snapshot fault, answered before the node's
+/// `set_fault`) already reads both readers false when its answer arrives; `set_fault`, first or
+/// repeated, leaves them false; and a view A1 reports after the fault is not kept. Cuts: no
+/// revoke in `fail_waiter`, red at the first assertion; none in `set_fault`, red after it.
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn own84_6_a_terminal_fault_revokes_ownership_before_it_is_answered() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trio::host_over(dir.path(), &rt);
+    let held = OwnerToken {
+        generation: Generation(2),
+        owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+    };
+    let views = Arc::clone(&host.owner_views);
+    let live = live_view(held, host.clock.now().plus_millis(60_000));
+
+    // `fail_waiter`, alone: the reply path a compile fault takes before `set_fault`.
+    host.stepped_at = host.clock.now();
+    host.report_view(&live);
+    assert!(views.still_owner(P1, held), "precondition: owned");
+    let (reply, answer) = mpsc::channel();
+    let fault = fail_waiter(&host.owner_views, &reply, "a compile fault".to_owned());
+    assert!(
+        matches!(answer.try_recv(), Ok(Answer::Error { .. })),
+        "the waiter is answered"
+    );
+    assert!(!views.still_owner(P1, held), "still_owner after the reply");
+    assert!(views.ownership(P1).is_none(), "ownership after the reply");
+
+    // `set_fault`, first and repeated, and a view reported after it.
+    host.set_fault(fault);
+    host.set_fault(Fault::from("a second fault".to_owned()));
+    host.report_view(&live);
+    assert!(!views.still_owner(P1, held), "owned after the fault");
+    assert!(views.ownership(P1).is_none());
+}
+
+/// own84_6b: `set_fault` alone (a duty or a step that faults, no `fail_waiter` first) revokes
+/// ownership. Cut: no revoke in `set_fault`, red. Unit.
+#[config_log::retcd_test]
+fn own84_6b_set_fault_alone_revokes_ownership() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trio::host_over(dir.path(), &rt);
+    let held = OwnerToken {
+        generation: Generation(2),
+        owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+    };
+    host.stepped_at = host.clock.now();
+    host.report_view(&live_view(held, host.clock.now().plus_millis(60_000)));
+    assert!(
+        host.owner_views.still_owner(P1, held),
+        "precondition: owned"
+    );
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    assert!(!host.owner_views.still_owner(P1, held));
+    assert!(host.owner_views.ownership(P1).is_none());
+}
+
+/// One probe that must find the partition owned and its write refused at one held tick: what
+/// `still_owner` promises not to cover (checks 7 and 8, a read-only recovery). Returns the
+/// refusal's kind.
+fn owned_but_refused(trio: &mut Trio, token: OwnerToken, request: u64) -> ErrorKind {
+    let probe = probe(trio, token, request);
+    assert!(
+        probe.owner && probe.owner_after,
+        "still_owner reads true while the view admits: {probe:?}"
+    );
+    probe
+        .refused
+        .unwrap_or_else(|| panic!("the write is refused: {probe:?}"))
+}
+
+/// own84_7a: a frozen queue under a live view. A put is applied and left unpublished (both
+/// copies' ACKs dropped), a control outage fences node 1, and A1 replaces its own grant: the
+/// view admits again but T1's queue still waits on the put (check 7). `still_owner` reads true
+/// and the write is refused, at one held tick. Integration (~3 s): bootstrap, then one fence on
+/// a 600 ms grant and its self-replace.
+#[config_log::retcd_test]
+fn own84_7a_a_frozen_queue_under_a_live_view_is_owned_and_refuses_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), short_grant);
+    trio.bootstrap();
+    trio.ready();
+    let token = token(&trio);
+    trio.links.drop_direction(NodeId(2), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    let unacknowledged = trio.call(put(1));
+    trio.until("node 1 applies seq 2", |trio| {
+        (trio.head() == Some(2)).then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+    trio.mem.stop_failing();
+    trio.until("node 1 owns again, its queue waiting on seq 2", |trio| {
+        // A1 holds before its new view reaches T1 and the map, so wait for the view too.
+        let status = trio.status(0);
+        (status.authority.starts_with("held(")
+            && status.waits_on == Some(Seq(2))
+            && still_owner(trio, token))
+        .then_some(())
+    });
+    let kind = owned_but_refused(&mut trio, token, 2);
+    assert_eq!(kind, ErrorKind::ProtectionPaused, "check 7's refusal");
+    drop(unacknowledged);
+}
+
+/// own84_7b: an L1-paused partition under a live grant. Both links from node 1 are held and a
+/// put stays unacknowledged past the pause age, so L1 pauses writes (check 8) while A1 still
+/// renews. `still_owner` reads true and the write is refused, at one held tick.
+/// Integration (~2.5 s): bootstrap, then the 400 ms pause age.
+#[config_log::retcd_test]
+fn own84_7b_an_l1_paused_partition_under_a_live_grant_is_owned_and_refuses_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+    trio.bootstrap();
+    trio.ready();
+    let token = token(&trio);
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    let unacknowledged = trio.call(put(1));
+    trio.until("L1 pauses writes", |trio| {
+        (trio.status(0).admits == Some(false)).then_some(())
+    });
+    let kind = owned_but_refused(&mut trio, token, 2);
+    assert_eq!(kind, ErrorKind::ProtectionPaused, "check 8's refusal");
+    drop(unacknowledged);
+}
+
+/// own84_7c: a read-only recovery under a live view. One host bootstraps with both peers
+/// unreachable, so F1 commits `ReadOnly` at cutoff 0, as walk A10 does; A1 holds the grant and
+/// publishes a live view. `still_owner` reads true and a write is refused, at one held tick.
+/// Integration (~2.5 s): bootstrap's discovery window on one host.
+#[config_log::retcd_test]
+fn own84_7c_a_read_only_recovery_under_a_live_view_is_owned_and_refuses_writes() {
+    let dir = config_testkit::fs::temp_dir();
+    let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let links = Links::new();
+    let (tx, rx) = mpsc::channel();
+    links.register(NodeId(1), tx.clone(), crate::host::BOOT);
+    links.hold(NodeId(1), NodeId(2));
+    links.hold(NodeId(1), NodeId(3));
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let control = ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+    let clock = HostClock::capped(Trio::CLOCK_STEP_CAP_MILLIS);
+    let mut host = Host::new(NodeId(1), engine, links, control, clock);
+    host.peer_drop_after_millis = 600_000;
+    host.unreachable_drop_after_millis = 600_000;
+    rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
+        tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
+    }))
+    .expect("bootstrap");
+    let step = |host: &mut Host| {
+        host.run_due();
+        host.drain();
+        assert_eq!(host.fault, None, "node 1 faulted");
+        while let Ok(msg) = rx.try_recv() {
+            host.handle(msg);
+        }
+    };
+    let deadline = Instant::now() + crate::host::test_patience(Trio::PATIENCE);
+    let token = loop {
+        step(&mut host);
+        let read_only = host
+            .committed
+            .get(&P1)
+            .is_some_and(|result| result.mode == PartitionMode::ReadOnly);
+        if let Some(owned) = host.owner_views.ownership(P1).filter(|_| read_only) {
+            break owned.token;
+        }
+        assert!(Instant::now() < deadline, "no read-only commit owned");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+
+    let hold = clock.hold();
+    let owner = host.owner_views.still_owner(P1, token);
+    let (reply, answer) = mpsc::channel();
+    host.handle(Msg::Client(Client {
+        partition: P1,
+        call: put(1),
+        reply,
+    }));
+    let mut refused = None;
+    for _ in 0..HELD_STEPS {
+        step(&mut host);
+        if let Ok(found) = answer.try_recv() {
+            refused = Some(found);
+            break;
+        }
+    }
+    let owner_after = host.owner_views.still_owner(P1, token);
+    drop(hold);
+    assert!(owner && owner_after, "owned while the view admits");
+    match refused {
+        Some(Answer::Error { error, .. }) => {
+            assert_eq!(error.kind, ErrorKind::RecoveryReadOnly, "{error:?}");
+        }
+        other => panic!("a read-only partition refuses the write at the held tick: {other:?}"),
+    }
+}
+
+/// own83_11 (#84 review's revoke, seen from #83's stream): a node that faults while `Activated`
+/// sends `Deactivating` with a deadline of now and then `Deactivated`, on the turn it faults,
+/// and never activates again; by then `still_owner` already reads false (the revoke is first).
+/// Faulted by `set_fault` alone, as a duty or a step that faults. Its duty is run by hand: the
+/// trio's `step` asserts no host faulted. Cut: `faulted: false` in `ownership_duty`, red: node
+/// 1 stays `Activated` under a view that still admits. Integration (~1 s): bootstrap.
+#[config_log::retcd_test]
+fn own83_11_a_faulted_owner_sends_deactivated() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    hear(&events, &mut heard);
+    assert_eq!(
+        on(1, &heard),
+        [("activated", held)],
+        "precondition: {heard:?}"
+    );
+    heard.clear();
+
+    let host = &mut trio.nodes[0].0;
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    assert!(
+        !host.owner_views.still_owner(P1, held),
+        "the revoke comes before the stream"
+    );
+    host.ownership_duty();
+    hear(&events, &mut heard);
+    assert_eq!(
+        on(1, &heard),
+        [("deactivating", held), ("deactivated", held)],
+        "the faulted owner deactivates on that turn: {heard:?}"
+    );
+    for _ in 0..10 {
+        trio.nodes[0].0.ownership_duty();
+    }
+    hear(&events, &mut heard);
+    assert_eq!(on(1, &heard).len(), 2, "never again: {heard:?}");
 }

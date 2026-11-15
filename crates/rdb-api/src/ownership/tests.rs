@@ -89,33 +89,53 @@ fn own84_1b_tokens_order_by_generation_then_epoch() {
     assert_eq!(token(2, 3).to_string(), "2.3");
 }
 
-/// own84_1c: the shared map reads a view on the clock it was published with, keeps only the
-/// newest per partition, and a cleared map (a stopped node) owns nothing. `remaining` counts to
-/// the first tick that does not admit. Unit.
+/// own84_1c: the shared map keeps only the newest view per partition, and a cleared map (a
+/// stopped node) owns nothing. On a held clock, so `remaining` is exact: it counts the whole
+/// milliseconds to the last admitting tick, reads zero on that tick, and the tick after it owns
+/// nothing. Two short, distinct horizons, so a constant answer cannot pass. Unit.
 #[test]
 fn own84_1c_owner_views_read_the_newest_view_and_clear_on_stop() {
-    let clock = HostClock::start();
+    let clock = HostClock::capped(20);
+    let _hold = clock.hold();
+    let now = clock.now();
     let map = OwnerViews::new(NodeId(2), clock);
     let old = token(1, 1);
     let new = token(2, 2);
     assert!(map.ownership(P).is_none(), "no view, no owner");
-    map.publish(view(old, u64::MAX), clock);
+    map.publish(view(old, u64::MAX), clock, now);
     assert!(map.still_owner(P, old));
-    map.publish(view(new, clock.now().0 + 60_000), clock);
+    map.publish(view(new, now.0 + 250), clock, now);
     assert!(
         !map.still_owner(P, old),
         "a newer view retires the old token"
     );
     let owned = map.ownership(P).expect("owned");
     assert_eq!(
-        (owned.node, owned.partition, owned.token),
-        (NodeId(2), P, new)
+        owned,
+        Ownership {
+            node: NodeId(2),
+            partition: P,
+            token: new,
+            remaining: Duration::from_millis(250),
+        }
     );
-    assert!(
-        owned.remaining <= Duration::from_millis(60_001),
-        "{owned:?}"
+    map.publish(view(new, now.0 + 40), clock, now);
+    assert_eq!(
+        map.ownership(P).map(|o| o.remaining),
+        Some(Duration::from_millis(40)),
+        "a second, shorter horizon"
     );
-    assert!(owned.remaining > Duration::from_millis(59_000), "{owned:?}");
+    map.publish(view(new, now.0), clock, now);
+    assert_eq!(
+        map.ownership(P).map(|o| o.remaining),
+        Some(Duration::ZERO),
+        "the last admitting tick: still owned, nothing left to spend"
+    );
+    assert!(map.still_owner(P, new));
+    map.publish(view(new, now.0 - 1), clock, now);
+    assert!(map.ownership(P).is_none(), "the tick after the horizon");
+    assert!(!map.still_owner(P, new));
+    map.publish(view(new, now.0 + 250), clock, now);
     assert!(!map.still_owner(PartitionId(4), new), "another partition");
     map.clear();
     assert!(!map.still_owner(P, new));
@@ -474,4 +494,149 @@ fn own83_3_route_marks_make_an_answer_stale_on_its_partition_or_a_watch_end() {
     drop(second);
     assert!(!marks.current(p2, stamp));
     assert_eq!(marks.stamp(p2), None);
+}
+
+/// own84_1d: a publication brings its host's clock, and the map reads by the newest one. Two
+/// held readings 10 s apart (the trio's `lagging` clock): the same view reads a different
+/// `remaining` on each, and a view live on the lagging clock is past on the other. Unit.
+#[test]
+fn own84_1d_a_publication_replaces_the_clock_the_map_reads() {
+    let ahead = HostClock::capped(20);
+    let _hold = ahead.hold();
+    let behind = ahead.lagging(10_000);
+    let (a, b) = (ahead.now(), behind.now());
+    assert_eq!(
+        a.0 - b.0,
+        10_000,
+        "precondition: two distinct held readings"
+    );
+    let held = token(3, 1);
+    let map = OwnerViews::new(NodeId(1), ahead);
+    map.publish(view(held, a.0 + 100), ahead, a);
+    assert_eq!(
+        map.ownership(P).map(|o| o.remaining),
+        Some(Duration::from_millis(100))
+    );
+    map.publish(view(held, a.0 + 100), behind, b);
+    assert_eq!(
+        map.ownership(P).map(|o| o.remaining),
+        Some(Duration::from_millis(10_100)),
+        "read on the clock the last view came with"
+    );
+    map.publish(view(held, b.0 + 5), behind, b);
+    assert!(map.still_owner(P, held), "live on the lagging clock");
+    map.publish(view(held, b.0 + 5), ahead, b);
+    assert!(
+        !map.still_owner(P, held),
+        "the same view, read on the other clock, is past"
+    );
+}
+
+/// own84_1e: `remaining` is a lower bound at every phase inside a tick. A tick is a whole
+/// millisecond, so the real time behind tick `n` is `n + f` for `f` in `[0, 1)` ms, and the view
+/// admits until real time `horizon + 1`. At every tenth of a millisecond around the horizon, the
+/// budget is at most the real time left, and never short by a whole tick or more. Cut: `+ 1`
+/// back in `remaining_at`, red at `f = 0.1` on every tick. Unit.
+#[test]
+fn own84_1e_remaining_never_overstates_the_time_left_inside_a_tick() {
+    let horizon = 1_000_u64;
+    for n in horizon - 3..=horizon {
+        for tenth in 0..10_u64 {
+            let real_us = n * 1_000 + tenth * 100;
+            let left_us = (horizon + 1) * 1_000 - real_us;
+            let budget = remaining_at(Tick(horizon), Tick(n));
+            let budget_us = u64::try_from(budget.as_micros()).expect("small");
+            assert!(
+                budget_us <= left_us,
+                "tick {n} + 0.{tenth} ms: budget {budget_us} us, left {left_us} us"
+            );
+            assert!(
+                left_us - budget_us <= 1_000,
+                "tick {n} + 0.{tenth} ms: budget {budget_us} us short of {left_us} us by a tick"
+            );
+        }
+    }
+    assert_eq!(remaining_at(Tick(horizon), Tick(horizon)), Duration::ZERO);
+    assert_eq!(
+        remaining_at(Tick(horizon), Tick(horizon + 5)),
+        Duration::ZERO
+    );
+}
+
+/// own84_1f: a fence's view (horizon the tick before its publication) is not kept, so a clock
+/// stepped back, once or again, never makes the ended token owned again. A later live view of
+/// the same token (a regrant, as admission admits it) is owned. Read on a guarded clock, the one
+/// `rdb_node --clock-step-file` steps back. Cut: keep the past view in `publish`, red at the
+/// first step. Unit.
+#[test]
+fn own84_1f_a_fenced_view_stays_unowned_across_repeated_backward_steps() {
+    let clock = HostClock::guarded(0);
+    let held = token(4, 2);
+    let map = OwnerViews::new(NodeId(1), clock);
+    let granted = clock.now();
+    map.publish(view(held, granted.0 + 60_000), clock, granted);
+    assert!(map.still_owner(P, held), "precondition: owned");
+    let fenced_at = clock.now();
+    map.publish(view(held, fenced_at.0 - 1), clock, fenced_at);
+    assert!(!map.still_owner(P, held), "the fence ends it");
+    for step in 1..=3 {
+        clock.step_back(5_000);
+        assert!(
+            clock.now() < fenced_at,
+            "precondition: step {step} is back past the fence"
+        );
+        assert!(!map.still_owner(P, held), "owned again after step {step}");
+        assert!(map.ownership(P).is_none(), "step {step}");
+    }
+    let regranted = clock.now();
+    map.publish(view(held, regranted.0 + 60_000), clock, regranted);
+    assert!(map.still_owner(P, held), "a live regrant of the same token");
+    let taken = token(4, 3);
+    map.publish(view(taken, regranted.0 + 60_000), clock, regranted);
+    assert!(
+        !map.still_owner(P, held),
+        "a higher token here retires the old one"
+    );
+}
+
+/// own84_1g: inputs no live view answers. A zero token against a live, nonzero view; partition
+/// zero and a partition with no view; each through both readers. Unit.
+#[test]
+fn own84_1g_a_zero_token_and_unknown_partitions_own_nothing() {
+    let clock = HostClock::capped(20);
+    let _hold = clock.hold();
+    let now = clock.now();
+    let map = OwnerViews::new(NodeId(1), clock);
+    let held = token(2, 3);
+    map.publish(view(held, now.0 + 1_000), clock, now);
+    assert!(map.still_owner(P, held), "precondition");
+    assert!(!map.still_owner(P, token(0, 0)), "a zero token");
+    for partition in [PartitionId(0), PartitionId(99)] {
+        assert!(map.ownership(partition).is_none(), "{partition:?}");
+        assert!(!map.still_owner(partition, held), "{partition:?}");
+        assert!(!map.still_owner(partition, token(0, 0)), "{partition:?}");
+    }
+}
+
+/// own84_1h: a revoked map (a faulted host) owns nothing, and keeps nothing published after,
+/// however many times it is revoked. Unit.
+#[test]
+fn own84_1h_a_revoked_map_owns_nothing_for_good() {
+    let clock = HostClock::capped(20);
+    let _hold = clock.hold();
+    let now = clock.now();
+    let map = OwnerViews::new(NodeId(1), clock);
+    let held = token(2, 3);
+    map.publish(view(held, now.0 + 1_000), clock, now);
+    assert!(map.still_owner(P, held), "precondition");
+    for round in 1..=2 {
+        map.revoke();
+        assert!(!map.still_owner(P, held), "round {round}");
+        assert!(map.ownership(P).is_none(), "round {round}");
+        map.publish(view(held, now.0 + 1_000), clock, now);
+        assert!(
+            !map.still_owner(P, held),
+            "a view after revoke, round {round}"
+        );
+    }
 }

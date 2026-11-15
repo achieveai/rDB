@@ -6862,3 +6862,109 @@ fn u2_r7_11_an_adoption_flatten_that_faulted_part_way_is_resumed_by_the_repair()
     assert_eq!(recovered["cutoff"], head.0, "{recovered}");
     next_put_follows(&mut trio, 9_600, head, generation);
 }
+
+/// What node 1's two ownership readers and its T1 say at one step, for own84_8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnerStep {
+    /// `ownership(1)`'s token.
+    owned: Option<crate::ownership::OwnerToken>,
+    /// T1's lineage for partition 1, as a token: what check 6 compares a view with.
+    serving: Option<crate::ownership::OwnerToken>,
+}
+
+/// Node 1's [`OwnerStep`], with both readers checked against T1: `still_owner(t)` is true only
+/// for the token T1 serves, and only when `ownership` names it too. Each `token` in `asked` is
+/// read; the ones `still_owner` reads true are returned.
+fn owner_step(
+    trio: &Trio,
+    asked: &[crate::ownership::OwnerToken],
+) -> (OwnerStep, Vec<crate::ownership::OwnerToken>) {
+    use crate::ownership::OwnerToken;
+    let host = &trio.nodes[0].0;
+    let serving = host
+        .transaction
+        .kernel(NodeId(1), P1)
+        .map(|kernel| OwnerToken::of(kernel.lineage()));
+    let owned = host.owner_views.ownership(P1).map(|o| o.token);
+    let held: Vec<OwnerToken> = asked
+        .iter()
+        .copied()
+        .filter(|token| host.owner_views.still_owner(P1, *token))
+        .collect();
+    let step = OwnerStep { owned, serving };
+    if let Some(owned) = owned {
+        assert_eq!(
+            Some(owned),
+            serving,
+            "ownership names a token T1 does not serve: {step:?}"
+        );
+    }
+    for token in &held {
+        assert_eq!(
+            Some(*token),
+            serving,
+            "still_owner({token}) while T1 serves another: {step:?}"
+        );
+    }
+    (step, held)
+}
+
+/// own84_8 (#84 review): both ownership readers follow write admission across a persisted
+/// epoch revoke, a same-boot regrant at the next lineage, and a real restart of the owner.
+/// Node 3 restarts, so node 1 revokes its epoch (on disk, in the same boot: a disk fence),
+/// re-plans and commits the next generation; then node 1 itself restarts.
+/// At every step, neither reader names a token T1 does not serve, which covers the steps where
+/// T1 has installed a recovery's lineage before A1's view confirms it. Once the revoked token
+/// reads false it never reads true again, before or after the restart, and the regrant's token
+/// is greater. A restarted owner acquires no grant in this process (`Db::restart_node`), so
+/// after its restart node 1 owns nothing, neither token, for 1.5 s.
+/// Integration (~5 s): bootstrap, a rejoin, then 1.5 s after an owner restart.
+#[config_log::retcd_test]
+fn own84_8_ownership_follows_admission_across_a_revoke_a_regrant_and_a_restart() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let (first, _) = owner_step(&trio, &[]);
+    let old = first.owned.expect("node 1 owns partition 1 once started");
+
+    restart_as(&mut trio, dir.path(), 3, false);
+    let mut steps = vec![first];
+    let mut ended = false;
+    let regrant = trio.until("node 1 owns the rejoin's next lineage", |trio| {
+        let (step, held) = owner_step(trio, &[old]);
+        if held.is_empty() {
+            ended = true;
+        } else {
+            assert!(!ended, "the revoked token {old} owned again: {step:?}");
+        }
+        steps.push(step);
+        let committed = commit_of(trio).is_some_and(|(generation, _, _)| generation > before);
+        step.owned.filter(|token| committed && *token != old)
+    });
+    assert!(ended, "the revoke ended the old token");
+    assert!(regrant > old, "the regrant {regrant} after {old}");
+    let unconfirmed = steps
+        .iter()
+        .filter(|step| step.serving.is_some_and(|t| t > old) && step.owned.is_none())
+        .count();
+    tracing::info!(unconfirmed, steps = steps.len(), "own84_8_rejoin_observed");
+    // The confirmation is a control round trip after T1 installs the lineage, so at least one
+    // step sees the new lineage served and not yet owned (5 of 5 runs, 2026-11-15).
+    assert!(
+        unconfirmed >= 1,
+        "no step between the lineage and its confirmation: {steps:?}"
+    );
+
+    // A restarted owner stays out until its folder is opened again (`Db::restart_node`): the
+    // new process acquires no grant, so it owns nothing; watched for 1.5 s of trio time.
+    restart_as(&mut trio, dir.path(), 1, false);
+    let until = trio.clock.now().plus_millis(1_500);
+    trio.until("1.5 s after node 1's restart", |trio| {
+        let (step, held) = owner_step(trio, &[old, regrant]);
+        assert_eq!(
+            (step.owned, held),
+            (None, vec![]),
+            "the restarted owner owns a token: {step:?}"
+        );
+        (trio.clock.now() >= until).then_some(())
+    });
+}
