@@ -140,6 +140,20 @@ impl Replication {
         self.receivers.get(&(node, partition))
     }
 
+    /// Mark the receiver for `(node, partition)`, if one is installed, as refused at
+    /// `generation`: see [`AppendReceiver::refuse_landing`]. Returns whether one was marked.
+    pub fn refuse_landing(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> bool {
+        self.receivers
+            .get_mut(&(node, partition))
+            .map(|receiver| receiver.refuse_landing(generation))
+            .is_some()
+    }
+
     /// Give the dormant receiver for `(node, partition)` its verified digests, for a catch-up
     /// it is about to source (lead ruling A-R173): see [`AppendReceiver::restore_history`].
     ///

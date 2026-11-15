@@ -163,6 +163,11 @@ pub struct AppendReceiver {
     /// held in memory (issue #80 R4-1). At or below it the copy refuses plain appends and sends
     /// no ACK. No code clears it: `Recovered` moves the lineage above it.
     sealed_through: Option<Generation>,
+    /// The generation this copy's host refused to link its stored lineage into (#107 slice 2a,
+    /// lead ruling on row 31b), set by [`Self::refuse_landing`]. That generation's `Recovered`
+    /// anchors at the root, as a fresh receiver does, so it claims no prefix of the refused
+    /// lineage; any `Recovered` clears it.
+    refused_landing: Option<Generation>,
 }
 
 /// F1's plan for a recovery, as `Msg::Restore` delivers it to a copy it is about to catch up:
@@ -253,6 +258,7 @@ impl AppendReceiver {
             dormant: false,
             recovery_plan: None,
             sealed_through: None,
+            refused_landing: None,
         })
     }
 
@@ -308,7 +314,17 @@ impl AppendReceiver {
             dormant: true,
             recovery_plan: None,
             sealed_through: None,
+            refused_landing: None,
         })
+    }
+
+    /// The host refused to link `generation` onto what this copy stores (#107 slice 2a, lead
+    /// ruling on row 31b): that generation's `Recovered` re-anchors this receiver at the root,
+    /// `NeedPrefix { have: Seq(0) }`, exactly as a receiver built fresh after a restart does,
+    /// instead of on a rung of the lineage it refused. Claiming less only lengthens the walk;
+    /// claiming a refused prefix lets the walk start above seq 1 and leave a hole.
+    pub fn refuse_landing(&mut self, generation: Generation) {
+        self.refused_landing = Some(generation);
     }
 
     /// Keep F1's `plan` for the recovery in flight, replacing any plan held (#79 S3b). A

@@ -3794,7 +3794,9 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
 /// removed, quarantined or not, and `land_receiver_dropped` names the reason, so the copy
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
-/// receiver stays, as the held tail does, and nothing is logged. Nothing links in any case.
+/// receiver stays, as the held tail does, with no `land_receiver_dropped`; it is only marked
+/// refused at this generation (`AppendReceiver::refuse_landing`, #107 row 31b), so its
+/// `Recovered` anchors it at the root. Nothing links in any case.
 /// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
@@ -3839,7 +3841,11 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
         assert_eq!(host.engine.lineages(), held, "{case}: nothing linked");
         let after = host.replication.receiver(NodeId(2), PartitionId(1));
         if mode == PartitionMode::ReadOnly {
-            assert_eq!(after, Some(&receiver), "{case}: the receiver stays");
+            // #107 slice 2a (lead ruling on row 31b): kept, and marked so it claims nothing of
+            // the lineage it refused; otherwise unchanged.
+            let mut marked = receiver.clone();
+            marked.refuse_landing(result.new_generation);
+            assert_eq!(after, Some(&marked), "{case}: the receiver stays");
         } else {
             assert_eq!(after, None, "{case}: the live receiver is dropped");
         }

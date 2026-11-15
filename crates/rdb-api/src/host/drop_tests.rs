@@ -7164,22 +7164,16 @@ fn tail_on_three(trio: &mut Trio) -> Generation {
 /// Row 31b (#107, moved from slice 1): row 2b's tail, but the live re-add's commit is
 /// `ReadOnly`: node 1 and node 2 are held apart while node 3's links heal, so the re-plan
 /// commits without writes. Node 3's landing refuses `held_past_base` and, being `ReadOnly`,
-/// keeps its live receiver (no `land_receiver_dropped`). Once 1 and 2 heal, the partition is
-/// expected back at `Active` with three regular copies, as it is when node 3 restarts instead,
-/// and every generation that pins node 3 regular holds seq 1 on node 3.
-///
-/// **Red, and ignored: NEEDS_CONTEXT (slice 2a report, section "row 31b").** Observed in the
-/// trio, 2026-11-15: the kept receiver answers R1's shadow cursor `NeedPrefix { have: Seq(1) }`
-/// from its refused lineage, so R1 walks node 3 from seq 2 into the `ReadOnly` generation,
-/// which then has no seq 1. Node 1 promotes it (`shadow_promote`), node 3's next landing
-/// refuses `from_has_no_floor` (check B holds), and the repair is held on node 3's tail
-/// (`membership_repair_held{held_past_base}`), so the partition stays `ReadOnly`. With a
-/// restart in place of the live return, the fresh receiver answers `have: Seq(0)`, the walk
-/// starts at the root, and the partition reaches `Active`. Fixing it changes the slice 1
-/// `ReadOnly` exception or the promote rule, which the design does not cover.
+/// keeps its live receiver (no `land_receiver_dropped`), which claims nothing of the refused
+/// lineage (`land_receiver_from_root`, lead ruling): R1 walks it from seq 1, as a restarted
+/// copy's fresh receiver is. Once 1 and 2 heal, the partition is back at `Active` with three
+/// regular copies, as it is when node 3 restarts instead, and every generation that pins node 3
+/// regular holds seq 1 on node 3.
+/// Cut: `on_recovered` ignores `refused_landing`, red (the kept receiver answers
+/// `have: Seq(1)`, node 3's next landing refuses `from_has_no_floor`, the repair is held on its
+/// tail, and the partition stays `ReadOnly`: never `Active`).
 /// Integration (~8 s): the drop, the `ReadOnly` re-add, the walk and the promote, the heal.
 #[config_log::retcd_test]
-#[ignore = "#107 s2a NEEDS_CONTEXT: a kept receiver walks a ReadOnly re-add from seq 2"]
 fn issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_and_recovers() {
     const METHOD: &str =
         "issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_and_recovers";
@@ -7216,6 +7210,16 @@ fn issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_an
     assert!(
         dropped.is_empty(),
         "ReadOnly keeps the receiver: {dropped:?}"
+    );
+    let from_root: Vec<_> = logged!(METHOD, "land_receiver_from_root")
+        .into_iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| (line["generation"].clone(), line["reason"].clone()))
+        .collect();
+    assert_eq!(
+        from_root,
+        [(shadowed.0.into(), "held_past_base".into())],
+        "the kept receiver claims nothing of the refused lineage"
     );
 
     trio.links.heal(NodeId(1), NodeId(2));

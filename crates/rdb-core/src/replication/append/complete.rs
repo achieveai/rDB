@@ -7,10 +7,13 @@
 //! progress is evidence, never qualification.
 
 use crate::contracts::authority::AuthorityView;
+use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendOutcome, AppendReject};
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::event::EffectKind;
-use crate::contracts::ids::{BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq, ReplicaRole};
+use crate::contracts::ids::{
+    BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq, ReplicaRole, Seq,
+};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::recovery::RecoveryResult;
 use crate::contracts::storage::DurablePrefix;
@@ -103,6 +106,8 @@ impl AppendReceiver {
     /// member clears that.
     pub fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<EffectKind> {
         self.recovery_plan = None;
+        // #107 slice 2a: a generation the host refused to link claims nothing of what it refused.
+        let refused = self.refused_landing.take() == Some(result.new_generation);
         let config = &result.committed.pinned_config;
         let invalid = || {
             vec![ignored(KernelIgnoredReason::Replica(
@@ -126,6 +131,7 @@ impl AppendReceiver {
             .history
             .lookup(selected.cutoff_seq, selected.cutoff_digest);
         let keeps_head = lookup == DigestLookup::Match
+            && !refused
             && !self.retired
             && self.quarantine.is_none()
             && self.lineage.generation == result.new_generation
@@ -134,6 +140,14 @@ impl AppendReceiver {
             && !self.retired
             && self.lineage.generation == result.new_generation;
         let anchor = match lookup {
+            _ if refused => {
+                self.history.truncate_above(Seq::ZERO);
+                self.history.insert(Seq::ZERO, Digest::ROOT);
+                Some(Head {
+                    seq: Seq::ZERO,
+                    digest: Digest::ROOT,
+                })
+            }
             _ if keeps_head => Some(self.applied_head),
             DigestLookup::Differs { .. } => None,
             DigestLookup::Match | DigestLookup::NotRetained => {

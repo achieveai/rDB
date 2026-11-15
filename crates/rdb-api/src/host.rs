@@ -10217,7 +10217,9 @@ impl Host {
     /// handling and keeps whatever receiver it holds. For the refusals after those, in a commit
     /// that takes writes it also drops any live receiver it holds (check A), so it walks up from
     /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
-    /// stays, as the held tail does. A copy refused past the cutoff whose tail is
+    /// stays, as the held tail does, but anchors at the root on this generation's `Recovered`
+    /// (`AppendReceiver::refuse_landing`, #107 row 31b), so it too is walked from seq 1. A copy
+    /// refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
     /// writes: the drop duty leaves it out, and it is re-added as a shadow and walked up from the
     /// root once it restarts (#59,
@@ -10419,6 +10421,21 @@ impl Host {
                             "land_receiver_dropped"
                         );
                     }
+                }
+                // #107 slice 2a (lead ruling on row 31b): a receiver kept past a refusal claims
+                // nothing of the lineage it refused. This generation's `Recovered` anchors it at
+                // the root, as a restarted copy's fresh receiver is, so R1 walks it from seq 1.
+                if self
+                    .replication
+                    .refuse_landing(self.node, partition, generation)
+                {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        generation = generation.0,
+                        reason,
+                        "land_receiver_from_root"
+                    );
                 }
                 refused(reason)
             }
