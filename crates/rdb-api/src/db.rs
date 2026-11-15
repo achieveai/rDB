@@ -4069,11 +4069,15 @@ impl Db {
     }
 
     /// [`Self::promote`] of one partition, from any `Db` with a control store: a peer's running
-    /// `Db` or an app's, with the owner dead.
+    /// `Db` or an app's, with the owner dead or host-faulted.
     ///
-    /// Above one partition the owner must be dead, because the freeze is the whole node's. A
-    /// just-killed owner is waited out for up to its grant's length. The other partitions the
-    /// node owned stay `NoLink` until each has its own promote; the node's next open fails
+    /// Above one partition the owner must be dead or host-faulted, because the freeze is the
+    /// whole node's: it must not answer a look without a host fault, and its grant must not be
+    /// renewing (a frozen grant passes at once). A host fault lasts the boot, so a faulted owner
+    /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
+    /// until its last grant expiry plus the safety margin is proven past. The other partitions
+    /// the node owned remain not ready until each has its own promote (`Faulted` while the
+    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
     /// for a partition it no longer owns.
     ///
