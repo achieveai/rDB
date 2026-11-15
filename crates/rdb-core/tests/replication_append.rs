@@ -1530,18 +1530,20 @@ fn recovered_on_a_matching_cutoff_re_anchors_there_and_adopts_the_new_lineage() 
     assert_eq!(staged_batch(&effects), (BatchId(3), NEW_GEN, Seq(12)));
 }
 
-/// #107 slice 2a (lead ruling on row 31b): a receiver its host marked refused at a generation
-/// (`Replication::refuse_landing`) answers that generation's `Recovered` from the root,
-/// `NeedPrefix { have: Seq(0), head_digest: ROOT }`, exactly as a receiver built fresh after a
-/// restart does, even though it holds the cutoff (`Match`, which would anchor at 11). The mark
-/// is keyed to the generation: one for another generation anchors at the cutoff as before.
-/// Cut: `on_recovered` ignores `refused_landing`, red (`have: Seq(11)`).
+/// #107 slice 2a (lead ruling on row 31b, narrowed): a receiver its host marked refused at a
+/// generation (`Replication::refuse_landing`) never anchors that generation's `Recovered` on a
+/// rung below the cutoff. B holds through 12 and the cutoff is 13 (`NotRetained`): unmarked it
+/// anchors at 12, marked it answers from the root, `NeedPrefix { have: Seq(0), head_digest:
+/// ROOT }`, exactly as a receiver built fresh after a restart does. Holding the cutoff (11,
+/// `Match`) it anchors there marked or not: a proven prefix, which issue #105's tail adoption
+/// relies on. A mark for another generation changes nothing.
+/// Cut: the refused `NotRetained` arm removed, red (`have: Seq(12)`).
 #[retcd_test]
-fn issue107_31b_a_receiver_refused_at_a_generation_answers_its_recovered_from_the_root() {
+fn issue107_31b_a_receiver_refused_at_a_generation_never_anchors_below_its_cutoff() {
     let mut module = applied_to(12);
     assert!(module.refuse_landing(B, P, NEW_GEN), "a receiver to mark");
     assert!(!module.refuse_landing(C, P, NEW_GEN), "no receiver on C");
-    let effects = step(&mut module, &recovered(11, d(11), takeover_config()));
+    let effects = step(&mut module, &recovered(13, d(13), takeover_config()));
     assert_eq!(effects.len(), 1, "{effects:?}");
     assert_eq!(
         reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
@@ -1558,12 +1560,19 @@ fn issue107_31b_a_receiver_refused_at_a_generation_answers_its_recovered_from_th
     assert_eq!(rx_.history().highest(), Some(Seq::ZERO));
     assert_eq!(rx_.lineage().generation, NEW_GEN);
 
-    // Marked at another generation: today's anchor at the cutoff.
+    // Marked, holding the cutoff: anchored at it, as unmarked.
+    let mut at_cutoff = applied_to(12);
+    assert!(at_cutoff.refuse_landing(B, P, NEW_GEN));
+    let effects = step(&mut at_cutoff, &recovered(11, d(11), takeover_config()));
+    asks_new_primary(&effects, 11);
+    assert_eq!(rx(&at_cutoff).applied_head(), head(11));
+
+    // Marked at another generation: today's anchor at its own head below the cutoff.
     let mut other = applied_to(12);
     assert!(other.refuse_landing(B, P, Generation(NEW_GEN.0 + 1)));
-    let effects = step(&mut other, &recovered(11, d(11), takeover_config()));
-    asks_new_primary(&effects, 11);
-    assert_eq!(rx(&other).applied_head(), head(11));
+    let effects = step(&mut other, &recovered(13, d(13), takeover_config()));
+    asks_new_primary(&effects, 12);
+    assert_eq!(rx(&other).applied_head(), head(12));
 }
 
 /// The plan's fixture: B at `(15, d15)`, 16 staged, durable 12, quarantined; the takeover's

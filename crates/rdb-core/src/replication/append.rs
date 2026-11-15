@@ -165,8 +165,8 @@ pub struct AppendReceiver {
     sealed_through: Option<Generation>,
     /// The generation this copy's host refused to link its stored lineage into (#107 slice 2a,
     /// lead ruling on row 31b), set by [`Self::refuse_landing`]. That generation's `Recovered`
-    /// anchors at the root, as a fresh receiver does, so it claims no prefix of the refused
-    /// lineage; any `Recovered` clears it.
+    /// never anchors on a rung below the cutoff: without the cutoff it anchors at the root, as
+    /// a fresh receiver does. Any `Recovered` clears it.
     refused_landing: Option<Generation>,
 }
 
@@ -319,10 +319,12 @@ impl AppendReceiver {
     }
 
     /// The host refused to link `generation` onto what this copy stores (#107 slice 2a, lead
-    /// ruling on row 31b): that generation's `Recovered` re-anchors this receiver at the root,
-    /// `NeedPrefix { have: Seq(0) }`, exactly as a receiver built fresh after a restart does,
-    /// instead of on a rung of the lineage it refused. Claiming less only lengthens the walk;
-    /// claiming a refused prefix lets the walk start above seq 1 and leave a hole.
+    /// ruling on row 31b, narrowed): that generation's `Recovered` never anchors this receiver on
+    /// a rung below the cutoff. Holding the cutoff with its digest it anchors there, as any copy
+    /// does (a proven prefix, which issue #105's tail adoption relies on); otherwise it anchors at
+    /// the root, `NeedPrefix { have: Seq(0) }`, exactly as a receiver built fresh after a restart
+    /// does. A rung below the cutoff would start the walk inside the new generation's prefix and
+    /// leave it no seq 1.
     pub fn refuse_landing(&mut self, generation: Generation) {
         self.refused_landing = Some(generation);
     }

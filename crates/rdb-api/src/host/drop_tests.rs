@@ -7164,12 +7164,13 @@ fn tail_on_three(trio: &mut Trio) -> Generation {
 /// Row 31b (#107, moved from slice 1): row 2b's tail, but the live re-add's commit is
 /// `ReadOnly`: node 1 and node 2 are held apart while node 3's links heal, so the re-plan
 /// commits without writes. Node 3's landing refuses `held_past_base` and, being `ReadOnly`,
-/// keeps its live receiver (no `land_receiver_dropped`), which claims nothing of the refused
-/// lineage (`land_receiver_from_root`, lead ruling): R1 walks it from seq 1, as a restarted
-/// copy's fresh receiver is. Once 1 and 2 heal, the partition is back at `Active` with three
+/// keeps its live receiver (no `land_receiver_dropped`), marked refused
+/// (`land_receiver_from_root`, lead ruling, narrowed): the receiver does not hold the cutoff, so
+/// it never anchors on a rung below it and anchors at the root instead, and R1 walks it from
+/// seq 1, as a restarted copy's fresh receiver is. Once 1 and 2 heal, the partition is back at `Active` with three
 /// regular copies, as it is when node 3 restarts instead, and every generation that pins node 3
 /// regular holds seq 1 on node 3.
-/// Cut: `on_recovered` ignores `refused_landing`, red (the kept receiver answers
+/// Cut: `on_recovered`'s refused `NotRetained` arm removed, red (the kept receiver answers
 /// `have: Seq(1)`, node 3's next landing refuses `from_has_no_floor`, the repair is held on its
 /// tail, and the partition stays `ReadOnly`: never `Active`).
 /// Integration (~8 s): the drop, the `ReadOnly` re-add, the walk and the promote, the heal.

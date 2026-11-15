@@ -3796,7 +3796,8 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
 /// receiver stays, as the held tail does, with no `land_receiver_dropped`; it is only marked
 /// refused at this generation (`AppendReceiver::refuse_landing`, #107 row 31b), so its
-/// `Recovered` anchors it at the root. Nothing links in any case.
+/// `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at the root.
+/// Nothing links in any case.
 /// Cuts: keep the receiver on refusal, red (2a); remove the `ReadOnly` exception, red (31a).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
