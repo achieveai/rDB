@@ -8056,3 +8056,268 @@ fn issue107_r_a_paused_drop_with_no_link_loss_stays_restart_only() {
     let warned = logged!(METHOD, "copy_left_out_until_restart");
     assert_eq!(warned.len(), 1, "{warned:?}");
 }
+
+/// Seeds node 1 with a second due return beside node 3's on partition 1: partition 2, a copy
+/// of partition 1's commit, with `left` (pinned on partition 1) left out of it at the boot it
+/// runs and recorded as a clocked drop. Its link hold starts at `older`, partition 1's 100 ms
+/// later, so partition 2 is the one linked longest. Returns partition 2.
+fn seed_second_return(trio: &mut Trio, left: NodeId, older: Tick) -> PartitionId {
+    let p2 = PartitionId(2);
+    let one = &mut trio.nodes[0].0;
+    let mut committed = one.committed[&P1].clone();
+    let members = &mut committed.committed.pinned_config.members;
+    if left != NodeId(3) {
+        let at = members
+            .iter()
+            .position(|member| member.node == left)
+            .expect("pinned on partition 1");
+        let member = members.remove(at);
+        one.left_out.insert(p2, vec![member]);
+    } else {
+        let out = one.left_out[&P1].clone();
+        one.left_out.insert(p2, out);
+    }
+    one.committed.insert(p2, committed);
+    let why = one.live_readd.clocked[&(P1, NodeId(3))];
+    one.live_readd.clocked.insert((p2, left), why);
+    let up = |trio: &Trio, node: NodeId, since: Tick| LinkSeen::Up {
+        since,
+        conn: trio.links.connection(NodeId(1), node).expect("linked"),
+    };
+    let (second, first) = (
+        up(trio, left, older),
+        up(trio, NodeId(3), older.plus_millis(100)),
+    );
+    let one = &mut trio.nodes[0].0;
+    one.live_readd.links.insert((p2, left), second);
+    one.live_readd.links.insert((P1, NodeId(3)), first);
+    assert_eq!(
+        one.live_readd_refusal(p2, left),
+        None,
+        "a second due return"
+    );
+    p2
+}
+
+/// Blocker 1, the failed send (#107 slice 2a review, round 2): a due copy whose `Inspect`
+/// cannot be sent sits out a whole hold, so another due copy, on another node, is probed and
+/// started. Seeded beside node 3's return on partition 1: partition 2 leaves node 2 out, with
+/// the older hold. Node 2's mailbox is replaced by one whose receiver is gone, so
+/// `Links::send` fails. The first check logs `live_readd_unanswered{why: send_failed}` for
+/// partition 2, holds no probe and restarts its hold; the next probes node 3 on partition 1,
+/// and once that is answered starts its re-add. Partition 2 is not tried again in its hold.
+/// Cut: the send-failed branch returns without `live_readd_unanswered`, red (no
+/// `live_readd_unanswered` line, and partition 2's hold is not restarted).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_failed_send_sits_out_a_hold_and_a_healthy_copy_starts() {
+    const METHOD: &str = "issue107_r2_a_failed_send_sits_out_a_hold_and_a_healthy_copy_starts";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = seed_second_return(&mut trio, NodeId(2), t0);
+    let (dead, gone) = mpsc::channel();
+    drop(gone);
+    let boot2 = trio.nodes[1].0.boot;
+    trio.links.register(NodeId(2), dead, boot2);
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    let unanswered = live_lines(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(
+        (
+            unanswered[0]["partition"].as_u64(),
+            unanswered[0]["left_out"].as_u64(),
+            unanswered[0]["why"].as_str(),
+        ),
+        (Some(2), Some(2), Some("send_failed")),
+        "{unanswered:?}"
+    );
+    assert_eq!(probed(&trio), None, "no probe held for a send that failed");
+    assert!(
+        matches!(
+            trio.nodes[0].0.live_readd.links.get(&(p2, NodeId(2))),
+            Some(LinkSeen::Up { since, .. }) if *since == at(0)
+        ),
+        "partition 2's hold starts again"
+    );
+    assert!(inspects_on_three(&trio).is_empty());
+
+    trio.nodes[0].0.live_readd_duty(at(200));
+    assert_eq!(probed(&trio), Some(P1), "the healthy copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(400));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    assert!(!trio.nodes[0].0.rejoins.contains_key(&p2));
+    assert_eq!(live_lines(METHOD, "live_readd_unanswered").len(), 1);
+    let planned = live_lines(METHOD, "live_readd_planned");
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["partition"], 1, "{planned:?}");
+}
+
+/// Blocker 2, a remote same-boot reconnect (#107 slice 2a review, round 2): node 1 reaches
+/// node 3 over the process links, with no local mailbox for node 3 (`Links::knows` is false),
+/// so both `Links::connection` and `Net::connection` answer the route's connection id. The
+/// hold starts at `t0` on the first link; a second link at node 3's same boot replaces it, and
+/// both accessors answer the new id while the boot stays. The next check logs
+/// `live_readd_hold_restarted` naming both ids, nothing is probed before a whole hold of the
+/// new link, and at its boundary one `Inspect` goes out, on the new link only.
+/// Cuts: `Links::connection`'s remote branch answers one id for any connection
+/// (`net.connection(to).map(|_| 0)`), red (the accessors disagree); `live_readd_link_seen`
+/// keeps an up link's hold whatever its connection, red (no `live_readd_hold_restarted`).
+/// Integration (~2 s): bootstrap and the drop; the links have no sockets and the checks are
+/// direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_remote_reconnect_at_the_same_boot_starts_the_hold_again() {
+    const METHOD: &str = "issue107_r2_a_remote_reconnect_at_the_same_boot_starts_the_hold_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let boot3 = trio.nodes[2].0.boot;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let net = crate::net::Net::unsocketed(
+        NodeId(1),
+        trio.nodes[0].0.boot,
+        &[NodeId(2), NodeId(3)],
+        rt.handle().clone(),
+    );
+    let links = Links::new();
+    links.register(NodeId(1), trio.nodes[0].1.clone(), trio.nodes[0].0.boot);
+    links.attach(Arc::clone(&net));
+    let (first, mut out1) = net.link_up_unsocketed(NodeId(3), boot3);
+    let local = std::mem::replace(&mut trio.nodes[0].0.links, Arc::clone(&links));
+    assert!(!links.knows(NodeId(3)), "no local mailbox for node 3");
+    assert_eq!(
+        (
+            links.connection(NodeId(1), NodeId(3)),
+            net.connection(NodeId(3))
+        ),
+        (Some(first), Some(first))
+    );
+    assert_eq!(links.boot_of(NodeId(3)), Some(boot3));
+    assert_eq!(trio.nodes[0].0.live_readd_refusal(P1, NodeId(3)), None);
+    hold_from(&mut trio, t0);
+
+    let (second, mut out2) = net.link_up_unsocketed(NodeId(3), boot3);
+    assert_ne!(second, first, "a new connection");
+    assert_eq!(
+        (
+            links.connection(NodeId(1), NodeId(3)),
+            net.connection(NodeId(3))
+        ),
+        (Some(second), Some(second)),
+        "both accessors answer the replacement"
+    );
+    assert_eq!(links.boot_of(NodeId(3)), Some(boot3), "the same boot");
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    duty(&mut trio, 250);
+    let restarted = live_lines(METHOD, "live_readd_hold_restarted");
+    assert_eq!(restarted.len(), 1, "{restarted:?}");
+    assert_eq!(
+        (
+            restarted[0]["old_conn"].as_u64(),
+            restarted[0]["conn"].as_u64()
+        ),
+        (Some(first), Some(second)),
+        "{restarted:?}"
+    );
+    for millis in [LIVE_HOLD_MILLIS, 250 + LIVE_HOLD_MILLIS - 1] {
+        duty(&mut trio, millis);
+        assert_eq!(
+            probed(&trio),
+            None,
+            "under a hold of the new link at {millis} ms"
+        );
+    }
+    assert!(out2.try_recv().is_err(), "nothing sent on the new link yet");
+    duty(&mut trio, 250 + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1), "a whole hold of the new link");
+    assert!(out2.try_recv().is_ok(), "the Inspect, on the new link");
+    assert!(out2.try_recv().is_err(), "one frame");
+    assert!(out1.try_recv().is_err(), "nothing on the replaced link");
+    trio.nodes[0].0.links = local;
+}
+
+/// Blocker 3, the answer's freshness cutoff (#107 slice 2a review, round 2), the accepted
+/// side: a clean answer already queued when the duty next runs, 400 ms (two drop checks) after
+/// the probe went, is taken, and node 3's re-add starts.
+/// Cut: `<= 2 * DROP_CHECK_EVERY_MILLIS` in `inspect_answer` as `<`, red (no re-add).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_clean_answer_read_400_ms_after_its_probe_starts_the_return() {
+    const METHOD: &str = "issue107_r2_a_clean_answer_read_400_ms_after_its_probe_starts_the_return";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let sent = t0.plus_millis(LIVE_HOLD_MILLIS);
+    trio.nodes[0].0.live_readd_duty(sent);
+    assert_eq!(probed(&trio), Some(P1));
+    answer_as_three(&trio, inspects_on_three(&trio), None);
+    assert_eq!(2 * DROP_CHECK_EVERY_MILLIS, 400);
+    trio.nodes[0].0.live_readd_duty(sent.plus_millis(400));
+    assert!(readd_started(&trio, P1), "the answer at 400 ms is taken");
+    assert!(live_lines(METHOD, "live_readd_unanswered").is_empty());
+    assert_eq!(live_lines(METHOD, "live_readd_planned").len(), 1);
+}
+
+/// Blocker 3, the refused side: the same clean answer, queued before the duty runs at 401 ms
+/// after its probe, is too old. Partition 2 (seeded, node 3 left out, the older hold) is
+/// probed and answered clean; the check at 401 ms plans nothing for it, logs
+/// `live_readd_unanswered{why: no_answer}` and restarts its hold; the next check probes
+/// partition 1, and its answer starts that re-add.
+/// Cut: `<= 2 * DROP_CHECK_EVERY_MILLIS` as `<= 2 * DROP_CHECK_EVERY_MILLIS + 1`, red
+/// (partition 2's re-plan starts on the stale answer).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_clean_answer_read_401_ms_after_its_probe_is_refused_and_waits_a_hold() {
+    const METHOD: &str =
+        "issue107_r2_a_clean_answer_read_401_ms_after_its_probe_is_refused_and_waits_a_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = seed_second_return(&mut trio, NodeId(3), t0);
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    assert_eq!(probed(&trio), Some(p2), "the older hold first");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [p2]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(401));
+    assert!(
+        !trio.nodes[0].0.rejoins.contains_key(&p2),
+        "a stale answer plans nothing"
+    );
+    let unanswered = live_lines(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(
+        (
+            unanswered[0]["partition"].as_u64(),
+            unanswered[0]["why"].as_str()
+        ),
+        (Some(2), Some("no_answer")),
+        "{unanswered:?}"
+    );
+    assert_eq!(probed(&trio), None);
+    assert!(
+        matches!(
+            trio.nodes[0].0.live_readd.links.get(&(p2, NodeId(3))),
+            Some(LinkSeen::Up { since, .. }) if *since == at(401)
+        ),
+        "partition 2's hold starts again"
+    );
+
+    trio.nodes[0].0.live_readd_duty(at(601));
+    assert_eq!(probed(&trio), Some(P1), "the other due copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+    trio.nodes[0].0.live_readd_duty(at(801));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    assert!(!trio.nodes[0].0.rejoins.contains_key(&p2));
+}

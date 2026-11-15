@@ -670,6 +670,60 @@ impl Net {
     }
 }
 
+#[cfg(test)]
+impl Net {
+    /// A `Net` for node `node` at `boot`, with a route to each of `peers` and no sockets or
+    /// tasks. A row brings a link up with [`Self::link_up_unsocketed`], as a handshake would, so
+    /// a host reaches a peer it does not run over a link the row controls.
+    pub(crate) fn unsocketed(
+        node: NodeId,
+        boot: BootId,
+        peers: &[NodeId],
+        rt: tokio::runtime::Handle,
+    ) -> Arc<Self> {
+        let route = || Route {
+            conn: None,
+            queue: VecDeque::new(),
+            boot: None,
+            refused: None,
+            last_error: None,
+        };
+        let shared = Arc::new(Shared {
+            label: Label::Node(node),
+            admin_apps: BTreeSet::new(),
+            boot,
+            protocol_version: PROTOCOL_VERSION,
+            faults: Faults::new(),
+            links: std::sync::Weak::new(),
+            clock: HostClock::start(),
+            routes: Mutex::new(peers.iter().map(|peer| (*peer, route())).collect()),
+            conns: Mutex::new(BTreeMap::new()),
+            next_conn: AtomicU64::new(0),
+            rt,
+            span: tracing::Span::current(),
+            on_boot: Mutex::new(None),
+        });
+        Arc::new(Self {
+            shared,
+            tasks: Mutex::new(Vec::new()),
+            addr: None,
+        })
+    }
+
+    /// Bring a new link to `node` up at `boot` through `install`, replacing (and closing) any
+    /// live one. Returns its id and the frames it sends.
+    pub(crate) fn link_up_unsocketed(
+        &self,
+        node: NodeId,
+        boot: BootId,
+    ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Envelope>) {
+        let (tx, out) = unbounded_channel();
+        let conn = new_conn(&self.shared, Label::Node(node), tx);
+        install(&self.shared, node, &conn, boot);
+        (conn.id, out)
+    }
+}
+
 impl Drop for Net {
     fn drop(&mut self) {
         for task in lock(&self.tasks).drain(..) {
