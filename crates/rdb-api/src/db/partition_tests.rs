@@ -1157,6 +1157,25 @@ fn grant_frozen(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, node
         .is_some_and(|grant| grant.frozen)
 }
 
+/// `grants/{node}`'s expiry, in control-time milliseconds.
+fn grant_expiry_ms(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, node: u32) -> i64 {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(NodeId(node)).encode()),
+        }))
+        .expect("the grant reads");
+    read.record
+        .and_then(|found| GrantRecord::decode(&found.value))
+        .unwrap_or_else(|| panic!("grants/{node} holds a grant record"))
+        .expiry_utc_ms
+}
+
+/// This host's control time now, in the milliseconds a grant's expiry is written in.
+fn control_now_ms() -> i64 {
+    let now = crate::clock::HostClock::start().now();
+    i64::try_from(now.0).expect("control time fits an i64")
+}
+
 fn operations(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> usize {
     rt.block_on(store.list(config_core::ListRequest {
         prefix: Bytes::from_static(b"operations/"),
@@ -1348,7 +1367,8 @@ fn s3_a_live_owner_is_refused_by_name_and_nothing_is_written() {
 /// grant, not the look, red (`s3_a_live_owner_is_refused_by_name_and_nothing_is_written` stays
 /// green on that cut, because the renewing grant refuses it too).
 /// Integration (~7 s at scale 1): the promote waits out node 2's 6 s grant, which stopped renewing
-/// at the fault.
+/// at the fault. The row asserts that wait: node 2's grant had not expired when the promote was
+/// called, and had when it returned.
 #[config_log::retcd_test]
 fn i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze() {
     const METHOD: &str = "i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze";
@@ -1409,9 +1429,18 @@ fn i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze() {
         })
         .collect();
 
+    let called_at = control_now_ms();
     let promoted = db
         .promote_partition(PART2, NodeId(3), None)
         .unwrap_or_else(|error| panic!("a faulted owner is promoted away from: {error}"));
+    let returned_at = control_now_ms();
+    // It waited out the grant: node 2's last expiry lay ahead when the promote was called and
+    // behind when it returned. The freeze keeps that expiry.
+    let expiry = grant_expiry_ms(&rt, &store, 2);
+    assert!(
+        called_at < expiry && expiry <= returned_at,
+        "called at {called_at}, grant expiry {expiry}, returned at {returned_at}"
+    );
     assert_eq!(
         (promoted.partition, promoted.owner, promoted.prior_owner),
         (PART2, NodeId(3), NodeId(2)),
@@ -1457,23 +1486,33 @@ fn i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze() {
         "node 2 logged its fault"
     );
     // The promote runs on a runtime task with no test span, so its lines go to the run's
-    // untagged file. The fault's text is this row's own.
-    config_log::layer::flush_test_logs();
+    // untagged file. That file has its own background writer, which `flush_test_logs` does not
+    // drain, so poll it until the line lands. The fault's text is this row's own.
     let untagged =
         config_log::testing::test_log_dir().join(format!("_untagged-{}.jsonl", std::process::id()));
-    let text = std::fs::read_to_string(&untagged)
-        .unwrap_or_else(|e| panic!("read {}: {e}", untagged.display()));
-    let faulted: Vec<_> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|line| {
-            line["@m"] == "promote_owner_faulted"
-                && line["fault"]
-                    .as_str()
-                    .is_some_and(|fault| fault.contains("i122: injected"))
-        })
-        .map(|line| (line["@l"].clone(), line["owner"].clone()))
-        .collect();
+    let read_faulted = || -> Vec<(serde_json::Value, serde_json::Value)> {
+        let Ok(text) = std::fs::read_to_string(&untagged) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| {
+                line["@m"] == "promote_owner_faulted"
+                    && line["fault"]
+                        .as_str()
+                        .is_some_and(|fault| fault.contains("i122: injected"))
+            })
+            .map(|line| (line["@l"].clone(), line["owner"].clone()))
+            .collect()
+    };
+    let deadline = Instant::now() + patience;
+    let faulted = loop {
+        let faulted = read_faulted();
+        if !faulted.is_empty() || Instant::now() >= deadline {
+            break faulted;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(
         faulted,
         [("Warning".into(), 2.into())],
