@@ -126,10 +126,27 @@ pub struct Timeouts {
     pub read: Duration,
     /// How long the owner has had no link to a copy before it re-plans the partition without
     /// that copy. Under 2 s ([`host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]) is refused at open
-    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts, so a
-    /// shorter value pauses writes for less and drops more copies over a slow restart. Each
+    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts (unless
+    /// [`Self::live_readd`] is on), so a shorter value pauses writes for less and drops more
+    /// copies over a slow restart. Each
     /// process running a node reads its own; set it to the same value on every node.
     pub unreachable_drop_after: Duration,
+    /// Issue #107: whether a copy the owner dropped on its own clock comes back without a
+    /// restart. With it on, once the copy's link has been up again for 5 s and the copy answers
+    /// with no fault, the owner adds it back at the boot it still runs, as a shadow that catches
+    /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
+    /// operator, a move or a promote still returns only when its node restarts. One attempt per
+    /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
+    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
+    /// owner and as a returning copy (which marks a refused landing only with it on).
+    ///
+    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
+    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
+    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
+    /// setting off, a read-only return can leave the partition read-only until that copy
+    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
+    /// moves to 10, or a capability bit gates the re-add.
+    pub live_readd: bool,
 }
 
 impl Default for Timeouts {
@@ -138,6 +155,7 @@ impl Default for Timeouts {
             put: Duration::from_secs(5),
             read: Duration::from_secs(1),
             unreachable_drop_after: Duration::from_millis(host::UNREACHABLE_DROP_AFTER_MILLIS),
+            live_readd: false,
         }
     }
 }
@@ -1229,6 +1247,8 @@ struct Respawn {
     budgets: Budgets,
     limits: Limits,
     unreachable_drop_after_millis: u64,
+    /// `Timeouts::live_readd`.
+    live_readd: bool,
     /// The folder a restart takes [`next_boot`] of, when the open was given its boot
     /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
     boots: Option<PathBuf>,
@@ -1240,6 +1260,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The `db_open` line. #107 review: `live_readd` is a field only when the setting is on (a
+/// `None` field is not recorded), so with it off the line keeps the fields it had before the
+/// setting existed.
+fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, live_readd: bool) {
+    tracing::info!(
+        dedup_cap = limits.dedup_cap,
+        dedup_retention_ms = budgets.dedup_retention_millis,
+        unreachable_drop_after_ms,
+        live_readd = live_readd.then_some(true),
+        "db_open"
+    );
 }
 
 impl Db {
@@ -1307,17 +1340,14 @@ impl Db {
             ..budgets
         };
         let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
-        tracing::info!(
-            dedup_cap = limits.dedup_cap,
-            dedup_retention_ms = budgets.dedup_retention_millis,
-            unreachable_drop_after_ms = unreachable_drop_after_millis,
-            "db_open"
-        );
+        let live_readd = config.timeouts.live_readd;
+        log_open(&limits, &budgets, unreachable_drop_after_millis, live_readd);
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
             unreachable_drop_after_millis,
+            live_readd,
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
         };
@@ -1336,6 +1366,7 @@ impl Db {
                     budgets,
                     limits,
                     unreachable_drop_after_millis,
+                    live_readd,
                     boot,
                     partitions,
                 )
@@ -3956,6 +3987,7 @@ impl Db {
                 budgets,
                 limits: Limits::default(),
                 unreachable_drop_after_millis: host::UNREACHABLE_DROP_AFTER_MILLIS,
+                live_readd: false,
                 boots: None,
                 storage: StorageOptions::default(),
             }),
@@ -3995,6 +4027,7 @@ impl Db {
                 budgets,
                 limits,
                 unreachable_drop_after_millis: millis_of(config.timeouts.unreachable_drop_after),
+                live_readd: config.timeouts.live_readd,
                 boots: None,
                 storage: config.storage,
             }),
@@ -4020,6 +4053,7 @@ impl Db {
                 budgets,
                 limits,
                 millis_of(config.timeouts.unreachable_drop_after),
+                config.timeouts.live_readd,
                 boot,
                 config.storage,
                 1,
@@ -4333,6 +4367,7 @@ impl Db {
                 respawn.budgets,
                 respawn.limits,
                 respawn.unreachable_drop_after_millis,
+                respawn.live_readd,
                 boot,
                 respawn.storage,
                 self.route.partitions(),
@@ -4447,6 +4482,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             respawn.unreachable_drop_after_millis,
+            respawn.live_readd,
             boot,
             self.route.partitions(),
         )
@@ -7146,6 +7182,7 @@ mod tests {
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
                 host::UNREACHABLE_DROP_AFTER_MILLIS,
+                false,
                 boot,
                 partitions,
             )
@@ -7256,6 +7293,7 @@ mod tests {
                             fast(),
                             Limits::default(),
                             host::UNREACHABLE_DROP_AFTER_MILLIS,
+                            false,
                             boot,
                             partitions,
                         )?;
@@ -7574,6 +7612,50 @@ mod tests {
         let empty = db.txn(&[], deadline).expect_err("an empty txn");
         assert_eq!(empty.error.kind, ErrorKind::InvalidArgument, "{empty:?}");
         db.shutdown();
+    }
+
+    /// #107 review: with `Timeouts::live_readd` off, `db_open` carries exactly the fields it had
+    /// before the setting existed; on, the same fields and `live_readd: true`, and no other.
+    /// Cut: the field logged whatever the setting, red (an OFF line with `live_readd`).
+    #[config_log::retcd_test]
+    fn db_open_names_live_readd_only_with_it_on() {
+        const METHOD: &str = "db_open_names_live_readd_only_with_it_on";
+        let fields = |line: &serde_json::Value| -> BTreeSet<String> {
+            let context = [
+                "testModule",
+                "testMethod",
+                "testRun",
+                "application",
+                "file",
+                "line",
+                "span",
+                "thread",
+            ];
+            line.as_object()
+                .expect("an object")
+                .keys()
+                .filter(|key| !key.starts_with('@') && !context.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        };
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open")
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let off = [
+            "dedup_cap",
+            "dedup_retention_ms",
+            "unreachable_drop_after_ms",
+        ]
+        .map(str::to_owned);
+        assert_eq!(fields(&lines[0]), BTreeSet::from(off.clone()), "{lines:?}");
+        let mut on = BTreeSet::from(off);
+        on.insert("live_readd".to_owned());
+        assert_eq!(fields(&lines[1]), on, "{lines:?}");
+        assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn

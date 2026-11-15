@@ -36,6 +36,8 @@
 
 mod complete;
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 
 use crate::contracts::authority::{FenceCredential, Lineage};
@@ -163,6 +165,14 @@ pub struct AppendReceiver {
     /// held in memory (issue #80 R4-1). At or below it the copy refuses plain appends and sends
     /// no ACK. No code clears it: `Recovered` moves the lineage above it.
     sealed_through: Option<Generation>,
+    /// The generations this copy's host refused to link its stored lineage into (#107 slice 2a,
+    /// lead ruling on row 31b), added by [`Self::refuse_landing`]. Each such generation's
+    /// `Recovered` never anchors on a rung below the cutoff: without the cutoff it anchors at
+    /// the root, as a fresh receiver does. Kept per generation (review blocker 2): two refusals
+    /// in one due batch arrive before either `Recovered`, and one slot let the second overwrite
+    /// the first and the first `Recovered` then clear the second. A `Recovered` removes its own
+    /// generation and every older one, and keeps the newer ones.
+    refused_landings: BTreeSet<Generation>,
 }
 
 /// F1's plan for a recovery, as `Msg::Restore` delivers it to a copy it is about to catch up:
@@ -253,6 +263,7 @@ impl AppendReceiver {
             dormant: false,
             recovery_plan: None,
             sealed_through: None,
+            refused_landings: BTreeSet::new(),
         })
     }
 
@@ -308,7 +319,24 @@ impl AppendReceiver {
             dormant: true,
             recovery_plan: None,
             sealed_through: None,
+            refused_landings: BTreeSet::new(),
         })
+    }
+
+    /// The host refused to link `generation` onto what this copy stores (#107 slice 2a, lead
+    /// ruling on row 31b, narrowed): that generation's `Recovered` never anchors this receiver on
+    /// a rung below the cutoff. Holding the cutoff with its digest it anchors there, as any copy
+    /// does (a proven prefix, which issue #105's tail adoption relies on); otherwise it anchors at
+    /// the root, `NeedPrefix { have: Seq(0) }`, exactly as a receiver built fresh after a restart
+    /// does. A rung below the cutoff would start the walk inside the new generation's prefix and
+    /// leave it no seq 1.
+    pub fn refuse_landing(&mut self, generation: Generation) {
+        self.refused_landings.insert(generation);
+    }
+
+    /// The generations [`Self::refuse_landing`] marked that no `Recovered` has cleared yet.
+    pub(crate) fn refused_landings(&self) -> impl Iterator<Item = Generation> + '_ {
+        self.refused_landings.iter().copied()
     }
 
     /// Keep F1's `plan` for the recovery in flight, replacing any plan held (#79 S3b). A
