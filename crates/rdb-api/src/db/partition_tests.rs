@@ -1157,6 +1157,25 @@ fn grant_frozen(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, node
         .is_some_and(|grant| grant.frozen)
 }
 
+/// `grants/{node}`'s expiry, in control-time milliseconds.
+fn grant_expiry_ms(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>, node: u32) -> i64 {
+    let read = rt
+        .block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(NodeId(node)).encode()),
+        }))
+        .expect("the grant reads");
+    read.record
+        .and_then(|found| GrantRecord::decode(&found.value))
+        .unwrap_or_else(|| panic!("grants/{node} holds a grant record"))
+        .expiry_utc_ms
+}
+
+/// This host's control time now, in the milliseconds a grant's expiry is written in.
+fn control_now_ms() -> i64 {
+    let now = crate::clock::HostClock::start().now();
+    i64::try_from(now.0).expect("control time fits an i64")
+}
+
 fn operations(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> usize {
     rt.block_on(store.list(config_core::ListRequest {
         prefix: Bytes::from_static(b"operations/"),
@@ -1336,6 +1355,169 @@ fn s3_a_live_owner_is_refused_by_name_and_nothing_is_written() {
     db.put_in(group_in(&db, PART2), b"k", b"v", None)
         .expect("it still writes");
     db.shutdown();
+}
+
+/// Issue #122 half A: an owner above one partition whose look answers with a host fault counts
+/// as not answering, so a promote with no freeze first goes on to the grant checks and moves the
+/// partition. Node 2 owns partitions 2, 5 and 8 of 8. After the fault it publishes nothing on any
+/// of them and answers a write with the fault; partition 2 writes at node 3. Before the fault,
+/// the same promote is refused on the look alone.
+/// Cuts: `owner_dead` takes any reply as an answer again: `OwnerAlive` after the fault, red.
+/// `owner_dead` takes every reply as faulted: the refusal before the fault names the renewing
+/// grant, not the look, red (`s3_a_live_owner_is_refused_by_name_and_nothing_is_written` stays
+/// green on that cut, because the renewing grant refuses it too).
+/// Integration (~7 s at scale 1): the promote waits out node 2's 6 s grant, which stopped renewing
+/// at the fault. The row asserts that wait: node 2's grant had not expired when the promote was
+/// called, and had when it returned.
+#[config_log::retcd_test]
+fn i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze() {
+    const METHOD: &str = "i122_a_faulted_owner_above_one_partition_is_promoted_without_a_freeze";
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut db = ready(&rt, dir.path(), &store, Some(8));
+    let owned = [PART2, PART5, PART8];
+    for partition in owned {
+        assert_eq!(db.owner_of(partition), Some(NodeId(2)), "{partition:?}");
+    }
+    let moved = group_in(&db, PART2);
+    db.put_in(moved, b"before", b"1", None).expect("before");
+
+    // Before the fault, the look alone refuses: a look answered with no fault is a live owner.
+    let alive = db
+        .promote_partition(PART2, NodeId(3), None)
+        .expect_err("node 2 is alive");
+    assert!(
+        matches!(&alive, admin::PromoteError::OwnerAlive { evidence, .. } if evidence == "it answered a look"),
+        "{alive:?}"
+    );
+    nothing_written(&rt, &store, PART2, 2);
+
+    let boot = db.boot_of(NodeId(2)).expect("this Db runs node 2");
+    db.send_to(
+        NodeId(2),
+        Msg::Fault {
+            boot,
+            kind: "i122",
+            detail: "injected".to_owned(),
+        },
+    )
+    .expect("node 2 takes the fault");
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let deadline = Instant::now() + patience;
+    let faulted = loop {
+        let seen = db.look_in(PART2, NodeId(2)).expect("node 2 answers a look");
+        if seen.fault.is_some() {
+            break seen;
+        }
+        assert!(Instant::now() < deadline, "node 2 never faulted: {seen:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        faulted
+            .fault
+            .as_deref()
+            .is_some_and(|fault| fault.contains("i122: injected")),
+        "{faulted:?}"
+    );
+    let published_at_fault: Vec<_> = owned
+        .iter()
+        .map(|partition| {
+            db.look_in(*partition, NodeId(2))
+                .expect("node 2 answers a look")
+                .published
+        })
+        .collect();
+
+    let called_at = control_now_ms();
+    let promoted = db
+        .promote_partition(PART2, NodeId(3), None)
+        .unwrap_or_else(|error| panic!("a faulted owner is promoted away from: {error}"));
+    let returned_at = control_now_ms();
+    // It waited out the grant: node 2's last expiry lay ahead when the promote was called and
+    // behind when it returned. The freeze keeps that expiry.
+    let expiry = grant_expiry_ms(&rt, &store, 2);
+    assert!(
+        called_at < expiry && expiry <= returned_at,
+        "called at {called_at}, grant expiry {expiry}, returned at {returned_at}"
+    );
+    assert_eq!(
+        (promoted.partition, promoted.owner, promoted.prior_owner),
+        (PART2, NodeId(3), NodeId(2)),
+        "{promoted:?}"
+    );
+    assert!(grant_frozen(&rt, &store, 2), "the promote froze node 2");
+    until_ready(&db, PART2);
+    db.put_in(moved, b"after", b"2", None)
+        .expect("partition 2 writes at node 3");
+    let found = db.get_in(moved, b"before").expect("a read").value;
+    assert_eq!(found.map(|(_, bytes)| bytes.to_vec()), Some(b"1".to_vec()));
+
+    // Node 2 takes no write after the fault: a put sent to it straight answers the fault, and
+    // nothing it owns publishes past where it stood at the fault.
+    let answer = db
+        .send_call(NodeId(2), PART5, compile(1220, group_in(&db, PART5)))
+        .expect("node 2 runs")
+        .recv_timeout(patience)
+        .expect("node 2 answers");
+    let Answer::Error { error, .. } = &answer else {
+        panic!("node 2 answers a put with its fault: {answer:?}");
+    };
+    assert!(error.detail.contains("i122: injected"), "{error:?}");
+    let published_after: Vec<_> = owned
+        .iter()
+        .map(|partition| {
+            db.look_in(*partition, NodeId(2))
+                .expect("node 2 answers a look")
+                .published
+        })
+        .collect();
+    assert_eq!(
+        published_after, published_at_fault,
+        "node 2 published nothing"
+    );
+    db.shutdown();
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["@m"] == "host_fault" && line["node"] == 2),
+        "node 2 logged its fault"
+    );
+    // The promote runs on a runtime task with no test span, so its lines go to the run's
+    // untagged file. That file has its own background writer, which `flush_test_logs` does not
+    // drain, so poll it until the line lands. The fault's text is this row's own.
+    let untagged =
+        config_log::testing::test_log_dir().join(format!("_untagged-{}.jsonl", std::process::id()));
+    let read_faulted = || -> Vec<(serde_json::Value, serde_json::Value)> {
+        let Ok(text) = std::fs::read_to_string(&untagged) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| {
+                line["@m"] == "promote_owner_faulted"
+                    && line["fault"]
+                        .as_str()
+                        .is_some_and(|fault| fault.contains("i122: injected"))
+            })
+            .map(|line| (line["@l"].clone(), line["owner"].clone()))
+            .collect()
+    };
+    let deadline = Instant::now() + patience;
+    let faulted = loop {
+        let faulted = read_faulted();
+        if !faulted.is_empty() || Instant::now() >= deadline {
+            break faulted;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        faulted,
+        [("Warning".into(), 2.into())],
+        "the promote logged the fault it read, once"
+    );
 }
 
 /// A paused owner (SIGSTOP, a frozen VM) answers nothing and its expiry stands still, so the

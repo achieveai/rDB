@@ -113,6 +113,17 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// a routed `CatchUp` or `Restore` seed carries (unit 2, architect section 15.3). It ships with
 /// `partitions/{p}` layout 6, which an older build cannot read, so the upgrade stops and restarts
 /// the whole cluster.
+///
+/// Issue #107 (Rev 5 m5), a rule with no frame of its own: an owner's live re-add
+/// (`Host::live_readd_duty`) re-adds a copy at the boot it still runs. Every peer speaking 9 has
+/// check A in `Host::land_link` (a refused landing in a commit that takes writes drops the live
+/// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
+/// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
+/// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
+/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
+/// once every node runs a build with both, and on every node, an operator rule while it is off by
+/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// weakens check A takes a bump.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
@@ -455,6 +466,15 @@ impl Net {
             .and_then(|route| route.boot)
     }
 
+    /// The id of the connection `node`'s link is up on, or `None` with none up. Each
+    /// connection gets a new id, so a reconnect at the same boot answers another one.
+    #[must_use]
+    pub fn connection(&self, node: NodeId) -> Option<u64> {
+        lock(&self.shared.routes)
+            .get(&node)
+            .and_then(|route| route.conn.as_ref().map(|conn| conn.id))
+    }
+
     /// How each node's link stands.
     #[must_use]
     pub fn states(&self) -> BTreeMap<NodeId, LinkState> {
@@ -653,6 +673,60 @@ impl Net {
             },
         );
         (handled, rx)
+    }
+}
+
+#[cfg(test)]
+impl Net {
+    /// A `Net` for node `node` at `boot`, with a route to each of `peers` and no sockets or
+    /// tasks. A row brings a link up with [`Self::link_up_unsocketed`], as a handshake would, so
+    /// a host reaches a peer it does not run over a link the row controls.
+    pub(crate) fn unsocketed(
+        node: NodeId,
+        boot: BootId,
+        peers: &[NodeId],
+        rt: tokio::runtime::Handle,
+    ) -> Arc<Self> {
+        let route = || Route {
+            conn: None,
+            queue: VecDeque::new(),
+            boot: None,
+            refused: None,
+            last_error: None,
+        };
+        let shared = Arc::new(Shared {
+            label: Label::Node(node),
+            admin_apps: BTreeSet::new(),
+            boot,
+            protocol_version: PROTOCOL_VERSION,
+            faults: Faults::new(),
+            links: std::sync::Weak::new(),
+            clock: HostClock::start(),
+            routes: Mutex::new(peers.iter().map(|peer| (*peer, route())).collect()),
+            conns: Mutex::new(BTreeMap::new()),
+            next_conn: AtomicU64::new(0),
+            rt,
+            span: tracing::Span::current(),
+            on_boot: Mutex::new(None),
+        });
+        Arc::new(Self {
+            shared,
+            tasks: Mutex::new(Vec::new()),
+            addr: None,
+        })
+    }
+
+    /// Bring a new link to `node` up at `boot` through `install`, replacing (and closing) any
+    /// live one. Returns its id and the frames it sends.
+    pub(crate) fn link_up_unsocketed(
+        &self,
+        node: NodeId,
+        boot: BootId,
+    ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Envelope>) {
+        let (tx, out) = unbounded_channel();
+        let conn = new_conn(&self.shared, Label::Node(node), tx);
+        install(&self.shared, node, &conn, boot);
+        (conn.id, out)
     }
 }
 
