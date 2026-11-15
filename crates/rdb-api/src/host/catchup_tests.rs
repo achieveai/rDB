@@ -4047,6 +4047,34 @@ fn issue107_no_floor_no_link() {
     );
 }
 
+/// Issue #107 slice 1, check B below the base (`land_at` arm 3). Generation 1 holds seqs 3 and
+/// 4 only, holed below its head 4. A landing of 2 at base 5 sits above that head, so the base
+/// digest is not compared and the head's record reads and verifies: only check B stands
+/// between it and a link. It refuses `from_has_no_floor`, and nothing is written: lineages,
+/// generation 2's link and the cached view are unchanged.
+/// Cut: run check B only when `head == base`, red (generation 2 links at seq 4).
+/// Unit.
+#[config_log::retcd_test]
+fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain_after(&mut engine, Generation(1), vec![Digest::ROOT; 2], 2);
+    }
+    let mut host = host_over(&path, &rt);
+    host.refresh_view(p, Generation(1)).expect("a step view");
+    let before = untouched(&host);
+    assert!(before.view.is_some(), "a cached view");
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 5, Digest::ROOT)),
+        Err("from_has_no_floor")
+    );
+    assert_eq!(untouched(&host), before, "the refusal wrote nothing");
+}
+
 /// Issue #107 slice 1, row 2a's dormant clause: check A drops only a live receiver. Node 2
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that

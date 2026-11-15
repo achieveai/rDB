@@ -1047,7 +1047,8 @@ fn walk_c_held(
 /// running. The last is a `no_mutation` refusal that asks to be sent again once that re-plan
 /// commits. In the two-holder walk it is the shadow promote of the re-added node 1: the owner's
 /// shadow duty starts it once node 1 has caught up to the cutoff, and that can land before
-/// this call (PR #118 at `af21e98`, 2026-11-15: 1 of 20 runs and once in a gate).
+/// this call. Seen on PR #118 at `af21e98` (2026-11-15); the failing assertion and its log
+/// are in that PR's thread.
 fn forget_k2(app: &Db, through: Seq, patience: Duration) {
     let deadline = Instant::now() + patience;
     loop {
@@ -1061,7 +1062,9 @@ fn forget_k2(app: &Db, through: Seq, patience: Duration) {
                 if (error.kind == ErrorKind::NotPrimary
                     || error.detail.contains("nothing for --through to give up")
                     || (error.no_mutation
-                        && error.detail.contains("is running: ask again once it commits")))
+                        && error
+                            .detail
+                            .contains("is running: ask again once it commits")))
                     && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(100));

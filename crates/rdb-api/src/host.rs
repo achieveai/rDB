@@ -11772,7 +11772,10 @@ impl Host {
     ///   lineage that reaches seq 1 or applied nothing (check B, #107, after the depth guard;
     ///   only seq 1 is read). A holed one answers `InventoryFailed` with
     ///   `missed_generation_from_has_no_floor`, and one whose seq 1 read fails with
-    ///   `missed_generation_history_read_failed`.
+    ///   `missed_generation_history_read_failed`. When a tail above the base was released
+    ///   (or adopted) for this ask, the same refusal answers `TailHeld` instead, with that
+    ///   reason, logged `tail_release_refused` (or `tail_adopted_refused`), never a bare
+    ///   `InventoryFailed` once a tail was found.
     fn inventory(
         &mut self,
         partition: PartitionId,
@@ -12827,7 +12830,10 @@ impl Host {
     /// nothing and names its reason, as [`Self::inherit_missed_link`] does; that one stays the
     /// survivor's exact-base guard (A-R177), and this one is never called from `survivor`.
     ///
-    /// Guards, in this order: the head at or below the base (`held_past_base`); the record at the
+    /// Choosing `from` can refuse first: `anchor_generation_absent` (lineages held, none below
+    /// the anchor's generation), and for a copy holding no lineage of the partition
+    /// `publish_marks_unreadable` or `publish_marks_held`. After choosing `from`, guards, in
+    /// this order: the head at or below the base (`held_past_base`); the record at the
     /// head reads and verifies ([`Self::checked`]), and at the base its digest is the anchor's
     /// (`base_digest_differs`); the depth guard
     /// (`link_depth_ceiling`); then check B (#107): `from`'s lineage must reach seq 1 through its

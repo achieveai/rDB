@@ -85,6 +85,19 @@ and the full-copy fallback (scope ruling 2026-10-02).
      crash after the link answers normally. It is logged `inventory_link_inherited{from, to, base}`.
      A copy **below** `base` in its own generation is not covered by this caller (critic-f5's
      residual).
+   - **Amended 2026-11-15 (issue #107 slice 1, PR #118): check B, the floor check.** Both callers
+     above (landing's `land_at` and the inventory's `inherit_missed_link`) now run one more guard,
+     after the depth guard and before anything is written: the parent's lineage must reach seq 1
+     through its chain, or have applied nothing (an empty copy's generation 0 passes). Only seq 1 is
+     read; `History` falls through a copied level, so that one read answers for every level. A
+     holed parent is refused by name: landing `from_has_no_floor`, inventory
+     `missed_generation_from_has_no_floor`. A seq 1 read that fails refuses `history_read_failed`
+     (landing, logged `land_floor_read_failed`) or `missed_generation_history_read_failed`
+     (inventory, logged `missed_generation_floor_read_failed`). Nothing is written by a refusal.
+     Check B is refusal-only and runs whatever the #107 live re-add switch says (lead ruling,
+     2026-11-15; product stage Development). Adoption (`Adopt::Link`, `Adopt::Resume`) does not
+     run it; issue #121 tracks that. It depends on seq 1 being kept: a history trim (#61) must
+     revisit it.
 9. **Spec sentence amended.** §7.2: "Revalidate at IO dispatch and isolate physical effects in an
    epoch/generation namespace." New reading: the namespace isolates **writes**; a read of `g` also sees
    older generations' keys at `base`. §4.1 is unchanged.
