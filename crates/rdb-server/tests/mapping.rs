@@ -244,9 +244,14 @@ fn every_api_error_round_trips_through_the_rich_status() {
 }
 
 /// PR #129 review: a `NotWired` refusal, a faulted owner's above all, says retrying at that
-/// node will not help, and that a call can succeed once another node takes over. It invites a
-/// new write only when the call wrote nothing; otherwise it says to call Status first.
-/// Cut: the `no_mutation` false step reuses the true one's words: red on "Status".
+/// node will not help, and that a call can succeed once another node takes over. The takeover
+/// clause opens "if the owner faulted", since an undecodable call is `NotWired` too and no
+/// retry fixes it. The gateway routes to the faulted owner until Ready re-reads the owner, so
+/// both steps say to call Ready until it reports ready before anything else. It invites a new
+/// write only when the call wrote nothing; otherwise a write calls Status first and a read,
+/// which has no request id, is called again.
+/// Cuts: the `no_mutation` false step reuses the true one's words: red on "Status"; either
+/// step without its Ready clause: red on "call Ready until it reports ready".
 #[test]
 fn a_not_wired_step_says_another_node_can_take_over() {
     for no_mutation in [false, true] {
@@ -259,14 +264,29 @@ fn a_not_wired_step_says_another_node_can_take_over() {
             message.contains("retrying at this node will not help"),
             "{case}"
         );
-        assert!(message.contains("once another node takes over"), "{case}");
+        assert!(
+            message.contains("if the owner faulted, once another node takes over"),
+            "{case}"
+        );
+        // Ready comes before any call again or Status.
+        let ready = message
+            .find("call Ready until it reports ready")
+            .unwrap_or_else(|| panic!("no Ready step: {case}"));
+        let next = message
+            .find("call it again")
+            .or_else(|| message.find("call Status"))
+            .unwrap_or_else(|| panic!("no step after Ready: {case}"));
+        assert!(ready < next, "{case}");
         assert_eq!(
             message.contains("as a new Put or Txn"),
             no_mutation,
             "{case}"
         );
         assert_eq!(
-            message.contains("call Status with the write's request id"),
+            message.contains(
+                "for a write, call Status with its request id before writing again, and never \
+                 send it again as a new write; for a read, call it again"
+            ),
             !no_mutation,
             "{case}"
         );

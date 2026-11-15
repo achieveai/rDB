@@ -199,21 +199,27 @@ pub fn wire_message(error: &ApiError) -> String {
 pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'static str {
     const MAY_HAVE: &str = "the write may have applied: call Status with its request id before \
                             writing again, and never send it again as a new write";
-    // `NotWired` wins over the kind. The node that answered cannot serve the call, a faulted
-    // owner above all, so retrying at it will not help. Another node can take the partition
-    // over: an operator promote today, and automatic failover of a faulted owner once #122
-    // lands (ruling Q13). A fresh call then routes to the new owner and can succeed, so the
-    // step says so, and `no_mutation` picks how a write goes again (PR #129 review).
+    // `NotWired` wins over the kind. The node that answered cannot serve the call, so retrying
+    // at it will not help. `NotWired` also answers a call no retry fixes, such as one that
+    // did not decode, so the takeover clause opens "if the owner faulted" (PR #129 review).
+    // Another node can take a faulted owner's partition over: an operator promote today, and
+    // automatic failover once #122 lands (ruling Q13). This gateway still routes to the
+    // faulted owner after the takeover: it reads the owner again only on Ready, NotPrimary,
+    // LeaseExpired or a failed send. So both steps say to call Ready until it reports ready
+    // first; a call then routes to the new owner and can succeed. `no_mutation` picks how a
+    // write goes again, and a read, which has no request id, is called again.
     if matches!(retry, RetryRule::NotWired) {
         return if no_mutation {
             "retrying at this node will not help: keep the gateway's log and report this \
-             message; once another node takes over (an operator promote does that), call it \
-             again; this call wrote nothing, so a write goes again as a new Put or Txn"
+             message; if the owner faulted, once another node takes over (an operator promote \
+             does that), call Ready until it reports ready, then call it again; this call wrote \
+             nothing, so a write goes again as a new Put or Txn"
         } else {
             "retrying at this node will not help: keep the gateway's log and report this \
-             message; once another node takes over (an operator promote does that), call \
-             Status with the write's request id before writing again, and never send it again \
-             as a new write"
+             message; if the owner faulted, once another node takes over (an operator promote \
+             does that), call Ready until it reports ready; then, for a write, call Status with \
+             its request id before writing again, and never send it again as a new write; for \
+             a read, call it again"
         };
     }
     match kind {
