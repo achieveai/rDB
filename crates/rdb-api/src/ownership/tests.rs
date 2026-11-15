@@ -15,9 +15,16 @@ fn token(generation: u64, owner_epoch: u64) -> OwnerToken {
     }
 }
 
+/// A second partition, for the rows that check one partition's change leaves another alone.
+const Q: PartitionId = PartitionId(5);
+
 fn view(held: OwnerToken, valid_through: u64) -> AuthorityView {
+    view_of(P, held, valid_through)
+}
+
+fn view_of(partition: PartitionId, held: OwnerToken, valid_through: u64) -> AuthorityView {
     AuthorityView {
-        lineage: held.lineage(P),
+        lineage: held.lineage(partition),
         grant_id: GrantId(7),
         boot_id: BootId(1),
         authority_generation: AuthorityGeneration(1),
@@ -101,9 +108,9 @@ fn own84_1c_owner_views_read_the_newest_view_and_clear_on_stop() {
     let old = token(1, 1);
     let new = token(2, 2);
     assert!(map.ownership(P).is_none(), "no view, no owner");
-    map.publish(view(old, u64::MAX), clock, now);
+    map.publish(view(old, u64::MAX), clock, now, false);
     assert!(map.still_owner(P, old));
-    map.publish(view(new, now.0 + 250), clock, now);
+    map.publish(view(new, now.0 + 250), clock, now, false);
     assert!(
         !map.still_owner(P, old),
         "a newer view retires the old token"
@@ -118,23 +125,23 @@ fn own84_1c_owner_views_read_the_newest_view_and_clear_on_stop() {
             remaining: Duration::from_millis(250),
         }
     );
-    map.publish(view(new, now.0 + 40), clock, now);
+    map.publish(view(new, now.0 + 40), clock, now, false);
     assert_eq!(
         map.ownership(P).map(|o| o.remaining),
         Some(Duration::from_millis(40)),
         "a second, shorter horizon"
     );
-    map.publish(view(new, now.0), clock, now);
+    map.publish(view(new, now.0), clock, now, false);
     assert_eq!(
         map.ownership(P).map(|o| o.remaining),
         Some(Duration::ZERO),
         "the last admitting tick: still owned, nothing left to spend"
     );
     assert!(map.still_owner(P, new));
-    map.publish(view(new, now.0 - 1), clock, now);
+    map.publish(view(new, now.0 - 1), clock, now, false);
     assert!(map.ownership(P).is_none(), "the tick after the horizon");
     assert!(!map.still_owner(P, new));
-    map.publish(view(new, now.0 + 250), clock, now);
+    map.publish(view(new, now.0 + 250), clock, now, false);
     assert!(!map.still_owner(PartitionId(4), new), "another partition");
     map.clear();
     assert!(!map.still_owner(P, new));
@@ -157,20 +164,20 @@ fn own84_1d_a_publication_replaces_the_clock_the_map_reads() {
     );
     let held = token(3, 1);
     let map = OwnerViews::new(NodeId(1), ahead);
-    map.publish(view(held, a.0 + 100), ahead, a);
+    map.publish(view(held, a.0 + 100), ahead, a, false);
     assert_eq!(
         map.ownership(P).map(|o| o.remaining),
         Some(Duration::from_millis(100))
     );
-    map.publish(view(held, a.0 + 100), behind, b);
+    map.publish(view(held, a.0 + 100), behind, b, false);
     assert_eq!(
         map.ownership(P).map(|o| o.remaining),
         Some(Duration::from_millis(10_100)),
         "read on the clock the last view came with"
     );
-    map.publish(view(held, b.0 + 5), behind, b);
+    map.publish(view(held, b.0 + 5), behind, b, false);
     assert!(map.still_owner(P, held), "live on the lagging clock");
-    map.publish(view(held, b.0 + 5), ahead, b);
+    map.publish(view(held, b.0 + 5), ahead, b, false);
     assert!(
         !map.still_owner(P, held),
         "the same view, read on the other clock, is past"
@@ -203,6 +210,16 @@ fn own84_1e_remaining_never_overstates_the_time_left_inside_a_tick() {
     }
     assert_eq!(remaining_at(Tick(horizon), Tick(horizon)), Duration::ZERO);
     assert_eq!(
+        remaining_at(Tick(0), Tick(0)),
+        Duration::ZERO,
+        "tick 0, equal"
+    );
+    assert_eq!(
+        remaining_at(Tick(0), Tick(1)),
+        Duration::ZERO,
+        "tick 0, past"
+    );
+    assert_eq!(
         remaining_at(Tick(horizon), Tick(horizon + 5)),
         Duration::ZERO
     );
@@ -219,11 +236,17 @@ fn own84_1f_a_fenced_view_stays_unowned_across_repeated_backward_steps() {
     let held = token(4, 2);
     let map = OwnerViews::new(NodeId(1), clock);
     let granted = clock.now();
-    map.publish(view(held, granted.0 + 60_000), clock, granted);
+    map.publish(view(held, granted.0 + 60_000), clock, granted, false);
+    let other = view_of(Q, held, granted.0 + 600_000);
+    map.publish(other, clock, granted, false);
     assert!(map.still_owner(P, held), "precondition: owned");
     let fenced_at = clock.now();
-    map.publish(view(held, fenced_at.0 - 1), clock, fenced_at);
+    map.publish(view(held, fenced_at.0 - 1), clock, fenced_at, false);
     assert!(!map.still_owner(P, held), "the fence ends it");
+    assert!(
+        map.still_owner(Q, held) && map.ownership(Q).is_some(),
+        "another partition's live view is kept"
+    );
     for step in 1..=3 {
         clock.step_back(5_000);
         assert!(
@@ -234,10 +257,10 @@ fn own84_1f_a_fenced_view_stays_unowned_across_repeated_backward_steps() {
         assert!(map.ownership(P).is_none(), "step {step}");
     }
     let regranted = clock.now();
-    map.publish(view(held, regranted.0 + 60_000), clock, regranted);
+    map.publish(view(held, regranted.0 + 60_000), clock, regranted, false);
     assert!(map.still_owner(P, held), "a live regrant of the same token");
     let taken = token(4, 3);
-    map.publish(view(taken, regranted.0 + 60_000), clock, regranted);
+    map.publish(view(taken, regranted.0 + 60_000), clock, regranted, false);
     assert!(
         !map.still_owner(P, held),
         "a higher token here retires the old one"
@@ -253,7 +276,7 @@ fn own84_1g_a_zero_token_and_unknown_partitions_own_nothing() {
     let now = clock.now();
     let map = OwnerViews::new(NodeId(1), clock);
     let held = token(2, 3);
-    map.publish(view(held, now.0 + 1_000), clock, now);
+    map.publish(view(held, now.0 + 1_000), clock, now, false);
     assert!(map.still_owner(P, held), "precondition");
     assert!(!map.still_owner(P, token(0, 0)), "a zero token");
     for partition in [PartitionId(0), PartitionId(99)] {
@@ -272,16 +295,126 @@ fn own84_1h_a_revoked_map_owns_nothing_for_good() {
     let now = clock.now();
     let map = OwnerViews::new(NodeId(1), clock);
     let held = token(2, 3);
-    map.publish(view(held, now.0 + 1_000), clock, now);
+    map.publish(view(held, now.0 + 1_000), clock, now, false);
     assert!(map.still_owner(P, held), "precondition");
+    map.publish(view_of(Q, held, now.0 + 1_000), clock, now, false);
+    assert!(map.still_owner(Q, held), "precondition: a second partition");
+    let other_clock = clock.lagging(10_000);
     for round in 1..=2 {
         map.revoke();
         assert!(!map.still_owner(P, held), "round {round}");
         assert!(map.ownership(P).is_none(), "round {round}");
-        map.publish(view(held, now.0 + 1_000), clock, now);
-        assert!(
-            !map.still_owner(P, held),
-            "a view after revoke, round {round}"
+        map.publish(view(held, now.0 + 1_000), clock, now, false);
+        // Another partition, on another clock: revoke is the whole map's, not one entry's.
+        map.publish(
+            view_of(Q, held, now.0 + 1_000),
+            other_clock,
+            other_clock.now(),
+            false,
         );
+        for partition in [P, Q] {
+            assert!(
+                !map.still_owner(partition, held),
+                "a view after revoke, round {round}, {partition:?}"
+            );
+            assert!(
+                map.ownership(partition).is_none(),
+                "round {round}, {partition:?}"
+            );
+        }
     }
+    // A stopped node's clear does not undo the revoke.
+    map.clear();
+    map.publish(view(held, now.0 + 1_000), clock, now, false);
+    assert!(!map.still_owner(P, held), "revoke, clear, then a view");
+    assert!(map.ownership(P).is_none(), "revoke, clear, then a view");
+}
+
+/// own84_1i (#84 review): the clock is stepped back between the host's step capture and the
+/// fence's publication. The past view is published with the captured tick, so it is removed:
+/// both readers read false at once and after another step back. Compared with the clock's
+/// fresh reading instead, the view would be kept and admit again. Read on a guarded clock.
+/// Cut: `publish` comparing the horizon with `clock.now()` rather than `at`, red at "at once".
+/// Unit.
+#[test]
+fn own84_1i_a_rollback_between_the_step_and_the_fence_publication_keeps_it_ended() {
+    let clock = HostClock::guarded(0);
+    let held = token(4, 2);
+    let map = OwnerViews::new(NodeId(1), clock);
+    let granted = clock.now();
+    map.publish(view(held, granted.0 + 60_000), clock, granted, false);
+    assert!(map.still_owner(P, held), "precondition: owned");
+    let fenced_at = clock.now();
+    clock.step_back(5_000);
+    assert!(
+        clock.now() < fenced_at,
+        "precondition: rolled back past the step"
+    );
+    map.publish(view(held, fenced_at.0 - 1), clock, fenced_at, false);
+    assert!(!map.still_owner(P, held), "at once");
+    assert!(map.ownership(P).is_none(), "at once");
+    clock.step_back(5_000);
+    assert!(!map.still_owner(P, held), "after another step back");
+    assert!(map.ownership(P).is_none(), "after another step back");
+}
+
+/// own84_1j (#84 review): a still-live view's clock rolls back. On a held clock with a guard,
+/// `remaining` is exact before and after each step back: it grows by exactly the step, and the
+/// view stays owned. Unit.
+#[test]
+fn own84_1j_remaining_follows_a_rollback_of_a_live_view_exactly() {
+    let clock = HostClock::capped(20).with_guard();
+    let _hold = clock.hold();
+    let now = clock.now();
+    let held = token(3, 1);
+    let map = OwnerViews::new(NodeId(1), clock);
+    map.publish(view(held, now.0 + 1_000), clock, now, false);
+    let remaining = |map: &OwnerViews| map.ownership(P).map(|owned| owned.remaining);
+    assert_eq!(
+        remaining(&map),
+        Some(Duration::from_millis(1_000)),
+        "before"
+    );
+    clock.step_back(300);
+    assert_eq!(
+        clock.now().0,
+        now.0 - 300,
+        "precondition: the held clock stepped"
+    );
+    assert_eq!(
+        remaining(&map),
+        Some(Duration::from_millis(1_300)),
+        "one step back"
+    );
+    assert!(map.still_owner(P, held));
+    clock.step_back(200);
+    assert_eq!(
+        remaining(&map),
+        Some(Duration::from_millis(1_500)),
+        "two steps back"
+    );
+    assert!(map.still_owner(P, held));
+}
+
+/// own84_1k (#84 review): a view marked as a fence's (`fenced`: A1 fenced its partition in that
+/// step) is removed whatever its horizon, including a horizon equal to the step tick, which a
+/// fence at tick 0 publishes. Unmarked, the same view through the step tick is owned. A
+/// regrant after it is owned. Another partition is left alone. Cut: `publish` ignoring
+/// `fenced`, red. Unit.
+#[test]
+fn own84_1k_a_fenced_view_is_removed_even_through_its_step_tick() {
+    let clock = HostClock::capped(20);
+    let _hold = clock.hold();
+    let now = clock.now();
+    let held = token(2, 3);
+    let map = OwnerViews::new(NodeId(1), clock);
+    map.publish(view_of(Q, held, now.0 + 1_000), clock, now, false);
+    map.publish(view(held, now.0), clock, now, false);
+    assert!(map.still_owner(P, held), "precondition: owned through now");
+    map.publish(view(held, now.0), clock, now, true);
+    assert!(!map.still_owner(P, held), "the fence's view");
+    assert!(map.ownership(P).is_none(), "the fence's view");
+    assert!(map.still_owner(Q, held), "another partition");
+    map.publish(view(held, now.0 + 1_000), clock, now, false);
+    assert!(map.still_owner(P, held), "a regrant");
 }

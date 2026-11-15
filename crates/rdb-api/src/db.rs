@@ -3518,7 +3518,16 @@ impl Db {
 
     /// The owner token of `partition` while a node this process runs leads it, read from that
     /// node's newest authority view on its own clock (#84). `None` when no node here leads it,
-    /// in an app-only `Db` always, and from the tick write admission stops on the leader.
+    /// in an app-only `Db` always, and from the tick write admission's check 6 (the view's
+    /// horizon and lineage) stops admitting on the leader.
+    ///
+    /// It mirrors check 6 and nothing else, so `Some` does not mean the partition takes writes:
+    /// a frozen queue (check 7, `PROTECTION_PAUSED`), an L1 pause or block (check 8,
+    /// `PROTECTION_PAUSED` or `DIVERGENCE_REQUIRES_OPERATOR`) and a read-only recovery
+    /// (`RECOVERY_READ_ONLY`) refuse writes while it is `Some`.
+    ///
+    /// It assumes the side effects it fences run in the process that runs the leading node, on
+    /// the same machine: if the node stops, they stop with it.
     ///
     /// Stamp [`Ownership::token`] on every side effect made outside rDB for the partition, and
     /// make the destination refuse a lower token: see `docs/rdb/embed.md`, "Fencing your own
@@ -3532,18 +3541,23 @@ impl Db {
     }
 
     /// Whether a node this process runs still leads `partition` under `token`: write
-    /// admission's own view test (check 6), on that node's clock. False from the tick write
-    /// admission stops for `token`, and after a fence (frozen grant, revoked epoch) before the
-    /// node admits another write, however its clock is stepped after. False for good once the
-    /// node faults, before any caller is answered with the fault. Never true for a token older
-    /// than the one the node serves.
+    /// admission's view test (check 6: the view's horizon and lineage) and nothing else, on that
+    /// node's clock. False from the tick check 6 stops admitting `token`, and after a fence
+    /// (frozen grant, revoked epoch) before the node admits another write, however its clock is
+    /// stepped after. False for good once the node faults, before any caller is answered with
+    /// the fault. Never true for a token older than the one the node serves.
     ///
     /// Fails closed. `true` means no other node can hold `token`'s partition now; it does not
-    /// mean the partition takes writes (a frozen queue, an L1 pause or a read-only recovery
-    /// refuses them under a view that still admits: checks 7 and 8). It is a filter, not a proof: a process paused between this check
-    /// and its effect can still act late, so the destination must reject a lower token. After a
-    /// lapse with no promote, the node takes a new grant and the same token is owned again, as
-    /// write admission admits it again.
+    /// mean the partition takes writes. Under a view check 6 admits, a frozen queue (check 7,
+    /// `PROTECTION_PAUSED`), an L1 pause or block (check 8, `PROTECTION_PAUSED` or
+    /// `DIVERGENCE_REQUIRES_OPERATOR`) and a read-only recovery (`RECOVERY_READ_ONLY`) refuse
+    /// writes while it reads `true`.
+    ///
+    /// It assumes the effect it guards runs in the process that runs the leading node, on the
+    /// same machine. It is a filter, not a proof: a process paused between this check and its
+    /// effect can still act late, so the destination must reject a lower token. After a lapse
+    /// with no promote, the node takes a new grant and the same token is owned again, as write
+    /// admission admits it again.
     #[must_use]
     pub fn still_owner(&self, partition: PartitionId, token: OwnerToken) -> bool {
         lock(&self.nodes)

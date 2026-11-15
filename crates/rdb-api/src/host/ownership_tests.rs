@@ -4,7 +4,7 @@
 
 use super::trio::{self, current_thread, Trio};
 use super::*;
-use crate::ownership::OwnerToken;
+use crate::ownership::{OwnerToken, OwnerViews};
 
 const P1: PartitionId = PartitionId(1);
 
@@ -362,8 +362,10 @@ fn live_view(token: OwnerToken, valid_through: Tick) -> AuthorityView {
 /// own84_6: a terminal fault revokes the host's ownership before any caller hears of it. A
 /// waiter answered by `fail_waiter` (a compile or snapshot fault, answered before the node's
 /// `set_fault`) already reads both readers false when its answer arrives; `set_fault`, first or
-/// repeated, leaves them false; and a view A1 reports after the fault is not kept. Cuts: no
-/// revoke in `fail_waiter`, red at the first assertion; none in `set_fault`, red after it.
+/// repeated, leaves them false; and a view A1 reports after the fault is not kept. Cut: no
+/// revoke in `fail_waiter`, red at the first assertion. Removing only `set_fault`'s revoke
+/// cannot turn this row red, since `fail_waiter` has already revoked the map: `own84_6b` is that
+/// cut's row. The order (revoked before the waiter can read the fault) is `own84_6c`'s.
 /// Unit (one host, no cluster).
 #[config_log::retcd_test]
 fn own84_6_a_terminal_fault_revokes_ownership_before_it_is_answered() {
@@ -379,7 +381,7 @@ fn own84_6_a_terminal_fault_revokes_ownership_before_it_is_answered() {
 
     // `fail_waiter`, alone: the reply path a compile fault takes before `set_fault`.
     host.stepped_at = host.clock.now();
-    host.report_view(&live);
+    host.report_view(&live, false);
     assert!(views.still_owner(P1, held), "precondition: owned");
     let (reply, answer) = mpsc::channel();
     let fault = fail_waiter(&host.owner_views, &reply, "a compile fault".to_owned());
@@ -393,7 +395,7 @@ fn own84_6_a_terminal_fault_revokes_ownership_before_it_is_answered() {
     // `set_fault`, first and repeated, and a view reported after it.
     host.set_fault(fault);
     host.set_fault(Fault::from("a second fault".to_owned()));
-    host.report_view(&live);
+    host.report_view(&live, false);
     assert!(!views.still_owner(P1, held), "owned after the fault");
     assert!(views.ownership(P1).is_none());
 }
@@ -410,7 +412,10 @@ fn own84_6b_set_fault_alone_revokes_ownership() {
         owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
     };
     host.stepped_at = host.clock.now();
-    host.report_view(&live_view(held, host.clock.now().plus_millis(60_000)));
+    host.report_view(
+        &live_view(held, host.clock.now().plus_millis(60_000)),
+        false,
+    );
     assert!(
         host.owner_views.still_owner(P1, held),
         "precondition: owned"
@@ -568,4 +573,314 @@ fn own84_7c_a_read_only_recovery_under_a_live_view_is_owned_and_refuses_writes()
         }
         other => panic!("a read-only partition refuses the write at the held tick: {other:?}"),
     }
+}
+
+/// The token the rows below find owned before their fault.
+const HELD: OwnerToken = OwnerToken {
+    generation: Generation(2),
+    owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+};
+
+/// Both readers own [`HELD`] on partition 1.
+fn assert_owned(views: &OwnerViews, what: &str) {
+    assert!(views.still_owner(P1, HELD), "{what}: still_owner");
+    assert_eq!(
+        views.ownership(P1).map(|owned| owned.token),
+        Some(HELD),
+        "{what}: ownership"
+    );
+}
+
+/// Neither reader owns [`HELD`] on partition 1.
+fn assert_unowned(views: &OwnerViews, what: &str) {
+    assert!(!views.still_owner(P1, HELD), "{what}: still_owner");
+    assert!(views.ownership(P1).is_none(), "{what}: ownership");
+}
+
+/// A host over a fresh folder whose owner map holds a live view of partition 1 under
+/// [`HELD`], owned by both readers.
+fn owned_host(dir: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
+    let mut host = trio::host_over(dir, rt);
+    host.stepped_at = host.clock.now();
+    host.report_view(
+        &live_view(HELD, host.clock.now().plus_millis(60_000)),
+        false,
+    );
+    assert_owned(&host.owner_views, "precondition");
+    host
+}
+
+/// How long [`answered_only_after_revoke`] watches for an early answer. A fault path that
+/// replies first replies at once, so it is seen well inside this; a correct one waits for the
+/// reader, so the row always waits this long.
+const ORDER_WAIT: Duration = Duration::from_millis(250);
+
+/// Run `fault` on another thread while this one holds `views` for reading. `OwnerViews::revoke`
+/// takes the write lock, so a path that revokes before it replies is stuck until the reader
+/// lets go, and its waiter hears nothing in [`ORDER_WAIT`]. A path that replies first is heard
+/// at once. Then the reader lets go, the answer is the fault, and both readers read false.
+fn answered_only_after_revoke(
+    name: &str,
+    views: &OwnerViews,
+    answer: &Receiver<Answer>,
+    fault: impl FnOnce() + Send,
+) {
+    std::thread::scope(|scope| {
+        let readers = views.hold_readers();
+        let faulting = scope.spawn(fault);
+        let early = answer.recv_timeout(ORDER_WAIT);
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "{name}: the waiter heard of the fault before ownership was revoked: {early:?}"
+        );
+        drop(readers);
+        faulting.join().expect("the fault path panicked");
+    });
+    match answer.try_recv() {
+        Ok(Answer::Error { .. }) => {}
+        other => panic!("{name}: the waiter is answered with the fault: {other:?}"),
+    }
+    assert_unowned(views, name);
+}
+
+/// A waiter under request `request`, `kind`, answering on `reply`.
+fn pending(request: u64, kind: PendingKind, reply: Sender<Answer>) -> (RequestIdentity, Pending) {
+    (
+        identity(request),
+        Pending {
+            reply,
+            kind,
+            event: EventId(0),
+            since: Tick(0),
+        },
+    )
+}
+
+/// own84_6c (#84 review): both fault paths revoke ownership before the waiter can read the
+/// fault, not merely by the time the call returns. `fail_waiter` alone, and `set_fault`
+/// answering a pending call, each run while the map is held for reading: the waiter hears
+/// nothing until revoke has run, then hears the fault with both readers false.
+/// Cuts: `fail_waiter` sending before it revokes, red ("heard of the fault before ownership
+/// was revoked"); `set_fault` revoking after its pending loop, red the same way.
+/// Unit (one host each, no cluster): each case waits [`ORDER_WAIT`].
+#[config_log::retcd_test]
+fn own84_6c_both_fault_paths_revoke_before_the_waiter_can_read_the_fault() {
+    let rt = current_thread();
+
+    let dir = config_testkit::fs::temp_dir();
+    let host = owned_host(dir.path(), &rt);
+    let views = Arc::clone(&host.owner_views);
+    let (reply, answer) = mpsc::channel();
+    answered_only_after_revoke("fail_waiter", &views, &answer, || {
+        fail_waiter(&views, &reply, "a compile fault".to_owned());
+    });
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = owned_host(dir.path(), &rt);
+    let views = Arc::clone(&host.owner_views);
+    let (reply, answer) = mpsc::channel();
+    let root = root_key(TenantId(1), AFFINITY, b"a");
+    let (id, waiter) = pending(1, PendingKind::Read(root, Look::Doc), reply);
+    host.pending.insert(id, waiter);
+    answered_only_after_revoke("set_fault", &views, &answer, || {
+        host.set_fault(Fault::from("a flush fault".to_owned()));
+    });
+}
+
+/// own84_6d (#84 review): every concrete caller of `fail_waiter` outside a compile passes the
+/// host's own map, and revokes it before its waiter hears the fault: a put's expiry meeting
+/// another call, a status query no module answers, a read whose step view is missing, a reply
+/// to a call it does not answer, and a previous-view answer to a read or under an unbound
+/// handle. Each case faults a fresh host whose map owns [`HELD`], through
+/// [`answered_only_after_revoke`]. The two compile callers are pinned in
+/// `a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault`.
+/// Cut: no revoke in `fail_waiter`, red on the first case.
+/// Unit (one host per case, no cluster): each case waits [`ORDER_WAIT`].
+#[config_log::retcd_test]
+fn own84_6d_each_fail_waiter_caller_revokes_before_it_answers() {
+    type Case = fn(&mut Host, Sender<Answer>) -> Result<(), Fault>;
+    fn read_kind() -> PendingKind {
+        PendingKind::Read(root_key(TenantId(1), AFFINITY, b"a"), Look::Doc)
+    }
+    fn previous_kind() -> PendingKind {
+        PendingKind::Previous(root_key(TenantId(1), AFFINITY, b"a"))
+    }
+    fn served_read() -> ReplyEffect {
+        ReplyEffect::Read {
+            identity: identity(1),
+            outcome: ReadServiceOutcome::Served,
+            value: None,
+        }
+    }
+    fn waiting(host: &mut Host, kind: PendingKind, reply: Sender<Answer>) {
+        let (id, waiter) = pending(1, kind, reply);
+        host.pending.insert(id, waiter);
+    }
+    let cases: [(&str, Case); 6] = [
+        ("a put's expiry meets a read", |host, reply| {
+            waiting(host, read_kind(), reply);
+            host.expire_txn(identity(1), EventId(0), Tick(0))
+        }),
+        ("a status query no module answers", |host, reply| {
+            // Forged, as F-001's rows forge replies: a status waiter on a stale timer's step,
+            // which no module answers.
+            let site = Site {
+                partition: P1,
+                correlation: CorrelationId(1),
+            };
+            let fire = EventKind::Timer(TimerFired {
+                id: TimerId(u64::MAX),
+                version: TimerVersion(1),
+                scheduled_at: Tick(0),
+            });
+            let queued = host.queued(site, fire, false, None);
+            host.statuses.insert(queued.event.id, (identity(1), reply));
+            let fault = host.process(queued).expect_err("no module answered");
+            assert!(fault.detail.contains("status query"), "{fault:?}");
+            Err(fault)
+        }),
+        ("a read with no step view", |host, reply| {
+            waiting(host, read_kind(), reply);
+            host.reply(P1, &served_read())
+        }),
+        ("a read reply to a previous-view call", |host, reply| {
+            waiting(host, previous_kind(), reply);
+            host.reply(P1, &served_read())
+        }),
+        ("a previous view to a read", |host, reply| {
+            waiting(host, read_kind(), reply);
+            host.previous_answer(P1, identity(1), Ok(SnapshotHandle(7)))
+        }),
+        ("an unbound previous view", |host, reply| {
+            waiting(host, previous_kind(), reply);
+            host.previous_answer(P1, identity(1), Ok(SnapshotHandle(7)))
+        }),
+    ];
+    let rt = current_thread();
+    for (name, case) in cases {
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = owned_host(dir.path(), &rt);
+        let views = Arc::clone(&host.owner_views);
+        let (reply, answer) = mpsc::channel();
+        answered_only_after_revoke(name, &views, &answer, || {
+            case(&mut host, reply).expect_err(name);
+        });
+    }
+}
+
+/// own84_6e (#84 review): a waiter that already gave up (its receiver dropped) does not undo
+/// the revoke. `fail_waiter` still revokes and returns the fault; faulting again, through
+/// `fail_waiter` and `set_fault`, and a view reported late leave both readers false.
+/// Cut: `fail_waiter` revoking only when its send succeeds, red. Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn own84_6e_a_dropped_waiter_does_not_undo_the_revoke() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = owned_host(dir.path(), &rt);
+    let (reply, answer) = mpsc::channel();
+    drop(answer);
+    let fault = fail_waiter(&host.owner_views, &reply, "a compile fault".to_owned());
+    assert_eq!(fault.detail, "a compile fault", "the fault is returned");
+    assert_unowned(&host.owner_views, "after a reply nobody read");
+    let again = fail_waiter(&host.owner_views, &reply, "a second fault".to_owned());
+    host.set_fault(fault);
+    host.set_fault(again);
+    host.report_view(
+        &live_view(HELD, host.clock.now().plus_millis(60_000)),
+        false,
+    );
+    assert_unowned(&host.owner_views, "after repeated faults and a late view");
+}
+
+/// An authority effect of partition 1, as A1 emits it.
+fn from_a1(kind: AuthorityEffect) -> Effect {
+    Effect {
+        correlation: CorrelationId::default(),
+        from: ModuleName::Authority,
+        partition: P1,
+        kind: EffectKind::Kernel(KernelEffect::Authority(kind)),
+    }
+}
+
+/// own84_9 (#84 review): a fence at tick 0. A1's fence view there has its horizon saturated to
+/// 0, the fence tick itself, which check 6 still admits (writes stay frozen by check 7). The
+/// host names the view a fence's from its step, so both readers read false at once and stay
+/// false. Outside a fence, a view whose last admitting tick is now is still owned (equality,
+/// `remaining` zero), and a regrant after the fence is owned again. Both scopes of fence, on a
+/// guarded clock (the one `rdb_node --clock-step-file` steps) stepped back to read tick 0.
+/// Cut: `publish` ignoring `fenced`, red at "the fence's step" for the first scope.
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn own84_9_a_fence_at_tick_zero_ends_ownership() {
+    use rdb_core::contracts::authority::DenyReason;
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trio::host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    clock.step_back(u64::MAX);
+    assert_eq!(clock.now(), Tick(0), "precondition: the clock reads tick 0");
+    host.clock = clock;
+    host.stepped_at = clock.now();
+    let view = |valid_through| {
+        from_a1(AuthorityEffect::PublishAuthorityView(live_view(
+            HELD,
+            Tick(valid_through),
+        )))
+    };
+    for scope in [FenceScope::Partition(P1), FenceScope::Node] {
+        host.deliver(&[view(60_000)]).expect("a live view");
+        assert_owned(&host.owner_views, "a live view");
+        host.deliver(&[view(0)]).expect("a view through now");
+        assert_owned(&host.owner_views, "a view through now, outside a fence");
+        assert_eq!(
+            host.owner_views.ownership(P1).map(|owned| owned.remaining),
+            Some(Duration::ZERO)
+        );
+        let fence = from_a1(AuthorityEffect::Fence {
+            scope,
+            reason: DenyReason::Frozen,
+        });
+        host.deliver(&[fence, view(0)]).expect("the fence's step");
+        assert_unowned(&host.owner_views, &format!("the fence's step, {scope:?}"));
+        assert_eq!(clock.now(), Tick(0), "still tick 0");
+        assert_unowned(&host.owner_views, &format!("read again, {scope:?}"));
+        host.deliver(&[view(60_000)]).expect("a regrant");
+        assert_owned(&host.owner_views, &format!("a regrant, {scope:?}"));
+    }
+}
+
+/// own84_7d (#84 review): the other L1 refusal. L1 blocked for an operator
+/// (`DivergenceRequiresOperator`) under a live grant: `still_owner` reads true and the write is
+/// refused `DIVERGENCE_REQUIRES_OPERATOR`, at one held tick.
+/// Integration (~2 s): bootstrap's discovery window, then the steps to the block.
+#[config_log::retcd_test]
+fn own84_7d_a_partition_blocked_for_an_operator_is_owned_and_refuses_writes() {
+    use rdb_core::contracts::authority::BlockReason;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let token = token(&trio);
+    trio.nodes[0].0.push(
+        Site {
+            partition: P1,
+            correlation: CorrelationId::default(),
+        },
+        EventKind::Kernel(KernelEvent::BlockPartition(
+            BlockReason::DivergenceRequiresOperator {
+                diverged: vec![CopyId(3)],
+            },
+        )),
+        false,
+        None,
+    );
+    trio.until("L1 blocks writes", |trio| {
+        (trio.status(0).admits == Some(false)).then_some(())
+    });
+    let kind = owned_but_refused(&mut trio, token, 1);
+    assert_eq!(
+        kind,
+        ErrorKind::DivergenceRequiresOperator,
+        "check 8's refusal"
+    );
 }

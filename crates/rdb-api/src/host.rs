@@ -5382,13 +5382,16 @@ impl Host {
     }
 
     /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`], under `grant`.
+    /// `fenced` when that step also fenced the view's partition ([`fenced_in`]): the view is
+    /// the fence's, so the owner map drops it whatever its horizon (#84 review: a fence at tick
+    /// 0 saturates its horizon to the fence tick).
     /// `renewed_at` is the dispatch tick of the last committed renewal, which the horizon is
     /// counted from, absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
     /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
     /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
     /// and is set while the view is still valid. A healthy view mostly reads
     /// `ClockSampleStale` here, a reason that never fences (spec §7.2, M12 gate): read `past_horizon` for whether time ran out.
-    fn report_view(&mut self, view: &AuthorityView) {
+    fn report_view(&mut self, view: &AuthorityView, fenced: bool) {
         let at = self.stepped_at;
         let margin_ms = margin_ms(view.valid_through_tick, at);
         tracing::info!(
@@ -5405,7 +5408,7 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
-        self.owner_views.publish(*view, self.clock, at);
+        self.owner_views.publish(*view, self.clock, at, fenced);
         // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
         // history; a later fence of either scope must not reuse it.
         if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
@@ -5976,7 +5979,7 @@ impl Host {
                 }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
-                self.report_view(view);
+                self.report_view(view, fenced_in(step, view.lineage.partition));
             }
             KernelEffect::Authority(AuthorityEffect::Fence { scope, reason }) => {
                 tracing::warn!(
@@ -14370,6 +14373,20 @@ const fn is_progress(kind: &EventKind) -> bool {
 /// [`NodeStatus::fence`] for `state`: the reason only while `Fenced`. Not
 /// [`AuthorityState::fence_reason`], which also answers `last_fence` while `Unheld`, as during a
 /// self-replace's re-acquisition (walk 8d).
+/// Whether `step` holds A1's fence of `partition`: a node fence, or one scoped to it. A1
+/// publishes a fence's views in the fence's own step and no other view there
+/// (`Authority::fence`), so a view of `partition` in such a step is the fence's.
+fn fenced_in(step: &[Effect], partition: PartitionId) -> bool {
+    step.iter().any(|effect| {
+        effect.from == ModuleName::Authority
+            && matches!(
+                &effect.kind,
+                EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fence { scope, .. }))
+                    if *scope == FenceScope::Node || *scope == FenceScope::Partition(partition)
+            )
+    })
+}
+
 const fn fence_of(state: &AuthorityState) -> Option<DenyReason> {
     match state {
         AuthorityState::Fenced { reason, .. } => Some(*reason),

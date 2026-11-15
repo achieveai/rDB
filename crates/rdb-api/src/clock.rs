@@ -504,6 +504,16 @@ impl HostClock {
         }
     }
 
+    /// This capped clock with a guard of its own, so [`Self::step_back`] moves it while it is
+    /// held: a rollback read at exact ticks (#84 review). Copies share the guard.
+    #[cfg(test)]
+    pub(crate) fn with_guard(self) -> Self {
+        Self {
+            guard: Some(Box::leak(Box::new(ClockGuard::new()))),
+            ..self
+        }
+    }
+
     /// Stop this capped clock, every copy of it, until the returned hold drops: readings in
     /// between all return the tick of the call, and the real time held counts nothing.
     ///
@@ -531,7 +541,8 @@ impl HostClock {
         #[cfg(test)]
         if let Some(capped) = self.capped {
             let counted = self.start_utc_ms.saturating_add(capped.elapsed());
-            return Tick(counted.saturating_sub(self.lag_millis));
+            let counted = counted.saturating_sub(self.lag_millis);
+            return Tick(self.guard.map_or(counted, |guard| guard.adjust(counted)));
         }
         let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let tick = self.start_utc_ms.saturating_add(elapsed);

@@ -381,6 +381,10 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
   (admission check 6), on the clock of the node that leads it. It sends no message.
 - Both read only the nodes this `Db` runs. An app-only `Db` (no local nodes) always gets `None`
   and `false`. So call them in the process that runs the leading node.
+- Both assume the effects they fence run **in that same process, on the same machine**: a
+  partition's primary and the work it guards (for SBX, its sandbox) live together. If the node
+  stops, that work stops with it and is moved elsewhere with the partition. An effect made by
+  another process or machine is not covered by `still_owner`, only by the destination's fence.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
 
 **What `still_owner` promises.** It mirrors admission check 6 (the grant's horizon and the
@@ -394,8 +398,9 @@ lineage) and nothing else.
   A stopped or restarted node owns nothing until it leads again.
 - While it is true, no other node can own the partition under this token or a higher one.
 - It does **not** mean the partition takes writes. Checks 7 and 8 and a read-only recovery
-  refuse writes while `still_owner` is true: a frozen queue (`PROTECTION_PAUSED`), an L1 pause
-  (`PROTECTION_PAUSED`), or a `ReadOnly` commit (`RECOVERY_READ_ONLY`).
+  refuse writes while `still_owner` is true: a frozen queue (check 7, `PROTECTION_PAUSED`), an
+  L1 pause (check 8, `PROTECTION_PAUSED`), an L1 block for an operator (check 8,
+  `DIVERGENCE_REQUIRES_OPERATOR`), or a `ReadOnly` commit (`RECOVERY_READ_ONLY`).
 - After a cut-off with no promote, the node takes a new grant and the **same** token is owned
   again, as rDB writes again. After a promote, the old token is never owned again.
 
@@ -441,16 +446,25 @@ because the new owner restores and acts **after** its register.
 
 For a sandbox gateway (SBX):
 
+- **The lock.** SBX's container runtime takes a lock **per sandbox** across container creation
+  and snapshot upload, and one sandbox is one workspace. That per-workspace (per-sandbox) lock
+  is the serialization expected here: the register, each create and each upload check the
+  workspace's fence record while holding it. (Later, this work may move from the gateway to the
+  supervisor on rDB. That is a direction, not a promise; until it happens, the gateway's lock is
+  the one that counts.)
 - Stamp the token on **every** side effect: each container (as a label) and each snapshot upload.
 - **Snapshots.** The snapshot store's fence record is per workspace. An upload is a conditional
   write that checks the record. The new owner registers its token there before it restores.
 - **Containers.** Container creation must be serialized with the register on the same record:
-  take the lock (or do the conditional write), check the token, create, release. A sweep alone
+  take the sandbox's lock, check the token, create, release. A sweep alone
   is not enough. A stale owner can pass its check, pause, and create after the new owner's
   sweep found nothing, and that container would survive. With creation serialized, a stale
   create either lands before the register (and the sweep stops it) or is refused.
 - After its register, the new owner stops any container of that workspace with a lower token.
   One sweep then suffices.
+- **Not covered.** SBX lists each of its side effects whose destination cannot compare a token,
+  and documents each one as not covered by this fence. For those, `still_owner` narrows the
+  window and nothing closes it.
 
 What SBX's own acceptance tests must show, against the real stores: an effect at an equal token
 is accepted; after a register of a higher token, a lower one is refused; that refusal holds after

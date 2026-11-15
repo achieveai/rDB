@@ -8,7 +8,8 @@
 //! same tick admission stops. A fence (frozen grant, revoked epoch, a boot) publishes a view whose
 //! horizon is the tick before it, and the host writes the map before it steps T1 again, so
 //! `still_owner` is false before rDB admits another write. That view is removed, not kept, so a
-//! clock stepped back cannot revive it. A host fault revokes the map before any caller is
+//! clock stepped back cannot revive it; the host names it a fence's from the step that carries
+//! the fence, so a fence at tick 0 (horizon saturated to the fence tick) is removed too. A host fault revokes the map before any caller is
 //! answered with the fault.
 //!
 //! `true` means only that no other node can hold this token's partition now. It does not mean
@@ -137,17 +138,19 @@ impl OwnerViews {
     }
 
     /// A1 published `view` in the host step at tick `at`, on a host reading `clock`: it replaces
-    /// the partition's last one, as `Host::authority_views` does. A view already past at `at`
-    /// (a fence's) removes the partition's entry instead: it admits nothing from `at` on, and
-    /// kept, a clock stepped back to its horizon would read it as admitting again. Ignored once
-    /// the map is revoked.
-    pub(crate) fn publish(&self, view: AuthorityView, clock: HostClock, at: Tick) {
+    /// the partition's last one, as `Host::authority_views` does. A fence's view (`fenced`: A1
+    /// fenced the partition in that step) or one already past at `at` removes the partition's
+    /// entry instead: it admits nothing from `at` on, and kept, a clock stepped back to its
+    /// horizon would read it as admitting again. `fenced` is needed besides the horizon: a fence
+    /// at tick 0 publishes a horizon that saturates to 0, the fence's own tick, which check 6
+    /// still admits (writes stay frozen there by check 7). Ignored once the map is revoked.
+    pub(crate) fn publish(&self, view: AuthorityView, clock: HostClock, at: Tick, fenced: bool) {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         if state.revoked {
             return;
         }
         state.clock = clock;
-        if view.valid_through_tick < at {
+        if fenced || view.valid_through_tick < at {
             state.views.remove(&view.lineage.partition);
         } else {
             state.views.insert(view.lineage.partition, view);
@@ -170,6 +173,13 @@ impl OwnerViews {
             .unwrap_or_else(PoisonError::into_inner)
             .views
             .clear();
+    }
+
+    /// Hold the map for reading until the returned guard drops: [`Self::revoke`] waits for it.
+    /// For the rows that pin a fault's order, revoke before reply (#84 review).
+    #[cfg(test)]
+    pub(crate) fn hold_readers(&self) -> impl Sized + '_ {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `partition`'s ownership, while this node's view admits now.

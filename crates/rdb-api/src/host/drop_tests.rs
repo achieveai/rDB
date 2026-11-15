@@ -7117,6 +7117,8 @@ struct OwnerStep {
     owned: Option<crate::ownership::OwnerToken>,
     /// T1's lineage for partition 1, as a token: what check 6 compares a view with.
     serving: Option<crate::ownership::OwnerToken>,
+    /// `still_owner(serving)`, read after `ownership`.
+    serving_owned: bool,
 }
 
 /// Node 1's [`OwnerStep`], with both readers checked against T1: `still_owner(t)` is true only
@@ -7133,12 +7135,17 @@ fn owner_step(
         .kernel(NodeId(1), P1)
         .map(|kernel| OwnerToken::of(kernel.lineage()));
     let owned = host.owner_views.ownership(P1).map(|o| o.token);
+    let serving_owned = serving.is_some_and(|token| host.owner_views.still_owner(P1, token));
     let held: Vec<OwnerToken> = asked
         .iter()
         .copied()
         .filter(|token| host.owner_views.still_owner(P1, *token))
         .collect();
-    let step = OwnerStep { owned, serving };
+    let step = OwnerStep {
+        owned,
+        serving,
+        serving_owned,
+    };
     if let Some(owned) = owned {
         assert_eq!(
             Some(owned),
@@ -7161,7 +7168,8 @@ fn owner_step(
 /// Node 3 restarts, so node 1 revokes its epoch (on disk, in the same boot: a disk fence),
 /// re-plans and commits the next generation; then node 1 itself restarts.
 /// At every step, neither reader names a token T1 does not serve, which covers the steps where
-/// T1 has installed a recovery's lineage before A1's view confirms it. Once the revoked token
+/// T1 has installed a recovery's lineage before A1's view confirms it; at those steps
+/// `still_owner` asked about the token T1 serves reads false too. Once the revoked token
 /// reads false it never reads true again, before or after the restart, and the regrant's token
 /// is greater. A restarted owner acquires no grant in this process (`Db::restart_node`), so
 /// after its restart node 1 owns nothing, neither token, for 1.5 s.
@@ -7189,10 +7197,18 @@ fn own84_8_ownership_follows_admission_across_a_revoke_a_regrant_and_a_restart()
     });
     assert!(ended, "the revoke ended the old token");
     assert!(regrant > old, "the regrant {regrant} after {old}");
-    let unconfirmed = steps
+    let unconfirmed: Vec<_> = steps
         .iter()
         .filter(|step| step.serving.is_some_and(|t| t > old) && step.owned.is_none())
-        .count();
+        .collect();
+    // #84 review: the other reader, asked about the token T1 already serves, agrees.
+    for step in &unconfirmed {
+        assert!(
+            !step.serving_owned,
+            "still_owner(serving) before A1 confirms it: {step:?}"
+        );
+    }
+    let unconfirmed = unconfirmed.len();
     tracing::info!(unconfirmed, steps = steps.len(), "own84_8_rejoin_observed");
     // The confirmation is a control round trip after T1 installs the lineage, so at least one
     // step sees the new lineage served and not yet owned (5 of 5 runs, 2026-11-15).

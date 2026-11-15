@@ -2607,6 +2607,8 @@ fn answered_now(answer: &Receiver<Answer>) -> Option<Answer> {
 /// F-001 (S0 review): a put or compile whose step view cannot be built faults the node.
 /// Its own caller hears that at once, as `set_fault` tells every pending call; dropped, it
 /// would wait out the `Db`'s timeout and read as "no answer". Both arms that compile.
+/// #84 review: node 1 owns partition 1 before the call, and neither ownership reader owns it
+/// once the caller holds the fault (each compile caller passes the host's own map).
 #[test]
 fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
     for (name, call) in [
@@ -2618,6 +2620,10 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
         trio.bootstrap();
         trio.ready();
         let host = &mut trio.nodes[0].0;
+        let owned = host
+            .owner_views
+            .ownership(PartitionId(1))
+            .unwrap_or_else(|| panic!("{name}: precondition: node 1 owns partition 1"));
         host.fail_step_view = true;
         let (reply, answer) = mpsc::channel();
         host.handle(Msg::Client(Client {
@@ -2627,6 +2633,14 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
         }));
         let fault = host.fault.clone().expect("the node faulted");
         assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
+        assert!(
+            !host.owner_views.still_owner(PartitionId(1), owned.token),
+            "{name}: still_owner after the fault"
+        );
+        assert!(
+            host.owner_views.ownership(PartitionId(1)).is_none(),
+            "{name}: ownership after the fault"
+        );
         match answered_now(&answer) {
             Some(Answer::Error {
                 error,
@@ -6399,7 +6413,7 @@ fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_u
     assert!(trio.status(1).fence.is_none(), "node 2 is not fenced");
     let host = &mut trio.nodes[1].0;
     host.owner_after_fence.insert(p1, Some(NodeId(3)));
-    host.report_view(&view);
+    host.report_view(&view, false);
     assert!(
         host.owner_after_fence.is_empty(),
         "held again: {:?}",
