@@ -3707,6 +3707,11 @@ fn u2_r7_10_a_flatten_that_crashed_part_way_is_resumed_by_the_next_ask() {
 /// Node 2's live receiver of `result`'s pin, in lineage `generation` at `head`, as a process
 /// that never restarted still holds it from an earlier generation.
 fn live_receiver(result: &RecoveryResult, generation: u64, head: Head) -> AppendReceiver {
+    AppendReceiver::new(receiver_init(result, generation, head)).expect("a live receiver")
+}
+
+/// Node 2's receiver arguments for [`live_receiver`] and the dormant row.
+fn receiver_init(result: &RecoveryResult, generation: u64, head: Head) -> ReceiverInit {
     let config = result.committed.pinned_config.clone();
     let own = config
         .members
@@ -3714,7 +3719,7 @@ fn live_receiver(result: &RecoveryResult, generation: u64, head: Head) -> Append
         .find(|member| member.node == NodeId(2))
         .expect("node 2 is pinned")
         .copy;
-    AppendReceiver::new(ReceiverInit {
+    ReceiverInit {
         config,
         own,
         lineage: Lineage {
@@ -3724,8 +3729,7 @@ fn live_receiver(result: &RecoveryResult, generation: u64, head: Head) -> Append
         },
         head,
         durable: DurableSeq(0),
-    })
-    .expect("a live receiver")
+    }
 }
 
 /// Quarantine `receiver` the way R1 does: its pinned primary sends the next record with a
@@ -3788,7 +3792,7 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
     );
 }
 
-/// Issue #107 slice 1, rows 2a and 31a (`ws-readd-rev5.md`, m3), with row 5's refusal clause:
+/// Issue #107 slice 1, rows 2a and 31a (#107), with row 5's refusal clause:
 /// check A's refusal arm in `land_link`, on a copy that never restarted. Node 2 holds
 /// generation 1 to seq 3 and a live receiver there; the commit's cutoff is 2, so `land_at`
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
@@ -3868,20 +3872,26 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
     assert_eq!(refused.len(), 4, "every case refused: {refused:?}");
 }
 
-/// Issue #107 slice 1, row 5 (`ws-readd-architect.md` 2.3): check A's success arm. Node 2
+/// Issue #107 slice 1, row 5 (#107, check A): check A's success arm. Node 2
 /// holds generation 1 exactly through the cutoff and lands generation 2 there, linked. A live
-/// receiver it holds at another head (seq 1, below the link) is replaced by one at the linked
-/// head (`land_receiver_installed`); a quarantined one is kept (`land_receiver_kept`), as it
-/// must stay. A live receiver at the linked head is kept too:
+/// receiver it holds at another head is replaced by one at the linked head, compared whole
+/// (`land_receiver_installed`): one at seq 1, below the link, and one at the linked seq with
+/// another digest, which a sequence-only comparison would keep. A quarantined one is kept
+/// (`land_receiver_kept`), as it must stay. A live receiver at the linked head is kept too:
 /// `m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver`.
-/// Cut: keep the live receiver always, red (the mismatched receiver stays at seq 1).
+/// Cuts: keep the live receiver always, red (the mismatched receiver stays at seq 1); compare
+/// the seq only, red (the wrong-digest receiver stays).
 /// Unit, under a second here (one trio bootstrap, for the commit it lands).
 #[config_log::retcd_test]
 fn issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head() {
     const METHOD: &str = "issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head";
     let rt = current_thread();
     let mut landing: Option<RecoveryResult> = None;
-    for quarantined in [false, true] {
+    for (case, seq, wrong_digest, quarantined) in [
+        ("below the link", 1, false, false),
+        ("below the link, quarantined", 1, false, true),
+        ("at the linked seq with another digest", 2, true, false),
+    ] {
         let dir = config_testkit::fs::temp_dir();
         let path = dir.path().join("node");
         let digests = write_chain(
@@ -3892,12 +3902,17 @@ fn issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head() {
         let result = landing
             .get_or_insert_with(|| landing_at(2, digests[1]))
             .clone();
+        let digest = if wrong_digest {
+            digests[0]
+        } else {
+            digests[seq - 1]
+        };
         let mut receiver = live_receiver(
             &result,
             1,
             Head {
-                seq: Seq(1),
-                digest: digests[0],
+                seq: Seq(seq as u64),
+                digest,
             },
         );
         if quarantined {
@@ -3910,23 +3925,29 @@ fn issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head() {
                 host.land_link(PartitionId(1), &result),
                 Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
             ),
-            "quarantined {quarantined}: linked and caught up"
+            "{case}: linked and caught up"
         );
         let after = host
             .replication
             .receiver(NodeId(2), PartitionId(1))
             .expect("a receiver");
         if quarantined {
-            assert_eq!(after, &receiver, "a quarantined receiver stays");
+            assert_eq!(after, &receiver, "{case}: a quarantined receiver stays");
         } else {
             assert_eq!(
-                (after.lineage().generation, after.applied_head().seq),
-                (Generation(2), Seq(2)),
-                "replaced at the linked head"
+                (after.lineage(), after.applied_head()),
+                (
+                    result.selected.root,
+                    Head {
+                        seq: Seq(2),
+                        digest: digests[1],
+                    }
+                ),
+                "{case}: replaced at the linked head"
             );
         }
     }
-    assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 1);
+    assert_eq!(logged!(METHOD, "land_receiver_installed").len(), 2);
     let kept: Vec<_> = logged!(METHOD, "land_receiver_kept")
         .into_iter()
         .map(|line| line["quarantined"].clone())
@@ -4024,4 +4045,196 @@ fn issue107_no_floor_no_link() {
         host.land_at(p, anchor_at(34, 3, digests[2])),
         Ok((Generation(33), Seq(3), digests[2]))
     );
+}
+
+/// Issue #107 slice 1, row 2a's dormant clause: check A drops only a live receiver. Node 2
+/// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
+/// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
+/// takes writes (`DegradedRf2`). The dormant receiver stays installed, unchanged, and no
+/// `land_receiver_dropped` is logged. Nothing links.
+/// Cut: drop the `is_dormant` filter on the refusal arm, red (the dormant receiver is removed).
+/// Unit, under a second here (one trio bootstrap, for the commit it lands).
+#[config_log::retcd_test]
+fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
+    const METHOD: &str = "issue107_a_refused_writable_landing_keeps_a_dormant_receiver";
+    use rdb_core::contracts::ids::Revision;
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let mut result = landing_at(2, digests[1]);
+    result.mode = PartitionMode::DegradedRf2;
+    let receiver = AppendReceiver::dormant(
+        receiver_init(
+            &result,
+            1,
+            Head {
+                seq: Seq(3),
+                digest: digests[2],
+            },
+        ),
+        Revision(1),
+    )
+    .expect("a dormant receiver");
+    assert!(receiver.is_dormant());
+    let mut host = host_over(&path, &rt);
+    host.replication.install_receiver(receiver.clone());
+    let held = host.engine.lineages();
+    assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
+    assert_eq!(host.engine.lineages(), held, "nothing linked");
+    assert_eq!(
+        host.replication.receiver(NodeId(2), PartitionId(1)),
+        Some(&receiver),
+        "the dormant receiver stays installed"
+    );
+    assert_eq!(host.fault, None);
+    assert_eq!(logged!(METHOD, "land_receiver_dropped").len(), 0);
+    let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(refused, [serde_json::Value::from("held_past_base")]);
+}
+
+/// Generation 1 of partition 1 at `path`, seqs 1 to 3, with the stored `History` value at seq 1
+/// cut to 3 bytes (shorter than a frame): the head reads and verifies, and a read of seq 1
+/// faults `Corrupt`. Answers the digests as written, `[0]` at seq 1.
+fn floor_unreadable(path: &std::path::Path) -> Vec<Digest> {
+    let digests = write_chain(
+        &mut RocksEngine::open(path).expect("open engine"),
+        Generation(1),
+        3,
+    );
+    let raw = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        path,
+        rdb_storage::keys::COLUMN_FAMILIES,
+    )
+    .expect("raw open");
+    let cf = raw
+        .cf_handle(rdb_storage::keys::cf_for(Namespace::History))
+        .expect("history cf");
+    let key = rdb_storage::keys::encode_key(
+        PartitionId(1),
+        Generation(1),
+        Namespace::History,
+        &1u64.to_be_bytes(),
+    );
+    assert!(
+        raw.get_cf(cf, &key).expect("raw read").is_some(),
+        "seq 1 is stored"
+    );
+    raw.put_cf(cf, &key, [0, 0, 0]).expect("raw put");
+    digests
+}
+
+/// What a check B refusal must leave as it was: the lineages, generation 2's link (none), and
+/// the cached step view's key.
+#[derive(Debug, PartialEq)]
+struct Untouched {
+    lineages: Vec<(PartitionId, Generation)>,
+    link: Option<rdb_storage::Link>,
+    view: Option<(Generation, AppliedSeq)>,
+}
+
+fn untouched(host: &Host) -> Untouched {
+    let p = PartitionId(1);
+    Untouched {
+        lineages: host.engine.lineages(),
+        link: host.engine.link(p, Generation(2)),
+        view: host.views.get(&p).map(|(key, _)| *key),
+    }
+}
+
+/// Issue #107 slice 1, check B's read-error arm in `land_at`. Generation 1's head (seq 3) reads,
+/// and its seq 1 does not. A landing of 2 at base 3 passes every guard before check B, and
+/// check B's read faults: `land_at` refuses `history_read_failed`, logs
+/// `land_floor_read_failed` with the partition, the source generation and the fault, and links
+/// nothing: lineages, links and the cached view are unchanged.
+/// Cut: swallow the read error (`Err(_) => {}`), red (generation 2 links).
+/// Unit.
+#[config_log::retcd_test]
+fn issue107_a_landing_whose_floor_read_fails_refuses_and_writes_nothing() {
+    const METHOD: &str = "issue107_a_landing_whose_floor_read_fails_refuses_and_writes_nothing";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = floor_unreadable(&path);
+    let mut host = host_over(&path, &rt);
+    host.refresh_view(p, Generation(1)).expect("a step view");
+    let before = untouched(&host);
+    assert!(before.view.is_some(), "a cached view");
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 3, digests[2])),
+        Err("history_read_failed")
+    );
+    assert_eq!(untouched(&host), before, "the refusal wrote nothing");
+    let logged: Vec<_> = logged!(METHOD, "land_floor_read_failed")
+        .into_iter()
+        .map(|line| {
+            (
+                line["partition"].clone(),
+                line["from"].clone(),
+                line["fault"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("Corrupt")),
+            )
+        })
+        .collect();
+    assert_eq!(logged, [(1.into(), 1.into(), true)]);
+}
+
+/// Issue #107 slice 1, check B's read-error arm in `inherit_missed_link`, on the inventory
+/// path. The copy missed generation 2 and holds generation 1 exactly through its base (seq 3),
+/// whose head reads and whose seq 1 does not. The inventory answers `InventoryFailed`, named
+/// `missed_generation_history_read_failed` in `inventory_failed`, after
+/// `missed_generation_floor_read_failed` logs the partition, the source generation and the
+/// fault. Nothing is linked: lineages, links and the cached view are unchanged.
+/// Cut: swallow the read error (`Err(_) => {}`), red (the inventory links 2 and reports).
+/// Unit.
+#[config_log::retcd_test]
+fn issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing() {
+    const METHOD: &str = "issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = floor_unreadable(&path);
+    let mut host = host_over(&path, &rt);
+    host.refresh_view(p, Generation(1)).expect("a step view");
+    let before = untouched(&host);
+    assert!(before.view.is_some(), "a cached view");
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor_at(2, 3, digests[2]), None, None),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+    );
+    assert_eq!(untouched(&host), before, "the refusal wrote nothing");
+    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        failed,
+        [serde_json::Value::from(
+            "missed_generation_history_read_failed"
+        )]
+    );
+    let logged: Vec<_> = logged!(METHOD, "missed_generation_floor_read_failed")
+        .into_iter()
+        .map(|line| {
+            (
+                line["partition"].clone(),
+                line["from"].clone(),
+                line["fault"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("Corrupt")),
+            )
+        })
+        .collect();
+    assert_eq!(logged, [(1.into(), 1.into(), true)]);
 }
