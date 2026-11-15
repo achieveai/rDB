@@ -1810,12 +1810,20 @@ pub enum Clearance {
 /// and `store` is not (critic A2). So with lists failing this is an error even where it would
 /// answer [`Clearance::Current`].
 ///
-/// Guard 3 and the delete are two calls: rEtcd has no compare across keys. That is safe in M9
-/// because nothing can make guard 3 false between them. The only writers of `partitions/` are
-/// [`bootstrap`] and F1's commit, and both write `Serving` (`rdb_dev`'s `control lifecycle`
-/// runs on the same thread as its `admin clear-grant`). **M10 tripwire:** the first writer of a
-/// non-`Serving` lifecycle, the planner, must also be the only clearer, or rEtcd must gain a
-/// multi-key compare.
+/// Guard 3 and the delete are two calls: rEtcd has no compare across keys, and guard 3 can go
+/// false between them, because a promote (the operator's or the opt-in planner's) writes
+/// `Fencing` to `partitions/{p}`. The race is closed on the promote side, not here (spec §7.3,
+/// "The clearing service does not race a fence"): every `Fencing` write is followed by a
+/// `freeze` of this same grant key.
+/// - A delete after the freeze cannot apply: the freeze moved the grant's revision, so this
+///   delete's compare fails, and guard 1 refuses a frozen record on any later pass.
+/// - A delete between the `Fencing` write and the freeze: when the promote judged the owner
+///   dead, the freeze finds the record moved and refuses with [`PromoteError::OwnerAlive`], and
+///   the promote undoes its `Fencing` write (or rereads and reports, when the undo is unproven);
+///   otherwise the freeze creates the key frozen, so the transfer goes on against a frozen
+///   record, never a vanished one.
+///
+/// So the clearer need not be the planner, and rEtcd needs no multi-key compare.
 ///
 /// Logged as `grant_clear{node, boot, record_boot, revision, expiry, now, until, verdict}`, and a
 /// failure as `grant_clear_failed{node, error}`.
