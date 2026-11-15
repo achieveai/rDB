@@ -7,6 +7,7 @@ and the full-copy fallback (scope ruling 2026-10-02).
 **Decided by:** Gautam, HITL 2026-10-02 (L-R182k fall-through; L-R182pp edits, chain, full-copy ruling).
 **Amends:** spec §7.2, one sentence (decision 9). ADR-rdb-0007 decision 1, decision 5 and its row
 "Late old dispatch leaves quarantine only" (decision 10). Fixes `FORMAT_VERSION`, provisional since M8 S0.
+**Extended by:** [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md) (check B).
 
 ## Context
 

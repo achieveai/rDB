@@ -446,6 +446,14 @@ hold-honouring send (logged `copy_ahead_reposted`), so a lost landing is retried
 stalling (row `h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold`). A copy
 holding **past** the cutoff in its own generation is still refused by name, as before.
 
+**Amended 2026-11-15 (issue #107 slice 1, PR #118): check B on landing.** After the depth guard,
+`land_at` also requires the parent generation's lineage to reach seq 1 through its chain, or to
+have applied nothing. That holds at the cutoff (arm 2) and below it (arm 3) alike. A holed parent
+is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logged
+`land_floor_read_failed`), and nothing is written. The guard order and the inventory's twin are in
+[ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md). Check B is refusal-only and
+runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
+
 **Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
 receiver's anchor, and protocol 9.** Three rules, all with `Timeouts::live_readd` (off by
 default) as the only way in:
@@ -470,8 +478,9 @@ default) as the only way in:
   A. Check B and the refusal mark are newer than some builds at 9 (main at 1eb3fe0 has neither),
   and the handshake does not tell them apart. So turn the setting on for an owner only once
   every node runs a build with both: with a receiver of such an older build, a `ReadOnly` return
-  can leave that copy a holed lineage that nothing refuses. Nothing enforces this order yet; the
-  gate for it is an open question on PR #126. Any change that weakens check A takes a bump.
+  can leave that copy a holed lineage that nothing refuses. Nothing enforces this order yet. By the lead's
+  ruling on PR #126 it stays an operator rule while the setting is off by default; a bump to 10,
+  or a capability bit, is a precondition for turning it on by default (issue #107). Any change that weakens check A takes a bump.
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
@@ -511,6 +520,14 @@ else (a tail above `base`, a different digest, a parent at the depth ceiling) fa
 name and writes nothing. This changes no row of the table above, and it does not reopen the K1
 amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
 pauses writes (B-R38).
+
+**Amended 2026-11-15 (issue #107 slice 1, PR #118): check B on the inventory link.** The link above
+also needs the older generation's lineage to reach seq 1 through its chain, or to have applied
+nothing, checked after the depth ceiling. A holed one fails the inventory
+`missed_generation_from_has_no_floor`, and a failed seq 1 read
+`missed_generation_history_read_failed`, with nothing written. When a tail above `base` was
+released or adopted for the ask, the same refusal answers `TailHeld` with that reason instead.
+See [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md).
 
 **Ruling 2026-10-24 (M10 S2, lead ruling A-R406; critic-d4 ADV-1): a secondary restarted while
 every copy is up is handled like a dropped copy.** This records existing behaviour; it changes no
