@@ -406,7 +406,8 @@ pub struct HostClock {
     /// How far this copy of a capped clock reads behind the others (crate tests only).
     #[cfg(test)]
     lag_millis: u64,
-    /// The guard of this process, when its clock has one (`Links`).
+    /// The clock's guard, when it has one: its process's, made once per `Links`, or, in a crate
+    /// test, one of its own ([`Self::with_guard`]), shared only by this clock's copies.
     guard: Option<&'static ClockGuard>,
 }
 

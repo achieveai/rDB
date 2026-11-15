@@ -383,8 +383,9 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
 - `db.ownership(partition)` returns `Some(Ownership)` while a node **in this process** leads the
   partition. It holds `token` (an `OwnerToken`: `generation`, then `owner_epoch`) and
   `remaining`, the time left on the node's write permission.
-- `db.still_owner(partition, token)` is the same test rDB makes before it admits a write
-  (admission check 6), on the clock of the node that leads it. It sends no message.
+- `db.still_owner(partition, token)` is the test rDB makes before it admits a write
+  (admission check 6), plus fences and faults, on the clock of the node that leads it. It sends
+  no message. See "What `still_owner` promises" below.
 - Both read only the nodes this `Db` runs. An app-only `Db` (no local nodes) always gets `None`
   and `false`. So call them in the process that runs the leading node.
 - Both assume the effects they fence run **in that same process, on the same machine**: a

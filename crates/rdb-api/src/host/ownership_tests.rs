@@ -775,6 +775,76 @@ fn own84_6d_each_fail_waiter_caller_revokes_before_it_answers() {
     }
 }
 
+/// own84_6g (#84 review 4): a previous-view answer under a handle storage **did** bind, whose
+/// view meets a read fault, revokes before its waiter hears the fault. own84_6d's previous-view
+/// cases stop at a wrong kind or an unbound handle; this one reaches `object_answer`'s error in
+/// `Host::previous_answer`. The root record of `a` in partition 1, generation 1 is cut to 3
+/// bytes on disk (shorter than a frame), as the A-R164 rows cut values, so the bound view's
+/// read records `StorageFault::Corrupt`. Run through [`answered_only_after_revoke`]; then both
+/// readers are false and the fault names the storage read fault.
+/// Cut: `previous_answer`'s `object_answer` arm sending the fault before `fail_waiter`'s
+/// revoke, red ("heard of the fault before ownership was revoked").
+/// Unit (one host, no cluster): waits [`ORDER_WAIT`].
+#[config_log::retcd_test]
+fn own84_6g_a_previous_view_read_fault_revokes_before_it_answers() {
+    use rdb_core::contracts::storage::Namespace;
+    let dir = config_testkit::fs::temp_dir();
+    let root = root_key(TenantId(1), AFFINITY, b"a");
+    // The engine makes its column families; then its root record is written as no frame reads.
+    drop(RocksEngine::open(dir.path()).expect("open engine"));
+    {
+        let raw = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            dir.path(),
+            rdb_storage::keys::COLUMN_FAMILIES,
+        )
+        .expect("raw open");
+        let cf = raw
+            .cf_handle(rdb_storage::keys::cf_for(Namespace::User))
+            .expect("user column family");
+        let key =
+            rdb_storage::keys::encode_key(P1, Generation(1), Namespace::User, root.as_bytes());
+        raw.put_cf(cf, key, [0, 0, 0]).expect("raw put");
+    }
+    let rt = current_thread();
+    let mut host = owned_host(dir.path(), &rt);
+    let handle = SnapshotHandle(7);
+    let view = host
+        .engine
+        .snapshot(P1, Generation(1), handle)
+        .expect("a view of generation 1");
+    host.bound.insert(handle, view);
+    let (reply, answer) = mpsc::channel();
+    let (id, waiter) = pending(1, PendingKind::Previous(root), reply);
+    host.pending.insert(id, waiter);
+    let views = Arc::clone(&host.owner_views);
+    let mut returned = None;
+    let heard = answered_only_after_revoke(
+        "a bound previous view's read fault",
+        &views,
+        &answer,
+        || {
+            returned = Some(host.previous_answer(P1, identity(1), Ok(handle)));
+        },
+    );
+    let fault = returned
+        .expect("previous_answer ran")
+        .expect_err("a read fault is a host fault");
+    assert!(
+        fault.detail.contains("storage read fault"),
+        "the bound view was read, not refused as unbound: {fault:?}"
+    );
+    match heard {
+        Answer::Error {
+            error,
+            request: None,
+        } => assert_eq!(error.detail, format!("host fault: {}", fault.detail)),
+        other => panic!("the caller is told the host faulted: {other:?}"),
+    }
+    assert!(!views.still_owner(P1, HELD), "still_owner after the fault");
+    assert!(views.ownership(P1).is_none(), "ownership after the fault");
+}
+
 /// own84_6e (#84 review): a waiter that already gave up (its receiver dropped) does not undo
 /// the revoke. `fail_waiter` still revokes and returns the fault; faulting again, through
 /// `fail_waiter` and `set_fault`, and a view reported late leave both readers false.

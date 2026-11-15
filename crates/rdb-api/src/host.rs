@@ -14906,8 +14906,10 @@ const fn is_progress(kind: &EventKind) -> bool {
 }
 
 /// A1's fences in one step, read once per step (#84 review), not once per view. A1 publishes a
-/// fence's views in the fence's own step and no other view there (`Authority::fence`), so a
-/// view of a partition these cover is the fence's.
+/// fence's views in the fence's own step, and no other view of a partition the fence covers
+/// there (`Authority::fence`), so a view of a partition these cover is the fence's. The same
+/// step can publish a view of a partition no fence in it covers (`Authority::install_partitions`
+/// fencing one partition and publishing another's); [`Self::covers`] leaves that view unfenced.
 #[derive(Debug, Default)]
 struct StepFences {
     /// The step holds a node fence: every partition's, wherever A1 sited it.
