@@ -632,8 +632,8 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// product budgets. Durability then ages past L1's pause age again and again, so puts may be
 /// refused `PROTECTION_PAUSED` for most of the run; that is L1 doing its job, not a stall. What
 /// must hold: the owner keeps its grant (same grant id, no fence), no node faults (3 s is under
-/// the 5 s stuck limit, scaled as a wait here by A-R395), no node-thread step goes over 500 ms,
-/// and nothing waits on a held sync.
+/// the default stuck limit, 30 s since issue #109, scaled as a wait here by A-R395), no
+/// node-thread step goes over 500 ms, and nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
 /// Integration (~15 s): a fresh open, 12 s of held syncs (more under load, until 3 begin on
 /// each node, A-R395), then a stop that waits the last out.

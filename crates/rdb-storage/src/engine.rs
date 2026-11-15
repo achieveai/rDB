@@ -90,9 +90,9 @@ pub struct StorageOptions {
     /// How long one WAL sync may stay in flight before the node that runs it faults, in
     /// milliseconds (ruling A-R317). The engine does not read it; the host's syncer does. A
     /// slow sync that returns inside it costs nothing but durable lag (L1 pauses admission on
-    /// unsafe age meanwhile), and past 5 s the host logs it at Warn as a slow disk (issue
-    /// #109); one still running past it is a stuck disk, and the node gives up its grant so
-    /// another can take over. `None` keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
+    /// unsafe age meanwhile), and past 5 s the host logs it at Warn as slow (issue #109); one
+    /// still running past it is a stuck disk, and the node gives up its grant so another can
+    /// take over. `None` keeps [`DEFAULT_SYNC_STUCK_MILLIS`].
     pub sync_stuck_millis: Option<u64>,
 }
 
@@ -101,11 +101,11 @@ pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
 
 /// The default of [`StorageOptions::sync_stuck_millis`] (A-R317; issue #109): 30 s, about 2.3
 /// times the longest WAL sync seen in flight (13,058 ms, a restart right after a 54 GB load,
-/// issue #109; whether it would have returned is not known). It was 5 s, about 1.7 times the
-/// slowest measured under load (2,973 ms, lr6), so a busy disk faulted the node for the whole
-/// open. A stuck disk now costs about 36 s before another node takes over: this, plus the
-/// 5.9 s the last renewed grant still lives at the default 6 s grant. Past 5 s a sync in
-/// flight is logged as slow, at Warn.
+/// issue #109). It was 5 s, about 1.7 times the slowest measured under load (2,973 ms, lr6),
+/// and that 13 s sync faulted its node for the rest of the open. Whether that disk was slow or
+/// stuck, and whether the sync would have returned, is not known. A stuck disk now costs about
+/// 36 s before another node takes over: this, plus the 5.9 s the last renewed grant still
+/// lives at the default 6 s grant. Past 5 s a sync in flight is logged as slow, at Warn.
 pub const DEFAULT_SYNC_STUCK_MILLIS: u64 = 30_000;
 
 /// The default memtable budget of one store, all column families together (A-R300): 64 MiB,
