@@ -3,18 +3,24 @@
 //!
 //! The source of truth is the [`AuthorityView`] A1 already publishes to its host. Each host
 //! keeps its newest view per partition in an [`OwnerViews`] that [`crate::Db`] reads on the
-//! app's thread, with the host's own [`HostClock`]. [`owns_at`] is write admission's check 6
-//! ([`view_admits`]), not a copy of it, so for clock reasons `still_owner` turns false at the
-//! same tick admission stops. A fence (frozen grant, revoked epoch, a boot) publishes a view whose
-//! horizon is the tick before it, and the host writes the map before it steps T1 again, so
-//! `still_owner` is false before rDB admits another write. That view is removed, not kept, so a
-//! clock stepped back cannot revive it; the host names it a fence's from the step that carries
-//! the fence, so a fence at tick 0 (horizon saturated to the fence tick) is removed too. A host fault revokes the map before any caller is
-//! answered with the fault.
+//! app's thread, with the host's own [`HostClock`]. The readers follow check 6, plus fences and
+//! faults, and nothing else:
+//!
+//! - Check 6: [`owns_at`] is write admission's check 6 ([`view_admits`]), not a copy of it, so
+//!   for clock reasons `still_owner` turns false at the same tick admission stops.
+//! - Fences: a fence (frozen grant, revoked epoch, a boot) publishes a view whose horizon is the
+//!   tick before it, and the host writes the map before it steps T1 again, so `still_owner` is
+//!   false before rDB admits another write. That view is removed, not kept, so a clock stepped
+//!   back cannot revive it. The host names it a fence's from the step that carries the fence (a
+//!   node fence, wherever A1 sites it, or one scoped to the partition), so a fence at tick 0 is
+//!   removed too, though its horizon saturates to the fence tick, which check 6 still admits.
+//! - Faults: a host fault revokes the map for good, before any caller is answered with the
+//!   fault.
 //!
 //! `true` means only that no other node can hold this token's partition now. It does not mean
-//! the partition takes writes: a frozen queue, a paused L1 or a read-only recovery refuse writes
-//! under a view that still admits (checks 7 and 8).
+//! the partition takes writes: checks 7 and 8 refuse writes under a view that still admits, a
+//! frozen queue (check 7, which a read-only recovery also freezes) and a paused or blocked L1
+//! (check 8).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};

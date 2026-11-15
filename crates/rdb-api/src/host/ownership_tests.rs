@@ -345,10 +345,15 @@ fn own84_4_a_paused_process_resumes_not_owning() {
 
 /// A live view of partition 1 under `token`, through `valid_through`.
 fn live_view(token: OwnerToken, valid_through: Tick) -> AuthorityView {
+    live_view_of(P1, token, valid_through)
+}
+
+/// A live view of `partition` under `token`, through `valid_through`.
+fn live_view_of(partition: PartitionId, token: OwnerToken, valid_through: Tick) -> AuthorityView {
     use rdb_core::contracts::authority::DenyReason;
     use rdb_core::contracts::ids::{AuthorityGeneration, BootId, ConfigVersion, GrantId};
     AuthorityView {
-        lineage: token.lineage(P1),
+        lineage: token.lineage(partition),
         grant_id: GrantId(1),
         boot_id: BootId(1),
         authority_generation: AuthorityGeneration(1),
@@ -619,12 +624,13 @@ const ORDER_WAIT: Duration = Duration::from_millis(250);
 /// takes the write lock, so a path that revokes before it replies is stuck until the reader
 /// lets go, and its waiter hears nothing in [`ORDER_WAIT`]. A path that replies first is heard
 /// at once. Then the reader lets go, the answer is the fault, and both readers read false.
-fn answered_only_after_revoke(
+/// Returns that answer.
+pub(super) fn answered_only_after_revoke(
     name: &str,
     views: &OwnerViews,
     answer: &Receiver<Answer>,
     fault: impl FnOnce() + Send,
-) {
+) -> Answer {
     std::thread::scope(|scope| {
         let readers = views.hold_readers();
         let faulting = scope.spawn(fault);
@@ -636,11 +642,12 @@ fn answered_only_after_revoke(
         drop(readers);
         faulting.join().expect("the fault path panicked");
     });
-    match answer.try_recv() {
-        Ok(Answer::Error { .. }) => {}
+    let heard = match answer.try_recv() {
+        Ok(heard @ Answer::Error { .. }) => heard,
         other => panic!("{name}: the waiter is answered with the fault: {other:?}"),
-    }
+    };
     assert_unowned(views, name);
+    heard
 }
 
 /// A waiter under request `request`, `kind`, answering on `reply`.
@@ -692,8 +699,8 @@ fn own84_6c_both_fault_paths_revoke_before_the_waiter_can_read_the_fault() {
 /// another call, a status query no module answers, a read whose step view is missing, a reply
 /// to a call it does not answer, and a previous-view answer to a read or under an unbound
 /// handle. Each case faults a fresh host whose map owns [`HELD`], through
-/// [`answered_only_after_revoke`]. The two compile callers are pinned in
-/// `a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault`.
+/// [`answered_only_after_revoke`]. The two compile callers in `Host::client` are pinned in
+/// `own84_6f_each_compile_caller_in_client_revokes_before_it_answers` (`tests.rs`).
 /// Cut: no revoke in `fail_waiter`, red on the first case.
 /// Unit (one host per case, no cluster): each case waits [`ORDER_WAIT`].
 #[config_log::retcd_test]
@@ -847,6 +854,84 @@ fn own84_9_a_fence_at_tick_zero_ends_ownership() {
         host.deliver(&[view(60_000)]).expect("a regrant");
         assert_owned(&host.owner_views, &format!("a regrant, {scope:?}"));
     }
+}
+
+/// own84_9b (#84 review): a node fence A1 sites at partition 0, at tick 0, with views of two
+/// served partitions in the same step. Partition 0 is served by nobody, so the fence's site is
+/// neither view's partition: a node fence is every partition's, wherever it is sited. Both
+/// views have the zero horizon check 6 still admits at tick 0, so only the fence can end
+/// ownership. Both readers read false for both partitions, at once and read again; a regrant
+/// of the same token is owned again on both.
+/// Cut: `StepFences::of` counting a node fence for its own site's partition only, red at
+/// "the fence's step"; own84_9 stays green under it.
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn own84_9b_a_node_fence_sited_elsewhere_ends_ownership_of_every_partition() {
+    use rdb_core::contracts::authority::DenyReason;
+    const SITE: PartitionId = PartitionId(0);
+    const SERVED: [PartitionId; 2] = [P1, PartitionId(2)];
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trio::host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    clock.step_back(u64::MAX);
+    assert_eq!(clock.now(), Tick(0), "precondition: the clock reads tick 0");
+    host.clock = clock;
+    host.stepped_at = clock.now();
+    let at_site = |kind| Effect {
+        correlation: CorrelationId::default(),
+        from: ModuleName::Authority,
+        partition: SITE,
+        kind: EffectKind::Kernel(KernelEffect::Authority(kind)),
+    };
+    let views = |valid_through| {
+        SERVED.map(|partition| {
+            at_site(AuthorityEffect::PublishAuthorityView(live_view_of(
+                partition,
+                HELD,
+                Tick(valid_through),
+            )))
+        })
+    };
+    let owned = |host: &Host, what: &str| {
+        for partition in SERVED {
+            assert!(
+                host.owner_views.still_owner(partition, HELD),
+                "{what}, {partition:?}: still_owner"
+            );
+            assert_eq!(
+                host.owner_views.ownership(partition).map(|o| o.token),
+                Some(HELD),
+                "{what}, {partition:?}: ownership"
+            );
+        }
+    };
+    let unowned = |host: &Host, what: &str| {
+        for partition in SERVED {
+            assert!(
+                !host.owner_views.still_owner(partition, HELD),
+                "{what}, {partition:?}: still_owner"
+            );
+            assert!(
+                host.owner_views.ownership(partition).is_none(),
+                "{what}, {partition:?}: ownership"
+            );
+        }
+    };
+    host.deliver(&views(0)).expect("views through now");
+    owned(&host, "views through now, outside a fence");
+    let fence = at_site(AuthorityEffect::Fence {
+        scope: FenceScope::Node,
+        reason: DenyReason::Frozen,
+    });
+    let [first, second] = views(0);
+    host.deliver(&[fence, first, second])
+        .expect("the fence's step");
+    unowned(&host, "the fence's step");
+    assert_eq!(clock.now(), Tick(0), "still tick 0");
+    unowned(&host, "read again");
+    host.deliver(&views(60_000)).expect("a regrant");
+    owned(&host, "a regrant of the same token");
 }
 
 /// own84_7d (#84 review): the other L1 refusal. L1 blocked for an operator

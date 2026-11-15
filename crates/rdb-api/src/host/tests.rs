@@ -2655,6 +2655,74 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
     }
 }
 
+/// own84_6f (#84 review): each compile caller in `Host::client`, a put and a compile, revokes
+/// ownership itself before its caller hears the fault. Called on `client` directly, not through
+/// `handle`, whose `set_fault` afterwards would revoke anyway and hide a caller that does not.
+/// The call runs while the owner map is held for reading: its caller hears nothing until the
+/// reader lets go, then `client` returns the fault, the caller hears it as an error, and
+/// neither reader owns node 1's token.
+/// Cuts: the put arm's `map_err` answering without `fail_waiter`'s revoke, red on "put" ("heard
+/// of the fault before ownership was revoked"); the same in the compile arm, red on "compile".
+/// Under both, `a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault` stays
+/// green: that is the masking this row removes.
+/// Integration (~1 s per call): a trio bootstrap for each; each waits `ORDER_WAIT` on purpose.
+#[config_log::retcd_test]
+fn own84_6f_each_compile_caller_in_client_revokes_before_it_answers() {
+    use super::ownership_tests::answered_only_after_revoke;
+    for (name, call) in [
+        ("put", put(1, b"a", b"1", None)),
+        ("compile", compile(1, b"a", b"1")),
+    ] {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let host = &mut trio.nodes[0].0;
+        let owned = host
+            .owner_views
+            .ownership(PartitionId(1))
+            .unwrap_or_else(|| panic!("{name}: precondition: node 1 owns partition 1"));
+        assert!(
+            host.owner_views.still_owner(PartitionId(1), owned.token),
+            "{name}: precondition: still_owner"
+        );
+        host.fail_step_view = true;
+        let views = Arc::clone(&host.owner_views);
+        let (reply, answer) = mpsc::channel();
+        let mut returned = None;
+        let heard = answered_only_after_revoke(name, &views, &answer, || {
+            returned = Some(host.client(Client {
+                partition: PartitionId(1),
+                call,
+                reply,
+            }));
+        });
+        let fault = returned
+            .expect("client ran")
+            .expect_err("client returns the fault");
+        assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
+        match heard {
+            Answer::Error {
+                error,
+                request: None,
+            } => assert_eq!(
+                error.detail,
+                format!("host fault: {}", fault.detail),
+                "{name}"
+            ),
+            other => panic!("{name}: the caller is told the host faulted: {other:?}"),
+        }
+        assert!(
+            !views.still_owner(PartitionId(1), owned.token),
+            "{name}: still_owner after the fault"
+        );
+        assert!(
+            views.ownership(PartitionId(1)).is_none(),
+            "{name}: ownership after the fault"
+        );
+    }
+}
+
 /// S1-8, admits at fault: a faulted node answers every call with its fault, so its status
 /// never says it admits writes, though L1 still allows and A1 still holds its grant.
 /// Before, `admits` read only L1 and A1 and said `true` beside `fault`.

@@ -258,7 +258,8 @@ pub fn reanchor_deferred(phases: impl IntoIterator<Item = RecoveryPhase>) -> boo
 }
 
 /// The process's clock guard, leaked once per [`crate::transport::Links`]. Every
-/// [`HostClock`] copy of that process shares it.
+/// [`HostClock`] copy of that process shares it. A crate test can also make one apart from
+/// `Links` ([`HostClock::guarded`], [`HostClock::with_guard`]), shared by that clock's copies.
 #[derive(Debug)]
 pub struct ClockGuard {
     /// Milliseconds a re-anchor moved the clock forward; only ever rises.
@@ -470,7 +471,8 @@ impl HostClock {
     /// Between readings closer than that it is [`Self::start`]'s clock. A longer gap, a stall
     /// of the reading thread, counts `max_step_millis` and is logged
     /// `test_clock_capped{real_millis, counted_millis}`. Copies share one state, so every host
-    /// in a row reads one time, and it never moves backwards.
+    /// in a row reads one time, and without a guard it never moves backwards: a capped clock
+    /// given one by [`Self::with_guard`] moves back when [`Self::step_back`] is called.
     ///
     /// The state is leaked, once per call, so the clock stays `Copy` as its production callers
     /// take it: a few bytes per test cluster.
@@ -505,7 +507,9 @@ impl HostClock {
     }
 
     /// This capped clock with a guard of its own, so [`Self::step_back`] moves it while it is
-    /// held: a rollback read at exact ticks (#84 review). Copies share the guard.
+    /// held: a rollback read at exact ticks (#84 review). Copies share the guard. The guard is
+    /// leaked once per call, not once per `Links`, and a clock built this way can move
+    /// backwards, unlike a capped clock without one.
     #[cfg(test)]
     pub(crate) fn with_guard(self) -> Self {
         Self {
