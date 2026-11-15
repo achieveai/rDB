@@ -54,7 +54,7 @@ use rdb_core::partition_map::RoutesRoot;
 
 use crate::clock::HostClock;
 use crate::db::{ApiError, Db};
-use crate::host::{Msg, NodeStopped, BOOT};
+use crate::host::{Msg, NodeStatus, NodeStopped, BOOT};
 
 /// The partition S0 serves.
 pub const PARTITION: PartitionId = PartitionId(1);
@@ -2207,10 +2207,11 @@ pub enum PromoteError {
         /// The partition.
         partition: u32,
     },
-    /// Above one partition, the owner is alive: it answered, or its grant is still being
-    /// renewed. A promote freezes the whole node's grant and moves one partition, so it would
-    /// fence the node's other partitions (issue #79 S3). Nothing was changed. A live owner's
-    /// promote is #61 slice S7.
+    /// Above one partition, the owner is alive: it answered a look without a host fault, or
+    /// its grant is still being renewed. An owner that answers with a host fault is not alive
+    /// here (issue #122). A promote freezes the whole node's grant and moves one partition, so
+    /// it would fence the node's other partitions (issue #79 S3). Nothing was changed. A live
+    /// owner's promote is #61 slice S7.
     #[error(
         "node {node} is alive and owns partition {partition} ({evidence}): a promote of one \
          partition from a live node is not built, because it would stop every partition node \
@@ -3283,8 +3284,9 @@ async fn kept_boots(
     }
 }
 
-/// Whether `prior` answers a look at `ctx.partition` within `ctx.look_within`.
-async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
+/// What `prior` answers to a look at `ctx.partition` within `ctx.look_within`; `None` when the
+/// look cannot be sent or no answer comes in time.
+async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> Option<NodeStatus> {
     let (reply, answer) = std::sync::mpsc::channel();
     let asked = (ctx.send)(
         prior,
@@ -3294,12 +3296,13 @@ async fn owner_answers(ctx: &PromoteCtx, prior: NodeId) -> bool {
         },
     );
     if asked.is_err() {
-        return false;
+        return None;
     }
     let within = ctx.look_within;
-    tokio::task::spawn_blocking(move || answer.recv_timeout(within).is_ok())
+    tokio::task::spawn_blocking(move || answer.recv_timeout(within).ok())
         .await
-        .unwrap_or(false)
+        .ok()
+        .flatten()
 }
 
 /// Refuse a promote run on a clock with no bound ([`PromoteError::ClockUnbounded`]), before it
@@ -3359,16 +3362,19 @@ async fn refuse_frozen_target(ctx: &PromoteCtx) -> Result<(), PromoteError> {
 }
 
 /// Show that `prior`, which owns `ctx.partition` above one partition, is dead: it does not
-/// answer a look, and its grant is not being renewed and has run out. A just-killed owner is
-/// waited out, not refused. Returns the `mod_revision` of the grant record judged, 0 for none.
+/// answer a look, or answers it with a host fault, and its grant is not being renewed and has
+/// run out. A just-killed owner is waited out, not refused. Returns the `mod_revision` of the
+/// grant record judged, 0 for none.
 ///
 /// The freeze is the node's, so this keeps it to nodes with nothing left to stop (issue #79
-/// S3).
+/// S3). A host fault is the whole host's and lasts the boot, so a faulted owner has nothing left
+/// to stop either (issue #122): it goes on to the grant checks as a silent one does.
 ///
 /// # Errors
 ///
-/// [`PromoteError::OwnerAlive`] when it answers or its expiry moves; [`PromoteError::Control`]
-/// when the store does not answer or the wait runs out. Nothing has been written either way.
+/// [`PromoteError::OwnerAlive`] when it answers without a fault or its expiry moves;
+/// [`PromoteError::Control`] when the store does not answer or the wait runs out. Nothing has
+/// been written either way.
 async fn owner_dead(
     ctx: &PromoteCtx,
     prior: NodeId,
@@ -3414,9 +3420,17 @@ async fn owner_dead(
         }
         if !looked {
             looked = true;
-            if owner_answers(ctx, prior).await {
-                tracing::warn!(owner = prior.0, "promote_owner_answered");
-                return Err(alive("it answered a look"));
+            match owner_answers(ctx, prior).await {
+                Some(NodeStatus { fault: None, .. }) => {
+                    tracing::warn!(owner = prior.0, "promote_owner_answered");
+                    return Err(alive("it answered a look"));
+                }
+                Some(NodeStatus {
+                    fault: Some(fault), ..
+                }) => {
+                    tracing::warn!(owner = prior.0, %fault, "promote_owner_faulted");
+                }
+                None => {}
             }
         }
         let Some((revision, held)) = found else {
@@ -4891,6 +4905,84 @@ mod tests {
         rt.block_on(promote(ctx)).expect_err("refused")
     }
 
+    /// What a host-faulted node 1 answers a look with (issue #122).
+    fn faulted_status() -> NodeStatus {
+        NodeStatus {
+            node: OWNER,
+            boot: BOOT,
+            fault: Some("control adapter: admin fixture".to_owned()),
+            holds: None,
+            authority: "none".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery: None,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: None,
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+            pinned: members(),
+            config_version: Some(CONFIG_VERSION),
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
+            tail_refused: None,
+        }
+    }
+
+    /// A promote above one partition over `store` within `within`, with node 1, the owner,
+    /// answering every look with [`faulted_status`] and every other node unreachable. Also
+    /// returns how many looks node 1 answered.
+    fn promote_above_one_faulted(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+    ) -> (PromoteError, usize) {
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&looks);
+        let ctx = PromoteCtx {
+            partition: PARTITION,
+            owner_must_be_dead: true,
+            look_within: Duration::from_secs(1),
+            store,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            to: NodeId(2),
+            drop: None,
+            within,
+            members: members(),
+            members_version: CONFIG_VERSION,
+            member_boot: all_known(),
+            send: Arc::new(move |node, msg| match (node, msg) {
+                (OWNER, Msg::Inspect { reply, .. }) => {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    reply.send(faulted_status()).expect("the look waits");
+                    Ok(())
+                }
+                (node, _) => Err(NodeStopped(node)),
+            }),
+        };
+        let refused = rt.block_on(promote(ctx)).expect_err("refused");
+        (refused, looks.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// `grants/1`'s expiry `ahead_ms` past this host's control time now.
+    fn expiry_ahead(ahead_ms: i64) -> i64 {
+        i64::try_from(
+            HostClock::control_time(HostClock::start().now(), &Budgets::SPEC_DEFAULTS)
+                .estimate
+                .0,
+        )
+        .expect("in range")
+            + ahead_ms
+    }
+
     fn unfrozen_and_serving(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) {
         let grant = rt
             .block_on(store.get(GetRequest {
@@ -4936,6 +5028,65 @@ mod tests {
             told.ends_with("stop that node first, then promote again")
                 && !told.contains("retrying will not help"),
             "{told}"
+        );
+        unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// Issue #122 review: a host-faulted owner whose grant has not run out is still waited out,
+    /// not promoted away from. Node 1 answers the look with a host fault, its 60 s grant stands
+    /// still, and the promote has 100 ms: it runs out of time on the grant check, and
+    /// `grants/1` and `partitions/1` are left as they were. Cuts: `owner_dead`'s fault arm
+    /// returns the grant's revision at once, skipping the grant checks: the freeze writes
+    /// `grants/1`, red. The fault arm refuses as a live owner: `OwnerAlive`, red.
+    /// Unit (~150 ms): `MemStore`, waits out the 100 ms.
+    #[test]
+    fn above_one_partition_a_faulted_owner_with_an_unexpired_grant_is_refused() {
+        let rt = runtime();
+        let store = config_testkit::MemStore::new();
+        rooted(&store, &rt, BootId(5));
+        old_grant(&store, &rt, GrantId(4));
+        put_grant_expiry(&store, &rt, expiry_ahead(60_000));
+        let before = grant_revision(&store, &rt);
+        let store: Arc<dyn ConfigStore> = Arc::new(store);
+        let (refused, looks) =
+            promote_above_one_faulted(Arc::clone(&store), &rt, Duration::from_millis(100));
+        assert_eq!(looks, 1, "node 1 was looked at once");
+        assert!(
+            matches!(&refused, PromoteError::Control(detail) if detail.contains("was not proven past")),
+            "{refused:?}"
+        );
+        assert_eq!(grant_revision(&*store, &rt), before, "grants/1 not written");
+        unfrozen_and_serving(&*store, &rt);
+    }
+
+    /// Issue #122 review: a host-faulted owner whose grant is still being renewed is refused as
+    /// alive, the same as a silent one ([`above_one_partition_an_owner_still_renewing_is_refused`]),
+    /// with nothing written. Here the look is answered, so the fault arm runs. Cuts: `owner_dead`'s
+    /// fault arm returns the grant's revision at once: the freeze refuses "it came back during the
+    /// promote" instead, red. The fault arm refuses "it answered a look": red.
+    /// Unit (~60 ms): `MemStore`.
+    #[test]
+    fn above_one_partition_a_faulted_owner_still_renewing_is_refused() {
+        let rt = runtime();
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: true,
+            on_fencing: false,
+            clear_on_fencing: false,
+            undo: UndoFault::Answers,
+        });
+        rooted(&store.inner, &rt, BootId(5));
+        old_grant(&store.inner, &rt, GrantId(4));
+        put_grant_expiry(&store.inner, &rt, expiry_ahead(60_000));
+        let (refused, looks) = promote_above_one_faulted(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            &rt,
+            Duration::from_secs(1),
+        );
+        assert_eq!(looks, 1, "node 1 was looked at once");
+        assert!(
+            matches!(&refused, PromoteError::OwnerAlive { evidence, .. } if evidence == "its grant is still being renewed"),
+            "{refused:?}"
         );
         unfrozen_and_serving(&store.inner, &rt);
     }

@@ -58,6 +58,9 @@ struct Inner {
     buffered: BTreeMap<(NodeId, NodeId), VecDeque<Msg>>,
     /// Dropped directions, `(from, to)`: what is sent on one is lost.
     dropped: BTreeSet<(NodeId, NodeId)>,
+    /// Per pair, smaller node first, how many heals lifted a hold or a drop on it: what
+    /// [`Links::connection`] answers for a pair this process runs both ends of.
+    heals: BTreeMap<(NodeId, NodeId), u64>,
     /// [`Links::drop_next_restore`].
     #[cfg(test)]
     drop_next_restore: BTreeSet<NodeId>,
@@ -256,6 +259,9 @@ impl Links {
         let removed = inner.held.remove(&pair(a, b));
         let undropped =
             usize::from(inner.dropped.remove(&(a, b))) + usize::from(inner.dropped.remove(&(b, a)));
+        if removed || undropped > 0 {
+            *inner.heals.entry(pair(a, b)).or_default() += 1;
+        }
         let mut flushed = 0;
         for direction in [(a, b), (b, a)] {
             let Some(queue) = inner.buffered.remove(&direction) else {
@@ -283,6 +289,22 @@ impl Links {
             inner.held.iter().copied().chain(dropped).collect()
         };
         pairs.into_iter().map(|(a, b)| self.heal(a, b)).sum()
+    }
+
+    /// Which connection `from` reaches `to` on now, or `None` with none up: another answer
+    /// later means the link was lost and made again in between, even at the same boot (#107
+    /// review: a same-boot reconnect starts the live re-add's hold again). Over the process
+    /// links it is the connection's id; for a node this process runs, the count of heals of the
+    /// pair, and `None` while the pair is held, as `Host::linked` reads a hold.
+    #[must_use]
+    pub fn connection(&self, from: NodeId, to: NodeId) -> Option<u64> {
+        let inner = self.lock();
+        if let Some(net) = Self::remote(&inner, to) {
+            drop(inner);
+            return net.connection(to);
+        }
+        let pair = pair(from, to);
+        (!inner.held.contains(&pair)).then(|| inner.heals.get(&pair).copied().unwrap_or(0))
     }
 
     /// The held links, smaller node first.
