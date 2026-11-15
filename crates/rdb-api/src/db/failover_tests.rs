@@ -372,8 +372,9 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
         rig.planner_grant().is_some()
     });
 
-    // A cold start raises the alert while each node has no grant yet (heard, not serving):
-    // only alerts after the stop count against the running nodes.
+    // A cold start raises no alert (lead ruling 2), and the rig has waited for every owner's
+    // own grant, so this is 0 in a passing run. Counted anyway so that only alerts after the
+    // stop count against the running nodes.
     let setup_alerts = logged(method, "planner_owner_alive_not_serving").len();
     let stopped = Instant::now();
     rig.stop(0);
@@ -841,6 +842,75 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
         Vec::<serde_json::Value>::new(),
         "after node 2 took its grant"
     );
+}
+
+/// Lead ruling on PR #119 item 9: an owner heard on its links that has had its chance to take a
+/// grant and has none of its own is the Q2 case. Node 2 is cut from rEtcd once every process is
+/// open, as in the cold-start row, and stays cut. Past [`crate::planner::no_grant_grace`] the
+/// planner raises `planner_owner_alive_not_serving` for node 2 once (`no_grant_of_own`), and
+/// moves nothing.
+/// Integration (~20 s): the old record runs out, then the grace, 9 s at the rig's 3 s grants.
+/// The grace follows the grant, and a shorter grant in this rig would also shorten every
+/// host's lease and renewals, which the other rows here are tuned to.
+/// Cut: never escalate in `sweep` (the `waited < no_grant_grace` test always true); no alert
+/// within 30 s, red.
+#[config_log::retcd_test]
+fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved() {
+    const METHOD: &str =
+        "own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved";
+    let rig = opened(3, [Some(failover()); 3]);
+    rig.procs[1].faults.apply("cut-control\n");
+    let node2_boot = rig.procs[1].boot;
+    assert_eq!(rig.owned_by(NodeId(2)), vec![2], "node 2 owns partition 2");
+    assert!(
+        rig.grants()
+            .get(&NodeId(2))
+            .is_none_or(|grant| grant.boot != node2_boot),
+        "node 2 took its grant before it was cut: the row did not set up its state"
+    );
+    let before = rig.record(2);
+
+    let alerts = logged_at_least_within(
+        METHOD,
+        "planner_owner_alive_not_serving",
+        1,
+        Duration::from_secs(30),
+    );
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    let alert = &alerts[0];
+    assert_eq!(alert["node"], 2, "{alert:?}");
+    assert_eq!(alert["no_grant_of_own"], true, "{alert:?}");
+    let grace = crate::planner::no_grant_grace(&budgets());
+    assert!(
+        // A `u128` field is logged as a string.
+        alert["since_ms"]
+            .as_str()
+            .and_then(|ms| ms.parse::<u128>().ok())
+            .is_some_and(|ms| ms >= grace.as_millis()),
+        "said only past the grace of {grace:?}: {alert:?}"
+    );
+    let entered = logged(METHOD, "planner_owner_no_grant_yet");
+    assert!(
+        entered.iter().any(|line| line["node"] == 2),
+        "the planner saw node 2 with no grant of its own first: {entered:?}"
+    );
+
+    std::thread::sleep(10 * failover().poll);
+    let alerts = logged(METHOD, "planner_owner_alive_not_serving");
+    assert_eq!(alerts.len(), 1, "said once, not every poll: {alerts:?}");
+    assert_eq!(rig.record(2), before, "partitions/2 unchanged");
+    // Scoped to node 2: a process that opens late under load is rightly judged silent until
+    // it does (observed for node 3, refused `lone_survivor`), and that is not this row's case.
+    let decided: Vec<_> = logged(METHOD, "planner_promote_decision")
+        .into_iter()
+        .filter(|line| line["partition"] == 2 || line["dead"] == 2)
+        .collect();
+    assert!(decided.is_empty(), "{decided:?}");
+    let silent: Vec<_> = logged(METHOD, "planner_node_silent")
+        .into_iter()
+        .filter(|line| line["node"] == 2)
+        .collect();
+    assert!(silent.is_empty(), "{silent:?}");
 }
 
 /// Lead ruling 1 on PR #119: the planner on node 1 holds `planner/grant`; node 1's host

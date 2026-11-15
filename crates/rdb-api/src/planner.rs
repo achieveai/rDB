@@ -188,6 +188,20 @@ pub(crate) fn choose_target(
     Ok(tied[index])
 }
 
+/// How long an owner may be heard with no grant of its own before the planner raises
+/// `planner_owner_alive_not_serving` for it (ruling on PR #119 item 9): three grant lifetimes,
+/// 18 s at the spec's 6 s.
+///
+/// The state is a node's start: its recovery replaces the past boot's record once that record
+/// has run out (the state begins only then) and the discovery window has passed, which is at
+/// most one grant lifetime at the spec defaults (2 s against 6 s). In the failover rows (3 s
+/// grants, the discovery window stretched to 6 s) the whole start, from open to the owner's own
+/// grant, took about 6.3 s, and the state itself under 0.2 s when left alone. Three lifetimes
+/// cover a start twice over and still alert well inside a minute.
+pub(crate) fn no_grant_grace(budgets: &Budgets) -> Duration {
+    Duration::from_millis(budgets.grant_millis.saturating_mul(3))
+}
+
 /// What the planner judged a node owning partitions to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
@@ -216,8 +230,10 @@ pub(crate) struct Memory {
     host_faulted: bool,
     /// `planner_grant_read_failed`, once per [`REPEAT_EVERY`] per cause.
     read_failed: Repeats,
-    /// Owners heard but holding no grant yet, each said once (`planner_owner_no_grant_yet`).
-    no_grant_yet: BTreeSet<NodeId>,
+    /// Owners heard but holding no grant of their own: the boot the links knew and when the
+    /// planner first saw it so (`planner_owner_no_grant_yet`, said once per entry). A new boot
+    /// starts the clock again.
+    no_grant_yet: BTreeMap<NodeId, (Option<BootId>, Instant)>,
     verdicts: BTreeMap<NodeId, Verdict>,
     no_eligible: BTreeMap<PartitionId, &'static str>,
 }
@@ -443,28 +459,50 @@ impl Planner {
             let verdict = self
                 .judge(owner, grants.get(&owner), records[0].0.partition)
                 .await;
-            // No alert before the owner's first grant of its own: a node just started has none
-            // until its recovery takes one, and it is not "not serving" (lead ruling on PR
-            // #119). Until then `grants/{owner}` is absent or still the record of the boot
-            // before, which runs out first. A grant counts as its own when the links know no
-            // other boot for the owner. Nothing is remembered either, so the alert is still
-            // said once a grant of its own expires.
-            let past_boot = grants.get(&owner).is_some_and(|record| {
-                self.links
-                    .boot_of(owner)
-                    .is_some_and(|boot| boot != record.boot)
-            });
+            // No alert before the owner's first grant of its own, within [`no_grant_grace`]: a
+            // node just started has none until its recovery takes one, and it is not "not
+            // serving" (lead ruling on PR #119). Until then `grants/{owner}` is absent or still
+            // the record of the boot before, which runs out first. A grant counts as its own
+            // when the links know no other boot for the owner. Past the grace it has had its
+            // chance, and the Q2 alert is said, once per change as below (ruling on item 9).
+            let boot = self.links.boot_of(owner);
+            let past_boot = grants
+                .get(&owner)
+                .is_some_and(|record| boot.is_some_and(|boot| boot != record.boot));
             if past_boot || !grants.contains_key(&owner) {
                 if let Verdict::AliveNotServing(evidence) = verdict {
-                    if memory.no_grant_yet.insert(owner) {
-                        tracing::info!(
+                    let now = Instant::now();
+                    let since = match memory.no_grant_yet.get(&owner) {
+                        Some((at, since)) if *at == boot => *since,
+                        _ => {
+                            tracing::info!(
+                                node = owner.0,
+                                evidence,
+                                past_boot,
+                                grace_ms = no_grant_grace(&self.budgets).as_millis(),
+                                "planner_owner_no_grant_yet"
+                            );
+                            memory.no_grant_yet.insert(owner, (boot, now));
+                            memory.verdicts.remove(&owner);
+                            now
+                        }
+                    };
+                    let waited = now.saturating_duration_since(since);
+                    if waited < no_grant_grace(&self.budgets) {
+                        continue;
+                    }
+                    if memory.verdicts.get(&owner) != Some(&verdict) {
+                        tracing::warn!(
                             node = owner.0,
                             evidence,
-                            past_boot,
-                            "planner_owner_no_grant_yet"
+                            grant_expired = past_boot,
+                            no_grant_of_own = true,
+                            since_ms = waited.as_millis(),
+                            partitions = records.len(),
+                            "planner_owner_alive_not_serving"
                         );
                     }
-                    memory.verdicts.remove(&owner);
+                    memory.verdicts.insert(owner, verdict);
                     continue;
                 }
             }
@@ -476,6 +514,7 @@ impl Planner {
                     node = owner.0,
                     evidence,
                     grant_expired = true,
+                    no_grant_of_own = false,
                     partitions = records.len(),
                     "planner_owner_alive_not_serving"
                 ),
