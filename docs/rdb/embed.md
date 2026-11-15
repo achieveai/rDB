@@ -420,6 +420,106 @@ For a sandbox gateway (SBX):
 `rdb_node` logs `ownership_held` when its node starts leading a partition (with `token` and
 `remaining_ms`) and `ownership_lapsed` when `still_owner` turns false for it.
 
+### Ownership events: when to start and stop
+
+Polling `still_owner` tells you the state now. To be told when it changes, subscribe:
+`db.ownership_events()` returns a `std::sync::mpsc::Receiver<OwnershipEvent>` for every node in
+this process. Each event names its `node`, `partition` and `token` (an `OwnerToken`).
+
+| Event | What it means | What your app does |
+|---|---|---|
+| `Activated` | The node is the partition's writable primary and its data is readable there. | Start work. Stamp `token` on every side effect. |
+| `Deactivating { deadline }` | No renewal has landed. The node stops taking writes at `deadline` (an `Instant`) unless one lands. | Start no effect that cannot finish before `deadline`. Checkpoint. |
+| `Activated` again, same token | The renewal landed in time. | Carry on. Nothing to rebuild. |
+| `Deactivated` | The node no longer owns the partition under `token`. | Stop everything stamped with `token`. |
+
+**When `Activated` comes.** Only when every one of these holds:
+
+- the node is the partition's primary, and rDB admits writes there under `token`;
+- the partition's data is readable (its generation is marked activated);
+- its commit is not read-only, and its queue is open;
+- more than 1.5 s is left before the write permission ends.
+
+A read-only (capped) commit never sends `Activated`, however long it serves reads.
+
+**The 1.5 s warning.** `Deactivating` comes `DEACTIVATING_LEAD_MILLIS` (1500 ms) before the
+node's last write tick. That number is chosen so that an rEtcd stall rDB rides out (2-3 s, then
+the renewal lands) sends **nothing**. A stall long enough to warn gives you 1.5 s. Use the
+`deadline`, not your own guess: it already counts the clock margin from "The clock rule".
+
+**When `Deactivated` comes.** At the first tick past the node's last write tick, on the node's
+own timer. It does not wait for rEtcd to answer, so a node cut off from rEtcd still sends it on
+time. It also comes at once on a fence or a promote. It gives no reason.
+
+**Order.**
+
+- On one node and partition: `Activated`, then `Deactivating`, then `Activated` again (same
+  token) or `Deactivated`. A fence or a promote sends `Deactivating` with a `deadline` of now,
+  then `Deactivated` at once.
+- Across nodes: after a promote, the old owner's `Deactivated` comes before the new owner's
+  `Activated`. That order comes from the grant timing, not from delivery. Events from two
+  processes can reach a third party in any order, so **the destinations must still fence**
+  (below).
+
+**Subscribing.**
+
+- Each call makes a new subscriber. Its first events are the current state: `Activated` (or
+  `Deactivating`) for each partition a node of this process owns now.
+- The channel holds 4096 events. A subscriber that falls that far behind is **dropped**: its
+  `recv` returns `Err`. A node of this process stopping, or the `Db` shutting down, ends every
+  subscriber the same way.
+- On `Err`, subscribe again unless you are shutting down. You get the current state again, so
+  you lose nothing but the history.
+
+```rust
+use rdb_api::OwnershipEvent;
+
+while !shutting_down() {
+    let events = db.ownership_events();
+    for event in events.iter() {
+        match event {
+            OwnershipEvent::Activated { partition, token, .. } => start(partition, token),
+            OwnershipEvent::Deactivating { partition, token, deadline, .. } => {
+                wind_down(partition, token, deadline)
+            }
+            OwnershipEvent::Deactivated { partition, token, .. } => stop(partition, token),
+        }
+    }
+    // The iterator ended: dropped for lag, or the node stopped. Subscribe again.
+}
+```
+
+**Your duty: fence with the token.** The events tell you when to start and stop. They do not
+stop a late effect: a process paused after `Deactivated` was sent still acts when it wakes. So,
+as above:
+
+- Stamp `token` on every side effect.
+- Every destination keeps the **highest** token it has seen for the partition, and refuses an
+  effect stamped with a lower one.
+
+For SBX: subscribe once at start-up. On `Activated`, start the partition's containers labelled
+with `token`, and stop any with a lower token. On `Deactivating`, checkpoint and start no new
+container. On `Deactivated`, stop the partition's containers with that token. The snapshot store
+refuses an upload with a lower token than the one it holds.
+
+### Which node owns a group: `route`
+
+`db.route(group)` returns `RouteInfo { partition, owner, token }`: the group's partition, the
+node that owns it, and the owner's token, read from the partition's control record. Use it to
+send a request to the right node.
+
+- It is a **hint**. Ownership can move right after you read it. The token, checked by the
+  destination, is what makes a late request harmless.
+- A node's `Db` keeps the answer while its control watch is open, until the watch delivers a
+  change to that partition or ends. It opens no new watch. An app-only `Db` (no local node)
+  reads rEtcd on every call.
+- It does not yet return the owner's network address.
+
+**Try it.** `rdb_node` prints each event as
+`rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
+`deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
+`admin route G` prints `route group G partition P owner node N token G.E`.
+
 ## 5. Reopening your folder
 
 Open the same folder against the same rEtcd with the same `Db::open` call. There is nothing

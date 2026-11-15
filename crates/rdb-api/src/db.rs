@@ -50,7 +50,9 @@ use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
-use crate::ownership::{OwnerToken, Ownership};
+use crate::ownership::{
+    OwnerToken, Ownership, OwnershipEvent, RouteInfo, RouteStamp, Subscriber, SUBSCRIBER_CAPACITY,
+};
 use crate::transport::Links;
 use ack_floor::AckFloor;
 
@@ -587,6 +589,9 @@ struct Route {
     /// [`OWNER_REREAD_GAP`] of it is not made: the call goes on with the owner that read named
     /// (A-R299).
     last_read: Mutex<BTreeMap<u32, Instant>>,
+    /// #83: what [`Db::route`] last read of each partition's record, and the stamp of the
+    /// `partitions/` watches it was read under. Served while the stamp is current.
+    answers: Mutex<BTreeMap<u32, (RouteInfo, RouteStamp)>>,
 }
 
 impl Default for Route {
@@ -595,6 +600,7 @@ impl Default for Route {
             owners: vec![std::sync::atomic::AtomicU32::new(OWNER.0)],
             refresh: None,
             last_read: Mutex::new(BTreeMap::new()),
+            answers: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -743,6 +749,30 @@ async fn read_owner(
         ))
     })?;
     Ok((record.owner, root.instance))
+}
+
+/// #83: `partition`'s owner and token as its `partitions/{p}` record names them.
+async fn read_route(store: &dyn ConfigStore, partition: PartitionId) -> Result<RouteInfo, String> {
+    let key = ControlKey::Partition(partition).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("route: get {key}: {error}"))?;
+    let found = read
+        .record
+        .ok_or_else(|| format!("route: {key} is absent: the database is not formed yet"))?;
+    let record = PartitionRecord::decode(&found.value)
+        .ok_or_else(|| format!("route: {key} is not a partition record this build reads"))?;
+    Ok(RouteInfo {
+        partition,
+        owner: record.owner,
+        token: OwnerToken {
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+        },
+    })
 }
 
 /// The refusal of a partition count no database can have (issue #79, ruling Q3): 0, or above
@@ -1409,7 +1439,7 @@ impl Db {
             route: Route {
                 owners,
                 refresh: Some((store, rt)),
-                last_read: Mutex::new(BTreeMap::new()),
+                ..Route::default()
             },
         })
     }
@@ -1598,7 +1628,7 @@ impl Db {
                         .collect()
                 },
                 refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
-                last_read: Mutex::new(BTreeMap::new()),
+                ..Route::default()
             },
         };
         let mut failed = None;
@@ -3547,6 +3577,98 @@ impl Db {
         lock(&self.nodes)
             .iter()
             .any(|handle| handle.owner_views.still_owner(partition, token))
+    }
+
+    /// Where `group`'s calls go (#83): its partition, and the owner and token its
+    /// `partitions/{p}` record names. A hint for forwarding a request, never authority: the
+    /// owner can lose the partition the moment after, so act only through
+    /// [`Self::still_owner`] on the owner and the destination's own token check.
+    ///
+    /// Cached. A node this process runs watches `partitions/` for its own authority already, and
+    /// each change that watch delivers for a partition makes that partition's answer stale; the
+    /// end of any such watch makes every answer stale. Nothing new is watched. While no such
+    /// watch is open (an app-only `Db`, or every node here cut from rEtcd) nothing is cached and
+    /// each call reads the record. A stale answer is read again, within the read timeout.
+    /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each read.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when the record cannot be read in the read timeout, does not decode, or is
+    /// absent, and from a `Db` a crate test built by hand, which has no control store.
+    pub fn route(&self, group: AffinityId) -> Result<RouteInfo, ApiError> {
+        let partition = self.partition_for(group);
+        let marks = self.control.route_marks();
+        if let Some((info, stamp)) = lock(&self.route.answers).get(&partition.0).copied() {
+            if marks.current(partition, stamp) {
+                return Ok(info);
+            }
+        }
+        // The stamp is taken before the read, so a change delivered during it leaves the
+        // answer stale rather than cached past the change.
+        let stamp = marks.stamp(partition);
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Err(ApiError::new(
+                ErrorKind::Unavailable,
+                "route: this Db has no control store to read partitions/ from".to_owned(),
+            ));
+        };
+        let (done, read) = mpsc::channel();
+        rt.spawn(async move {
+            // The caller may have given up; then nobody needs the answer.
+            let _ = done.send(read_route(&*store, partition).await);
+        });
+        let info = match read.recv_timeout(self.timeouts.read) {
+            Ok(Ok(info)) => info,
+            Ok(Err(detail)) => {
+                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
+                return Err(ApiError::new(ErrorKind::Unavailable, detail));
+            }
+            Err(_) => {
+                let detail = format!(
+                    "route: partitions/{} did not read within {:?}",
+                    partition.0, self.timeouts.read
+                );
+                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
+                return Err(ApiError::new(ErrorKind::Unavailable, detail));
+            }
+        };
+        tracing::info!(
+            partition = partition.0,
+            owner = info.owner.0,
+            generation = info.token.generation.0,
+            owner_epoch = info.token.owner_epoch.0,
+            cached = stamp.is_some(),
+            "db_route_read"
+        );
+        if let Some(stamp) = stamp {
+            lock(&self.route.answers).insert(partition.0, (info, stamp));
+        }
+        Ok(info)
+    }
+
+    /// The ownership changes of every node this process runs (#83): `Activated`,
+    /// `Deactivating { deadline }` and `Deactivated`, per partition, in order per node. Each
+    /// node sends its current state first (an `Activated`, or a `Deactivating`, per partition
+    /// it leads), then every change. One subscriber per call.
+    ///
+    /// The receiver holds up to 4096 unread events. A subscriber that falls that far behind is
+    /// dropped (logged `ownership_subscriber_dropped{node, why}`), and so is every subscriber
+    /// when a node here stops: its receiver then ends (`recv` answers `Err`) once every node
+    /// has let go of it, and the app calls this again, which starts again from the current
+    /// state. In an app-only `Db`, which runs no node, it ends at once. See
+    /// `docs/rdb/embed.md`, "Ownership events".
+    #[must_use]
+    pub fn ownership_events(&self) -> mpsc::Receiver<OwnershipEvent> {
+        let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
+        for handle in lock(&self.nodes).iter() {
+            if handle
+                .send(Msg::Subscribe(Arc::clone(&subscriber)))
+                .is_err()
+            {
+                tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
+            }
+        }
+        events
     }
 
     /// Each node's state for partition 1, in node order. A node that does not answer within

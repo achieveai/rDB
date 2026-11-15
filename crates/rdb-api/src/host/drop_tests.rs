@@ -65,7 +65,7 @@ fn present(trio: &mut Trio, request: u64, asked_as: u64) -> bool {
 }
 
 /// Node 1's last commit: its generation, mode and member nodes.
-fn commit_of(trio: &Trio) -> Option<(Generation, PartitionMode, Vec<u32>)> {
+pub(super) fn commit_of(trio: &Trio) -> Option<(Generation, PartitionMode, Vec<u32>)> {
     trio.nodes[0]
         .0
         .committed
@@ -6344,7 +6344,7 @@ const ADOPTED_TAIL: u64 = 3;
 
 /// b19's read-only commit with node 2 holding [`ADOPTED_TAIL`] records past it, node 2 still held.
 /// Answers the trio, the read-only generation and node 2's head, the cutoff adoption brings.
-fn read_only_beside_an_adoptable_tail(dir: &std::path::Path) -> (Trio, Generation, Seq) {
+pub(super) fn read_only_beside_an_adoptable_tail(dir: &std::path::Path) -> (Trio, Generation, Seq) {
     let (mut trio, before) = started(dir, tuned);
     trio.nodes[0].0.repair_retry_first_millis = 100;
     let read_only = read_only_with_a_tail_of(&mut trio, before, ADOPTED_TAIL);
@@ -6371,7 +6371,7 @@ fn stood_down(trio: &Trio) -> Option<Generation> {
 }
 
 /// Node 1's commit once it is writable again.
-fn writable_commit(trio: &mut Trio) -> (Generation, PartitionMode, Vec<u32>) {
+pub(super) fn writable_commit(trio: &mut Trio) -> (Generation, PartitionMode, Vec<u32>) {
     trio.until("node 1 commits writable", |trio| {
         commit_of(trio).filter(|(_, mode, _)| *mode != PartitionMode::ReadOnly)
     })

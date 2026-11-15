@@ -2265,3 +2265,64 @@ fn own84_5_token_grows_across_a_promote() {
     );
     db.shutdown();
 }
+
+/// own83_2 (#83): at 8 partitions, `route(group)` names the group's partition by the key map
+/// and the owner and token of that partition's `partitions/{p}` record, read here on its own.
+/// And the in-process stream agrees: every partition's owner sends `Activated` under the token
+/// `route` names (own83_7 at this layer: a subscriber that comes after ready hears the current
+/// state first). The memory store serves no watch, so every `route` here reads through.
+#[test]
+fn own83_2_route_names_the_owner_and_token_of_the_groups_partition() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut db = ready(&rt, dir.path(), &store, Some(8));
+    let mut routes = BTreeMap::new();
+    for group in (0..64).map(AffinityId) {
+        let route = db.route(group).expect("route answers");
+        assert_eq!(
+            route.partition,
+            partition_of(affinity_hash(TENANT, group), 8),
+            "the key map's partition"
+        );
+        let record = PartitionRecord::decode(&partition_value(&rt, &store, route.partition).value)
+            .expect("the record decodes");
+        assert_eq!(route.owner, record.owner, "{group:?}");
+        assert_eq!(
+            route.token,
+            OwnerToken {
+                generation: record.generation,
+                owner_epoch: record.owner_epoch,
+            },
+            "{group:?}"
+        );
+        routes.insert(route.partition, route);
+    }
+    assert_eq!(routes.len(), 8, "64 groups cover the 8 partitions");
+
+    let events = db.ownership_events();
+    let mut activated = BTreeMap::new();
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+    while activated.len() < routes.len() {
+        let left = until.saturating_duration_since(Instant::now());
+        match events.recv_timeout(left) {
+            Ok(OwnershipEvent::Activated {
+                node,
+                partition,
+                token,
+            }) => {
+                activated.insert(partition, (node, token));
+            }
+            Ok(other) => panic!("only Activated on a quiet database: {other:?}"),
+            Err(error) => panic!("{} of 8 partitions activated: {error}", activated.len()),
+        }
+    }
+    for (partition, route) in &routes {
+        assert_eq!(
+            activated[partition],
+            (route.owner, route.token),
+            "{partition:?}'s Activated is route's answer"
+        );
+    }
+    db.shutdown();
+}

@@ -25,7 +25,8 @@
 //! primary is node ((P-1) mod 3) + 1. Above 1 every call must say which affinity group it is in:
 //! `--group G` right after the verb on `put`, `get`, `doc`, `map`, `set`, `members`, `list`,
 //! `items` and `status`, and a `G:` prefix on each `txn` op. `admin where G` prints the group's
-//! hash, partition and primary. Value verbs also take `--as N` after the verb, a write under
+//! hash, partition and primary; `admin route G` prints `Db::route`'s answer for it, the owner
+//! and token `partitions/{p}` names (#83). Value verbs also take `--as N` after the verb, a write under
 //! the app's request id N.
 //!
 //! `--keep` keeps `--dir` after the run. rdb_dev's own voters still go at exit, and the
@@ -2165,6 +2166,10 @@ fn repl<'scope, 'env>(
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["admin", "where", group] => parse_group(group).map(|group| say(&where_line(db, group))),
             ["admin", "where", ..] => Err("admin where <group>".to_owned()),
+            ["admin", "route", group] => parse_group(group).map(|group| {
+                bad |= !answer(&route_line(db, group));
+            }),
+            ["admin", "route", ..] => Err("admin route <group>".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
                 bad |= !answer(&match rt.block_on(admin::clear_grant(db, store, node)) {
                     Ok(clearance) => clearance_line(clearance, node, db),
@@ -3205,6 +3210,18 @@ fn where_line(db: &Db, group: rdb_api::AffinityId) -> String {
         "group {} hash {hash:#018x} partition {} primary node {owner}",
         group.0, partition.0
     )
+}
+
+/// `admin route G` (#83): `Db::route`'s answer, the partition and the owner and token its record
+/// names, or `err admin route G: <why>`.
+fn route_line(db: &Db, group: rdb_api::AffinityId) -> String {
+    match db.route(group) {
+        Ok(route) => format!(
+            "route group {} partition {} owner node {} token {}",
+            group.0, route.partition.0, route.owner.0, route.token
+        ),
+        Err(e) => format!("err admin route {}: {e}", group.0),
+    }
 }
 
 /// The first `txn` op that names no group, refused above one partition (issue #79).

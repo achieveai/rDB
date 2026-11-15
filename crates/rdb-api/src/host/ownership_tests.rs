@@ -309,3 +309,314 @@ fn own84_4_a_paused_process_resumes_not_owning() {
         "no promote: the same token is owned again"
     );
 }
+
+// ------------------------------------------------------------------ #83: the ownership stream
+
+use super::drop_tests::{commit_of, read_only_beside_an_adoptable_tail, writable_commit};
+use super::seal_tests::{control_behind_a_cut, spawn_promote_dropping};
+use super::trio::logged;
+use crate::ownership::{OwnershipEvent, Subscriber, SUBSCRIBER_CAPACITY};
+
+/// One subscriber on every host of the trio, as `Db::ownership_events` makes one.
+fn subscribe_all(trio: &mut Trio) -> Receiver<OwnershipEvent> {
+    let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
+    for (host, _, _) in &mut trio.nodes {
+        host.subscribe(Arc::clone(&subscriber));
+    }
+    events
+}
+
+/// The events `events` holds now, appended to `heard`: the trio steps every host on this
+/// thread, so arrival order is send order, across nodes too.
+fn hear(events: &Receiver<OwnershipEvent>, heard: &mut Vec<OwnershipEvent>) {
+    heard.extend(events.try_iter());
+}
+
+fn on(node: u32, heard: &[OwnershipEvent]) -> Vec<(&'static str, OwnerToken)> {
+    heard
+        .iter()
+        .filter(|event| event.node() == NodeId(node) && event.partition() == P1)
+        .map(|event| (event.state(), event.token()))
+        .collect()
+}
+
+/// The rooted instance `admin::promote` reads.
+const INSTANCE: [u8; INSTANCE_LEN] = [8; INSTANCE_LEN];
+/// A promote waits out the old grant: about a second and a half here.
+const PROMOTE_GRANT_MILLIS: u64 = 1_500;
+
+/// own83_5's hosts: bound to [`INSTANCE`], a [`PROMOTE_GRANT_MILLIS`] grant renewed every
+/// 300 ms, node 1's clock `lag` behind the others.
+fn promotable(lag: u64) -> impl Fn(&mut Host) {
+    move |host: &mut Host| {
+        Trio::fast(host);
+        host.engine.bind_instance(INSTANCE).expect("bind instance");
+        host.instance = Some(INSTANCE);
+        host.budgets.grant_millis = PROMOTE_GRANT_MILLIS;
+        host.budgets.renew_millis = 300;
+        if host.node == NodeId(1) && lag > 0 {
+            host.clock = host.clock.lagging(lag);
+        }
+    }
+}
+
+/// own83_5's schedule, with node 1's clock `lag` behind. Node 1 owns partition 1 and is cut
+/// from the store with its links held: a live owner that cannot renew and cannot hear the
+/// freeze. Node 2 promotes for real, dropping node 1. Every host is stepped throughout, so
+/// node 1 sends what it sends. Returns what was heard, in order, and node 2's read of the write
+/// acknowledged before the move, sent the moment node 2's `Activated` arrived.
+fn handover(method: &str, lag: u64) {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), promotable(lag));
+    let faults = control_behind_a_cut(&mut trio);
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.ready();
+    assert!(
+        matches!(trio.ask(put(1)), Answer::Txn { .. }),
+        "the write before the move is acknowledged"
+    );
+
+    // own83_7: a subscriber that comes late hears the current state first.
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    hear(&events, &mut heard);
+    let old = token(&trio);
+    assert_eq!(on(1, &heard), [("activated", old)], "{heard:?}");
+
+    faults.apply("cut-control");
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    let promote = spawn_promote_dropping(&trio, 2, Some(NodeId(1)));
+    let new = trio.until("node 2 sent Activated", |_| {
+        hear(&events, &mut heard);
+        on(2, &heard)
+            .into_iter()
+            .find(|(state, _)| *state == "activated")
+            .map(|(_, token)| token)
+    });
+    // own83_4: data is readable on node 2 the moment it says so.
+    let (reply, answer) = mpsc::channel();
+    trio.nodes[1]
+        .1
+        .send(Msg::Client(Client {
+            partition: P1,
+            call: ClientCall::Get {
+                identity: identity(900),
+                group: AffinityId(1),
+                object: Bytes::from_static(b"o"),
+                look: Look::Doc,
+            },
+            reply,
+        }))
+        .expect("node 2's mailbox");
+    let read = trio.answer(&answer);
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+
+    let node_1 = on(1, &heard);
+    let activated_at = heard
+        .iter()
+        .position(|event| event.node() == NodeId(2) && event.partition() == P1)
+        .expect("node 2's event");
+    let deactivated_at = heard
+        .iter()
+        .position(
+            |event| matches!(event, OwnershipEvent::Deactivated { node, .. } if *node == NodeId(1)),
+        )
+        .unwrap_or_else(|| panic!("node 1 sent no Deactivated: {heard:?}"));
+    assert_eq!(
+        node_1,
+        [
+            ("activated", old),
+            ("deactivating", old),
+            ("deactivated", old)
+        ],
+        "node 1, in order"
+    );
+    assert!(
+        deactivated_at < activated_at,
+        "node 1's Deactivated before node 2's Activated: {heard:?}"
+    );
+    assert!(new > old, "node 2's token {new} above node 1's {old}");
+    match read {
+        Answer::Read {
+            seen: Seen::Doc(_), ..
+        } => {}
+        other => panic!("node 2 activated before the acknowledged write read back: {other:?}"),
+    }
+
+    // Ruling B-1: `Deactivated` at the first turn past the horizon, on node 1's own clock.
+    let lines = logged!(method, "ownership_event");
+    let gone = lines
+        .iter()
+        .find(|line| line["node"] == 1 && line["state"] == "deactivated")
+        .expect("node 1 logged its Deactivated");
+    let horizon = gone["horizon"].as_u64().expect("a horizon");
+    let tick = gone["tick"].as_u64().expect("a tick");
+    assert!(
+        tick > horizon && tick <= horizon + 1 + Trio::CLOCK_STEP_CAP_MILLIS,
+        "Deactivated at tick {tick}, horizon {horizon}"
+    );
+    let came = lines
+        .iter()
+        .find(|line| line["node"] == 2 && line["state"] == "activated")
+        .expect("node 2 logged its Activated");
+    // Node 1's tick reads `lag` behind the trio's, so its stop on the trio's clock is `+ lag`.
+    let gap = came["tick"].as_u64().expect("a tick") - (tick + lag);
+    tracing::info!(gap_ms = gap, lag, "own83_5_gap");
+}
+
+/// own83_5, #83's acceptance row: node 1 owns partition 1, is cut from the store with its links
+/// held, and node 2 promotes for real, dropping it. Node 1 sends `Deactivating` then
+/// `Deactivated` before node 2 sends `Activated`, with a higher token. `Deactivated` comes at
+/// the first turn past node 1's horizon (ruling B-1). Also own83_4: a read sent to node 2 the
+/// moment it activates returns the write acknowledged before the move; and own83_7: a
+/// subscriber that comes late hears `Activated` first.
+/// Cut: `Judged::owned` judging 1.5 s in the past (a stop timer that fires late), red on both
+/// variants: node 2's `Activated` arrives with node 1 still `Deactivating`.
+/// Integration (~4 s): bootstrap's discovery window, then the promote's wait for a 1.5 s grant.
+#[config_log::retcd_test]
+fn own83_5_old_owner_sees_deactivating_then_deactivated_before_new_owner_sees_activated() {
+    handover(
+        "own83_5_old_owner_sees_deactivating_then_deactivated_before_new_owner_sees_activated",
+        0,
+    );
+}
+
+/// own83_5 with node 1's clock lagging the promoter's by ε (100 ms, `clock_error_millis`): the
+/// order still holds, since node 1's horizon on its own clock already leaves ε for that.
+/// Integration (~4 s), as own83_5.
+#[config_log::retcd_test]
+fn own83_5b_the_order_holds_with_the_old_owner_lagging_by_epsilon() {
+    handover(
+        "own83_5b_the_order_holds_with_the_old_owner_lagging_by_epsilon",
+        Budgets::SPEC_DEFAULTS.clock_error_millis,
+    );
+}
+
+/// Steps the trio for `millis` of real time, hearing as it goes.
+fn run_for(
+    trio: &mut Trio,
+    millis: u64,
+    events: &Receiver<OwnershipEvent>,
+    heard: &mut Vec<OwnershipEvent>,
+) {
+    let until = Instant::now() + Duration::from_millis(millis);
+    while Instant::now() < until {
+        trio.step();
+        hear(events, heard);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Fail the store for `millis` from just after a renewal of node 1 lands, then let it answer,
+/// and run on past the old horizon. What node 1 sent for partition 1 from the stall on.
+fn stall_after_a_renewal(
+    trio: &mut Trio,
+    millis: u64,
+    events: &Receiver<OwnershipEvent>,
+) -> Vec<(&'static str, OwnerToken)> {
+    let renewed_at = |trio: &Trio| trio.nodes[0].0.authority.view().renewed_at;
+    let before = renewed_at(trio);
+    trio.until("node 1's next renewal lands", |trio| {
+        (renewed_at(trio) > before).then_some(())
+    });
+    let mut heard = Vec::new();
+    hear(events, &mut heard);
+    heard.clear();
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store stalls".to_owned(),
+        });
+    run_for(trio, millis, events, &mut heard);
+    trio.mem.stop_failing();
+    // Past the old horizon (5.8 s after the renewal) with room for the renewal after the stall.
+    run_for(trio, 6_500 - millis, events, &mut heard);
+    on(1, &heard)
+}
+
+/// own83_8 on three hosts at the spec's budgets (ruling B-2): the control store fails for 3 s
+/// right after a renewal of node 1 lands, then answers again. Node 1 sends nothing: the
+/// renewal after the stall lands before the 1.5 s lead. Then a 4.5 s stall: `Deactivating`,
+/// then `Activated` again with the same token when the renewal lands, and never `Deactivated`.
+/// Cuts: `DEACTIVATING_LEAD_MILLIS = 1600`, red: the 3 s stall's window hears `Deactivating`,
+/// `Activated` pairs, one per clock sample (the steady-state horizon is the sample's, 2000 ms,
+/// see the constant's doc). `= 3000` (G/2), red: nothing ever activates.
+/// Integration (~15 s): bootstrap, then two stalls each run on past the old horizon.
+#[config_log::retcd_test]
+fn own83_8_a_3s_control_stall_gives_no_deactivating_on_three_hosts() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let events = subscribe_all(&mut trio);
+    assert_eq!(
+        stall_after_a_renewal(&mut trio, 3_000, &events),
+        [],
+        "a 3 s stall is ridden out silently"
+    );
+    assert_eq!(
+        stall_after_a_renewal(&mut trio, 4_500, &events),
+        [("deactivating", held), ("activated", held)],
+        "a 4.5 s stall warns, then resumes under the same token"
+    );
+}
+
+/// own83_9 (ruling B-4): a `ReadOnly` commit sends no `Activated`, however long it serves
+/// reads; the writable commit that follows its adoption sends `Activated` with that commit's
+/// token. b19's read-only commit on {1, 2}, with node 2 holding an adoptable tail.
+/// Cut: `writable_primary` without `!recovery_mode` **and** with the queue always open, red:
+/// `Activated` for the read-only generation. Either cut alone stays green: while the commit is
+/// `ReadOnly` here, T1's queue is frozen too, so the two checks guard this row redundantly.
+/// Integration (~8 s): b19's pause and drop, then the repair.
+#[config_log::retcd_test]
+fn own83_9_a_readonly_capped_commit_sends_no_activated() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, _) = read_only_beside_an_adoptable_tail(dir.path());
+    assert_eq!(
+        commit_of(&trio).map(|(_, mode, _)| mode),
+        Some(PartitionMode::ReadOnly),
+        "precondition"
+    );
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    run_for(&mut trio, 1_000, &events, &mut heard);
+    assert!(
+        !on(1, &heard).iter().any(|(state, _)| *state == "activated"),
+        "no Activated while the commit is ReadOnly: {heard:?}"
+    );
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (writable, _, _) = writable_commit(&mut trio);
+    let activated = trio.until("node 1 sent Activated", |_| {
+        hear(&events, &mut heard);
+        on(1, &heard)
+            .into_iter()
+            .find(|(state, _)| *state == "activated")
+            .map(|(_, token)| token)
+    });
+    assert_eq!(
+        activated.generation, writable,
+        "the writable commit's token"
+    );
+    assert!(
+        !heard.iter().any(|event| matches!(
+            event,
+            OwnershipEvent::Activated { token, .. } if token.generation == read_only
+        )),
+        "never for the read-only generation: {heard:?}"
+    );
+}

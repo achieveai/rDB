@@ -424,6 +424,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::PeerBooted { .. }
         | Msg::Rebuild { .. }
         | Msg::Synced(_)
+        | Msg::Subscribe(_)
         | Msg::Stop) => return Err(Box::new((WireError::LocalOnly(local_name(&local)), local))),
         #[cfg(test)]
         local @ Msg::Stall(_) => return Err(Box::new((WireError::LocalOnly("Stall"), local))),
@@ -452,6 +453,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Stall(_) => "Stall",
         Msg::Stop => "Stop",
         Msg::Synced(_) => "Synced",
+        Msg::Subscribe(_) => "Subscribe",
         _ => "a peer message",
     }
 }
