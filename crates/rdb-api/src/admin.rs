@@ -4653,6 +4653,9 @@ mod tests {
         inner: config_testkit::MemStore,
         on_get: bool,
         on_fencing: bool,
+        /// Delete `grants/1` right after the `Fencing` write, as a clearing service
+        /// (`clear_grant`, the reopen's heal) whose guard-3 read came first would.
+        clear_on_fencing: bool,
     }
 
     impl MovingGrant {
@@ -4716,6 +4719,18 @@ mod tests {
                 let answer = self.inner.put(request).await;
                 if fencing && self.on_fencing {
                     self.renew().await;
+                }
+                if fencing && self.clear_on_fencing {
+                    let cleared = self
+                        .inner
+                        .delete(DeleteRequest {
+                            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+                            expected_mod_revision: None,
+                            dedup: None,
+                        })
+                        .await
+                        .expect("clear grants/1");
+                    assert_eq!(cleared.outcome, MutationOutcome::Applied);
                 }
                 answer
             })
@@ -4793,6 +4808,7 @@ mod tests {
             inner: config_testkit::MemStore::new(),
             on_get: true,
             on_fencing: false,
+            clear_on_fencing: false,
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -4827,6 +4843,7 @@ mod tests {
             inner: config_testkit::MemStore::new(),
             on_get: false,
             on_fencing: true,
+            clear_on_fencing: false,
         });
         rooted(&store.inner, &rt, BootId(5));
         old_grant(&store.inner, &rt, GrantId(4));
@@ -4836,6 +4853,42 @@ mod tests {
             "{refused:?}"
         );
         unfrozen_and_serving(&store.inner, &rt);
+    }
+
+    /// PR #119 review question (clear-grant against a fence, spec §7.3): a clearing service
+    /// that read every partition `Serving` deletes `grants/1` between the promote's `Fencing`
+    /// write and its freeze. The freeze finds the key absent where `owner_dead` judged a record,
+    /// so the promote is refused `OwnerAlive`, the `Fencing` write is undone, and nothing is
+    /// created frozen: no transfer goes on against a grant that vanished. Unit (~20 ms): `MemStore`.
+    /// Cut: the absent-record arm of `freeze` ignores `dead_at`; a frozen record is created and
+    /// the promote goes on, red.
+    #[test]
+    fn above_one_partition_a_grant_cleared_after_the_fencing_undoes_it() {
+        let rt = runtime();
+        let store = Arc::new(MovingGrant {
+            inner: config_testkit::MemStore::new(),
+            on_get: false,
+            on_fencing: false,
+            clear_on_fencing: true,
+        });
+        rooted(&store.inner, &rt, BootId(5));
+        old_grant(&store.inner, &rt, GrantId(4));
+        let refused = promote_above_one(Arc::clone(&store) as Arc<dyn ConfigStore>, &rt);
+        assert!(
+            matches!(&refused, PromoteError::OwnerAlive { evidence, .. } if evidence.contains("came back")),
+            "{refused:?}"
+        );
+        let grant = rt
+            .block_on(store.inner.get(GetRequest {
+                key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            }))
+            .expect("get")
+            .record;
+        assert!(grant.is_none(), "nothing created frozen: {grant:?}");
+        let (record, ..) = rt
+            .block_on(read_partition(&store.inner, PARTITION))
+            .expect("read");
+        assert_eq!(record.lifecycle, PartitionLifecycle::Serving, "{record:?}");
     }
 
     /// PR #103 review question: a target whose clock bound is lost, or that reports a qualifying
