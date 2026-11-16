@@ -665,8 +665,8 @@ fn own81_v3_a_lone_survivor_is_not_promoted() {
 /// grant periods later nothing has been written: no decision, no freeze, `partitions/1`
 /// unchanged.
 ///
-/// Only nodes 2 and 3 run a planner: a planner never judges its own node, so with node 1
-/// holding the planner grant these rows would pass with nothing judged.
+/// Only nodes 2 and 3 run a planner: a planner does not judge its own node while its grant
+/// stands, so with node 1 holding the planner grant these rows would pass with nothing judged.
 fn alive_owner_is_not_failed_over(method: &str, alert: bool, harm: impl FnOnce(&Rig)) {
     let rig = rig_with(1, [None, Some(failover()), Some(failover())]);
     let before = rig.record(1);
@@ -979,8 +979,9 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
 #[config_log::retcd_test]
 fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
     const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
-    // No planner on node 2: a planner never judges its own node, so with node 2 holding the
-    // planner grant nothing would judge it and the wait below would time out (PR #119 round 6).
+    // No planner on node 2: a planner does not judge its own node while its grant stands,
+    // so with node 2 holding the planner grant nothing would judge it and the wait below
+    // would time out (PR #119 round 6).
     let rig = opened_cut(
         3,
         [Some(failover()), None, Some(failover())],
@@ -1047,16 +1048,19 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
 /// Integration (~20 s): the old record runs out, then the grace, 9 s at the rig's 3 s grants.
 /// The grace follows the grant, and a shorter grant in this rig would also shorten every
 /// host's lease and renewals, which the other rows here are tuned to.
-/// Only nodes 1 and 3 run a planner, as in [`alive_owner_is_not_failed_over`]: otherwise node 2
-/// can win the planner grant at start and, never judging itself, raise no alert.
+/// Only nodes 1 and 3 run a planner, leaving the owner under test (node 2) without one,
+/// just as [`alive_owner_is_not_failed_over`] leaves its owner (node 1) without one.
+/// Otherwise node 2 can win the planner grant at start and, not judging itself while its
+/// grant stands, raise no alert.
 /// Cut: never escalate in `sweep` (the `waited < no_grant_grace` test always true); no alert
 /// within 30 s, red.
 #[config_log::retcd_test]
 fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved() {
     const METHOD: &str =
         "own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved";
-    // No planner on node 2: a planner never judges its own node, so with node 2 holding the
-    // planner grant no alert for it could come (seen once, PR #119 round 6).
+    // No planner on node 2: a planner does not judge its own node while its grant stands,
+    // so with node 2 holding the planner grant no alert for it could come (seen once,
+    // PR #119 round 6).
     let rig = opened_cut(
         3,
         [Some(failover()), None, Some(failover())],
@@ -1138,7 +1142,8 @@ fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_mo
 /// so its planner stops on `planner_clock_unbounded` with or without the ruling.
 /// Integration (~20 s): a grant lapse, the alert, then a failover.
 /// Cut: skip the own-host check in `hold`; node 1 keeps renewing, nobody judges node 1 (a
-/// planner never judges its own node), and node 2 never holds the grant, red.
+/// planner does not judge its own node while its grant stands), and node 2 never holds the
+/// grant, red.
 #[config_log::retcd_test]
 fn own81_a_planner_on_a_faulted_host_gives_up_its_grant_and_another_fails_over() {
     const METHOD: &str =
