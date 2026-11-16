@@ -41,11 +41,11 @@ fn config(dir: &std::path::Path) -> DbConfig {
     }
 }
 
-/// A-R395: [`config`] with the stuck-sync limit at the spec's 5 s scaled as a wait
-/// ([`test_patience`]; equal to the spec at scale 1), for the rows whose subject is a slow
+/// A-R395: [`config`] with the stuck-sync limit at its default scaled as a wait
+/// ([`test_patience`]; equal to the default at scale 1), for the rows whose subject is a slow
 /// sync's tolerance, not the stuck limit. Beside 3 suite loops a held 1-3 s sync stayed in
-/// flight past an unscaled 5 s and faulted its node (A-R393 soak: 7 such reds in 15 lane runs).
-/// The stuck row keeps the real 5 s.
+/// flight past an unscaled 5 s, the default then, and faulted its node (A-R393 soak: 7 such
+/// reds in 15 lane runs). The stuck row sets its own real 5 s.
 fn config_slow_tolerant(dir: &std::path::Path) -> DbConfig {
     let stuck = test_patience(Duration::from_millis(
         rdb_storage::DEFAULT_SYNC_STUCK_MILLIS,
@@ -632,8 +632,8 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// product budgets. Durability then ages past L1's pause age again and again, so puts may be
 /// refused `PROTECTION_PAUSED` for most of the run; that is L1 doing its job, not a stall. What
 /// must hold: the owner keeps its grant (same grant id, no fence), no node faults (3 s is under
-/// the 5 s stuck limit, scaled as a wait here by A-R395), no node-thread step goes over 500 ms,
-/// and nothing waits on a held sync.
+/// the default stuck limit, 30 s since issue #109, scaled as a wait here by A-R395), no
+/// node-thread step goes over 500 ms, and nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
 /// Integration (~15 s): a fresh open, 12 s of held syncs (more under load, until 3 begin on
 /// each node, A-R395), then a stop that waits the last out.
@@ -722,13 +722,15 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
     );
 }
 
-/// A-R317 (5), b2: a sync stuck on node 1 (held 8 s, past the 5 s stuck limit) faults node 1
+/// A-R317 (5), b2: a sync stuck on node 1 (held 8 s, past a 5 s stuck limit) faults node 1
 /// node-wide (`wal_sync_stuck`, then `host_fault`) no sooner than the limit, so A1 renews no
 /// more and the grant lapses. A promote to node 2 then lands writes there within the limit plus
 /// the grant's 5.9 s (6 s since #80 S2d) plus 3 s to find and promote. Node 1 is still faulted after its sync
 /// returns: a late sync does not unfault a node. That late sync is finished, not reported lost at
 /// stop, and node 1 faults once.
 /// Cut: no stuck check (`stuck_sync` never faults), red (node 1 never faults).
+/// Issue #109: the default stuck limit is 30 s, so this row sets the 5 s it was written at;
+/// its subject is what a stuck sync does, not the default.
 /// Integration (~12 s): a fresh open, an 8 s held sync, a promote and a put.
 #[config_log::retcd_test]
 fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
@@ -736,7 +738,9 @@ fn m10_f4_a_stuck_sync_faults_the_node_and_a_promote_takes_over_in_time() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
-    let mut db = open(&rt, config(dir.path()), &store, Budgets::SPEC_DEFAULTS);
+    let mut stuck_at_5s = config(dir.path());
+    stuck_at_5s.storage.sync_stuck_millis = Some(5_000);
+    let mut db = open(&rt, stuck_at_5s, &store, Budgets::SPEC_DEFAULTS);
     admits_within(&db, "the open", Duration::from_secs(10));
     // A-R392: armed before `put a`, whose own sync is the one held. Armed after it, a test
     // thread slower than node 1's 100 ms flush duty let that sync run unheld, and with nothing
