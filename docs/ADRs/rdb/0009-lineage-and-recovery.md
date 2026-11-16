@@ -446,6 +446,73 @@ hold-honouring send (logged `copy_ahead_reposted`), so a lost landing is retried
 stalling (row `h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold`). A copy
 holding **past** the cutoff in its own generation is still refused by name, as before.
 
+**Amended 2026-11-15 (issue #107 slice 1, PR #118): check B on landing.** After the depth guard,
+`land_at` also requires the parent generation's lineage to reach seq 1 through its chain, or to
+have applied nothing. That holds at the cutoff (arm 2) and below it (arm 3) alike. A holed parent
+is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logged
+`land_floor_read_failed`), and nothing is written. The guard order and the inventory's twin are in
+[ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md). Check B is refusal-only and
+runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
+
+**Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
+receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default)
+gates the new parts of the first two. With it off, no owner starts a same-boot return and no
+node marks a refused receiver, and `db_open` and `membership_drop_planned` carry the fields they
+had before slice 2a. Check A, at the start of the second rule, is not gated: it runs on every
+node whatever the setting, as check B does (slice 1, above).
+
+- **Same-boot return.** An owner whose own drop clock left a copy out (the unreachable clock, or
+  the paused clock with the copy's link seen down) may pin it again at the boot it still runs,
+  not only at a newer one. The copy's link must have stayed up on one connection for 5 s (a
+  reconnect starts that again), no re-plan, rebuild or move may be under way, the commit must
+  take writes with a slot free, and the copy must answer an `Inspect` with no fault. The owner
+  reads the answer at its next drop check (every 200 ms), so the answer must be queued by then;
+  400 ms after the probe was sent is the cutoff for a late read, past which a queued answer is
+  refused as stale. It is pinned as a shadow, lands, is caught up and is promoted exactly
+  as a restarted copy is: the landing guards above, and check B, apply unchanged. One attempt
+  per drop. A copy whose probe cannot be sent, is not answered in time, answers a fault, or is
+  not taken waits a whole 5 s again.
+- **A refused receiver's anchor.** Check A drops a refused copy's live receiver only in a commit
+  that takes writes. With the setting on, a receiver it keeps (a live one in a `ReadOnly`
+  commit, or a dormant one in any commit) is marked refused at that generation (logged
+  `land_receiver_marked_refused`). That generation's `Recovered` then anchors a live marked
+  receiver by its digest lookup at the cutoff:
+  - `Match`: at the cutoff, as any copy does (a proved prefix, which issue #105's tail adoption
+    relies on);
+  - `NotRetained`: at the root, `NeedPrefix { have: 0, ROOT }`, as a receiver built fresh after
+    a restart does, never on a rung below the cutoff, where R1 would start the walk inside the
+    new generation's prefix and leave it no seq 1;
+  - `Differs`: unchanged, no anchor and the receiver is quarantined. The mark plays no part.
+
+  A dormant receiver is not anchored at all: `Replication::recovered` removes it before
+  `on_recovered` runs and builds a fresh receiver from the barrier's proof of this copy, or at
+  the root. So the mark on a dormant receiver matters only when an earlier generation's
+  `Recovered`, delivered in the same due batch as the later refused landing, rebuilds the copy
+  first; the fresh receiver takes over the dormant one's marks for later generations. Rows:
+  rdb-core `issue107_r2_a_mark_on_a_dormant_receiver_outlives_an_earlier_barriers_rebuild`, and
+  host `issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_due_batch`,
+  which runs the due batch through the host's own landing. Marks are kept per generation; a `Recovered` clears its own and every older one, so two refusals before
+  either `Recovered` keep both.
+
+  **With the setting off** nothing is marked, and a receiver kept in a `ReadOnly` commit
+  re-anchors on its `Recovered` as before slice 2a: at the cutoff on `Match`, on its own highest
+  rung at or below the cutoff on `NotRetained`, quarantined on `Differs`. The receiving node
+  reads its own setting: neither the plan nor the result tells it the re-adding owner's, so an
+  owner with the setting on can re-add a copy whose node has it off. Then that copy keeps no
+  mark, and a `ReadOnly` return can leave it the holed lineage row 31b showed; check B refuses
+  that lineage at its next landing, so the partition stays `ReadOnly` until the copy restarts
+  (availability, not data). So set the setting the same on every node, as for
+  `Timeouts::unreachable_drop_after`.
+- **Protocol 9.** No wire type changed, so `PROTOCOL_VERSION` stays 9. Every build at 9 has check
+  A. Check B and the refusal mark are newer than some builds at 9 (main at 1eb3fe0 has neither),
+  and the handshake does not tell them apart. Upgrade prerequisite: turn the setting on only
+  once every node runs a build with check B and the mark, and on every node at once; with a
+  receiver of an older build, a `ReadOnly` return can leave that copy a holed lineage that
+  nothing refuses. Nothing enforces this yet. By the lead's ruling on PR #126 it stays an
+  operator rule while the setting is off by default. Default-on prerequisite: a bump to 10, or a
+  capability bit that gates the re-add, so a peer without both guards refuses or is never
+  re-added live (issue #107). Any change that weakens check A takes a bump.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
@@ -484,6 +551,14 @@ else (a tail above `base`, a different digest, a parent at the depth ceiling) fa
 name and writes nothing. This changes no row of the table above, and it does not reopen the K1
 amendment: a copy that is unheard, or that holds less than `base` in its own generation, still
 pauses writes (B-R38).
+
+**Amended 2026-11-15 (issue #107 slice 1, PR #118): check B on the inventory link.** The link above
+also needs the older generation's lineage to reach seq 1 through its chain, or to have applied
+nothing, checked after the depth ceiling. A holed one fails the inventory
+`missed_generation_from_has_no_floor`, and a failed seq 1 read
+`missed_generation_history_read_failed`, with nothing written. When a tail above `base` was
+released or adopted for the ask, the same refusal answers `TailHeld` with that reason instead.
+See [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md).
 
 **Ruling 2026-10-24 (M10 S2, lead ruling A-R406; critic-d4 ADV-1): a secondary restarted while
 every copy is up is handled like a dropped copy.** This records existing behaviour; it changes no

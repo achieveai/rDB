@@ -129,10 +129,27 @@ pub struct Timeouts {
     pub read: Duration,
     /// How long the owner has had no link to a copy before it re-plans the partition without
     /// that copy. Under 2 s ([`host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]) is refused at open
-    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts, so a
-    /// shorter value pauses writes for less and drops more copies over a slow restart. Each
+    /// with [`OpenError::Config`]. A dropped copy returns only when its node restarts (unless
+    /// [`Self::live_readd`] is on), so a shorter value pauses writes for less and drops more
+    /// copies over a slow restart. Each
     /// process running a node reads its own; set it to the same value on every node.
     pub unreachable_drop_after: Duration,
+    /// Issue #107: whether a copy the owner dropped on its own clock comes back without a
+    /// restart. With it on, once the copy's link has been up again for 5 s and the copy answers
+    /// with no fault, the owner adds it back at the boot it still runs, as a shadow that catches
+    /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
+    /// operator, a move or a promote still returns only when its node restarts. One attempt per
+    /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
+    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
+    /// owner and as a returning copy (which marks a refused landing only with it on).
+    ///
+    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
+    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
+    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
+    /// setting off, a read-only return can leave the partition read-only until that copy
+    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
+    /// moves to 10, or a capability bit gates the re-add.
+    pub live_readd: bool,
 }
 
 impl Default for Timeouts {
@@ -141,6 +158,7 @@ impl Default for Timeouts {
             put: Duration::from_secs(5),
             read: Duration::from_secs(1),
             unreachable_drop_after: Duration::from_millis(host::UNREACHABLE_DROP_AFTER_MILLIS),
+            live_readd: false,
         }
     }
 }
@@ -1260,6 +1278,8 @@ struct Respawn {
     budgets: Budgets,
     limits: Limits,
     unreachable_drop_after_millis: u64,
+    /// `Timeouts::live_readd`.
+    live_readd: bool,
     /// The folder a restart takes [`next_boot`] of, when the open was given its boot
     /// ([`DbConfig::boot`]). `None`: a restart adds one to the boot it replaces.
     boots: Option<PathBuf>,
@@ -1271,6 +1291,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The `db_open` line. #107 review: `live_readd` is a field only when the setting is on (a
+/// `None` field is not recorded), so with it off the line keeps the fields it had before the
+/// setting existed.
+fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, live_readd: bool) {
+    tracing::info!(
+        dedup_cap = limits.dedup_cap,
+        dedup_retention_ms = budgets.dedup_retention_millis,
+        unreachable_drop_after_ms,
+        live_readd = live_readd.then_some(true),
+        "db_open"
+    );
 }
 
 impl Db {
@@ -1338,17 +1371,14 @@ impl Db {
             ..budgets
         };
         let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
-        tracing::info!(
-            dedup_cap = limits.dedup_cap,
-            dedup_retention_ms = budgets.dedup_retention_millis,
-            unreachable_drop_after_ms = unreachable_drop_after_millis,
-            "db_open"
-        );
+        let live_readd = config.timeouts.live_readd;
+        log_open(&limits, &budgets, unreachable_drop_after_millis, live_readd);
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
             limits,
             unreachable_drop_after_millis,
+            live_readd,
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
         };
@@ -1367,6 +1397,7 @@ impl Db {
                     budgets,
                     limits,
                     unreachable_drop_after_millis,
+                    live_readd,
                     boot,
                     partitions,
                 )
@@ -3548,7 +3579,20 @@ impl Db {
 
     /// The owner token of `partition` while a node this process runs leads it, read from that
     /// node's newest authority view on its own clock (#84). `None` when no node here leads it,
-    /// in an app-only `Db` always, and from the tick write admission stops on the leader.
+    /// in an app-only `Db` always, from the tick write admission's check 6 (the view's horizon
+    /// and lineage) stops admitting on the leader, from A1's fence of the partition (a node
+    /// fence or one scoped to it), and for good once the node faults, before any caller is
+    /// answered with the fault.
+    ///
+    /// It mirrors check 6, plus those fences and faults, and nothing else. A fence at tick 0 is
+    /// one case where they differ: its view's horizon saturates to the fence tick, which check 6
+    /// still admits, and ownership ends there anyway. So `Some` does not mean the partition
+    /// takes writes. Checks 7 and 8 refuse writes while it is `Some`: a frozen queue (check 7,
+    /// `PROTECTION_PAUSED`, or `RECOVERY_READ_ONLY` during a read-only recovery) and an L1 pause
+    /// or block (check 8, `PROTECTION_PAUSED` or `DIVERGENCE_REQUIRES_OPERATOR`).
+    ///
+    /// It assumes the side effects it fences run in the process that runs the leading node, on
+    /// the same machine: if the node stops, they stop with it.
     ///
     /// Stamp [`Ownership::token`] on every side effect made outside rDB for the partition, and
     /// make the destination refuse a lower token: see `docs/rdb/embed.md`, "Fencing your own
@@ -3562,18 +3606,25 @@ impl Db {
     }
 
     /// Whether a node this process runs still leads `partition` under `token`: write
-    /// admission's own view test (check 6), on that node's clock. False from the tick write
-    /// admission stops for `token`, and after a fence (frozen grant, revoked epoch) before the
-    /// node admits another write, however its clock is stepped after. False for good once the
-    /// node faults, before any caller is answered with the fault. Never true for a token older
-    /// than the one the node serves.
+    /// admission's view test (check 6: the view's horizon and lineage), plus fences and faults,
+    /// and nothing else, on that node's clock. False from the tick check 6 stops admitting
+    /// `token`. False from A1's fence of the partition (a node fence or one scoped to it:
+    /// frozen grant, revoked epoch) before the node admits another write, however its clock is
+    /// stepped after, and even at tick 0, where the fence's view still passes check 6. False for
+    /// good once the node faults, before any caller is answered with the fault. Never true for a
+    /// token older than the one the node serves.
     ///
     /// Fails closed. `true` means no other node can hold `token`'s partition now; it does not
-    /// mean the partition takes writes (a frozen queue, an L1 pause or a read-only recovery
-    /// refuses them under a view that still admits: checks 7 and 8). It is a filter, not a proof: a process paused between this check
-    /// and its effect can still act late, so the destination must reject a lower token. After a
-    /// lapse with no promote, the node takes a new grant and the same token is owned again, as
-    /// write admission admits it again.
+    /// mean the partition takes writes. Checks 7 and 8 refuse writes while it reads `true`: a
+    /// frozen queue (check 7, `PROTECTION_PAUSED`, or `RECOVERY_READ_ONLY` during a read-only
+    /// recovery) and an L1 pause or block (check 8, `PROTECTION_PAUSED` or
+    /// `DIVERGENCE_REQUIRES_OPERATOR`).
+    ///
+    /// It assumes the effect it guards runs in the process that runs the leading node, on the
+    /// same machine. It is a filter, not a proof: a process paused between this check and its
+    /// effect can still act late, so the destination must reject a lower token. After a lapse
+    /// with no promote, the node takes a new grant and the same token is owned again, as write
+    /// admission admits it again.
     #[must_use]
     pub fn still_owner(&self, partition: PartitionId, token: OwnerToken) -> bool {
         lock(&self.nodes)
@@ -4114,6 +4165,7 @@ impl Db {
                 budgets,
                 limits: Limits::default(),
                 unreachable_drop_after_millis: host::UNREACHABLE_DROP_AFTER_MILLIS,
+                live_readd: false,
                 boots: None,
                 storage: StorageOptions::default(),
             }),
@@ -4153,6 +4205,7 @@ impl Db {
                 budgets,
                 limits,
                 unreachable_drop_after_millis: millis_of(config.timeouts.unreachable_drop_after),
+                live_readd: config.timeouts.live_readd,
                 boots: None,
                 storage: config.storage,
             }),
@@ -4178,6 +4231,7 @@ impl Db {
                 budgets,
                 limits,
                 millis_of(config.timeouts.unreachable_drop_after),
+                config.timeouts.live_readd,
                 boot,
                 config.storage,
                 1,
@@ -4227,11 +4281,15 @@ impl Db {
     }
 
     /// [`Self::promote`] of one partition, from any `Db` with a control store: a peer's running
-    /// `Db` or an app's, with the owner dead.
+    /// `Db` or an app's, with the owner dead or host-faulted.
     ///
-    /// Above one partition the owner must be dead, because the freeze is the whole node's. A
-    /// just-killed owner is waited out for up to its grant's length. The other partitions the
-    /// node owned stay `NoLink` until each has its own promote; the node's next open fails
+    /// Above one partition the owner must be dead or host-faulted, because the freeze is the
+    /// whole node's: it must not answer a look without a host fault, and its grant must not be
+    /// renewing (a frozen grant passes at once). A host fault lasts the boot, so a faulted owner
+    /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
+    /// until its last grant expiry plus the safety margin is proven past. The other partitions
+    /// the node owned remain not ready until each has its own promote (`Faulted` while the
+    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
     /// for a partition it no longer owns.
     ///
@@ -4487,6 +4545,7 @@ impl Db {
                 respawn.budgets,
                 respawn.limits,
                 respawn.unreachable_drop_after_millis,
+                respawn.live_readd,
                 boot,
                 respawn.storage,
                 self.route.partitions(),
@@ -4601,6 +4660,7 @@ impl Db {
             respawn.budgets,
             respawn.limits,
             respawn.unreachable_drop_after_millis,
+            respawn.live_readd,
             boot,
             self.route.partitions(),
         )
@@ -7300,6 +7360,7 @@ mod tests {
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
                 host::UNREACHABLE_DROP_AFTER_MILLIS,
+                false,
                 boot,
                 partitions,
             )
@@ -7410,6 +7471,7 @@ mod tests {
                             fast(),
                             Limits::default(),
                             host::UNREACHABLE_DROP_AFTER_MILLIS,
+                            false,
                             boot,
                             partitions,
                         )?;
@@ -7728,6 +7790,50 @@ mod tests {
         let empty = db.txn(&[], deadline).expect_err("an empty txn");
         assert_eq!(empty.error.kind, ErrorKind::InvalidArgument, "{empty:?}");
         db.shutdown();
+    }
+
+    /// #107 review: with `Timeouts::live_readd` off, `db_open` carries exactly the fields it had
+    /// before the setting existed; on, the same fields and `live_readd: true`, and no other.
+    /// Cut: the field logged whatever the setting, red (an OFF line with `live_readd`).
+    #[config_log::retcd_test]
+    fn db_open_names_live_readd_only_with_it_on() {
+        const METHOD: &str = "db_open_names_live_readd_only_with_it_on";
+        let fields = |line: &serde_json::Value| -> BTreeSet<String> {
+            let context = [
+                "testModule",
+                "testMethod",
+                "testRun",
+                "application",
+                "file",
+                "line",
+                "span",
+                "thread",
+            ];
+            line.as_object()
+                .expect("an object")
+                .keys()
+                .filter(|key| !key.starts_with('@') && !context.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        };
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open")
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let off = [
+            "dedup_cap",
+            "dedup_retention_ms",
+            "unreachable_drop_after_ms",
+        ]
+        .map(str::to_owned);
+        assert_eq!(fields(&lines[0]), BTreeSet::from(off.clone()), "{lines:?}");
+        let mut on = BTreeSet::from(off);
+        on.insert("live_readd".to_owned());
+        assert_eq!(fields(&lines[1]), on, "{lines:?}");
+        assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn

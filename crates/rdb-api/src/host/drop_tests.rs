@@ -730,6 +730,7 @@ fn a_block_leaves_out_only_the_member_it_names() {
         promote: false,
         since: Tick(0),
         release: rdb_core::contracts::recovery::TailRelease::default(),
+        cause: None,
     };
     let rejoin = replan(None, Some(3));
     let out = |reason: &BlockReason, plan: Replan| block_leaves_out(reason, plan, &members);
@@ -2079,7 +2080,7 @@ fn role_of_three(trio: &Trio) -> Option<ReplicaRole> {
 /// b15 (A-R329, A-R336 option 3): node 3 restarts after node 1 has decided to drop it. The
 /// drop commits without node 3, and since it left out a member that has started again while
 /// the commit pins two regular copies, node 1 re-plans with node 3 as a shadow. L1 never
-/// counts it, so writes go on at rf2 while R1 catches it up off the stream. Once it has applied
+/// counts it, so writes go on at rf2 while R1 catches it up by its probe and catch-up cursor. Once it has applied
 /// the cutoff, node 1 promotes it: the next commit pins it as a regular secondary, synced in
 /// the barrier, and a put lands there. It is never dropped again. Node 3 restarts as a new
 /// host ([`restart`]), so the frames it sends carry the boot the commit pins.
@@ -3811,8 +3812,12 @@ fn m11_t9_a_re_run_after_the_target_is_back_starts_afresh() {
 /// M11 defect T8 (tester walk): the owner promoted a caught-up shadow whose link was already
 /// down. The promote left the healthy source out, writes paused on the dead target until the
 /// drop clock dropped it, and only two copies were left. Now a shadow the owner has no link to
-/// is not promoted: node 4 catches up, its links go, and the move is given up past the drop
+/// is not promoted. Since #113 the owner judges the promote when the shadow's `CopyCaughtUp`
+/// arrives (promote at catch-up), so the row cuts node 4's links before that: node 4 holds the
+/// head and its ACK is already on the way, node 1 has not admitted it. The catch-up then
+/// arrives on node 1 with no link, nothing is promoted, and the move is given up past the drop
 /// clock with node 3 kept, as in T4.
+/// Cut: no `!self.linked(shadow.node)` return in `shadow_duty`, red (promoted at catch-up).
 /// Integration (~4 s): bootstrap's window, the join, the drop clock, the give-up re-plan.
 #[config_log::retcd_test]
 fn m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted() {
@@ -3823,31 +3828,45 @@ fn m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted() {
         Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
         other => panic!("move 3 4: {other:?}"),
     }
-    trio.until("node 4 a shadow at the cutoff, not yet promoted", |trio| {
-        let host = &trio.nodes[0].0;
-        let committed = host.committed.get(&PartitionId(1))?;
-        let shadow = committed
-            .committed
-            .pinned_config
-            .members
-            .iter()
-            .find(|member| member.node == NodeId(4) && member.role == ReplicaRole::Shadow)?;
-        assert!(
-            !matches!(
-                host.rejoins.get(&PartitionId(1)),
-                Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
-                    if replan.promote
-            ),
-            "promoted in the step node 4 caught up: the row cannot cut its links first"
-        );
-        let acked = host
-            .replication
-            .primary(NodeId(1), PartitionId(1))?
-            .tracker()
-            .peer(shadow.copy)
-            .map_or(0, |peer| peer.progress.buffered_applied.0);
-        (acked >= committed.selected.cutoff_seq.0).then_some(())
-    });
+    let copy = trio.until(
+        "node 4 holds node 1's head, node 1 has not seen it",
+        |trio| {
+            let host = &trio.nodes[0].0;
+            let committed = host.committed.get(&PartitionId(1))?;
+            let shadow = committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.node == NodeId(4) && member.role == ReplicaRole::Shadow)?;
+            assert!(
+                !matches!(
+                    host.rejoins.get(&PartitionId(1)),
+                    Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                        if replan.promote
+                ),
+                "promoted before the row could cut node 4's links"
+            );
+            let tracker = host
+                .replication
+                .primary(NodeId(1), PartitionId(1))?
+                .tracker();
+            let head = tracker.head().0;
+            let acked = tracker
+                .peer(shadow.copy)
+                .map_or(0, |peer| peer.progress.buffered_applied.0);
+            let holds = trio.status(3).holds.map_or(0, |held| held.applied);
+            (head >= committed.selected.cutoff_seq.0 && holds >= head && acked < head)
+                .then_some(shadow.copy)
+        },
+    );
+    let caught_up = |copy: CopyId| {
+        logged!(METHOD, "copy_caught_up")
+            .into_iter()
+            .filter(|line| line["node"] == 1 && line["copy"] == copy.0)
+            .count()
+    };
+    assert_eq!(caught_up(copy), 0, "node 1 saw the catch-up before the cut");
     for other in [1, 2, 3] {
         trio.links.hold(NodeId(other), NodeId(4));
     }
@@ -3857,9 +3876,106 @@ fn m11_t8_a_caught_up_shadow_with_no_link_is_not_promoted() {
     assert_eq!(members, vec![1, 2, 3], "node 3 keeps its copy");
     assert_eq!(pinned_role(&trio, 3), Some(ReplicaRole::RegularSecondary));
     assert!(
+        caught_up(copy) >= 1,
+        "control: node 4's catch-up arrived on node 1 after the cut"
+    );
+    assert!(
         logged!(METHOD, "shadow_promote").is_empty(),
         "a shadow with no link was promoted"
     );
+}
+
+/// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): under nonstop writes a
+/// caught-up shadow was never promoted. R1 feeds a shadow by its 200 ms probe, so at each drop
+/// duty it trailed by one probe interval of writes, past [`PROMOTE_LAG_RECORDS`], and the
+/// drop duty was the only place the promote was judged. Now the owner judges it when the
+/// shadow's `CopyCaughtUp` arrives, at the head. Here node 1's stream to node 4 is cut while
+/// 100 records land, as in M2; once the catch-up walks, the trio's clock is held, so no drop
+/// duty runs and the cursor moves on ACKs alone. In the step the shadow reaches the head, node
+/// 1 has started the promote, and the move then ends with node 4 regular and node 3 out.
+/// Cut: no `shadow_at_head` call on `CopyCaughtUp`, red (caught up, no promote started).
+/// Integration (~3 s): 100 puts, the join, a one-record-a-trip catch-up, the promote.
+#[config_log::retcd_test]
+fn m11_113_a_shadow_is_promoted_in_the_step_its_catch_up_arrives() {
+    const METHOD: &str = "m11_113_a_shadow_is_promoted_in_the_step_its_catch_up_arrives";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = started_four(dir.path());
+    match trio.ask(move_call(10_000, 3, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("move 3 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&PartitionId(1))).then_some(())
+    });
+    trio.ready();
+    for request in 1..=100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    // (head, the shadow's acknowledged sequence) on node 1.
+    let seen = |trio: &Trio| {
+        let owner = &trio.nodes[0].0;
+        let copy = owner.committed[&PartitionId(1)]
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(4))
+            .map(|member| member.copy)?;
+        let tracker = owner
+            .replication
+            .primary(NodeId(1), PartitionId(1))?
+            .tracker();
+        let acked = tracker
+            .peer(copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        Some((tracker.head().0, acked))
+    };
+    let promoting = |trio: &Trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.promote && replan.rejoiner == Some(NodeId(4))
+        )
+    };
+    let (_, cut_at) = seen(&trio).expect("node 1 tracks node 4");
+    trio.links.heal(NodeId(1), NodeId(4));
+    // The retransmit timer restarts the walk; then the clock stops, and with it every duty.
+    trio.until("node 4's catch-up walks again", |trio| {
+        let (head, acked) = seen(trio)?;
+        assert!(
+            head.saturating_sub(acked) > PROMOTE_LAG_RECORDS,
+            "precondition: node 4 came within the bound before the clock was held"
+        );
+        (acked > cut_at).then_some(())
+    });
+    let hold = trio.clock.hold();
+    let head = trio.until("node 4 acknowledged node 1's head", |trio| {
+        let (head, acked) = seen(trio)?;
+        (acked >= head).then_some(head)
+    });
+    assert!(
+        promoting(&trio),
+        "node 4 reached the head ({head}) and node 1 started no promote"
+    );
+    drop(hold);
+    let (_, _, members) = trio.until("node 4 regular and node 3 out", |trio| {
+        commit_of(trio).filter(|(_, _, members)| !members.contains(&3))
+    });
+    assert_eq!(members, vec![1, 2, 4]);
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "{promotes:?}");
+    assert_eq!(promotes[0]["acked"], head, "{promotes:?}");
+    assert_eq!(promotes[0]["head"], head, "{promotes:?}");
 }
 
 /// M11 defect T11 (tester walk, ruling A-R455): two left-out nodes were re-added for one free
@@ -5170,6 +5286,7 @@ fn m11_r464_b_a_re_plan_keeps_the_catch_up_clock_start() {
         promote: false,
         since: Tick(400),
         release: rdb_core::contracts::recovery::TailRelease::default(),
+        cause: None,
     };
     host.rejoins.insert(
         p,
@@ -5566,6 +5683,7 @@ fn s4a_the_idle_drop_is_refused_on_a_secondary_a_rejoin_read_only_and_divergence
                 promote: false,
                 since: now,
                 release: rdb_core::contracts::recovery::TailRelease::default(),
+                cause: None,
             },
         },
     );
@@ -6296,6 +6414,254 @@ fn u2_a_member_answering_clean_repairs_when_the_other_members_tail_is_adoptable(
     assert!(held.is_empty(), "held for an adoptable tail: {held:?}");
 }
 
+/// The issue #106 rows' planted input: node 1's commit of partition 1 marked `ReadOnly`, its
+/// rebuild pinned, and F1's latest stall naming node 3's copy, so A-R383 holds the repair while
+/// node 3 answers. Answers the commit's generation and cutoff.
+fn pin_a_stalled_rebuild(trio: &mut Trio) -> (Generation, Seq) {
+    let p = PartitionId(1);
+    let owner = &mut trio.nodes[0].0;
+    let committed = owner.committed.get_mut(&p).expect("node 1's commit");
+    committed.mode = PartitionMode::ReadOnly;
+    let generation = committed.new_generation;
+    let cutoff = committed.selected.cutoff_seq;
+    let since = owner.clock.now();
+    owner.rebuilds.insert(
+        p,
+        RebuildWatch {
+            generation,
+            mode: PartitionMode::ReadOnly,
+            cutoff,
+            required: vec![CopyId(0), CopyId(1), CopyId(2)],
+            since,
+            pinned: true,
+            unproven: BTreeSet::from([CopyId(2)]),
+            unreported: false,
+        },
+    );
+    owner
+        .latest_stall
+        .insert(p, (generation, BTreeSet::from([CopyId(2)])));
+    (generation, cutoff)
+}
+
+/// Issue #106: A-R383 holds a `ReadOnly` commit's repair while a copy F1's stall named still
+/// answers, since that copy can still prove the rebuild. A copy whose status reports a tail past
+/// the pinned cutoff cannot: it withholds its post-commit proof (`sync_withheld`,
+/// `reason=tail_held`), so on real nodes the hold never ended and every put answered
+/// `RECOVERY_READ_ONLY` with no way out. Planted input as
+/// `s4d_a_member_answering_clean_does_not_repair_while_another_holds_a_tail`: node 1's commit
+/// marked `ReadOnly`, its rebuild pinned, F1's latest stall naming node 3's copy. While node 3
+/// answers clean the repair waits on the rebuild (one Information line,
+/// `membership_repair_rebuild_hold_started`); once node 3 reports `held_past_base` above the
+/// cutoff the hold ends (`membership_repair_rebuild_hold_ended`, reason
+/// `stalled_copy_withholds_proof`) and S4d's tail hold takes over and names node 3, so
+/// `forget-tail` can see it. `repair_duty`, the probes and the `Inspect` answers are real.
+/// Cut: a stalled copy reporting a tail still holds in `repair_duty`, red (no hold end, no
+/// `membership_repair_held`).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold() {
+    const METHOD: &str = "i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, cutoff) = pin_a_stalled_rebuild(&mut trio);
+
+    // Five drop checks with node 3 answering clean, so a probe is sent and its answers read at
+    // least twice: the rebuild may still finish, so the repair waits.
+    let until = trio.clock.now();
+    trio.until("five drop checks passed", |trio| {
+        (HostClock::millis_until(until, trio.clock.now()) >= 5 * DROP_CHECK_EVERY_MILLIS)
+            .then_some(())
+    });
+    assert!(
+        logged!(METHOD, "membership_repair_planned").is_empty(),
+        "a repair ran while the stalled copy answers clean"
+    );
+
+    trio.nodes[2].0.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: before,
+            head: Seq(cutoff.0 + 1),
+            base: cutoff,
+            reason: "held_past_base",
+            adoption: TailAdoption::Unchecked,
+        },
+    );
+    let held = trio.until("S4d's tail hold names node 3", |_| {
+        let held: Vec<_> = logged!(METHOD, "membership_repair_held")
+            .into_iter()
+            .filter(|line| line["reason"] == "held_past_base")
+            .collect();
+        (!held.is_empty()).then_some(held)
+    });
+    assert_eq!(held[0]["copy_node"], 3, "{held:?}");
+    assert!(
+        trio.nodes[0].0.tail_holds[&p]
+            .iter()
+            .any(|hold| hold.node == NodeId(3)),
+        "forget-tail can see node 3's tail"
+    );
+
+    let started_lines = logged!(METHOD, "membership_repair_rebuild_hold_started");
+    assert_eq!(
+        started_lines.len(),
+        1,
+        "the hold started once: {started_lines:?}"
+    );
+    assert_eq!(started_lines[0]["@l"], "Information", "{started_lines:?}");
+    assert_eq!(started_lines[0]["partition"], 1, "{started_lines:?}");
+    assert_eq!(
+        started_lines[0]["generation"], generation.0,
+        "{started_lines:?}"
+    );
+    assert_eq!(started_lines[0]["waits_on"], "[3]", "{started_lines:?}");
+    let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(
+        ended[0]["reason"], "stalled_copy_withholds_proof",
+        "{ended:?}"
+    );
+}
+
+/// Issue #106 review: the A-R383 hold logged as started also ends when no member outside is
+/// linked any more, since no stalled copy can then hold the repair. Before, `repair_duty` returned
+/// on the empty linked set without ending it, so the hold stayed logged with no end event. Planted
+/// input as `i106_a_stalled_copy_holding_a_tail_past_the_cutoff_ends_the_rebuild_hold`; once the
+/// hold has started, node 1's links to nodes 2 and 3 are held.
+/// Cut: `repair_duty` no longer ends the hold when `linked` is empty, red (no end line).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rebuild_hold_ends_when_no_member_outside_is_linked() {
+    const METHOD: &str = "i106_a_rebuild_hold_ends_when_no_member_outside_is_linked";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "no_member_linked", "{ended:?}");
+    assert!(
+        !trio.nodes[0].0.rebuild_hold.contains_key(&p),
+        "the hold is forgotten"
+    );
+}
+
+/// Issue #106 review round 2: the A-R383 hold also ends when a probe is read and no member
+/// answered it, since no stalled copy then answers to hold the repair (`stalled_copy_silent`).
+/// Planted input from [`pin_a_stalled_rebuild`]; once the hold has started, the directions from
+/// nodes 2 and 3 back to node 1 are dropped, so both stay linked (a half-open link) and every
+/// later probe reads empty. The check that only sends the first probe must not end it, so there
+/// is exactly one end line.
+/// Cut: `repair_duty` no longer ends the hold when a probe read has no answer, red (no end line).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rebuild_hold_ends_when_a_probe_reads_no_answer() {
+    const METHOD: &str = "i106_a_rebuild_hold_ends_when_a_probe_reads_no_answer";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.links.drop_direction(NodeId(2), NodeId(1));
+    trio.links.drop_direction(NodeId(3), NodeId(1));
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    // Two more drop checks: a second end of the hold would show here.
+    let until = trio.clock.now();
+    trio.until("two more drop checks passed", |trio| {
+        (HostClock::millis_until(until, trio.clock.now()) >= 2 * DROP_CHECK_EVERY_MILLIS)
+            .then_some(())
+    });
+    let ended_after = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+    assert_eq!(ended_after.len(), 1, "the hold ended once: {ended_after:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "stalled_copy_silent", "{ended:?}");
+    assert!(
+        logged!(METHOD, "membership_repair_planned").is_empty(),
+        "a repair ran with nobody answering"
+    );
+    assert!(
+        trio.nodes[0].0.committed[&p].mode == PartitionMode::ReadOnly,
+        "still read-only"
+    );
+}
+
+/// Issue #106 review round 2: when a rejoin empties the outside set of a commit that is still
+/// `ReadOnly`, the A-R383 hold ends with `no_member_outside`, not `not_read_only`, since the mode
+/// did not change. Planted input from [`pin_a_stalled_rebuild`]; once the hold has started, node 1
+/// is given a restart re-plan (`Rejoin::Planned`, for a later generation), which
+/// `read_only_outside` answers with no member.
+/// Cut: the empty-outside reason is `not_read_only` whatever the mode, red (wrong reason).
+/// Integration (~2 s): the trio's start and a few repair checks.
+#[config_log::retcd_test]
+fn i106_a_rejoin_on_a_read_only_commit_ends_the_rebuild_hold_with_no_member_outside() {
+    const METHOD: &str =
+        "i106_a_rejoin_on_a_read_only_commit_ends_the_rebuild_hold_with_no_member_outside";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), tuned);
+    let p = PartitionId(1);
+    let (generation, _) = pin_a_stalled_rebuild(&mut trio);
+
+    trio.until("the rebuild hold started", |_| {
+        (!logged!(METHOD, "membership_repair_rebuild_hold_started").is_empty()).then_some(())
+    });
+    trio.nodes[0].0.rejoins.insert(
+        p,
+        Rejoin::Planned {
+            generation: Generation(generation.0 + 1),
+            replan: Replan {
+                drop: None,
+                rejoiner: None,
+                promote: false,
+                since: Tick(0),
+                release: rdb_core::contracts::recovery::TailRelease::default(),
+                cause: None,
+            },
+        },
+    );
+    let ended = trio.until("the rebuild hold ended", |_| {
+        let ended = logged!(METHOD, "membership_repair_rebuild_hold_ended");
+        (!ended.is_empty()).then_some(ended)
+    });
+    assert_eq!(ended.len(), 1, "the hold ended once: {ended:?}");
+    assert_eq!(ended[0]["@l"], "Information", "{ended:?}");
+    assert_eq!(ended[0]["partition"], 1, "{ended:?}");
+    assert_eq!(ended[0]["generation"], generation.0, "{ended:?}");
+    assert_eq!(ended[0]["waits_on"], "[3]", "{ended:?}");
+    assert_eq!(ended[0]["reason"], "no_member_outside", "{ended:?}");
+    assert!(
+        trio.nodes[0].0.committed[&p].mode == PartitionMode::ReadOnly,
+        "the commit is still read-only, so the mode did not end the hold"
+    );
+}
+
 /// #79 S4d: a full copy that stopped part way leaves a staged child, which no landing or inventory
 /// will ever succeed on. The status says so as `interrupted_copy` (so a restart, which loses the
 /// recorded refusals, cannot hide it), for the newest lineage only: a remnant below a newer
@@ -6870,6 +7236,8 @@ struct OwnerStep {
     owned: Option<crate::ownership::OwnerToken>,
     /// T1's lineage for partition 1, as a token: what check 6 compares a view with.
     serving: Option<crate::ownership::OwnerToken>,
+    /// `still_owner(serving)`, read after `ownership`.
+    serving_owned: bool,
 }
 
 /// Node 1's [`OwnerStep`], with both readers checked against T1: `still_owner(t)` is true only
@@ -6886,12 +7254,17 @@ fn owner_step(
         .kernel(NodeId(1), P1)
         .map(|kernel| OwnerToken::of(kernel.lineage()));
     let owned = host.owner_views.ownership(P1).map(|o| o.token);
+    let serving_owned = serving.is_some_and(|token| host.owner_views.still_owner(P1, token));
     let held: Vec<OwnerToken> = asked
         .iter()
         .copied()
         .filter(|token| host.owner_views.still_owner(P1, *token))
         .collect();
-    let step = OwnerStep { owned, serving };
+    let step = OwnerStep {
+        owned,
+        serving,
+        serving_owned,
+    };
     if let Some(owned) = owned {
         assert_eq!(
             Some(owned),
@@ -6914,7 +7287,8 @@ fn owner_step(
 /// Node 3 restarts, so node 1 revokes its epoch (on disk, in the same boot: a disk fence),
 /// re-plans and commits the next generation; then node 1 itself restarts.
 /// At every step, neither reader names a token T1 does not serve, which covers the steps where
-/// T1 has installed a recovery's lineage before A1's view confirms it. Once the revoked token
+/// T1 has installed a recovery's lineage before A1's view confirms it; at those steps
+/// `still_owner` asked about the token T1 serves reads false too. Once the revoked token
 /// reads false it never reads true again, before or after the restart, and the regrant's token
 /// is greater. A restarted owner acquires no grant in this process (`Db::restart_node`), so
 /// after its restart node 1 owns nothing, neither token, for 1.5 s.
@@ -6942,10 +7316,18 @@ fn own84_8_ownership_follows_admission_across_a_revoke_a_regrant_and_a_restart()
     });
     assert!(ended, "the revoke ended the old token");
     assert!(regrant > old, "the regrant {regrant} after {old}");
-    let unconfirmed = steps
+    let unconfirmed: Vec<_> = steps
         .iter()
         .filter(|step| step.serving.is_some_and(|t| t > old) && step.owned.is_none())
-        .count();
+        .collect();
+    // #84 review: the other reader, asked about the token T1 already serves, agrees.
+    for step in &unconfirmed {
+        assert!(
+            !step.serving_owned,
+            "still_owner(serving) before A1 confirms it: {step:?}"
+        );
+    }
+    let unconfirmed = unconfirmed.len();
     tracing::info!(unconfirmed, steps = steps.len(), "own84_8_rejoin_observed");
     // The confirmation is a control round trip after T1 installs the lineage, so at least one
     // step sees the new lineage served and not yet owned (5 of 5 runs, 2026-11-15).
@@ -6967,4 +7349,1422 @@ fn own84_8_ownership_follows_admission_across_a_revoke_a_regrant_and_a_restart()
         );
         (trio.clock.now() >= until).then_some(())
     });
+}
+
+/// #107 slice 2a: the live re-add's link hold in these rows, past a few drop checks.
+const LIVE_HOLD_MILLIS: u64 = 300;
+
+/// [`tuned`] with the live re-add on and its link hold shortened.
+fn live(host: &mut Host) {
+    tuned(host);
+    host.live_readd.on = true;
+    host.live_readd.hold_millis = LIVE_HOLD_MILLIS;
+}
+
+/// Node 3 stops answering. `writer`: as a frozen process under writes does, its link stays up
+/// while L1 pauses on it, and closes partway through the paused clock (`PROBE_SILENCE`), so
+/// the paused clock drops it with the link loss seen. Otherwise nothing is written and its
+/// link goes at once, so the unreachable clock drops it. Returns the drop's generation and the
+/// next request id.
+fn blip_three(trio: &mut Trio, before: Generation, writer: bool) -> (Generation, u64) {
+    let mut request = 1;
+    let blamed_ms = |trio: &Trio| {
+        let now = trio.clock.now();
+        trio.nodes[0]
+            .0
+            .blamed
+            .get(&P1)
+            .map(|blame| HostClock::millis_until(blame.since, now))
+    };
+    let mut held = None;
+    if writer {
+        kill(trio, 3, &[1, 2]);
+        request = put_until_paused(trio, request).0;
+        trio.until("node 3 blamed for a third of the drop clock", |trio| {
+            blamed_ms(trio).filter(|ms| *ms >= DROP_AFTER_MILLIS / 3)
+        });
+        // Review: the clock held from this reading to the cut, so the cut lands inside the
+        // window the reading shows, at least a third of the paused clock and short of all of
+        // it, with node 3 still pinned: the paused clock fires with the link lost.
+        held = Some(trio.clock.hold());
+        let blamed = blamed_ms(trio).expect("node 3 still blamed");
+        assert!(
+            (DROP_AFTER_MILLIS / 3..DROP_AFTER_MILLIS).contains(&blamed),
+            "node 3 blamed for {blamed} ms at the cut"
+        );
+        assert_eq!(
+            commit_of(trio).map(|(_, _, members)| members),
+            Some(vec![1, 2, 3]),
+            "dropped before the cut"
+        );
+    }
+    hold_three(trio);
+    drop(held);
+    (dropped_three(trio, before), request)
+}
+
+/// Waits for node 1's first `Active` commit past `shadowed` with node 3 regular, as row 59
+/// does (the promote's own commit may still say `DegradedRf2`), and returns its generation.
+fn active_with_three(trio: &mut Trio, shadowed: Generation) -> Generation {
+    let (promoted, mode, members) =
+        trio.until("node 1 committed Active with node 3 regular", |trio| {
+            (role_of_three(trio) == Some(ReplicaRole::RegularSecondary))
+                .then(|| commit_of(trio))
+                .flatten()
+                .filter(|(generation, mode, _)| {
+                    *generation > shadowed && *mode == PartitionMode::Active
+                })
+        });
+    assert_eq!((mode, members), (PartitionMode::Active, vec![1, 2, 3]));
+    promoted
+}
+
+/// Waits until node 3 holds, in `generation`, the owner's record at that commit's cutoff: the
+/// owner sees the promote commit before node 3 has landed it.
+fn holds_the_cutoff(trio: &mut Trio, generation: Generation) {
+    // Review: only a record not there yet is waited for; any other refusal of the read is a
+    // storage fault, and fails the row naming it.
+    let record = |trio: &Trio, node: usize, cutoff: Seq| match trio.nodes[node]
+        .0
+        .checked(P1, generation, cutoff)
+    {
+        Ok((_, digest)) => Some(digest),
+        Err("no_record") => None,
+        Err(fault) => panic!("node {}'s record at the cutoff: {fault}", node + 1),
+    };
+    trio.until("node 3 holds the owner's record at the cutoff", |trio| {
+        let cutoff = trio.nodes[0].0.committed[&P1].selected.cutoff_seq;
+        let owner = record(trio, 0, cutoff)?;
+        (record(trio, 2, cutoff)? == owner).then_some(())
+    });
+}
+
+/// Row 1 (#107 slice 2a, Rev 5 M1), both ways: node 3 is dropped by the owner's own clock and
+/// comes back with no restart once its link is back. The drop names the clock that fired, with
+/// the link loss seen; writes land through the outage; the heal alone re-adds node 3 at the
+/// boot it still runs, as a shadow, then promotes it, so three regular copies, `Active`, and
+/// node 3 holds the owner's record at the cutoff. One live re-add, one promote, and node 3's
+/// `Host` was never replaced.
+fn live_return(method: &str, writer: bool) {
+    let clock = if writer { "paused" } else { "unreachable" };
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, writer);
+    let planned = drops_planned(method);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(
+        (
+            planned[0]["clock"].as_str(),
+            planned[0]["link_lost"].as_bool()
+        ),
+        (Some(clock), Some(true)),
+        "{planned:?}"
+    );
+    let recorded = logged!(method, "drop_clocked_recorded");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(
+        (
+            recorded[0]["left_out"].as_u64(),
+            recorded[0]["clock"].as_str()
+        ),
+        (Some(3), Some(clock)),
+        "{recorded:?}"
+    );
+    trio.ready();
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+
+    trio.links.heal_all();
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&P1)?;
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            .map(|member| (committed.new_generation, member.boot))
+    });
+    assert_eq!(shadowed.1, boot, "re-added at the boot it still runs");
+    let promoted = active_with_three(&mut trio, shadowed.0);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(trio.links.boot_of(NodeId(3)), Some(boot));
+    let readded = logged!(method, "live_readd_planned");
+    assert_eq!(readded.len(), 1, "{readded:?}");
+    assert_eq!(
+        (readded[0]["readded"].as_u64(), readded[0]["clock"].as_str()),
+        (Some(3), Some(format!("Some(\"{clock}\")").as_str())),
+        "{readded:?}"
+    );
+    assert_eq!(readds(method).len(), 1);
+    assert_eq!(logged!(method, "shadow_promote").len(), 1);
+    let warned = logged!(method, "copy_left_out_until_restart");
+    assert!(warned.is_empty(), "a copy that came back: {warned:?}");
+    let faults = logged!(method, "host_fault");
+    assert!(faults.is_empty(), "{faults:?}");
+    assert!(
+        trio.nodes[0].0.live_readd.clocked.is_empty(),
+        "the drop is spent"
+    );
+    holds_the_cutoff(&mut trio, promoted);
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
+        other => panic!("a put on three copies: {other:?}"),
+    }
+}
+
+/// Row 1, with a writer: a freeze under writes drops on the paused clock, with the link loss
+/// seen, and returns.
+/// Cuts: no same-boot arm in `readd_candidate`, red (never a shadow); a paused drop recorded
+/// without regard to the link (`clock == Unreachable` only), red (no `drop_clocked_recorded`);
+/// `Blame::seen_unlinked` ignores the check, red (`link_lost` false, nothing recorded).
+/// Integration (~5 s): bootstrap, the pause and drop, the hold, the re-add and the promote.
+#[config_log::retcd_test]
+fn issue107_1_a_copy_dropped_on_the_paused_clock_with_its_link_lost_returns_at_its_boot() {
+    live_return(
+        "issue107_1_a_copy_dropped_on_the_paused_clock_with_its_link_lost_returns_at_its_boot",
+        true,
+    );
+}
+
+/// Row 1, idle: no writer, so the unreachable clock drops node 3, and it returns.
+/// Cut: no same-boot arm in `readd_candidate`, red (never a shadow).
+/// Integration (~5 s): as above, with no pause.
+#[config_log::retcd_test]
+fn issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot() {
+    live_return(
+        "issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot",
+        false,
+    );
+}
+
+/// Issue #113 with #107 slice 2a: the live re-add's shadow is promoted at catch-up too, not
+/// only a move's. Node 3 is dropped on the unreachable clock while idle, 100 records land
+/// without it, and its link comes back at the boot it still runs, so the live re-add pins it
+/// as a shadow far behind. Once its catch-up walks, the trio's clock is held, so no drop duty
+/// runs and the cursor moves on ACKs alone. In the step node 3 reaches the head, node 1 has
+/// started the promote; then three regular copies, `Active`, one live re-add and one promote at
+/// the head. No move runs, so [`m11_113_a_shadow_is_promoted_in_the_step_its_catch_up_arrives`]
+/// alone cannot tell a hook for every shadow from one for a move's.
+/// Cuts: no `shadow_at_head` call on `CopyCaughtUp`, red; `shadow_at_head` acting only while
+/// `self.moves` holds the partition, red (both: caught up, no promote started).
+/// Integration (~5 s): the drop, 100 puts, the hold, a one-record-a-trip catch-up, the promote.
+#[config_log::retcd_test]
+fn issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives() {
+    const METHOD: &str =
+        "issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, false);
+    trio.ready();
+    for _ in 0..100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    // (head, node 3's acknowledged sequence) on node 1, while node 3 is pinned as a shadow.
+    let seen = |trio: &Trio| {
+        let owner = &trio.nodes[0].0;
+        let copy = owner
+            .committed
+            .get(&P1)?
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            .map(|member| member.copy)?;
+        let tracker = owner.replication.primary(NodeId(1), P1)?.tracker();
+        let acked = tracker
+            .peer(copy)
+            .map_or(0, |peer| peer.progress.buffered_applied.0);
+        Some((tracker.head().0, acked))
+    };
+    let promoting = |trio: &Trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&P1),
+            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
+                if replan.promote && replan.rejoiner == Some(NodeId(3))
+        )
+    };
+    trio.links.heal_all();
+    let cut_at = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        seen(trio).map(|(_, acked)| acked)
+    });
+    trio.until("the re-add's re-plan ended", |trio| {
+        (!trio.nodes[0].0.rejoins.contains_key(&P1)).then_some(())
+    });
+    trio.until("node 3's catch-up walks", |trio| {
+        let (head, acked) = seen(trio)?;
+        assert!(
+            head.saturating_sub(acked) > PROMOTE_LAG_RECORDS,
+            "precondition: node 3 came within the bound before the clock was held"
+        );
+        (acked > cut_at).then_some(())
+    });
+    assert!(!promoting(&trio), "promoted before the clock was held");
+    let hold = trio.clock.hold();
+    let head = trio.until("node 3 acknowledged node 1's head", |trio| {
+        let (head, acked) = seen(trio)?;
+        (acked >= head).then_some(head)
+    });
+    assert!(
+        promoting(&trio),
+        "node 3 reached the head ({head}) and node 1 started no promote"
+    );
+    drop(hold);
+    let promoted = active_with_three(&mut trio, after);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    let promotes = logged!(METHOD, "shadow_promote");
+    assert_eq!(promotes.len(), 1, "{promotes:?}");
+    assert_eq!(promotes[0]["acked"], head, "{promotes:?}");
+    assert_eq!(promotes[0]["head"], head, "{promotes:?}");
+    holds_the_cutoff(&mut trio, promoted);
+}
+
+/// Row 30a (#107 slice 2a): with the setting off, only the setting differs from row 1's idle
+/// way: node 3 is dropped on the unreachable clock, its link comes back for many holds, and
+/// nothing is recorded, nothing is probed and nothing re-adds it. It stays out, and node 1
+/// says once that a restart brings it back. Review round 2: the drop's
+/// `membership_drop_planned` line has no `link_lost` field, as before the setting existed (row
+/// 1 asserts it with the setting on). A return seeded with the setting off is
+/// [`issue107_30a_with_the_setting_off_a_seeded_return_is_never_probed`].
+/// Cuts: `Host::new` with `live_readd.on` true, red (node 3 re-added, `Active`); the cause set
+/// whatever the setting (`self.live_readd.on &&` removed in `drop_copy`), red (an entry);
+/// `link_lost` logged whatever the setting, red (the field on the OFF line).
+/// Integration (~4 s): the drop, then five holds of watching.
+#[config_log::retcd_test]
+fn issue107_30a_with_the_setting_off_a_healed_copy_records_nothing_and_stays_out() {
+    const METHOD: &str =
+        "issue107_30a_with_the_setting_off_a_healed_copy_records_nothing_and_stays_out";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.live_readd.hold_millis = LIVE_HOLD_MILLIS;
+    });
+    let (after, _) = blip_three(&mut trio, before, false);
+    let planned = drops_planned(METHOD);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["clock"], "unreachable", "{planned:?}");
+    assert!(
+        planned[0].get("link_lost").is_none(),
+        "no new field with the setting off: {planned:?}"
+    );
+    trio.links.heal_all();
+    pass(&mut trio, 5 * LIVE_HOLD_MILLIS + DROP_AFTER_MILLIS);
+    assert_eq!(
+        commit_of(&trio),
+        Some((after, PartitionMode::DegradedRf2, vec![1, 2])),
+        "re-added with the setting off"
+    );
+    assert!(trio.nodes[0].0.live_readd.clocked.is_empty());
+    for message in [
+        "drop_clocked_recorded",
+        "live_readd_probed",
+        "live_readd_planned",
+        "live_readd_not_planned",
+        "live_readd_refused",
+        "live_readd_unanswered",
+        "live_readd_hold_restarted",
+    ] {
+        let lines = logged!(METHOD, message);
+        assert!(lines.is_empty(), "{message}: {lines:?}");
+    }
+    assert!(readds(METHOD).is_empty());
+    let warned = logged!(METHOD, "copy_left_out_until_restart");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["left_out"], 3, "{warned:?}");
+}
+
+/// Row 2b (#107, moved from slice 1): row 59's tail on a copy re-added live. Node 3 is cut off
+/// under writes and dropped, and while its `Host` and its live receiver stay up it is given a
+/// tail of 500 records past every later cutoff. The heal re-adds it at the boot it still runs,
+/// as a real live return does, keeping this process's memory: its shadow landing refuses
+/// `held_past_base` in a commit that takes writes, so check A drops the live receiver
+/// (`land_receiver_dropped`), and R1 walks node 3 up from the root. It turns regular with
+/// seq 1 reachable in the promoted generation, the owner's record at the cutoff, and the tail
+/// never linked. No node faults (slice 1's "bind snapshot twice" came from its raised boot).
+/// Cut: keep the receiver on refusal, red (never `Active`: the kept receiver's walk leaves a hole).
+/// Integration (~6 s): the drop, the re-add's re-plan, the walk, the promote.
+#[config_log::retcd_test]
+fn issue107_2b_a_live_copy_with_a_tail_re_added_at_its_boot_is_walked_from_the_root() {
+    const METHOD: &str =
+        "issue107_2b_a_live_copy_with_a_tail_re_added_at_its_boot_is_walked_from_the_root";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (_, request) = blip_three(&mut trio, before, true);
+    let held = tail_on_three(&mut trio);
+    trio.links.heal_all();
+
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio).map(|(generation, _, _)| generation))
+            .flatten()
+    });
+    let promoted = active_with_three(&mut trio, shadowed);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    let faults = logged!(METHOD, "host_fault");
+    assert!(faults.is_empty(), "{faults:?}");
+
+    let dropped: Vec<_> = logged!(METHOD, "land_receiver_dropped")
+        .into_iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| (line["reason"].clone(), line["generation"].clone()))
+        .collect();
+    assert_eq!(
+        dropped,
+        [("held_past_base".into(), shadowed.0.into())],
+        "node 3's live receiver was dropped at the shadow's landing"
+    );
+    holds_the_cutoff(&mut trio, promoted);
+    let three = &trio.nodes[2].0;
+    assert_eq!(three.has_floor(P1, promoted), Ok(true), "seq 1 reachable");
+    assert!(
+        three
+            .engine
+            .link(P1, shadowed)
+            .is_none_or(|link| link.parent != held),
+        "generation {shadowed:?} linked onto the tail's {held:?}"
+    );
+    trio.ready();
+    match trio.ask(put(request)) {
+        Answer::Txn { result, .. } => assert_eq!(result.generation, promoted),
+        other => panic!("a put after the promote: {other:?}"),
+    }
+}
+
+/// Node 3, cut off and dropped with its `Host` and its live receiver up, is given a tail of 500
+/// records past its head in its newest generation, past every later cutoff, as row 59's is.
+/// Returns that generation.
+fn tail_on_three(trio: &mut Trio) -> Generation {
+    let three = &mut trio.nodes[2].0;
+    assert!(
+        three
+            .replication
+            .receiver(NodeId(3), P1)
+            .is_some_and(|receiver| !receiver.is_dormant()),
+        "node 3 still holds its live receiver"
+    );
+    let held = three
+        .engine
+        .lineages()
+        .into_iter()
+        .filter(|(partition, _)| *partition == P1)
+        .map(|(_, g)| g)
+        .max()
+        .expect("node 3 holds a generation");
+    let head = Seq(three.engine.buffered_applied(P1, held).0);
+    let mut digests = vec![Digest::ROOT; usize::try_from(head.0).expect("a small head")];
+    if let Some(last) = digests.last_mut() {
+        *last = three.checked(P1, held, head).expect("its head").1;
+    }
+    super::trio::write_chain_after(&mut three.engine, held, digests, 500);
+    held
+}
+
+/// Row 31b (#107, moved from slice 1): row 2b's tail, but the live re-add's commit is
+/// `ReadOnly`: node 1 and node 2 are held apart while node 3's links heal, so the re-plan
+/// commits without writes. Node 3's landing refuses `held_past_base` and, being `ReadOnly`,
+/// keeps its live receiver (no `land_receiver_dropped`), marked refused
+/// (`land_receiver_marked_refused`, lead ruling, narrowed): the receiver does not hold the
+/// cutoff, so it never anchors on a rung below it and anchors at the root instead, and R1 walks
+/// it from seq 1, as a restarted copy's fresh receiver is. Once 1 and 2 heal, the partition is
+/// back at `Active` with three regular copies, as it is when node 3 restarts instead, and every
+/// generation that pins node 3 regular holds seq 1 on node 3.
+/// Cut: `on_recovered`'s refused `NotRetained` arm removed, red (the kept receiver answers
+/// `have: Seq(1)`, node 3's next landing refuses `from_has_no_floor`, the repair is held on its
+/// tail, and the partition stays `ReadOnly`: never `Active`).
+/// Integration (~8 s): the drop, the `ReadOnly` re-add, the walk and the promote, the heal.
+#[config_log::retcd_test]
+fn issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_and_recovers() {
+    const METHOD: &str =
+        "issue107_31b_a_live_copy_re_added_in_a_read_only_commit_keeps_its_receiver_and_recovers";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    blip_three(&mut trio, before, true);
+    tail_on_three(&mut trio);
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.heal(NodeId(1), NodeId(3));
+    trio.links.heal(NodeId(2), NodeId(3));
+
+    let (shadowed, mode, members) = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::Shadow))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::ReadOnly, vec![1, 2, 3]),
+        "the live re-add committed without writes"
+    );
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    trio.until("node 3 refused its landing", |_| {
+        logged!(METHOD, "land_link_refused")
+            .into_iter()
+            .find(|line| line["node"] == 3 && line["generation"] == shadowed.0)
+            .map(|line| assert_eq!(line["reason"], "held_past_base", "{line:?}"))
+    });
+    let dropped: Vec<_> = logged!(METHOD, "land_receiver_dropped")
+        .into_iter()
+        .filter(|line| line["node"] == 3)
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "ReadOnly keeps the receiver: {dropped:?}"
+    );
+    let marked: Vec<_> = logged!(METHOD, "land_receiver_marked_refused")
+        .into_iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| (line["generation"].clone(), line["reason"].clone()))
+        .collect();
+    assert_eq!(
+        marked,
+        [(shadowed.0.into(), "held_past_base".into())],
+        "the kept receiver claims nothing of the refused lineage"
+    );
+
+    trio.links.heal(NodeId(1), NodeId(2));
+    let promoted = active_with_three(&mut trio, shadowed);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    for generation in (shadowed.0 + 1..=promoted.0).map(Generation) {
+        assert_eq!(
+            trio.nodes[2].0.has_floor(P1, generation),
+            Ok(true),
+            "node 3 holds seq 1 in {generation:?}"
+        );
+    }
+    holds_the_cutoff(&mut trio, promoted);
+    let faults = logged!(METHOD, "host_fault");
+    assert!(faults.is_empty(), "{faults:?}");
+}
+
+/// #107 slice 2a review: node 3 dropped by the unreachable clock with the live re-add on, every
+/// link healed, and the trio no longer stepped, so a row calls node 1's
+/// [`Host::live_readd_duty`] itself at the ticks it names and reads node 3's mail by hand.
+/// Node 1 passes every check but the link hold. Returns the trio and the tick to start from.
+fn due_return(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> (Trio, Tick) {
+    let (mut trio, before) = started(dir, |host| {
+        live(host);
+        tune(host);
+    });
+    blip_three(&mut trio, before, false);
+    trio.links.heal_all();
+    let one = &trio.nodes[0].0;
+    assert!(
+        one.live_readd.clocked.contains_key(&(P1, NodeId(3))),
+        "a drop to return"
+    );
+    assert_eq!(one.live_readd_refusal(P1, NodeId(3)), None);
+    assert!(one.live_readd.links.is_empty(), "no hold started yet");
+    // Node 3's mail so far: what the hold kept back. None of it is asked for here.
+    while trio.nodes[2].2.try_recv().is_ok() {}
+    let now = trio.clock.now();
+    (trio, now)
+}
+
+/// The `Inspect`s node 3 was sent since the last call, unanswered, in order. Everything else
+/// in its mailbox is thrown away: the trio is not stepped again.
+fn inspects_on_three(trio: &Trio) -> Vec<(PartitionId, Sender<NodeStatus>)> {
+    std::iter::from_fn(|| trio.nodes[2].2.try_recv().ok())
+        .filter_map(|msg| match msg {
+            Msg::Inspect { partition, reply } => Some((partition, reply)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Answer `asked` as node 3 would, with `fault` in its status.
+fn answer_as_three(
+    trio: &Trio,
+    asked: Vec<(PartitionId, Sender<NodeStatus>)>,
+    fault: Option<&str>,
+) {
+    for (partition, reply) in asked {
+        let mut status = trio.nodes[2].0.status(partition);
+        status.fault = fault.map(str::to_owned);
+        reply.send(status).expect("node 1 holds the probe");
+    }
+}
+
+/// The partition node 1's one live re-add probe is out for, if any.
+fn probed(trio: &Trio) -> Option<PartitionId> {
+    trio.nodes[0]
+        .0
+        .live_readd
+        .probe
+        .as_ref()
+        .map(|(_, partition, _)| *partition)
+}
+
+/// Whether node 1 runs the re-plan that re-adds node 3 to `partition`.
+fn readd_started(trio: &Trio, partition: PartitionId) -> bool {
+    matches!(
+        trio.nodes[0].0.rejoins.get(&partition),
+        Some(Rejoin::Revoking { replan, .. }) if replan.rejoiner == Some(NodeId(3))
+    )
+}
+
+/// Blocker 1 (#107 slice 2a review), two keys: a copy whose `Inspect` goes unanswered sits out a
+/// whole hold, so the other due copy is probed and started. Node 1 left out node 3 on
+/// partition 1 and, seeded beside it, on a partition 2 that copies partition 1's commit and
+/// left-out entry; partition 2's link hold is the older, so it is picked first. Its probe is
+/// withheld: at the next check node 1 logs `live_readd_unanswered` and holds no probe, at the
+/// check after it probes partition 1, and once that is answered it starts partition 1's re-add.
+/// Cut: no hold restart on an unanswered probe, red (partition 2 is probed again at the third
+/// check, and partition 1 never is).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r1_an_unanswered_copy_sits_out_a_hold_and_another_partition_starts() {
+    const METHOD: &str =
+        "issue107_r1_an_unanswered_copy_sits_out_a_hold_and_another_partition_starts";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = PartitionId(2);
+    let one = &mut trio.nodes[0].0;
+    let committed = one.committed[&P1].clone();
+    one.committed.insert(p2, committed);
+    let left = one.left_out[&P1].clone();
+    one.left_out.insert(p2, left);
+    let why = one.live_readd.clocked[&(P1, NodeId(3))];
+    one.live_readd.clocked.insert((p2, NodeId(3)), why);
+    let conn = trio.links.connection(NodeId(1), NodeId(3)).expect("linked");
+    let up = |since| LinkSeen::Up { since, conn };
+    let one = &mut trio.nodes[0].0;
+    one.live_readd.links.insert((p2, NodeId(3)), up(t0));
+    one.live_readd
+        .links
+        .insert((P1, NodeId(3)), up(t0.plus_millis(100)));
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    assert_eq!(probed(&trio), Some(p2), "the older hold first");
+    let withheld = inspects_on_three(&trio);
+    assert_eq!(withheld.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [p2]);
+
+    trio.nodes[0].0.live_readd_duty(at(200));
+    let unanswered = logged!(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(unanswered[0]["partition"], 2, "{unanswered:?}");
+    assert_eq!(probed(&trio), None, "partition 2 sits out a hold");
+    assert!(inspects_on_three(&trio).is_empty());
+    drop(withheld);
+
+    trio.nodes[0].0.live_readd_duty(at(400));
+    assert_eq!(probed(&trio), Some(P1), "the healthy copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(600));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    let planned = logged!(METHOD, "live_readd_planned");
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["partition"], 1, "{planned:?}");
+}
+
+/// Node 1's link hold for node 3 on partition 1 starts at `t0`: the first check sees it up.
+fn hold_from(trio: &mut Trio, t0: Tick) {
+    trio.nodes[0].0.live_readd_duty(t0);
+    assert!(matches!(
+        trio.nodes[0].0.live_readd.links.get(&(P1, NodeId(3))),
+        Some(LinkSeen::Up { since, .. }) if *since == t0
+    ));
+}
+
+/// The `live_readd_*` lines of `method` named `message`, for node 3 on partition 1 only.
+fn live_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == message && line["node"] == 1)
+        .collect()
+}
+
+/// Review (`live_readd_duty`'s hold): a link lost and made again at the same boot between two
+/// checks is a new link, and its hold starts again. The hold starts at `t0`; node 1 and node 3
+/// are held and healed with no check between; the next check sees another connection, logs
+/// `live_readd_hold_restarted`, and nothing is probed until a whole hold after that check.
+/// Cut: the hold kept whatever the connection, red (a probe at `t0` plus one hold).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_reconnect_between_two_checks_starts_the_hold_again() {
+    const METHOD: &str = "issue107_r_a_reconnect_between_two_checks_starts_the_hold_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.heal(NodeId(1), NodeId(3));
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    duty(&mut trio, 250);
+    assert_eq!(live_lines(METHOD, "live_readd_hold_restarted").len(), 1);
+    duty(&mut trio, LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), None, "under a hold of the new link");
+    duty(&mut trio, 250 + LIVE_HOLD_MILLIS - 1);
+    assert_eq!(probed(&trio), None);
+    assert!(inspects_on_three(&trio).is_empty());
+    duty(&mut trio, 250 + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1), "a whole hold of the new link");
+}
+
+/// Review: a link that goes down near the end of the hold loses its uptime. The hold starts at
+/// `t0`; the link is down at the check 50 ms before the hold ends and still down when it would
+/// have ended, so nothing is probed; it is up again at the next check, and is probed a whole
+/// hold after that.
+/// Cut: a link seen down keeps its hold, red (a probe at `t0` plus one hold, the link down).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_link_down_near_the_end_of_the_hold_discards_its_uptime() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    trio.links.hold(NodeId(1), NodeId(3));
+    duty(&mut trio, LIVE_HOLD_MILLIS - 50);
+    duty(&mut trio, LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), None, "the link is down");
+    trio.links.heal(NodeId(1), NodeId(3));
+    let back = LIVE_HOLD_MILLIS + 50;
+    duty(&mut trio, back);
+    duty(&mut trio, back + LIVE_HOLD_MILLIS - 1);
+    assert_eq!(probed(&trio), None, "under a hold since the link came back");
+    assert!(inspects_on_three(&trio).is_empty());
+    duty(&mut trio, back + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1));
+}
+
+/// Review: the hold at its default, `LIVE_READD_HOLD_MILLIS` (the other rows run 300 ms): no
+/// `Inspect` at 4,999 ms of link, one at 5,000 ms.
+/// Cut: `linked_ms >= hold` as `>`, red (no probe at 5,000 ms).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_the_default_hold_probes_at_5000_ms_and_not_before() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |host| {
+        host.live_readd.hold_millis = LIVE_READD_HOLD_MILLIS;
+    });
+    assert_eq!(LIVE_READD_HOLD_MILLIS, 5_000);
+    hold_from(&mut trio, t0);
+    trio.nodes[0].0.live_readd_duty(t0.plus_millis(4_999));
+    assert_eq!(probed(&trio), None, "4,999 ms");
+    assert!(inspects_on_three(&trio).is_empty());
+    trio.nodes[0].0.live_readd_duty(t0.plus_millis(5_000));
+    assert_eq!(probed(&trio), Some(P1), "5,000 ms");
+    assert_eq!(inspects_on_three(&trio).len(), 1);
+}
+
+/// Review: a copy whose `Inspect` answers a fault is refused (`live_readd_refused{faulted}`, with
+/// the fault), nothing is planned, and it is probed again only a whole hold after that answer.
+/// Cut: no hold restart on a fault, red (probed again at the next check past the old hold).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_faulted_answer_plans_nothing_and_waits_a_whole_hold() {
+    const METHOD: &str = "issue107_r_a_faulted_answer_plans_nothing_and_waits_a_whole_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    duty(&mut trio, LIVE_HOLD_MILLIS);
+    answer_as_three(&trio, inspects_on_three(&trio), Some("disk gone"));
+    let answered = LIVE_HOLD_MILLIS + 200;
+    duty(&mut trio, answered);
+    let refused = live_lines(METHOD, "live_readd_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        (refused[0]["reason"].as_str(), refused[0]["fault"].as_str()),
+        (Some("faulted"), Some("disk gone")),
+        "{refused:?}"
+    );
+    assert!(
+        !trio.nodes[0].0.rejoins.contains_key(&P1),
+        "nothing planned"
+    );
+    assert!(logged!(METHOD, "live_readd_planned").is_empty());
+    duty(&mut trio, answered + 200);
+    duty(&mut trio, answered + LIVE_HOLD_MILLIS - 1);
+    assert_eq!(probed(&trio), None, "a whole hold after the fault");
+    assert!(inspects_on_three(&trio).is_empty());
+    duty(&mut trio, answered + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1));
+}
+
+/// Review: a return probed and answered that the re-add does not start sits out a whole hold,
+/// instead of a probe and a `live_readd_not_planned` every other check. Node 2's link reports
+/// a newer boot when the answer is read, so the restart path re-plans for node 2, not node 3;
+/// that boot and the re-plan are then undone by hand.
+/// Review round 2: `why` names the re-plan for another member that started, not `None`.
+/// Cuts: no hold restart when not started, red (probed again at the next check); `why` as
+/// `rejoin_if_stale`'s answer, red (`null`).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_return_not_started_sits_out_a_whole_hold() {
+    const METHOD: &str = "issue107_r_a_return_not_started_sits_out_a_whole_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    duty(&mut trio, LIVE_HOLD_MILLIS);
+    answer_as_three(&trio, inspects_on_three(&trio), None);
+    let two = (trio.nodes[1].1.clone(), trio.nodes[1].0.boot);
+    trio.links
+        .register(NodeId(2), two.0.clone(), BootId(two.1 .0 + 1));
+    let answered = LIVE_HOLD_MILLIS + 200;
+    duty(&mut trio, answered);
+    let not = live_lines(METHOD, "live_readd_not_planned");
+    assert_eq!(not.len(), 1, "{not:?}");
+    assert_eq!(not[0]["retry_in_ms"], LIVE_HOLD_MILLIS, "{not:?}");
+    // Review round 2: names why, not `None`.
+    assert_eq!(
+        not[0]["why"], "a re-plan for another member started",
+        "{not:?}"
+    );
+    assert_eq!(not[0]["@l"], "Information", "{not:?}");
+    assert!(!readd_started(&trio, P1));
+    trio.links.register(NodeId(2), two.0, two.1);
+    trio.nodes[0].0.rejoins.remove(&P1);
+    for millis in [200, LIVE_HOLD_MILLIS - 1] {
+        duty(&mut trio, answered + millis);
+        assert_eq!(probed(&trio), None, "{millis} ms after");
+    }
+    assert!(inspects_on_three(&trio).is_empty());
+    assert_eq!(live_lines(METHOD, "live_readd_not_planned").len(), 1);
+    duty(&mut trio, answered + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1));
+}
+
+/// Review: the gate refuses before any `Inspect`, and logs each reason once per partition, node
+/// and reason. A copy whose partition is `ReadOnly` is never probed across three checks past the
+/// hold, and node 1 logs `live_readd_refused{read_only}` once. Back to `DegradedRf2`, it is
+/// probed at the next check.
+/// Cuts: the `read_only` clause removed, red (a probe); the refusal logged at every check, red
+/// (three lines).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_read_only_copy_is_refused_before_the_probe_and_logged_once() {
+    const METHOD: &str = "issue107_r_a_read_only_copy_is_refused_before_the_probe_and_logged_once";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let committed = trio.nodes[0].0.committed.get_mut(&P1).expect("committed");
+    let mode = std::mem::replace(&mut committed.mode, PartitionMode::ReadOnly);
+    for millis in [0, 200, 400] {
+        trio.nodes[0]
+            .0
+            .live_readd_duty(t0.plus_millis(LIVE_HOLD_MILLIS + millis));
+        assert_eq!(probed(&trio), None);
+    }
+    assert!(
+        inspects_on_three(&trio).is_empty(),
+        "refused before the probe"
+    );
+    let refused = live_lines(METHOD, "live_readd_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["reason"], "read_only", "{refused:?}");
+    assert_eq!(refused[0]["left_out"], 3, "{refused:?}");
+    trio.nodes[0]
+        .0
+        .committed
+        .get_mut(&P1)
+        .expect("committed")
+        .mode = mode;
+    trio.nodes[0]
+        .0
+        .live_readd_duty(t0.plus_millis(LIVE_HOLD_MILLIS + 600));
+    assert_eq!(probed(&trio), Some(P1));
+}
+
+/// Checks node 1 past the hold at `t0` plus `from` and 200 ms later, and asserts it probed
+/// nothing and logged `live_readd_refused{reason}` once.
+fn refused_twice(trio: &mut Trio, method: &str, t0: Tick, from: u64, reason: &str) {
+    for millis in [from, from + 200] {
+        trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+        assert_eq!(probed(trio), None, "{reason} at {millis} ms");
+    }
+    assert!(inspects_on_three(trio).is_empty(), "{reason}: an Inspect");
+    let refused = live_lines(method, "live_readd_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["reason"], reason, "{refused:?}");
+}
+
+/// Review: an `admin rebuild` of another node on the same partition blocks the return; once it
+/// clears, the return is probed.
+/// Cut: the gate's rebuild check by node only, red (a probe while the rebuild waits).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_another_nodes_rebuild_on_the_partition_blocks_until_it_clears() {
+    const METHOD: &str = "issue107_r_another_nodes_rebuild_on_the_partition_blocks_until_it_clears";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let (reply, _answer) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asks.insert(
+        P1,
+        RebuildAsk {
+            node: NodeId(2),
+            mode: crate::admin::rebuild::RebuildMode::Pinned,
+            from: Generation(0),
+            deadline: t0.plus_millis(60_000),
+            reply: RebuildReply(reply),
+        },
+    );
+    refused_twice(&mut trio, METHOD, t0, LIVE_HOLD_MILLIS, "rebuild");
+    trio.nodes[0].0.rebuild_asks.remove(&P1);
+    trio.nodes[0]
+        .0
+        .live_readd_duty(t0.plus_millis(LIVE_HOLD_MILLIS + 400));
+    assert_eq!(probed(&trio), Some(P1), "the rebuild cleared");
+}
+
+/// Review: a rebuild of node 3 waiting on another partition never lets the gate pass, so node 3
+/// is never probed. Before, the gate read partition 1's rebuild only, the re-add's candidate
+/// refused a node with a rebuild anywhere, and node 3 was probed and not planned at every hold.
+/// Cut: the gate's rebuild check by partition only, red (an `Inspect`).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_a_rebuild_of_the_copy_on_another_partition_never_probes_it() {
+    const METHOD: &str = "issue107_r_a_rebuild_of_the_copy_on_another_partition_never_probes_it";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let (reply, _answer) = mpsc::channel();
+    trio.nodes[0].0.rebuild_asks.insert(
+        PartitionId(2),
+        RebuildAsk {
+            node: NodeId(3),
+            mode: crate::admin::rebuild::RebuildMode::NotPinned,
+            from: Generation(0),
+            deadline: t0.plus_millis(60_000),
+            reply: RebuildReply(reply),
+        },
+    );
+    for millis in (0..6).map(|n| LIVE_HOLD_MILLIS + n * 200) {
+        trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+        assert_eq!(probed(&trio), None, "{millis} ms");
+    }
+    assert!(inspects_on_three(&trio).is_empty());
+    assert!(live_lines(METHOD, "live_readd_not_planned").is_empty());
+    let refused = live_lines(METHOD, "live_readd_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["reason"], "rebuild", "{refused:?}");
+}
+
+/// Review: a live move on the partition blocks the return, logged once; clearing the move lets
+/// the return be probed.
+/// Cut: the gate's move clause removed, red (a probe while the move runs).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r_an_active_move_blocks_the_return_until_it_clears() {
+    const METHOD: &str = "issue107_r_an_active_move_blocks_the_return_until_it_clears";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    trio.nodes[0].0.moves.insert(
+        P1,
+        CopyMove {
+            from: NodeId(2),
+            to: NodeId(4),
+            abandoned: None,
+            filled: false,
+            lagged: false,
+        },
+    );
+    refused_twice(&mut trio, METHOD, t0, LIVE_HOLD_MILLIS, "move");
+    trio.nodes[0].0.moves.remove(&P1);
+    trio.nodes[0]
+        .0
+        .live_readd_duty(t0.plus_millis(LIVE_HOLD_MILLIS + 400));
+    assert_eq!(probed(&trio), Some(P1), "the move cleared");
+}
+
+/// Row 30a's seeded half (review): the setting off, and node 1 seeded with an otherwise
+/// eligible return (the drop recorded with it on, then the setting turned off). Across many
+/// holds of link nothing is probed, nothing planned, and no `live_readd_*` line is logged.
+/// Cut: `live_readd_duty`'s `on` check removed, red (an `Inspect`).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_30a_with_the_setting_off_a_seeded_return_is_never_probed() {
+    const METHOD: &str = "issue107_30a_with_the_setting_off_a_seeded_return_is_never_probed";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    trio.nodes[0].0.live_readd.on = false;
+    for millis in (0..10).map(|n| n * 200) {
+        trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+        assert_eq!(probed(&trio), None, "{millis} ms");
+    }
+    assert!(inspects_on_three(&trio).is_empty(), "an Inspect");
+    assert!(!trio.nodes[0].0.rejoins.contains_key(&P1), "a plan");
+    let live: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .skip(before)
+        .filter(|line| {
+            line["@m"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("live_readd"))
+        })
+        .collect();
+    assert!(live.is_empty(), "{live:?}");
+}
+
+/// Review: a dropped copy whose link never returns is told to restart. Node 3 is dropped on the
+/// unreachable clock with the live re-add on, and stays cut off: once node 1 has seen its link
+/// down for the unreachable clock again, it logs `copy_left_out_until_restart` once, naming
+/// node 3. (Row 1 checks the warning stays hidden for a copy that comes back.)
+/// Cut: the warning hidden for any copy with a live return recorded, red (no warning).
+/// Integration (~4 s): the drop, then two drop clocks of watching.
+#[config_log::retcd_test]
+fn issue107_r_a_dropped_copy_whose_link_never_returns_is_told_to_restart() {
+    const METHOD: &str = "issue107_r_a_dropped_copy_whose_link_never_returns_is_told_to_restart";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    blip_three(&mut trio, before, false);
+    assert!(trio.nodes[0]
+        .0
+        .live_readd
+        .clocked
+        .contains_key(&(P1, NodeId(3))));
+    pass(&mut trio, 2 * DROP_AFTER_MILLIS);
+    let warned = logged!(METHOD, "copy_left_out_until_restart");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["left_out"], 3, "{warned:?}");
+}
+
+/// Review: a paused drop with no link loss (node 3's links drop every message, so it stays
+/// linked and the paused clock fires) records no loss and mints no live cause: the drop logs
+/// `link_lost` false, nothing is recorded, and healed, node 3 stays out for many holds with no
+/// `live_readd_*` line, told once to restart.
+/// Cut: the cause minted whatever the link (`|| blame.link_lost` as `|| true`), red (recorded).
+/// Integration (~4 s): the pause and the drop, then five holds of watching.
+#[config_log::retcd_test]
+fn issue107_r_a_paused_drop_with_no_link_loss_stays_restart_only() {
+    const METHOD: &str = "issue107_r_a_paused_drop_with_no_link_loss_stays_restart_only";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    kill(&trio, 3, &[1, 2]);
+    put_until_paused(&mut trio, 1);
+    let after = dropped_three(&mut trio, before);
+    let planned = drops_planned(METHOD);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(
+        (
+            planned[0]["clock"].as_str(),
+            planned[0]["link_lost"].as_bool()
+        ),
+        (Some("paused"), Some(false)),
+        "{planned:?}"
+    );
+    assert!(logged!(METHOD, "drop_clocked_recorded").is_empty());
+    assert!(trio.nodes[0].0.live_readd.clocked.is_empty());
+    trio.links.heal_all();
+    pass(&mut trio, 5 * LIVE_HOLD_MILLIS + DROP_AFTER_MILLIS);
+    assert_eq!(
+        commit_of(&trio),
+        Some((after, PartitionMode::DegradedRf2, vec![1, 2]))
+    );
+    let live: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| {
+            line["@m"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("live_readd"))
+        })
+        .collect();
+    assert!(live.is_empty(), "{live:?}");
+    assert!(readds(METHOD).is_empty());
+    let warned = logged!(METHOD, "copy_left_out_until_restart");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+}
+
+/// Seeds node 1 with a second due return beside node 3's on partition 1: partition 2, a copy
+/// of partition 1's commit, with `left` left out of it at the boot it runs and recorded as a
+/// clocked drop. Node 3 is already left out of partition 1, so for `left == NodeId(3)` the
+/// commit is copied as it is and partition 1's left-out entry with it; any other `left` must be
+/// pinned on partition 1, and is removed from the copied pin. Its link hold starts at `older`,
+/// partition 1's 100 ms later, so partition 2 is the one linked longest. Returns partition 2.
+fn seed_second_return(trio: &mut Trio, left: NodeId, older: Tick) -> PartitionId {
+    let p2 = PartitionId(2);
+    let one = &mut trio.nodes[0].0;
+    let mut committed = one.committed[&P1].clone();
+    let members = &mut committed.committed.pinned_config.members;
+    if left != NodeId(3) {
+        let at = members
+            .iter()
+            .position(|member| member.node == left)
+            .expect("pinned on partition 1");
+        let member = members.remove(at);
+        one.left_out.insert(p2, vec![member]);
+    } else {
+        let out = one.left_out[&P1].clone();
+        one.left_out.insert(p2, out);
+    }
+    one.committed.insert(p2, committed);
+    let why = one.live_readd.clocked[&(P1, NodeId(3))];
+    one.live_readd.clocked.insert((p2, left), why);
+    let up = |trio: &Trio, node: NodeId, since: Tick| LinkSeen::Up {
+        since,
+        conn: trio.links.connection(NodeId(1), node).expect("linked"),
+    };
+    let (second, first) = (
+        up(trio, left, older),
+        up(trio, NodeId(3), older.plus_millis(100)),
+    );
+    let one = &mut trio.nodes[0].0;
+    one.live_readd.links.insert((p2, left), second);
+    one.live_readd.links.insert((P1, NodeId(3)), first);
+    assert_eq!(
+        one.live_readd_refusal(p2, left),
+        None,
+        "a second due return"
+    );
+    p2
+}
+
+/// Blocker 1, the failed send (#107 slice 2a review, round 2): a due copy whose `Inspect`
+/// cannot be sent sits out a whole hold, so another due copy, on another node, is probed and
+/// started. Seeded beside node 3's return on partition 1: partition 2 leaves node 2 out, with
+/// the older hold. Node 2's mailbox is replaced by one whose receiver is gone, so
+/// `Links::send` fails. The first check logs `live_readd_unanswered{why: send_failed}` for
+/// partition 2, holds no probe and restarts its hold; the next probes node 3 on partition 1,
+/// and once that is answered starts its re-add. Partition 2 is not tried again in its hold.
+/// Cut: the send-failed branch returns without `live_readd_unanswered`, red (no
+/// `live_readd_unanswered` line, and partition 2's hold is not restarted).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_failed_send_sits_out_a_hold_and_a_healthy_copy_starts() {
+    const METHOD: &str = "issue107_r2_a_failed_send_sits_out_a_hold_and_a_healthy_copy_starts";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = seed_second_return(&mut trio, NodeId(2), t0);
+    let (dead, gone) = mpsc::channel();
+    drop(gone);
+    let boot2 = trio.nodes[1].0.boot;
+    trio.links.register(NodeId(2), dead, boot2);
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    let unanswered = live_lines(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(
+        (
+            unanswered[0]["partition"].as_u64(),
+            unanswered[0]["left_out"].as_u64(),
+            unanswered[0]["why"].as_str(),
+        ),
+        (Some(2), Some(2), Some("send_failed")),
+        "{unanswered:?}"
+    );
+    assert_eq!(unanswered[0]["@l"], "Warning", "a warning: {unanswered:?}");
+    assert_eq!(probed(&trio), None, "no probe held for a send that failed");
+    assert!(
+        matches!(
+            trio.nodes[0].0.live_readd.links.get(&(p2, NodeId(2))),
+            Some(LinkSeen::Up { since, .. }) if *since == at(0)
+        ),
+        "partition 2's hold starts again"
+    );
+    assert!(inspects_on_three(&trio).is_empty());
+
+    trio.nodes[0].0.live_readd_duty(at(200));
+    assert_eq!(probed(&trio), Some(P1), "the healthy copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(400));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    assert!(!trio.nodes[0].0.rejoins.contains_key(&p2));
+    assert_eq!(live_lines(METHOD, "live_readd_unanswered").len(), 1);
+    let planned = live_lines(METHOD, "live_readd_planned");
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["partition"], 1, "{planned:?}");
+}
+
+/// Blocker 2, a remote same-boot reconnect (#107 slice 2a review, round 2): node 1 reaches
+/// node 3 over the process links, with no local mailbox for node 3 (`Links::knows` is false),
+/// so both `Links::connection` and `Net::connection` answer the route's connection id. The
+/// hold starts at `t0` on the first link; a second link at node 3's same boot replaces it, and
+/// both accessors answer the new id while the boot stays. The next check logs
+/// `live_readd_hold_restarted` naming both ids, nothing is probed before a whole hold of the
+/// new link, and at its boundary one `Inspect` goes out, on the new link only.
+/// Cuts: `Links::connection`'s remote branch answers one id for any connection
+/// (`net.connection(to).map(|_| 0)`), red (the accessors disagree); `live_readd_link_seen`
+/// keeps an up link's hold whatever its connection, red (no `live_readd_hold_restarted`).
+/// Integration (~2 s): bootstrap and the drop; the links have no sockets and the checks are
+/// direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_remote_reconnect_at_the_same_boot_starts_the_hold_again() {
+    const METHOD: &str = "issue107_r2_a_remote_reconnect_at_the_same_boot_starts_the_hold_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let boot3 = trio.nodes[2].0.boot;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let net = crate::net::Net::unsocketed(
+        NodeId(1),
+        trio.nodes[0].0.boot,
+        &[NodeId(2), NodeId(3)],
+        rt.handle().clone(),
+    );
+    let links = Links::new();
+    links.register(NodeId(1), trio.nodes[0].1.clone(), trio.nodes[0].0.boot);
+    links.attach(Arc::clone(&net));
+    let (first, mut out1) = net.link_up_unsocketed(NodeId(3), boot3);
+    let local = std::mem::replace(&mut trio.nodes[0].0.links, Arc::clone(&links));
+    assert!(!links.knows(NodeId(3)), "no local mailbox for node 3");
+    assert_eq!(
+        (
+            links.connection(NodeId(1), NodeId(3)),
+            net.connection(NodeId(3))
+        ),
+        (Some(first), Some(first))
+    );
+    assert_eq!(links.boot_of(NodeId(3)), Some(boot3));
+    assert_eq!(trio.nodes[0].0.live_readd_refusal(P1, NodeId(3)), None);
+    hold_from(&mut trio, t0);
+
+    let (second, mut out2) = net.link_up_unsocketed(NodeId(3), boot3);
+    assert_ne!(second, first, "a new connection");
+    assert_eq!(
+        (
+            links.connection(NodeId(1), NodeId(3)),
+            net.connection(NodeId(3))
+        ),
+        (Some(second), Some(second)),
+        "both accessors answer the replacement"
+    );
+    assert_eq!(links.boot_of(NodeId(3)), Some(boot3), "the same boot");
+    let duty =
+        |trio: &mut Trio, millis: u64| trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+    duty(&mut trio, 250);
+    let restarted = live_lines(METHOD, "live_readd_hold_restarted");
+    assert_eq!(restarted.len(), 1, "{restarted:?}");
+    assert_eq!(
+        (
+            restarted[0]["old_conn"].as_u64(),
+            restarted[0]["conn"].as_u64()
+        ),
+        (Some(first), Some(second)),
+        "{restarted:?}"
+    );
+    for millis in [LIVE_HOLD_MILLIS, 250 + LIVE_HOLD_MILLIS - 1] {
+        duty(&mut trio, millis);
+        assert_eq!(
+            probed(&trio),
+            None,
+            "under a hold of the new link at {millis} ms"
+        );
+    }
+    assert!(out2.try_recv().is_err(), "nothing sent on the new link yet");
+    duty(&mut trio, 250 + LIVE_HOLD_MILLIS);
+    assert_eq!(probed(&trio), Some(P1), "a whole hold of the new link");
+    assert!(out2.try_recv().is_ok(), "the Inspect, on the new link");
+    assert!(out2.try_recv().is_err(), "one frame");
+    assert!(out1.try_recv().is_err(), "nothing on the replaced link");
+    trio.nodes[0].0.links = local;
+}
+
+/// Blocker 3, the answer's freshness cutoff (#107 slice 2a review, round 2), the accepted
+/// side: a clean answer already queued when the duty next runs, 400 ms (two drop checks) after
+/// the probe went, is taken, and node 3's re-add starts.
+/// Cut: `<= 2 * DROP_CHECK_EVERY_MILLIS` in `inspect_answer` as `<`, red (no re-add).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_clean_answer_read_400_ms_after_its_probe_starts_the_return() {
+    const METHOD: &str = "issue107_r2_a_clean_answer_read_400_ms_after_its_probe_starts_the_return";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let sent = t0.plus_millis(LIVE_HOLD_MILLIS);
+    trio.nodes[0].0.live_readd_duty(sent);
+    assert_eq!(probed(&trio), Some(P1));
+    answer_as_three(&trio, inspects_on_three(&trio), None);
+    assert_eq!(2 * DROP_CHECK_EVERY_MILLIS, 400);
+    trio.nodes[0].0.live_readd_duty(sent.plus_millis(400));
+    assert!(readd_started(&trio, P1), "the answer at 400 ms is taken");
+    assert!(live_lines(METHOD, "live_readd_unanswered").is_empty());
+    assert_eq!(live_lines(METHOD, "live_readd_planned").len(), 1);
+}
+
+/// Blocker 3, the refused side: the same clean answer, queued before the duty runs at 401 ms
+/// after its probe, is too old. Partition 2 (seeded, node 3 left out, the older hold) is
+/// probed and answered clean; the check at 401 ms plans nothing for it, logs
+/// `live_readd_unanswered{why: no_answer}` and restarts its hold; the next check probes
+/// partition 1, and its answer starts that re-add.
+/// Cut: `<= 2 * DROP_CHECK_EVERY_MILLIS` as `<= 2 * DROP_CHECK_EVERY_MILLIS + 1`, red
+/// (partition 2's re-plan starts on the stale answer).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_a_clean_answer_read_401_ms_after_its_probe_is_refused_and_waits_a_hold() {
+    const METHOD: &str =
+        "issue107_r2_a_clean_answer_read_401_ms_after_its_probe_is_refused_and_waits_a_hold";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    let p2 = seed_second_return(&mut trio, NodeId(3), t0);
+    let at = |millis: u64| t0.plus_millis(LIVE_HOLD_MILLIS + millis);
+
+    trio.nodes[0].0.live_readd_duty(at(0));
+    assert_eq!(probed(&trio), Some(p2), "the older hold first");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [p2]);
+    answer_as_three(&trio, asked, None);
+
+    trio.nodes[0].0.live_readd_duty(at(401));
+    assert!(
+        !trio.nodes[0].0.rejoins.contains_key(&p2),
+        "a stale answer plans nothing"
+    );
+    let unanswered = live_lines(METHOD, "live_readd_unanswered");
+    assert_eq!(unanswered.len(), 1, "{unanswered:?}");
+    assert_eq!(
+        (
+            unanswered[0]["partition"].as_u64(),
+            unanswered[0]["why"].as_str()
+        ),
+        (Some(2), Some("no_answer")),
+        "{unanswered:?}"
+    );
+    assert_eq!(probed(&trio), None);
+    assert!(
+        matches!(
+            trio.nodes[0].0.live_readd.links.get(&(p2, NodeId(3))),
+            Some(LinkSeen::Up { since, .. }) if *since == at(401)
+        ),
+        "partition 2's hold starts again"
+    );
+
+    trio.nodes[0].0.live_readd_duty(at(601));
+    assert_eq!(probed(&trio), Some(P1), "the other due copy is probed");
+    let asked = inspects_on_three(&trio);
+    assert_eq!(asked.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [P1]);
+    answer_as_three(&trio, asked, None);
+    trio.nodes[0].0.live_readd_duty(at(801));
+    assert!(readd_started(&trio, P1), "partition 1's re-add started");
+    assert!(!trio.nodes[0].0.rejoins.contains_key(&p2));
+}
+
+/// Review round 2: the gate's other reasons, each with node 3's return otherwise due on
+/// partition 1 and its hold past. `replan_running` (a re-plan of the partition running),
+/// `no_free_slot` (the commit pins three members) and `not_left_out` (no left-out entry for
+/// node 3): for each, two checks probe nothing and log `live_readd_refused{reason}` once,
+/// and undoing it lets the gate pass again. `not_owner` (node 1 no longer the pinned primary)
+/// is the gate's answer too, but the duty never logs it: it forgets a partition it no longer
+/// owns before the gate runs, so the entry is gone and nothing is logged.
+/// Cuts: each of the four clauses removed in turn, red (the gate answers `None`).
+/// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
+#[config_log::retcd_test]
+fn issue107_r2_the_gate_refuses_each_reason_before_the_probe_and_logs_it_once() {
+    const METHOD: &str =
+        "issue107_r2_the_gate_refuses_each_reason_before_the_probe_and_logs_it_once";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, t0) = due_return(dir.path(), |_| {});
+    hold_from(&mut trio, t0);
+    let key = (P1, NodeId(3));
+    let mut from = LIVE_HOLD_MILLIS;
+    let mut refuses = |trio: &mut Trio, reason: &str| {
+        assert_eq!(
+            trio.nodes[0].0.live_readd_refusal(key.0, key.1),
+            Some(reason),
+            "{reason}"
+        );
+        for millis in [from, from + 200] {
+            trio.nodes[0].0.live_readd_duty(t0.plus_millis(millis));
+            assert_eq!(probed(trio), None, "{reason} at {millis} ms");
+        }
+        from += 400;
+        assert!(inspects_on_three(trio).is_empty(), "{reason}: an Inspect");
+        let refused: Vec<_> = live_lines(METHOD, "live_readd_refused")
+            .into_iter()
+            .filter(|line| line["reason"] == reason)
+            .collect();
+        assert_eq!(refused.len(), 1, "{reason}: {refused:?}");
+        assert_eq!(refused[0]["left_out"], 3, "{refused:?}");
+    };
+
+    let replan = Replan {
+        drop: None,
+        rejoiner: None,
+        promote: false,
+        since: t0,
+        release: TailRelease::default(),
+        cause: None,
+    };
+    let rejoin = Rejoin::Revoking {
+        epoch: trio.nodes[0].0.committed[&P1].selected.root.owner_epoch,
+        replan,
+    };
+    trio.nodes[0].0.rejoins.insert(P1, rejoin);
+    refuses(&mut trio, "replan_running");
+    trio.nodes[0].0.rejoins.remove(&P1);
+
+    fn members(trio: &mut Trio) -> &mut Vec<Member> {
+        &mut trio.nodes[0]
+            .0
+            .committed
+            .get_mut(&P1)
+            .expect("committed")
+            .committed
+            .pinned_config
+            .members
+    }
+    let mut third = members(&mut trio)[1];
+    third.node = NodeId(4);
+    members(&mut trio).push(third);
+    refuses(&mut trio, "no_free_slot");
+    members(&mut trio).pop();
+
+    let left = trio.nodes[0].0.left_out.remove(&P1).expect("left out");
+    refuses(&mut trio, "not_left_out");
+    trio.nodes[0].0.left_out.insert(P1, left);
+    assert_eq!(trio.nodes[0].0.live_readd_refusal(key.0, key.1), None);
+
+    let primary = members(&mut trio)
+        .iter_mut()
+        .find(|member| member.node == NodeId(1))
+        .expect("node 1 pinned");
+    primary.role = ReplicaRole::RegularSecondary;
+    assert_eq!(
+        trio.nodes[0].0.live_readd_refusal(key.0, key.1),
+        Some("not_owner")
+    );
+    trio.nodes[0].0.live_readd_duty(t0.plus_millis(from));
+    assert!(
+        !trio.nodes[0].0.live_readd.clocked.contains_key(&key),
+        "a partition no longer owned forgets its return"
+    );
+    assert_eq!(probed(&trio), None);
+    assert!(inspects_on_three(&trio).is_empty());
+    let refused: Vec<_> = live_lines(METHOD, "live_readd_refused")
+        .into_iter()
+        .filter(|line| line["reason"] == "not_owner")
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
 }

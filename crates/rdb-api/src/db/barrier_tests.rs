@@ -1041,9 +1041,14 @@ fn walk_c_held(
 }
 
 /// `forget-tail --through through --give-up-live-copy`, sent again until the owner accepts it:
-/// while the app's route still names the old owner (`NotPrimary`), and while the owner has not
+/// while the app's route still names the old owner (`NotPrimary`), while the owner has not
 /// yet heard a holder's tail in its status probes ("nothing for --through to give up"), which
-/// cuts c5 and c6 hit at random on 2026-11-09.
+/// cuts c5 and c6 hit at random on 2026-11-09, and while another re-plan of the partition is
+/// running. The last is a `no_mutation` refusal that asks to be sent again once that re-plan
+/// commits. In the two-holder walk it is the shadow promote of the re-added node 1: the owner's
+/// shadow duty starts it once node 1 has caught up to the cutoff, and that can land before
+/// this call. Seen on PR #118 at `af21e98` (2026-11-15); the failing assertion and its log
+/// are in that PR's thread.
 fn forget_k2(app: &Db, through: Seq, patience: Duration) {
     let deadline = Instant::now() + patience;
     loop {
@@ -1055,7 +1060,11 @@ fn forget_k2(app: &Db, through: Seq, patience: Duration) {
             Ok(_) => return,
             Err(error)
                 if (error.kind == ErrorKind::NotPrimary
-                    || error.detail.contains("nothing for --through to give up"))
+                    || error.detail.contains("nothing for --through to give up")
+                    || (error.no_mutation
+                        && error
+                            .detail
+                            .contains("is running: ask again once it commits")))
                     && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(100));

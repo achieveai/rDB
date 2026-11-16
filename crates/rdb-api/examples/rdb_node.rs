@@ -32,6 +32,9 @@
 //!   Names are trimmed, so `ops, admin` lists `ops` and `admin`.
 //!   `--unreachable-drop-after-ms` is how long this node, as an owner, waits with no link to a
 //!   copy before it drops that copy (default 10000, least 2000; `Timeouts::unreachable_drop_after`).
+//!   `--live-readd` lets this node, as an owner, add back a copy its own drop clock left out
+//!   once that copy's link is back, with no restart of the copy (`Timeouts::live_readd`, #107).
+//!   Off unless given.
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -94,6 +97,8 @@ struct Args {
     clock_step_file: Option<PathBuf>,
     /// `--unreachable-drop-after-ms`; `None` is `Timeouts::default()`'s.
     unreachable_drop_after_ms: Option<u64>,
+    /// `--live-readd` (#107).
+    live_readd: bool,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -109,6 +114,7 @@ const USAGE: &str = "usage:
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
+           [--live-readd]
 ";
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -212,6 +218,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                         "--unreachable-drop-after-ms takes whole milliseconds".to_owned()
                     })?);
             }
+            "--live-readd" => args.live_readd = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -595,6 +602,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
                 Timeouts::default().unreachable_drop_after,
                 Duration::from_millis,
             ),
+            live_readd: args.live_readd,
             ..Timeouts::default()
         },
         dedup_cap: None,

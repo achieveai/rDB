@@ -338,17 +338,23 @@ partitions and would treat it as partition 1.
 its owner, whether it is ready, and if not, why (`NoLink`, `NoAnswer`, `Recovering`, `Paused`,
 `Fenced`, `Faulted`). It asks every owner at once and waits at most `Timeouts::read`.
 
-`db.promote_partition(partition, to, drop)` moves one partition off a **dead** owner. Any `Db`
+`db.promote_partition(partition, to, drop)` moves one partition off a **dead** or host-faulted owner. Any `Db`
 can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_dev
 `admin promote 3 --partition 2`).
 
-- **It waits out the owner's grant.** About 3.2 s after the owner died, with the default 3 s
-  grant. If the promote is already waiting and the app retries at once, a partition's writes
-  stop for up to the grant plus about 0.45 s (measured 3.0 to 3.4 s). The app's own pause
-  between retries adds to that (measured 3.2 to 3.6 s with one).
-- **A live owner is refused**, as `PromoteError::OwnerAlive`, and nothing is written. The owner
-  must not answer a look, and its grant must not be renewing. `promote_partition` returns
+- **It waits out the owner's grant.** It waits until the owner's last grant expiry plus 0.2 s
+  of margin is proven past. With default budgets that is 6.2 s after its last renewal: the
+  default grant is 6 s (`Budgets::SPEC_DEFAULTS.grant_millis`, which `Db::open` uses). If the promote is already waiting and the app retries at once, a partition's writes
+  stop for up to the grant plus about 0.45 s. The app's own pause between retries adds to that.
+  The figures were measured when the default grant was 3 s (3.0 to 3.4 s, and 3.2 to 3.6 s with
+  a pause between retries); they have not been measured again at 6 s.
+- **A live owner is refused**, as `PromoteError::OwnerAlive`, and nothing is written. Unless its
+  grant is already frozen, the owner must not answer a look without a host fault, and its grant
+  must not be renewing. `promote_partition` returns
   `PromoteError`, so match on it: do not retry `OwnerAlive` while that node lives.
+- **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
+  for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
+  for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -377,25 +383,34 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
 - `db.ownership(partition)` returns `Some(Ownership)` while a node **in this process** leads the
   partition. It holds `token` (an `OwnerToken`: `generation`, then `owner_epoch`) and
   `remaining`, the time left on the node's write permission.
-- `db.still_owner(partition, token)` is the same test rDB makes before it admits a write
-  (admission check 6), on the clock of the node that leads it. It sends no message.
+- `db.still_owner(partition, token)` is the test rDB makes before it admits a write
+  (admission check 6), plus fences and faults, on the clock of the node that leads it. It sends
+  no message. See "What `still_owner` promises" below.
 - Both read only the nodes this `Db` runs. An app-only `Db` (no local nodes) always gets `None`
   and `false`. So call them in the process that runs the leading node.
+- Both assume the effects they fence run **in that same process, on the same machine**: a
+  partition's primary and the work it guards (for SBX, its sandbox) live together. If the node
+  stops, that work stops with it and is moved elsewhere with the partition. An effect made by
+  another process or machine is not covered by `still_owner`, only by the destination's fence.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
 
 **What `still_owner` promises.** It mirrors admission check 6 (the grant's horizon and the
-lineage) and nothing else.
+lineage), plus fences and faults, and nothing else. `ownership` follows the same rule.
 
 - It turns false no later than check 6 stops admitting writes for that token. When time runs
-  out, both stop at the same tick. After a fence (a frozen grant, a revoked epoch), it turns
-  false before rDB admits another write. A fence stays false even if the node's clock is later
-  stepped back.
+  out, both stop at the same tick. After a fence (a frozen grant, a revoked epoch; a node fence
+  or one scoped to the partition), it turns false before rDB admits another write. A fence
+  stays false even if the node's clock is later stepped back. A fence at tick 0 also turns it
+  false, though that fence's view still passes check 6 (its horizon saturates to the fence's
+  own tick).
 - If the node faults, it turns false before any caller is told of the fault, and stays false.
   A stopped or restarted node owns nothing until it leads again.
 - While it is true, no other node can own the partition under this token or a higher one.
-- It does **not** mean the partition takes writes. Checks 7 and 8 and a read-only recovery
-  refuse writes while `still_owner` is true: a frozen queue (`PROTECTION_PAUSED`), an L1 pause
-  (`PROTECTION_PAUSED`), or a `ReadOnly` commit (`RECOVERY_READ_ONLY`).
+- It does **not** mean the partition takes writes. Checks 7 and 8 refuse writes while
+  `still_owner` is true: a frozen queue (check 7, `PROTECTION_PAUSED`, or `RECOVERY_READ_ONLY`
+  after a `ReadOnly` commit, which freezes the queue), an L1 pause (check 8,
+  `PROTECTION_PAUSED`), or an L1 block for an operator (check 8,
+  `DIVERGENCE_REQUIRES_OPERATOR`).
 - After a cut-off with no promote, the node takes a new grant and the **same** token is owned
   again, as rDB writes again. After a promote, the old token is never owned again.
 
@@ -427,6 +442,10 @@ the check and the effect.
   effect are one serialized step, so a register cannot land between them. An equal token is
   accepted. A lower one is refused.
 - The record is durable and never goes down. A gateway or store restart keeps it.
+- The record and the lock are **shared**: every machine's gateway for that workspace consults
+  the same record and takes the same lock, the old owner's gateway as well as the new one's. A
+  lock local to each machine does not stop an old owner on another machine: its gateway checks
+  its own copy, which the new owner's register never raised.
 
 Protection starts at the register, not at rDB's promote. Between the promote and the register,
 the old owner's token still equals the record, and its effects are accepted. That is safe only
@@ -441,16 +460,31 @@ because the new owner restores and acts **after** its register.
 
 For a sandbox gateway (SBX):
 
+- **The lock.** SBX's container runtime takes a lock **per sandbox** across container creation
+  and snapshot upload, and one sandbox is one workspace. That per-workspace (per-sandbox) lock
+  is the serialization expected here: the register, each create and each upload check the
+  workspace's fence record while holding it. (Later, this work may move from the gateway to the
+  supervisor on rDB. That is a direction, not a promise; until it happens, the gateway's lock is
+  the one that counts.)
+- **Requirement: the lock and the record are shared.** SBX must use one lock and one
+  highest-token record per workspace, the same one consulted by every machine's gateway for that
+  workspace. The old owner's gateway, on the old machine, must take the same lock and read the
+  same record as the new owner's gateway when it registers its token. A lock local to each
+  machine does not stop an old owner on another machine. Whether SBX's lock is shared is not yet
+  confirmed (2026-11-15). **Until SBX confirms it, this fence is not claimed** for SBX.
 - Stamp the token on **every** side effect: each container (as a label) and each snapshot upload.
 - **Snapshots.** The snapshot store's fence record is per workspace. An upload is a conditional
   write that checks the record. The new owner registers its token there before it restores.
 - **Containers.** Container creation must be serialized with the register on the same record:
-  take the lock (or do the conditional write), check the token, create, release. A sweep alone
+  take the sandbox's lock, check the token, create, release. A sweep alone
   is not enough. A stale owner can pass its check, pause, and create after the new owner's
   sweep found nothing, and that container would survive. With creation serialized, a stale
   create either lands before the register (and the sweep stops it) or is refused.
 - After its register, the new owner stops any container of that workspace with a lower token.
   One sweep then suffices.
+- **Not covered.** SBX must list each of its side effects whose destination cannot compare a
+  token, and document each one as not covered by this fence. For those, `still_owner` narrows the
+  window and nothing closes it.
 
 What SBX's own acceptance tests must show, against the real stores: an effect at an equal token
 is accepted; after a register of a higher token, a lower one is refused; that refusal holds after
@@ -909,7 +943,43 @@ Two clocks decide when a copy is dropped:
 `Timeouts::unreachable_drop_after` under 2,000 ms is refused at open with `OpenError::Config`.
 Set it to the same value on every node. A lower value pauses writes for less when a node dies,
 but a restart or link loss longer than the value drops the copy from every partition that owner
-holds, and that copy comes back only when its node restarts.
+holds, and that copy comes back only when its node restarts, unless `Timeouts::live_readd` is
+on (below).
+
+**`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
+it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
+its own, both as an owner (to re-add a copy it dropped) and as a returning copy (to mark a
+landing it refused, see below). With it on, a copy the owner dropped on one of the two clocks
+above comes back by itself once its link is back:
+
+- **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
+  copy's link go down. A copy that stayed linked while it held writes up (a slow disk, say)
+  still needs a restart. So does a copy dropped by an operator, a move or a promote, and any
+  copy an owner finds left out after the owner itself restarted.
+- **How.** The copy's link must stay up for 5 s on one connection (a reconnect starts the 5 s
+  again). Then the owner asks the copy for its state. If it answers with no fault, the owner
+  adds it back at the process it still runs, as a standby that catches up while writes go on,
+  then as a full copy. Nothing is restarted: the copy's process is the same one.
+- **What stops it.** The partition being read-only, a re-plan, `admin rebuild` or a move under
+  way, or no free slot: the owner logs `live_readd_refused` once with the reason, and tries
+  again once that clears. A copy that does not answer (`live_readd_unanswered`), answers with a
+  fault, or is not taken (`live_readd_not_planned`) waits another 5 s. Each drop gets one
+  re-add: if that re-add fails, the copy stays out until its node restarts.
+- **Restart warning.** While a return can still come, the owner does not log
+  `copy_left_out_until_restart`. Once the copy's link has stayed down for
+  `Timeouts::unreachable_drop_after` again, it does, naming the node.
+- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
+  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
+  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
+  older build. The re-add itself needs a partition that takes writes. But if the partition goes
+  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
+  and the partition can then stay read-only until that copy's node restarts. A build older than
+  check B can also be left holding a lineage with a hole in it, which nothing refuses
+  (ADR-rdb-0009 section 7).
+- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
+  them apart. Turning it on by default first needs the protocol version raised to 10, or a
+  capability bit that gates the re-add, so a node without these guards is refused or never
+  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -948,7 +1018,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 - **A copy falls behind or stops answering.** After a short time (about 3 s), node 1 pauses
   new writes. They resume once that copy catches up, or once rDB stops waiting for it: in the
   walk, 15 s after the kill, while the copy stayed down.
-- **A copy cut off long enough to be dropped stays out after the link heals.** That is the
+- **A copy cut off long enough to be dropped stays out after the link heals,** with
+  `Timeouts::live_readd` off, the default (with it on, see that setting above). That is the
   copy rDB stopped waiting for, in the bullet above. Writes keep working on the other two
   copies. Healing the link alone does not add it back. Restart that node: `lr restart N` with
   three processes, or `db.restart_node(NodeId(N))` embedded. It comes back as a standby first,
