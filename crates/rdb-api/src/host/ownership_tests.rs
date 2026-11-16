@@ -1006,15 +1006,18 @@ fn owned_host(dir: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
     host
 }
 
-/// How long [`answered_only_after_revoke`] watches for an early answer. A fault path that
-/// replies first replies at once, so it is seen well inside this; a correct one waits for the
-/// reader, so the row always waits this long.
-const ORDER_WAIT: Duration = Duration::from_millis(250);
+/// How long [`answered_only_after_revoke`] lets a fault path run before calling it stuck: it
+/// has neither begun to revoke nor returned. Only a hang guard; the order check itself waits
+/// on no clock.
+const ORDER_STUCK: Duration = Duration::from_secs(10);
 
 /// Run `fault` on another thread while this one holds `views` for reading. `OwnerViews::revoke`
-/// takes the write lock, so a path that revokes before it replies is stuck until the reader
-/// lets go, and its waiter hears nothing in [`ORDER_WAIT`]. A path that replies first is heard
-/// at once. Then the reader lets go, the answer is the fault, and both readers read false.
+/// takes the write lock, so a path that revokes before it replies is stuck at the revoke until
+/// the reader lets go. This thread waits until the path has begun to revoke
+/// (`OwnerViews::revokes_begun` moves) or has returned, and only then looks at the waiter: a
+/// path that replied before it called revoke has already sent, so the waiter holds the answer
+/// and the row is red. No timer decides it, so a fault thread that starts late changes nothing.
+/// Then the reader lets go, the answer is the fault, and both readers read false.
 /// Returns that answer.
 pub(super) fn answered_only_after_revoke(
     name: &str,
@@ -1024,10 +1027,19 @@ pub(super) fn answered_only_after_revoke(
 ) -> Answer {
     std::thread::scope(|scope| {
         let readers = views.hold_readers();
+        let begun = views.revokes_begun();
         let faulting = scope.spawn(fault);
-        let early = answer.recv_timeout(ORDER_WAIT);
+        let stuck = Instant::now() + crate::host::test_patience(ORDER_STUCK);
+        while views.revokes_begun() == begun && !faulting.is_finished() {
+            assert!(
+                Instant::now() < stuck,
+                "{name}: the fault path neither began to revoke nor returned"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let early = answer.try_recv();
         assert!(
-            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            matches!(early, Err(mpsc::TryRecvError::Empty)),
             "{name}: the waiter heard of the fault before ownership was revoked: {early:?}"
         );
         drop(readers);
@@ -1060,7 +1072,7 @@ fn pending(request: u64, kind: PendingKind, reply: Sender<Answer>) -> (RequestId
 /// nothing until revoke has run, then hears the fault with both readers false.
 /// Cuts: `fail_waiter` sending before it revokes, red ("heard of the fault before ownership
 /// was revoked"); `set_fault` revoking after its pending loop, red the same way.
-/// Unit (one host each, no cluster): each case waits [`ORDER_WAIT`].
+/// Unit (one host each, no cluster).
 #[config_log::retcd_test]
 fn own84_6c_both_fault_paths_revoke_before_the_waiter_can_read_the_fault() {
     let rt = current_thread();
@@ -1093,7 +1105,7 @@ fn own84_6c_both_fault_paths_revoke_before_the_waiter_can_read_the_fault() {
 /// [`answered_only_after_revoke`]. The two compile callers in `Host::client` are pinned in
 /// `own84_6f_each_compile_caller_in_client_revokes_before_it_answers` (`tests.rs`).
 /// Cut: no revoke in `fail_waiter`, red on the first case.
-/// Unit (one host per case, no cluster): each case waits [`ORDER_WAIT`].
+/// Unit (one host per case, no cluster).
 #[config_log::retcd_test]
 fn own84_6d_each_fail_waiter_caller_revokes_before_it_answers() {
     type Case = fn(&mut Host, Sender<Answer>) -> Result<(), Fault>;
@@ -1175,7 +1187,7 @@ fn own84_6d_each_fail_waiter_caller_revokes_before_it_answers() {
 /// readers are false and the fault names the storage read fault.
 /// Cut: `previous_answer`'s `object_answer` arm sending the fault before `fail_waiter`'s
 /// revoke, red ("heard of the fault before ownership was revoked").
-/// Unit (one host, no cluster): waits [`ORDER_WAIT`].
+/// Unit (one host, no cluster).
 #[config_log::retcd_test]
 fn own84_6g_a_previous_view_read_fault_revokes_before_it_answers() {
     use rdb_core::contracts::storage::Namespace;

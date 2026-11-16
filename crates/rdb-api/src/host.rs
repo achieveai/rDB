@@ -333,6 +333,15 @@ const MAIL_BEFORE_DUTIES: usize = 256;
 /// A-R192a: a step of a node's thread longer than this is logged at info (`host_slow_step`).
 const SLOW_STEP_MILLIS: u64 = 250;
 
+/// Issue #109: a WAL sync in flight longer than this is slow, and the host says so at Warn
+/// without faulting: `wal_sync_slow_in_flight` once while it runs, and `wal_sync_slow` when
+/// it returns to a live node (`Host::synced`). A sync that returns after the node faulted, or
+/// at stop, logs its own Info line instead (`sync_finished_after_fault`,
+/// `sync_finished_at_stop`). 5 s, about 1.7 times the slowest sync measured under load
+/// (2,973 ms, lr6), the old stuck limit. Only a sync still in flight past
+/// `sync_stuck_millis` faults the node.
+const SYNC_SLOW_WARN_MILLIS: u64 = 5_000;
+
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
 /// window. That CAS takes 5-20 ms here, and up to ~80 ms with the suite running in parallel;
@@ -2296,6 +2305,8 @@ type LinkWaiter = (Box<RecoveryResult>, Site);
 struct InFlight {
     started: Instant,
     after: Vec<AfterSync>,
+    /// Issue #109: `wal_sync_slow_in_flight` is logged for this sync, once.
+    warned: bool,
 }
 
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
@@ -4219,6 +4230,7 @@ impl Host {
         self.syncing = Some(InFlight {
             started: Instant::now(),
             after,
+            warned: false,
         });
         Ok(())
     }
@@ -4281,7 +4293,16 @@ impl Host {
         } = done;
         let ok = flushed.is_ok();
         let result = self.engine.finish_sync(sync, flushed);
-        if took > SLOW_STEP_MILLIS {
+        if took > SYNC_SLOW_WARN_MILLIS {
+            tracing::warn!(
+                node = self.node.0,
+                millis = took,
+                ok,
+                slow_ms = SYNC_SLOW_WARN_MILLIS,
+                stuck_ms = self.sync_stuck_millis,
+                "wal_sync_slow"
+            );
+        } else if took > SLOW_STEP_MILLIS {
             tracing::info!(node = self.node.0, millis = took, ok, "wal_sync_slow");
         }
         let mut at = 0;
@@ -4879,12 +4900,36 @@ impl Host {
     /// F4 (A-R317): a sync in flight past [`Self::sync_stuck_millis`] is a stuck disk. The
     /// node faults, as any host fault does: it runs nothing more, so A1 renews no more, and the
     /// grant lapses for another node to take over. `true` when it faulted.
+    ///
+    /// Issue #109: one in flight past [`SYNC_SLOW_WARN_MILLIS`] but not past the stuck limit is
+    /// slow, not yet stuck. It is logged once at Warn and costs nothing else: it credits nothing
+    /// until it returns, and L1 pauses admission on unsafe age meanwhile.
     fn stuck_sync(&mut self) -> bool {
         let Some(flight) = &self.syncing else {
             return false;
         };
         let held = millis(flight.started);
-        if held <= self.sync_stuck_millis {
+        self.stuck_sync_held(held)
+    }
+
+    /// [`Self::stuck_sync`] for a sync in flight `held` ms: the watchdog's rule on a given
+    /// age, so a row can hold its boundaries to the millisecond. `false` with none in flight.
+    fn stuck_sync_held(&mut self, held: u64) -> bool {
+        let stuck_ms = self.sync_stuck_millis;
+        let Some(flight) = &mut self.syncing else {
+            return false;
+        };
+        if held <= stuck_ms {
+            if held > SYNC_SLOW_WARN_MILLIS && !flight.warned {
+                flight.warned = true;
+                tracing::warn!(
+                    node = self.node.0,
+                    held_ms = held,
+                    slow_ms = SYNC_SLOW_WARN_MILLIS,
+                    stuck_ms,
+                    "wal_sync_slow_in_flight"
+                );
+            }
             return false;
         }
         tracing::error!(
@@ -4900,11 +4945,23 @@ impl Host {
         true
     }
 
-    /// How long until the sync in flight counts as stuck; `None` when none is in flight.
+    /// How long until [`Self::stuck_sync`] next has something to do for the sync in flight:
+    /// warn it is slow, then fault it as stuck. `None` when none is in flight.
     fn until_stuck(&self) -> Option<Duration> {
+        let flight = self.syncing.as_ref()?;
+        self.until_stuck_after(flight.started.elapsed())
+    }
+
+    /// [`Self::until_stuck`] for a sync in flight `elapsed`: the wake rule on a given age, so a
+    /// row can check the interval exactly. `None` when none is in flight.
+    fn until_stuck_after(&self, elapsed: Duration) -> Option<Duration> {
         self.syncing.as_ref().map(|flight| {
-            Duration::from_millis(self.sync_stuck_millis.saturating_add(1))
-                .saturating_sub(flight.started.elapsed())
+            let next = if flight.warned || SYNC_SLOW_WARN_MILLIS >= self.sync_stuck_millis {
+                self.sync_stuck_millis
+            } else {
+                SYNC_SLOW_WARN_MILLIS
+            };
+            Duration::from_millis(next.saturating_add(1)).saturating_sub(elapsed)
         })
     }
 
