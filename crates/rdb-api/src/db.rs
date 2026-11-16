@@ -3837,7 +3837,7 @@ impl Db {
     /// A node whose restart failed ([`Self::restart_failed`]) runs no process, so it holds and
     /// sends nothing. The stream leaves it out and stays open on the others (logged
     /// `ownership_subscribe_node_down{node}`), and a later restart that starts the node hands
-    /// it every such stream still open, current state first: nothing is missed either way. A
+    /// it every such stream still open, so that node's next stop ends them. A
     /// node that cannot be reached for any other reason drops the subscriber at once (logged
     /// `ownership_subscribe_unsent`), so a stream that may miss its events never looks whole.
     /// In a `Db` with no running node (an app-only one, or one whose every restart failed),
