@@ -229,6 +229,18 @@ Stated plainly so it cannot be quoted out of context, in the same register as rE
 6. **Moving this boundary is a human decision**, recorded as an amendment to this ADR plus the
    separate approval that `docs/rdb/developer-handoff.md` §9 requires. No agent moves it.
 
+**Amendment, 2026-11-15: an opt-in failover planner (PR #119, issue #81 C1).** Approved by the
+owner on 2026-11-15 ([#81 comment](https://github.com/achieveai/rDB/issues/81#issuecomment-6901036233)).
+That approval is both the rule 6 decision and the `developer-handoff.md` §9 approval, for this scope
+only.
+
+- The automatic failover planner may ship **opt-in**. It runs only when `DbConfig::failover` is
+  set, and it is **off by default**. With the setting off, rule 3 holds unchanged.
+- It is **not for production** until fencing is shown on a real rEtcd cluster with real clocks.
+  Turning it on in a deployment is the operator's choice, made with that limit stated.
+- **Turning it on by default** still needs V2 claimed on a real cluster (rule 3), ADR-rdb-0007 and
+  this ADR Accepted, and a separate human approval recorded as a further amendment here.
+
 ## Consequences
 
 - A summary line can no longer say "V3 passed" without its form. That is the point, and it will read

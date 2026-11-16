@@ -66,6 +66,7 @@ async fn open_db_of(partitions: Option<u32>) -> (Arc<Db>, impl Sized) {
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        failover: None,
     };
     let db = Arc::new(
         Db::open(config, store, tokio::runtime::Handle::current())

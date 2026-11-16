@@ -945,6 +945,7 @@ where
         }
     };
     let config = DbConfig {
+        failover: None,
         partitions: args.partitions,
         ack_floor: true,
         dir: args.dir.clone(),
@@ -9425,6 +9426,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            failover: None,
             partitions: None,
             ack_floor: true,
             dir,
@@ -9505,6 +9507,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            failover: None,
             partitions: Some(8),
             ack_floor: true,
             dir,
@@ -9561,6 +9564,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            failover: None,
             partitions: None,
             ack_floor: true,
             dir: dir.join("run"),
@@ -9623,6 +9627,7 @@ mod tests {
             .expect("a control client"),
         );
         let config = DbConfig {
+            failover: None,
             partitions: None,
             ack_floor: true,
             dir: root.path().join("run"),

@@ -36,6 +36,7 @@ fn config(dir: &Path, partitions: Option<u32>) -> DbConfig {
         client: DEFAULT_CLIENT,
         boot: None,
         storage: crate::StorageOptions::default(),
+        failover: None,
     }
 }
 

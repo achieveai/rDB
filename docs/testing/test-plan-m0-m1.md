@@ -673,7 +673,9 @@ Normative. A test violating any of these is rejected in review.
 1. **No fixed sleeps.** `tokio::time::sleep`, `thread::sleep`, and `yield_now` loops are
    banned as synchronization. Enforced by a source-scan test over `tests/**` and
    `crates/*/tests/**` (same mechanism as M0-58), allowlisting only sleeps that are the
-   *subject* of a test (e.g. an explicit `NetFault::delay`).
+   *subject* of a test (e.g. an explicit `NetFault::delay`). The one other exception is the
+   README's grant-driven observation window: a row asserting that nothing happens for N grant
+   lifetimes may sleep `lifetimes(n)`, never a literal duration (README, "No fixed sleeps").
 2. **Poll with deadlines.** Every wait is `wait_for_leader(d)` / `wait_applied(i, d)` /
    `poll_until(pred, d, interval)`. Default deadline 5 s; 15 s for election-after-partition;
    never above 30 s. A timeout must fail with the last observed `NodeMetrics` of every node in

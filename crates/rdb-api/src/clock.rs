@@ -622,6 +622,20 @@ pub(crate) struct ClockHold {
 }
 
 #[cfg(test)]
+impl ClockHold {
+    /// Move every copy of the held clock forward by exactly `millis`, still held: a row that
+    /// needs a boundary to the millisecond reads the tick it set, never one real time chose.
+    pub(crate) fn advance(&self, millis: u64) {
+        let mut read = self
+            .capped
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.1 = read.1.saturating_add(millis);
+    }
+}
+
+#[cfg(test)]
 impl Drop for ClockHold {
     fn drop(&mut self) {
         let mut read = self

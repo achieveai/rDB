@@ -2020,6 +2020,7 @@ fn db_config(dir: &FsPath) -> crate::db::DbConfig {
         client: crate::db::DEFAULT_CLIENT,
         boot: None,
         storage: crate::StorageOptions::default(),
+        failover: None,
     }
 }
 

@@ -708,6 +708,7 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
             rt.block_on(restore_control(&*store, records, target))?;
         }
         let config = DbConfig {
+            failover: None,
             partitions: None,
             ack_floor: true,
             dir: args.dir.join("db"),
@@ -850,6 +851,7 @@ fn run_remote(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
         .map_err(|down| format!("links down: {down}"))?;
     println!("links up nodes={peers:?}");
     let config = DbConfig {
+        failover: None,
         partitions: None,
         ack_floor: true,
         dir: args.dir.join("app"),

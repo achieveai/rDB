@@ -133,7 +133,7 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 const HANDSHAKE: Duration = Duration::from_secs(5);
 
 /// How often a link's reader probes the peer's clock (#80 S2c): also the link keepalive.
-const PROBE_PERIOD: Duration = Duration::from_secs(1);
+pub(crate) const PROBE_PERIOD: Duration = Duration::from_secs(1);
 
 /// A link with no echo for this long is closed: the peer stopped answering without a FIN.
 const PROBE_SILENCE: Duration = Duration::from_secs(5);
@@ -252,6 +252,9 @@ impl Conn {
     }
 
     fn write(&self, frame: &Frame) {
+        if self.faults.muted() {
+            return;
+        }
         let body = wire::encode(frame);
         let sent = lock(&self.tx)
             .as_ref()
@@ -491,6 +494,21 @@ impl Net {
                 (*node, state)
             })
             .collect()
+    }
+
+    /// Whether `node` answered a clock probe on its live link within `within` (#81 C1, ruling
+    /// C-2). Echoes come from the peer's net tasks, not its host thread, so a peer whose host is
+    /// stuck on a slow sync still answers; a stopped or frozen process does not. False with no
+    /// link up, a link that has echoed no probe yet, or a node that is no peer of this process.
+    #[must_use]
+    pub fn heard_within(&self, node: NodeId, within: Duration) -> bool {
+        lock(&self.shared.routes)
+            .get(&node)
+            .and_then(|route| route.conn.as_ref())
+            .is_some_and(|conn| {
+                conn.probe_echoed.load(Ordering::Relaxed) > 0
+                    && lock(&conn.answered_at).elapsed() < within
+            })
     }
 
     /// Wait until every node in `nodes` has its link up, or `within` passes, or one of them
@@ -912,6 +930,10 @@ async fn read(shared: Arc<Shared>, conn: Arc<Conn>, mut inbound: Streaming<Envel
                         Err(error) => return error.to_string(),
                     },
                 };
+                // Mute: a stopped process reads nothing, the clock exchange included.
+                if shared.faults.muted() {
+                    continue;
+                }
                 if !held.is_empty() || shared.faults.holds(&conn.peer) {
                     // A hold keeps data back, never the clock exchange: the peer's silence
                     // timer knows nothing of this side's hold, so a probe held past
