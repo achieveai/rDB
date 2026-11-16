@@ -378,8 +378,9 @@ async fn planner_grant_raw(store: &Arc<dyn ConfigStore>) -> Option<(Bytes, u64)>
 /// Cut: write the grant unconditionally (`expected_mod_revision: None`); node 3 overwrites
 /// node 2's record and holds too, red. Cut: on a conflict, rewrite the record found as it is
 /// (same bytes, a new revision); that write waits at the gate for a release that never comes,
-/// so the row does not finish. Before the one-shot gate, with a few yields before the
-/// snapshot, node 3's writes went through the recycled permit first and that cut passed.
+/// and the bounded join fails the row naming the parked write. Before the one-shot gate, with
+/// a few yields before the snapshot, node 3's writes went through the recycled permit first and
+/// that cut passed.
 #[config_log::retcd_test]
 fn expired_grant_takeovers_race() {
     let rt = crate::db::reopen_tests::runtime();
@@ -409,33 +410,50 @@ fn expired_grant_takeovers_race() {
     hold.advance(takeover_floor(&budgets) + 1);
     let (mut m2, mut m3) = (Memory::default(), Memory::default());
     let (stale_started, first_done) = (tokio::sync::Notify::new(), tokio::sync::Notify::new());
-    let (held_first, held_stale, snapshot) = rt.block_on(async {
-        tokio::join!(
-            async {
-                let held = first.hold(&mut m2).await;
-                first_done.notify_one();
-                held
-            },
-            async {
-                // Node 2's write is parked at the gate; only now does node 3 read, so it reads
-                // the same expired record at the same revision.
-                gated.put_arrived.notified().await;
-                stale_started.notify_one();
-                stale.hold(&mut m3).await
-            },
-            async {
-                stale_started.notified().await;
-                // Node 3's write is parked behind node 2's. One release lets node 2's through
-                // alone; node 3's stays parked until the second, after the snapshot.
-                gated.put_arrived.notified().await;
-                gated.release();
-                first_done.notified().await;
-                let snapshot = planner_grant_raw(&store).await.expect("node 2's write");
-                gated.release();
-                snapshot
-            }
-        )
-    });
+    // The race needs two writes and two releases. A third write (a conflict that rewrites the
+    // record it found, say) parks at the one-shot gate for a release that never comes, so the
+    // join is bounded and a stuck race fails the row rather than hanging it (PR #119 review).
+    let patience = crate::host::test_patience(Duration::from_millis(10 * budgets.grant_millis));
+    let (held_first, held_stale, snapshot) = rt
+        .block_on(async {
+            // Built inside the runtime: a timer needs its reactor.
+            tokio::time::timeout(patience, async {
+                tokio::join!(
+                    async {
+                        let held = first.hold(&mut m2).await;
+                        first_done.notify_one();
+                        held
+                    },
+                    async {
+                        // Node 2's write is parked at the gate; only now does node 3 read,
+                        // so it reads the same expired record at the same revision.
+                        gated.put_arrived.notified().await;
+                        stale_started.notify_one();
+                        stale.hold(&mut m3).await
+                    },
+                    async {
+                        stale_started.notified().await;
+                        // Node 3's write is parked behind node 2's. One release lets node
+                        // 2's through alone; node 3's stays parked until the second, after
+                        // the snapshot.
+                        gated.put_arrived.notified().await;
+                        gated.release();
+                        first_done.notified().await;
+                        let snapshot = planner_grant_raw(&store).await.expect("node 2's write");
+                        gated.release();
+                        snapshot
+                    }
+                )
+            })
+            .await
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "the takeover race did not finish within {patience:?}: a write beyond the two \
+                 released (likely an extra write after the conflict) is parked at the one-shot \
+                 gate"
+            )
+        });
     assert!(held_first, "node 2, released first, holds");
     assert!(!held_stale, "node 3's stale CAS holds nothing");
     assert!(

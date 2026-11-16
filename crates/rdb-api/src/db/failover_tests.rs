@@ -686,7 +686,9 @@ fn alive_owner_is_not_failed_over(method: &str, alert: bool, harm: impl FnOnce(&
             "{alerts:?}"
         );
     }
-    std::thread::sleep(Duration::from_millis(2 * budgets().grant_millis));
+    // An absence is asserted, so nothing can be polled for: wait two grant lifetimes, the
+    // configured timing, and look once.
+    std::thread::sleep(lifetimes(2));
     assert_eq!(rig.record(1), before, "partitions/1 unchanged");
     assert!(!rig.grants()[&NodeId(1)].frozen, "nothing froze grants/1");
     assert!(logged(method, "planner_promote_decision").is_empty());
@@ -893,7 +895,7 @@ fn own81_d1_v9_off_by_default_then_a_planner_started_after_the_owner_died_fails_
     let moving = rig.owned_by(NodeId(1));
     let before: Vec<PartitionRecord> = (1..=6).map(|p| rig.record(p)).collect();
     rig.stop(0);
-    std::thread::sleep(Duration::from_millis(3 * budgets().grant_millis));
+    std::thread::sleep(lifetimes(3));
     let after: Vec<PartitionRecord> = (1..=6).map(|p| rig.record(p)).collect();
     assert_eq!(after, before, "D1: no record changed");
     assert_eq!(rig.planner_grant(), None, "D1: no planner ran");
@@ -977,7 +979,7 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
     const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
     let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
     // Inside the grace: the row asserts no alert, and past the grace one is due.
-    std::thread::sleep(Duration::from_millis(budgets().grant_millis));
+    std::thread::sleep(lifetimes(1));
     let node2_boot = rig.procs[1].boot;
     assert_eq!(rig.owned_by(NodeId(2)), vec![2], "node 2 owns partition 2");
     assert!(
