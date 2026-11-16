@@ -969,7 +969,9 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
 /// the row saw it or not by chance (lead's gate at dc2b1b4). The setup is then delayed by one
 /// grant lifetime before the first check, and the state still holds (PR #119 review: a cut
 /// applied after the opens let node 2's first grant land first). Then node 2 is let go and
-/// takes its grant, and still no alert.
+/// takes its grant, and still no alert. Only nodes 1 and 3 run a planner, so the one holding the
+/// planner grant can judge node 2; the wait for `planner_owner_no_grant_yet` naming node 2 fails
+/// the row if nothing did.
 /// Integration (~18 s): the old grant runs out, the delay, a few sweeps, the owners' grants.
 /// Cut: drop the "no grant of its own" check in `sweep`; node 2's old record runs out while it
 /// answers, the alert is said for it, red. Or judge "of its own" by the record's presence, not
@@ -977,7 +979,13 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
 #[config_log::retcd_test]
 fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
     const METHOD: &str = "own81_cold_start_raises_no_alert_before_an_owners_first_grant";
-    let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
+    // No planner on node 2: a planner never judges its own node, so with node 2 holding the
+    // planner grant nothing would judge it and the wait below would time out (PR #119 round 6).
+    let rig = opened_cut(
+        3,
+        [Some(failover()), None, Some(failover())],
+        Some(NodeId(2)),
+    );
     // Inside the grace: the row asserts no alert, and past the grace one is due.
     std::thread::sleep(lifetimes(1));
     let node2_boot = rig.procs[1].boot;
