@@ -5637,9 +5637,13 @@ impl Host {
             } else {
                 self.own_states.insert(partition, next);
             }
+            // The log's horizon is A1's last view even when it is dead (fenced, or published
+            // already past its horizon), so a `Deactivated` it ends still says where the
+            // horizon was (#123: own83_5 read 0 when that publication landed first).
+            let logged = self.authority_views.get(&partition).copied();
             for step in steps {
                 let event = self.ownership_event(partition, step);
-                self.log_ownership_event(&event, step, view.as_ref());
+                self.log_ownership_event(&event, step, logged.as_ref());
                 self.publish_ownership(event);
             }
         }
@@ -5736,8 +5740,9 @@ impl Host {
     }
 
     /// `ownership_event{node, partition, state, generation, owner_epoch, tick, horizon, deadline,
-    /// subscribers}` (the log layer redacts a field named `token`): `tick` is the host clock at the change, `horizon` the view's
-    /// `valid_through_tick`, `deadline` a `Deactivating`'s stop tick (0 otherwise).
+    /// subscribers}` (the log layer redacts a field named `token`): `tick` is the host clock at the change, `horizon` A1's
+    /// last view's `valid_through_tick` (0 at a stop, or with no view), `deadline` a
+    /// `Deactivating`'s stop tick (0 otherwise).
     fn log_ownership_event(
         &self,
         event: &OwnershipEvent,
