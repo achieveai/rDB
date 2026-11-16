@@ -51,7 +51,7 @@ use crate::host::{
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::ownership::{
-    OwnerToken, Ownership, OwnershipEvent, RouteInfo, RouteStamp, Subscriber, SUBSCRIBER_CAPACITY,
+    OwnerToken, Ownership, OwnershipEvents, RouteInfo, RouteStamp, Subscriber, SUBSCRIBER_CAPACITY,
 };
 use crate::transport::Links;
 use ack_floor::AckFloor;
@@ -3706,19 +3706,27 @@ impl Db {
     ///
     /// The receiver holds up to 4096 unread events. A subscriber that falls that far behind is
     /// dropped (logged `ownership_subscriber_dropped{node, why}`), and so is every subscriber
-    /// when a node here stops: its receiver then ends (`recv` answers `Err`) once every node
-    /// has let go of it, and the app calls this again, which starts again from the current
-    /// state. In an app-only `Db`, which runs no node, it ends at once. See
-    /// `docs/rdb/embed.md`, "Ownership events".
+    /// when a node here stops, after that node sends `Deactivated` for what it held. A
+    /// subscriber is also dropped at once when a node here cannot be reached (its restart
+    /// failed, logged `ownership_subscribe_unsent`): a stream that misses one node's events
+    /// must not look whole. A dropped receiver ends (`recv` answers `Err`) once every node has
+    /// let go of it. The stream has no end-of-snapshot marker, and an ended one cannot say what
+    /// was missed, so on its end the app stops everything it started from it, forgets it, and
+    /// calls this again, which starts again from the current state. In an app-only `Db`, which
+    /// runs no node, it ends at once. See `docs/rdb/embed.md`, "Ownership events".
     #[must_use]
-    pub fn ownership_events(&self) -> mpsc::Receiver<OwnershipEvent> {
+    pub fn ownership_events(&self) -> OwnershipEvents {
         let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
         for handle in lock(&self.nodes).iter() {
             if handle
                 .send(Msg::Subscribe(Arc::clone(&subscriber)))
                 .is_err()
             {
+                // #123 review: the nodes already reached keep it otherwise, and this node's
+                // events would be missing from a stream that never ends.
+                subscriber.drop_everywhere();
                 tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
+                break;
             }
         }
         events

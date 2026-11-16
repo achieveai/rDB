@@ -253,8 +253,11 @@ impl OwnerViews {
 /// **The grant cap** is for grants far shorter than the spec's (crate tests run 600 ms grants,
 /// which warn 150 ms ahead), so a partition there still activates and still warns before its
 /// horizon. At the spec's grant it never binds.
+///
+/// Crate-private: `Budgets` is a core type the app surface does not re-export (#123 review).
+/// Apps read [`DEACTIVATING_LEAD_MILLIS`].
 #[must_use]
-pub const fn deactivating_lead_millis(budgets: &Budgets) -> u64 {
+pub(crate) const fn deactivating_lead_millis(budgets: &Budgets) -> u64 {
     let clock = budgets
         .max_sample_age_millis
         .saturating_sub(budgets.clock_sample_period_millis.saturating_mul(2));
@@ -266,14 +269,28 @@ pub const fn deactivating_lead_millis(budgets: &Budgets) -> u64 {
     }
 }
 
-/// [`deactivating_lead_millis`] at `Budgets::SPEC_DEFAULTS`: 1000 ms.
+/// How long before a partition's last write tick its owner sends
+/// [`OwnershipEvent::Deactivating`], at rDB's default budgets: 1000 ms.
+///
+/// ```text
+/// lead = min(max_sample_age - 2 x clock_sample_period, grant / 4)
+///      = min(2000 - 2 x 500, 6000 / 4) = min(1000, 1500) = 1000 ms
+/// ```
+///
+/// The subtraction saturates at 0, and `grant / 4` rounds down. The clock term binds at the
+/// defaults: a node's write permission also ends when its clock sample is older than
+/// `max_sample_age`, and the second `clock_sample_period` lets a sample come one whole period
+/// late without a warning. The grant cap binds only for grants far shorter than the default.
+/// The `deadline` an event carries is what to act on; this is the lead it is sent with.
 pub const DEACTIVATING_LEAD_MILLIS: u64 = deactivating_lead_millis(&Budgets::SPEC_DEFAULTS);
 
 /// An ownership change on one node of this process (#83), from [`crate::Db::ownership_events`].
 ///
 /// Per node and partition the order is always `Activated`, then `Deactivating`, then either
-/// `Activated` again with the same token (a renewal landed in time: resume, no rebuild) or
-/// `Deactivated`. Across nodes, an old owner's `Deactivated` comes before a new owner's
+/// `Activated` again with the same token (the write permission was extended in time, by a
+/// renewal or by a fresh clock sample: resume, no rebuild) or `Deactivated`. A fence, fault or
+/// stop sends `Deactivating` with a passed deadline and then `Deactivated` from `Activated`,
+/// `Deactivated` alone from `Deactivating`, and nothing for a partition not held. Across nodes, an old owner's `Deactivated` comes before a new owner's
 /// `Activated` by the grant arithmetic, not by delivery (`docs/rdb/embed.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnershipEvent {
@@ -288,8 +305,9 @@ pub enum OwnershipEvent {
         /// The token it serves under.
         token: OwnerToken,
     },
-    /// No renewal has landed and `node` stops admitting writes for `token` at `deadline`, unless
-    /// one lands first. Start nothing new for the partition and begin to drain.
+    /// `node`'s write permission for `token` is about to end: it stops admitting writes at
+    /// `deadline`, unless the permission is extended first (a renewal, or a fresh clock sample).
+    /// Start nothing new for the partition and begin to drain.
     Deactivating {
         /// The node.
         node: NodeId,
@@ -297,9 +315,10 @@ pub enum OwnershipEvent {
         partition: PartitionId,
         /// The token it was serving under.
         token: OwnerToken,
-        /// When write admission stops for `token` on this node, unless a renewal lands first.
-        /// Already past for a fence (frozen grant, revoked epoch, host fault), which is followed
-        /// by `Deactivated` at once.
+        /// When write admission stops for `token` on this node, unless the permission is
+        /// extended first: never later than the node's clock reaching its first refused tick.
+        /// Already past for a fence (frozen grant, revoked epoch), a host fault or a node stop,
+        /// which is followed by `Deactivated` at once.
         deadline: Instant,
     },
     /// `node` admits no write for `token` any more. Stop every effect made under it.
@@ -487,32 +506,35 @@ pub(crate) const SUBSCRIBER_CAPACITY: usize = 4096;
 #[derive(Debug)]
 pub struct Subscriber {
     tx: SyncSender<OwnershipEvent>,
-    /// Set when any host dropped it: full, gone, or the host stopped. Every host then lets go
-    /// of its sender, so the receiver ends and the app subscribes again.
-    dropped: AtomicBool,
+    /// Set when any host dropped it (full, gone, or the host stopped), when the `Db` could not
+    /// reach one of its nodes, or when the app dropped its [`OwnershipEvents`]. Every host then
+    /// lets go of its sender at its next turn, quiet or not, so the receiver ends and the app
+    /// subscribes again.
+    dropped: Arc<AtomicBool>,
 }
 
 impl Subscriber {
     /// A subscriber holding at most `capacity` unread events, and its receiver.
-    pub(crate) fn new(capacity: usize) -> (Arc<Self>, Receiver<OwnershipEvent>) {
+    pub(crate) fn new(capacity: usize) -> (Arc<Self>, OwnershipEvents) {
         let (tx, rx) = mpsc::sync_channel(capacity);
+        let dropped = Arc::new(AtomicBool::new(false));
         (
             Arc::new(Self {
                 tx,
-                dropped: AtomicBool::new(false),
+                dropped: Arc::clone(&dropped),
             }),
-            rx,
+            OwnershipEvents { rx, dropped },
         )
     }
 
-    /// Whether any host dropped this subscriber.
+    /// Whether this subscriber was dropped, by any host or by its receiver.
     pub(crate) fn is_dropped(&self) -> bool {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.load(Ordering::SeqCst)
     }
 
     /// Drop it for every host.
     pub(crate) fn drop_everywhere(&self) {
-        self.dropped.store(true, Ordering::Relaxed);
+        self.dropped.store(true, Ordering::SeqCst);
     }
 
     /// Send `event`. `Err` names why the subscriber must be dropped: `"full"` when it lags by
@@ -527,6 +549,76 @@ impl Subscriber {
             Err(TrySendError::Full(_)) => Err("full"),
             Err(TrySendError::Disconnected(_)) => Err("gone"),
         }
+    }
+}
+
+/// The receiving end of [`crate::Db::ownership_events`]: `recv`, `recv_timeout`, `try_recv`,
+/// `iter` and `try_iter`, as on [`std::sync::mpsc::Receiver`].
+///
+/// It ends (`recv` answers `Err`, `iter` stops) once every node has let go of it: when it fell
+/// 4096 events behind, a node of the process stopped or could not be reached, or the `Db` shut
+/// down. Events already queued are handed out first. Dropping it tells every node, which lets go
+/// of it at its next turn, so a dropped subscription costs nothing for long, quiet or not.
+#[derive(Debug)]
+pub struct OwnershipEvents {
+    rx: Receiver<OwnershipEvent>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl OwnershipEvents {
+    /// The next event, waiting for one.
+    ///
+    /// # Errors
+    ///
+    /// The subscription ended.
+    pub fn recv(&self) -> Result<OwnershipEvent, mpsc::RecvError> {
+        self.rx.recv()
+    }
+
+    /// The next event, waiting at most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// `Timeout` when none came in time; `Disconnected` when the subscription ended.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<OwnershipEvent, mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    /// The next event, if one is queued now.
+    ///
+    /// # Errors
+    ///
+    /// `Empty` when none is queued; `Disconnected` when the subscription ended.
+    pub fn try_recv(&self) -> Result<OwnershipEvent, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Every event, waiting for each, until the subscription ends.
+    pub fn iter(&self) -> mpsc::Iter<'_, OwnershipEvent> {
+        self.rx.iter()
+    }
+
+    /// The events queued now, without waiting.
+    pub fn try_iter(&self) -> mpsc::TryIter<'_, OwnershipEvent> {
+        self.rx.try_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a OwnershipEvents {
+    type Item = OwnershipEvent;
+    type IntoIter = mpsc::Iter<'a, OwnershipEvent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl Drop for OwnershipEvents {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
     }
 }
 

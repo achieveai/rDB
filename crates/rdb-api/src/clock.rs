@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::NodeId;
@@ -581,6 +581,25 @@ impl HostClock {
     pub const fn millis_until(now: Tick, at: Tick) -> u64 {
         at.0.saturating_sub(now.0)
     }
+
+    /// An `Instant` no later than the moment this clock first reads `at` (#123 review): the
+    /// public form of a tick deadline. The `Instant` is read first and the tick after it, both
+    /// fresh, so no time spent before the call is counted twice. A tick is a whole millisecond
+    /// and the one read may be almost over, so one millisecond is taken off. A deadline already
+    /// reached gives the `Instant` read, which is not in the future.
+    #[must_use]
+    pub fn instant_at(&self, at: Tick) -> Instant {
+        let anchor = Instant::now();
+        let now = self.now();
+        Self::instant_from(anchor, now, at)
+    }
+
+    /// [`Self::instant_at`] from an `anchor` read no later than the tick `now` was.
+    #[must_use]
+    pub(crate) fn instant_from(anchor: Instant, now: Tick, at: Tick) -> Instant {
+        let ahead = Self::millis_until(now, at).saturating_sub(1);
+        anchor + Duration::from_millis(ahead)
+    }
 }
 
 /// [`HostClock::capped`]'s shared state: the instant counted up to, and the milliseconds
@@ -652,6 +671,49 @@ impl Capped {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// #123 review: a tick deadline's `Instant` is never later than the moment the clock first
+    /// reads that tick, however long ago the caller read the clock, and a deadline at or before
+    /// the tick read is not in the future. Exact on synthetic readings, then on a real clock read
+    /// 60 ms before the conversion (an old tick delta added to a later `Instant` lands ~60 ms
+    /// late). Cuts: no millisecond off, red at "ahead"; the tick delta counted from a reading
+    /// 60 ms old, red at "a stale reading". Unit, ~0.1 s.
+    #[test]
+    fn a_tick_deadline_converts_to_an_instant_no_later_than_the_tick() {
+        let anchor = Instant::now();
+        let at =
+            |now: u64, deadline: u64| HostClock::instant_from(anchor, Tick(now), Tick(deadline));
+        assert_eq!(at(100, 400), anchor + Duration::from_millis(299), "ahead");
+        assert_eq!(at(100, 101), anchor, "the next tick may begin at once");
+        assert_eq!(at(100, 100), anchor, "the tick read");
+        assert_eq!(
+            at(100, 40),
+            anchor,
+            "a passed deadline is not in the future"
+        );
+
+        let clock = HostClock::start();
+        let begins = |tick: Tick| clock.start + Duration::from_millis(tick.0 - clock.start_utc_ms);
+        let read_earlier = clock.now();
+        std::thread::sleep(Duration::from_millis(60));
+        let deadline = Tick(read_earlier.0 + 300);
+        let got = clock.instant_at(deadline);
+        assert!(
+            got <= begins(deadline),
+            "a stale reading: {:?} after the tick begins",
+            got.saturating_duration_since(begins(deadline))
+        );
+        assert!(
+            begins(deadline).duration_since(got) <= Duration::from_millis(20),
+            "and not far ahead of it: {:?}",
+            begins(deadline).duration_since(got)
+        );
+        let passed = clock.instant_at(read_earlier);
+        assert!(
+            passed <= Instant::now(),
+            "a passed deadline is not in the future"
+        );
+    }
 
     /// #50: a stall between two readings counts the cap, and readings far closer together than
     /// a millisecond still add up to the time that passed. Cuts: count the whole gap, red on

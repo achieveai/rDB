@@ -497,14 +497,15 @@ register and sweep run, never leaves a container behind.
 ### Ownership events: when to start and stop
 
 Polling `still_owner` tells you the state now. To be told when it changes, subscribe:
-`db.ownership_events()` returns a `std::sync::mpsc::Receiver<OwnershipEvent>` for every node in
-this process. Each event names its `node`, `partition` and `token` (an `OwnerToken`).
+`db.ownership_events()` returns an `OwnershipEvents` stream for every node in this process. It
+has the receive calls of a `std::sync::mpsc::Receiver` (`recv`, `recv_timeout`, `try_recv`,
+`iter`, `try_iter`). Each event names its `node`, `partition` and `token` (an `OwnerToken`).
 
 | Event | What it means | What your app does |
 |---|---|---|
 | `Activated` | The node is the partition's writable primary and its data is readable there. | Start work. Stamp `token` on every side effect. |
-| `Deactivating { deadline }` | No renewal has landed. The node stops taking writes at `deadline` (an `Instant`) unless one lands. | Start no effect that cannot finish before `deadline`. Checkpoint. |
-| `Activated` again, same token | The warning is withdrawn: the renewal landed in time. | Resume. Nothing to rebuild. |
+| `Deactivating { deadline }` | The write permission is about to end. The node stops taking writes at `deadline` (an `Instant`) unless it is extended first. | Start no effect that cannot finish before `deadline`. Checkpoint. |
+| `Activated` again, same token | The warning is withdrawn: the write permission was extended in time. | Resume. Nothing to rebuild. |
 | `Deactivated` | The node no longer owns the partition under `token`. | Stop everything stamped with `token`. |
 
 **When `Activated` comes.** Only when every one of these holds:
@@ -519,35 +520,44 @@ A read-only (capped) commit never sends `Activated`, however long it serves read
 **The warning's lead.** `Deactivating` comes a fixed lead before the node's last write tick:
 
 ```text
-lead = max_sample_age - 2 x clock_sample_period    (defaults: 2000 - 2 x 500 = 1000 ms)
+lead = min(max_sample_age - 2 x clock_sample_period, grant / 4)
+     = min(2000 - 2 x 500, 6000 / 4) = 1000 ms at the defaults
 ```
 
-`rdb_api::deactivating_lead_millis(&budgets)` computes it; `DEACTIVATING_LEAD_MILLIS` is its value
-at the defaults (1000 ms). Why the clock settings: a node's write permission also ends when its
-clock sample is older than `max_sample_age`, and it takes a new sample every
+The subtraction stops at 0 rather than going negative, and `grant / 4` rounds down. The grant
+term binds only for grants far shorter than the default. `rdb_api::DEACTIVATING_LEAD_MILLIS` is
+the lead at the defaults (1000 ms). Why the clock settings: a node's write permission also ends
+when its clock sample is older than `max_sample_age`, and it takes a new sample every
 `clock_sample_period`. The second period is slack, so a sample up to one whole period late sends
 **nothing**. If samples stop altogether, ownership really ends, and you get the full lead. An
 rEtcd stall rDB rides out (2-3 s, then the renewal lands) also sends nothing. Use the `deadline`,
 not your own guess: it already counts the clock margin from "The clock rule".
 
-**A withdrawn warning.** When the renewal lands after a `Deactivating`, the node sends
-`Activated` again with the **same** token. That always means the warning is withdrawn: no other
-node owned the partition in between, so SBX may resume where it was, with nothing to rebuild.
-The same holds after a `Deactivated` when the next `Activated` carries the same token (a node
-cut off from rEtcd, with no promote, that took its grant back). A real handover always comes
-with a **new, higher** token. Compare the whole token: a different token means a different
+**A withdrawn warning.** When the node's write permission is extended after a `Deactivating`,
+the node sends `Activated` again with the **same** token. Two things extend it: a renewal that
+lands, or a fresh clock sample, which moves the permission's end out again with no renewal at
+all (the end is the earlier of the grant's and the sample's, see the lead above). Either way the
+warning is withdrawn: no other node owned the partition in between, so SBX may resume where it
+was, with nothing to rebuild. The same holds after a `Deactivated` when the next `Activated`
+carries the same token (a node cut off from rEtcd, with no promote, that took its grant back).
+A real handover always comes with a **new, higher** token. Compare the whole token: a different token means a different
 owner's term, and the destinations' fencing (below) is what keeps the old one out.
 
 **When `Deactivated` comes.** At the first tick past the node's last write tick, on the node's
 own timer. It does not wait for rEtcd to answer, so a node cut off from rEtcd still sends it on
-time. It also comes at once on a fence, a promote or a node fault (on the turn the node
-faults, and after `still_owner` already reads false). It gives no reason.
+time. It also comes at once on a fence, a promote, a node fault (on the turn the node faults,
+and after `still_owner` already reads false) or a node stop (before its subscribers end, and
+after `still_owner` already reads false). It gives no reason.
 
 **Order.**
 
 - On one node and partition: `Activated`, then `Deactivating`, then `Activated` again (same
-  token) or `Deactivated`. A fence or a promote sends `Deactivating` with a `deadline` of now,
-  then `Deactivated` at once.
+  token) or `Deactivated`.
+- A fence, a promote, a fault or a stop ends the term at once:
+  - from `Activated`: `Deactivating` with a `deadline` that has already passed, then
+    `Deactivated`;
+  - from `Deactivating` (already warned): `Deactivated` only;
+  - for a partition the node does not hold: nothing.
 - Across nodes: after a promote, the old owner's `Deactivated` comes before the new owner's
   `Activated`. That order comes from the grant timing, not from delivery. Events from two
   processes can reach a third party in any order, so **the destinations must still fence**
@@ -557,15 +567,28 @@ faults, and after `still_owner` already reads false). It gives no reason.
 
 - Each call makes a new subscriber. Its first events are the current state: `Activated` (or
   `Deactivating`) for each partition a node of this process owns now.
-- The channel holds 4096 events. A subscriber that falls that far behind is **dropped**: its
-  `recv` returns `Err`. A node of this process stopping, or the `Db` shutting down, ends every
-  subscriber the same way.
-- On `Err`, subscribe again unless you are shutting down. You get the current state again, so
-  you lose nothing but the history.
+- The stream holds 4096 events. A subscriber that falls that far behind is **dropped**: its
+  `recv` returns `Err` once it has handed out what it holds. A node of this process stopping,
+  a node it cannot reach (its restart failed), or the `Db` shutting down ends every subscriber
+  the same way. A `Db` that runs no node ends every stream at once.
+- A healthy owner sends nothing for as long as it stays healthy. Wait with `recv_timeout`, so
+  the loop can see your own shutdown; a timeout changes nothing you hold.
+
+**When the stream ends: stop and reset.** An ended stream cannot tell you what it missed. A
+`Deactivated` may be among the lost events, and the next stream lists only what is held when it
+starts; it has no end-of-list marker, so you cannot tell "not held any more" from "not listed
+yet". So on `Err`:
+
+1. Stop everything you started or warned about on the ended stream, as if each had sent
+   `Deactivated`. Keep no work because the next stream has not mentioned it.
+2. Wait a little (half a second below), unless you are shutting down, then subscribe again.
+   What that stream lists, you start again.
 
 ```rust
 use rdb_api::{Db, OwnerToken, OwnershipEvent, PartitionId};
-use std::time::Instant;
+use std::collections::BTreeSet;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 /// What your app does on each event: start, wind down and stop its own work.
 pub trait OnOwnership {
@@ -575,24 +598,61 @@ pub trait OnOwnership {
     fn shutting_down(&self) -> bool;
 }
 
-/// Follows `db`'s ownership events until `app` shuts down. A subscriber ends when it falls
-/// behind or a node stops; the next one starts with the current state, so nothing is missed.
+/// How often a quiet stream checks for shutdown. A healthy owner can send nothing for hours.
+pub const CHECK_EVERY: Duration = Duration::from_millis(100);
+/// How long to wait after a stream ends before subscribing again.
+pub const RESUBSCRIBE_AFTER: Duration = Duration::from_millis(500);
+
+/// Follows `db`'s ownership events until `app` shuts down.
+///
+/// When a stream ends, nothing says what it missed: a `Deactivated` may be lost, and the next
+/// stream's first events list only what is held then. So everything started or warned on the
+/// ended stream is stopped first (stop and reset), and the next stream starts from scratch.
 pub fn follow(db: &Db, app: &mut impl OnOwnership) {
+    // Every (partition, token) the current stream started or warned about, not yet stopped.
+    let mut held = BTreeSet::new();
     while !app.shutting_down() {
-        for event in db.ownership_events().iter() {
-            match event {
-                OwnershipEvent::Activated { partition, token, .. } => app.start(partition, token),
-                OwnershipEvent::Deactivating {
+        let events = db.ownership_events();
+        loop {
+            match events.recv_timeout(CHECK_EVERY) {
+                Ok(OwnershipEvent::Activated {
+                    partition, token, ..
+                }) => {
+                    held.insert((partition, token));
+                    app.start(partition, token);
+                }
+                Ok(OwnershipEvent::Deactivating {
                     partition,
                     token,
                     deadline,
                     ..
-                } => app.wind_down(partition, token, deadline),
-                OwnershipEvent::Deactivated { partition, token, .. } => app.stop(partition, token),
+                }) => {
+                    held.insert((partition, token));
+                    app.wind_down(partition, token, deadline);
+                }
+                Ok(OwnershipEvent::Deactivated {
+                    partition, token, ..
+                }) => {
+                    held.remove(&(partition, token));
+                    app.stop(partition, token);
+                }
+                // Quiet is healthy: keep everything held, and look at the shutdown flag.
+                Err(RecvTimeoutError::Timeout) => {}
+                // The stream ended.
+                Err(RecvTimeoutError::Disconnected) => break,
             }
             if app.shutting_down() {
                 return;
             }
+        }
+        // Stop and reset. Never keep work because the next stream does not mention it.
+        for (partition, token) in std::mem::take(&mut held) {
+            app.stop(partition, token);
+        }
+        // Wait before subscribing again (a `Db` that runs no node ends every stream at once).
+        let until = Instant::now() + RESUBSCRIBE_AFTER;
+        while !app.shutting_down() && Instant::now() < until {
+            std::thread::sleep(CHECK_EVERY.min(until.saturating_duration_since(Instant::now())));
         }
     }
 }
@@ -615,6 +675,8 @@ For SBX, subscribe once at start-up, then:
   `deadline`.
 - **`Deactivated`.** Stop the partition's containers with that token. Do not lower or clear the
   fence record: it never goes down, and the next owner raises it.
+- **The stream ended.** Stop every partition's containers you started or warned about on it,
+  as for `Deactivated`, then subscribe again. What the new stream lists, you start again.
 
 ### Which node owns a group: `route`
 

@@ -5114,7 +5114,12 @@ mod events_sample {
     include!("events_sample.rs");
 
     use super::{embed_block, ready_nodes, runtime, GUIDE};
-    use std::sync::Arc;
+    use crate::host::Msg;
+    use crate::ownership::OwnershipEvents;
+    use crate::{NodeId, Timeouts};
+    use rdb_core::contracts::ids::Generation;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// #83 B1: embed.md's ownership events block is the marked span of `events_sample.rs`, so
     /// the guide's code is the code this module compiles and runs. Unit.
@@ -5128,13 +5133,15 @@ mod events_sample {
         );
     }
 
-    /// Counts what `follow` hands it, and shuts down after the first start.
-    #[derive(Default)]
-    struct Started(Vec<(PartitionId, OwnerToken)>);
+    /// What `follow` hands it, and a shutdown flag the row sets: or set by the first start.
+    struct Started {
+        started: Vec<(PartitionId, OwnerToken)>,
+        shutdown: Arc<AtomicBool>,
+    }
 
     impl OnOwnership for Started {
         fn start(&mut self, partition: PartitionId, token: OwnerToken) {
-            self.0.push((partition, token));
+            self.started.push((partition, token));
         }
         fn wind_down(&mut self, partition: PartitionId, _: OwnerToken, _: Instant) {
             panic!("a quiet database warns nothing: {partition:?}");
@@ -5143,27 +5150,386 @@ mod events_sample {
             panic!("a quiet database stops nothing: {partition:?}");
         }
         fn shutting_down(&self) -> bool {
-            !self.0.is_empty()
+            self.shutdown.load(Ordering::SeqCst) || !self.started.is_empty()
         }
     }
 
-    /// #83 B1: on a ready database, `follow` hears the current state first: `Activated` for
-    /// the partition, under the token `ownership` reports. Integration (~1 s): one fresh open
-    /// until ready.
+    /// #83 B1, #123 review: on a ready database, `follow` hears the current state first:
+    /// `Activated` for the partition, under the token `ownership` reports. Bounded: `follow`
+    /// runs on a worker, and when nothing comes within the patience the row sets the app's
+    /// shutdown flag, joins the worker (a quiet stream checks it every `CHECK_EVERY`), shuts the
+    /// `Db` down and fails. Cut: no current state sent by `Host::subscribe`, red in ~10 s (x the
+    /// deadline scale) instead of a hang. Integration (~1 s): one fresh open until ready.
     #[config_log::retcd_test]
     fn the_ownership_events_sample_runs_against_a_db() {
         let rt = runtime();
         let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let dir = config_testkit::fs::temp_dir();
         let mut db = ready_nodes(&rt, dir.path(), &store);
-        let mut app = Started::default();
-        follow(&db, &mut app);
         let partition = crate::admin::PARTITION;
         let held = db
             .ownership(partition)
             .expect("a ready partition is owned")
             .token;
-        assert_eq!(app.0, [(partition, held)]);
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (came, started) = std::thread::scope(|scope| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let db = &db;
+            let flag = Arc::clone(&shutdown);
+            let worker = scope.spawn(move || {
+                let mut app = Started {
+                    started: Vec::new(),
+                    shutdown: flag,
+                };
+                follow(db, &mut app);
+                let _ = done.send(());
+                app.started
+            });
+            let came = finished.recv_timeout(patience).is_ok();
+            if !came {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            (came, worker.join().expect("follow panicked"))
+        });
+        db.shutdown();
+        assert!(came, "follow heard no Activated within {patience:?}");
+        assert_eq!(started, [(partition, held)]);
+    }
+
+    /// What a [`Recorder`] heard, in order, and the flag that shuts it down.
+    #[derive(Default)]
+    struct Heard {
+        calls: Mutex<Vec<(&'static str, PartitionId, OwnerToken)>>,
+        shutdown: AtomicBool,
+        /// How many times `follow` asked whether to shut down.
+        checks: AtomicU64,
+    }
+
+    impl Heard {
+        fn calls(&self) -> Vec<(&'static str, PartitionId, OwnerToken)> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        /// Wait, bounded, until `count` calls are recorded.
+        fn until(&self, count: usize) {
+            let until = Instant::now() + Duration::from_secs(2);
+            while self.calls().len() < count {
+                assert!(Instant::now() < until, "{count} calls: {:?}", self.calls());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    struct Recorder(Arc<Heard>);
+
+    impl Recorder {
+        fn note(&self, call: &'static str, partition: PartitionId, token: OwnerToken) {
+            self.0
+                .calls
+                .lock()
+                .expect("calls")
+                .push((call, partition, token));
+        }
+    }
+
+    impl OnOwnership for Recorder {
+        fn start(&mut self, partition: PartitionId, token: OwnerToken) {
+            self.note("start", partition, token);
+        }
+        fn wind_down(&mut self, partition: PartitionId, token: OwnerToken, _: Instant) {
+            self.note("wind_down", partition, token);
+        }
+        fn stop(&mut self, partition: PartitionId, token: OwnerToken) {
+            self.note("stop", partition, token);
+        }
+        fn shutting_down(&self) -> bool {
+            self.0.checks.fetch_add(1, Ordering::SeqCst);
+            self.0.shutdown.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The next subscriber `follow` sends the scripted node, within a bound.
+    fn next_subscriber(
+        mailbox: &std::sync::mpsc::Receiver<Msg>,
+    ) -> Arc<crate::ownership::Subscriber> {
+        loop {
+            match mailbox.recv_timeout(Duration::from_secs(2)) {
+                Ok(Msg::Subscribe(subscriber)) => return subscriber,
+                Ok(_) => {}
+                Err(error) => panic!("no subscription reached the node: {error}"),
+            }
+        }
+    }
+
+    fn token(generation: u64) -> OwnerToken {
+        OwnerToken {
+            generation: Generation(generation),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+        }
+    }
+
+    /// Run `follow` with a [`Recorder`] on `db` while `script` drives it, then shut it down while
+    /// the subscriber `script` returns is still held (a quiet, live stream), and require `follow`
+    /// to return within `CHECK_EVERY` and a margin. Bounded however `follow` or `script`
+    /// behaves: the shutdown is asked even when `script` panics; every subscription that reaches
+    /// `mailbox` from then on is dropped at once; and after 2 s the held subscriber is let go
+    /// too, so every stream `follow` can hold ends and it sees the shutdown.
+    fn follow_scripted(
+        db: &Db,
+        heard: &Arc<Heard>,
+        mailbox: Option<&std::sync::mpsc::Receiver<Msg>>,
+        script: impl FnOnce() -> Option<Arc<crate::ownership::Subscriber>>,
+    ) {
+        std::thread::scope(|scope| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let app = Arc::clone(heard);
+            let worker = scope.spawn(move || {
+                follow(db, &mut Recorder(app));
+                let _ = done.send(());
+            });
+            let scripted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(script));
+            let asked = Instant::now();
+            heard.shutdown.store(true, Ordering::SeqCst);
+            let (mut live, panicked) = match scripted {
+                Ok(live) => (live, None),
+                Err(panic) => (None, Some(panic)),
+            };
+            let mut took = None;
+            while took.is_none() {
+                for msg in mailbox
+                    .into_iter()
+                    .flat_map(std::sync::mpsc::Receiver::try_iter)
+                {
+                    if let Msg::Subscribe(subscriber) = msg {
+                        subscriber.drop_everywhere();
+                    }
+                }
+                if finished.recv_timeout(Duration::from_millis(10)).is_ok() {
+                    took = Some(asked.elapsed());
+                } else if asked.elapsed() > Duration::from_secs(2) {
+                    live = None;
+                }
+            }
+            drop(live);
+            worker.join().expect("follow panicked");
+            if let Some(panic) = panicked {
+                std::panic::resume_unwind(panic);
+            }
+            let took = took.expect("follow returned");
+            assert!(
+                took < Duration::from_secs(2),
+                "follow did not return after shutdown: {took:?}"
+            );
+            assert!(
+                took < CHECK_EVERY + Duration::from_millis(300),
+                "shutdown took {took:?}"
+            );
+        });
+    }
+
+    /// #123 review: the sample's stop-and-reset rule, on scripted streams from a node that runs
+    /// no thread (the row plays it). Stream 1 starts partition 1 and warns partition 2 (a term
+    /// first heard as `Deactivating`), then is dropped as a full host drops it. Stream 2 starts
+    /// partition 3, then ends as its last host lets go (a node stop). Before each next
+    /// subscription, `follow` has stopped every term the ended stream held, and the next streams
+    /// list nothing. Stream 3 then stays open and quiet: 300 ms of timeouts stop nothing, and
+    /// a shutdown asked on that quiet stream returns within `CHECK_EVERY`. Cuts: no stop on the
+    /// stream's end, red at "stream 1 ended"; `recv` with no timeout, red at "shutdown took".
+    /// Unit (~1.5 s): two of the sample's half-second waits.
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_stops_and_resets_when_a_stream_ends() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let mut db = Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        );
+        let (p1, p2, p3) = (PartitionId(1), PartitionId(2), PartitionId(3));
+        let heard = Arc::new(Heard::default());
+        follow_scripted(&db, &heard, Some(&mailbox), || {
+            let first = next_subscriber(&mailbox);
+            let activated = |partition, token| OwnershipEvent::Activated {
+                node: NodeId(1),
+                partition,
+                token,
+            };
+            first.send(activated(p1, token(2))).expect("sent");
+            first
+                .send(OwnershipEvent::Deactivating {
+                    node: NodeId(1),
+                    partition: p2,
+                    token: token(3),
+                    deadline: Instant::now() + Duration::from_secs(1),
+                })
+                .expect("sent");
+            heard.until(2);
+            first.drop_everywhere();
+            drop(first);
+            let second = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls(),
+                [
+                    ("start", p1, token(2)),
+                    ("wind_down", p2, token(3)),
+                    ("stop", p1, token(2)),
+                    ("stop", p2, token(3)),
+                ],
+                "stream 1 ended: both its terms are stopped before stream 2"
+            );
+            second.send(activated(p3, token(4))).expect("sent");
+            heard.until(5);
+            drop(second);
+            let third = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls()[4..],
+                [("start", p3, token(4)), ("stop", p3, token(4))],
+                "stream 2 ended: its term is stopped before stream 3"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(heard.calls().len(), 6, "a quiet stream stops nothing");
+            Some(third)
+        });
+        db.shutdown();
+    }
+
+    /// #123 review: a `Db` that runs no node ends every stream at once. `follow` waits
+    /// `RESUBSCRIBE_AFTER` between streams, so in 1.2 s it asks for a few streams, not millions,
+    /// and it returns promptly when shut down mid-wait. Cut: no wait after a stream ends, red at
+    /// "bounded" (the loop spins). Unit (~1.2 s).
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_waits_between_streams_on_an_app_only_db() {
+        let rt = runtime();
+        let mut db = Db::by_hand(
+            Vec::new(),
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        );
+        let heard = Arc::new(Heard::default());
+        follow_scripted(&db, &heard, None, || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            None
+        });
+        let checks = heard.checks.load(Ordering::SeqCst);
+        assert!(
+            checks < 100,
+            "bounded: {checks} shutdown checks in 1.2 s ({} per stream ended)",
+            RESUBSCRIBE_AFTER.as_millis() / CHECK_EVERY.as_millis()
+        );
+        assert_eq!(heard.calls(), [], "nothing was ever held");
+        db.shutdown();
+    }
+
+    /// The events `events` hands out until it ends, within `patience`.
+    fn until_ended(events: &OwnershipEvents, patience: Duration) -> Vec<OwnershipEvent> {
+        let until = Instant::now() + patience;
+        let mut heard = Vec::new();
+        loop {
+            match events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(event) => heard.push(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return heard,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the stream did not end within {patience:?}: heard {heard:?}")
+                }
+            }
+        }
+    }
+
+    /// The first `Activated` `events` hands out, within the patience.
+    fn first_activated(events: &OwnershipEvents) -> (NodeId, PartitionId, OwnerToken) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        match events.recv_timeout(patience) {
+            Ok(OwnershipEvent::Activated {
+                node,
+                partition,
+                token,
+            }) => (node, partition, token),
+            other => panic!("the current state first: {other:?}"),
+        }
+    }
+
+    /// #123 review: a clean stop ends what a node held before its subscribers end. On a ready
+    /// database, `Db::shutdown` stops node 1, which sends `Deactivating` with a passed deadline,
+    /// then `Deactivated`, for the token it held, and only then does the stream end. Cut:
+    /// `Host::ownership_stop` dropping the subscribers without sending, red: the stream ends
+    /// after `Activated` alone. Integration (~1 s): one fresh open until ready.
+    #[config_log::retcd_test]
+    fn a_stopping_node_sends_deactivated_before_the_stream_ends() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let events = db.ownership_events();
+        let (node, partition, held) = first_activated(&events);
+        db.shutdown();
+        let stopped = Instant::now();
+        let rest = until_ended(&events, Duration::from_secs(5));
+        let ended: Vec<(&str, OwnerToken)> = rest
+            .iter()
+            .filter(|event| event.node() == node && event.partition() == partition)
+            .map(|event| (event.state(), event.token()))
+            .collect();
+        assert_eq!(
+            ended,
+            [("deactivating", held), ("deactivated", held)],
+            "{rest:?}"
+        );
+        match rest.first() {
+            Some(OwnershipEvent::Deactivating { deadline, .. }) => {
+                assert!(*deadline <= stopped, "a stop's deadline has passed");
+            }
+            other => panic!("Deactivating first: {other:?}"),
+        }
+    }
+
+    /// #123 review: a subscription that cannot reach a node does not stay open without it. Node
+    /// 2's restart fails (its folder is pointed at a file), so it runs no process: a stream asked
+    /// for then ends, in bounded time, instead of staying open on nodes 1 and 3 and never
+    /// hearing node 2. Once node 2 restarts, a new stream stays open and hears the current
+    /// state. Cut: `Db::ownership_events` logging the unsent subscription without dropping it,
+    /// red at "a partial stream ends". Integration (~2 s): one fresh open until ready, two
+    /// restarts.
+    #[config_log::retcd_test]
+    fn a_stream_that_misses_a_node_ends_and_a_restart_recovers() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let blocker = dir.path().join("not-a-folder");
+        std::fs::write(&blocker, b"a file where node 2's folder goes").expect("write");
+        let respawn = db.respawn.as_mut().expect("an open restarts nodes");
+        let nodes_dir = std::mem::replace(&mut respawn.nodes_dir, blocker);
+        db.restart_node(NodeId(2))
+            .expect_err("node 2 cannot open a file as its folder");
+        assert!(db.restart_failed(NodeId(2)), "precondition");
+
+        let partial = db.ownership_events();
+        let heard = until_ended(&partial, Duration::from_secs(2));
+        assert!(
+            heard
+                .iter()
+                .all(|event| matches!(event, OwnershipEvent::Activated { .. })),
+            "a partial stream ends: {heard:?}"
+        );
+
+        db.respawn.as_mut().expect("respawn").nodes_dir = nodes_dir;
+        db.restart_node(NodeId(2)).expect("node 2 restarts");
+        let whole = db.ownership_events();
+        let (node, partition, _) = first_activated(&whole);
+        assert_eq!((node, partition), (NodeId(1), crate::admin::PARTITION));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !matches!(
+                whole.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "a stream that reaches every node stays open"
+        );
         db.shutdown();
     }
 }

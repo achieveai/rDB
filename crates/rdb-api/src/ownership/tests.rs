@@ -309,7 +309,7 @@ fn own83_1_ownership_state_table() {
 }
 
 /// The spec's horizon after a renewal dispatched at `dispatch`: `G - eps - delta - 1` later,
-/// as `Authority::admission_horizon` gives it at full `eps` (`DEACTIVATING_LEAD_MILLIS`'s doc).
+/// as `Authority::admission_horizon` gives it at full `eps` ([`deactivating_lead_millis`]'s doc).
 fn spec_horizon(dispatch: u64) -> u64 {
     let b = Budgets::SPEC_DEFAULTS;
     dispatch + b.grant_millis - b.clock_error_millis - b.dispatch_margin_millis - 1
@@ -343,7 +343,7 @@ fn stall_steps(dispatch: u64, lands: u64, until: u64) -> Vec<(u64, Step)> {
 /// bound, which binds in steady state, is the host row's (`own83_8_..._on_three_hosts`, a
 /// real stall on three hosts).
 /// Cut: `DEACTIVATING_LEAD_MILLIS = G/2` (3000), red: the 3 s stall sends `Deactivating` at
-/// 2799. Unit.
+/// 2800. Unit.
 #[test]
 fn own83_8_a_3s_control_stall_gives_no_deactivating() {
     let t = token(2, 2);
@@ -445,6 +445,132 @@ fn own83_10b_samples_stopping_still_warn_the_lead_ahead() {
     assert!(sent[1].0 - sent[0].0 >= DEACTIVATING_LEAD_MILLIS);
 }
 
+/// own83_12 (#123 review): a fresh clock sample alone withdraws a warning. One renewal, at 0,
+/// and none after, so the grant's horizon stays at `spec_horizon(0)` throughout. Samples every
+/// period to 1000, then none until 2600: the sample's horizon (3000) comes within the lead at
+/// 2001, and the sample at 2600 moves it out to 4600 with no renewal: `Activated` again, same
+/// token. Run to 4000, before the grant's own lead starts (4800). Cut: `ownership_step` keeping
+/// a `Deactivating` term whose time left is above the lead again, red: no `Activated` at 2600.
+/// Unit.
+#[test]
+fn own83_12_a_fresh_sample_withdraws_a_warning_without_a_renewal() {
+    let b = Budgets::SPEC_DEFAULTS;
+    let t = token(2, 2);
+    let samples = [0, 500, 1_000, 2_600, 3_000, 3_500, 4_000];
+    let mut state = OwnState::Active(t);
+    let mut sent = Vec::new();
+    for now in 0..=4_000 {
+        let sampled = samples
+            .iter()
+            .copied()
+            .filter(|at| *at <= now)
+            .max()
+            .expect("a sample at 0");
+        let horizon = spec_horizon(0).min(sampled + b.max_sample_age_millis);
+        let (next, steps) = ownership_step(state, &judged(Some(view(t, horizon)), now, true, true));
+        state = next;
+        sent.extend(steps.into_iter().map(|step| (now, step)));
+    }
+    let stop = 1_000 + b.max_sample_age_millis + 1;
+    assert_eq!(
+        sent,
+        vec![
+            (
+                stop - DEACTIVATING_LEAD_MILLIS,
+                Step::Deactivating(t, Tick(stop))
+            ),
+            (2_600, Step::Activated(t)),
+        ],
+        "warned by the stale sample, withdrawn by the fresh one"
+    );
+}
+
+/// own83_13 (#123 review): a fence ends a term at once, and what it sends depends on where the
+/// term stands. From `Active`: `Deactivating` with the deadline now, then `Deactivated`. From
+/// `Deactivating` (already warned): `Deactivated` only. Not held: nothing. A fence is the view
+/// gone (the host judges a fence's view as none) or a view that no longer admits now.
+/// Cut: `ownership_step` sending `Deactivating` before `Deactivated` from either state, red at
+/// "from Deactivating". Unit.
+#[test]
+fn own83_13_a_fence_while_deactivating_sends_only_deactivated() {
+    use OwnState::{Active, Deactivating, Inactive};
+    let t = token(2, 2);
+    let fenced_at = 5_000;
+    for (name, fenced) in [
+        ("the view gone", None),
+        (
+            "a view through the tick before",
+            Some(view(t, fenced_at - 1)),
+        ),
+    ] {
+        let judged = judged(fenced, fenced_at, true, true);
+        assert_eq!(
+            ownership_step(Active(t), &judged),
+            (
+                Inactive,
+                vec![Step::Deactivating(t, Tick(fenced_at)), Step::Deactivated(t)]
+            ),
+            "from Active, {name}"
+        );
+        assert_eq!(
+            ownership_step(Deactivating(t), &judged),
+            (Inactive, vec![Step::Deactivated(t)]),
+            "from Deactivating, {name}"
+        );
+        assert_eq!(
+            ownership_step(Inactive, &judged),
+            (Inactive, vec![]),
+            "not held, {name}"
+        );
+    }
+}
+
+/// own83_14 (#123 review): the lead's formula as `embed.md` gives it,
+/// `min(max_sample_age - 2 x clock_sample_period, grant / 4)`: the clock term at the defaults,
+/// the grant cap for short grants (rounded down), and a clock term that saturates at 0 rather
+/// than wrapping. Cut: no grant cap, red at "the crate tests' 600 ms grant". Unit.
+#[test]
+fn own83_14_the_lead_is_the_clock_term_capped_by_a_quarter_grant() {
+    let spec = Budgets::SPEC_DEFAULTS;
+    let with = |grant_millis, max_sample_age_millis, clock_sample_period_millis| Budgets {
+        grant_millis,
+        max_sample_age_millis,
+        clock_sample_period_millis,
+        ..spec
+    };
+    assert_eq!(
+        deactivating_lead_millis(&spec),
+        1_000,
+        "defaults: the clock term"
+    );
+    assert_eq!(DEACTIVATING_LEAD_MILLIS, deactivating_lead_millis(&spec));
+    assert_eq!(
+        deactivating_lead_millis(&with(600, 2_000, 500)),
+        150,
+        "the crate tests' 600 ms grant: the cap"
+    );
+    assert_eq!(
+        deactivating_lead_millis(&with(3_000, 2_000, 500)),
+        750,
+        "a grant whose quarter is below the clock term"
+    );
+    assert_eq!(
+        deactivating_lead_millis(&with(601, 2_000, 500)),
+        150,
+        "a quarter rounds down"
+    );
+    assert_eq!(
+        deactivating_lead_millis(&with(6_000, 900, 500)),
+        0,
+        "the clock term saturates at 0"
+    );
+    assert_eq!(
+        deactivating_lead_millis(&with(6_000, 2_000, u64::MAX)),
+        0,
+        "and so does twice the period"
+    );
+}
+
 /// own83_7b: a subscriber that falls [`SUBSCRIBER_CAPACITY`] events behind is dropped for every
 /// host, and its receiver then ends; one that keeps up is never dropped. Unit.
 #[test]
@@ -467,9 +593,12 @@ fn own83_7b_a_lagging_subscriber_is_dropped_and_its_receiver_ends() {
         "what it held is still read, then it ends"
     );
 
+    // #123 review: dropping the receiver drops the subscriber for every host, so a host lets
+    // go of it at its next turn even when it has nothing to send.
     let (gone, receiver) = Subscriber::new(2);
     drop(receiver);
-    assert_eq!(gone.send(event), Err("gone"));
+    assert!(gone.is_dropped(), "a dropped receiver tells the hosts");
+    assert_eq!(gone.send(event), Err("dropped"));
 }
 
 /// own83_3 at the cache layer: a route read under an open `partitions/` watch is current until a

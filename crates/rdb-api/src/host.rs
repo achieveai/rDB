@@ -2918,6 +2918,10 @@ struct Host {
     /// #83: where each partition stands in this node's ownership stream, and who hears it.
     /// Judged once per turn in [`Self::ownership_duty`].
     own_states: BTreeMap<PartitionId, OwnState>,
+    /// #83 (#123 review): partitions whose last view admitted nothing from its publication on
+    /// (a fence's, or one already past), as [`OwnerViews::publish`] drops them. The stream judges
+    /// them as no view, so a clock stepped back later cannot make one admit again.
+    dead_views: BTreeSet<PartitionId>,
     subscribers: Vec<Arc<Subscriber>>,
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
@@ -3083,6 +3087,7 @@ impl Host {
             authority_views: BTreeMap::new(),
             owner_views: OwnerViews::new(node, clock),
             own_states: BTreeMap::new(),
+            dead_views: BTreeSet::new(),
             subscribers: Vec::new(),
             frames_received: 0,
             own_asks: Vec::new(),
@@ -3213,11 +3218,9 @@ impl Host {
                 self.set_fault(fault);
             }
         }
-        // #83: a stopped node sends no more, so its subscribers end everywhere and subscribe
-        // again: a restarted node would otherwise never be heard by them.
-        for subscriber in self.subscribers.drain(..) {
-            subscriber.drop_everywhere();
-        }
+        // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
+        // everywhere and subscribe again: a restarted node would otherwise never be heard.
+        self.ownership_stop();
         tracing::info!(
             node = self.node.0,
             boot = self.boot.0,
@@ -5540,7 +5543,7 @@ impl Host {
         let partitions: Vec<PartitionId> = self.authority_views.keys().copied().collect();
         for partition in partitions {
             let prev = self.own_states.get(&partition).copied().unwrap_or_default();
-            let view = self.authority_views.get(&partition).copied();
+            let view = self.judged_view(partition);
             // Writability is read only where it can matter: a partition not yet active whose
             // view admits. An active one leaves only by its view, its horizon or a fault.
             let owns = view.is_some_and(|view| {
@@ -5566,10 +5569,45 @@ impl Host {
                 self.own_states.insert(partition, next);
             }
             for step in steps {
-                let event = self.ownership_event(partition, step, now);
+                let event = self.ownership_event(partition, step);
                 self.log_ownership_event(&event, step, view.as_ref());
                 self.publish_ownership(event);
             }
+        }
+    }
+
+    /// The view the stream judges `partition` by: A1's last, unless it admitted nothing from
+    /// its publication on ([`Self::dead_views`]).
+    fn judged_view(&self, partition: PartitionId) -> Option<AuthorityView> {
+        if self.dead_views.contains(&partition) {
+            return None;
+        }
+        self.authority_views.get(&partition).copied()
+    }
+
+    /// #83 (#123 review): the node stopped, so it admits nothing. Each partition it held sends
+    /// what a lost view sends (`Deactivating` with a deadline of now unless already warned, then
+    /// `Deactivated`), after the owner map reads false, and then every subscriber is dropped.
+    fn ownership_stop(&mut self) {
+        self.owner_views.clear();
+        let judged = Judged {
+            view: None,
+            now: self.clock.now(),
+            faulted: true,
+            writable: false,
+            queue_open: false,
+            lead_millis: deactivating_lead_millis(&self.budgets),
+        };
+        for (partition, prev) in std::mem::take(&mut self.own_states) {
+            let (_, steps) = ownership_step(prev, &judged);
+            for step in steps {
+                let event = self.ownership_event(partition, step);
+                self.log_ownership_event(&event, step, None);
+                self.publish_ownership(event);
+            }
+        }
+        for subscriber in self.subscribers.drain(..) {
+            subscriber.drop_everywhere();
         }
     }
 
@@ -5603,9 +5641,10 @@ impl Host {
         (writable, queue_open)
     }
 
-    /// The public event for `step`, with the node and, for a deadline, an `Instant` as far ahead
-    /// as the deadline tick is of `now`.
-    fn ownership_event(&self, partition: PartitionId, step: Step, now: Tick) -> OwnershipEvent {
+    /// The public event for `step`, with the node and, for a deadline, the `Instant` of the
+    /// deadline tick from a fresh reading of the host clock ([`HostClock::instant_at`]): never
+    /// later than the tick, and not in the future once it has passed (#123 review).
+    fn ownership_event(&self, partition: PartitionId, step: Step) -> OwnershipEvent {
         let node = self.node;
         match step {
             Step::Activated(token) => OwnershipEvent::Activated {
@@ -5617,8 +5656,7 @@ impl Host {
                 node,
                 partition,
                 token,
-                deadline: Instant::now()
-                    + Duration::from_millis(HostClock::millis_until(now, deadline)),
+                deadline: self.clock.instant_at(deadline),
             },
             Step::Deactivated(token) => OwnershipEvent::Deactivated {
                 node,
@@ -5672,8 +5710,11 @@ impl Host {
     }
 
     /// #83: `subscriber` hears this node's current state first, an `Activated` or a
-    /// `Deactivating` per partition that has one, then every change.
+    /// `Deactivating` per partition that has one, then every change. The state is judged afresh
+    /// first (#123 review): mail runs before the turn's duty, and a fault or a horizon passed
+    /// since the last one must not be replayed as held.
     fn subscribe(&mut self, subscriber: Arc<Subscriber>) {
+        self.ownership_duty();
         let now = self.clock.now();
         let current: Vec<(PartitionId, Step)> = self
             .own_states
@@ -5682,7 +5723,7 @@ impl Host {
                 OwnState::Inactive => None,
                 OwnState::Active(token) => Some((*partition, Step::Activated(*token))),
                 OwnState::Deactivating(token) => {
-                    let after = self.authority_views.get(partition).map_or(now, |view| {
+                    let after = self.judged_view(*partition).map_or(now, |view| {
                         Tick(view.valid_through_tick.0.saturating_add(1))
                     });
                     Some((*partition, Step::Deactivating(*token, after)))
@@ -5690,7 +5731,7 @@ impl Host {
             })
             .collect();
         for (partition, step) in current {
-            let event = self.ownership_event(partition, step, now);
+            let event = self.ownership_event(partition, step);
             if let Err(why) = subscriber.send(event) {
                 subscriber.drop_everywhere();
                 tracing::warn!(node = self.node.0, why, "ownership_subscriber_dropped");
@@ -5743,6 +5784,11 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        if fenced || view.valid_through_tick < at {
+            self.dead_views.insert(view.lineage.partition);
+        } else {
+            self.dead_views.remove(&view.lineage.partition);
+        }
         self.owner_views.publish(*view, self.clock, at, fenced);
         // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
         // history; a later fence of either scope must not reuse it.
