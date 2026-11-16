@@ -2607,6 +2607,8 @@ fn answered_now(answer: &Receiver<Answer>) -> Option<Answer> {
 /// F-001 (S0 review): a put or compile whose step view cannot be built faults the node.
 /// Its own caller hears that at once, as `set_fault` tells every pending call; dropped, it
 /// would wait out the `Db`'s timeout and read as "no answer". Both arms that compile.
+/// #84 review: node 1 owns partition 1 before the call, and neither ownership reader owns it
+/// once the caller holds the fault (each compile caller passes the host's own map).
 #[test]
 fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
     for (name, call) in [
@@ -2618,6 +2620,10 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
         trio.bootstrap();
         trio.ready();
         let host = &mut trio.nodes[0].0;
+        let owned = host
+            .owner_views
+            .ownership(PartitionId(1))
+            .unwrap_or_else(|| panic!("{name}: precondition: node 1 owns partition 1"));
         host.fail_step_view = true;
         let (reply, answer) = mpsc::channel();
         host.handle(Msg::Client(Client {
@@ -2627,6 +2633,14 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
         }));
         let fault = host.fault.clone().expect("the node faulted");
         assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
+        assert!(
+            !host.owner_views.still_owner(PartitionId(1), owned.token),
+            "{name}: still_owner after the fault"
+        );
+        assert!(
+            host.owner_views.ownership(PartitionId(1)).is_none(),
+            "{name}: ownership after the fault"
+        );
         match answered_now(&answer) {
             Some(Answer::Error {
                 error,
@@ -2638,6 +2652,74 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
             ),
             other => panic!("{name}: the caller is told the host faulted: {other:?}"),
         }
+    }
+}
+
+/// own84_6f (#84 review): each compile caller in `Host::client`, a put and a compile, revokes
+/// ownership itself before its caller hears the fault. Called on `client` directly, not through
+/// `handle`, whose `set_fault` afterwards would revoke anyway and hide a caller that does not.
+/// The call runs while the owner map is held for reading: its caller hears nothing until the
+/// reader lets go, then `client` returns the fault, the caller hears it as an error, and
+/// neither reader owns node 1's token.
+/// Cuts: the put arm's `map_err` answering without `fail_waiter`'s revoke, red on "put" ("heard
+/// of the fault before ownership was revoked"); the same in the compile arm, red on "compile".
+/// Under both, `a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault` stays
+/// green: that is the masking this row removes.
+/// Integration (~1 s per call): a trio bootstrap for each.
+#[config_log::retcd_test]
+fn own84_6f_each_compile_caller_in_client_revokes_before_it_answers() {
+    use super::ownership_tests::answered_only_after_revoke;
+    for (name, call) in [
+        ("put", put(1, b"a", b"1", None)),
+        ("compile", compile(1, b"a", b"1")),
+    ] {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let host = &mut trio.nodes[0].0;
+        let owned = host
+            .owner_views
+            .ownership(PartitionId(1))
+            .unwrap_or_else(|| panic!("{name}: precondition: node 1 owns partition 1"));
+        assert!(
+            host.owner_views.still_owner(PartitionId(1), owned.token),
+            "{name}: precondition: still_owner"
+        );
+        host.fail_step_view = true;
+        let views = Arc::clone(&host.owner_views);
+        let (reply, answer) = mpsc::channel();
+        let mut returned = None;
+        let heard = answered_only_after_revoke(name, &views, &answer, || {
+            returned = Some(host.client(Client {
+                partition: PartitionId(1),
+                call,
+                reply,
+            }));
+        });
+        let fault = returned
+            .expect("client ran")
+            .expect_err("client returns the fault");
+        assert!(fault.detail.contains("injected"), "{name}: {fault:?}");
+        match heard {
+            Answer::Error {
+                error,
+                request: None,
+            } => assert_eq!(
+                error.detail,
+                format!("host fault: {}", fault.detail),
+                "{name}"
+            ),
+            other => panic!("{name}: the caller is told the host faulted: {other:?}"),
+        }
+        assert!(
+            !views.still_owner(PartitionId(1), owned.token),
+            "{name}: still_owner after the fault"
+        );
+        assert!(
+            views.ownership(PartitionId(1)).is_none(),
+            "{name}: ownership after the fault"
+        );
     }
 }
 
@@ -6399,7 +6481,7 @@ fn m10_s2_a_learned_owner_is_forgotten_once_a1_leaves_the_fence_it_was_learned_u
     assert!(trio.status(1).fence.is_none(), "node 2 is not fenced");
     let host = &mut trio.nodes[1].0;
     host.owner_after_fence.insert(p1, Some(NodeId(3)));
-    host.report_view(&view);
+    host.report_view(&view, false);
     assert!(
         host.owner_after_fence.is_empty(),
         "held again: {:?}",

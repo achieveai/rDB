@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::contracts::authority::DenyReason;
+use crate::contracts::authority::{AuthorityView, DenyReason, Lineage};
 use crate::contracts::errors::{ErrorKind, RdbError};
 use crate::contracts::ids::{Generation, GrantId, PartitionId, RequestIdentity, Seq};
 use crate::contracts::time::Tick;
@@ -102,6 +102,31 @@ pub fn freeze_error(cause: FreezeCause, at: &DenyContext) -> RdbError {
     }
 }
 
+/// Check 6's verdict on one view: what [`view_admits`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewAdmits {
+    /// `now` is at or before the view's horizon and the view names `lineage`.
+    Admits,
+    /// `now` is past `valid_through_tick`; the view's `past_horizon` is the reason.
+    PastHorizon,
+    /// The view is in time but names another lineage.
+    OtherLineage,
+}
+
+/// Check 6, the `Admission` checkpoint's view test (K-A-35): the horizon first, then the
+/// lineage. The one comparison both [`admit`] and `rdb_api`'s `Db::still_owner` (#84) make,
+/// so an app's ownership check can never outlast the write admission it mirrors.
+#[must_use]
+pub fn view_admits(view: &AuthorityView, lineage: Lineage, now: Tick) -> ViewAdmits {
+    if now > view.valid_through_tick {
+        ViewAdmits::PastHorizon
+    } else if view.lineage != lineage {
+        ViewAdmits::OtherLineage
+    } else {
+        ViewAdmits::Admits
+    }
+}
+
 /// Checks 1–10, first failure wins. `kernel` is `None` when this node serves no lineage for
 /// `partition`, which is check 4's `NOT_PRIMARY` — after checks 1–3, because order is normative.
 ///
@@ -151,16 +176,19 @@ pub fn admit(
     let Some(view) = k.authority() else {
         return refuse(deny_error(DenyReason::NoGrant, Boundary::PreApply, &at));
     };
-    if now > view.valid_through_tick {
-        return refuse(deny_error(view.past_horizon, Boundary::PreApply, &at));
-    }
-    if view.lineage != lineage {
-        let at = k.deny_context(req.identity, view.lineage.generation);
-        return refuse(deny_error(
-            DenyReason::GenerationChanged,
-            Boundary::PreApply,
-            &at,
-        ));
+    match view_admits(view, lineage, now) {
+        ViewAdmits::Admits => {}
+        ViewAdmits::PastHorizon => {
+            return refuse(deny_error(view.past_horizon, Boundary::PreApply, &at));
+        }
+        ViewAdmits::OtherLineage => {
+            let at = k.deny_context(req.identity, view.lineage.generation);
+            return refuse(deny_error(
+                DenyReason::GenerationChanged,
+                Boundary::PreApply,
+                &at,
+            ));
+        }
     }
     // 7. The queue is open. A lost-authority freeze whose authority is back and which waits only
     //    on an unresolved write is refused as that write's freeze (U1, A-R109).
