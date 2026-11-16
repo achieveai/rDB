@@ -1440,7 +1440,13 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
     for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 3, head), (1, 3, head)] {
         let host = &mut trio.nodes[node].0;
         assert_eq!(
-            host.kernel(ModuleName::Replication, &ask(copy, barrier), site, &[]),
+            host.kernel(
+                ModuleName::Replication,
+                &ask(copy, barrier),
+                site,
+                &[],
+                &StepFences::default(),
+            ),
             Ok(()),
             "node {} asked for copy {copy} at {barrier}",
             host.node.0
@@ -1548,7 +1554,13 @@ fn h3_a_copy_ahead_on_control_is_sent_the_root_again_through_the_hold() {
         };
         let host = &mut trio.nodes[0].0;
         assert_eq!(
-            host.kernel(ModuleName::Replication, &ahead, site, &[]),
+            host.kernel(
+                ModuleName::Replication,
+                &ahead,
+                site,
+                &[],
+                &StepFences::default(),
+            ),
             Ok(()),
             "partition {}",
             partition.0

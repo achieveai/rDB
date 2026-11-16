@@ -56,7 +56,9 @@ use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS, PROGRESS_KEY
 
 use crate::contracts::publication::AckFloor;
 pub use crate::contracts::publication::{AppliedCandidate, FreezeCause};
-pub use admission::{admit, deny_error, freeze_error, Boundary, DenyContext, QUEUE_CAP};
+pub use admission::{
+    admit, deny_error, freeze_error, view_admits, Boundary, DenyContext, ViewAdmits, QUEUE_CAP,
+};
 pub use dedup::{
     DedupIndex, FloorPlan, Retained, RetainedAnswer, SeedBlocked, SeedPending, TrimMemory,
     RETENTION_CAP_ENTRIES,

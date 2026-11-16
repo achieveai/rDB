@@ -50,6 +50,7 @@ use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
+use crate::ownership::{OwnerToken, Ownership};
 use crate::transport::Links;
 use ack_floor::AckFloor;
 
@@ -3544,6 +3545,61 @@ impl Db {
             self.settled(request);
         }
         answered.map_err(|error| self.explained(error))
+    }
+
+    /// The owner token of `partition` while a node this process runs leads it, read from that
+    /// node's newest authority view on its own clock (#84). `None` when no node here leads it,
+    /// in an app-only `Db` always, from the tick write admission's check 6 (the view's horizon
+    /// and lineage) stops admitting on the leader, from A1's fence of the partition (a node
+    /// fence or one scoped to it), and for good once the node faults, before any caller is
+    /// answered with the fault.
+    ///
+    /// It mirrors check 6, plus those fences and faults, and nothing else. A fence at tick 0 is
+    /// one case where they differ: its view's horizon saturates to the fence tick, which check 6
+    /// still admits, and ownership ends there anyway. So `Some` does not mean the partition
+    /// takes writes. Checks 7 and 8 refuse writes while it is `Some`: a frozen queue (check 7,
+    /// `PROTECTION_PAUSED`, or `RECOVERY_READ_ONLY` during a read-only recovery) and an L1 pause
+    /// or block (check 8, `PROTECTION_PAUSED` or `DIVERGENCE_REQUIRES_OPERATOR`).
+    ///
+    /// It assumes the side effects it fences run in the process that runs the leading node, on
+    /// the same machine: if the node stops, they stop with it.
+    ///
+    /// Stamp [`Ownership::token`] on every side effect made outside rDB for the partition, and
+    /// make the destination refuse a lower token: see `docs/rdb/embed.md`, "Fencing your own
+    /// side effects". Sends no message to the node; one read lock.
+    #[must_use]
+    pub fn ownership(&self, partition: PartitionId) -> Option<Ownership> {
+        lock(&self.nodes)
+            .iter()
+            .filter_map(|handle| handle.owner_views.ownership(partition))
+            .max_by_key(|ownership| ownership.token)
+    }
+
+    /// Whether a node this process runs still leads `partition` under `token`: write
+    /// admission's view test (check 6: the view's horizon and lineage), plus fences and faults,
+    /// and nothing else, on that node's clock. False from the tick check 6 stops admitting
+    /// `token`. False from A1's fence of the partition (a node fence or one scoped to it:
+    /// frozen grant, revoked epoch) before the node admits another write, however its clock is
+    /// stepped after, and even at tick 0, where the fence's view still passes check 6. False for
+    /// good once the node faults, before any caller is answered with the fault. Never true for a
+    /// token older than the one the node serves.
+    ///
+    /// Fails closed. `true` means no other node can hold `token`'s partition now; it does not
+    /// mean the partition takes writes. Checks 7 and 8 refuse writes while it reads `true`: a
+    /// frozen queue (check 7, `PROTECTION_PAUSED`, or `RECOVERY_READ_ONLY` during a read-only
+    /// recovery) and an L1 pause or block (check 8, `PROTECTION_PAUSED` or
+    /// `DIVERGENCE_REQUIRES_OPERATOR`).
+    ///
+    /// It assumes the effect it guards runs in the process that runs the leading node, on the
+    /// same machine. It is a filter, not a proof: a process paused between this check and its
+    /// effect can still act late, so the destination must reject a lower token. After a lapse
+    /// with no promote, the node takes a new grant and the same token is owned again, as write
+    /// admission admits it again.
+    #[must_use]
+    pub fn still_owner(&self, partition: PartitionId, token: OwnerToken) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.owner_views.still_owner(partition, token))
     }
 
     /// Each node's state for partition 1, in node order. A node that does not answer within
