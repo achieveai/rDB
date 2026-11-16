@@ -2579,9 +2579,10 @@ enum PendingKind {
     Previous(RootKey),
 }
 
-/// Why a node faulted, typed (A-R178): every waiter, and every call after, is refused with
-/// [`Fault::error`]. A view that read stored damage refuses as `CORRUPT_HISTORY` (retry
-/// `Quarantine`), as a compile that decodes damage does; any other fault is [`ApiError::host`].
+/// Why a node faulted, typed (A-R178): every waiter is refused with [`Fault::error`], and every
+/// call after with [`Fault::refusal`]. A view that read stored damage refuses as
+/// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
+/// fault is [`ApiError::host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fault {
     /// The kind of stored damage the node read, when that is why it faulted.
@@ -2595,6 +2596,15 @@ impl Fault {
             Some(kind) => ApiError::new(kind, format!("host fault: {}", self.detail)),
             None => ApiError::host(&self.detail),
         }
+    }
+
+    /// [`Self::error`] for a call that reached the node after it faulted: refused before
+    /// admission, so it mutated nothing (#124, ruling Q15 (b)). Its retry rule is unchanged.
+    /// A call admitted before the fault keeps [`Self::error`].
+    fn refusal(&self) -> ApiError {
+        let mut error = self.error();
+        error.no_mutation = true;
+        error
     }
 }
 
@@ -3805,7 +3815,7 @@ impl Host {
         match msg {
             Msg::Client(client) => {
                 let _ = client.reply.send(Answer::Error {
-                    error: fault.error(),
+                    error: fault.refusal(),
                     request: None,
                 });
             }
