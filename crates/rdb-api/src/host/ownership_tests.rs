@@ -1651,6 +1651,96 @@ fn own83_17_a_deactivating_deadline_is_no_later_than_the_hosts_first_refused_tic
     }
 }
 
+/// own83_23 (#123 review): the normal warning, live. A subscriber that joined while the term was
+/// `Active`, with more than the lead left, hears `Activated` and then nothing until the host's
+/// clock enters the lead; the duty then sends it `Deactivating` itself (no replay: the
+/// subscriber was already held), with a `deadline` still ahead of the moment it is heard by the
+/// time left, as the host's own clock reads it then, and no later than the moment that clock
+/// reaches the first refused tick (the horizon + 1), which this row waits for. The lead is cut
+/// to 200 ms through the clock term (`max_sample_age` 400 ms, period 100 ms), the term that binds
+/// at the defaults, so the row waits 500 ms rather than 1.3 s. Every time bound is read against
+/// the clock, never a fixed sleep, so a pause cannot fail correct code: a subscription that a
+/// pause pushed into the lead is warned by the replay and is tried again. Cuts: the live
+/// step's deadline at `now` (`ownership_step`, `Active` turning low), red at "ahead";
+/// no step when an `Active` term turns low, red at "a live Deactivating". `own83_17`'s two
+/// samples are replays, and the first cut leaves it green. Unit (~0.5 s).
+#[config_log::retcd_test]
+fn own83_23_a_live_subscriber_hears_the_warning_ahead_of_its_deadline() {
+    const LEAD: u64 = 200;
+    const MARGIN: u64 = 300;
+    let rt = current_thread();
+    let mut attempts = 0;
+    let (mut host, events, _dir) = loop {
+        attempts += 1;
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(LEAD + MARGIN));
+        host.budgets.max_sample_age_millis = 400;
+        host.budgets.clock_sample_period_millis = 100;
+        assert_eq!(
+            deactivating_lead_millis(&host.budgets),
+            LEAD,
+            "precondition: the clock term binds"
+        );
+        let events = subscribe_one(&mut host);
+        match drained(&events).as_slice() {
+            [("activated", token)] if *token == HELD => break (host, events, dir),
+            // A pause of MARGIN ms before the subscription: it was warned by the replay, so
+            // this attempt says nothing about a live warning. Try again, a few times.
+            [("deactivating", token)] if *token == HELD && attempts < 3 => {}
+            other => panic!("subscribed while active, outside the lead: {other:?}"),
+        }
+    };
+    let refused = Tick(host.authority_views[&P1].valid_through_tick.0 + 1);
+    let warn_from = Tick(refused.0 - LEAD);
+    host.ownership_duty();
+    if host.clock.now() < warn_from {
+        assert_eq!(
+            drained(&events),
+            [],
+            "outside the lead, a turn sends nothing"
+        );
+    }
+    while host.clock.now() < warn_from {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    host.ownership_duty();
+    let heard_at = Instant::now();
+    let tick = host.clock.now();
+    let deadline = match events.try_iter().last() {
+        Some(OwnershipEvent::Deactivating {
+            token, deadline, ..
+        }) => {
+            assert_eq!(token, HELD, "the warned token");
+            deadline
+        }
+        other => panic!("a live Deactivating, sent by the duty: {other:?}"),
+    };
+    assert_eq!(
+        host.own_states.get(&P1),
+        Some(&OwnState::Deactivating(HELD)),
+        "warned"
+    );
+    // The duty read the clock no later than `tick`, so at least this much was left when it was
+    // heard (one millisecond off for the conversion, one for rounding).
+    let left = refused.0.saturating_sub(tick.0).saturating_sub(2);
+    assert!(
+        deadline >= heard_at + Duration::from_millis(left),
+        "a live warning's deadline is ahead of the moment it is heard by the time left \
+         ({left} ms at tick {}): it is {:?} ahead",
+        tick.0,
+        deadline.saturating_duration_since(heard_at)
+    );
+    while host.clock.now() < refused {
+        std::hint::spin_loop();
+    }
+    let reached = Instant::now();
+    assert!(
+        deadline <= reached,
+        "no later than the host's tick: {:?} after it",
+        deadline.saturating_duration_since(reached)
+    );
+}
+
 /// own83_18 (#123 review): dropped receivers are let go of on quiet turns. 50 subscribers each
 /// hear the current state on every host and are dropped, with no ownership change at all; after
 /// one more turn every host holds only the one live subscriber, which still hears the next

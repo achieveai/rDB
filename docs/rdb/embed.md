@@ -569,8 +569,12 @@ after `still_owner` already reads false). It gives no reason.
   `Deactivating`) for each partition a node of this process owns now.
 - The stream holds 4096 events. A subscriber that falls that far behind is **dropped**: its
   `recv` returns `Err` once it has handed out what it holds. A node of this process stopping,
-  a node it cannot reach (its restart failed), or the `Db` shutting down ends every subscriber
-  the same way. A `Db` that runs no node ends every stream at once.
+  or the `Db` shutting down, ends every subscriber the same way. A `Db` that runs no node ends
+  every stream at once.
+- A node whose restart failed (`db.restart_failed(node)`) runs nothing, so it holds nothing and
+  sends nothing. A stream leaves it out and stays open on the other nodes. If a later restart
+  starts it, the node joins every stream still open, with its current state first, so nothing
+  is missed.
 - A healthy owner sends nothing for as long as it stays healthy. Wait with `recv_timeout`, so
   the loop can see your own shutdown; a timeout changes nothing you hold.
 

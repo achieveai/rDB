@@ -674,10 +674,14 @@ mod tests {
 
     /// #123 review: a tick deadline's `Instant` is never later than the moment the clock first
     /// reads that tick, however long ago the caller read the clock, and a deadline at or before
-    /// the tick read is not in the future. Exact on synthetic readings, then on a real clock read
-    /// 60 ms before the conversion (an old tick delta added to a later `Instant` lands ~60 ms
-    /// late). Cuts: no millisecond off, red at "ahead"; the tick delta counted from a reading
-    /// 60 ms old, red at "a stale reading". Unit, ~0.1 s.
+    /// the tick read is not in the future. Exact on synthetic readings, then on a real clock in
+    /// three cases, each checked by [`converts_no_later_than_the_tick`] against the `Instant`s
+    /// read around the conversion, so a scheduling pause cannot fail correct code: the clock read
+    /// 60 ms before the conversion; read 400 ms before, past the 300 ms deadline (an injected
+    /// pause past the tick, which the old fixed-tick check failed); and a 50 ms pause between
+    /// the conversion's `Instant` and its tick (injected through `instant_from`). Cuts: no
+    /// millisecond off, red at "ahead"; the tick delta counted from a reading 60 ms old, red at
+    /// "a stale reading". Unit, ~0.5 s.
     #[test]
     fn a_tick_deadline_converts_to_an_instant_no_later_than_the_tick() {
         let anchor = Instant::now();
@@ -693,25 +697,58 @@ mod tests {
         );
 
         let clock = HostClock::start();
-        let begins = |tick: Tick| clock.start + Duration::from_millis(tick.0 - clock.start_utc_ms);
-        let read_earlier = clock.now();
-        std::thread::sleep(Duration::from_millis(60));
-        let deadline = Tick(read_earlier.0 + 300);
-        let got = clock.instant_at(deadline);
+        for pause in [60, 400] {
+            let read_earlier = clock.now();
+            std::thread::sleep(Duration::from_millis(pause));
+            let deadline = Tick(read_earlier.0 + 300);
+            converts_no_later_than_the_tick(&clock, deadline, || clock.instant_at(deadline));
+            let passed = clock.instant_at(read_earlier);
+            assert!(
+                passed <= Instant::now(),
+                "a passed deadline is not in the future"
+            );
+        }
+        let deadline = clock.now().plus_millis(300);
+        converts_no_later_than_the_tick(&clock, deadline, || {
+            let anchor = Instant::now();
+            std::thread::sleep(Duration::from_millis(50));
+            HostClock::instant_from(anchor, clock.now(), deadline)
+        });
+    }
+
+    /// Check `convert`'s `Instant` for `deadline` against the `Instant`s read just before and
+    /// just after it, never against a fixed tick, so a pause anywhere fails only wrong code.
+    /// The answer is no later than the moment `deadline`'s tick begins, or than the conversion's
+    /// end when the tick had begun by then (a deadline already reached converts to the `Instant`
+    /// read). It is earlier than that beginning only by the time the conversion took (a pause
+    /// between its `Instant` and its tick reading), the millisecond taken off and one of
+    /// rounding; or, when the tick may have begun during the conversion, it is no earlier than
+    /// the conversion's start.
+    fn converts_no_later_than_the_tick(
+        clock: &HostClock,
+        deadline: Tick,
+        convert: impl FnOnce() -> Instant,
+    ) {
+        let begins = clock.start + Duration::from_millis(deadline.0 - clock.start_utc_ms);
+        let before = Instant::now();
+        let got = convert();
+        let after = Instant::now();
         assert!(
-            got <= begins(deadline),
+            got <= begins.max(after),
             "a stale reading: {:?} after the tick begins",
-            got.saturating_duration_since(begins(deadline))
+            got.saturating_duration_since(begins)
         );
+        let slack = after.duration_since(before) + Duration::from_millis(2);
+        let floor = if after < begins {
+            begins - slack
+        } else {
+            before.min(begins - slack)
+        };
         assert!(
-            begins(deadline).duration_since(got) <= Duration::from_millis(20),
-            "and not far ahead of it: {:?}",
-            begins(deadline).duration_since(got)
-        );
-        let passed = clock.instant_at(read_earlier);
-        assert!(
-            passed <= Instant::now(),
-            "a passed deadline is not in the future"
+            got >= floor,
+            "and not far ahead of it: {:?} before the tick begins, more than the {slack:?} the \
+             conversion took",
+            begins.saturating_duration_since(got)
         );
     }
 

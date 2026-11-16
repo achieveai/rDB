@@ -574,7 +574,8 @@ impl Subscriber {
 ///
 /// It ends (`recv` answers `Err`, `iter` stops) once every node has let go of it: when it fell
 /// 4096 events behind, a node of the process stopped or could not be reached, or the `Db` shut
-/// down. Events already queued are handed out first. Dropping it tells every node, which lets go
+/// down. A node whose restart failed is not one that could not be reached: it holds nothing,
+/// and the stream stays open without it until a restart starts it. Events already queued are handed out first. Dropping it tells every node, which lets go
 /// of it at its next turn, so a dropped subscription costs nothing for long, quiet or not.
 #[derive(Debug)]
 pub struct OwnershipEvents {

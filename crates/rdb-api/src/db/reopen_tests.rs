@@ -5204,6 +5204,8 @@ mod events_sample {
         shutdown: AtomicBool,
         /// How many times `follow` asked whether to shut down.
         checks: AtomicU64,
+        /// Set to make the app panic in `start`, as a buggy app would.
+        panic_on_start: AtomicBool,
     }
 
     impl Heard {
@@ -5235,6 +5237,10 @@ mod events_sample {
 
     impl OnOwnership for Recorder {
         fn start(&mut self, partition: PartitionId, token: OwnerToken) {
+            assert!(
+                !self.0.panic_on_start.load(Ordering::SeqCst),
+                "the app panicked on start"
+            );
             self.note("start", partition, token);
         }
         fn wind_down(&mut self, partition: PartitionId, token: OwnerToken, _: Instant) {
@@ -5273,8 +5279,9 @@ mod events_sample {
     /// the subscriber `script` returns is still held (a quiet, live stream), and require `follow`
     /// to return within `CHECK_EVERY` and a margin. Bounded however `follow` or `script`
     /// behaves: the shutdown is asked even when `script` panics; every subscription that reaches
-    /// `mailbox` from then on is dropped at once; and after 2 s the held subscriber is let go
-    /// too, so every stream `follow` can hold ends and it sees the shutdown.
+    /// `mailbox` from then on is dropped at once; after 2 s the held subscriber is let go too, so
+    /// every stream `follow` can hold ends and it sees the shutdown; and a `follow` that panics
+    /// fails the row at once with its own panic.
     fn follow_scripted(
         db: &Db,
         heard: &Arc<Heard>,
@@ -5305,14 +5312,22 @@ mod events_sample {
                         subscriber.drop_everywhere();
                     }
                 }
-                if finished.recv_timeout(Duration::from_millis(10)).is_ok() {
-                    took = Some(asked.elapsed());
-                } else if asked.elapsed() > Duration::from_secs(2) {
-                    live = None;
+                match finished.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) => took = Some(asked.elapsed()),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if asked.elapsed() > Duration::from_secs(2) {
+                            live = None;
+                        }
+                    }
+                    // #123 review: the worker ended without saying so, so `follow` panicked.
+                    // Waiting longer cannot change that: fail now, with its panic.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             drop(live);
-            worker.join().expect("follow panicked");
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
             if let Some(panic) = panicked {
                 std::panic::resume_unwind(panic);
             }
@@ -5394,6 +5409,65 @@ mod events_sample {
             Some(third)
         });
         db.shutdown();
+    }
+
+    /// #123 review: `follow_scripted` fails at once, with `follow`'s own panic, when `follow`
+    /// panics. The app panics on the first `Activated`; the harness must surface that panic well
+    /// inside a second instead of waiting for a completion that can never come. The harness runs
+    /// on its own thread, so a hang is a red row after 5 s, not a stuck binary. Cut:
+    /// `follow_scripted` treating a disconnected completion as a timeout, red at "a panicked
+    /// worker fails the row at once" (the harness spins). Unit (~0.1 s).
+    #[config_log::retcd_test]
+    fn follow_scripted_fails_at_once_with_the_panic_when_follow_panics() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let db = Arc::new(Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let heard = Arc::new(Heard::default());
+        heard.panic_on_start.store(true, Ordering::SeqCst);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let began = Instant::now();
+        let harness = {
+            let (db, heard) = (Arc::clone(&db), Arc::clone(&heard));
+            std::thread::spawn(move || {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    follow_scripted(&db, &heard, Some(&mailbox), || {
+                        let first = next_subscriber(&mailbox);
+                        first
+                            .send(OwnershipEvent::Activated {
+                                node: NodeId(1),
+                                partition: PartitionId(1),
+                                token: token(2),
+                            })
+                            .expect("sent");
+                        Some(first)
+                    });
+                }));
+                let _ = done.send(caught.err());
+            })
+        };
+        let panic = outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a panicked worker fails the row at once: the harness is still waiting")
+            .expect("follow_scripted panicked");
+        let took = began.elapsed();
+        harness.join().expect("the harness thread");
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("the app panicked on start"),
+            "follow's own panic, not a wrapper: {message:?}"
+        );
+        assert!(took < Duration::from_secs(1), "at once: {took:?}");
+        assert_eq!(heard.calls(), [], "the app recorded nothing");
     }
 
     /// #123 review: a `Db` that runs no node ends every stream at once. `follow` waits
@@ -5487,15 +5561,18 @@ mod events_sample {
         }
     }
 
-    /// #123 review: a subscription that cannot reach a node does not stay open without it. Node
-    /// 2's restart fails (its folder is pointed at a file), so it runs no process: a stream asked
-    /// for then ends, in bounded time, instead of staying open on nodes 1 and 3 and never
-    /// hearing node 2. Once node 2 restarts, a new stream stays open and hears the current
-    /// state. Cut: `Db::ownership_events` logging the unsent subscription without dropping it,
-    /// red at "a partial stream ends". Integration (~2 s): one fresh open until ready, two
-    /// restarts.
+    /// #123 review: a node whose restart failed leaves a new stream waiting, not ended. Node 2's
+    /// restart fails (its folder is pointed at a file), so it runs no process and holds nothing.
+    /// A stream asked for then hears node 1's current state and stays open, rather than ending
+    /// at once on every call while node 2 is down. When node 2 restarts, the same stream is
+    /// handed to it and stays open: node 2's next stop ends it, as a node stop ends every
+    /// subscriber that node holds. A stream asked for after that is whole and stays open.
+    /// Cuts: `Db::ownership_events` dropping the subscriber for a down node (the old
+    /// behaviour), red at "the current state first" (the stream ended before any event); no
+    /// `Db::hand_waiting_subscribers` on a restart, red at "node 2 holds it". Integration
+    /// (~2 s): one fresh open until ready, three restarts.
     #[config_log::retcd_test]
-    fn a_stream_that_misses_a_node_ends_and_a_restart_recovers() {
+    fn a_stream_waits_for_a_node_whose_restart_failed_and_is_handed_to_it_on_restart() {
         let rt = runtime();
         let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let dir = config_testkit::fs::temp_dir();
@@ -5508,21 +5585,47 @@ mod events_sample {
             .expect_err("node 2 cannot open a file as its folder");
         assert!(db.restart_failed(NodeId(2)), "precondition");
 
-        let partial = db.ownership_events();
-        let heard = until_ended(&partial, Duration::from_secs(2));
+        let waiting = db.ownership_events();
+        let (node, partition, _) = first_activated(&waiting);
+        assert_eq!((node, partition), (NodeId(1), crate::admin::PARTITION));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
-            heard
-                .iter()
-                .all(|event| matches!(event, OwnershipEvent::Activated { .. })),
-            "a partial stream ends: {heard:?}"
+            !matches!(
+                waiting.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "a stream stays open while node 2 is down"
         );
 
         db.respawn.as_mut().expect("respawn").nodes_dir = nodes_dir;
         db.restart_node(NodeId(2)).expect("node 2 restarts");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !matches!(
+                waiting.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "the stream stays open once node 2 runs again"
+        );
+        db.restart_node(NodeId(2)).expect("node 2 restarts again");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let until = Instant::now() + patience;
+        let ended = loop {
+            match waiting.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
+            }
+        };
+        assert!(
+            ended,
+            "node 2 holds it: its next stop ends the stream within {patience:?}"
+        );
+
         let whole = db.ownership_events();
         let (node, partition, _) = first_activated(&whole);
         assert_eq!((node, partition), (NodeId(1), crate::admin::PARTITION));
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
             !matches!(
                 whole.try_recv(),

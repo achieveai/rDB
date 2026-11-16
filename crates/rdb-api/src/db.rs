@@ -564,6 +564,18 @@ struct Opened {
     /// before the node starts again (D-MC1), or the next open refuses it `Unbound`. `None`
     /// only in an app-only open, which runs no node, and a `Db` a crate test builds by hand.
     instance: Option<[u8; INSTANCE_LEN]>,
+    /// Ownership subscribers that left out a node whose restart failed (#123 review), and which
+    /// nodes, so a later restart that starts one hands it to the node. Weak: what keeps a
+    /// subscriber alive is the nodes holding it, so a dropped one still ends.
+    waiting: Mutex<Vec<Waiting>>,
+}
+
+/// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
+#[derive(Debug)]
+struct Waiting {
+    subscriber: std::sync::Weak<Subscriber>,
+    /// The nodes it has not reached, each one whose restart failed when it subscribed.
+    missing: BTreeSet<NodeId>,
 }
 
 /// The control store, runtime and budgets [`Db::promote`] runs on.
@@ -576,6 +588,17 @@ impl std::fmt::Debug for PromoteStore {
     }
 }
 
+impl Waiting {
+    /// Whether it may still be handed to a node: some node is missing, and it is still open.
+    fn live(&self) -> bool {
+        !self.missing.is_empty()
+            && self
+                .subscriber
+                .upgrade()
+                .is_some_and(|subscriber| !subscriber.is_dropped())
+    }
+}
+
 impl Default for Opened {
     fn default() -> Self {
         Self {
@@ -585,6 +608,7 @@ impl Default for Opened {
             stuck: Mutex::new(None),
             control: None,
             instance: None,
+            waiting: Mutex::new(Vec::new()),
         }
     }
 }
@@ -3706,18 +3730,33 @@ impl Db {
     ///
     /// The receiver holds up to 4096 unread events. A subscriber that falls that far behind is
     /// dropped (logged `ownership_subscriber_dropped{node, why}`), and so is every subscriber
-    /// when a node here stops, after that node sends `Deactivated` for what it held. A
-    /// subscriber is also dropped at once when a node here cannot be reached (its restart
-    /// failed, logged `ownership_subscribe_unsent`): a stream that misses one node's events
-    /// must not look whole. A dropped receiver ends (`recv` answers `Err`) once every node has
-    /// let go of it. The stream has no end-of-snapshot marker, and an ended one cannot say what
-    /// was missed, so on its end the app stops everything it started from it, forgets it, and
-    /// calls this again, which starts again from the current state. In an app-only `Db`, which
-    /// runs no node, it ends at once. See `docs/rdb/embed.md`, "Ownership events".
+    /// when a node here stops, after that node sends `Deactivated` for what it held. A dropped
+    /// receiver ends (`recv` answers `Err`) once every node has let go of it. The stream has no
+    /// end-of-snapshot marker, and an ended one cannot say what was missed, so on its end the
+    /// app stops everything it started from it, forgets it, and calls this again, which starts
+    /// again from the current state.
+    ///
+    /// A node whose restart failed ([`Self::restart_failed`]) runs no process, so it holds and
+    /// sends nothing. The stream leaves it out and stays open on the others (logged
+    /// `ownership_subscribe_node_down{node}`), and a later restart that starts the node hands
+    /// it every such stream still open, current state first: nothing is missed either way. A
+    /// node that cannot be reached for any other reason drops the subscriber at once (logged
+    /// `ownership_subscribe_unsent`), so a stream that may miss its events never looks whole.
+    /// In a `Db` with no running node (an app-only one, or one whose every restart failed),
+    /// it ends at once. See `docs/rdb/embed.md`, "Ownership events".
     #[must_use]
     pub fn ownership_events(&self) -> OwnershipEvents {
         let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
-        for handle in lock(&self.nodes).iter() {
+        let nodes = lock(&self.nodes);
+        let mut missing = BTreeSet::new();
+        for handle in nodes.iter() {
+            if handle.start_failed {
+                // #123 review: no process runs it, so it has nothing to send until a restart
+                // starts it, and that restart hands it this subscriber.
+                tracing::info!(node = handle.node.0, "ownership_subscribe_node_down");
+                missing.insert(handle.node);
+                continue;
+            }
             if handle
                 .send(Msg::Subscribe(Arc::clone(&subscriber)))
                 .is_err()
@@ -3726,8 +3765,16 @@ impl Db {
                 // events would be missing from a stream that never ends.
                 subscriber.drop_everywhere();
                 tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
-                break;
+                return events;
             }
+        }
+        if !missing.is_empty() {
+            let mut waiting = lock(&self.opened.waiting);
+            waiting.retain(Waiting::live);
+            waiting.push(Waiting {
+                subscriber: Arc::downgrade(&subscriber),
+                missing,
+            });
         }
         events
     }
@@ -4568,6 +4615,7 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                self.hand_waiting_subscribers(handle);
                 // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
                 // node process; the record owner then re-plans to link this copy again.
                 for other in nodes.iter().filter(|other| other.node != node) {
@@ -4604,6 +4652,38 @@ impl Db {
                 Err(ApiError::host(&detail))
             }
         }
+    }
+
+    /// Hand the node `handle` now runs every ownership subscriber still open that left it out
+    /// while its restart had failed (#123 review). The node sends it the current state first,
+    /// as to any new subscriber. Called under the node lock, as `Self::ownership_events` reads
+    /// the nodes, so no subscriber comes between.
+    fn hand_waiting_subscribers(&self, handle: &NodeHandle) {
+        let mut waiting = lock(&self.opened.waiting);
+        for entry in waiting.iter_mut() {
+            if !entry.missing.remove(&handle.node) {
+                continue;
+            }
+            let Some(subscriber) = entry.subscriber.upgrade() else {
+                continue;
+            };
+            if subscriber.is_dropped() {
+                continue;
+            }
+            if handle
+                .send(Msg::Subscribe(Arc::clone(&subscriber)))
+                .is_err()
+            {
+                subscriber.drop_everywhere();
+                tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
+            } else {
+                tracing::info!(
+                    node = handle.node.0,
+                    "ownership_subscriber_handed_on_restart"
+                );
+            }
+        }
+        waiting.retain(Waiting::live);
     }
 
     /// Start `node` at `boot` on the empty `folder` its wipe left (D-MC1): open the engine,
