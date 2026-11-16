@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use rdb_api::{ApiError, ErrorKind, Generation, RequestId, RetryRule};
-use rdb_server::{check_listen, code_for, rdb_error_of, to_status, wire_kind, wire_retry};
+use rdb_server::{
+    check_listen, code_for, rdb_error_of, to_status, wire_kind, wire_message, wire_retry,
+};
 
 /// Every kind, in the proto's order. `wire_kind` is exhaustive, so a new kind fails to compile
 /// there first; this list is then one more place to add it.
@@ -239,6 +241,86 @@ fn every_api_error_round_trips_through_the_rich_status() {
             }
         }
     }
+}
+
+/// PR #129 review: a `NotWired` refusal, a faulted owner's above all, says retrying at that
+/// node will not help, and that a call can succeed once another node takes over. The takeover
+/// clause opens "if the owner faulted", since an undecodable call is `NotWired` too and no
+/// retry fixes it. The gateway routes to the faulted owner until Ready re-reads the owner, so
+/// both steps say to call Ready until it reports ready before anything else. It invites a new
+/// write only when the call wrote nothing; otherwise a write calls Status first and a read,
+/// which has no request id, is called again.
+/// Cuts: the `no_mutation` false step reuses the true one's words: red on "Status"; either
+/// step without its Ready clause: red on "call Ready until it reports ready".
+#[test]
+fn a_not_wired_step_says_another_node_can_take_over() {
+    for no_mutation in [false, true] {
+        let mut error = ApiError::new(ErrorKind::Unavailable, "host fault: injected");
+        error.retry = RetryRule::NotWired;
+        error.no_mutation = no_mutation;
+        let message = wire_message(&error);
+        let case = format!("no_mutation={no_mutation}: {message}");
+        assert!(
+            message.contains("retrying at this node will not help"),
+            "{case}"
+        );
+        assert!(
+            message.contains("if the owner faulted, once another node takes over"),
+            "{case}"
+        );
+        // Ready comes before any call again or Status.
+        let ready = message
+            .find("call Ready until it reports ready")
+            .unwrap_or_else(|| panic!("no Ready step: {case}"));
+        let next = message
+            .find("call it again")
+            .or_else(|| message.find("call Status"))
+            .unwrap_or_else(|| panic!("no step after Ready: {case}"));
+        assert!(ready < next, "{case}");
+        assert_eq!(
+            message.contains("as a new Put or Txn"),
+            no_mutation,
+            "{case}"
+        );
+        assert_eq!(
+            message.contains(
+                "for a write, call Status with its request id before writing again, and never \
+                 send it again as a new write; for a read, call it again"
+            ),
+            !no_mutation,
+            "{case}"
+        );
+    }
+}
+
+/// PR #129 review: an undecodable call is `NotWired` and proven unsent too, but no takeover
+/// fixes it, so its step offers the takeover only "if the owner faulted", which keeps it from
+/// contradicting the detail's "sending it again will not help". The detail is the one
+/// `rdb_api`'s `undecodable_call` (net/mod.rs) writes, copied here since that function is
+/// private. Cut: drop "if the owner faulted, " from `wire_step`'s `no_mutation` true step: red.
+#[test]
+fn an_undecodable_call_offers_the_takeover_only_if_the_owner_faulted() {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        "node 2's process could not decode the call (bad frame); it was not run, and sending it \
+         again will not help: check both sides run the same build",
+    );
+    error.retry = RetryRule::NotWired;
+    error.no_mutation = true;
+    let message = wire_message(&error);
+    assert!(
+        message.contains("sending it again will not help"),
+        "the detail is kept: {message}"
+    );
+    let takeovers = message.matches("once another node takes over").count();
+    assert_eq!(takeovers, 1, "{message}");
+    assert_eq!(
+        message
+            .matches("if the owner faulted, once another node takes over")
+            .count(),
+        takeovers,
+        "every takeover clause is conditional: {message}"
+    );
 }
 
 /// C7: a refused conditional write says it changed nothing and is `FAILED_PRECONDITION`.

@@ -10410,6 +10410,144 @@ mod tests {
         db.shutdown();
     }
 
+    /// #124 (ruling Q15 (b)): a write that reaches node 1 after it faulted was never admitted,
+    /// so its refusal says `no_mutation`. Two ways in, each with one put and with two: a fresh
+    /// put or txn, refused at its compile; and the first send of a write compiled before the
+    /// fault, refused by the faulted node. That first send is settled through `Db::finished`, as
+    /// `Db::put` settles it, and the ack floor then neither waits on it nor pins it. A
+    /// `db.resend` of the same request still says `no_mutation` false, as every resend does, and
+    /// node 1's held head does not move.
+    /// Cuts: `Host::answer_faulted` answers with `Fault::error` (before #124): the first send
+    /// says `no_mutation` false, red. `Db::finished` holds only a refusal with no request: the
+    /// first send is pinned, red.
+    #[config_log::retcd_test]
+    fn m10_124_a_write_that_reaches_a_faulted_owner_says_nothing_was_applied() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        db.put(b"a", b"1", None).expect("put before the fault");
+        let op = |object: &'static [u8], value: &[u8]| PutOp {
+            group: GROUP,
+            object: Bytes::from_static(object),
+            change: byte_doc(value),
+            expect: None,
+        };
+        // One request of one put and one of two, compiled before the fault and not yet sent.
+        let mut compiled = Vec::new();
+        for (name, puts) in [
+            ("one put", vec![op(b"c", b"3")]),
+            ("two puts", vec![op(b"d", b"4"), op(b"e", b"5")]),
+        ] {
+            let identity = db.write_identity().expect("an id");
+            let compile = ClientCall::Compile {
+                identity,
+                puts,
+                remaining_millis: millis(db.timeouts.put),
+            };
+            let Some(Answer::Compiled(request)) = db.call(PARTITION, compile, db.timeouts.put)
+            else {
+                panic!("the compile of {name} before the fault is answered");
+            };
+            assert_eq!(
+                request.mutations.len(),
+                if name == "one put" { 1 } else { 2 },
+                "{name}: {request:?}"
+            );
+            compiled.push((name, identity.request, request));
+        }
+        let owner = |db: &Db| {
+            db.node_status()
+                .into_iter()
+                .find(|status| status.node == OWNER)
+                .expect("node 1 answers a status look")
+        };
+        let boot = db.boot_of(OWNER).expect("this Db runs node 1");
+        db.send_to(
+            OWNER,
+            Msg::Fault {
+                boot,
+                kind: "issue_124",
+                detail: "injected".to_owned(),
+            },
+        )
+        .expect("node 1 takes the fault");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        let held = loop {
+            let status = owner(&db);
+            if status.fault.is_some() {
+                break status.holds.map(|held| (held.generation, held.applied));
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 never faulted: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let fresh = db
+            .put(b"b", b"2", None)
+            .expect_err("a faulted node writes nothing");
+        tracing::info!(error = ?fresh.error, "issue_124_fresh_put");
+        let fresh_txn = db
+            .txn(
+                &[txn_put(b"f", b"6", None), txn_put(b"g", b"7", None)],
+                Duration::from_secs(1),
+            )
+            .expect_err("a faulted node writes nothing");
+        tracing::info!(error = ?fresh_txn.error, "issue_124_fresh_txn");
+        for (name, fresh) in [("a fresh put", fresh), ("a fresh two-put txn", fresh_txn)] {
+            assert!(fresh.error.detail.contains("injected"), "{name}: {fresh:?}");
+            assert!(fresh.error.no_mutation, "{name}: {fresh:?}");
+            assert!(fresh.request.is_none(), "{name}: {fresh:?}");
+        }
+
+        for (name, id, request) in compiled {
+            assert!(
+                lock(&db.ack_floor).carried(id.0, Instant::now()).is_some(),
+                "{name}: the floor waits on it before its first send"
+            );
+            let first = db.finished(
+                id,
+                db.send(
+                    ClientCall::Resend {
+                        request: request.clone(),
+                    },
+                    db.timeouts.put,
+                ),
+            );
+            let first = first.expect_err("a faulted node writes nothing");
+            tracing::info!(name, error = ?first.error, "issue_124_first_send");
+            assert!(first.error.detail.contains("injected"), "{name}: {first:?}");
+            assert!(
+                first.error.no_mutation,
+                "{name}: a first send that reached the faulted node: {first:?}"
+            );
+            let mut floor = lock(&db.ack_floor);
+            assert!(
+                floor.carried(id.0, Instant::now()).is_none(),
+                "{name}: the floor no longer waits on the first send"
+            );
+            assert!(
+                !floor.pins().contains(&id.0),
+                "{name}: the first send is held, not a pin: {:?}",
+                floor.pins()
+            );
+            drop(floor);
+
+            let again = db
+                .resend(request)
+                .expect_err("a faulted node writes nothing");
+            assert!(!again.error.no_mutation, "{name}: a resend: {again:?}");
+        }
+        assert_eq!(
+            owner(&db).holds.map(|held| (held.generation, held.applied)),
+            held,
+            "node 1's held head after the refusals"
+        );
+        db.shutdown();
+    }
+
     /// D10 (A-R398, S2-4 `ahead2`): the old owner that a promote dropped is re-added when it
     /// restarts. Node 2 promoted, node 1 dropped; node 1 restarts at a new boot. Node 2 pins it
     /// back as a shadow, promotes it once caught up, and the partition is `Active` on three
