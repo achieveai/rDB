@@ -258,7 +258,8 @@ pub fn reanchor_deferred(phases: impl IntoIterator<Item = RecoveryPhase>) -> boo
 }
 
 /// The process's clock guard, leaked once per [`crate::transport::Links`]. Every
-/// [`HostClock`] copy of that process shares it.
+/// [`HostClock`] copy of that process shares it. A crate test can also make one apart from
+/// `Links` ([`HostClock::guarded`], [`HostClock::with_guard`]), shared by that clock's copies.
 #[derive(Debug)]
 pub struct ClockGuard {
     /// Milliseconds a re-anchor moved the clock forward; only ever rises.
@@ -405,7 +406,8 @@ pub struct HostClock {
     /// How far this copy of a capped clock reads behind the others (crate tests only).
     #[cfg(test)]
     lag_millis: u64,
-    /// The guard of this process, when its clock has one (`Links`).
+    /// The clock's guard, when it has one: its process's, made once per `Links`, or, in a crate
+    /// test, one of its own ([`Self::with_guard`]), shared only by this clock's copies.
     guard: Option<&'static ClockGuard>,
 }
 
@@ -470,7 +472,8 @@ impl HostClock {
     /// Between readings closer than that it is [`Self::start`]'s clock. A longer gap, a stall
     /// of the reading thread, counts `max_step_millis` and is logged
     /// `test_clock_capped{real_millis, counted_millis}`. Copies share one state, so every host
-    /// in a row reads one time, and it never moves backwards.
+    /// in a row reads one time, and without a guard it never moves backwards: a capped clock
+    /// given one by [`Self::with_guard`] moves back when [`Self::step_back`] is called.
     ///
     /// The state is leaked, once per call, so the clock stays `Copy` as its production callers
     /// take it: a few bytes per test cluster.
@@ -504,6 +507,18 @@ impl HostClock {
         }
     }
 
+    /// This capped clock with a guard of its own, so [`Self::step_back`] moves it while it is
+    /// held: a rollback read at exact ticks (#84 review). Copies share the guard. The guard is
+    /// leaked once per call, not once per `Links`, and a clock built this way can move
+    /// backwards, unlike a capped clock without one.
+    #[cfg(test)]
+    pub(crate) fn with_guard(self) -> Self {
+        Self {
+            guard: Some(Box::leak(Box::new(ClockGuard::new()))),
+            ..self
+        }
+    }
+
     /// Stop this capped clock, every copy of it, until the returned hold drops: readings in
     /// between all return the tick of the call, and the real time held counts nothing.
     ///
@@ -531,7 +546,8 @@ impl HostClock {
         #[cfg(test)]
         if let Some(capped) = self.capped {
             let counted = self.start_utc_ms.saturating_add(capped.elapsed());
-            return Tick(counted.saturating_sub(self.lag_millis));
+            let counted = counted.saturating_sub(self.lag_millis);
+            return Tick(self.guard.map_or(counted, |guard| guard.adjust(counted)));
         }
         let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let tick = self.start_utc_ms.saturating_add(elapsed);

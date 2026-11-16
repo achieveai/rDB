@@ -94,6 +94,7 @@ use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 use crate::clock::{ClockGuard, HostClock};
 use crate::control::ControlAdapter;
 use crate::db::ApiError;
+use crate::ownership::OwnerViews;
 use crate::transport::Links;
 
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
@@ -248,7 +249,10 @@ pub const LIVE_READD_HOLD_MILLIS: u64 = 5_000;
 /// host rows 123 records behind paused writes 717 ms; at 32 the pause measured 133-193 ms
 /// (2026-10-26), under the 0.5 s goal with the re-plan's own cost. A shadow that keeps up
 /// trails by the records in flight, far below this; one that trails more is still catching up,
-/// and waits. If writes land faster than it catches up, it waits until they slow.
+/// and waits. The owner judges it when the shadow's `CopyCaughtUp` arrives, at the head, as
+/// well as at each drop duty (issue #113, promote at catch-up). Between R1's shadow probes a
+/// shadow trails by one probe interval of writes, so under nonstop writes a drop duty alone
+/// always found it past this bound and never promoted it.
 pub const PROMOTE_LAG_RECORDS: u64 = 32;
 
 /// A-R458, A-R461: the most records a node reads ahead into its kept ladders in one duty: an
@@ -325,6 +329,15 @@ const MAIL_BEFORE_DUTIES: usize = 256;
 
 /// A-R192a: a step of a node's thread longer than this is logged at info (`host_slow_step`).
 const SLOW_STEP_MILLIS: u64 = 250;
+
+/// Issue #109: a WAL sync in flight longer than this is slow, and the host says so at Warn
+/// without faulting: `wal_sync_slow_in_flight` once while it runs, and `wal_sync_slow` when
+/// it returns to a live node (`Host::synced`). A sync that returns after the node faulted, or
+/// at stop, logs its own Info line instead (`sync_finished_after_fault`,
+/// `sync_finished_at_stop`). 5 s, about 1.7 times the slowest sync measured under load
+/// (2,973 ms, lr6), the old stuck limit. Only a sync still in flight past
+/// `sync_stuck_millis` faults the node.
+const SYNC_SLOW_WARN_MILLIS: u64 = 5_000;
 
 /// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
 /// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
@@ -1441,6 +1454,8 @@ pub struct NodeHandle {
     pub(crate) start_failed: bool,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
+    /// The node's published views, for `Db::ownership` and `Db::still_owner` (#84).
+    pub(crate) owner_views: Arc<OwnerViews>,
 }
 
 impl NodeHandle {
@@ -1470,6 +1485,7 @@ impl NodeHandle {
                 start_failed: false,
                 tx,
                 join: None,
+                owner_views: OwnerViews::new(node, HostClock::start()),
             },
             rx,
         )
@@ -1483,6 +1499,8 @@ impl NodeHandle {
                 tracing::error!(node = self.node.0, "node_thread_panicked");
             }
         }
+        // A stopped node admits nothing, so it owns nothing (#84).
+        self.owner_views.clear();
     }
 }
 
@@ -1573,6 +1591,7 @@ pub(crate) fn spawn_on(
     links.register(node, tx.clone(), boot);
     let path = engine.path().to_path_buf();
     let mut host = Host::new(node, engine, links, control, clock);
+    let owner_views = Arc::clone(&host.owner_views);
     host.syncer = Some(Syncer::start(node, path, tx.clone())?);
     host.boot = boot;
     host.budgets = budgets;
@@ -1598,6 +1617,7 @@ pub(crate) fn spawn_on(
         start_failed: false,
         tx,
         join: Some(join),
+        owner_views,
     })
 }
 
@@ -2279,6 +2299,8 @@ type LinkWaiter = (Box<RecoveryResult>, Site);
 struct InFlight {
     started: Instant,
     after: Vec<AfterSync>,
+    /// Issue #109: `wal_sync_slow_in_flight` is logged for this sync, once.
+    warned: bool,
 }
 
 /// D18's stall (ruling A-R206): node directories whose host's run loop sleeps once, at the top of
@@ -2895,6 +2917,9 @@ struct Host {
     /// Per partition, the last view A1 published. `txn_dispatch` and `host_stall` measure the
     /// grant left against its horizon (M9 S2a, critic A2).
     authority_views: BTreeMap<PartitionId, AuthorityView>,
+    /// The same views, shared with [`crate::Db`] for an app's `ownership` and `still_owner`
+    /// (#84). Written in [`Self::report_view`] with `authority_views`, before T1 steps again.
+    pub(crate) owner_views: Arc<OwnerViews>,
     /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
     /// node is still sent, though it holds no role (M9 S2b, critic A5).
     frames_received: u64,
@@ -3057,6 +3082,7 @@ impl Host {
             fault: None,
             stepped_at: now,
             authority_views: BTreeMap::new(),
+            owner_views: OwnerViews::new(node, clock),
             frames_received: 0,
             own_asks: Vec::new(),
             syncer: None,
@@ -3794,6 +3820,9 @@ impl Host {
     /// reported, and any waiter still open is answered with it; a later fault is only logged
     /// (PR #60 review F4).
     fn set_fault(&mut self, fault: Fault) {
+        // #84 review: a faulted node admits nothing, so its owner views go before any waiter
+        // reads the fault below.
+        self.owner_views.revoke();
         let fault = match self.fault.take() {
             Some(first) => {
                 tracing::error!(
@@ -4168,6 +4197,7 @@ impl Host {
         self.syncing = Some(InFlight {
             started: Instant::now(),
             after,
+            warned: false,
         });
         Ok(())
     }
@@ -4230,7 +4260,16 @@ impl Host {
         } = done;
         let ok = flushed.is_ok();
         let result = self.engine.finish_sync(sync, flushed);
-        if took > SLOW_STEP_MILLIS {
+        if took > SYNC_SLOW_WARN_MILLIS {
+            tracing::warn!(
+                node = self.node.0,
+                millis = took,
+                ok,
+                slow_ms = SYNC_SLOW_WARN_MILLIS,
+                stuck_ms = self.sync_stuck_millis,
+                "wal_sync_slow"
+            );
+        } else if took > SLOW_STEP_MILLIS {
             tracing::info!(node = self.node.0, millis = took, ok, "wal_sync_slow");
         }
         let mut at = 0;
@@ -4828,12 +4867,36 @@ impl Host {
     /// F4 (A-R317): a sync in flight past [`Self::sync_stuck_millis`] is a stuck disk. The
     /// node faults, as any host fault does: it runs nothing more, so A1 renews no more, and the
     /// grant lapses for another node to take over. `true` when it faulted.
+    ///
+    /// Issue #109: one in flight past [`SYNC_SLOW_WARN_MILLIS`] but not past the stuck limit is
+    /// slow, not yet stuck. It is logged once at Warn and costs nothing else: it credits nothing
+    /// until it returns, and L1 pauses admission on unsafe age meanwhile.
     fn stuck_sync(&mut self) -> bool {
         let Some(flight) = &self.syncing else {
             return false;
         };
         let held = millis(flight.started);
-        if held <= self.sync_stuck_millis {
+        self.stuck_sync_held(held)
+    }
+
+    /// [`Self::stuck_sync`] for a sync in flight `held` ms: the watchdog's rule on a given
+    /// age, so a row can hold its boundaries to the millisecond. `false` with none in flight.
+    fn stuck_sync_held(&mut self, held: u64) -> bool {
+        let stuck_ms = self.sync_stuck_millis;
+        let Some(flight) = &mut self.syncing else {
+            return false;
+        };
+        if held <= stuck_ms {
+            if held > SYNC_SLOW_WARN_MILLIS && !flight.warned {
+                flight.warned = true;
+                tracing::warn!(
+                    node = self.node.0,
+                    held_ms = held,
+                    slow_ms = SYNC_SLOW_WARN_MILLIS,
+                    stuck_ms,
+                    "wal_sync_slow_in_flight"
+                );
+            }
             return false;
         }
         tracing::error!(
@@ -4849,11 +4912,23 @@ impl Host {
         true
     }
 
-    /// How long until the sync in flight counts as stuck; `None` when none is in flight.
+    /// How long until [`Self::stuck_sync`] next has something to do for the sync in flight:
+    /// warn it is slow, then fault it as stuck. `None` when none is in flight.
     fn until_stuck(&self) -> Option<Duration> {
+        let flight = self.syncing.as_ref()?;
+        self.until_stuck_after(flight.started.elapsed())
+    }
+
+    /// [`Self::until_stuck`] for a sync in flight `elapsed`: the wake rule on a given age, so a
+    /// row can check the interval exactly. `None` when none is in flight.
+    fn until_stuck_after(&self, elapsed: Duration) -> Option<Duration> {
         self.syncing.as_ref().map(|flight| {
-            Duration::from_millis(self.sync_stuck_millis.saturating_add(1))
-                .saturating_sub(flight.started.elapsed())
+            let next = if flight.warned || SYNC_SLOW_WARN_MILLIS >= self.sync_stuck_millis {
+                self.sync_stuck_millis
+            } else {
+                SYNC_SLOW_WARN_MILLIS
+            };
+            Duration::from_millis(next.saturating_add(1)).saturating_sub(elapsed)
         })
     }
 
@@ -5418,6 +5493,7 @@ impl Host {
         let pending = waiter.remove();
         let PendingKind::Txn(request) = pending.kind else {
             return Err(fail_waiter(
+                &self.owner_views,
                 &pending.reply,
                 format!(
                     "a put's expiry met request {}'s {:?}",
@@ -5481,13 +5557,16 @@ impl Host {
     }
 
     /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`], under `grant`.
+    /// `fenced` when that step also fenced the view's partition ([`StepFences::covers`]): the view is
+    /// the fence's, so the owner map drops it whatever its horizon (#84 review: a fence at tick
+    /// 0 saturates its horizon to the fence tick).
     /// `renewed_at` is the dispatch tick of the last committed renewal, which the horizon is
     /// counted from, absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
     /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
     /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
     /// and is set while the view is still valid. A healthy view mostly reads
     /// `ClockSampleStale` here, a reason that never fences (spec §7.2, M12 gate): read `past_horizon` for whether time ran out.
-    fn report_view(&mut self, view: &AuthorityView) {
+    fn report_view(&mut self, view: &AuthorityView, fenced: bool) {
         let at = self.stepped_at;
         let margin_ms = margin_ms(view.valid_through_tick, at);
         tracing::info!(
@@ -5504,6 +5583,7 @@ impl Host {
             "authority_view"
         );
         self.authority_views.insert(view.lineage.partition, *view);
+        self.owner_views.publish(*view, self.clock, at, fenced);
         // A-R399, critic-d3 A3: A1 holds a grant again, so what the last fence learned is
         // history; a later fence of either scope must not reuse it.
         if fence_of(self.authority.state()).is_none() && !self.owner_after_fence.is_empty() {
@@ -5701,6 +5781,7 @@ impl Host {
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
             return Err(fail_waiter(
+                &self.owner_views,
                 &reply,
                 format!(
                     "no module answered request {}'s status query",
@@ -5851,6 +5932,7 @@ impl Host {
     // ------------------------------------------------------------------ effects
 
     fn deliver(&mut self, effects: &[Effect]) -> Result<(), Fault> {
+        let fences = StepFences::of(effects);
         for effect in effects {
             let site = Site {
                 partition: effect.partition,
@@ -5911,7 +5993,9 @@ impl Host {
                         self.timers.remove(id);
                     }
                 }
-                EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site, effects)?,
+                EffectKind::Kernel(kernel) => {
+                    self.kernel(effect.from, kernel, site, effects, &fences)?;
+                }
             }
         }
         self.answer_own_asks();
@@ -6054,6 +6138,7 @@ impl Host {
         kernel: &KernelEffect,
         site: Site,
         step: &[Effect],
+        fences: &StepFences,
     ) -> Result<(), Fault> {
         let node = self.node.0;
         match kernel {
@@ -6073,7 +6158,7 @@ impl Host {
                 }
             }
             KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
-                self.report_view(view);
+                self.report_view(view, fences.covers(view.lineage.partition));
             }
             KernelEffect::Authority(AuthorityEffect::Fence { scope, reason }) => {
                 tracing::warn!(
@@ -6178,6 +6263,7 @@ impl Host {
             } => return self.send_recovery_envelopes(*copy, (*first, *through), credential, site),
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+                self.shadow_at_head(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -6607,7 +6693,7 @@ impl Host {
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
     /// (the commit's) pins fewer regular copies than rf3. The restart re-plan pins it again as
-    /// a shadow, which L1 never counts and R1 catches up off the stream; [`Self::shadow_duty`]
+    /// a shadow, which L1 never counts and R1 catches up by its probe and catch-up cursor; [`Self::shadow_duty`]
     /// promotes it once it reaches the cutoff. A member pinned in any role, a shadow included,
     /// is already re-added. Only a boot newer than the one the drop recorded counts. That is the
     /// committed boot, so a copy dropped after a restart the commit never pinned (b10's
@@ -6974,8 +7060,8 @@ impl Host {
             })
             .collect();
         // A-R329: a rejoiner that is not pinned is a member a drop left out, linked again as a
-        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it off the
-        // stream; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
+        // shadow at the boot its link reports. L1 never counts a shadow, and R1 feeds it by its
+        // probe and catch-up cursor; [`Self::shadow_duty`] promotes it once it reaches the cutoff.
         let readded = replan.rejoiner.and_then(|node| {
             let left = self
                 .left_out
@@ -7196,8 +7282,9 @@ impl Host {
     /// #107 slice 2a: re-add, at the boot it still runs, a copy this owner's own drop clock left
     /// out ([`LiveReadd::clocked`]), once its link is back. `Links::install` tells nobody of a
     /// same-boot reconnect, so this runs at every drop check, and ends in the restart path's
-    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up off the
-    /// stream, and promoted by [`Self::shadow_duty`]. With `live_readd` off it does nothing.
+    /// [`Self::rejoin_if_stale`]: the copy is pinned again as a shadow, caught up by R1's probe
+    /// and catch-up cursor, and promoted by [`Self::shadow_duty`] when its catch-up arrives
+    /// ([`Self::shadow_at_head`]) or at a drop duty. With `live_readd` off it does nothing.
     ///
     /// The gate ([`Self::live_readd_refusal`]): this node is the pinned primary, no re-plan
     /// runs, the committed mode takes writes (`Active` or `DegradedRf2`, the test
@@ -8131,7 +8218,7 @@ impl Host {
 
     /// M11 thin slice: move the copy on `from` to `to`, or say where that move stands. Only the
     /// pinned primary takes it. The move is two re-plans through the restart machinery: the
-    /// first pins `to` as a shadow (R1 catches it up off the stream, from seq 1), and once it
+    /// first pins `to` as a shadow (R1 catches it up by its probe and catch-up cursor, from seq 1), and once it
     /// reaches the cutoff [`Self::shadow_duty`] pins it regular and leaves `from` out in one
     /// commit. Membership changes only by those commits. Asking again resumes: the intent is
     /// in memory, and once `to` is pinned as a shadow the pin itself says what is moving (D2).
@@ -8462,7 +8549,7 @@ impl Host {
 
     /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
     /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
-    /// [`move_copy_id`]; R1 feeds it off the stream and F1's barrier skips it.
+    /// [`move_copy_id`]; R1 feeds it by its probe and catch-up cursor, and F1's barrier skips it.
     fn move_shadow(
         &self,
         partition: PartitionId,
@@ -8758,12 +8845,34 @@ impl Host {
         );
     }
 
+    /// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): `copy` sent `CopyCaughtUp`
+    /// for `partition`, so if the commit pins it as the shadow, judge its promote now with
+    /// [`Self::shadow_duty`] and every guard there: the owner, no re-plan running, the link,
+    /// the move and member checks, and A-R442's lag bound. R1 feeds a shadow by its probe, not
+    /// the stream, so between probes it trails by one probe interval of writes; judged only at
+    /// the drop duty, a writer that never slows found it behind at every duty for good.
+    fn shadow_at_head(&mut self, partition: PartitionId, copy: CopyId) {
+        let shadow = self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| member.copy == copy && member.role == ReplicaRole::Shadow)
+        });
+        if shadow {
+            let now = self.clock.now();
+            self.shadow_duty(partition, now);
+        }
+    }
+
     /// A-R329's promote (arch-d8 option 3): once the shadow `partition`'s commit pins (a copy a
     /// drop left out and a restart re-added, [`Self::readd_candidate`]) has applied up to the
     /// commit's cutoff, as this primary's tracker last admitted it, the owner re-plans with it
     /// as the rejoiner, and [`Self::drained`] pins it as a regular secondary. That run's F1
     /// catches up what it still lacks and syncs it in the barrier before L1 counts it. Nothing
-    /// while a re-plan runs, or on a node that is not the commit's pinned primary.
+    /// while a re-plan runs, or on a node that is not the commit's pinned primary. Runs at each
+    /// drop duty and when the shadow reports it caught up ([`Self::shadow_at_head`], #113).
     fn shadow_duty(&mut self, partition: PartitionId, now: Tick) {
         // A-R459: the lag clock runs only while each duty finds the move's shadow behind.
         let lagging = self.move_catching_up.remove(&partition);
@@ -13871,7 +13980,7 @@ impl Host {
                     }],
                     remaining_millis,
                 )
-                .map_err(|detail| fail_waiter(&reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &reply, detail))?
             {
                 Ok(Some(request)) => (
                     identity,
@@ -13900,7 +14009,7 @@ impl Host {
             } => {
                 let answer = match self
                     .compile(partition, identity, &puts, remaining_millis)
-                    .map_err(|detail| fail_waiter(&reply, detail))?
+                    .map_err(|detail| fail_waiter(&self.owner_views, &reply, detail))?
                 {
                     Ok(Some(request)) => Answer::Compiled(request),
                     Ok(None) => Answer::Unchanged,
@@ -14429,6 +14538,7 @@ impl Host {
                 },
                 ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => {
                     return Err(fail_waiter(
+                        &self.owner_views,
                         &waiter,
                         format!("reply {} to a status query", reply_name(reply)),
                     ));
@@ -14464,10 +14574,11 @@ impl Host {
             },
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
                 .read_answer(partition, *outcome, *value, &root, &look)
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &pending.reply, detail))?
                 .in_mode(self.recovery_mode(partition)),
             (reply, kind) => {
                 return Err(fail_waiter(
+                    &self.owner_views,
                     &pending.reply,
                     format!(
                         "reply {} does not answer a pending {kind:?}",
@@ -14546,6 +14657,7 @@ impl Host {
         };
         let PendingKind::Previous(root) = pending.kind else {
             return Err(fail_waiter(
+                &self.owner_views,
                 &pending.reply,
                 format!(
                     "a previous-view answer for request {} that asked {:?}",
@@ -14564,6 +14676,7 @@ impl Host {
             Ok(handle) => {
                 let view = self.bound.get(&handle).ok_or_else(|| {
                     fail_waiter(
+                        &self.owner_views,
                         &pending.reply,
                         format!("previous view {} is not bound", handle.0),
                     )
@@ -14575,7 +14688,7 @@ impl Host {
                     &Look::Doc,
                     ReadServiceOutcome::Served,
                 )
-                .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                .map_err(|detail| fail_waiter(&self.owner_views, &pending.reply, detail))?
                 .in_mode(self.recovery_mode(partition))
             }
         };
@@ -14876,6 +14989,43 @@ const fn is_progress(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Kernel(input) if !matches!(input, KernelEvent::Recovered(_)))
 }
 
+/// A1's fences in one step, read once per step (#84 review), not once per view. A1 publishes a
+/// fence's views in the fence's own step, and no other view of a partition the fence covers
+/// there (`Authority::fence`), so a view of a partition these cover is the fence's. The same
+/// step can publish a view of a partition no fence in it covers (`Authority::install_partitions`
+/// fencing one partition and publishing another's); [`Self::covers`] leaves that view unfenced.
+#[derive(Debug, Default)]
+struct StepFences {
+    /// The step holds a node fence: every partition's, wherever A1 sited it.
+    node: bool,
+    /// The partitions a partition-scoped fence in the step names.
+    partitions: Vec<PartitionId>,
+}
+
+impl StepFences {
+    fn of(step: &[Effect]) -> Self {
+        let mut fences = Self::default();
+        for effect in step.iter().filter(|e| e.from == ModuleName::Authority) {
+            if let EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fence {
+                scope,
+                ..
+            })) = &effect.kind
+            {
+                match scope {
+                    FenceScope::Node => fences.node = true,
+                    FenceScope::Partition(partition) => fences.partitions.push(*partition),
+                }
+            }
+        }
+        fences
+    }
+
+    /// Whether the step fenced `partition`: a node fence, or one scoped to it.
+    fn covers(&self, partition: PartitionId) -> bool {
+        self.node || self.partitions.contains(&partition)
+    }
+}
+
 /// [`NodeStatus::fence`] for `state`: the reason only while `Fenced`. Not
 /// [`AuthorityState::fence_reason`], which also answers `last_fence` while `Unheld`, as during a
 /// self-replace's re-acquisition (walk 8d).
@@ -15058,8 +15208,10 @@ fn unsupported(node: NodeId, kind: &str) -> Fault {
 
 /// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
 /// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
-/// `fault`, for the node.
-fn fail_waiter(reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+/// `fault`, for the node. `owner_views` is revoked first, as `set_fault` does, so a waiter that
+/// reads the fault and then asks `still_owner` reads false (#84 review).
+fn fail_waiter(owner_views: &OwnerViews, reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
+    owner_views.revoke();
     let fault = fault.into();
     let _ = reply.send(Answer::Error {
         error: fault.error(),
@@ -15827,6 +15979,8 @@ mod catchup_tests;
 mod drop_tests;
 #[cfg(test)]
 mod note_tests;
+#[cfg(test)]
+mod ownership_tests;
 #[cfg(test)]
 mod seal_tests;
 #[cfg(test)]
