@@ -1039,13 +1039,21 @@ fn own81_cold_start_raises_no_alert_before_an_owners_first_grant() {
 /// Integration (~20 s): the old record runs out, then the grace, 9 s at the rig's 3 s grants.
 /// The grace follows the grant, and a shorter grant in this rig would also shorten every
 /// host's lease and renewals, which the other rows here are tuned to.
+/// Only nodes 1 and 3 run a planner, as in [`alive_owner_is_not_failed_over`]: otherwise node 2
+/// can win the planner grant at start and, never judging itself, raise no alert.
 /// Cut: never escalate in `sweep` (the `waited < no_grant_grace` test always true); no alert
 /// within 30 s, red.
 #[config_log::retcd_test]
 fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved() {
     const METHOD: &str =
         "own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_moved";
-    let rig = opened_cut(3, [Some(failover()); 3], Some(NodeId(2)));
+    // No planner on node 2: a planner never judges its own node, so with node 2 holding the
+    // planner grant no alert for it could come (seen once, PR #119 round 6).
+    let rig = opened_cut(
+        3,
+        [Some(failover()), None, Some(failover())],
+        Some(NodeId(2)),
+    );
     // Wait for the uncut owners to acquire their own grants; node 2's write cut was installed
     // before Db::open_with.
     until(
