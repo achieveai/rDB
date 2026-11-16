@@ -117,6 +117,10 @@ pub(crate) fn remaining_at(valid_through: Tick, now: Tick) -> Duration {
 pub(crate) struct OwnerViews {
     node: NodeId,
     state: RwLock<Published>,
+    /// Calls to [`Self::revoke`] so far, counted before it takes the lock, so a crate test
+    /// holding the readers sees a revoke that is waiting for them ([`Self::revokes_begun`]).
+    #[cfg(test)]
+    revokes: std::sync::atomic::AtomicUsize,
 }
 
 /// What [`OwnerViews`] guards: the views and the host clock they are read by, written together.
@@ -140,6 +144,8 @@ impl OwnerViews {
                 views: BTreeMap::new(),
                 revoked: false,
             }),
+            #[cfg(test)]
+            revokes: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -167,6 +173,9 @@ impl OwnerViews {
     /// is kept. Called before the host answers any caller with the fault, so a caller that reads
     /// the fault and then asks `still_owner` already reads false.
     pub(crate) fn revoke(&self) {
+        #[cfg(test)]
+        self.revokes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         state.revoked = true;
         state.views.clear();
@@ -186,6 +195,14 @@ impl OwnerViews {
     #[cfg(test)]
     pub(crate) fn hold_readers(&self) -> impl Sized + '_ {
         self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many calls to [`Self::revoke`] have begun, waiting for the lock or not. Anything a
+    /// thread did before it called `revoke` (a reply sent, say) is visible to the reader of
+    /// this count.
+    #[cfg(test)]
+    pub(crate) fn revokes_begun(&self) -> usize {
+        self.revokes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `partition`'s ownership, while this node's view admits now.

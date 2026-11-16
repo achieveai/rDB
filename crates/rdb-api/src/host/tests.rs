@@ -2665,7 +2665,7 @@ fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
 /// of the fault before ownership was revoked"); the same in the compile arm, red on "compile".
 /// Under both, `a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault` stays
 /// green: that is the masking this row removes.
-/// Integration (~1 s per call): a trio bootstrap for each; each waits `ORDER_WAIT` on purpose.
+/// Integration (~1 s per call): a trio bootstrap for each.
 #[config_log::retcd_test]
 fn own84_6f_each_compile_caller_in_client_revokes_before_it_answers() {
     use super::ownership_tests::answered_only_after_revoke;
