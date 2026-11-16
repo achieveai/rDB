@@ -148,6 +148,14 @@ impl Links {
         net.and_then(|net| net.boot_of(node))
     }
 
+    /// Whether the process links heard `node` within `within` ([`Net::heard_within`]). False
+    /// with no `Net` attached: only a node in another process is judged this way (#81 C1).
+    #[must_use]
+    pub fn heard_within(&self, node: NodeId, within: std::time::Duration) -> bool {
+        let net = self.lock().net.clone();
+        net.is_some_and(|net| net.heard_within(node, within))
+    }
+
     /// The process links for `to` when this process does not run it.
     fn remote(inner: &Inner, to: NodeId) -> Option<Arc<Net>> {
         if inner.mailboxes.contains_key(&to) {
@@ -411,6 +419,7 @@ mod tests {
             client: DEFAULT_CLIENT,
             boot: None,
             storage: crate::StorageOptions::default(),
+            failover: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), fast))

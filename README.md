@@ -168,6 +168,11 @@ Anti-flake rules enforced across the suite (normative; a violation is rejected i
 - **No fixed sleeps.** Every wait is deadline-bounded (`wait_for_leader`, `wait_applied`,
   `poll_until`), expressed as a multiple of the configured election timeout, not a literal
   duration.
+  - *Narrow exception: grant-driven observation windows and watchdogs.* A row that asserts
+    that nothing happens for N grant lifetimes has no event to wait for, so it may sleep
+    `lifetimes(n)` (`crates/rdb-api/src/db/failover_tests.rs`), N times the rig's configured
+    grant lifetime, then assert once. Never a literal duration, and never to wait for
+    something that does happen: poll for that.
 - **No literal ports.** Every listener binds `127.0.0.1:0`; the OS assigns the port.
 - **Per-test JSONL.** Every test opens `#[config_log::retcd_test]`; every line it (or a node
   it spawns) emits carries `testModule`/`testMethod`/`testRun` and lands in

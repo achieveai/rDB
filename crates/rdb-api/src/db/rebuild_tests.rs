@@ -18,6 +18,7 @@ fn config(dir: &Path) -> DbConfig {
         client: DEFAULT_CLIENT,
         boot: None,
         storage: crate::StorageOptions::default(),
+        failover: None,
     }
 }
 
