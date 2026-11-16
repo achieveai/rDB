@@ -554,9 +554,10 @@ impl Subscriber {
         self.dropped.store(true, Ordering::SeqCst);
     }
 
-    /// Send `event`. `Err` names why the subscriber must be dropped: `"full"` when it lags by
-    /// [`SUBSCRIBER_CAPACITY`] events, `"gone"` when its receiver was dropped, `"dropped"` when
-    /// another host dropped it already.
+    /// Send `event`. `Err` names why the subscriber must be dropped: `"dropped"` when it was
+    /// dropped already (by any host, or by its receiver: dropping [`OwnershipEvents`] marks it),
+    /// `"full"` when it lags by [`SUBSCRIBER_CAPACITY`] events, and `"gone"` only when its
+    /// receiver was dropped between that check and the send.
     pub(crate) fn send(&self, event: OwnershipEvent) -> Result<(), &'static str> {
         if self.is_dropped() {
             return Err("dropped");

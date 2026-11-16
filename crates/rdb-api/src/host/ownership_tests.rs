@@ -1584,8 +1584,11 @@ fn own83_16_a_fence_then_a_backstep_never_resumes_the_fenced_token() {
     assert!(host.owner_views.still_owner(P1, HELD));
 }
 
-/// own83_17 (#123 review): `Deactivating`'s `deadline`, from both callers that convert one: the
-/// duty that warns, and the replay to a subscriber that comes while the term is warned. Each
+/// own83_17 (#123 review): `Deactivating`'s `deadline` as the replay to a subscriber converts
+/// it, sampled twice. The term is 300 ms from its horizon, inside the lead, so the duty that
+/// subscribing runs first already turns it `Deactivating`, and both samples (`"the duty"`, taken
+/// before a further duty run, and `"the replay"`, after it) are replays. The live warning from
+/// the duty to a subscriber already held is `own83_23`'s. Each
 /// deadline is ahead of the moment it is heard by about the time left (a nonzero deadline,
 /// never zeroed) and no later than the moment the host's clock reaches the first refused tick
 /// (the horizon + 1), which this row waits for. A fence's deadline has already passed when it is

@@ -756,7 +756,7 @@ mod tests {
         let floor = if after < begins {
             begins - slack
         } else {
-            before.min(begins - slack)
+            before
         };
         assert!(
             got >= floor,

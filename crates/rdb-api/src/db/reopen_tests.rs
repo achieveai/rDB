@@ -5207,6 +5207,8 @@ mod events_sample {
         checks: AtomicU64,
         /// Set to make the app panic in `start`, as a buggy app would.
         panic_on_start: AtomicBool,
+        /// Set to make the app never answer that it shuts down, so `follow` never returns.
+        ignore_shutdown: AtomicBool,
     }
 
     impl Heard {
@@ -5252,7 +5254,7 @@ mod events_sample {
         }
         fn shutting_down(&self) -> bool {
             self.0.checks.fetch_add(1, Ordering::SeqCst);
-            self.0.shutdown.load(Ordering::SeqCst)
+            self.0.shutdown.load(Ordering::SeqCst) && !self.0.ignore_shutdown.load(Ordering::SeqCst)
         }
     }
 
@@ -5280,68 +5282,70 @@ mod events_sample {
     /// the subscriber `script` returns is still held (a quiet, live stream), and require `follow`
     /// to return within `CHECK_EVERY` and a margin. Bounded however `follow` or `script`
     /// behaves: the shutdown is asked even when `script` panics; every subscription that reaches
-    /// `mailbox` from then on is dropped at once; after 2 s the held subscriber is let go too, so
-    /// every stream `follow` can hold ends and it sees the shutdown; and a `follow` that panics
-    /// fails the row at once with its own panic.
+    /// `mailbox` from then on is dropped at once; a `follow` that panics fails the row at once
+    /// with its own panic; and a `follow` still running 2 s after the shutdown fails the row
+    /// then (with `script`'s panic, if it panicked). `follow` runs on a detached thread, so a
+    /// `follow` that never returns cannot block the row from failing.
     fn follow_scripted(
-        db: &Db,
+        db: &Arc<Db>,
         heard: &Arc<Heard>,
         mailbox: Option<&std::sync::mpsc::Receiver<Msg>>,
         script: impl FnOnce() -> Option<Arc<crate::ownership::Subscriber>>,
     ) {
-        std::thread::scope(|scope| {
-            let (done, finished) = std::sync::mpsc::channel();
-            let app = Arc::clone(heard);
-            let worker = scope.spawn(move || {
-                follow(db, &mut Recorder(app));
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = {
+            let (db, app) = (Arc::clone(db), Arc::clone(heard));
+            std::thread::spawn(move || {
+                follow(&db, &mut Recorder(app));
                 let _ = done.send(());
-            });
-            let scripted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(script));
-            let asked = Instant::now();
-            heard.shutdown.store(true, Ordering::SeqCst);
-            let (mut live, panicked) = match scripted {
-                Ok(live) => (live, None),
-                Err(panic) => (None, Some(panic)),
-            };
-            let mut took = None;
-            while took.is_none() {
-                for msg in mailbox
-                    .into_iter()
-                    .flat_map(std::sync::mpsc::Receiver::try_iter)
-                {
-                    if let Msg::Subscribe(subscriber) = msg {
-                        subscriber.drop_everywhere();
-                    }
+            })
+        };
+        let scripted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(script));
+        let asked = Instant::now();
+        heard.shutdown.store(true, Ordering::SeqCst);
+        let (live, panicked) = match scripted {
+            Ok(live) => (live, None),
+            Err(panic) => (None, Some(panic)),
+        };
+        let took = loop {
+            for msg in mailbox
+                .into_iter()
+                .flat_map(std::sync::mpsc::Receiver::try_iter)
+            {
+                if let Msg::Subscribe(subscriber) = msg {
+                    subscriber.drop_everywhere();
                 }
-                match finished.recv_timeout(Duration::from_millis(10)) {
-                    Ok(()) => took = Some(asked.elapsed()),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if asked.elapsed() > Duration::from_secs(2) {
-                            live = None;
+            }
+            match finished.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) => break Some(asked.elapsed()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // #123 review: past the bound, fail now. The worker is left detached, so a
+                    // `follow` that never returns cannot hold the row up.
+                    if asked.elapsed() > Duration::from_secs(2) {
+                        drop(live);
+                        if let Some(panic) = panicked {
+                            std::panic::resume_unwind(panic);
                         }
+                        panic!("follow did not return within 2 s of the shutdown");
                     }
-                    // #123 review: the worker ended without saying so, so `follow` panicked.
-                    // Waiting longer cannot change that: fail now, with its panic.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+                // #123 review: the worker ended without saying so, so `follow` panicked.
+                // Waiting longer cannot change that: fail now, with its panic.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
             }
-            drop(live);
-            if let Err(panic) = worker.join() {
-                std::panic::resume_unwind(panic);
-            }
-            if let Some(panic) = panicked {
-                std::panic::resume_unwind(panic);
-            }
-            let took = took.expect("follow returned");
-            assert!(
-                took < Duration::from_secs(2),
-                "follow did not return after shutdown: {took:?}"
-            );
-            assert!(
-                took < CHECK_EVERY + Duration::from_millis(300),
-                "shutdown took {took:?}"
-            );
-        });
+        };
+        drop(live);
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        if let Some(panic) = panicked {
+            std::panic::resume_unwind(panic);
+        }
+        let took = took.expect("follow returned");
+        assert!(
+            took < CHECK_EVERY + Duration::from_millis(300),
+            "shutdown took {took:?}"
+        );
     }
 
     /// #123 review: the sample's stop-and-reset rule, on scripted streams from a node that runs
@@ -5349,21 +5353,23 @@ mod events_sample {
     /// first heard as `Deactivating`), then is dropped as a full host drops it. Stream 2 starts
     /// partition 3, then ends as its last host lets go (a node stop). Before each next
     /// subscription, `follow` has stopped every term the ended stream held, and the next streams
-    /// list nothing. Stream 3 then stays open and quiet: 300 ms of timeouts stop nothing, and
-    /// a shutdown asked on that quiet stream returns within `CHECK_EVERY`. Cuts: no stop on the
-    /// stream's end, red at "stream 1 ended"; `recv` with no timeout, red at "shutdown took".
-    /// Unit (~1.5 s): two of the sample's half-second waits.
+    /// list nothing. Stream 3 starts partition 1 under a new token, sends its `Deactivated`, and
+    /// is dropped: that term is stopped exactly once. Stream 4 then stays open and quiet: 300 ms
+    /// of timeouts stop nothing, and a shutdown asked on that quiet stream returns within
+    /// `CHECK_EVERY`. Cuts: no stop on the stream's end, red at "stream 1 ended"; no removal
+    /// from `held` on `Deactivated`, red at "stream 3 ended"; `recv` with no timeout, red at
+    /// "shutdown took". Unit (~2 s): three of the sample's half-second waits.
     #[config_log::retcd_test]
     fn the_ownership_events_sample_stops_and_resets_when_a_stream_ends() {
         let rt = runtime();
         let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
-        let mut db = Db::by_hand(
+        let db = Arc::new(Db::by_hand(
             vec![node],
             Arc::new(config_testkit::MemStore::new()),
             rt.handle(),
             Timeouts::default(),
             None,
-        );
+        ));
         let (p1, p2, p3) = (PartitionId(1), PartitionId(2), PartitionId(3));
         let heard = Arc::new(Heard::default());
         follow_scripted(&db, &heard, Some(&mailbox), || {
@@ -5405,10 +5411,30 @@ mod events_sample {
                 [("start", p3, token(4)), ("stop", p3, token(4))],
                 "stream 2 ended: its term is stopped before stream 3"
             );
+            third.send(activated(p1, token(5))).expect("sent");
+            third
+                .send(OwnershipEvent::Deactivated {
+                    node: NodeId(1),
+                    partition: p1,
+                    token: token(5),
+                })
+                .expect("sent");
+            heard.until(8);
+            third.drop_everywhere();
+            drop(third);
+            let fourth = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls()[6..],
+                [("start", p1, token(5)), ("stop", p1, token(5))],
+                "stream 3 ended: a term it already stopped is not stopped again"
+            );
             std::thread::sleep(Duration::from_millis(300));
-            assert_eq!(heard.calls().len(), 6, "a quiet stream stops nothing");
-            Some(third)
+            assert_eq!(heard.calls().len(), 8, "a quiet stream stops nothing");
+            Some(fourth)
         });
+        let Ok(mut db) = Arc::try_unwrap(db) else {
+            panic!("follow let go of the Db")
+        };
         db.shutdown();
     }
 
@@ -5471,6 +5497,60 @@ mod events_sample {
         assert_eq!(heard.calls(), [], "the app recorded nothing");
     }
 
+    /// #123 review: `follow_scripted` fails the row 2 s after the shutdown when `follow` never
+    /// returns (the app never answers that it shuts down), instead of hanging the binary. The
+    /// harness runs on its own thread, so a hang is a red row after 5 s. Once the app answers
+    /// again, the detached `follow` returns and lets go of the `Db`. Cut: the expiry only
+    /// dropping the held subscriber (the old harness), red at "a hung follow fails the row".
+    /// Unit (~2.5 s): the harness's 2 s bound.
+    #[config_log::retcd_test]
+    fn follow_scripted_fails_after_the_bound_when_follow_never_returns() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let db = Arc::new(Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let heard = Arc::new(Heard::default());
+        heard.ignore_shutdown.store(true, Ordering::SeqCst);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let harness = {
+            let (db, heard) = (Arc::clone(&db), Arc::clone(&heard));
+            std::thread::spawn(move || {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    follow_scripted(&db, &heard, Some(&mailbox), || {
+                        Some(next_subscriber(&mailbox))
+                    });
+                }));
+                let _ = done.send(caught.err());
+            })
+        };
+        let panic = outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a hung follow fails the row: the harness is still waiting")
+            .expect("follow_scripted panicked");
+        harness.join().expect("the harness thread");
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("follow did not return within 2 s"),
+            "the bound's own message: {message:?}"
+        );
+
+        heard.ignore_shutdown.store(false, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&db) > 1 {
+            assert!(Instant::now() < until, "the detached follow returns");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// #123 review: a `Db` that runs no node ends every stream at once. `follow` waits
     /// `RESUBSCRIBE_AFTER` between streams, so in 1.2 s it asks for a few streams, not millions,
     /// and it returns promptly when shut down mid-wait. Cut: no wait after a stream ends, red at
@@ -5478,13 +5558,13 @@ mod events_sample {
     #[config_log::retcd_test]
     fn the_ownership_events_sample_waits_between_streams_on_an_app_only_db() {
         let rt = runtime();
-        let mut db = Db::by_hand(
+        let db = Arc::new(Db::by_hand(
             Vec::new(),
             Arc::new(config_testkit::MemStore::new()),
             rt.handle(),
             Timeouts::default(),
             None,
-        );
+        ));
         let heard = Arc::new(Heard::default());
         follow_scripted(&db, &heard, None, || {
             std::thread::sleep(Duration::from_millis(1_200));
@@ -5497,6 +5577,9 @@ mod events_sample {
             RESUBSCRIBE_AFTER.as_millis() / CHECK_EVERY.as_millis()
         );
         assert_eq!(heard.calls(), [], "nothing was ever held");
+        let Ok(mut db) = Arc::try_unwrap(db) else {
+            panic!("follow let go of the Db")
+        };
         db.shutdown();
     }
 

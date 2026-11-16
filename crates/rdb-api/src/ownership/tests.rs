@@ -342,8 +342,9 @@ fn stall_steps(dispatch: u64, lands: u64, until: u64) -> Vec<(u64, Step)> {
 /// on the spec's budgets. It models the grant's bound on the horizon only; the clock sample's
 /// bound, which binds in steady state, is the host row's (`own83_8_..._on_three_hosts`, a
 /// real stall on three hosts).
-/// Cut: `DEACTIVATING_LEAD_MILLIS = G/2` (3000), red: the 3 s stall sends `Deactivating` at
-/// 2800. Unit.
+/// Cut: `deactivating_lead_millis` without its clock term (the lead is then the grant's `G/4`,
+/// 1500), red at "2000 - 2 x 500 at the spec's budgets"; both stalls' steps stay as asserted
+/// at that lead. Unit.
 #[test]
 fn own83_8_a_3s_control_stall_gives_no_deactivating() {
     let t = token(2, 2);

@@ -3221,6 +3221,11 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
+        // everywhere and subscribe again: a restarted node would otherwise never be heard. Before
+        // the syncer stops and the final marks (#123 review): both wait on the disk, and a stuck
+        // disk must not hold back the terminal `Deactivated` events.
+        self.ownership_stop();
         // F4 (A-R317): the sync in flight returns before the final marks, so their synced write
         // never waits behind it on a live node.
         if let Some(syncer) = self.syncer.take() {
@@ -3239,9 +3244,6 @@ impl Host {
                 self.set_fault(fault);
             }
         }
-        // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
-        // everywhere and subscribe again: a restarted node would otherwise never be heard.
-        self.ownership_stop();
         tracing::info!(
             node = self.node.0,
             boot = self.boot.0,

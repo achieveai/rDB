@@ -574,8 +574,8 @@ after `still_owner` already reads false). It gives no reason.
   every stream at once.
 - A node whose restart failed (`db.restart_failed(node)`) runs nothing, so it holds nothing and
   sends nothing. A stream leaves it out and stays open on the other nodes. If a later restart
-  starts it, the node joins every stream still open, with its current state first, so nothing
-  is missed.
+  starts it, the node joins every stream still open, and its next stop ends them, as any
+  node's stop does.
 - A healthy owner sends nothing for as long as it stays healthy. Wait with `recv_timeout`, so
   the loop can see your own shutdown; a timeout changes nothing you hold.
 
@@ -588,6 +588,9 @@ yet". So on `Err`:
    `Deactivated`. Keep no work because the next stream has not mentioned it.
 2. Wait a little (half a second below), unless you are shutting down, then subscribe again.
    What that stream lists, you start again.
+
+On your own shutdown, `follow` below returns at once and stops nothing: work it started is still
+running. Your shutdown stops it, with the rest of your app's work.
 
 ```rust
 use rdb_api::{Db, OwnerToken, OwnershipEvent, PartitionId};
@@ -613,6 +616,9 @@ pub const RESUBSCRIBE_AFTER: Duration = Duration::from_millis(500);
 /// When a stream ends, nothing says what it missed: a `Deactivated` may be lost, and the next
 /// stream's first events list only what is held then. So everything started or warned on the
 /// ended stream is stopped first (stop and reset), and the next stream starts from scratch.
+///
+/// On shutdown it returns at once and stops nothing: what it started is still running, and the
+/// caller stops it as part of shutting down.
 pub fn follow(db: &Db, app: &mut impl OnOwnership) {
     // Every (partition, token) the current stream started or warned about, not yet stopped.
     let mut held = BTreeSet::new();

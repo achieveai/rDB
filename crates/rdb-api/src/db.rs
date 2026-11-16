@@ -4253,7 +4253,9 @@ impl Db {
 
     /// A resend's or retry's answer under `request`: whatever refused it, the request may have
     /// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the
-    /// dedup replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED`
+    /// dedup replay and prove only that this send mutated nothing (Q-A); so does a faulted
+    /// node's refusal, which comes before admission and the replay alike (#124, Q15 (b)), so its
+    /// `no_mutation` is cleared here too. A `PROTECTION_PAUSED`
     /// refusal points at [`Self::status`] only when status shows, or will show, the outcome
     /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
     /// 7, P2), but a request refused at admission was never queued, and nothing resolves it

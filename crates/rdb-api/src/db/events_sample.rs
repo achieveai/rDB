@@ -28,6 +28,9 @@ pub const RESUBSCRIBE_AFTER: Duration = Duration::from_millis(500);
 /// When a stream ends, nothing says what it missed: a `Deactivated` may be lost, and the next
 /// stream's first events list only what is held then. So everything started or warned on the
 /// ended stream is stopped first (stop and reset), and the next stream starts from scratch.
+///
+/// On shutdown it returns at once and stops nothing: what it started is still running, and the
+/// caller stops it as part of shutting down.
 pub fn follow(db: &Db, app: &mut impl OnOwnership) {
     // Every (partition, token) the current stream started or warned about, not yet stopped.
     let mut held = BTreeSet::new();
