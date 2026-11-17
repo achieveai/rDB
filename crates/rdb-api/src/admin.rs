@@ -252,7 +252,8 @@ pub(crate) async fn form(
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
     let written = write_records(store, &all).await?;
     for (partition, revision) in &written {
-        start_recovery(now, boot, *partition, *revision, &send)?;
+        let members = members_for(*partition, boot);
+        start_recovery(now, boot, *partition, *revision, members, &send)?;
     }
     Ok(written[0].1)
 }
@@ -311,12 +312,13 @@ async fn create_or_adopt(
     }
 }
 
-/// Send `partition`'s bootstrap plan and fence to its [`initial_owner`].
+/// Send `partition`'s bootstrap plan, pinning `members`, and fence to its [`initial_owner`].
 fn start_recovery(
     now: Tick,
     boot: BootId,
     partition: PartitionId,
     revision: Revision,
+    members: Vec<Member>,
     send: &impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
 ) -> Result<(), BootstrapError> {
     let owner = initial_owner(partition);
@@ -333,7 +335,7 @@ fn start_recovery(
     let plan = recovery_plan(
         anchor,
         CONFIG_VERSION,
-        members_for(partition, boot),
+        members,
         boot,
         GrantId(1),
         AuthorityGeneration(1),
@@ -399,6 +401,220 @@ async fn adopt(
     }
     tracing::info!(key = %key, revision = found.mod_revision, "bootstrap_partition_record_adopted");
     Ok(Revision(found.mod_revision))
+}
+
+/// The `operations/` key of the formation record (#80 S1a, ADR-rdb-0022): tag `0x00E0` in bits
+/// 48..64, apart from the promote tag and F1's, as [`PROMOTE_OPERATION_BASE`] is.
+pub const FORMATION_OPERATION: OperationId = OperationId(0x00E0 << 48);
+
+/// The version byte of the formation record: layout 1 is the instance, the partition count as
+/// a little-endian u32, then one little-endian u32 per declared node.
+const FORMATION_LAYOUT: u8 = 1;
+
+/// What a declaration asks for (#80 S1a): the database's nodes and its partition count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// The data nodes. This build declares nodes 1, 2 and 3 only.
+    pub nodes: Vec<NodeId>,
+    /// The partition count, fixed from then on.
+    pub partitions: u32,
+}
+
+/// The formation record a declaration wrote: the database's identity, its partition count and
+/// its nodes. Written once and never changed (ADR-rdb-0022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Formation {
+    /// The rDB instance every node's copy binds.
+    pub instance: [u8; INSTANCE_LEN],
+    /// The partition count.
+    pub partitions: u32,
+    /// The declared nodes, in order.
+    pub nodes: Vec<NodeId>,
+}
+
+impl Formation {
+    /// Layout 1 ([`FORMATION_LAYOUT`]).
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut out = Vec::with_capacity(1 + INSTANCE_LEN + 4 + 4 * self.nodes.len());
+        out.push(FORMATION_LAYOUT);
+        out.extend_from_slice(&self.instance);
+        out.extend_from_slice(&self.partitions.to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&node.0.to_le_bytes());
+        }
+        Bytes::from(out)
+    }
+
+    /// `None` for a body that is not layout 1.
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        let [FORMATION_LAYOUT, rest @ ..] = body else {
+            return None;
+        };
+        let (instance, rest) = rest.split_at_checked(INSTANCE_LEN)?;
+        let (partitions, rest) = rest.split_at_checked(4)?;
+        if rest.len() % 4 != 0 {
+            return None;
+        }
+        Some(Self {
+            instance: instance.try_into().ok()?,
+            partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+            nodes: rest
+                .chunks_exact(4)
+                .map(|node| node.try_into().map(|b| NodeId(u32::from_le_bytes(b))))
+                .collect::<Result<_, _>>()
+                .ok()?,
+        })
+    }
+}
+
+/// How [`declare`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared {
+    /// This call wrote the formation record.
+    Created(Formation),
+    /// The same declaration was already there; nothing was written.
+    Already(Formation),
+}
+
+/// Why [`declare`] wrote no formation record.
+#[derive(Debug, thiserror::Error)]
+pub enum DeclareError {
+    /// The declaration is not one this build makes, or differs from the one already there.
+    #[error("{0}")]
+    Refused(String),
+    /// A control record was in the way, or the store failed.
+    #[error(transparent)]
+    Records(#[from] BootstrapError),
+    /// The formation record does not decode.
+    #[error("{key} is not a formation record this build reads")]
+    Undecodable {
+        /// Its key.
+        key: String,
+    },
+}
+
+/// The formation record, `None` when no declaration wrote one (#80 S1a).
+///
+/// # Errors
+///
+/// [`DeclareError::Records`] when the store fails, [`DeclareError::Undecodable`] for a record this
+/// build does not read.
+pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>, DeclareError> {
+    let key = ControlKey::Operation(FORMATION_OPERATION).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| BootstrapError::Control(format!("get {key}: {error}")))?;
+    read.record
+        .map(|found| Formation::decode(&found.value).ok_or(DeclareError::Undecodable { key }))
+        .transpose()
+}
+
+/// Declare a database (#80 S1a, ADR-rdb-0022): `routes/0` at more than one partition, every
+/// partition's generation-0 record ([`write_records`], placement as [`initial_owner`]), then
+/// **last** the formation record under [`FORMATION_OPERATION`], naming a new instance. No copy is
+/// written: each node process forms the partitions it owns from its own empty folder.
+///
+/// Write-once and idempotent: the same declaration again answers [`Declared::Already`] and
+/// writes nothing; a different one is refused, naming what is there. A declaration that stopped
+/// before its formation record is finished by running it again: the records it wrote are
+/// adopted.
+///
+/// # Errors
+///
+/// [`DeclareError`]. A database formed some other way (`--form`, `lr up`) holds a rooted
+/// `partitions/1`, which is in the way: [`DeclareError::Records`].
+pub async fn declare(
+    store: &Arc<dyn ConfigStore>,
+    declaration: &Declaration,
+) -> Result<Declared, DeclareError> {
+    let wanted = crate::db::ALL_NODES.to_vec();
+    if declaration.nodes != wanted {
+        return Err(DeclareError::Refused(format!(
+            "nodes {:?}: this build declares nodes 1, 2 and 3 only; nothing was written",
+            declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+        )));
+    }
+    let max = rdb_core::partition_map::MAX_PARTITIONS;
+    if !(1..=max).contains(&declaration.partitions) {
+        return Err(DeclareError::Refused(format!(
+            "partitions {} is out of range: a database has 1 to {max} partitions; nothing was \
+             written",
+            declaration.partitions
+        )));
+    }
+    let same = |found: Formation| {
+        if found.partitions == declaration.partitions && found.nodes == declaration.nodes {
+            tracing::info!(
+                instance_hex = %instance_hex(&found.instance),
+                partitions = found.partitions,
+                "declare_already"
+            );
+            Ok(Declared::Already(found))
+        } else {
+            Err(DeclareError::Refused(format!(
+                "the database is already declared with {} partitions and nodes {:?}: a \
+                 declaration is written once; nothing was written",
+                found.partitions,
+                found.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+            )))
+        }
+    };
+    if let Some(found) = read_formation(&**store).await? {
+        return same(found);
+    }
+    let partitions = declaration.partitions;
+    if partitions > 1 {
+        let key = ControlKey::Route(RangeId(0)).encode();
+        let value = RoutesRoot {
+            partition_count: partitions,
+        }
+        .encode();
+        create_or_adopt(store, &key, &value).await?;
+    }
+    let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
+    write_records(store, &all).await?;
+    let formation = Formation {
+        instance: *uuid::Uuid::new_v4().as_bytes(),
+        partitions,
+        nodes: declaration.nodes.clone(),
+    };
+    let key = ControlKey::Operation(FORMATION_OPERATION).encode();
+    let created = store
+        .put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: formation.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        })
+        .await;
+    match created {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(
+                instance_hex = %instance_hex(&formation.instance),
+                partitions,
+                revision = response.revision,
+                "declare_formation_written"
+            );
+            Ok(Declared::Created(formation))
+        }
+        // Another declaration's record landed first, or this one's reply was lost: read it.
+        Ok(_) | Err(ConfigError::DeadlineExceededUnknownOutcome) => {
+            match read_formation(&**store).await? {
+                Some(found) if found == formation => Ok(Declared::Created(found)),
+                Some(found) => same(found),
+                None => Err(BootstrapError::Control(format!(
+                    "{key} is absent after a create that was not reported applied"
+                ))
+                .into()),
+            }
+        }
+        Err(error) => Err(BootstrapError::Control(format!("put {key}: {error}")).into()),
+    }
 }
 
 /// The most opens one data directory may have (arch R3b): `N <= 2^23`, so a boot and a
@@ -1156,9 +1372,22 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // M11 T6: the members are the ones `partitions/1` pins, not nodes 1 to 3. A move may have
     // put a copy on node 4; re-pinning node 3 would recover from a copy the move left behind.
     let pinned = pinned_members(&ctx).await?;
+    // A partition still to form pins its formed members (#80 S1a): in a node process they run
+    // in other processes, at the boots their handshakes report, not at this open's.
+    let forming: Vec<Vec<RecordMember>> = ctx
+        .bootstrap
+        .iter()
+        .map(|(partition, _)| {
+            members_for(*partition, BOOT)
+                .iter()
+                .map(RecordMember::of)
+                .collect()
+        })
+        .collect();
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
     // fence's reads and decision tick as fresh as they were. One union over the partitions.
-    let boots = member_boots(&ctx, &member_union(&pinned), deadline).await?;
+    let union = member_union(&[pinned.as_slice(), forming.as_slice()].concat());
+    let boots = member_boots(&ctx, &union, deadline).await?;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle. Once, for
     // every partition this node owns (issue #79).
@@ -1216,12 +1445,19 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
                 })?;
         }
     }
-    for (partition, revision) in ctx.bootstrap.iter().copied() {
+    for ((partition, revision), was) in ctx.bootstrap.iter().copied().zip(&forming) {
         let send = |_, msg| ctx.owner.send(msg).map_err(|_| NodeStopped(ctx.owner_node));
-        start_recovery(ctx.clock.now(), ctx.boot, partition, revision, &send).map_err(|_| {
-            HealError::NodeStopped {
-                node: ctx.owner_node,
-            }
+        let members = members_at_boots(was, &boots);
+        start_recovery(
+            ctx.clock.now(),
+            ctx.boot,
+            partition,
+            revision,
+            members,
+            &send,
+        )
+        .map_err(|_| HealError::NodeStopped {
+            node: ctx.owner_node,
         })?;
     }
     Ok(healed)

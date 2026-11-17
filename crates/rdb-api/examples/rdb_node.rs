@@ -4,6 +4,7 @@
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
 //! rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
+//! rdb_node --declare --control E [--partitions P] [--nodes K] [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
@@ -18,6 +19,11 @@
 //!   `--dir`, until ready, then shuts down. A node process only ever opens a formed database.
 //!   `--partitions` is how many partitions the database is formed with (issue #79), fixed from
 //!   then on. Unset, a new database has one and a node process reads the count from the store.
+//! * `--declare` makes the database with no copy at all (#80 S1a, ADR-rdb-0022): it writes the
+//!   control records and, last, the formation record naming the database's instance, then exits.
+//!   Each node process then opens its own empty `--dir`, and the owner of each partition forms
+//!   it. `--partitions` defaults to 1; `--nodes` is the node count, and this build declares 3.
+//!   Run again with the same arguments it says `already`; with another count it is refused.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
 //!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
@@ -82,6 +88,7 @@ use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, Parti
 struct Args {
     gen_certs: bool,
     form: bool,
+    declare: bool,
     apps: Vec<String>,
     node: Option<u32>,
     dir: Option<PathBuf>,
@@ -122,6 +129,7 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
   rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
+  rdb_node --declare --control E [--partitions P] [--nodes K] [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
@@ -139,6 +147,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "--gen-certs" => args.gen_certs = true,
             "--form" => args.form = true,
+            "--declare" => args.declare = true,
             "--apps" => {
                 args.apps = value("--apps")?
                     .split(',')
@@ -275,7 +284,11 @@ const FAILOVER_SILENT_MIN_MS: u64 = 1_000;
 /// `--failover`.
 fn failover_refusal(args: &Args) -> Result<(), String> {
     if args.failover {
-        for (given, mode) in [(args.form, "--form"), (args.gen_certs, "--gen-certs")] {
+        for (given, mode) in [
+            (args.form, "--form"),
+            (args.declare, "--declare"),
+            (args.gen_certs, "--gen-certs"),
+        ] {
             if given {
                 return Err(format!(
                     "--failover runs only in a node process, not with {mode}"
@@ -362,9 +375,11 @@ fn run(
     if args.gen_certs {
         return gen_certs(&args);
     }
-    let name = args
-        .node
-        .map_or_else(|| "rdb_node-form".to_owned(), |n| format!("rdb_node-{n}"));
+    let name = match args.node {
+        Some(n) => format!("rdb_node-{n}"),
+        None if args.declare => "rdb_node-declare".to_owned(),
+        None => "rdb_node-form".to_owned(),
+    };
     let log_dir = args.log_dir.clone().unwrap_or_else(|| PathBuf::from("."));
     let mut config = config_log::LogConfig::for_application("rdb_node");
     config.dir.clone_from(&log_dir);
@@ -384,6 +399,8 @@ fn run(
         Ok(rt) => {
             let result = if args.form {
                 form(&args, &rt)
+            } else if args.declare {
+                declare(&args, &rt)
             } else {
                 serve(&args, &rt)
             };
@@ -471,6 +488,29 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     ready.map_err(|e| format!("form: not ready within {within:?}: {e}"))?;
     tracing::info!(dir = %dir.display(), "rdb_node_formed");
     println!("rdb_node formed dir={}", dir.display());
+    Ok(())
+}
+
+/// Declare the database (#80 S1a): control records only, no copy, then exit.
+fn declare(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    let store = control(args)?;
+    let declaration = rdb_api::admin::Declaration {
+        nodes: (1..=args.nodes.unwrap_or(3)).map(NodeId).collect(),
+        partitions: args.partitions.unwrap_or(1),
+    };
+    let (word, formation) = match rt.block_on(rdb_api::admin::declare(&store, &declaration)) {
+        Ok(rdb_api::admin::Declared::Created(formation)) => ("declared", formation),
+        Ok(rdb_api::admin::Declared::Already(formation)) => ("already", formation),
+        Err(e) => return Err(format!("declare: {e}")),
+    };
+    let instance = rdb_api::admin::instance_hex(&formation.instance);
+    let nodes: Vec<String> = formation.nodes.iter().map(|n| n.0.to_string()).collect();
+    tracing::info!(%instance, partitions = formation.partitions, word, "rdb_node_declared");
+    println!(
+        "rdb_node {word} instance={instance} partitions={} nodes={}",
+        formation.partitions,
+        nodes.join(",")
+    );
     Ok(())
 }
 
