@@ -454,17 +454,17 @@ impl Formation {
         };
         let (instance, rest) = rest.split_at_checked(INSTANCE_LEN)?;
         let (partitions, rest) = rest.split_at_checked(4)?;
-        if rest.len() % 4 != 0 {
+        let (nodes, tail) = rest.as_chunks::<4>();
+        if !tail.is_empty() {
             return None;
         }
         Some(Self {
             instance: instance.try_into().ok()?,
             partitions: u32::from_le_bytes(partitions.try_into().ok()?),
-            nodes: rest
-                .chunks_exact(4)
-                .map(|node| node.try_into().map(|b| NodeId(u32::from_le_bytes(b))))
-                .collect::<Result<_, _>>()
-                .ok()?,
+            nodes: nodes
+                .iter()
+                .map(|node| NodeId(u32::from_le_bytes(*node)))
+                .collect(),
         })
     }
 }
