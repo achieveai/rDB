@@ -830,6 +830,18 @@ mod tests {
         parse(argv.iter().map(|a| (*a).to_owned()))
     }
 
+    /// #80 S1a: `--declare` runs no planner either, so `--failover` with it is refused; plain
+    /// `--declare` with its count parses. Unit.
+    #[test]
+    fn s1a_declare_rejects_failover() {
+        assert_eq!(
+            parsed(&["--declare", "--failover"]).map(|_| ()),
+            Err("--failover runs only in a node process, not with --declare".to_owned())
+        );
+        assert!(parsed(&["--declare", "--partitions", "8"])
+            .is_ok_and(|args| args.declare && args.partitions == Some(8) && !args.failover));
+    }
+
     /// PR #119 review: `--failover` with `--form` is a parse error, since forming runs no
     /// planner; plain `--form` parses. Unit.
     /// Cut: drop the mode check in `failover_refusal`; the pair parses, red.

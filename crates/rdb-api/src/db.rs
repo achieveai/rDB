@@ -6626,6 +6626,8 @@ mod clock_guard_tests;
 #[cfg(test)]
 mod failover_tests;
 #[cfg(test)]
+mod formation_tests;
+#[cfg(test)]
 pub(crate) mod reopen_tests;
 
 #[cfg(test)]
