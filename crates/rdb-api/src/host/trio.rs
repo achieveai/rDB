@@ -232,6 +232,8 @@ impl Trio {
             while let Ok(msg) = rx.try_recv() {
                 host.handle(msg);
             }
+            // As `Host::run` does once per turn, before its wait (#83).
+            host.ownership_duty();
             assert_eq!(host.fault, None, "node {} faulted", host.node.0);
             assert_not_blocked(
                 &host.status(PartitionId(1)),

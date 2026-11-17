@@ -54,6 +54,11 @@
 //! While it runs, `rdb_node ownership node=N partition=P token=G.E` when this node starts leading
 //! a partition, and `rdb_node ownership-lapsed node=N partition=P token=G.E` when
 //! `Db::still_owner` turns false for that token (#84; logged `ownership_held`, `ownership_lapsed`).
+//! And each event of `Db::ownership_events` (#83), as it arrives:
+//! `rdb_node ownership-event node=N partition=P state=activated token=G.E`, `state=deactivating`
+//! with `deadline_in_ms=D` (time left until writes stop), or `state=deactivated`. The host logs
+//! each as `ownership_event` with its clock tick; a dropped subscriber subscribes again
+//! (`rdb_node_ownership_resubscribed`).
 //! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
 //! step failed, 2 bad arguments.
 
@@ -71,7 +76,7 @@ use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, PartitionId, Timeouts};
+use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, Timeouts};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -568,6 +573,41 @@ fn watch_ownership(db: &Db, node: NodeId, done: &AtomicBool) {
     );
 }
 
+/// #83's manual entry point: print each ownership event as it arrives. A receiver that ends
+/// (this subscriber lagged, or a node stopped) is subscribed again, which starts from the
+/// current state.
+fn print_ownership_events(db: &Db, done: &AtomicBool) {
+    let mut events = db.ownership_events();
+    while !done.load(Ordering::Relaxed) {
+        let event = match events.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("rdb_node_ownership_resubscribed");
+                std::thread::sleep(Duration::from_millis(100));
+                events = db.ownership_events();
+                continue;
+            }
+        };
+        let tail = match event {
+            OwnershipEvent::Deactivating { deadline, .. } => format!(
+                " deadline_in_ms={}",
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+            ),
+            _ => String::new(),
+        };
+        println!(
+            "rdb_node ownership-event node={} partition={} state={} token={}{tail}",
+            event.node().0,
+            event.partition().0,
+            event.state(),
+            event.token()
+        );
+    }
+}
+
 /// Run node `--node` of the database in `--dir` until `--stop-file` appears.
 /// Prints a wait's outcome. True when it timed out, so `serve` keeps waiting: the
 /// line then ends `(retrying)`, and `lr` reads a not-ready line without it as final.
@@ -687,6 +727,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| watch_ownership(&db, node, &done));
+        scope.spawn(|| print_ownership_events(&db, &done));
         while !stopped() {
             if !retrying {
                 std::thread::sleep(Duration::from_millis(100));

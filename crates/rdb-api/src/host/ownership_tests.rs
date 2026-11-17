@@ -343,6 +343,354 @@ fn own84_4_a_paused_process_resumes_not_owning() {
     );
 }
 
+// ------------------------------------------------------------------ #83: the ownership stream
+
+use super::drop_tests::{commit_of, read_only_beside_an_adoptable_tail, writable_commit};
+use super::seal_tests::{control_behind_a_cut, spawn_promote_dropping};
+use super::trio::logged;
+use crate::ownership::{OwnershipEvent, OwnershipEvents, Subscriber, SUBSCRIBER_CAPACITY};
+
+/// One subscriber on every host of the trio, as `Db::ownership_events` makes one.
+fn subscribe_all(trio: &mut Trio) -> OwnershipEvents {
+    let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
+    for (host, _, _) in &mut trio.nodes {
+        host.subscribe(Arc::clone(&subscriber));
+    }
+    events
+}
+
+/// The events `events` holds now, appended to `heard`: the trio steps every host on this
+/// thread, so arrival order is send order, across nodes too.
+fn hear(events: &OwnershipEvents, heard: &mut Vec<OwnershipEvent>) {
+    heard.extend(events.try_iter());
+}
+
+fn on(node: u32, heard: &[OwnershipEvent]) -> Vec<(&'static str, OwnerToken)> {
+    heard
+        .iter()
+        .filter(|event| event.node() == NodeId(node) && event.partition() == P1)
+        .map(|event| (event.state(), event.token()))
+        .collect()
+}
+
+/// The rooted instance `admin::promote` reads.
+const INSTANCE: [u8; INSTANCE_LEN] = [8; INSTANCE_LEN];
+/// A promote waits out the old grant: about a second and a half here.
+const PROMOTE_GRANT_MILLIS: u64 = 1_500;
+
+/// own83_5's hosts: bound to [`INSTANCE`], a [`PROMOTE_GRANT_MILLIS`] grant renewed every
+/// 300 ms, node 1's clock `lag` behind the others.
+fn promotable(lag: u64) -> impl Fn(&mut Host) {
+    move |host: &mut Host| {
+        Trio::fast(host);
+        host.engine.bind_instance(INSTANCE).expect("bind instance");
+        host.instance = Some(INSTANCE);
+        host.budgets.grant_millis = PROMOTE_GRANT_MILLIS;
+        host.budgets.renew_millis = 300;
+        if host.node == NodeId(1) && lag > 0 {
+            host.clock = host.clock.lagging(lag);
+        }
+    }
+}
+
+/// own83_5's schedule, with node 1's clock `lag` behind. Node 1 owns partition 1 and is cut
+/// from the store with its links held: a live owner that cannot renew and cannot hear the
+/// freeze. Node 2 promotes for real, dropping node 1. Every host is stepped throughout, so
+/// node 1 sends what it sends. Returns what was heard, in order, and node 2's read of the write
+/// acknowledged before the move, sent the moment node 2's `Activated` arrived.
+fn handover(method: &str, lag: u64) {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), promotable(lag));
+    let faults = control_behind_a_cut(&mut trio);
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.ready();
+    assert!(
+        matches!(trio.ask(put(1)), Answer::Txn { .. }),
+        "the write before the move is acknowledged"
+    );
+
+    // own83_7: a subscriber that comes late hears the current state first.
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    hear(&events, &mut heard);
+    let old = token(&trio);
+    assert_eq!(on(1, &heard), [("activated", old)], "{heard:?}");
+
+    faults.apply("cut-control");
+    trio.links.hold(NodeId(1), NodeId(2));
+    trio.links.hold(NodeId(1), NodeId(3));
+    let promote = spawn_promote_dropping(&trio, 2, Some(NodeId(1)));
+    let new = trio.until("node 2 sent Activated", |_| {
+        hear(&events, &mut heard);
+        on(2, &heard)
+            .into_iter()
+            .find(|(state, _)| *state == "activated")
+            .map(|(_, token)| token)
+    });
+    // own83_4: data is readable on node 2 the moment it says so.
+    let (reply, answer) = mpsc::channel();
+    trio.nodes[1]
+        .1
+        .send(Msg::Client(Client {
+            partition: P1,
+            call: ClientCall::Get {
+                identity: identity(900),
+                group: AffinityId(1),
+                object: Bytes::from_static(b"o"),
+                look: Look::Doc,
+            },
+            reply,
+        }))
+        .expect("node 2's mailbox");
+    let read = trio.answer(&answer);
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+
+    let node_1 = on(1, &heard);
+    let activated_at = heard
+        .iter()
+        .position(|event| event.node() == NodeId(2) && event.partition() == P1)
+        .expect("node 2's event");
+    let deactivated_at = heard
+        .iter()
+        .position(
+            |event| matches!(event, OwnershipEvent::Deactivated { node, .. } if *node == NodeId(1)),
+        )
+        .unwrap_or_else(|| panic!("node 1 sent no Deactivated: {heard:?}"));
+    assert_eq!(
+        node_1,
+        [
+            ("activated", old),
+            ("deactivating", old),
+            ("deactivated", old)
+        ],
+        "node 1, in order"
+    );
+    assert!(
+        deactivated_at < activated_at,
+        "node 1's Deactivated before node 2's Activated: {heard:?}"
+    );
+    assert!(new > old, "node 2's token {new} above node 1's {old}");
+    match read {
+        Answer::Read {
+            seen: Seen::Doc(_), ..
+        } => {}
+        other => panic!("node 2 activated before the acknowledged write read back: {other:?}"),
+    }
+
+    // Ruling B-1: `Deactivated` at the first turn past the horizon, on node 1's own clock.
+    let lines = logged!(method, "ownership_event");
+    let gone = lines
+        .iter()
+        .find(|line| line["node"] == 1 && line["state"] == "deactivated")
+        .expect("node 1 logged its Deactivated");
+    let horizon = gone["horizon"].as_u64().expect("a horizon");
+    let tick = gone["tick"].as_u64().expect("a tick");
+    assert!(
+        tick > horizon && tick <= horizon + 1 + Trio::CLOCK_STEP_CAP_MILLIS,
+        "Deactivated at tick {tick}, horizon {horizon}"
+    );
+    let came = lines
+        .iter()
+        .find(|line| line["node"] == 2 && line["state"] == "activated")
+        .expect("node 2 logged its Activated");
+    // Node 1's tick reads `lag` behind the trio's, so its stop on the trio's clock is `+ lag`.
+    let gap = came["tick"].as_u64().expect("a tick") - (tick + lag);
+    tracing::info!(gap_ms = gap, lag, "own83_5_gap");
+}
+
+/// own83_5, #83's acceptance row: node 1 owns partition 1, is cut from the store with its links
+/// held, and node 2 promotes for real, dropping it. Node 1 sends `Deactivating` then
+/// `Deactivated` before node 2 sends `Activated`, with a higher token. `Deactivated` comes at
+/// the first turn past node 1's horizon (ruling B-1). Also own83_4: a read sent to node 2 the
+/// moment it activates returns the write acknowledged before the move; and own83_7: a
+/// subscriber that comes late hears `Activated` first.
+/// Cut: `Judged::owned` judging 1.5 s in the past (a stop timer that fires late), red on both
+/// variants: node 2's `Activated` arrives with node 1 still `Deactivating`.
+/// Integration (~4 s): bootstrap's discovery window, then the promote's wait for a 1.5 s grant.
+#[config_log::retcd_test]
+fn own83_5_old_owner_sees_deactivating_then_deactivated_before_new_owner_sees_activated() {
+    handover(
+        "own83_5_old_owner_sees_deactivating_then_deactivated_before_new_owner_sees_activated",
+        0,
+    );
+}
+
+/// own83_5 with node 1's clock lagging the promoter's by ε (100 ms, `clock_error_millis`): the
+/// order still holds, since node 1's horizon on its own clock already leaves ε for that.
+/// Integration (~4 s), as own83_5.
+#[config_log::retcd_test]
+fn own83_5b_the_order_holds_with_the_old_owner_lagging_by_epsilon() {
+    handover(
+        "own83_5b_the_order_holds_with_the_old_owner_lagging_by_epsilon",
+        Budgets::SPEC_DEFAULTS.clock_error_millis,
+    );
+}
+
+/// Steps the trio for `millis` of real time, hearing as it goes.
+fn run_for(
+    trio: &mut Trio,
+    millis: u64,
+    events: &OwnershipEvents,
+    heard: &mut Vec<OwnershipEvent>,
+) {
+    let until = Instant::now() + Duration::from_millis(millis);
+    while Instant::now() < until {
+        trio.step();
+        hear(events, heard);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Fail the store for `millis` of the hosts' time from just after a renewal of node 1 lands,
+/// then let it answer, and run on past the old horizon, on the hosts' time too. What node 1 sent
+/// for partition 1 from the stall on.
+fn stall_after_a_renewal(
+    trio: &mut Trio,
+    millis: u64,
+    events: &OwnershipEvents,
+) -> Vec<(&'static str, OwnerToken)> {
+    let renewed_at = |trio: &Trio| trio.nodes[0].0.authority.view().renewed_at;
+    let before = renewed_at(trio);
+    trio.until("node 1's next renewal lands", |trio| {
+        (renewed_at(trio) > before).then_some(())
+    });
+    let mut heard = Vec::new();
+    hear(events, &mut heard);
+    heard.clear();
+    let stalled_at = trio.clock.now();
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store stalls".to_owned(),
+        });
+    let reached = run_to(trio, stalled_at.plus_millis(millis), events, &mut heard);
+    // #123 review: the stall is the hosts' time, not the wall's. The trio's clock drops any
+    // scheduling gap past 20 ms, so a wall-time stall could end short on the hosts' clock.
+    assert!(
+        reached.0 - stalled_at.0 >= millis,
+        "the store failed for {} ms of host time, not {millis}",
+        reached.0 - stalled_at.0
+    );
+    trio.mem.stop_failing();
+    // Past the old horizon (5.8 s after the renewal) with room for the renewal after the stall.
+    run_to(trio, stalled_at.plus_millis(6_500), events, &mut heard);
+    on(1, &heard)
+}
+
+/// Steps the trio until its clock reads `target`, hearing as it goes, and returns the tick it
+/// stopped at. Bounded on the wall clock too: twice the host time, plus 2 s, scaled.
+fn run_to(
+    trio: &mut Trio,
+    target: Tick,
+    events: &OwnershipEvents,
+    heard: &mut Vec<OwnershipEvent>,
+) -> Tick {
+    let left = target.0.saturating_sub(trio.clock.now().0);
+    let bound = Instant::now() + test_patience(Duration::from_millis(2 * left + 2_000));
+    loop {
+        let now = trio.clock.now();
+        if now >= target {
+            return now;
+        }
+        assert!(
+            Instant::now() < bound,
+            "the trio's clock did not reach {} (at {})",
+            target.0,
+            now.0
+        );
+        trio.step();
+        hear(events, heard);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// own83_8 on three hosts at the spec's budgets (ruling B-2): the control store fails for 3 s
+/// right after a renewal of node 1 lands, then answers again. Node 1 sends nothing: the
+/// renewal after the stall lands before the lead (1 s). Then a 4.9 s stall, which passes the
+/// lead's start (4.8 s after the renewal's dispatch) and still renews before the horizon
+/// (5.8 s): `Deactivating`, then `Activated` again with the same token, never `Deactivated`.
+/// Cuts (on `deactivating_lead_millis`): 1600, red: the 3 s stall's window hears
+/// `Deactivating`, `Activated` pairs, one per clock sample (the steady-state horizon is the
+/// sample's, 2000 ms, see its doc). 3000 (G/2), red: nothing ever activates.
+/// Integration (~15 s): bootstrap, then two stalls each run on past the old horizon.
+#[config_log::retcd_test]
+fn own83_8_a_3s_control_stall_gives_no_deactivating_on_three_hosts() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let events = subscribe_all(&mut trio);
+    assert_eq!(
+        stall_after_a_renewal(&mut trio, 3_000, &events),
+        [],
+        "a 3 s stall is ridden out silently"
+    );
+    assert_eq!(
+        stall_after_a_renewal(&mut trio, 4_900, &events),
+        [("deactivating", held), ("activated", held)],
+        "a 4.9 s stall warns, then resumes under the same token"
+    );
+}
+
+/// own83_9 (ruling B-4): a `ReadOnly` commit sends no `Activated`, however long it serves
+/// reads; the writable commit that follows its adoption sends `Activated` with that commit's
+/// token. b19's read-only commit on {1, 2}, with node 2 holding an adoptable tail.
+/// Cut: `writable_primary` without `!recovery_mode` **and** with the queue always open, red:
+/// `Activated` for the read-only generation. Either cut alone stays green: while the commit is
+/// `ReadOnly` here, T1's queue is frozen too, so the two checks guard this row redundantly.
+/// Integration (~8 s): b19's pause and drop, then the repair.
+#[config_log::retcd_test]
+fn own83_9_a_readonly_capped_commit_sends_no_activated() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, read_only, _) = read_only_beside_an_adoptable_tail(dir.path());
+    assert_eq!(
+        commit_of(&trio).map(|(_, mode, _)| mode),
+        Some(PartitionMode::ReadOnly),
+        "precondition"
+    );
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    run_for(&mut trio, 1_000, &events, &mut heard);
+    assert!(
+        !on(1, &heard).iter().any(|(state, _)| *state == "activated"),
+        "no Activated while the commit is ReadOnly: {heard:?}"
+    );
+    trio.links.heal(NodeId(1), NodeId(2));
+    let (writable, _, _) = writable_commit(&mut trio);
+    let activated = trio.until("node 1 sent Activated", |_| {
+        hear(&events, &mut heard);
+        on(1, &heard)
+            .into_iter()
+            .find(|(state, _)| *state == "activated")
+            .map(|(_, token)| token)
+    });
+    assert_eq!(
+        activated.generation, writable,
+        "the writable commit's token"
+    );
+    assert!(
+        !heard.iter().any(|event| matches!(
+            event,
+            OwnershipEvent::Activated { token, .. } if token.generation == read_only
+        )),
+        "never for the read-only generation: {heard:?}"
+    );
+}
+
 /// A live view of partition 1 under `token`, through `valid_through`.
 fn live_view(token: OwnerToken, valid_through: Tick) -> AuthorityView {
     live_view_of(P1, token, valid_through)
@@ -578,6 +926,49 @@ fn own84_7c_a_read_only_recovery_under_a_live_view_is_owned_and_refuses_writes()
         }
         other => panic!("a read-only partition refuses the write at the held tick: {other:?}"),
     }
+}
+
+/// own83_11 (#84 review's revoke, seen from #83's stream): a node that faults while `Activated`
+/// sends `Deactivating` with a deadline of now and then `Deactivated`, on the turn it faults,
+/// and never activates again; by then `still_owner` already reads false (the revoke is first).
+/// Faulted by `set_fault` alone, as a duty or a step that faults. Its duty is run by hand: the
+/// trio's `step` asserts no host faulted. Cut: `faulted: false` in `ownership_duty`, red: node
+/// 1 stays `Activated` under a view that still admits. Integration (~1 s): bootstrap.
+#[config_log::retcd_test]
+fn own83_11_a_faulted_owner_sends_deactivated() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let events = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    hear(&events, &mut heard);
+    assert_eq!(
+        on(1, &heard),
+        [("activated", held)],
+        "precondition: {heard:?}"
+    );
+    heard.clear();
+
+    let host = &mut trio.nodes[0].0;
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    assert!(
+        !host.owner_views.still_owner(P1, held),
+        "the revoke comes before the stream"
+    );
+    host.ownership_duty();
+    hear(&events, &mut heard);
+    assert_eq!(
+        on(1, &heard),
+        [("deactivating", held), ("deactivated", held)],
+        "the faulted owner deactivates on that turn: {heard:?}"
+    );
+    for _ in 0..10 {
+        trio.nodes[0].0.ownership_duty();
+    }
+    hear(&events, &mut heard);
+    assert_eq!(on(1, &heard).len(), 2, "never again: {heard:?}");
 }
 
 /// The token the rows below find owned before their fault.
@@ -1049,5 +1440,408 @@ fn own84_7d_a_partition_blocked_for_an_operator_is_owned_and_refuses_writes() {
         kind,
         ErrorKind::DivergenceRequiresOperator,
         "check 8's refusal"
+    );
+}
+
+// ------------------------------------------------------------------ #83, PR #123 review rows
+
+/// A subscriber on one hand-built host, through its mailbox path.
+fn subscribe_one(host: &mut Host) -> OwnershipEvents {
+    let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
+    host.handle(Msg::Subscribe(subscriber));
+    events
+}
+
+/// The (state, token) of each event `events` holds now.
+fn drained(events: &OwnershipEvents) -> Vec<(&'static str, OwnerToken)> {
+    events
+        .try_iter()
+        .map(|event| (event.state(), event.token()))
+        .collect()
+}
+
+/// A hand-built host whose stream already sent `Activated` for [`HELD`] on partition 1 under a
+/// view through `valid_through`. The state is written by hand: a hand-built host is never the
+/// writable primary, so its duty cannot activate on its own (own83_5 and own83_9 drive that
+/// half on three hosts).
+fn active_host(
+    dir: &std::path::Path,
+    rt: &tokio::runtime::Runtime,
+    valid_through: impl FnOnce(Tick) -> Tick,
+) -> Host {
+    let mut host = trio::host_over(dir, rt);
+    let now = host.clock.now();
+    host.stepped_at = now;
+    host.report_view(&live_view(HELD, valid_through(now)), false);
+    host.own_states.insert(P1, OwnState::Active(HELD));
+    host
+}
+
+/// own83_15 (#123 review): a subscriber that comes after a fault, or after the view's horizon
+/// passed with no turn in between, hears no `Activated`: `subscribe` judges the state afresh
+/// before it replays it. One that subscribed before hears the term end. Cut: no duty at the top
+/// of `subscribe`, red: both late subscribers hear `Activated`. Unit (one host, ~0.2 s).
+#[config_log::retcd_test]
+fn own83_15_a_subscriber_after_a_fault_or_a_passed_horizon_hears_no_activated() {
+    let rt = current_thread();
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(60_000));
+    let before = subscribe_one(&mut host);
+    assert_eq!(drained(&before), [("activated", HELD)], "precondition");
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    let late = subscribe_one(&mut host);
+    assert_eq!(drained(&late), [], "after a fault, nothing is held");
+    assert_eq!(
+        drained(&before),
+        [("deactivating", HELD), ("deactivated", HELD)],
+        "the earlier subscriber hears the term end"
+    );
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(1_100));
+    let before = subscribe_one(&mut host);
+    assert_eq!(drained(&before), [("activated", HELD)], "precondition");
+    let horizon = host.authority_views[&P1].valid_through_tick;
+    while host.clock.now() <= horizon {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let late = subscribe_one(&mut host);
+    assert_eq!(drained(&late), [], "past the horizon, nothing is held");
+    assert_eq!(
+        drained(&before),
+        [("deactivating", HELD), ("deactivated", HELD)],
+        "the earlier subscriber hears the term end"
+    );
+}
+
+/// own83_16 (#123 review): a fence's view stays dead for the stream when the clock is stepped
+/// back (`HostClock::step_back`, `rdb_node --clock-step-file`). The term is `Deactivating` when
+/// the fence's view (horizon the tick before the fence) is published and the clock is stepped
+/// back 5 s, so that view reads as admitting far from its horizon: the stream sends
+/// `Deactivated` only, never `Activated` for the fenced token, and nothing on ten more turns. A
+/// later valid view of the same token (a regrant) is judged live again. Cut: the duty judging
+/// `authority_views` as published (no `dead_views`), red: `Activated` for the fenced token.
+/// Unit (one host).
+#[config_log::retcd_test]
+fn own83_16_a_fence_then_a_backstep_never_resumes_the_fenced_token() {
+    use rdb_core::contracts::authority::DenyReason;
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = trio::host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    host.clock = clock;
+    let lead = deactivating_lead_millis(&host.budgets);
+    let view = |through: Tick| {
+        from_a1(AuthorityEffect::PublishAuthorityView(live_view(
+            HELD, through,
+        )))
+    };
+    host.stepped_at = clock.now();
+    host.deliver(&[view(clock.now().plus_millis(60_000))])
+        .expect("a live view");
+    host.own_states.insert(P1, OwnState::Active(HELD));
+    let events = subscribe_one(&mut host);
+    assert_eq!(drained(&events), [("activated", HELD)], "precondition");
+    host.stepped_at = clock.now();
+    host.deliver(&[view(clock.now().plus_millis(lead / 2))])
+        .expect("a view within the lead");
+    host.ownership_duty();
+    assert_eq!(drained(&events), [("deactivating", HELD)], "warned");
+
+    let fenced_at = clock.now();
+    host.stepped_at = fenced_at;
+    let fence = from_a1(AuthorityEffect::Fence {
+        scope: FenceScope::Partition(P1),
+        reason: DenyReason::Frozen,
+    });
+    host.deliver(&[fence, view(Tick(fenced_at.0 - 1))])
+        .expect("the fence's step");
+    clock.step_back(5_000);
+    assert!(
+        clock.now().0 + lead < fenced_at.0 - 1,
+        "precondition: the fence's view reads as admitting, outside the lead"
+    );
+    host.ownership_duty();
+    assert_eq!(
+        drained(&events),
+        [("deactivated", HELD)],
+        "the fence ends the warned term"
+    );
+    for _ in 0..10 {
+        host.ownership_duty();
+    }
+    assert_eq!(drained(&events), [], "and it never resumes");
+
+    host.stepped_at = clock.now();
+    host.deliver(&[view(clock.now().plus_millis(60_000))])
+        .expect("a regrant");
+    assert_eq!(
+        host.judged_view(P1).map(|view| view.lineage),
+        Some(HELD.lineage(P1)),
+        "a regrant of the same token is judged live"
+    );
+    assert!(host.owner_views.still_owner(P1, HELD));
+}
+
+/// own83_17 (#123 review): `Deactivating`'s `deadline` as the replay to a subscriber converts
+/// it, sampled twice. The term is 300 ms from its horizon, inside the lead, so the duty that
+/// subscribing runs first already turns it `Deactivating`, and both samples (`"the duty"`, taken
+/// before a further duty run, and `"the replay"`, after it) are replays. The live warning from
+/// the duty to a subscriber already held is `own83_23`'s. Each
+/// deadline is ahead of the moment it is heard by about the time left (a nonzero deadline,
+/// never zeroed) and no later than the moment the host's clock reaches the first refused tick
+/// (the horizon + 1), which this row waits for. A fence's deadline has already passed when it is
+/// heard. A conversion from a stale tick reading is the clock row's cut
+/// (`a_tick_deadline_converts_to_an_instant_no_later_than_the_tick`). Cuts here: the replay's
+/// deadline zeroed (its step at `now`), red at "about 300 ms ahead"; `ownership_event`
+/// converting the tick after the deadline, red at "no later than the host's tick".
+/// Unit (~0.4 s).
+#[config_log::retcd_test]
+fn own83_17_a_deactivating_deadline_is_no_later_than_the_hosts_first_refused_tick() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(300));
+    let first = subscribe_one(&mut host);
+    let warned = Instant::now();
+    host.ownership_duty();
+    let late = subscribe_one(&mut host);
+    let deadline_of = |events: &OwnershipEvents, what: &str| {
+        let heard: Vec<OwnershipEvent> = events.try_iter().collect();
+        match heard.as_slice() {
+            [.., OwnershipEvent::Deactivating {
+                token, deadline, ..
+            }] => {
+                assert_eq!(*token, HELD, "{what}: the warned token");
+                *deadline
+            }
+            other => panic!("{what}: a Deactivating last: {other:?}"),
+        }
+    };
+    let duty = deadline_of(&first, "the duty");
+    let replay = deadline_of(&late, "the replay");
+    let refused = Tick(host.authority_views[&P1].valid_through_tick.0 + 1);
+    for (what, deadline) in [("the duty", duty), ("the replay", replay)] {
+        assert!(
+            deadline > warned + Duration::from_millis(200),
+            "{what}: about 300 ms ahead, heard at once: {:?}",
+            deadline.saturating_duration_since(warned)
+        );
+    }
+    while host.clock.now() < refused {
+        std::hint::spin_loop();
+    }
+    let reached = Instant::now();
+    for (what, deadline) in [("the duty", duty), ("the replay", replay)] {
+        assert!(
+            deadline <= reached,
+            "{what}: no later than the host's tick: {:?} after it",
+            deadline.saturating_duration_since(reached)
+        );
+    }
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(60_000));
+    let events = subscribe_one(&mut host);
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    host.ownership_duty();
+    let heard = Instant::now();
+    match events.try_iter().nth(1) {
+        Some(OwnershipEvent::Deactivating { deadline, .. }) => {
+            assert!(deadline <= heard, "a fence's deadline has passed");
+        }
+        other => panic!("Activated, then Deactivating: {other:?}"),
+    }
+}
+
+/// own83_23 (#123 review): the normal warning, live. A subscriber that joined while the term was
+/// `Active`, with more than the lead left, hears `Activated` and then nothing until the host's
+/// clock enters the lead; the duty then sends it `Deactivating` itself (no replay: the
+/// subscriber was already held), with a `deadline` still ahead of the moment it is heard by the
+/// time left, as the host's own clock reads it then, and no later than the moment that clock
+/// reaches the first refused tick (the horizon + 1), which this row waits for. The lead is cut
+/// to 200 ms through the clock term (`max_sample_age` 400 ms, period 100 ms), the term that binds
+/// at the defaults, so the row waits 500 ms rather than 1.3 s. Every time bound is read against
+/// the clock, never a fixed sleep, so a pause cannot fail correct code: a subscription that a
+/// pause pushed into the lead is warned by the replay and is tried again. Cuts: the live
+/// step's deadline at `now` (`ownership_step`, `Active` turning low), red at "ahead";
+/// no step when an `Active` term turns low, red at "a live Deactivating". `own83_17`'s two
+/// samples are replays, and the first cut leaves it green. Unit (~0.5 s).
+#[config_log::retcd_test]
+fn own83_23_a_live_subscriber_hears_the_warning_ahead_of_its_deadline() {
+    const LEAD: u64 = 200;
+    const MARGIN: u64 = 300;
+    let rt = current_thread();
+    let mut attempts = 0;
+    let (mut host, events, _dir) = loop {
+        attempts += 1;
+        let dir = config_testkit::fs::temp_dir();
+        let mut host = active_host(dir.path(), &rt, |now| now.plus_millis(LEAD + MARGIN));
+        host.budgets.max_sample_age_millis = 400;
+        host.budgets.clock_sample_period_millis = 100;
+        assert_eq!(
+            deactivating_lead_millis(&host.budgets),
+            LEAD,
+            "precondition: the clock term binds"
+        );
+        let events = subscribe_one(&mut host);
+        match drained(&events).as_slice() {
+            [("activated", token)] if *token == HELD => break (host, events, dir),
+            // A pause of MARGIN ms before the subscription: it was warned by the replay, so
+            // this attempt says nothing about a live warning. Try again, a few times.
+            [("deactivating", token)] if *token == HELD && attempts < 3 => {}
+            other => panic!("subscribed while active, outside the lead: {other:?}"),
+        }
+    };
+    let refused = Tick(host.authority_views[&P1].valid_through_tick.0 + 1);
+    let warn_from = Tick(refused.0 - LEAD);
+    host.ownership_duty();
+    if host.clock.now() < warn_from {
+        assert_eq!(
+            drained(&events),
+            [],
+            "outside the lead, a turn sends nothing"
+        );
+    }
+    while host.clock.now() < warn_from {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    host.ownership_duty();
+    let heard_at = Instant::now();
+    let tick = host.clock.now();
+    let deadline = match events.try_iter().last() {
+        Some(OwnershipEvent::Deactivating {
+            token, deadline, ..
+        }) => {
+            assert_eq!(token, HELD, "the warned token");
+            deadline
+        }
+        other => panic!("a live Deactivating, sent by the duty: {other:?}"),
+    };
+    assert_eq!(
+        host.own_states.get(&P1),
+        Some(&OwnState::Deactivating(HELD)),
+        "warned"
+    );
+    // The duty read the clock no later than `tick`, so at least this much was left when it was
+    // heard (one millisecond off for the conversion, one for rounding).
+    let left = refused.0.saturating_sub(tick.0).saturating_sub(2);
+    assert!(
+        deadline >= heard_at + Duration::from_millis(left),
+        "a live warning's deadline is ahead of the moment it is heard by the time left \
+         ({left} ms at tick {}): it is {:?} ahead",
+        tick.0,
+        deadline.saturating_duration_since(heard_at)
+    );
+    while host.clock.now() < refused {
+        std::hint::spin_loop();
+    }
+    let reached = Instant::now();
+    assert!(
+        deadline <= reached,
+        "no later than the host's tick: {:?} after it",
+        deadline.saturating_duration_since(reached)
+    );
+}
+
+/// own83_18 (#123 review): dropped receivers are let go of on quiet turns. 50 subscribers each
+/// hear the current state on every host and are dropped, with no ownership change at all; after
+/// one more turn every host holds only the one live subscriber, which still hears the next
+/// change. Cut: `OwnershipEvents` without its `Drop`, red: 51 subscribers held.
+/// Integration (~2 s): bootstrap.
+#[config_log::retcd_test]
+fn own83_18_dropped_receivers_are_let_go_of_on_quiet_turns() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let live = subscribe_all(&mut trio);
+    let mut heard = Vec::new();
+    hear(&live, &mut heard);
+    assert_eq!(on(1, &heard), [("activated", held)], "precondition");
+    for cycle in 0..50 {
+        let events = subscribe_all(&mut trio);
+        assert_eq!(
+            drained(&events),
+            [("activated", held)],
+            "cycle {cycle}: the current state"
+        );
+        drop(events);
+        trio.step();
+    }
+    trio.step();
+    for (host, _, _) in &trio.nodes {
+        assert_eq!(
+            host.subscribers.len(),
+            1,
+            "node {}: only the live subscriber is held",
+            host.node.0
+        );
+    }
+    let host = &mut trio.nodes[0].0;
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    host.ownership_duty();
+    heard.clear();
+    hear(&live, &mut heard);
+    assert_eq!(
+        on(1, &heard),
+        [("deactivating", held), ("deactivated", held)],
+        "the live subscriber hears the next change"
+    );
+}
+
+/// own83_19 (#123 review): a subscriber that overflows on one host ends on every host. A
+/// subscriber of capacity 1 is held by all three hosts; node 1's current state fills it, and
+/// node 1's next change finds it full and drops it. Nodes 2 and 3 still hold their senders and
+/// have nothing to send: each lets go at its next turn, so the receiver hands out what it holds
+/// and then ends, in bounded time. Nothing in the row sets the drop flag. A second subscriber,
+/// drained, stays live and hears the change. Cut: no `retain` at the top of `ownership_duty`,
+/// red: the overflowed receiver never ends. Integration (~2 s): bootstrap.
+#[config_log::retcd_test]
+fn own83_19_an_overflow_on_one_host_ends_the_subscriber_on_every_host() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = token(&trio);
+    let (small, overflowed) = Subscriber::new(1);
+    for (host, _, _) in &mut trio.nodes {
+        host.subscribe(Arc::clone(&small));
+    }
+    drop(small);
+    let live = subscribe_all(&mut trio);
+    assert_eq!(drained(&live), [("activated", held)], "precondition");
+
+    let host = &mut trio.nodes[0].0;
+    host.set_fault(Fault::from("a flush fault".to_owned()));
+    host.ownership_duty();
+    for (host, _, _) in &mut trio.nodes[1..] {
+        host.ownership_duty();
+    }
+    let within = Instant::now() + Duration::from_secs(1);
+    let mut kept = Vec::new();
+    let ended = loop {
+        let left = within.saturating_duration_since(Instant::now());
+        match overflowed.recv_timeout(left) {
+            Ok(event) => kept.push((event.state(), event.token())),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+            Err(mpsc::RecvTimeoutError::Timeout) => break false,
+        }
+    };
+    assert!(ended, "the overflowed receiver ends: kept {kept:?}");
+    assert_eq!(
+        kept,
+        [("activated", held)],
+        "what it held is handed out first"
+    );
+    assert_eq!(
+        drained(&live),
+        [("deactivating", held), ("deactivated", held)],
+        "the drained subscriber hears the change"
+    );
+    assert!(
+        matches!(live.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "and stays live"
     );
 }

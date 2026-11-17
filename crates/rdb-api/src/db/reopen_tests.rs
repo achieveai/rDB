@@ -5108,6 +5108,619 @@ mod guide_sample {
     }
 }
 
+/// embed.md's ownership events sample (`events_sample.rs`), compiled into this module.
+#[allow(dead_code)]
+mod events_sample {
+    use crate as rdb_api;
+    include!("events_sample.rs");
+
+    use super::{embed_block, ready_nodes, runtime, GUIDE};
+    use crate::host::Msg;
+    use crate::ownership::OwnershipEvents;
+    use crate::{NodeId, Timeouts};
+    use rdb_core::contracts::ids::Generation;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// #83 B1: embed.md's ownership events block is the marked span of `events_sample.rs`, so
+    /// the guide's code is the code this module compiles and runs. Unit.
+    #[test]
+    fn the_ownership_events_sample_in_embed_md_is_the_one_that_compiles() {
+        let block = embed_block(include_str!("events_sample.rs"));
+        assert!(block.contains("fn follow"), "{block}");
+        assert!(
+            GUIDE.replace("\r\n", "\n").contains(&block),
+            "embed.md lacks, verbatim:\n{block}"
+        );
+    }
+
+    /// What `follow` hands it, and a shutdown flag the row sets: or set by the first start.
+    struct Started {
+        started: Vec<(PartitionId, OwnerToken)>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl OnOwnership for Started {
+        fn start(&mut self, partition: PartitionId, token: OwnerToken) {
+            self.started.push((partition, token));
+        }
+        fn wind_down(&mut self, partition: PartitionId, _: OwnerToken, _: Instant) {
+            panic!("a quiet database warns nothing: {partition:?}");
+        }
+        fn stop(&mut self, partition: PartitionId, _: OwnerToken) {
+            panic!("a quiet database stops nothing: {partition:?}");
+        }
+        fn shutting_down(&self) -> bool {
+            self.shutdown.load(Ordering::SeqCst) || !self.started.is_empty()
+        }
+    }
+
+    /// #83 B1, #123 review: on a ready database, `follow` hears the current state first:
+    /// `Activated` for the partition, under the token `ownership` reports. Bounded: `follow`
+    /// runs on a worker, and when nothing comes within the patience the row sets the app's
+    /// shutdown flag, joins the worker (a quiet stream checks it every `CHECK_EVERY`), shuts the
+    /// `Db` down and fails. Cut: no current state sent by `Host::subscribe`, red in ~10 s (x the
+    /// deadline scale) instead of a hang. Integration (~1 s): one fresh open until ready.
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_runs_against_a_db() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let partition = crate::admin::PARTITION;
+        let held = db
+            .ownership(partition)
+            .expect("a ready partition is owned")
+            .token;
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (came, started) = std::thread::scope(|scope| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let db = &db;
+            let flag = Arc::clone(&shutdown);
+            let worker = scope.spawn(move || {
+                let mut app = Started {
+                    started: Vec::new(),
+                    shutdown: flag,
+                };
+                follow(db, &mut app);
+                let _ = done.send(());
+                app.started
+            });
+            let came = finished.recv_timeout(patience).is_ok();
+            if !came {
+                shutdown.store(true, Ordering::SeqCst);
+            }
+            (came, worker.join().expect("follow panicked"))
+        });
+        db.shutdown();
+        assert!(came, "follow heard no Activated within {patience:?}");
+        assert_eq!(started, [(partition, held)]);
+    }
+
+    /// What a [`Recorder`] heard, in order, and the flag that shuts it down.
+    #[derive(Default)]
+    struct Heard {
+        calls: Mutex<Vec<(&'static str, PartitionId, OwnerToken)>>,
+        shutdown: AtomicBool,
+        /// How many times `follow` asked whether to shut down.
+        checks: AtomicU64,
+        /// Set to make the app panic in `start`, as a buggy app would.
+        panic_on_start: AtomicBool,
+        /// Set to make the app never answer that it shuts down, so `follow` never returns.
+        ignore_shutdown: AtomicBool,
+    }
+
+    impl Heard {
+        fn calls(&self) -> Vec<(&'static str, PartitionId, OwnerToken)> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        /// Wait, bounded, until `count` calls are recorded.
+        fn until(&self, count: usize) {
+            let until = Instant::now() + Duration::from_secs(2);
+            while self.calls().len() < count {
+                assert!(Instant::now() < until, "{count} calls: {:?}", self.calls());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    struct Recorder(Arc<Heard>);
+
+    impl Recorder {
+        fn note(&self, call: &'static str, partition: PartitionId, token: OwnerToken) {
+            self.0
+                .calls
+                .lock()
+                .expect("calls")
+                .push((call, partition, token));
+        }
+    }
+
+    impl OnOwnership for Recorder {
+        fn start(&mut self, partition: PartitionId, token: OwnerToken) {
+            assert!(
+                !self.0.panic_on_start.load(Ordering::SeqCst),
+                "the app panicked on start"
+            );
+            self.note("start", partition, token);
+        }
+        fn wind_down(&mut self, partition: PartitionId, token: OwnerToken, _: Instant) {
+            self.note("wind_down", partition, token);
+        }
+        fn stop(&mut self, partition: PartitionId, token: OwnerToken) {
+            self.note("stop", partition, token);
+        }
+        fn shutting_down(&self) -> bool {
+            self.0.checks.fetch_add(1, Ordering::SeqCst);
+            self.0.shutdown.load(Ordering::SeqCst) && !self.0.ignore_shutdown.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The next subscriber `follow` sends the scripted node, within a bound.
+    fn next_subscriber(
+        mailbox: &std::sync::mpsc::Receiver<Msg>,
+    ) -> Arc<crate::ownership::Subscriber> {
+        loop {
+            match mailbox.recv_timeout(Duration::from_secs(2)) {
+                Ok(Msg::Subscribe(subscriber)) => return subscriber,
+                Ok(_) => {}
+                Err(error) => panic!("no subscription reached the node: {error}"),
+            }
+        }
+    }
+
+    fn token(generation: u64) -> OwnerToken {
+        OwnerToken {
+            generation: Generation(generation),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+        }
+    }
+
+    /// Run `follow` with a [`Recorder`] on `db` while `script` drives it, then shut it down while
+    /// the subscriber `script` returns is still held (a quiet, live stream), and require `follow`
+    /// to return within `CHECK_EVERY` and a margin. Bounded however `follow` or `script`
+    /// behaves: the shutdown is asked even when `script` panics; every subscription that reaches
+    /// `mailbox` from then on is dropped at once; a `follow` that panics fails the row at once
+    /// with its own panic; and a `follow` still running 2 s after the shutdown fails the row
+    /// then (with `script`'s panic, if it panicked). `follow` runs on a detached thread, so a
+    /// `follow` that never returns cannot block the row from failing.
+    fn follow_scripted(
+        db: &Arc<Db>,
+        heard: &Arc<Heard>,
+        mailbox: Option<&std::sync::mpsc::Receiver<Msg>>,
+        script: impl FnOnce() -> Option<Arc<crate::ownership::Subscriber>>,
+    ) {
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = {
+            let (db, app) = (Arc::clone(db), Arc::clone(heard));
+            std::thread::spawn(move || {
+                follow(&db, &mut Recorder(app));
+                let _ = done.send(());
+            })
+        };
+        let scripted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(script));
+        let asked = Instant::now();
+        heard.shutdown.store(true, Ordering::SeqCst);
+        let (live, panicked) = match scripted {
+            Ok(live) => (live, None),
+            Err(panic) => (None, Some(panic)),
+        };
+        let took = loop {
+            for msg in mailbox
+                .into_iter()
+                .flat_map(std::sync::mpsc::Receiver::try_iter)
+            {
+                if let Msg::Subscribe(subscriber) = msg {
+                    subscriber.drop_everywhere();
+                }
+            }
+            match finished.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) => break Some(asked.elapsed()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // #123 review: past the bound, fail now. The worker is left detached, so a
+                    // `follow` that never returns cannot hold the row up.
+                    if asked.elapsed() > Duration::from_secs(2) {
+                        drop(live);
+                        if let Some(panic) = panicked {
+                            std::panic::resume_unwind(panic);
+                        }
+                        panic!("follow did not return within 2 s of the shutdown");
+                    }
+                }
+                // #123 review: the worker ended without saying so, so `follow` panicked.
+                // Waiting longer cannot change that: fail now, with its panic.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+            }
+        };
+        drop(live);
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        if let Some(panic) = panicked {
+            std::panic::resume_unwind(panic);
+        }
+        let took = took.expect("follow returned");
+        assert!(
+            took < CHECK_EVERY + Duration::from_millis(300),
+            "shutdown took {took:?}"
+        );
+    }
+
+    /// #123 review: the sample's stop-and-reset rule, on scripted streams from a node that runs
+    /// no thread (the row plays it). Stream 1 starts partition 1 and warns partition 2 (a term
+    /// first heard as `Deactivating`), then is dropped as a full host drops it. Stream 2 starts
+    /// partition 3, then ends as its last host lets go (a node stop). Before each next
+    /// subscription, `follow` has stopped every term the ended stream held, and the next streams
+    /// list nothing. Stream 3 starts partition 1 under a new token, sends its `Deactivated`, and
+    /// is dropped: that term is stopped exactly once. Stream 4 then stays open and quiet: 300 ms
+    /// of timeouts stop nothing, and a shutdown asked on that quiet stream returns within
+    /// `CHECK_EVERY`. Cuts: no stop on the stream's end, red at "stream 1 ended"; no removal
+    /// from `held` on `Deactivated`, red at "stream 3 ended"; `recv` with no timeout, red at
+    /// "shutdown took". Unit (~2 s): three of the sample's half-second waits.
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_stops_and_resets_when_a_stream_ends() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let db = Arc::new(Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let (p1, p2, p3) = (PartitionId(1), PartitionId(2), PartitionId(3));
+        let heard = Arc::new(Heard::default());
+        follow_scripted(&db, &heard, Some(&mailbox), || {
+            let first = next_subscriber(&mailbox);
+            let activated = |partition, token| OwnershipEvent::Activated {
+                node: NodeId(1),
+                partition,
+                token,
+            };
+            first.send(activated(p1, token(2))).expect("sent");
+            first
+                .send(OwnershipEvent::Deactivating {
+                    node: NodeId(1),
+                    partition: p2,
+                    token: token(3),
+                    deadline: Instant::now() + Duration::from_secs(1),
+                })
+                .expect("sent");
+            heard.until(2);
+            first.drop_everywhere();
+            drop(first);
+            let second = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls(),
+                [
+                    ("start", p1, token(2)),
+                    ("wind_down", p2, token(3)),
+                    ("stop", p1, token(2)),
+                    ("stop", p2, token(3)),
+                ],
+                "stream 1 ended: both its terms are stopped before stream 2"
+            );
+            second.send(activated(p3, token(4))).expect("sent");
+            heard.until(5);
+            drop(second);
+            let third = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls()[4..],
+                [("start", p3, token(4)), ("stop", p3, token(4))],
+                "stream 2 ended: its term is stopped before stream 3"
+            );
+            third.send(activated(p1, token(5))).expect("sent");
+            third
+                .send(OwnershipEvent::Deactivated {
+                    node: NodeId(1),
+                    partition: p1,
+                    token: token(5),
+                })
+                .expect("sent");
+            heard.until(8);
+            third.drop_everywhere();
+            drop(third);
+            let fourth = next_subscriber(&mailbox);
+            assert_eq!(
+                heard.calls()[6..],
+                [("start", p1, token(5)), ("stop", p1, token(5))],
+                "stream 3 ended: a term it already stopped is not stopped again"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(heard.calls().len(), 8, "a quiet stream stops nothing");
+            Some(fourth)
+        });
+        let Ok(mut db) = Arc::try_unwrap(db) else {
+            panic!("follow let go of the Db")
+        };
+        db.shutdown();
+    }
+
+    /// #123 review: `follow_scripted` fails at once, with `follow`'s own panic, when `follow`
+    /// panics. The app panics on the first `Activated`; the harness must surface that panic well
+    /// inside a second instead of waiting for a completion that can never come. The harness runs
+    /// on its own thread, so a hang is a red row after 5 s, not a stuck binary. Cut:
+    /// `follow_scripted` treating a disconnected completion as a timeout, red at "a panicked
+    /// worker fails the row at once" (the harness spins). Unit (~0.1 s).
+    #[config_log::retcd_test]
+    fn follow_scripted_fails_at_once_with_the_panic_when_follow_panics() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let db = Arc::new(Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let heard = Arc::new(Heard::default());
+        heard.panic_on_start.store(true, Ordering::SeqCst);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let began = Instant::now();
+        let harness = {
+            let (db, heard) = (Arc::clone(&db), Arc::clone(&heard));
+            std::thread::spawn(move || {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    follow_scripted(&db, &heard, Some(&mailbox), || {
+                        let first = next_subscriber(&mailbox);
+                        first
+                            .send(OwnershipEvent::Activated {
+                                node: NodeId(1),
+                                partition: PartitionId(1),
+                                token: token(2),
+                            })
+                            .expect("sent");
+                        Some(first)
+                    });
+                }));
+                let _ = done.send(caught.err());
+            })
+        };
+        let panic = outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a panicked worker fails the row at once: the harness is still waiting")
+            .expect("follow_scripted panicked");
+        let took = began.elapsed();
+        harness.join().expect("the harness thread");
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("the app panicked on start"),
+            "follow's own panic, not a wrapper: {message:?}"
+        );
+        assert!(took < Duration::from_secs(1), "at once: {took:?}");
+        assert_eq!(heard.calls(), [], "the app recorded nothing");
+    }
+
+    /// #123 review: `follow_scripted` fails the row 2 s after the shutdown when `follow` never
+    /// returns (the app never answers that it shuts down), instead of hanging the binary. The
+    /// harness runs on its own thread, so a hang is a red row after 5 s. Once the app answers
+    /// again, the detached `follow` returns and lets go of the `Db`. Cut: the expiry only
+    /// dropping the held subscriber (the old harness), red at "a hung follow fails the row".
+    /// Unit (~2.5 s): the harness's 2 s bound.
+    #[config_log::retcd_test]
+    fn follow_scripted_fails_after_the_bound_when_follow_never_returns() {
+        let rt = runtime();
+        let (node, mailbox) = crate::host::NodeHandle::unanswered(NodeId(1));
+        let db = Arc::new(Db::by_hand(
+            vec![node],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let heard = Arc::new(Heard::default());
+        heard.ignore_shutdown.store(true, Ordering::SeqCst);
+        let (done, outcome) = std::sync::mpsc::channel();
+        let harness = {
+            let (db, heard) = (Arc::clone(&db), Arc::clone(&heard));
+            std::thread::spawn(move || {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    follow_scripted(&db, &heard, Some(&mailbox), || {
+                        Some(next_subscriber(&mailbox))
+                    });
+                }));
+                let _ = done.send(caught.err());
+            })
+        };
+        let panic = outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a hung follow fails the row: the harness is still waiting")
+            .expect("follow_scripted panicked");
+        harness.join().expect("the harness thread");
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("follow did not return within 2 s"),
+            "the bound's own message: {message:?}"
+        );
+
+        heard.ignore_shutdown.store(false, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&db) > 1 {
+            assert!(Instant::now() < until, "the detached follow returns");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #123 review: a `Db` that runs no node ends every stream at once. `follow` waits
+    /// `RESUBSCRIBE_AFTER` between streams, so in 1.2 s it asks for a few streams, not millions,
+    /// and it returns promptly when shut down mid-wait. Cut: no wait after a stream ends, red at
+    /// "bounded" (the loop spins). Unit (~1.2 s).
+    #[config_log::retcd_test]
+    fn the_ownership_events_sample_waits_between_streams_on_an_app_only_db() {
+        let rt = runtime();
+        let db = Arc::new(Db::by_hand(
+            Vec::new(),
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        ));
+        let heard = Arc::new(Heard::default());
+        follow_scripted(&db, &heard, None, || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            None
+        });
+        let checks = heard.checks.load(Ordering::SeqCst);
+        assert!(
+            checks < 100,
+            "bounded: {checks} shutdown checks in 1.2 s ({} per stream ended)",
+            RESUBSCRIBE_AFTER.as_millis() / CHECK_EVERY.as_millis()
+        );
+        assert_eq!(heard.calls(), [], "nothing was ever held");
+        let Ok(mut db) = Arc::try_unwrap(db) else {
+            panic!("follow let go of the Db")
+        };
+        db.shutdown();
+    }
+
+    /// The events `events` hands out until it ends, within `patience`.
+    fn until_ended(events: &OwnershipEvents, patience: Duration) -> Vec<OwnershipEvent> {
+        let until = Instant::now() + patience;
+        let mut heard = Vec::new();
+        loop {
+            match events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(event) => heard.push(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return heard,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the stream did not end within {patience:?}: heard {heard:?}")
+                }
+            }
+        }
+    }
+
+    /// The first `Activated` `events` hands out, within the patience.
+    fn first_activated(events: &OwnershipEvents) -> (NodeId, PartitionId, OwnerToken) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        match events.recv_timeout(patience) {
+            Ok(OwnershipEvent::Activated {
+                node,
+                partition,
+                token,
+            }) => (node, partition, token),
+            other => panic!("the current state first: {other:?}"),
+        }
+    }
+
+    /// #123 review: a clean stop ends what a node held before its subscribers end. On a ready
+    /// database, `Db::shutdown` stops node 1, which sends `Deactivating` with a passed deadline,
+    /// then `Deactivated`, for the token it held, and only then does the stream end. Cut:
+    /// `Host::ownership_stop` dropping the subscribers without sending, red: the stream ends
+    /// after `Activated` alone. Integration (~1 s): one fresh open until ready.
+    #[config_log::retcd_test]
+    fn a_stopping_node_sends_deactivated_before_the_stream_ends() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let events = db.ownership_events();
+        let (node, partition, held) = first_activated(&events);
+        db.shutdown();
+        let stopped = Instant::now();
+        let rest = until_ended(&events, Duration::from_secs(5));
+        let ended: Vec<(&str, OwnerToken)> = rest
+            .iter()
+            .filter(|event| event.node() == node && event.partition() == partition)
+            .map(|event| (event.state(), event.token()))
+            .collect();
+        assert_eq!(
+            ended,
+            [("deactivating", held), ("deactivated", held)],
+            "{rest:?}"
+        );
+        match rest.first() {
+            Some(OwnershipEvent::Deactivating { deadline, .. }) => {
+                assert!(*deadline <= stopped, "a stop's deadline has passed");
+            }
+            other => panic!("Deactivating first: {other:?}"),
+        }
+    }
+
+    /// #123 review: a node whose restart failed leaves a new stream waiting, not ended. Node 2's
+    /// restart fails (its folder is pointed at a file), so it runs no process and holds nothing.
+    /// A stream asked for then hears node 1's current state and stays open, rather than ending
+    /// at once on every call while node 2 is down. When node 2 restarts, the same stream is
+    /// handed to it and stays open: node 2's next stop ends it, as a node stop ends every
+    /// subscriber that node holds. A stream asked for after that is whole and stays open.
+    /// Cuts: `Db::ownership_events` dropping the subscriber for a down node (the old
+    /// behaviour), red at "the current state first" (the stream ended before any event); no
+    /// `Db::hand_waiting_subscribers` on a restart, red at "node 2 holds it". Integration
+    /// (~2 s): one fresh open until ready, three restarts.
+    #[config_log::retcd_test]
+    fn a_stream_waits_for_a_node_whose_restart_failed_and_is_handed_to_it_on_restart() {
+        let rt = runtime();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = ready_nodes(&rt, dir.path(), &store);
+        let blocker = dir.path().join("not-a-folder");
+        std::fs::write(&blocker, b"a file where node 2's folder goes").expect("write");
+        let respawn = db.respawn.as_mut().expect("an open restarts nodes");
+        let nodes_dir = std::mem::replace(&mut respawn.nodes_dir, blocker);
+        db.restart_node(NodeId(2))
+            .expect_err("node 2 cannot open a file as its folder");
+        assert!(db.restart_failed(NodeId(2)), "precondition");
+
+        let waiting = db.ownership_events();
+        let (node, partition, _) = first_activated(&waiting);
+        assert_eq!((node, partition), (NodeId(1), crate::admin::PARTITION));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !matches!(
+                waiting.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "a stream stays open while node 2 is down"
+        );
+
+        db.respawn.as_mut().expect("respawn").nodes_dir = nodes_dir;
+        db.restart_node(NodeId(2)).expect("node 2 restarts");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !matches!(
+                waiting.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "the stream stays open once node 2 runs again"
+        );
+        db.restart_node(NodeId(2)).expect("node 2 restarts again");
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let until = Instant::now() + patience;
+        let ended = loop {
+            match waiting.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
+            }
+        };
+        assert!(
+            ended,
+            "node 2 holds it: its next stop ends the stream within {patience:?}"
+        );
+
+        let whole = db.ownership_events();
+        let (node, partition, _) = first_activated(&whole);
+        assert_eq!((node, partition), (NodeId(1), crate::admin::PARTITION));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !matches!(
+                whole.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "a stream that reaches every node stays open"
+        );
+        db.shutdown();
+    }
+}
+
 /// local-cluster.md section 3's app, compiled here as the guide prints it (critic-w5g A4). Its
 /// `main` needs a running `lr` cluster, so no row runs it (a gated multi-process walk is
 /// achieveai/rDB#72); the compile and the byte check below are what keep the guide's code

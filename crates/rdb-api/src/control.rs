@@ -49,6 +49,7 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 use crate::host::{FenceFacts, Msg};
+use crate::ownership::RouteMarks;
 use crate::transport::Links;
 
 /// Where a completion goes: the asking node and the boot it asked under, and the effect's
@@ -87,6 +88,8 @@ pub struct ControlAdapter {
     watches: Mutex<BTreeMap<(NodeId, ControlPrefix), Watching>>,
     /// The reload of each (node, prefix). A newer one aborts the one it replaces.
     reloads: Reloads,
+    /// What the `partitions/` watches tell `Db::route` (#83): no stream of its own.
+    route_marks: Arc<RouteMarks>,
 }
 
 impl std::fmt::Debug for ControlAdapter {
@@ -112,7 +115,13 @@ impl ControlAdapter {
             tasks: Mutex::new(BTreeMap::new()),
             watches: Mutex::new(BTreeMap::new()),
             reloads: Arc::new(Mutex::new(BTreeMap::new())),
+            route_marks: Arc::new(RouteMarks::default()),
         })
+    }
+
+    /// Which cached routes the `partitions/` watches have made stale (#83).
+    pub(crate) fn route_marks(&self) -> &RouteMarks {
+        &self.route_marks
     }
 
     /// Carry out `effect` for `node`, running at `boot`; its completion arrives in the node's
@@ -165,9 +174,19 @@ impl ControlAdapter {
                 || Arc::new(AtomicU32::new(0)),
                 |(_, count)| Arc::clone(count),
             );
+            let marks =
+                (prefix == ControlPrefix::Partitions).then(|| Arc::clone(&self.route_marks));
             let task = self.rt.spawn(
-                watch(store, links, site, prefix, from, Arc::clone(&unserved))
-                    .instrument(Span::current()),
+                watch(
+                    store,
+                    links,
+                    site,
+                    prefix,
+                    from,
+                    Arc::clone(&unserved),
+                    marks,
+                )
+                .instrument(Span::current()),
             );
             if let Some((old, _)) = watches.insert((node, prefix), (task, unserved)) {
                 old.abort();
@@ -993,6 +1012,7 @@ async fn watch(
     prefix: ControlPrefix,
     from: Revision,
     unserved: Arc<AtomicU32>,
+    route_marks: Option<Arc<RouteMarks>>,
 ) {
     let name = prefix.encode();
     let before = unserved.load(Ordering::Relaxed);
@@ -1032,6 +1052,9 @@ async fn watch(
             return;
         }
     };
+    // #83: a `partitions/` watch keeps cached routes current while it is open; its guard moves
+    // every route's stamp when it ends, however it ends (an abort drops it too).
+    let route_watch = route_marks.as_ref().map(RouteMarks::opened);
     let mut cursor = from;
     while let Some(item) = stream.next().await {
         let event = match item {
@@ -1047,6 +1070,9 @@ async fn watch(
                     revision = event.revision,
                     "control_watch_event"
                 );
+                if let (Some(marks), ControlKey::Partition(partition)) = (&route_marks, &key) {
+                    marks.changed(*partition);
+                }
                 ControlEvent::Watched {
                     prefix,
                     cursor: WatchCursor { revision: cursor },
@@ -1064,6 +1090,7 @@ async fn watch(
                 }
             }
             Err(error) => {
+                drop(route_watch);
                 count_end(&unserved, served, opened_at);
                 terminate(&links, site, prefix, cursor, &error);
                 return;
@@ -1075,6 +1102,7 @@ async fn watch(
         }
         post(&links, site, event);
     }
+    drop(route_watch);
     // Counted before the end is posted: A1 may ask for the next watch as soon as it hears it.
     count_end(&unserved, served, opened_at);
     terminate(
@@ -2320,6 +2348,7 @@ mod tests {
             ControlPrefix::Partitions,
             Revision(2),
             Arc::new(AtomicU32::new(0)),
+            None,
         ));
         let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
             module_path!(),
@@ -2366,6 +2395,7 @@ mod tests {
             ControlPrefix::Partitions,
             Revision(2),
             Arc::new(AtomicU32::new(0)),
+            None,
         ));
         let first = rx.try_iter().find_map(|msg| match msg {
             Msg::Control { event, .. } => Some(event),
@@ -2439,6 +2469,7 @@ mod tests {
                 prefix,
                 Revision(from),
                 Arc::new(AtomicU32::new(0)),
+                None,
             ));
             rx.try_iter()
                 .map(|msg| match msg {

@@ -4,6 +4,7 @@
 
 use super::*;
 
+use crate::ownership::OwnershipEvent;
 use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::PartitionLifecycle;
 use rdb_core::contracts::authority::DenyReason;
@@ -2474,5 +2475,421 @@ fn own84_5_token_grows_across_a_promote() {
         !db.still_owner(PART2, old.token),
         "the old token is never owned after a promote"
     );
+    db.shutdown();
+}
+
+/// own83_2 (#83): at 8 partitions, `route(group)` names the group's partition by the key map
+/// and the owner and token of that partition's `partitions/{p}` record, read here on its own.
+/// And the in-process stream agrees: every partition's owner sends `Activated` under the token
+/// `route` names (own83_7 at this layer: a subscriber that comes after ready hears the current
+/// state first). The memory store serves no watch, so every `route` here reads through.
+#[test]
+fn own83_2_route_names_the_owner_and_token_of_the_groups_partition() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut db = ready(&rt, dir.path(), &store, Some(8));
+    let mut routes = BTreeMap::new();
+    for group in (0..64).map(AffinityId) {
+        let route = db.route(group).expect("route answers");
+        assert_eq!(
+            route.partition,
+            partition_of(affinity_hash(TENANT, group), 8),
+            "the key map's partition"
+        );
+        let record = PartitionRecord::decode(&partition_value(&rt, &store, route.partition).value)
+            .expect("the record decodes");
+        assert_eq!(route.owner, record.owner, "{group:?}");
+        assert_eq!(
+            route.token,
+            OwnerToken {
+                generation: record.generation,
+                owner_epoch: record.owner_epoch,
+            },
+            "{group:?}"
+        );
+        routes.insert(route.partition, route);
+    }
+    assert_eq!(routes.len(), 8, "64 groups cover the 8 partitions");
+
+    let events = db.ownership_events();
+    let mut activated = BTreeMap::new();
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+    while activated.len() < routes.len() {
+        let left = until.saturating_duration_since(Instant::now());
+        match events.recv_timeout(left) {
+            Ok(OwnershipEvent::Activated {
+                node,
+                partition,
+                token,
+            }) => {
+                activated.insert(partition, (node, token));
+            }
+            Ok(other) => panic!("only Activated on a quiet database: {other:?}"),
+            Err(error) => panic!("{} of 8 partitions activated: {error}", activated.len()),
+        }
+    }
+    for (partition, route) in &routes {
+        assert_eq!(
+            activated[partition],
+            (route.owner, route.token),
+            "{partition:?}'s Activated is route's answer"
+        );
+    }
+    db.shutdown();
+}
+
+// ---- #83, PR #123 review: `route` cached under the adapter's real `partitions/` watch ----
+
+use config_core::ConfigError;
+use rdb_core::contracts::control::ControlEffect;
+use rdb_core::contracts::ids::{CorrelationId, Revision};
+
+type WatchItems = tokio::sync::mpsc::UnboundedSender<Result<config_core::WatchItem, ConfigError>>;
+
+/// A memory store whose `partitions/` reads are counted and can be held after they read, and
+/// whose leader watches are streams the row feeds (`MemStore` serves none). Written out by hand
+/// because `async-trait` is not a dependency of this crate.
+struct RouteStore {
+    inner: config_testkit::MemStore,
+    /// Reads of a `partitions/` key so far.
+    reads: std::sync::atomic::AtomicU32,
+    /// While set, a `partitions/` read waits at `gate` after it has read.
+    hold: AtomicBool,
+    gate: tokio::sync::Semaphore,
+    /// Told when a held read has read.
+    held: Mutex<std::sync::mpsc::Sender<()>>,
+    /// The senders of the watches opened so far, oldest first, until the row takes one: the
+    /// row's sender is then the only one, so dropping it ends that stream.
+    watches: Mutex<Vec<Option<WatchItems>>>,
+}
+
+type Reply<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConfigError>> + Send + 'a>>;
+
+impl ConfigStore for RouteStore {
+    fn get<'a, 'b>(
+        &'a self,
+        request: config_core::GetRequest,
+    ) -> Reply<'b, config_core::GetResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        if !request.key.starts_with(b"partitions/") {
+            return self.inner.get(request);
+        }
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let answer = self.inner.get(request).await;
+            if self.hold.load(Ordering::SeqCst) {
+                let _ = self.held.lock().expect("held").send(());
+                let _permit = self.gate.acquire().await.expect("never closed");
+            }
+            answer
+        })
+    }
+
+    fn list<'a, 'b>(
+        &'a self,
+        request: config_core::ListRequest,
+    ) -> Reply<'b, config_core::ListResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.list(request)
+    }
+
+    fn put<'a, 'b>(
+        &'a self,
+        request: config_core::PutRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.put(request)
+    }
+
+    fn delete<'a, 'b>(
+        &'a self,
+        request: config_core::DeleteRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.delete(request)
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn watch<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        let (items, stream) = tokio::sync::mpsc::unbounded_channel();
+        self.watches.lock().expect("watches").push(Some(items));
+        let _ = request;
+        let stream: config_core::WatchStream =
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(stream));
+        Box::pin(std::future::ready(Ok(stream)))
+    }
+
+    fn watch_leader<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.watch(request)
+    }
+}
+
+/// A `Db` with no node, over a [`RouteStore`] holding partition 1's record, owned by node 1 at
+/// `(1, 1)`, and the store's held-read signal.
+fn route_db(rt: &tokio::runtime::Runtime) -> (Db, Arc<RouteStore>, std::sync::mpsc::Receiver<()>) {
+    let (held, read) = std::sync::mpsc::channel();
+    let store = Arc::new(RouteStore {
+        inner: config_testkit::MemStore::new(),
+        reads: std::sync::atomic::AtomicU32::new(0),
+        hold: AtomicBool::new(false),
+        gate: tokio::sync::Semaphore::new(0),
+        held: Mutex::new(held),
+        watches: Mutex::new(Vec::new()),
+    });
+    let dynamic: Arc<dyn ConfigStore> = Arc::clone(&store) as Arc<dyn ConfigStore>;
+    let mut db = Db::by_hand(
+        Vec::new(),
+        Arc::clone(&dynamic),
+        rt.handle(),
+        Timeouts::default(),
+        None,
+    );
+    db.opened.control = Some(PromoteStore(
+        dynamic,
+        rt.handle().clone(),
+        crate::host::test_budgets(),
+    ));
+    write_route(rt, &store, NodeId(1), 1);
+    (db, store, read)
+}
+
+/// Write partition 1's record naming `owner` at `(epoch, epoch)`, as a promote writes it, and
+/// return the watch event that delivers it.
+fn write_route(
+    rt: &tokio::runtime::Runtime,
+    store: &RouteStore,
+    owner: NodeId,
+    epoch: u64,
+) -> config_core::WatchItem {
+    let key = Bytes::from(ControlKey::Partition(PARTITION).encode());
+    let value = PartitionRecord {
+        partition: PARTITION,
+        owner,
+        generation: Generation(epoch),
+        owner_epoch: OwnerEpoch(epoch),
+        config_version: admin::CONFIG_VERSION,
+        lifecycle: PartitionLifecycle::Serving,
+    }
+    .encode();
+    let written = rt
+        .block_on(store.inner.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the record is written");
+    config_core::WatchItem::Event(config_core::MutationEvent {
+        revision: written.revision,
+        key,
+        kind: config_core::MutationEventKind::Put {
+            value,
+            create_revision: 1,
+        },
+    })
+}
+
+/// Open node 1's `partitions/` watch through the adapter, as A1 asks for it, and wait (bounded)
+/// until the store has served it and the adapter counts it open.
+fn open_route_watch(db: &Db, store: &RouteStore, boot: u64) -> WatchItems {
+    let before = store.watches.lock().expect("watches").len();
+    db.control.submit(
+        NodeId(1),
+        BootId(boot),
+        PARTITION,
+        CorrelationId::default(),
+        ControlEffect::Watch {
+            prefix: ControlPrefix::Partitions,
+            from: Revision(0),
+        },
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let opened = store.watches.lock().expect("watches").len() > before;
+        if opened && db.control.route_marks().stamp(PARTITION).is_some() {
+            return store.watches.lock().expect("watches")[before]
+                .take()
+                .expect("taken once");
+        }
+        assert!(Instant::now() < until, "the adapter's watch did not open");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// `route` until `reads` partition reads have been made, bounded: an answer made stale is read
+/// again at the next call, so a few calls suffice once the adapter has seen what moved it.
+fn route_until_read(db: &Db, store: &RouteStore, reads: u32, what: &str) -> RouteInfo {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let route = db.route(G1).expect("route answers");
+        if store.reads.load(Ordering::SeqCst) >= reads {
+            return route;
+        }
+        assert!(
+            Instant::now() < until,
+            "{what}: the cached answer was never read again"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `route` until a call is served without a read, bounded: a watch the store has served is
+/// counted open by the adapter's task a moment later.
+fn route_until_cached(db: &Db, store: &RouteStore, what: &str) {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let reads = store.reads.load(Ordering::SeqCst);
+        db.route(G1).expect("route answers");
+        if store.reads.load(Ordering::SeqCst) == reads {
+            return;
+        }
+        assert!(Instant::now() < until, "{what}: every call read");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn token_at(epoch: u64) -> OwnerToken {
+    OwnerToken {
+        generation: Generation(epoch),
+        owner_epoch: OwnerEpoch(epoch),
+    }
+}
+
+/// own83_20 (#123 review): `route` is cached under the adapter's own `partitions/` watch, and a
+/// change that watch delivers makes the next call read again. The first call reads; the next
+/// calls are served from the cache, even after the record changes, while nothing is delivered;
+/// once the change is delivered, the next call reads and names the new owner and token. Cuts:
+/// no `marks.changed` in the adapter's `watch`, red at "delivered"; the cache served without
+/// `current`, red at "delivered"; the cache never served, red at "cached". Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_20_a_delivered_partition_change_rereads_the_cached_route() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let items = open_route_watch(&db, &store, 1);
+    let first = db.route(G1).expect("route answers");
+    assert_eq!((first.owner, first.token), (NodeId(1), token_at(1)));
+    let change = write_route(&rt, &store, NodeId(3), 2);
+    for _ in 0..3 {
+        assert_eq!(db.route(G1).expect("route answers"), first, "cached");
+    }
+    assert_eq!(store.reads.load(Ordering::SeqCst), 1, "cached: one read");
+    items.send(Ok(change)).expect("the watch is open");
+    let moved = route_until_read(&db, &store, 2, "delivered");
+    assert_eq!((moved.owner, moved.token), (NodeId(3), token_at(2)));
+    assert_eq!(db.route(G1).expect("route answers"), moved);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 2, "cached again");
+    db.shutdown();
+}
+
+/// own83_21 (#123 review): the end of the adapter's watch, and its abort by a newer watch of
+/// the family, each make a cached route stale. Cached under watch 1; watch 2 opens (as A1 asks
+/// again) and aborts watch 1: the next call reads again, and is cached under watch 2; watch 2's
+/// stream ends: the next call reads again, and with no watch open nothing is cached. Cuts: the
+/// `RouteWatch` guard not moving `every` when it drops, red at "aborted" (watch 2 keeps the
+/// open count above 0, so only `every` can tell). Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_21_a_watch_abort_or_end_rereads_the_cached_route() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let _first = open_route_watch(&db, &store, 1);
+    db.route(G1).expect("route answers");
+    db.route(G1).expect("route answers");
+    assert_eq!(
+        store.reads.load(Ordering::SeqCst),
+        1,
+        "precondition: cached"
+    );
+
+    let second = open_route_watch(&db, &store, 2);
+    route_until_read(&db, &store, 2, "aborted");
+    route_until_cached(&db, &store, "cached under watch 2");
+
+    let cached = store.reads.load(Ordering::SeqCst);
+    drop(second);
+    route_until_read(&db, &store, cached + 1, "ended");
+    for _ in 0..3 {
+        let reads = store.reads.load(Ordering::SeqCst);
+        db.route(G1).expect("route answers");
+        assert_eq!(
+            store.reads.load(Ordering::SeqCst),
+            reads + 1,
+            "no watch open: every call reads"
+        );
+    }
+    db.shutdown();
+}
+
+/// own83_22 (#123 review): a change delivered while a `route` read is in flight leaves that
+/// read's answer stale. The read is held after it has read the old record; the new record is
+/// written and its change delivered through the adapter's watch; the held read is let go and
+/// answers the old owner. The next call reads again and names the new one. Cut: the stamp
+/// taken after the read, red: the next call serves the old answer from the cache.
+/// Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_22_a_change_during_a_route_read_leaves_its_answer_stale() {
+    let rt = runtime();
+    let (mut db, store, held) = route_db(&rt);
+    let items = open_route_watch(&db, &store, 1);
+    store.hold.store(true, Ordering::SeqCst);
+    let marks = db.control.route_marks();
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| db.route(G1));
+        held.recv_timeout(Duration::from_secs(2))
+            .expect("the read reaches the store");
+        store.hold.store(false, Ordering::SeqCst);
+        let before = marks.stamp(PARTITION);
+        items
+            .send(Ok(write_route(&rt, &store, NodeId(3), 2)))
+            .expect("the watch is open");
+        let until = Instant::now() + Duration::from_secs(2);
+        while marks.stamp(PARTITION) == before {
+            assert!(
+                Instant::now() < until,
+                "the adapter did not mark the change"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        store.gate.add_permits(1);
+        let old = reading.join().expect("route").expect("route answers");
+        assert_eq!(old.owner, NodeId(1), "the held read answers what it read");
+    });
+    let next = db.route(G1).expect("route answers");
+    assert_eq!(
+        (next.owner, next.token),
+        (NodeId(3), token_at(2)),
+        "the next call reads again"
+    );
+    assert_eq!(store.reads.load(Ordering::SeqCst), 2);
     db.shutdown();
 }

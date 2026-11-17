@@ -50,7 +50,9 @@ use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
-use crate::ownership::{OwnerToken, Ownership};
+use crate::ownership::{
+    OwnerToken, Ownership, OwnershipEvents, RouteInfo, RouteStamp, Subscriber, SUBSCRIBER_CAPACITY,
+};
 use crate::transport::Links;
 use ack_floor::AckFloor;
 
@@ -571,6 +573,18 @@ struct Opened {
     /// before the node starts again (D-MC1), or the next open refuses it `Unbound`. `None`
     /// only in an app-only open, which runs no node, and a `Db` a crate test builds by hand.
     instance: Option<[u8; INSTANCE_LEN]>,
+    /// Ownership subscribers that left out a node whose restart failed (#123 review), and which
+    /// nodes, so a later restart that starts one hands it to the node. Weak: what keeps a
+    /// subscriber alive is the nodes holding it, so a dropped one still ends.
+    waiting: Mutex<Vec<Waiting>>,
+}
+
+/// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
+#[derive(Debug)]
+struct Waiting {
+    subscriber: std::sync::Weak<Subscriber>,
+    /// The nodes it has not reached, each one whose restart failed when it subscribed.
+    missing: BTreeSet<NodeId>,
 }
 
 /// The control store, runtime and budgets [`Db::promote`] runs on.
@@ -580,6 +594,17 @@ struct PromoteStore(Arc<dyn ConfigStore>, Handle, Budgets);
 impl std::fmt::Debug for PromoteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PromoteStore").finish_non_exhaustive()
+    }
+}
+
+impl Waiting {
+    /// Whether it may still be handed to a node: some node is missing, and it is still open.
+    fn live(&self) -> bool {
+        !self.missing.is_empty()
+            && self
+                .subscriber
+                .upgrade()
+                .is_some_and(|subscriber| !subscriber.is_dropped())
     }
 }
 
@@ -593,6 +618,7 @@ impl Default for Opened {
             stuck: Mutex::new(None),
             control: None,
             instance: None,
+            waiting: Mutex::new(Vec::new()),
         }
     }
 }
@@ -615,6 +641,9 @@ struct Route {
     /// [`OWNER_REREAD_GAP`] of it is not made: the call goes on with the owner that read named
     /// (A-R299).
     last_read: Mutex<BTreeMap<u32, Instant>>,
+    /// #83: what [`Db::route`] last read of each partition's record, and the stamp of the
+    /// `partitions/` watches it was read under. Served while the stamp is current.
+    answers: Mutex<BTreeMap<u32, (RouteInfo, RouteStamp)>>,
 }
 
 impl Default for Route {
@@ -623,6 +652,7 @@ impl Default for Route {
             owners: vec![std::sync::atomic::AtomicU32::new(OWNER.0)],
             refresh: None,
             last_read: Mutex::new(BTreeMap::new()),
+            answers: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -771,6 +801,30 @@ async fn read_owner(
         ))
     })?;
     Ok((record.owner, root.instance))
+}
+
+/// #83: `partition`'s owner and token as its `partitions/{p}` record names them.
+async fn read_route(store: &dyn ConfigStore, partition: PartitionId) -> Result<RouteInfo, String> {
+    let key = ControlKey::Partition(partition).encode();
+    let read = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| format!("route: get {key}: {error}"))?;
+    let found = read
+        .record
+        .ok_or_else(|| format!("route: {key} is absent: the database is not formed yet"))?;
+    let record = PartitionRecord::decode(&found.value)
+        .ok_or_else(|| format!("route: {key} is not a partition record this build reads"))?;
+    Ok(RouteInfo {
+        partition,
+        owner: record.owner,
+        token: OwnerToken {
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+        },
+    })
 }
 
 /// The refusal of a partition count no database can have (issue #79, ruling Q3): 0, or above
@@ -1538,7 +1592,7 @@ impl Db {
             route: Route {
                 owners,
                 refresh: Some((store, rt)),
-                last_read: Mutex::new(BTreeMap::new()),
+                ..Route::default()
             },
         })
     }
@@ -1727,7 +1781,7 @@ impl Db {
                         .collect()
                 },
                 refresh: partial.then(|| (Arc::clone(&store), rt.clone())),
-                last_read: Mutex::new(BTreeMap::new()),
+                ..Route::default()
             },
         };
         let mut failed = None;
@@ -3700,6 +3754,129 @@ impl Db {
             .any(|handle| handle.owner_views.still_owner(partition, token))
     }
 
+    /// Where `group`'s calls go (#83): its partition, and the owner and token its
+    /// `partitions/{p}` record names. A hint for forwarding a request, never authority: the
+    /// owner can lose the partition the moment after, so act only through
+    /// [`Self::still_owner`] on the owner and the destination's own token check.
+    ///
+    /// Cached. A node this process runs watches `partitions/` for its own authority already, and
+    /// each change that watch delivers for a partition makes that partition's answer stale; the
+    /// end of any such watch makes every answer stale. Nothing new is watched. While no such
+    /// watch is open (an app-only `Db`, or every node here cut from rEtcd) nothing is cached and
+    /// each call reads the record. A stale answer is read again, within the read timeout.
+    /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each read.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when the record cannot be read in the read timeout, does not decode, or is
+    /// absent, and from a `Db` a crate test built by hand, which has no control store.
+    pub fn route(&self, group: AffinityId) -> Result<RouteInfo, ApiError> {
+        let partition = self.partition_for(group);
+        let marks = self.control.route_marks();
+        if let Some((info, stamp)) = lock(&self.route.answers).get(&partition.0).copied() {
+            if marks.current(partition, stamp) {
+                return Ok(info);
+            }
+        }
+        // The stamp is taken before the read, so a change delivered during it leaves the
+        // answer stale rather than cached past the change.
+        let stamp = marks.stamp(partition);
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Err(ApiError::new(
+                ErrorKind::Unavailable,
+                "route: this Db has no control store to read partitions/ from".to_owned(),
+            ));
+        };
+        let (done, read) = mpsc::channel();
+        rt.spawn(async move {
+            // The caller may have given up; then nobody needs the answer.
+            let _ = done.send(read_route(&*store, partition).await);
+        });
+        let info = match read.recv_timeout(self.timeouts.read) {
+            Ok(Ok(info)) => info,
+            Ok(Err(detail)) => {
+                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
+                return Err(ApiError::new(ErrorKind::Unavailable, detail));
+            }
+            Err(_) => {
+                let detail = format!(
+                    "route: partitions/{} did not read within {:?}",
+                    partition.0, self.timeouts.read
+                );
+                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
+                return Err(ApiError::new(ErrorKind::Unavailable, detail));
+            }
+        };
+        tracing::info!(
+            partition = partition.0,
+            owner = info.owner.0,
+            generation = info.token.generation.0,
+            owner_epoch = info.token.owner_epoch.0,
+            cached = stamp.is_some(),
+            "db_route_read"
+        );
+        if let Some(stamp) = stamp {
+            lock(&self.route.answers).insert(partition.0, (info, stamp));
+        }
+        Ok(info)
+    }
+
+    /// The ownership changes of every node this process runs (#83): `Activated`,
+    /// `Deactivating { deadline }` and `Deactivated`, per partition, in order per node. Each
+    /// node sends its current state first (an `Activated`, or a `Deactivating`, per partition
+    /// it leads), then every change. One subscriber per call.
+    ///
+    /// The receiver holds up to 4096 unread events. A subscriber that falls that far behind is
+    /// dropped (logged `ownership_subscriber_dropped{node, why}`), and so is every subscriber
+    /// when a node here stops, after that node sends `Deactivated` for what it held. A dropped
+    /// receiver ends (`recv` answers `Err`) once every node has let go of it. The stream has no
+    /// end-of-snapshot marker, and an ended one cannot say what was missed, so on its end the
+    /// app stops everything it started from it, forgets it, and calls this again, which starts
+    /// again from the current state.
+    ///
+    /// A node whose restart failed ([`Self::restart_failed`]) runs no process, so it holds and
+    /// sends nothing. The stream leaves it out and stays open on the others (logged
+    /// `ownership_subscribe_node_down{node}`), and a later restart that starts the node hands
+    /// it every such stream still open, so that node's next stop ends them. A
+    /// node that cannot be reached for any other reason drops the subscriber at once (logged
+    /// `ownership_subscribe_unsent`), so a stream that may miss its events never looks whole.
+    /// In a `Db` with no running node (an app-only one, or one whose every restart failed),
+    /// it ends at once. See `docs/rdb/embed.md`, "Ownership events".
+    #[must_use]
+    pub fn ownership_events(&self) -> OwnershipEvents {
+        let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
+        let nodes = lock(&self.nodes);
+        let mut missing = BTreeSet::new();
+        for handle in nodes.iter() {
+            if handle.start_failed {
+                // #123 review: no process runs it, so it has nothing to send until a restart
+                // starts it, and that restart hands it this subscriber.
+                tracing::info!(node = handle.node.0, "ownership_subscribe_node_down");
+                missing.insert(handle.node);
+                continue;
+            }
+            if handle
+                .send(Msg::Subscribe(Arc::clone(&subscriber)))
+                .is_err()
+            {
+                // #123 review: the nodes already reached keep it otherwise, and this node's
+                // events would be missing from a stream that never ends.
+                subscriber.drop_everywhere();
+                tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
+                return events;
+            }
+        }
+        if !missing.is_empty() {
+            let mut waiting = lock(&self.opened.waiting);
+            waiting.retain(Waiting::live);
+            waiting.push(Waiting {
+                subscriber: Arc::downgrade(&subscriber),
+                missing,
+            });
+        }
+        events
+    }
+
     /// Each node's state for partition 1, in node order. A node that does not answer within
     /// the read timeout is left out.
     ///
@@ -4076,7 +4253,9 @@ impl Db {
 
     /// A resend's or retry's answer under `request`: whatever refused it, the request may have
     /// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the
-    /// dedup replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED`
+    /// dedup replay and prove only that this send mutated nothing (Q-A); so does a faulted
+    /// node's refusal, which comes before admission and the replay alike (#124, Q15 (b)), so its
+    /// `no_mutation` is cleared here too. A `PROTECTION_PAUSED`
     /// refusal points at [`Self::status`] only when status shows, or will show, the outcome
     /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
     /// 7, P2), but a request refused at admission was never queued, and nothing resolves it
@@ -4536,6 +4715,7 @@ impl Db {
                     boot = boot.0,
                     "node_restarted"
                 );
+                self.hand_waiting_subscribers(handle);
                 // #42 (A-R249): the other nodes hear the new boot as a net handshake tells a
                 // node process; the record owner then re-plans to link this copy again.
                 for other in nodes.iter().filter(|other| other.node != node) {
@@ -4572,6 +4752,38 @@ impl Db {
                 Err(ApiError::host(&detail))
             }
         }
+    }
+
+    /// Hand the node `handle` now runs every ownership subscriber still open that left it out
+    /// while its restart had failed (#123 review). The node sends it the current state first,
+    /// as to any new subscriber. Called under the node lock, as `Self::ownership_events` reads
+    /// the nodes, so no subscriber comes between.
+    fn hand_waiting_subscribers(&self, handle: &NodeHandle) {
+        let mut waiting = lock(&self.opened.waiting);
+        for entry in waiting.iter_mut() {
+            if !entry.missing.remove(&handle.node) {
+                continue;
+            }
+            let Some(subscriber) = entry.subscriber.upgrade() else {
+                continue;
+            };
+            if subscriber.is_dropped() {
+                continue;
+            }
+            if handle
+                .send(Msg::Subscribe(Arc::clone(&subscriber)))
+                .is_err()
+            {
+                subscriber.drop_everywhere();
+                tracing::warn!(node = handle.node.0, "ownership_subscribe_unsent");
+            } else {
+                tracing::info!(
+                    node = handle.node.0,
+                    "ownership_subscriber_handed_on_restart"
+                );
+            }
+        }
+        waiting.retain(Waiting::live);
     }
 
     /// Start `node` at `boot` on the empty `folder` its wipe left (D-MC1): open the engine,
