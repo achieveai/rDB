@@ -471,8 +471,17 @@ For a sandbox gateway (SBX):
   highest-token record per workspace, the same one consulted by every machine's gateway for that
   workspace. The old owner's gateway, on the old machine, must take the same lock and read the
   same record as the new owner's gateway when it registers its token. A lock local to each
-  machine does not stop an old owner on another machine. Whether SBX's lock is shared is not yet
-  confirmed (2026-11-15). **Until SBX confirms it, this fence is not claimed** for SBX.
+  machine does not stop an old owner on another machine. **SBX's lock is not shared today**
+  (confirmed by the gateway team on 2026-11-18, against SBX master `2df7866`). Per-sandbox
+  serialization is in-memory state in one gateway process. Durable state is one SQLite file per
+  gateway, whose OS advisory lock stops only a second gateway on the same host and file.
+  Nothing coordinates gateways on different machines. **So this fence is not claimed for SBX
+  across machines.** Within one gateway process it holds. Across machines it waits for SBX's
+  distributed-gateway design (SBX PR 245, a draft). That design must supply one record and one
+  serialization per workspace that every machine's gateway consults. A conditional write on a
+  shared record covers an effect the store itself checks, such as a snapshot upload. It does
+  not cover a container create: the check and the create are two steps, so they still need a
+  lock shared by every machine.
 - Stamp the token on **every** side effect: each container (as a label) and each snapshot upload.
 - **Snapshots.** The snapshot store's fence record is per workspace. An upload is a conditional
   write that checks the record. The new owner registers its token there before it restores.
