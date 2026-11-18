@@ -16,7 +16,7 @@
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
 //!   certificates is how a walk presents a certificate this run's nodes do not trust.
 //! * `--form` makes the database once (ruling A-R231): all three copies in this process on
-//!   `--dir`, until ready, then shuts down. A node process only ever opens a formed database.
+//!   `--dir`, until ready, then shuts down. A node process opens only a formed or declared database.
 //!   `--partitions` is how many partitions the database is formed with (issue #79), fixed from
 //!   then on. Unset, a new database has one and a node process reads the count from the store.
 //! * `--declare` makes the database with no copy at all (#80 S1a, ADR-rdb-0022): it writes the
@@ -24,6 +24,8 @@
 //!   Each node process then opens its own empty `--dir`, and the owner of each partition forms
 //!   it. `--partitions` defaults to 1; `--nodes` is the node count, and this build declares 3.
 //!   Run again with the same arguments it says `already`; with another count it is refused.
+//!   It takes no `--form`, `--gen-certs`, `--node`, `--dir` or `--live-readd`: each is refused,
+//!   not ignored.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
 //!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
@@ -270,7 +272,31 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     failover_refusal(&args)?;
+    declare_refusal(&args)?;
     Ok(args)
+}
+
+/// What `--declare` does not read, refused rather than ignored (PR #138 review): it writes
+/// control records only, so it makes no copy (`--form`), certificates (`--gen-certs`) or node
+/// process (`--node`, `--dir`, `--live-readd`).
+fn declare_refusal(args: &Args) -> Result<(), String> {
+    if !args.declare {
+        return Ok(());
+    }
+    for (given, flag) in [
+        (args.form, "--form"),
+        (args.gen_certs, "--gen-certs"),
+        (args.node.is_some(), "--node"),
+        (args.dir.is_some(), "--dir"),
+        (args.live_readd, "--live-readd"),
+    ] {
+        if given {
+            return Err(format!(
+                "--declare writes only control records and takes no {flag}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The shortest `--failover-silent-ms` taken: one clock-probe period, the same floor
@@ -494,11 +520,23 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 /// Declare the database (#80 S1a): control records only, no copy, then exit.
 fn declare(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let store = control(args)?;
+    let line = declare_on(args, &store, rt)?;
+    println!("{line}");
+    Ok(())
+}
+
+/// [`declare`] on `store`, answering the line it prints: the parsed `--nodes` and
+/// `--partitions` go to `admin::declare` as given, so a row can run this path on its own store.
+fn declare_on(
+    args: &Args,
+    store: &Arc<dyn ConfigStore>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<String, String> {
     let declaration = rdb_api::admin::Declaration {
         nodes: (1..=args.nodes.unwrap_or(3)).map(NodeId).collect(),
         partitions: args.partitions.unwrap_or(1),
     };
-    let (word, formation) = match rt.block_on(rdb_api::admin::declare(&store, &declaration)) {
+    let (word, formation) = match rt.block_on(rdb_api::admin::declare(store, &declaration)) {
         Ok(rdb_api::admin::Declared::Created(formation)) => ("declared", formation),
         Ok(rdb_api::admin::Declared::Already(formation)) => ("already", formation),
         Err(e) => return Err(format!("declare: {e}")),
@@ -506,12 +544,11 @@ fn declare(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let instance = rdb_api::admin::instance_hex(&formation.instance);
     let nodes: Vec<String> = formation.nodes.iter().map(|n| n.0.to_string()).collect();
     tracing::info!(%instance, partitions = formation.partitions, word, "rdb_node_declared");
-    println!(
+    Ok(format!(
         "rdb_node {word} instance={instance} partitions={} nodes={}",
         formation.partitions,
         nodes.join(",")
-    );
-    Ok(())
+    ))
 }
 
 /// How often [`watch_ownership`] reads each partition's ownership.
@@ -798,7 +835,9 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_apps, parse};
+    use std::sync::Arc;
+
+    use super::{admin_apps, declare_on, parse, ConfigStore};
 
     fn apps(argv: &[&str]) -> Vec<String> {
         let args = parse(argv.iter().map(|a| (*a).to_owned())).expect("parses");
@@ -840,6 +879,103 @@ mod tests {
         );
         assert!(parsed(&["--declare", "--partitions", "8"])
             .is_ok_and(|args| args.declare && args.partitions == Some(8) && !args.failover));
+    }
+
+    /// PR #138 review: each planner knob with `--declare` is refused, with `--failover` (no
+    /// planner runs) and without it (an orphan knob). Unit.
+    #[test]
+    fn s1a_declare_rejects_each_planner_knob() {
+        for knob in [
+            ["--failover-silent-ms", "2000"],
+            ["--failover-max-concurrent", "2"],
+        ] {
+            assert_eq!(
+                parsed(&["--declare", "--failover", knob[0], knob[1]]).map(|_| ()),
+                Err("--failover runs only in a node process, not with --declare".to_owned()),
+                "{knob:?} with --failover"
+            );
+            assert_eq!(
+                parsed(&["--declare", knob[0], knob[1]]).map(|_| ()),
+                Err(format!("{} needs --failover", knob[0])),
+                "{knob:?} alone"
+            );
+        }
+    }
+
+    /// PR #138 review: `--declare` refuses at parse time each flag it would otherwise ignore,
+    /// or (`--form`, `--gen-certs`) run instead of declaring. Unit.
+    /// Cut: drop `declare_refusal` from `parse`; every pair parses, red.
+    #[test]
+    fn s1a_declare_rejects_flags_it_does_not_read() {
+        for (flags, named) in [
+            (&["--form"][..], "--form"),
+            (&["--gen-certs"][..], "--gen-certs"),
+            (&["--node", "2"][..], "--node"),
+            (&["--dir", "d"][..], "--dir"),
+            (&["--live-readd"][..], "--live-readd"),
+        ] {
+            let argv: Vec<&str> = ["--declare"].iter().chain(flags).copied().collect();
+            assert_eq!(
+                parsed(&argv).map(|_| ()),
+                Err(format!(
+                    "--declare writes only control records and takes no {named}"
+                )),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// PR #138 review: `--declare --nodes` outside 3 to `MAX_NODES`, or not a number, is
+    /// refused while parsing; the shared parser still takes 4 and 8 for `--gen-certs`. Unit.
+    #[test]
+    fn s1a_declare_node_counts_parse_as_gen_certs_does() {
+        for bad in ["0", "9", "three"] {
+            assert!(
+                parsed(&["--declare", "--nodes", bad]).is_err(),
+                "--declare --nodes {bad}"
+            );
+        }
+        for good in [4, 8] {
+            let text = good.to_string();
+            assert!(
+                parsed(&["--gen-certs", "--cert-dir", "c", "--nodes", &text])
+                    .is_ok_and(|args| args.nodes == Some(good)),
+                "--gen-certs --nodes {good}"
+            );
+        }
+    }
+
+    /// PR #138 review: `--declare --nodes 4` parses, reaches `admin::declare` with four nodes
+    /// (not the default three), and is refused there with no formation record written. Unit
+    /// (<100 ms, an in-memory store).
+    /// Cut: `declare_on` builds nodes 1 to 3 whatever `--nodes` says; it declares, red.
+    #[config_log::retcd_test]
+    fn s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let args = parsed(&["--declare", "--nodes", "4", "--partitions", "8"]).expect("parses");
+        let refused = declare_on(&args, &store, &rt);
+        assert!(
+            matches!(&refused, Err(text) if text.contains("nodes [1, 2, 3, 4]")
+                && text.contains("nothing was written")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            rt.block_on(rdb_api::admin::read_formation(&*store))
+                .expect("the store answers"),
+            None,
+            "no formation record"
+        );
+        let line = declare_on(
+            &parsed(&["--declare", "--partitions", "8"]).expect("parses"),
+            &store,
+            &rt,
+        )
+        .expect("three nodes declare");
+        assert!(line.starts_with("rdb_node declared "), "{line}");
     }
 
     /// PR #119 review: `--failover` with `--form` is a parse error, since forming runs no

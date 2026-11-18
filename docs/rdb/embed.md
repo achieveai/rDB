@@ -1177,13 +1177,15 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   This has been run with three processes on 127.0.0.1, .2 and .3 of one host. It has not been
   run on separate machines. Still missing: more than 3 nodes, a rule against two nodes on one
   machine, TLS to rEtcd from `rdb_node`, and adding or removing a node. A node process started
-  on a folder of a database that was neither formed nor declared is still refused with "form
-  the database first (lr up)".
+  on a folder of a database that was neither formed nor declared is still refused with
+  "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
+  of a declared database is refused: its node processes form it.
 - **A copy missed while the database is first formed never joins.** This happens when a node's
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
-  one more copy and the partition becomes read-only. A copy wiped after forming is not
-  affected: it rejoins through the heal.
+  one more copy and the partition becomes read-only. For a declared database, an owner whose
+  folder is lost after its first root and before any admitted write is still refused as
+  unfinished forming; repeating --declare does not recover it (#137).
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take

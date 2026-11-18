@@ -7,6 +7,7 @@ use super::reopen_tests::{config, fast, runtime};
 use super::*;
 use crate::net::faults::Faults;
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
+use crate::test_store::{HoldAt, PutHold, Script, Scripted};
 
 /// The partition count the rows declare: more than one per node, so each owner forms several.
 const PARTITIONS: u32 = 8;
@@ -103,55 +104,165 @@ fn listeners(
     (listeners, addrs)
 }
 
-/// Declare, then open nodes 1 to 3 each on a new empty folder of its own; none waited on yet.
-fn declared_rig() -> Rig {
+/// A runtime, `store` and certificates for nodes 1 to 3; no node process yet.
+fn bare_rig(store: Arc<dyn ConfigStore>) -> Rig {
     let rt = runtime();
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let cert_dir = config_testkit::fs::temp_dir();
     let labels: Vec<Label> = ALL_NODES.iter().map(|node| Label::Node(*node)).collect();
     certs::generate(cert_dir.path(), &labels).expect("certs");
-    let declared = rt
-        .block_on(admin::declare(&store, &declaration()))
-        .expect("the declaration is written");
-    assert!(
-        matches!(declared, admin::Declared::Created(_)),
-        "{declared:?}"
-    );
-    let (listeners, addrs) = listeners(&rt);
-    let procs = ALL_NODES
-        .iter()
-        .zip(listeners)
-        .map(|(node, listener)| {
-            let dir = config_testkit::fs::temp_dir();
-            let (db, net) = open_node(
-                &rt,
-                &store,
-                cert_dir.path(),
-                *node,
-                dir.path(),
-                listener,
-                &addrs,
-            )
-            .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
-            Proc {
-                node: *node,
-                db,
-                _net: net,
-                dir: dir.path().to_path_buf(),
-                _dir: Box::new(dir),
-            }
-        })
-        .collect();
     Rig {
         rt,
         store,
         cert_dir: cert_dir.path().to_path_buf(),
         _cert_dir: Box::new(cert_dir),
-        procs,
+        procs: Vec::new(),
     }
 }
 
+/// Declare, then open nodes 1 to 3 each on a new empty folder of its own; none waited on yet.
+fn declared_rig() -> Rig {
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    rig.declare_created();
+    rig.open_all(fresh_dirs());
+    rig
+}
+
+/// A folder's path, and the `TempDir` that removes it when dropped.
+type Folder = (PathBuf, Box<dyn std::any::Any>);
+
+/// A new empty folder.
+fn folder() -> Folder {
+    let dir = config_testkit::fs::temp_dir();
+    (dir.path().to_path_buf(), Box::new(dir))
+}
+
+/// Three new empty folders, for nodes 1 to 3.
+fn fresh_dirs() -> Vec<Folder> {
+    ALL_NODES.iter().map(|_| folder()).collect()
+}
+
+/// Every record in `store`: key, value, create and mod revision, in key order. Equal snapshots
+/// mean nothing was written between them, an identical-byte rewrite included.
+fn snapshot(
+    rt: &tokio::runtime::Runtime,
+    store: &dyn ConfigStore,
+) -> Vec<(Bytes, Bytes, u64, u64)> {
+    let listed = rt
+        .block_on(store.list(config_core::ListRequest {
+            prefix: Bytes::from_static(b""),
+            max_items: 0,
+            max_bytes: 0,
+        }))
+        .expect("the store answers");
+    assert!(!listed.truncated, "a whole list");
+    listed
+        .records
+        .into_iter()
+        .map(|record| {
+            (
+                record.key,
+                record.value,
+                record.create_revision,
+                record.mod_revision,
+            )
+        })
+        .collect()
+}
+
+/// The keys of `snap`, as text.
+fn keys(snap: &[(Bytes, Bytes, u64, u64)]) -> Vec<String> {
+    snap.iter()
+        .map(|(key, ..)| String::from_utf8_lossy(key).into_owned())
+        .collect()
+}
+
+/// The control keys a whole declaration of `partitions` writes, the formation record last.
+fn declared_keys(partitions: u32, marker: bool) -> Vec<String> {
+    let mut keys: Vec<String> = (1..=partitions)
+        .map(|id| ControlKey::Partition(PartitionId(id)).encode())
+        .collect();
+    keys.push(ControlKey::Route(RangeId(0)).encode());
+    if marker {
+        keys.push(ControlKey::Operation(admin::FORMATION_OPERATION).encode());
+    }
+    keys.sort();
+    keys
+}
+
+/// Whether every record of `before` is in `after`, byte for byte, at the same revisions.
+fn kept(before: &[(Bytes, Bytes, u64, u64)], after: &[(Bytes, Bytes, u64, u64)]) -> bool {
+    before.iter().all(|record| after.contains(record))
+}
+
+/// Whether `dir` holds a `nodes/` folder: an open that created one and was refused removes it.
+fn has_copies(dir: &Path) -> bool {
+    dir.join("nodes").exists()
+}
+
 impl Rig {
+    /// `declaration()` on this rig's store, which must write it.
+    fn declare_created(&self) -> admin::Formation {
+        match self
+            .rt
+            .block_on(admin::declare(&self.store, &declaration()))
+        {
+            Ok(admin::Declared::Created(formation)) => formation,
+            other => panic!("the declaration is written: {other:?}"),
+        }
+    }
+
+    /// Open nodes 1 to 3, each on its folder in `dirs`, in that order; none waited on yet.
+    fn open_all(&mut self, dirs: Vec<Folder>) {
+        let (listeners, addrs) = listeners(&self.rt);
+        for ((node, listener), (dir, keep)) in ALL_NODES.iter().zip(listeners).zip(dirs) {
+            let (db, net) = open_node(
+                &self.rt,
+                &self.store,
+                &self.cert_dir,
+                *node,
+                &dir,
+                listener,
+                &addrs,
+            )
+            .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
+            self.procs.push(Proc {
+                node: *node,
+                db,
+                _net: net,
+                dir,
+                _dir: keep,
+            });
+        }
+    }
+
+    /// Open `node`'s process once more on its folder, alone, the others down.
+    fn reopen(&self, node: NodeId) -> Result<(Db, Arc<Net>), OpenError> {
+        let (mut listeners, addrs) = listeners(&self.rt);
+        open_node(
+            &self.rt,
+            &self.store,
+            &self.cert_dir,
+            node,
+            &self.procs[node.0 as usize - 1].dir,
+            listeners.remove(node.0 as usize - 1),
+            &addrs,
+        )
+    }
+
+    /// Shut every process down.
+    fn shutdown_all(&mut self) {
+        for proc in &mut self.procs {
+            proc.db.shutdown();
+        }
+    }
+
+    /// Lose `node`'s whole folder, as a wiped disk does, leaving an empty one.
+    fn wipe(&self, node: NodeId) {
+        let dir = &self.procs[node.0 as usize - 1].dir;
+        std::fs::remove_dir_all(dir).expect("remove the folder");
+        std::fs::create_dir_all(dir).expect("an empty folder");
+    }
+
     fn wait_ready(&self) {
         for proc in &self.procs {
             proc.db
@@ -302,33 +413,43 @@ fn s1a_restart_of_each_node_reopens_its_own_folder() {
 }
 
 /// S1a: `declare` is write-once. The same declaration again answers `Already` with the same
-/// instance; another partition count, or nodes other than 1 to 3, is refused and writes nothing.
-/// Unit (<100 ms, an in-memory store).
+/// instance; another partition count, or nodes other than 1 to 3, is refused, before and after
+/// the declaration. None of the later calls writes anything: every record's bytes and create and
+/// mod revisions are as they were (PR #138 review: an identical-byte rewrite would pass a
+/// compare of the decoded record). Unit (<100 ms, an in-memory store).
 #[config_log::retcd_test]
 fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let refused = rt.block_on(admin::declare(
-        &store,
-        &admin::Declaration {
-            nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
-            partitions: PARTITIONS,
-        },
-    ));
+    let four = admin::Declaration {
+        nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+        partitions: PARTITIONS,
+    };
+    let refused = rt.block_on(admin::declare(&store, &four));
     assert!(
         matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
         "{refused:?}"
     );
+    assert!(snapshot(&rt, &*store).is_empty(), "nothing was written");
     let Ok(admin::Declared::Created(first)) = rt.block_on(admin::declare(&store, &declaration()))
     else {
         panic!("the first declaration is written");
     };
     assert_eq!(first.partitions, PARTITIONS);
+    let declared = snapshot(&rt, &*store);
+    assert_eq!(keys(&declared), declared_keys(PARTITIONS, true));
+
     let again = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(&again, Ok(admin::Declared::Already(found)) if *found == first),
         "{again:?}"
     );
+    assert_eq!(
+        snapshot(&rt, &*store),
+        declared,
+        "the same declaration wrote nothing"
+    );
+
     let changed = rt.block_on(admin::declare(
         &store,
         &admin::Declaration {
@@ -342,29 +463,37 @@ fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
         "{changed:?}"
     );
     assert_eq!(
-        rt.block_on(admin::read_formation(&*store))
-            .expect("the store answers"),
-        Some(first),
-        "the formation record is unchanged"
+        snapshot(&rt, &*store),
+        declared,
+        "another count wrote nothing"
     );
+
+    let refused = rt.block_on(admin::declare(&store, &four));
+    assert!(
+        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
+        "{refused:?}"
+    );
+    assert_eq!(snapshot(&rt, &*store), declared, "four nodes wrote nothing");
 }
 
 /// S1a keeps A-R231(a): with no declaration, a node process on an empty folder is refused with
-/// today's text, and forms nothing. Unit (<1 s, an in-memory store, no links).
+/// today's text, and forms nothing. PR #138 review: that same folder then opens once the
+/// database is declared, binds the declared instance, becomes ready and holds only its own
+/// copy. Integration (~3 s): a refused open, then a declared formation of 8 partitions.
 #[config_log::retcd_test]
 fn s1a_undeclared_partial_open_is_refused_as_before() {
-    let rt = runtime();
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let dir = config_testkit::fs::temp_dir();
-    let refused = rt
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let (kept_dir, keep) = folder();
+    let refused = rig
+        .rt
         .block_on(Db::open_with(
             DbConfig {
                 local: vec![NodeId(2)],
-                boot: Some(next_boot(dir.path()).expect("a boot")),
-                ..config(dir.path())
+                boot: Some(next_boot(&kept_dir).expect("a boot")),
+                ..config(&kept_dir)
             },
-            Arc::clone(&store),
-            rt.handle().clone(),
+            Arc::clone(&rig.store),
+            rig.rt.handle().clone(),
             fast(),
         ))
         .map(|_| ())
@@ -375,16 +504,583 @@ fn s1a_undeclared_partial_open_is_refused_as_before() {
             .contains("database not formed: the control store holds no partitions/1"),
         "{refused}"
     );
-    let listed = rt
-        .block_on(store.list(config_core::ListRequest {
-            prefix: Bytes::from_static(b""),
-            max_items: 0,
-            max_bytes: 0,
-        }))
-        .expect("the store answers");
     assert!(
-        listed.records.is_empty(),
-        "nothing was written: {:?}",
-        listed.records
+        snapshot(&rig.rt, &*rig.store).is_empty(),
+        "nothing was written"
     );
+    assert!(!has_copies(&kept_dir), "no copy was made");
+
+    let formation = rig.declare_created();
+    let mut dirs = fresh_dirs();
+    dirs[1] = (kept_dir.clone(), keep);
+    rig.open_all(dirs);
+    rig.wait_ready();
+    assert_eq!(
+        rig.of(NodeId(2)).opened.instance,
+        Some(formation.instance),
+        "the kept folder binds the declared instance"
+    );
+    assert_eq!(copies_in(&kept_dir), ["2"]);
+}
+
+/// PR #138 review (blocker): a store formed with one partition the old way holds a rooted
+/// `partitions/1` and no `routes/0`. A declaration of 8 is refused there, twice, before it
+/// writes anything: no `routes/0` that would make later opens expect 8 partitions. The
+/// database then reopens at its own count. Integration (~3 s): a whole-database formation and
+/// a reopen.
+/// Cut: drop `declare_preflight` from `admin::declare`; the declaration writes `routes/0`, then
+/// stops at the rooted record with `Records`, red at the first refusal.
+#[config_log::retcd_test]
+fn s1a_declare_on_a_formed_store_is_refused_and_writes_nothing() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let open = || {
+        rt.block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the whole database opens")
+    };
+    let mut db = open();
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("formed with one partition");
+    db.shutdown();
+    drop(db);
+    let formed = snapshot(&rt, &*store);
+    for attempt in 1..=2 {
+        let refused = rt.block_on(admin::declare(&store, &declaration()));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("partitions/1 is not the untouched generation-0 record")
+                    && text.contains("nothing was written")),
+            "attempt {attempt}: {refused:?}"
+        );
+        assert_eq!(
+            snapshot(&rt, &*store),
+            formed,
+            "attempt {attempt} wrote nothing"
+        );
+    }
+    let mut db = open();
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the database reopens at its own count");
+    assert_eq!(db.partition_for(AffinityId(1)), PartitionId(1));
+    db.shutdown();
+}
+
+/// PR #138 review (blocker, and the missing interrupted-retry row): a declaration of 8 stops
+/// after `routes/0` and three records. A declaration of 1 is then refused and writes nothing
+/// (it would publish count 1 beside `routes/0` = 8). Running the declaration of 8 again stops
+/// after a longer prefix, and a third run finishes it. Every record written by an earlier run
+/// keeps its bytes and revisions, and the formation record exists only after the run that
+/// finished. Unit (<200 ms, an in-memory store).
+/// Cut: drop `declare_preflight` from `admin::declare`; the declaration of 1 adopts
+/// `partitions/1` and writes a formation record of 1 partition, red.
+#[config_log::retcd_test]
+fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
+    let rt = runtime();
+    let scripted = Arc::new(Scripted::new(Script::default()));
+    let store: Arc<dyn ConfigStore> = scripted.clone();
+    let stop_after = |puts: u32| {
+        scripted.rescript(Script {
+            pass_puts: puts,
+            fail_put_with: Some(config_core::ConfigError::Unavailable {
+                reason: "scripted: the declaring process stopped".to_owned(),
+            }),
+            ..Script::default()
+        });
+    };
+
+    stop_after(1 + 3);
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    let first = snapshot(&rt, &*store);
+    assert_eq!(
+        keys(&first),
+        [
+            "partitions/1",
+            "partitions/2",
+            "partitions/3",
+            ControlKey::Route(RangeId(0)).encode().as_str()
+        ]
+    );
+
+    scripted.rescript(Script::default());
+    let one = rt.block_on(admin::declare(
+        &store,
+        &admin::Declaration {
+            partitions: 1,
+            ..declaration()
+        },
+    ));
+    assert!(
+        matches!(&one, Err(admin::DeclareError::Refused(text))
+            if text.contains("says 8 partitions and this declaration asks for 1")),
+        "{one:?}"
+    );
+    assert_eq!(
+        snapshot(&rt, &*store),
+        first,
+        "the declaration of 1 wrote nothing"
+    );
+
+    stop_after(1 + 5);
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    let second = snapshot(&rt, &*store);
+    assert!(kept(&first, &second), "{first:?} -> {second:?}");
+    assert_eq!(keys(&second).len(), 6, "{:?}", keys(&second));
+    assert_eq!(
+        rt.block_on(admin::read_formation(&*store)).expect("reads"),
+        None
+    );
+
+    scripted.rescript(Script::default());
+    let done = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(matches!(done, Ok(admin::Declared::Created(_))), "{done:?}");
+    let third = snapshot(&rt, &*store);
+    assert!(kept(&second, &third), "{second:?} -> {third:?}");
+    assert_eq!(keys(&third), declared_keys(PARTITIONS, true));
+}
+
+/// PR #138 review: the formation record is published last. Held at its put, the store
+/// already holds `routes/0` and all 8 untouched generation-0 records, and no formation record.
+/// A declaration stopped before its last record writes no formation record; a node process on
+/// a fresh folder is then refused, makes no copy and writes nothing; once the declaration is
+/// run again, that same folder opens and the database becomes ready. Integration (~3 s).
+/// Cut: `declare` writes the formation record before `write_records`; the held put finds no
+/// partition records, red.
+#[config_log::retcd_test]
+fn s1a_the_formation_record_is_published_after_every_prerequisite() {
+    let rt = runtime();
+    let mem: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let marker = ControlKey::Operation(admin::FORMATION_OPERATION).encode();
+    let held = PutHold::new(Arc::clone(&mem), &marker, HoldAt::BeforeApply);
+    let held_store: Arc<dyn ConfigStore> = held.clone();
+    let declaring = rt.spawn(async move { admin::declare(&held_store, &declaration()).await });
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), held.arrived.notified())
+            .await
+            .expect("the formation record's put arrives");
+    });
+    let at_marker = snapshot(&rt, &*mem);
+    assert_eq!(keys(&at_marker), declared_keys(PARTITIONS, false));
+    for (key, value, create, modified) in &at_marker {
+        assert_eq!(create, modified, "{key:?} is untouched");
+        if key.starts_with(b"partitions/") {
+            assert!(
+                PartitionRoot::decode(value).is_none(),
+                "{key:?} names no instance yet"
+            );
+        }
+    }
+    declaring.abort();
+    drop(rt);
+
+    let scripted = Arc::new(Scripted::new(Script {
+        pass_puts: 1 + (PARTITIONS - 1),
+        fail_put_with: Some(config_core::ConfigError::Unavailable {
+            reason: "scripted: the declaring process stopped".to_owned(),
+        }),
+        ..Script::default()
+    }));
+    let mut rig = bare_rig(scripted.clone());
+    let stopped = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    let prefix = snapshot(&rig.rt, &*rig.store);
+    assert!(
+        !keys(&prefix).contains(&marker),
+        "no formation record before the last partition record: {:?}",
+        keys(&prefix)
+    );
+    assert_eq!(
+        keys(&prefix).len(),
+        PARTITIONS as usize,
+        "{:?}",
+        keys(&prefix)
+    );
+
+    let (kept_dir, keep) = folder();
+    let (listeners, addrs) = listeners(&rig.rt);
+    let refused = open_node(
+        &rig.rt,
+        &rig.store,
+        &rig.cert_dir,
+        NodeId(1),
+        &kept_dir,
+        listeners.into_iter().next().expect("a listener"),
+        &addrs,
+    )
+    .map(|_| ())
+    .expect_err("an unfinished declaration forms nothing");
+    assert!(
+        refused.to_string().contains("database not formed yet"),
+        "{refused}"
+    );
+    assert!(!has_copies(&kept_dir), "no copy was made");
+    assert_eq!(
+        snapshot(&rig.rt, &*rig.store),
+        prefix,
+        "the open wrote nothing"
+    );
+
+    scripted.rescript(Script::default());
+    rig.declare_created();
+    let mut dirs = fresh_dirs();
+    dirs[0] = (kept_dir.clone(), keep);
+    rig.open_all(dirs);
+    rig.wait_ready();
+    assert_eq!(copies_in(&kept_dir), ["1"]);
+}
+
+/// A control store whose puts under `partitions/` wait at a gate until [`PartitionGate::open`],
+/// after notifying [`PartitionGate::arrived`]; every other call passes.
+struct PartitionGate {
+    inner: Arc<dyn ConfigStore>,
+    gate: tokio::sync::Semaphore,
+    arrived: tokio::sync::Notify,
+}
+
+impl PartitionGate {
+    fn open(&self) {
+        self.gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+}
+
+/// Opens a [`PartitionGate`] when dropped, so a row that panics while a put waits at the gate
+/// still lets that put's thread finish and its scope end.
+struct OpenOnDrop<'g>(&'g PartitionGate);
+
+impl Drop for OpenOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PartitionGate {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        if request.key.starts_with(b"partitions/") {
+            tracing::info!(key = %String::from_utf8_lossy(&request.key), "test_partition_put_gated");
+            self.arrived.notify_one();
+            let _permit = self.gate.acquire().await.expect("never closed");
+        }
+        self.inner.put(request).await
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// PR #138 review (blocker): node 2's open is delayed after its copy starts, at its first
+/// partition record write, while nodes 1 and 3 open and node 1 roots partition 1. Released,
+/// node 2's open still succeeds: it writes only the records of the partitions it owns, so it
+/// never meets node 1's root. Its folder keeps its copy, and all three become ready.
+/// Integration (~4 s): a declared formation with one open held.
+/// Cut: drop the owner filter on `forming` in `open_spawning`; node 2 adopts `partitions/1`,
+/// finds it rooted, and its open is refused `AlreadyExists` and removes its `nodes/`, red.
+#[config_log::retcd_test]
+fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    rig.declare_created();
+    let gated = Arc::new(PartitionGate {
+        inner: Arc::clone(&rig.store),
+        gate: tokio::sync::Semaphore::new(0),
+        arrived: tokio::sync::Notify::new(),
+    });
+    let gated_store: Arc<dyn ConfigStore> = gated.clone();
+    let (listeners, addrs) = listeners(&rig.rt);
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
+        listeners.into_iter().map(Some).collect();
+    let dirs = fresh_dirs();
+    let rooted_first = |rig: &Rig| {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+        loop {
+            let read = rig
+                .rt
+                .block_on(rig.store.get(config_core::GetRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                }))
+                .expect("the store answers");
+            if read
+                .record
+                .is_some_and(|found| PartitionRoot::decode(&found.value).is_some())
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "node 1 never rooted partition 1");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let opened: Vec<(NodeId, Db, Arc<Net>)> = std::thread::scope(|scope| {
+        let _release = OpenOnDrop(&gated);
+        let late_listener = listeners[1].take().expect("node 2's listener");
+        let late_dir = dirs[1].0.clone();
+        let (rt, cert_dir, addrs) = (&rig.rt, &rig.cert_dir, &addrs);
+        let gated_store = &gated_store;
+        let late = scope.spawn(move || {
+            open_node(
+                rt,
+                gated_store,
+                cert_dir,
+                NodeId(2),
+                &late_dir,
+                late_listener,
+                addrs,
+            )
+        });
+        rig.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), gated.arrived.notified())
+                .await
+                .expect("node 2's open reaches its first partition record write");
+        });
+        let mut opened = Vec::new();
+        for node in [NodeId(1), NodeId(3)] {
+            let (db, net) = open_node(
+                &rig.rt,
+                &rig.store,
+                &rig.cert_dir,
+                node,
+                &dirs[node.0 as usize - 1].0,
+                listeners[node.0 as usize - 1].take().expect("a listener"),
+                addrs,
+            )
+            .unwrap_or_else(|e| panic!("node {} opens: {e}", node.0));
+            opened.push((node, db, net));
+        }
+        rooted_first(&rig);
+        gated.open();
+        let (db, net) = late
+            .join()
+            .expect("node 2's thread")
+            .unwrap_or_else(|e| panic!("node 2's delayed open succeeds: {e}"));
+        opened.insert(1, (NodeId(2), db, net));
+        opened
+    });
+    assert_eq!(
+        copies_in(&dirs[1].0),
+        ["2"],
+        "node 2's folder keeps its copy"
+    );
+    for ((node, db, net), (dir, keep)) in opened.into_iter().zip(dirs) {
+        rig.procs.push(Proc {
+            node,
+            db,
+            _net: net,
+            dir,
+            _dir: keep,
+        });
+    }
+    rig.wait_ready();
+}
+
+/// PR #138 review (blocker): a whole-database open (`--form`, `lr up`) of a declared store on
+/// an empty folder would bind an instance of its own beside the declared one. It is refused
+/// before anything is bound or started: no `nodes/` is left and the store is unchanged. Unit
+/// (<1 s, an in-memory store).
+/// Cut: drop the declared refusal in `Db::check`; the open binds a fresh instance and forms,
+/// red at `expect_err`.
+#[config_log::retcd_test]
+fn s1a_a_whole_database_open_of_a_declared_store_is_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(formation)) =
+        rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    let declared = snapshot(&rt, &*store);
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|_| ())
+        .expect_err("a whole-database open does not form a declared database");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Config(_))
+            && text.contains(&admin::instance_hex(&formation.instance))
+            && text.contains("nothing was created"),
+        "{text}"
+    );
+    assert!(!has_copies(dir.path()), "nothing was bound");
+    assert_eq!(snapshot(&rt, &*store), declared, "nothing was written");
+}
+
+/// PR #138 review: a node process's first read, the formation record, failing `Unavailable`
+/// says `control store:` once and gives the step to take. Unit (<100 ms).
+/// Cut: `formation_refused` maps `Store` through `to_string` as before; the text says
+/// `control store:` twice and has no step, red.
+#[config_log::retcd_test]
+fn s1a_an_unreachable_store_at_the_formation_read_says_what_to_do() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+        fail_gets: 1,
+        ..Script::default()
+    }));
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(2)],
+                boot: Some(next_boot(dir.path()).expect("a boot")),
+                ..config(dir.path())
+            },
+            store,
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|_| ())
+        .expect_err("the store is unreachable");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Control(_))
+            && text.matches("control store:").count() == 1
+            && text.contains("get operations/")
+            && text.ends_with(RETCD_STEP),
+        "{text}"
+    );
+}
+
+/// PR #138 review, and #137: node 1 roots its first partition and stops before any write is
+/// admitted (the commit hook faults it before activation), then loses its whole folder. With
+/// the formation record present, its reopen is refused "has not finished forming", and running
+/// the same declaration again (`Already`) does not change that: today's limit, which #137
+/// owns. The refused opens bind nothing, start nothing and write nothing. Integration (~4 s).
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    rig.declare_created();
+    let dirs = fresh_dirs();
+    crate::host::set_after_commit(&dirs[0].0, Some(crate::host::AfterCommit::Fault));
+    rig.open_all(dirs);
+    let owned: Vec<PartitionId> = (1..=PARTITIONS)
+        .map(PartitionId)
+        .filter(|partition| admin::initial_owner(*partition) == NodeId(1))
+        .collect();
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while !rig.rt.block_on(async {
+        partition_states(&rig.store, PARTITIONS)
+            .await
+            .expect("the store answers")
+            .iter()
+            .any(|(partition, state)| {
+                owned.contains(partition) && matches!(state, PartitionState::Rooted(..))
+            })
+    }) {
+        assert!(Instant::now() < deadline, "node 1 never rooted a partition");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    rig.shutdown_all();
+    crate::host::set_after_commit(&rig.procs[0].dir, None);
+    let before = snapshot(&rig.rt, &*rig.store);
+    rig.wipe(NodeId(1));
+    for attempt in ["first", "after declaring again"] {
+        let refused = rig
+            .reopen(NodeId(1))
+            .map(|_| ())
+            .expect_err("the wiped owner is refused");
+        assert!(
+            refused.to_string().contains("has not finished forming"),
+            "{attempt}: {refused}"
+        );
+        assert!(!has_copies(&rig.procs[0].dir), "{attempt}: nothing bound");
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            before,
+            "{attempt}: nothing written"
+        );
+        let again = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+        assert!(
+            matches!(again, Ok(admin::Declared::Already(_))),
+            "{again:?}"
+        );
+    }
+}
+
+/// PR #138 review: after acknowledged writes, node 1 loses its whole folder. With the
+/// formation record present, its reopen is refused with the promote step: it never forms
+/// again, binds nothing, starts nothing and writes nothing. Integration (~5 s).
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_after_acknowledged_writes_is_told_to_promote() {
+    let mut rig = declared_rig();
+    rig.wait_ready();
+    for partition in (1..=PARTITIONS).filter(|p| admin::initial_owner(PartitionId(*p)) == NodeId(1))
+    {
+        let db = rig.of(NodeId(1));
+        put_lands(db, group_of(db, partition), b"k", b"v");
+    }
+    rig.shutdown_all();
+    let before = snapshot(&rig.rt, &*rig.store);
+    rig.wipe(NodeId(1));
+    let refused = rig
+        .reopen(NodeId(1))
+        .map(|_| ())
+        .expect_err("the wiped owner is refused");
+    assert!(refused.to_string().contains("admin promote"), "{refused}");
+    assert!(!has_copies(&rig.procs[0].dir), "nothing bound");
+    assert_eq!(snapshot(&rig.rt, &*rig.store), before, "nothing written");
 }

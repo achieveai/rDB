@@ -1842,7 +1842,18 @@ impl Db {
         } else {
             // A partition still to form joins its owner's heal, after the clear (design 7.2):
             // its recovery must not acquire the grant the heal has yet to clear.
-            let forming = found.forming();
+            let mut forming = found.forming();
+            // PR #138 review: a node process of a declared database writes only the records of
+            // the partitions it owns. Another owner may have rooted its own since `check` read
+            // them, and adopting that record would refuse this open.
+            if declared.is_some() {
+                let owners: BTreeMap<PartitionId, NodeId> = found.owners().collect();
+                forming.retain(|partition| {
+                    owners
+                        .get(partition)
+                        .is_some_and(|owner| config.local.contains(owner))
+                });
+            }
             let formed = admin::write_records(&store, &forming).await?;
             // One heal per owner this process runs, over all its partitions (issue #79).
             let mut heals: BTreeMap<NodeId, OwnerHeal> = BTreeMap::new();
@@ -1870,7 +1881,8 @@ impl Db {
     /// every copy, bound now on a fresh directory; and on a directory with data, a
     /// `partitions/1` and counter of that instance, and a copy that holds the generation the
     /// record names. A `partial` open (a node process) refuses a copy that holds no data before
-    /// binding anything: only a formed database's copy opens there (ruling A-R231(a)).
+    /// binding anything: only a formed database's copy opens there (ruling A-R231(a)), or a
+    /// declared one's (#80 S1a). A whole-database open of a declared database is refused.
     async fn check(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
         absent: Vec<Absent>,
@@ -1890,9 +1902,9 @@ impl Db {
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
         // A node process's empty copy (wiped, or created above) joins a formed database it is a
         // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
-        // it (ruling A-R328). It never forms one.
-        // #80 S1a: a declared database's partition 1 still to form is formed by its owner's
-        // process, whose copy may be empty; the copy binds the declared instance.
+        // it (ruling A-R328). It never forms one, with one exception (#80 S1a): a declared
+        // database whose partition 1 is still untouched. Its owner's process forms it, whose
+        // copy may be empty, and the copy binds the declared instance (below).
         let first_unformed = match declared {
             Some(_) => matches!(
                 partition_states(store, PARTITION.0).await?.pop(),
@@ -2009,14 +2021,6 @@ impl Db {
             .first()
             .copied()
             .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
-        for (node, engine) in engines.iter_mut() {
-            if resume.iter().any(|(held, ..)| held == node) {
-                continue;
-            }
-            engine
-                .bind_instance(instance)
-                .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
-        }
         let read = store
             .get(config_core::GetRequest {
                 key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
@@ -2050,6 +2054,41 @@ impl Db {
                 Some((record, PartitionRoot::decode(&found.value)))
             }
         };
+        let untouched = read
+            .record
+            .as_ref()
+            .is_some_and(|found| found.create_revision == found.mod_revision);
+        // Partition 1 alone (issue #79): a later partition may have landed first.
+        let holds_first = engines.values().any(holds_partition);
+        // PR #138 review: a whole-database open that would form here, over a declaration's
+        // untouched `partitions/1`, would bind an instance of its own beside the declared one.
+        // A declared database's node processes form it: refused before anything is bound.
+        if !partial
+            && !holds_first
+            && untouched
+            && matches!(&root, Some((record, None)) if record.generation == Generation(0))
+        {
+            if let Some(formation) = admin::read_formation(&**store)
+                .await
+                .map_err(formation_refused)?
+            {
+                return Err(OpenError::Config(format!(
+                    "the database is declared (instance {}, {} partitions): each node process \
+                     forms its own partitions from its own folder (rdb_node --node N), and a \
+                     whole-database open does not form it; nothing was created",
+                    admin::instance_hex(&formation.instance),
+                    formation.partitions
+                )));
+            }
+        }
+        for (node, engine) in engines.iter_mut() {
+            if resume.iter().any(|(held, ..)| held == node) {
+                continue;
+            }
+            engine
+                .bind_instance(instance)
+                .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+        }
         let fresh = Found {
             instance,
             fresh: true,
@@ -2058,12 +2097,6 @@ impl Db {
             others: Vec::new(),
             forms_first: false,
         };
-        let untouched = read
-            .record
-            .as_ref()
-            .is_some_and(|found| found.create_revision == found.mod_revision);
-        // Partition 1 alone (issue #79): a later partition may have landed first.
-        let holds_first = engines.values().any(holds_partition);
         // A node process never forms (ruling A-R231(a)), unless the database is declared and
         // its copies name the declared instance (#80 S1a): partition 1's owner forms it.
         let form = || {
@@ -5922,19 +5955,30 @@ fn roll_forward_copies(
     Ok(copies)
 }
 
-/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
-/// open reads no app object, so the text holds paths, generations and instance ids, never key
-/// or value text.
-/// [`admin::read_formation`]'s error as an open's (#80 S1a).
+/// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and
+/// the step to take when the store was not reachable, as every other read of an open says.
 fn formation_refused(error: admin::DeclareError) -> OpenError {
     match error {
         admin::DeclareError::Undecodable { key } => {
             undecodable(&key, "not a formation record this build reads")
         }
-        other => OpenError::Control(other.to_string()),
+        admin::DeclareError::Store { step, error } => {
+            let then = match error {
+                config_core::ConfigError::Unavailable { .. } => RETCD_STEP,
+                _ => "",
+            };
+            OpenError::Control(format!("{step}: {error}{then}"))
+        }
+        // `read_formation` writes nothing, so it ends neither way.
+        other @ (admin::DeclareError::Refused(_) | admin::DeclareError::Records(_)) => {
+            OpenError::Control(format!("read the formation record: {other}"))
+        }
     }
 }
 
+/// Log a refused open as `db_open_refused`, with its kind and its text, and hand it back. An
+/// open reads no app object, so the text holds paths, generations and instance ids, never key
+/// or value text.
 fn open_refused(error: OpenError) -> OpenError {
     let kind = match &error {
         OpenError::InUse(_) => "InUse",

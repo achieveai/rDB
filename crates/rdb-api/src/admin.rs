@@ -270,21 +270,26 @@ pub(crate) async fn write_records(
 ) -> Result<Vec<(PartitionId, Revision)>, BootstrapError> {
     let mut written = Vec::with_capacity(partitions.len());
     for partition in partitions.iter().copied() {
-        let record = PartitionRecord {
-            partition,
-            owner: initial_owner(partition),
-            generation: Generation(0),
-            owner_epoch: OwnerEpoch(0),
-            config_version: CONFIG_VERSION,
-            lifecycle: PartitionLifecycle::Serving,
-        };
         let key = ControlKey::Partition(partition).encode();
         written.push((
             partition,
-            create_or_adopt(store, &key, &record.encode()).await?,
+            create_or_adopt(store, &key, &initial_record(partition).encode()).await?,
         ));
     }
     Ok(written)
+}
+
+/// The generation-0 record [`write_records`] creates for `partition`, placed as
+/// [`initial_owner`].
+fn initial_record(partition: PartitionId) -> PartitionRecord {
+    PartitionRecord {
+        partition,
+        owner: initial_owner(partition),
+        generation: Generation(0),
+        owner_epoch: OwnerEpoch(0),
+        config_version: CONFIG_VERSION,
+        lifecycle: PartitionLifecycle::Serving,
+    }
 }
 
 /// Create `key` with `value`, or adopt it when an earlier attempt's create landed (F-004).
@@ -484,9 +489,19 @@ pub enum DeclareError {
     /// The declaration is not one this build makes, or differs from the one already there.
     #[error("{0}")]
     Refused(String),
-    /// A control record was in the way, or the store failed.
+    /// A control record was in the way, or the store failed a write.
     #[error(transparent)]
     Records(#[from] BootstrapError),
+    /// The store failed a read: `step` names it (`get <key>`, `list <prefix>`). The error stays
+    /// typed, so an open can say what to do about an `Unavailable` store.
+    #[error("{step}: {error}")]
+    Store {
+        /// The read that failed.
+        step: String,
+        /// How it failed.
+        #[source]
+        error: ConfigError,
+    },
     /// The formation record does not decode.
     #[error("{key} is not a formation record this build reads")]
     Undecodable {
@@ -499,7 +514,7 @@ pub enum DeclareError {
 ///
 /// # Errors
 ///
-/// [`DeclareError::Records`] when the store fails, [`DeclareError::Undecodable`] for a record this
+/// [`DeclareError::Store`] when the store fails, [`DeclareError::Undecodable`] for a record this
 /// build does not read.
 pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>, DeclareError> {
     let key = ControlKey::Operation(FORMATION_OPERATION).encode();
@@ -508,7 +523,10 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
             key: Bytes::from(key.clone()),
         })
         .await
-        .map_err(|error| BootstrapError::Control(format!("get {key}: {error}")))?;
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
     read.record
         .map(|found| Formation::decode(&found.value).ok_or(DeclareError::Undecodable { key }))
         .transpose()
@@ -568,6 +586,7 @@ pub async fn declare(
         return same(found);
     }
     let partitions = declaration.partitions;
+    declare_preflight(&**store, partitions).await?;
     if partitions > 1 {
         let key = ControlKey::Route(RangeId(0)).encode();
         let value = RoutesRoot {
@@ -615,6 +634,88 @@ pub async fn declare(
         }
         Err(error) => Err(BootstrapError::Control(format!("put {key}: {error}")).into()),
     }
+}
+
+/// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
+/// prefix of what this declaration writes, which it then adopts. That is `routes/0` at this
+/// count, if any, and untouched generation-0 records of partitions 1 to `partitions` only. So a
+/// database formed some other way (a rooted `partitions/1`), or an interrupted declaration of
+/// another count (its `routes/0`, or a record past this count), refuses it with nothing
+/// written. This is a read: two declarations of different counts **at once** can still both
+/// pass it (ADR-rdb-0022, Consequences).
+///
+/// # Errors
+///
+/// [`DeclareError::Refused`] naming the record in the way, [`DeclareError::Store`] when the
+/// store fails, [`DeclareError::Undecodable`] for a record this build does not read.
+async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(), DeclareError> {
+    let refused = |what: String| {
+        DeclareError::Refused(format!(
+            "{what}: the store holds part of another database or of another declaration, which \
+             this declaration cannot adopt; nothing was written"
+        ))
+    };
+    let key = ControlKey::Route(RangeId(0)).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
+    if let Some(found) = read.record {
+        let stored = RoutesRoot::decode(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?
+            .partition_count;
+        if stored != partitions {
+            return Err(refused(format!(
+                "{key} says {stored} partitions and this declaration asks for {partitions}"
+            )));
+        }
+    }
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("list {prefix}"),
+            error,
+        })?;
+    if listed.truncated {
+        return Err(DeclareError::Store {
+            step: format!("list {prefix}"),
+            error: ConfigError::Unavailable {
+                reason: format!("truncated at revision {}", listed.read_revision),
+            },
+        });
+    }
+    for found in &listed.records {
+        let key = String::from_utf8_lossy(&found.key).into_owned();
+        let record = PartitionRecord::decode(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        let partition = record.partition;
+        if partition.0 > partitions {
+            return Err(refused(format!(
+                "{key} exists and this declaration asks for {partitions} partitions"
+            )));
+        }
+        if found.value != initial_record(partition).encode()
+            || found.create_revision != found.mod_revision
+        {
+            return Err(refused(format!(
+                "{key} is not the untouched generation-0 record a declaration writes (revision \
+                 {})",
+                found.mod_revision
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The most opens one data directory may have (arch R3b): `N <= 2^23`, so a boot and a
@@ -4638,6 +4739,71 @@ mod tests {
             "{healed:?}"
         );
         assert!(sent.is_empty(), "{} messages before the clear", sent.len());
+    }
+
+    /// PR #138 review (#80 S1a): a heal with only partitions to form waits for every member of
+    /// them too, not only the rooted partitions' members. With node 3 never linked, it ends
+    /// `PeersUnknown` naming node 3 and sends nothing. With three distinct boots, each plan
+    /// pins every member at its own boot. Unit (~150 ms): `MemStore`, a 100 ms budget.
+    /// Cut: the heal waits on `member_union(&pinned)` alone; the first heal sends plans, red.
+    #[test]
+    fn s1a_a_bootstrap_only_heal_waits_for_every_member_and_pins_its_boot() {
+        let rt = runtime();
+        let two = PartitionId(2);
+        let heal_with = |member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>| {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let (owner, mailbox) = std::sync::mpsc::channel();
+            let ctx = HealCtx {
+                partition_count: 2,
+                store,
+                boot: OPEN_2,
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: HostClock::start(),
+                owner,
+                within: Duration::from_millis(100),
+                member_boot,
+                owner_node: OWNER,
+                partitions: Vec::new(),
+                bootstrap: vec![(two, Revision(4))],
+            };
+            let healed = rt.block_on(heal(ctx));
+            (healed, mailbox.try_iter().collect::<Vec<Msg>>())
+        };
+
+        let (refused, sent) = heal_with(Arc::new(|node: NodeId| {
+            (node != NodeId(3)).then_some(BootId(10 + u64::from(node.0)))
+        }));
+        assert!(
+            matches!(&refused, Err(HealError::PeersUnknown { nodes, .. }) if nodes == &[3]),
+            "{refused:?}"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+
+        let boot_of = |node: NodeId| BootId(10 + u64::from(node.0));
+        let (healed, sent) = heal_with(Arc::new(move |node| Some(boot_of(node))));
+        healed.expect("every member answered");
+        let pinned: Vec<Vec<(NodeId, BootId)>> = sent
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Inject {
+                    kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))),
+                    ..
+                } => Some(
+                    plan.config
+                        .members
+                        .iter()
+                        .map(|member| (member.node, member.boot))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<(NodeId, BootId)> = members_for(two, BOOT)
+            .iter()
+            .map(|member| (member.node, boot_of(member.node)))
+            .collect();
+        assert_eq!(want.len(), 3, "{want:?}");
+        assert_eq!(pinned, [want], "one plan, every member at its own boot");
     }
 
     /// The `FencingProof` a heal sent node 1, if it sent one.
