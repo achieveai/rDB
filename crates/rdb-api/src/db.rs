@@ -1693,6 +1693,9 @@ impl Db {
         } else {
             None
         };
+        if let Some(formation) = &formation {
+            declared_open_refusal(&config.local, formation, &*store).await?;
+        }
         let declared = formation.as_ref().map(|formation| formation.instance);
         // #80 S1b: partitions are placed over the declared nodes; a database no declaration
         // made keeps nodes 1 to 3.
@@ -6070,6 +6073,54 @@ fn roll_forward_copies(
 /// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and,
 /// when the store was not reachable, the rEtcd step the open's other `get` reads add
 /// (`partition_states`' `list` does not add it).
+/// #80 S1b (ADR-rdb-0023 Decisions 4 and 5): what a node process of a declared database must
+/// be before it opens, checked before this open creates `nodes/` or reads anything else. One
+/// process runs one declared node: a process is certainly one machine, so two local nodes would
+/// be two data nodes on one machine. And that node's `nodes/{id}` record must exist: a store
+/// with none was declared by an S1a build ([`admin::S1A_STORE`]). Nothing is written either way.
+async fn declared_open_refusal(
+    local: &[NodeId],
+    formation: &admin::Formation,
+    store: &dyn ConfigStore,
+) -> Result<(), OpenError> {
+    let [node] = local else {
+        return Err(OpenError::Config(format!(
+            "this open runs nodes {:?} of a declared database, and a declared database runs one \
+             data node per process and per machine: open each node in its own process; nothing \
+             was created",
+            local.iter().map(|node| node.0).collect::<Vec<_>>()
+        )));
+    };
+    let records = admin::read_nodes(store)
+        .await
+        .map_err(|error| match error {
+            admin::DeclareError::Undecodable { key } => {
+                undecodable(&key, "not a node record this build reads")
+            }
+            other => formation_refused(other),
+        })?;
+    if records.is_empty() {
+        return Err(OpenError::Config(format!(
+            "{}; nothing was created",
+            admin::S1A_STORE
+        )));
+    }
+    if !records.contains_key(node) {
+        return Err(OpenError::Config(format!(
+            "{} is absent, so node {} is not a declared node of this database (it declares \
+             nodes {:?}); nothing was created",
+            ControlKey::Node(*node).encode(),
+            node.0,
+            formation
+                .nodes
+                .iter()
+                .map(|node| node.0)
+                .collect::<Vec<_>>()
+        )));
+    }
+    Ok(())
+}
+
 fn formation_refused(error: admin::DeclareError) -> OpenError {
     match error {
         admin::DeclareError::Undecodable { key } => {
