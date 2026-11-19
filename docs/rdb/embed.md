@@ -459,23 +459,41 @@ because the new owner restores and acts **after** its register.
 - An effect whose destination cannot compare a token is not covered. `still_owner` narrows its
   window but cannot close it.
 
-For a sandbox gateway (SBX):
+For a sandbox gateway (SBX), this section says what SBX **must build**. It does not describe
+SBX today.
 
-- **The lock.** SBX's container runtime takes a lock **per sandbox** across container creation
-  and snapshot upload, and one sandbox is one workspace. That per-workspace (per-sandbox) lock
-  is the serialization expected here: the register, each create and each upload check the
-  workspace's fence record while holding it. (Later, this work may move from the gateway to the
-  supervisor on rDB. That is a direction, not a promise; until it happens, the gateway's lock is
-  the one that counts.)
-- **Requirement: the lock and the record are shared.** SBX must use one lock and one
-  highest-token record per workspace, the same one consulted by every machine's gateway for that
-  workspace. The old owner's gateway, on the old machine, must take the same lock and read the
-  same record as the new owner's gateway when it registers its token. A lock local to each
-  machine does not stop an old owner on another machine. Whether SBX's lock is shared is not yet
-  confirmed (2026-11-15). **Until SBX confirms it, this fence is not claimed** for SBX.
+**Where SBX is today** (SBX master `287f4ee`, checked 2026-11-19, on the register, container
+create and snapshot upload paths): **none of them registers or checks an rDB owner token**, and
+a search of SBX's crates for `owner_token`, `OwnerToken` and `fence` found no owner-token fence
+anywhere else. (It does find `complete_fenced` in `operation_manager.rs`, which checks an
+operation lease token: a lease fence, not an owner fence.) So none of this fence is in place for
+SBX yet, on one machine or across machines.
+- Per-sandbox serialization is in-memory state in one gateway process, and on the sandbox create
+  path (`create_sandbox` in `backend/docker_backend.rs`) it is not held across container
+  creation. (The per-parent lock `ops_locks` is held
+  across the ops-sibling create, `ensure_ops_container` in `docker.rs`.)
+- Durable state is one SQLite file per gateway. Its OS advisory lock stops only a second gateway
+  on the same host and file.
+- The cross-host coordination found is S3 conditional-create locks for repository-wide backup
+  work (`backup/locks.rs`: repository init and prune) and per-workspace purge tombstones. Those
+  are not an ownership fence.
+- An upload checks tombstones and snapshot divergence, not an owner token.
+
+Until SBX builds the requirements below, rDB claims no fence for SBX. SBX's distributed-gateway
+design (SBX PR 245, a draft as of 2026-11-19) is where they belong.
+
+- **Requirement: one shared serialization and record per workspace.** SBX must use one lock and
+  one highest-token record per workspace (one sandbox is one workspace). Every machine's gateway
+  for that workspace consults the same pair: the old owner's gateway, on the old machine, as
+  well as the new owner's. The register, each create and each upload check the record while
+  holding that serialization. A lock local to each machine or process does not stop an old
+  owner elsewhere. A conditional write on the shared record covers an effect the store itself
+  checks, such as a snapshot upload. It does not cover a container create: the check and the
+  create are two steps, so they need the shared lock held across both.
 - Stamp the token on **every** side effect: each container (as a label) and each snapshot upload.
-- **Snapshots.** The snapshot store's fence record is per workspace. An upload is a conditional
-  write that checks the record. The new owner registers its token there before it restores.
+- **Snapshots.** The snapshot store's fence record must be per workspace, and an upload must be
+  a conditional write that checks it. The new owner registers its token there before it
+  restores.
 - **Containers.** Container creation must be serialized with the register on the same record:
   take the sandbox's lock, check the token, create, release. A sweep alone
   is not enough. A stale owner can pass its check, pause, and create after the new owner's
