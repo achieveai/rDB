@@ -939,7 +939,9 @@ pub enum CounterError {
 }
 
 /// Count one more open of `instance` and return its number N (arch R3b): N = 1 by a create-only
-/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. A
+/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. Once
+/// any read has found the counter, `fresh` no longer applies: a counter gone on a later read is
+/// [`CounterError::Absent`], never created again. A
 /// conflict or a lost reply reads again and CASes again, so a lost reply can waste a number but
 /// never hand one out twice. A transient store error waits 50 ms and tries again; all of it is
 /// bounded by `within`. Logged as `open_counted{instance_hex, n, revision}` and each retry as
@@ -958,6 +960,10 @@ pub async fn count_open(
     let hex = instance_hex(instance);
     let deadline = tokio::time::Instant::now() + within;
     let mut last = String::from("nothing answered");
+    // Whether this open may still create the counter: only until a read finds one. A counter
+    // that was seen and is then gone was deleted, and a new N = 1 would overlap the request
+    // range of the open that holds 1 (PR #138 review r4).
+    let mut may_create = fresh;
     while tokio::time::Instant::now() < deadline {
         let read = match store
             .get(GetRequest {
@@ -974,8 +980,11 @@ pub async fn count_open(
             }
             Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
         };
+        if read.record.is_some() {
+            may_create = false;
+        }
         let (next, expected) = match read.record {
-            None if fresh => (
+            None if may_create => (
                 Count {
                     n: 1,
                     activated: Generation(0),

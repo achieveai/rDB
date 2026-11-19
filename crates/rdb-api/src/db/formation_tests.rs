@@ -1655,3 +1655,193 @@ fn s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing() {
     );
     assert_eq!(snapshot(&rt, &*store), before, "nothing was written");
 }
+
+/// A store whose counter puts race other opens, for the counter rows. Each of the first
+/// `conflicts` puts on the counter first lets another open count (`count_open` straight on
+/// `inner`, which creates the counter if it is absent), so the put it then forwards conflicts.
+/// When `vanish` and the last of them is a CAS (not a create), the counter is deleted after the
+/// other open counts, and every counter put after that is counted in `late_puts`.
+struct CounterRace {
+    inner: Arc<dyn ConfigStore>,
+    key: Bytes,
+    instance: [u8; INSTANCE_LEN],
+    conflicts: std::sync::atomic::AtomicU32,
+    vanish: bool,
+    vanished: std::sync::atomic::AtomicBool,
+    late_puts: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for CounterRace {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        use std::sync::atomic::Ordering;
+        if request.key != self.key {
+            return self.inner.put(request).await;
+        }
+        if self.vanished.load(Ordering::SeqCst) {
+            self.late_puts.fetch_add(1, Ordering::SeqCst);
+            return self.inner.put(request).await;
+        }
+        let left = self.conflicts.load(Ordering::SeqCst);
+        if left > 0 {
+            self.conflicts.store(left - 1, Ordering::SeqCst);
+            admin::count_open(&*self.inner, &self.instance, true, admin::COUNT_WITHIN)
+                .await
+                .expect("the other open counts");
+            if left == 1 && self.vanish && request.expected_mod_revision != Some(0) {
+                let deleted = self
+                    .inner
+                    .delete(config_core::DeleteRequest {
+                        key: self.key.clone(),
+                        expected_mod_revision: None,
+                        dedup: None,
+                    })
+                    .await
+                    .expect("delete the counter");
+                assert_eq!(deleted.outcome, config_core::MutationOutcome::Applied);
+                let answer = self.inner.put(request).await;
+                self.vanished.store(true, Ordering::SeqCst);
+                return answer;
+            }
+        }
+        self.inner.put(request).await
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// PR #138 review r4 (blocker): an open allowed to create the counter (`fresh`) reads it present,
+/// loses its CAS to other opens one or more times, and the counter is then deleted before it
+/// reads again. It is refused `Absent` and writes nothing: a counter it has seen is never
+/// recreated, since a new N = 1 would overlap the request range of the open that already holds
+/// 1. Started on an empty store too, where its own create loses to another open's. Against an
+/// intact counter the same conflicts are retried and counted after the others, and a first
+/// creation with no race is N = 1. Unit (<1 s, an in-memory store; each conflict waits 50 ms).
+/// Cut: `count_open` keeps `fresh` across a read that found the counter; the retry recreates
+/// N = 1, red.
+#[config_log::retcd_test]
+fn s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated() {
+    let rt = runtime();
+    let instance = [0x5a; INSTANCE_LEN];
+    let race = |vanish: bool, conflicts: u32, seeded: bool| {
+        let inner: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        if seeded {
+            assert_eq!(
+                rt.block_on(admin::count_open(
+                    &*inner,
+                    &instance,
+                    true,
+                    admin::COUNT_WITHIN
+                )),
+                Ok(1),
+                "the first creation"
+            );
+        }
+        CounterRace {
+            inner,
+            key: Bytes::from(admin::instance_key(&instance)),
+            instance,
+            conflicts: std::sync::atomic::AtomicU32::new(conflicts),
+            vanish,
+            vanished: std::sync::atomic::AtomicBool::new(false),
+            late_puts: std::sync::atomic::AtomicU32::new(0),
+        }
+    };
+    for seeded in [true, false] {
+        // Unseeded, the first conflict is on the create, so the delete needs a later CAS.
+        let lost = if seeded { [1, 3] } else { [2, 3] };
+        for conflicts in lost {
+            let case = format!("seeded {seeded}, {conflicts} conflicts, then deleted");
+            let store = race(true, conflicts, seeded);
+            let counted = rt.block_on(admin::count_open(
+                &store,
+                &instance,
+                true,
+                admin::COUNT_WITHIN,
+            ));
+            assert_eq!(
+                counted,
+                Err(admin::CounterError::Absent {
+                    key: admin::instance_key(&instance)
+                }),
+                "{case}"
+            );
+            assert!(
+                store.vanished.load(std::sync::atomic::Ordering::SeqCst),
+                "{case}: the counter was deleted"
+            );
+            assert_eq!(
+                store.late_puts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{case}: no put after the delete"
+            );
+            assert_eq!(
+                snapshot(&rt, &*store.inner),
+                Vec::new(),
+                "{case}: nothing written"
+            );
+        }
+        for conflicts in [0, 3] {
+            let case = format!("seeded {seeded}, {conflicts} conflicts, counter intact");
+            let store = race(false, conflicts, seeded);
+            let counted = rt.block_on(admin::count_open(
+                &store,
+                &instance,
+                true,
+                admin::COUNT_WITHIN,
+            ));
+            assert_eq!(
+                counted,
+                Ok(u64::from(seeded) + u64::from(conflicts) + 1),
+                "{case}: counted after the others"
+            );
+        }
+    }
+}

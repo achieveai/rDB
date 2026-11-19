@@ -77,12 +77,16 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
   node's copy.
 - Two more control records, the reservation and the formation record. Neither is ever
   rewritten, so they need no CAS discipline after creation.
-- The open counter is created only by the database's first open: a fresh whole-database open,
-  or a declared node process while nothing of the database is formed yet (partition 1
-  untouched, no copy in its folder holding data, and no other partition rooted). Every open
-  counts before it roots anything, so any of those means an earlier open counted. A later open
-  of a declared database, like any other, refuses an absent counter (a manual delete, or a
-  restore of some prefixes only) rather than count N = 1 again, after a partial formation too.
+- The open counter may be created by a fresh whole-database open, or by a declared node
+  process that finds, at that moment, partition 1 untouched, no copy in its folder holding
+  data, and every other partition still to form. Otherwise an absent counter is refused (a
+  manual delete, or a restore of some prefixes only) rather than counted N = 1 again, after a
+  partial formation too. Every open counts before it roots anything, so a rooted partition or
+  a copy holding data proves an earlier open counted. The reverse does not hold: the checks
+  read the current state, and an earlier open that counted and stopped before writing anything
+  leaves them all true, so they do not prove this is the first open. Once `count_open` has read
+  the counter present it never creates it, so a counter deleted between its retries is refused
+  too (`s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`).
 - Not covered: an owner whose copy is empty after its partition got its first root, before any
   write was admitted. It is refused as before ("has not finished forming"), and running the
   declaration again does not recover it (#137). The refusal says so; it does not give the
@@ -107,6 +111,11 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
   and written, partition 1 untouched, the counter deleted; nodes 2 and 3 reopening and node 1's
   first open are each refused. Red with the counter created whenever partition 1 is still to
   form, and (node 1) with the "no other partition rooted" clause cut.
+- `s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`: an open that may create the
+  counter reads it present, loses its CAS once or three times, and the counter is deleted
+  before its retry; it is refused `Absent` and writes nothing. Intact-counter retries and a
+  first creation still count. Red with `count_open` keeping `fresh` across a read that found
+  the counter.
 - `s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry` (applied and
   unapplied) and `s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing`.
 - `s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record`.

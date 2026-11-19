@@ -973,8 +973,9 @@ enum PartitionState {
 /// the store over as a one-folder database, after which the declaration is refused
 /// (ADR-rdb-0022, Decision 2).
 const RERUN_FORM: &str = "run the command that formed it again: rdb_node --form (what lr up runs) \
-                          with the same --dir, --control and --partitions, or, for a declared \
-                          database, rdb_node --declare with the same --control and --partitions";
+                          with the same --dir, --control and --partitions, or, if it was \
+                          declared or a declaration of it stopped, that rdb_node --declare again \
+                          with the same --control, --nodes and --partitions";
 
 /// How partition 1 to `count` each stand, in that order, from one `list` of `partitions/` (issue
 /// #79). A failed or truncated list is never read as a complete one.
@@ -1697,12 +1698,14 @@ impl Db {
         }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
-            // The counter is created only by the database's first open: a fresh one, or a
-            // declared node process (#80 S1a) while nothing of the database is formed yet:
-            // partition 1 untouched, no copy here holding data, and no other partition rooted.
-            // Every open counts before it roots anything, so any of those means an earlier open
-            // counted, and an absent counter was lost (PR #138 review r3). Any later open,
-            // declared or not, refuses it rather than count N = 1 again.
+            // This open may create the counter when it is fresh, or when it is a declared node
+            // process (#80 S1a) that finds, now, partition 1 untouched, no copy here holding
+            // data, and every other partition still to form. Otherwise an absent counter is
+            // refused, not counted N = 1 again. Every open counts before it roots anything, so a
+            // rooted partition or a copy holding data proves an earlier open counted and its
+            // counter was lost (PR #138 review r3). The checks read the current state only: an
+            // earlier open that counted and stopped before writing anything leaves them all true.
+            // `count_open` also stops creating once it has read the counter present (r4).
             None => admin::count_open(
                 &*store,
                 &found.instance,
@@ -1921,11 +1924,11 @@ impl Db {
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
         // A node process's empty copy (wiped, or created above) joins a formed database it is a
         // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
-        // it (ruling A-R328). It never forms one, with one exception (#80 S1a): a declared
-        // database whose partition 1 is still untouched. Every node process of it whose copies
-        // hold no data binds the declared instance here (below); each owner then forms its own
-        // partitions, partition 1's owner partition 1 (the owner filter in `open_spawning`).
-        // It creates the open counter only while nothing of the database is formed yet.
+        // it (ruling A-R328). It binds without one with one exception (#80 S1a, this branch): a
+        // declared database whose partition 1 is still untouched. Every node process of it
+        // whose copies hold no data binds the declared instance here (below). Forming is not
+        // limited to this branch: each declared owner forms its own untouched partitions
+        // through the owner filter in `open_spawning`, after partition 1 is rooted too.
         let first_unformed = match declared {
             Some(_) => matches!(
                 partition_states(store, PARTITION.0).await?.pop(),
