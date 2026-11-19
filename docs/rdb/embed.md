@@ -464,11 +464,13 @@ SBX today.
 
 **Where SBX is today** (SBX master `287f4ee`, checked 2026-11-19, on the register, container
 create and snapshot upload paths): **none of them registers or checks an rDB owner token**, and
-a search of SBX's crates for `owner_token`, `OwnerToken` and `fence` found no token fence
-anywhere else. So none of this fence is in place for SBX yet, on one machine or across machines.
+a search of SBX's crates for `owner_token`, `OwnerToken` and `fence` found no owner-token fence
+anywhere else. (It does find `complete_fenced` in `operation_manager.rs`, which checks an
+operation lease token: a lease fence, not an owner fence.) So none of this fence is in place for
+SBX yet, on one machine or across machines.
 - Per-sandbox serialization is in-memory state in one gateway process, and on the sandbox create
-  path it is not held across container creation. (The per-parent ops lock is held across the
-  ops-sibling create.)
+  path it is not held across container creation. (The per-parent lock `ops_locks` is held
+  across the ops-sibling create, `ensure_ops_container` in `docker.rs`.)
 - Durable state is one SQLite file per gateway. Its OS advisory lock stops only a second gateway
   on the same host and file.
 - The cross-host coordination found is S3 conditional-create locks for repository-wide backup
