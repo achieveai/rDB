@@ -1924,11 +1924,11 @@ impl Db {
         let holds_data = engines.values().any(|engine| !engine.lineages().is_empty());
         // A node process's empty copy (wiped, or created above) joins a formed database it is a
         // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
-        // it (ruling A-R328). It binds without one with one exception (#80 S1a, this branch): a
-        // declared database whose partition 1 is still untouched. Every node process of it
-        // whose copies hold no data binds the declared instance here (below). Forming is not
-        // limited to this branch: each declared owner forms its own untouched partitions
-        // through the owner filter in `open_spawning`, after partition 1 is rooted too.
+        // it (ruling A-R328). This branch binds one before it is formed in one case only (#80
+        // S1a): a declared database whose partition 1 is still untouched. Every node process of
+        // it whose copies hold no data binds the declared instance here (below). That condition
+        // is this branch's alone: each declared owner forms its own untouched partitions through
+        // the owner filter in `open_spawning`, after partition 1 is rooted too.
         let first_unformed = match declared {
             Some(_) => matches!(
                 partition_states(store, PARTITION.0).await?.pop(),
