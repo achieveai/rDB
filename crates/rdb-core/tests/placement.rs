@@ -885,11 +885,15 @@ fn s1b_ring_placement_at_three_nodes_is_todays_placement() {
 }
 
 /// #80 S1b row 2: for every node count 3 to 8 and every count of `S1B_COUNTS`, each partition
-/// gets three distinct copies on declared nodes with its primary among them, primaries differ
+/// `p` is where the ring formula puts it, written out here, not called: primary
+/// `(p - 1) % K + 1`, copies that node and the next two round the ring. So a shifted ring at
+/// any K is red, not only K = 3 (PR #144 review). Each gets three distinct copies on declared
+/// nodes with its primary among them, primaries differ
 /// by at most one per node, and copies by at most three (ruling 3: uneven, not rebalanced).
 /// K = 5, P = 64 gives primaries 13, 13, 13, 13, 12. The planner, given the result with a
 /// machine per node, finds no machine rule to repair. Unit.
 /// Cut: copies `{nodes[first], nodes[first + 1], nodes[first + 1]}`; two copies on one node, red.
+/// Cut: a ring offset of `p % K` for K above 5 only; partition 1 at K = 6 has primary 2, red.
 #[retcd_test]
 fn s1b_ring_placement_places_three_distinct_nodes_and_balances_primaries() {
     for k in 3..=8u32 {
@@ -899,6 +903,15 @@ fn s1b_ring_placement_places_three_distinct_nodes_and_balances_primaries() {
                 .map(|p| rdb_core::placement::initial(&nodes, p))
                 .collect();
             for placed in &partitions {
+                let owner = (placed.id - 1) % k + 1;
+                let mut ring_copies = vec![owner, owner % k + 1, (owner + 1) % k + 1];
+                ring_copies.sort_unstable();
+                assert_eq!(
+                    *placed,
+                    part(placed.id, &ring_copies, owner),
+                    "k={k} p={}",
+                    placed.id
+                );
                 let distinct: BTreeSet<u32> = placed.copies.iter().copied().collect();
                 assert_eq!(distinct.len(), 3, "k={k} p={}: {placed:?}", placed.id);
                 assert!(distinct.iter().all(|n| nodes.contains(n)), "{placed:?}");

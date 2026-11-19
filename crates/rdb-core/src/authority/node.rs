@@ -15,6 +15,8 @@
 //! purpose, as [`crate::authority::partition`]'s codec is: a layout of one record family, not a
 //! seam between teams.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use bytes::Bytes;
 
 use crate::contracts::ids::NodeId;
@@ -60,17 +62,78 @@ const fn machine_char(c: char) -> bool {
     matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | ':' | '-')
 }
 
-/// The host part of a `host:port` address, brackets of an IPv6 host removed, or `None` when
-/// `addr` has no port that parses as a u16 or an empty host.
+/// The host of a declared address, in the form two nodes are compared in (#80 S1b ruling 1):
+/// one machine is one host however its address is spelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Host {
+    /// An IP address, canonical: an IPv4-mapped IPv6 address is the IPv4 address, so `::1` and
+    /// `0:0:0:0:0:0:0:1` are one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`.
+    Ip(IpAddr),
+    /// A host name, lowercase, without a trailing dot. Two names are one host only when they
+    /// are equal so: a name and an IP of the same machine are not caught.
+    Name(String),
+}
+
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => write!(f, "{ip}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
+
+/// The host of `addr`, a `host:port` a node is declared at, or why it is not one a peer can
+/// dial: no `:port`, a port that is not 1 to 65535 (0 is refused, since no peer can dial it and
+/// a record is never rewritten), an empty host, a bracketed host that is not an IPv6 address,
+/// or an IPv6 address without brackets.
+///
+/// # Errors
+///
+/// The reason, as text that names `addr`.
+pub fn parse_addr(addr: &str) -> Result<Host, String> {
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(format!("address {addr:?} is not host:port"));
+    };
+    match port.parse::<u16>() {
+        Ok(0) => {
+            return Err(format!(
+                "address {addr:?} has port 0, which no peer can dial; a node record is never \
+                 rewritten, so give the port it will listen on"
+            ))
+        }
+        Ok(_) => {}
+        Err(_) => return Err(format!("address {addr:?} has no port of 1 to 65535")),
+    }
+    if host.is_empty() {
+        return Err(format!("address {addr:?} has no host"));
+    }
+    if let Some(inner) = host.strip_prefix('[') {
+        let ip = inner
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .ok_or_else(|| format!("address {addr:?}: a bracketed host must be an IPv6 address"))?;
+        return Ok(Host::Ip(ip.to_canonical()));
+    }
+    if host.contains(':') {
+        return Err(format!(
+            "address {addr:?}: an IPv6 host is written in brackets, as [::1]:7100"
+        ));
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Ok(Host::Ip(IpAddr::V4(ip)));
+    }
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if name.is_empty() {
+        return Err(format!("address {addr:?} has no host"));
+    }
+    Ok(Host::Name(name))
+}
+
+/// [`parse_addr`]'s host, or `None` when it refuses `addr`.
 #[must_use]
-pub fn host_of(addr: &str) -> Option<&str> {
-    let (host, port) = addr.rsplit_once(':')?;
-    port.parse::<u16>().ok()?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    (!host.is_empty()).then_some(host)
+pub fn host_of(addr: &str) -> Option<Host> {
+    parse_addr(addr).ok()
 }
 
 impl NodeRecord {
@@ -125,7 +188,7 @@ fn field(body: &[u8]) -> Option<(&str, &[u8])> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_of, machine_refusal, NodeRecord};
+    use super::{host_of, machine_refusal, parse_addr, Host, NodeRecord};
     use crate::contracts::ids::NodeId;
 
     /// #80 S1b row 4: layout 1's bytes are pinned as a literal, since every later build reads
@@ -173,15 +236,39 @@ mod tests {
         }
     }
 
-    /// #80 S1b: the host part of an address, which `admin::declare` compares, and the machine
-    /// label set. Unit.
+    /// #80 S1b: the host of an address, which `admin::declare` compares, and the machine
+    /// label set. Two spellings of one IP are one host; a name is lowercased and loses a
+    /// trailing dot. Port 0, a bracketed host that is not IPv6 and an unbracketed IPv6 host are
+    /// refused, each with its reason (PR #144 review). Unit.
+    /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`.
     #[test]
     fn s1b_host_of_and_machine_labels() {
-        assert_eq!(host_of("127.0.0.2:7100"), Some("127.0.0.2"));
-        assert_eq!(host_of("[::1]:7100"), Some("::1"));
-        assert_eq!(host_of("db-a.example:1"), Some("db-a.example"));
-        for bad in ["127.0.0.2", "127.0.0.2:x", ":7100", "127.0.0.2:70000"] {
-            assert_eq!(host_of(bad), None, "{bad}");
+        let ip = |text: &str| Some(Host::Ip(text.parse().expect("an IP")));
+        assert_eq!(host_of("127.0.0.2:7100"), ip("127.0.0.2"));
+        assert_eq!(host_of("[::1]:7100"), ip("::1"));
+        assert_eq!(host_of("[0:0:0:0:0:0:0:1]:7100"), ip("::1"));
+        assert_eq!(host_of("[::ffff:127.0.0.1]:7100"), ip("127.0.0.1"));
+        assert_eq!(
+            host_of("DB-A.example.:1"),
+            Some(Host::Name("db-a.example".to_owned()))
+        );
+        for (bad, why) in [
+            ("127.0.0.2", "not host:port"),
+            ("127.0.0.2:x", "no port"),
+            (":7100", "no host"),
+            ("127.0.0.2:70000", "no port"),
+            ("127.0.0.2:0", "port 0"),
+            ("[::gg]:7100", "must be an IPv6 address"),
+            ("[127.0.0.1]:7100", "must be an IPv6 address"),
+            ("[::1:7100", "must be an IPv6 address"),
+            ("::1:7100", "in brackets"),
+            (".:7100", "no host"),
+        ] {
+            let refused = parse_addr(bad).expect_err(bad);
+            assert!(
+                refused.contains(why) && refused.contains(bad),
+                "{bad}: {refused}"
+            );
         }
         assert_eq!(machine_refusal("host-a.rack_1:x"), None);
         for bad in ["", "HostA", "a b", &"m".repeat(64)] {

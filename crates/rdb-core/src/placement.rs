@@ -1,8 +1,12 @@
-//! The placement planner (M11, V9 Form line): **model only**.
+//! Placement: where a declared database first puts each partition, and the planner.
 //!
-//! A pure function from an [`Inventory`] (nodes and where each partition's copies and primary
-//! sit) and a move budget to an ordered list of [`Step`]s and the [`Residual`]s it could not
-//! clear. It reads no clock, opens no file and talks to no cluster; the same input gives the same
+//! [`initial`] is applied (#80 S1b, ADR-rdb-0023): the ring over the declared nodes that every
+//! writer of a generation-0 partition record places by. Everything else here is the placement
+//! planner (M11, V9 Form line), which is **model only**.
+//!
+//! [`plan`] is a pure function from an [`Inventory`] (nodes and where each partition's copies
+//! and primary sit) and a move budget to an ordered list of [`Step`]s and the [`Residual`]s it
+//! could not clear. It reads no clock, opens no file and talks to no cluster; the same input gives the same
 //! plan, byte for byte. `rdb_dev admin plan <file>` reads the inventory from a JSON file and
 //! prints the plan. Nothing applies it: the operator runs each line by hand.
 //!

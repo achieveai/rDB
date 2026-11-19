@@ -32,7 +32,7 @@ use config_core::{
 };
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
-use rdb_core::authority::node::{host_of, machine_refusal, NodeRecord, MAX_ADDR_LEN};
+use rdb_core::authority::node::{host_of, machine_refusal, parse_addr, NodeRecord, MAX_ADDR_LEN};
 use rdb_core::authority::partition::{
     prior_of, PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
@@ -613,12 +613,7 @@ impl Declaration {
         let mut records: Vec<NodeRecord> = Vec::with_capacity(self.nodes.len());
         for decl in &self.nodes {
             let n = decl.node.0;
-            let Some(host) = host_of(&decl.addr) else {
-                return Err(format!(
-                    "node {n} address {:?} is not host:port with a port of 0 to 65535",
-                    decl.addr
-                ));
-            };
+            let host = parse_addr(&decl.addr).map_err(|why| format!("node {n}: {why}"))?;
             if decl.addr.len() > MAX_ADDR_LEN {
                 return Err(format!(
                     "node {n} address {:?} is longer than {MAX_ADDR_LEN} bytes",
@@ -631,7 +626,11 @@ impl Declaration {
                     other.node.0, decl.addr
                 ));
             }
-            let machine = decl.machine.as_deref().unwrap_or(host).to_ascii_lowercase();
+            let machine = decl
+                .machine
+                .clone()
+                .unwrap_or_else(|| host.to_string())
+                .to_ascii_lowercase();
             if let Some(why) = machine_refusal(&machine) {
                 return Err(format!(
                     "node {n}: {why}{}",
@@ -722,16 +721,16 @@ impl Declaration {
 /// Why `records` put two nodes on one machine (#80 S1b, ruling 1), or `None`: two nodes whose
 /// machine labels are equal, or whose addresses have the same host, whatever their labels say.
 /// So `127.0.0.1` and `127.0.0.2` are two hosts, and two ports of one address are one. Labels
-/// are compared as written, lowercase ([`Declaration::records`] lowercases them); hosts are
-/// compared ignoring ASCII case.
+/// are compared as written, lowercase ([`Declaration::records`] lowercases them). Hosts are
+/// compared as [`host_of`] parses them: an IP by value, so `[::1]` and `[0:0:0:0:0:0:0:1]` are
+/// one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`; a name lowercase and without a trailing
+/// dot. A name and an IP of one machine are not caught; only the labels can say so.
 #[must_use]
 pub fn machine_clash(records: &[NodeRecord]) -> Option<String> {
     for (at, a) in records.iter().enumerate() {
         for b in &records[at + 1..] {
-            let (host_a, host_b) = (host_of(&a.addr), host_of(&b.addr));
-            if host_a.is_some()
-                && host_a.map(str::to_ascii_lowercase) == host_b.map(str::to_ascii_lowercase)
-            {
+            let host_a = host_of(&a.addr);
+            if host_a.is_some() && host_a == host_of(&b.addr) {
                 return Some(format!(
                     "nodes {} ({}) and {} ({}) are on one machine: their addresses have the same \
                      host, and a database runs one data node per machine",
@@ -1159,14 +1158,7 @@ async fn reserve(
                 "declare_reservation_refused"
             );
             let Some(held_records) = held.records else {
-                return Err(DeclareError::Refused(format!(
-                    "{key} reserves the store for a declaration of {} partitions and nodes {:?} \
-                     by a build before #80 S1b, which wrote no node addresses: declare the \
-                     database again, with --peers, on a new empty control store; nothing was \
-                     written",
-                    held.partitions,
-                    held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
-                )));
+                return Err(s1a_reservation_refused(&key, &held));
             };
             Err(DeclareError::Refused(format!(
                 "{key} reserves the store for a declaration of {} partitions and nodes {}, and \
@@ -1180,6 +1172,18 @@ async fn reserve(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// The refusal of a store an S1a build reserved (#80 S1b ruling 4): its reservation, layout 1,
+/// names no node addresses, so the database is declared again on a new store.
+fn s1a_reservation_refused(key: &str, held: &Reservation) -> DeclareError {
+    DeclareError::Refused(format!(
+        "{key} reserves the store for a declaration of {} partitions and nodes {:?} by a build \
+         before #80 S1b, which wrote no node addresses: declare the database again, with \
+         --peers, on a new empty control store; nothing was written",
+        held.partitions,
+        held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+    ))
 }
 
 /// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
@@ -1205,6 +1209,27 @@ async fn declare_preflight(
              this declaration cannot adopt; nothing was written"
         ))
     };
+    // #80 S1b ruling 4, PR #144 review: an S1a build's reservation first, so a store it left
+    // half-written is refused with what to do, not by whichever of its records differs. A
+    // layout-2 reservation is [`reserve`]'s to judge.
+    let key = ControlKey::Operation(RESERVATION_OPERATION).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
+    if let Some(found) = read.record {
+        let held = Declaration::decode_reservation(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        if held.records.is_none() {
+            tracing::info!(key = %key, reserved = held.partitions, "declare_reservation_refused");
+            return Err(s1a_reservation_refused(&key, &held));
+        }
+    }
     // #80 S1b: every `nodes/` record already there must be one this declaration writes, byte
     // for byte. Read before `partitions/`, which stays the preflight's last read.
     for (node, held) in read_nodes(store).await? {
@@ -2799,12 +2824,7 @@ async fn judge_and_clear(
     store: &dyn ConfigStore,
     node: NodeId,
 ) -> Result<Clearance, ApiError> {
-    let boot = db.boot_of(node).ok_or_else(|| {
-        ApiError::invalid(format!(
-            "node {}: no such node; this Db runs nodes 1, 2 and 3",
-            node.0
-        ))
-    })?;
+    let boot = db.boot_of(node).ok_or_else(|| db.no_such_node(node))?;
     let budgets = db.budgets().ok_or_else(|| {
         ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
     })?;
@@ -5414,6 +5434,39 @@ mod tests {
         for (what, body) in malformed(&formation_bytes, 1 + INSTANCE_LEN) {
             assert_eq!(Formation::decode(&body), None, "formation: {what}");
         }
+        // #80 S1b, PR #144 review: placement runs over the node list, so a list no declaration
+        // writes does not decode; 3 to 8 nodes numbered 1 to K do.
+        let with_nodes = |nodes: &[u32]| {
+            let mut body = formation_bytes[..=INSTANCE_LEN + 4].to_vec();
+            for node in nodes {
+                body.extend_from_slice(&node.to_le_bytes());
+            }
+            body
+        };
+        for (what, nodes) in [
+            ("no node", &[][..]),
+            ("two nodes", &[1, 2][..]),
+            ("nine nodes", &[1, 2, 3, 4, 5, 6, 7, 8, 9][..]),
+            ("a gap", &[1, 2, 4][..]),
+            ("a node twice", &[1, 2, 2][..]),
+            ("out of order", &[1, 3, 2][..]),
+            ("from node 0", &[0, 1, 2][..]),
+            ("not from node 1", &[2, 3, 4][..]),
+        ] {
+            assert_eq!(
+                Formation::decode(&with_nodes(nodes)),
+                None,
+                "formation: {what}"
+            );
+        }
+        for k in 3..=8u32 {
+            let nodes: Vec<u32> = (1..=k).collect();
+            assert_eq!(
+                Formation::decode(&with_nodes(&nodes)).map(|found| found.nodes.len()),
+                Some(k as usize),
+                "formation: {k} nodes"
+            );
+        }
         for (what, body) in malformed(&reservation_bytes, 1) {
             assert_eq!(
                 Declaration::decode_reservation(&body),
@@ -5633,7 +5686,8 @@ mod tests {
         let mut count_past = pinned.clone();
         count_past[5] = 4;
         let mut bad_machine = pinned.clone();
-        bad_machine[5 + 5 + 13 + 1] = b'M';
+        // Header 6 bytes, then node 1: id 4, address length 1, address 13, machine length 1.
+        bad_machine[6 + 4 + 1 + 13 + 1] = b'M';
         for (what, body) in [
             ("a body cut short", pinned[..pinned.len() - 1].to_vec()),
             ("a trailing byte", trailing),

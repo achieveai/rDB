@@ -209,7 +209,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     let n: u32 = n
                         .parse()
                         .map_err(|_| format!("--peers: {n:?} is not a node number"))?;
-                    args.peers.insert(NodeId(n), addr.to_owned());
+                    if let Some(first) = args.peers.insert(NodeId(n), addr.to_owned()) {
+                        return Err(format!(
+                            "--peers names node {n} twice, as {first} and {addr}; name each \
+                             node once"
+                        ));
+                    }
                 }
             }
             "--control" => {
@@ -291,7 +296,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     let n: u32 = n
                         .parse()
                         .map_err(|_| format!("--machines: {n:?} is not a node number"))?;
-                    args.machines.insert(NodeId(n), label.to_owned());
+                    if let Some(first) = args.machines.insert(NodeId(n), label.to_owned()) {
+                        return Err(format!(
+                            "--machines names node {n} twice, as {first} and {label}; name each \
+                             node once"
+                        ));
+                    }
                 }
             }
             "-h" | "--help" => return Err(String::new()),
@@ -848,15 +858,19 @@ fn serve_on(
     rt: &tokio::runtime::Runtime,
     store: Arc<dyn ConfigStore>,
 ) -> Result<(), String> {
-    serve_on_ready(args, rt, store, &|_| {})
+    serve_on_ready(args, rt, store, None, &|_| {})
 }
 
 /// [`serve_on`], calling `on_ready` with the node each time it prints its `ready` line, so a
-/// row can wait for every node of a database to be ready (#80 S1b).
+/// row can wait for every node of a database to be ready (#80 S1b). Given `bound`, a listener
+/// already bound to `--listen`, the node listens on it instead of binding `--listen` itself, so
+/// a row that picked the port never releases it for another process to take (PR #144 review).
+/// A `bound` on another address is refused before anything is written.
 fn serve_on_ready(
     args: &Args,
     rt: &tokio::runtime::Runtime,
     store: Arc<dyn ConfigStore>,
+    bound: Option<tokio::net::TcpListener>,
     on_ready: &(dyn Fn(NodeId) + Sync),
 ) -> Result<(), String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
@@ -871,13 +885,26 @@ fn serve_on_ready(
     }
     // #80 S1b: before the boot is written or anything is bound.
     start_check_on(args, node, &listen, &*store, rt)?;
+    if let Some(bound) = &bound {
+        let at = bound
+            .local_addr()
+            .map_err(|e| format!("--listen {listen}: the listener given: {e}"))?;
+        if at.to_string() != listen {
+            return Err(format!(
+                "--listen {listen}: the listener given is bound to {at}; nothing was started"
+            ));
+        }
+    }
     let store: Arc<dyn ConfigStore> = CutStore::new(store, Arc::clone(&faults));
     let boot = next_boot(&dir).map_err(|e| format!("boot: {}: {e}", dir.display()))?;
     let label = Label::Node(node);
     let tls = certs::load(&cert_dir, &label)?;
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind(&listen))
-        .map_err(|e| format!("--listen {listen}: {e}"))?;
+    let listener = match bound {
+        Some(bound) => bound,
+        None => rt
+            .block_on(tokio::net::TcpListener::bind(&listen))
+            .map_err(|e| format!("--listen {listen}: {e}"))?,
+    };
     let links = Links::with_clock_offset(args.clock_offset_ms);
     if let Some(file) = args.clock_step_file.clone() {
         watch_clock_step(file, Arc::clone(&links));
@@ -1100,10 +1127,14 @@ mod tests {
     /// read back from the store, `N@addr/machine`, a node with no label taking its host. Run
     /// again it says `already`. While parsing it refuses no `--peers`, a `--nodes` that counts
     /// otherwise, and a `--machines` node `--peers` does not name; `--machines` without
-    /// `--declare` is refused too. And two nodes on one machine reach `admin::declare`'s
-    /// refusal with nothing written. Unit (<100 ms, an in-memory store). This replaces the S1a
+    /// `--declare` is refused too, and so is a node `--peers` or `--machines` names twice,
+    /// within one flag or across two, rather than the later entry silently winning (PR #144
+    /// review). And two nodes on one machine reach `admin::declare`'s refusal with nothing
+    /// written. Unit (<100 ms, an in-memory store). This replaces the S1a
     /// row that declared `--nodes 4` to reach a refusal: four nodes are now legal (row 6).
     /// Cut: `declare_on` ignores `--machines`; node 4's label is its host, red at the line.
+    /// Cut: the parser's `insert` overwrites a repeated node; the four twice-named cases parse,
+    /// red at the first.
     #[config_log::retcd_test]
     fn s1b_declare_takes_peers_and_machines_and_prints_the_records() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1123,6 +1154,34 @@ mod tests {
             (
                 &["--node", "1", "--machines", "1=m1"][..],
                 "--machines is read only by --declare",
+            ),
+            (
+                &[
+                    "--declare",
+                    "--peers",
+                    "1=127.0.0.1:7100,2=127.0.0.2:7100,2=127.0.0.3:7100",
+                ][..],
+                "--peers names node 2 twice, as 127.0.0.2:7100 and 127.0.0.3:7100",
+            ),
+            (
+                &["--declare", "--peers", PEERS, "--peers", "3=127.0.0.9:7100"][..],
+                "--peers names node 3 twice",
+            ),
+            (
+                &["--declare", "--peers", PEERS, "--machines", "1=a,1=b"][..],
+                "--machines names node 1 twice, as a and b",
+            ),
+            (
+                &[
+                    "--declare",
+                    "--peers",
+                    PEERS,
+                    "--machines",
+                    "1=a",
+                    "--machines",
+                    "1=a",
+                ][..],
+                "--machines names node 1 twice",
             ),
         ] {
             assert!(
@@ -1265,7 +1324,9 @@ mod tests {
     /// `_untagged-<pid>.jsonl`.
     /// Cut: `machine_clash` compares only a host's first three characters, so every loopback
     /// address is one machine; the declaration is refused, red. Cut: `serve_on_ready` never
-    /// calls `on_ready`; red at "every node is ready" after the 30 s bound.
+    /// calls `on_ready`; red at "every node is ready" after the 30 s bound. Cut: `serve_on_ready`
+    /// drops the listener it is handed and binds `--listen` again; the row's second handle
+    /// holds each port, so every node ends `Address already in use`, red after the 30 s bound.
     #[config_log::retcd_test]
     fn s1b_four_declared_node_processes_run_on_one_machine() {
         const K: u32 = 4;
@@ -1280,11 +1341,22 @@ mod tests {
             .map(|n| rdb_api::net::wire::Label::Node(rdb_api::NodeId(n)))
             .collect();
         rdb_api::net::certs::generate(&certs, &labels).expect("certificates");
+        // Each port stays bound from its pick to its node's start, which listens on the very
+        // socket (PR #144 review). The row keeps a second handle on each socket throughout, so
+        // a start that dropped the listener and bound `--listen` again fails `AddrInUse`.
+        let mut handed: Vec<Option<tokio::net::TcpListener>> = Vec::new();
+        let mut kept: Vec<std::net::TcpListener> = Vec::new();
         let addrs: Vec<String> = (1..=K)
             .map(|n| {
                 let host = std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(n).expect("small"));
-                let (held, addr) = rt.block_on(config_testkit::ports::ephemeral_listener_on(host));
-                drop(held);
+                let (listener, addr) =
+                    rt.block_on(config_testkit::ports::ephemeral_listener_on(host));
+                let std = listener.into_std().expect("a std listener");
+                kept.push(std.try_clone().expect("a second handle"));
+                let _entered = rt.enter();
+                handed.push(Some(
+                    tokio::net::TcpListener::from_std(std).expect("a tokio listener"),
+                ));
                 addr.to_string()
             })
             .collect();
@@ -1335,7 +1407,8 @@ mod tests {
                     .expect("parses");
                     let store = Arc::clone(&store);
                     let (rt, on_ready) = (&rt, &on_ready);
-                    scope.spawn(move || serve_on_ready(&args, rt, store, on_ready))
+                    let bound = handed[n as usize - 1].take();
+                    scope.spawn(move || serve_on_ready(&args, rt, store, bound, on_ready))
                 })
                 .collect();
             let rooted = |p: u32| {
@@ -1375,6 +1448,7 @@ mod tests {
             );
             ended
         });
+        drop(kept);
         for (n, outcome) in (1..=K).zip(ended) {
             assert_eq!(outcome, Ok(()), "node {n} ends cleanly");
             let held: Vec<String> = std::fs::read_dir(dirs[n as usize - 1].join("nodes"))

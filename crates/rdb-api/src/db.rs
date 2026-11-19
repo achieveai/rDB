@@ -4280,6 +4280,12 @@ impl Db {
         self.opened.base_boot
     }
 
+    /// [`no_such_node`] for `node`, naming the nodes this `Db` runs.
+    pub(crate) fn no_such_node(&self, node: NodeId) -> ApiError {
+        let runs: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        no_such_node(node, &runs)
+    }
+
     /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
     /// a restart that failed, the boot that restart gave it: no process runs it, and the old
     /// boot is retired either way (F-013).
@@ -4860,12 +4866,11 @@ impl Db {
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
         let mut nodes = lock(&self.nodes);
-        let Some(handle) = nodes.iter_mut().find(|handle| handle.node == node) else {
-            return Err(ApiError::invalid(format!(
-                "node {}: no such node; this Db runs nodes 1, 2 and 3",
-                node.0
-            )));
+        let Some(at) = nodes.iter().position(|handle| handle.node == node) else {
+            let runs: Vec<NodeId> = nodes.iter().map(|handle| handle.node).collect();
+            return Err(no_such_node(node, &runs));
         };
+        let handle = &mut nodes[at];
         let old_boot = handle.boot;
         if let Some(aside) = aside.as_ref().filter(|aside| aside.boot != old_boot) {
             tracing::warn!(
@@ -6092,9 +6097,6 @@ fn roll_forward_copies(
     Ok(copies)
 }
 
-/// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and,
-/// when the store was not reachable, the rEtcd step the open's other `get` reads add
-/// (`partition_states`' `list` does not add it).
 /// #80 S1b (ADR-rdb-0023 Decisions 4 and 5): what a node process of a declared database must
 /// be before it opens, checked before this open creates `nodes/` or reads anything else. One
 /// process runs one declared node: a process is certainly one machine, so two local nodes would
@@ -6145,7 +6147,9 @@ async fn declared_open_refusal(
     // Ruling 2: the embedded node is held to its records as `rdb_node` is.
     let Some(addresses) = addresses else {
         return Err(OpenError::Config(format!(
-            "node {} of a declared database opened with no DbConfig::addresses: a declared node              says where it listens and where each peer does, and they are checked against the              nodes/ records; nothing was created",
+            "node {} of a declared database opened with no DbConfig::addresses: a declared node \
+             says where it listens and where each peer does, and they are checked against the \
+             nodes/ records; nothing was created",
             node.0
         )));
     };
@@ -6161,6 +6165,19 @@ async fn declared_open_refusal(
     Ok(())
 }
 
+/// The refusal of a call naming `node`, which this `Db` does not run: `runs` are the nodes it
+/// does, which since #80 S1b need not be 1, 2 and 3 (one declared node, say).
+pub(crate) fn no_such_node(node: NodeId, runs: &[NodeId]) -> ApiError {
+    ApiError::invalid(format!(
+        "node {}: no such node; this Db runs nodes {:?}",
+        node.0,
+        runs.iter().map(|node| node.0).collect::<Vec<_>>()
+    ))
+}
+
+/// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and,
+/// when the store was not reachable, the rEtcd step the open's other `get` reads add
+/// (`partition_states`' `list` does not add it).
 fn formation_refused(error: admin::DeclareError) -> OpenError {
     match error {
         admin::DeclareError::Undecodable { key } => {

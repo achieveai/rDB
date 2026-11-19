@@ -1965,9 +1965,10 @@ fn s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry(
         let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
         let mut before = snapshot(&rt, &*store);
         for attempt in 1..=2 {
-            // The formation record and `routes/0` reads pass; the read after the put fails.
+            // The formation record, reservation (#80 S1b preflight, PR #144 review) and
+            // `routes/0` reads pass; the read after the put fails.
             scripted.rescript(Script {
-                pass_gets: 2,
+                pass_gets: 3,
                 fail_gets: 1,
                 lose_put_replies: u32::from(applied),
                 drop_puts: u32::from(!applied),
@@ -2574,10 +2575,36 @@ const S1B_P: u32 = 16;
 /// node 1, not node 4, red at the route.
 #[config_log::retcd_test]
 fn s1b_five_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
-    let mut rig = declared_rig_of(S1B_K, S1B_P);
+    forms_each_from_its_own_folder(S1B_K);
+}
+
+/// #80 S1b, PR #144 review: row 11 at six, seven and eight nodes, the most a declaration takes,
+/// each node process on its own folder and its own host (127.0.0.1 to 127.0.0.K). Integration
+/// (~1 s each). Cut: `admin::placed` and `admin::owner_in` ring over the first five declared
+/// nodes only; partition 6's route names node 1, not node 6, red at 6, 7 and 8 (row 11 green).
+#[config_log::retcd_test]
+fn s1b_six_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(6);
+}
+
+/// Row 11 at seven nodes; see the six-node row.
+#[config_log::retcd_test]
+fn s1b_seven_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(7);
+}
+
+/// Row 11 at eight nodes, `db::MAX_NODES`; see the six-node row.
+#[config_log::retcd_test]
+fn s1b_eight_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(8);
+}
+
+/// Row 11's body over `k` declared nodes and [`S1B_P`] partitions.
+fn forms_each_from_its_own_folder(k: u32) {
+    let mut rig = declared_rig_of(k, S1B_P);
     rig.wait_ready();
     for partition in 1..=S1B_P {
-        let owner = NodeId(ring(S1B_K, partition).primary);
+        let owner = NodeId(ring(k, partition).primary);
         let db = rig.of(owner);
         let group = group_of(db, partition);
         let route = db.route(group).expect("a route");
@@ -2605,7 +2632,7 @@ fn s1b_five_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
             proc.node.0
         );
         let placed: BTreeSet<u32> = (1..=S1B_P)
-            .filter(|p| ring(S1B_K, *p).copies.contains(&proc.node.0))
+            .filter(|p| ring(k, *p).copies.contains(&proc.node.0))
             .collect();
         assert!(!placed.is_empty(), "node {} is placed", proc.node.0);
         assert!(placed.len() < S1B_P as usize, "node {}", proc.node.0);
@@ -2861,6 +2888,89 @@ fn s1b_declare_refuses_two_nodes_on_one_machine_and_writes_nothing() {
         ),
         "127.0.0.1, .2 and .3 are three machines"
     );
+}
+
+/// #80 S1b, PR #144 review: two spellings of one IP are one host, so their nodes are refused
+/// as on one machine, with default labels and with distinct explicit ones, and nothing is
+/// written: `[::1]` and `[0:0:0:0:0:0:0:1]`, and `127.0.0.1` and `[::ffff:127.0.0.1]`. A host
+/// name differing only in case or a trailing dot is one host too. Unit (<100 ms).
+/// Cut: `machine_clash` compares the address text, lowercase; every IP case declares, red at
+/// the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
+    let rt = runtime();
+    let pair = |a: &str, b: &str, labels: Option<[&str; 2]>| {
+        let mut declared = with_node(1, a, labels.map(|l| l[0]));
+        declared.nodes[1].addr = b.to_owned();
+        declared.nodes[1].machine = labels.map(|l| l[1].to_owned());
+        declared
+    };
+    for labels in [None, Some(["a", "b"])] {
+        for (a, b) in [
+            ("[::1]:7100", "[0:0:0:0:0:0:0:1]:7100"),
+            ("[::1]:7100", "[0:0:0:0:0:0:0:1]:7101"),
+            ("127.0.0.1:7100", "[::ffff:127.0.0.1]:7101"),
+            ("DB-A.example:7100", "db-a.example.:7101"),
+        ] {
+            let what = format!("{a} and {b}, labels {labels:?}");
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let refused = rt.block_on(admin::declare(&store, &pair(a, b, labels)));
+            assert!(
+                matches!(&refused, Err(admin::DeclareError::Refused(text))
+                    if text.contains("the same host") && text.contains("nodes 1 (")
+                        && text.contains("nothing was written")),
+                "{what}: {refused:?}"
+            );
+            assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
+        }
+    }
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let declared = rt.block_on(admin::declare(
+        &store,
+        &pair("[::1]:7100", "[::2]:7100", None),
+    ));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(_))),
+        "::1 and ::2 are two hosts: {declared:?}"
+    );
+}
+
+/// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
+/// written, since a node record is never rewritten: port 0, and a bracketed host that is not
+/// an IPv6 address (`[::gg]`). The same store then takes the corrected addresses. Unit
+/// (<100 ms). Cut: `parse_addr` accepts port 0 and parses no bracketed host; both declare, red
+/// at the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
+    let rt = runtime();
+    for (bad, names, corrected) in [
+        (
+            "127.0.0.3:0",
+            "has port 0, which no peer can dial",
+            "127.0.0.3:7100",
+        ),
+        (
+            "[::gg]:7100",
+            "a bracketed host must be an IPv6 address",
+            "[::3]:7100",
+        ),
+    ] {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, None)));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains(bad) && text.contains(names)
+                    && text.contains("nothing was written")),
+            "{bad}: {refused:?}"
+        );
+        assert!(snapshot(&rt, &*store).is_empty(), "{bad}: nothing written");
+        let declared = rt.block_on(admin::declare(&store, &with_node(3, corrected, None)));
+        assert!(
+            matches!(&declared, Ok(admin::Declared::Created(formation))
+                if formation.nodes.len() == 3),
+            "{corrected} on the store {bad} left: {declared:?}"
+        );
+    }
 }
 
 /// #80 S1b row 6: the node sets and addresses a declaration refuses, each with nothing
@@ -3276,6 +3386,67 @@ fn s1b_a_declared_open_given_a_peer_address_that_disagrees_is_refused() {
 #[config_log::retcd_test]
 fn s1b_a_declared_open_with_no_addresses_is_refused() {
     refused_on_every_open(None, &["no DbConfig::addresses", "nothing was created"]);
+}
+
+/// #80 S1b ruling 4, PR #144 review: a store an S1a build began declaring and did not finish
+/// holds its layout-1 reservation (partitions and node numbers, no addresses), `routes/0` and
+/// partition records, and no formation or `nodes/` record. Declaring it again is refused with
+/// what to do, whatever the new declaration says: five nodes, whose partition 4 differs from
+/// the S1a record, and the same three nodes, whose records match it byte for byte so only the
+/// reservation can refuse it. Nothing is written. Unit (<100 ms).
+/// Cut: `declare_preflight` skips its reservation read; five nodes are refused at
+/// `partitions/4` without what to do, red at the text.
+#[config_log::retcd_test]
+fn s1b_a_half_written_s1a_declaration_is_refused_with_how_to_redeclare() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(formation)) =
+        rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    // What an S1a build left when it stopped before its formation record.
+    let mut gone: Vec<String> = (1..=3)
+        .map(|n| ControlKey::Node(NodeId(n)).encode())
+        .collect();
+    gone.push(ControlKey::Operation(admin::FORMATION_OPERATION).encode());
+    gone.push(admin::instance_key(&formation.instance));
+    for key in gone {
+        rt.block_on(store.delete(config_core::DeleteRequest {
+            key: Bytes::from(key),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("delete");
+    }
+    let mut layout_1 = vec![1];
+    layout_1.extend_from_slice(&PARTITIONS.to_le_bytes());
+    for n in 1..=3u32 {
+        layout_1.extend_from_slice(&n.to_le_bytes());
+    }
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Operation(admin::RESERVATION_OPERATION).encode()),
+        value: Bytes::from(layout_1),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("the S1a reservation");
+    let s1a = snapshot(&rt, &*store);
+    for (what, declared) in [
+        ("five nodes", declaration_of(5, PARTITIONS)),
+        ("the same three nodes", declaration()),
+    ] {
+        let refused = rt.block_on(admin::declare(&store, &declared));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("by a build before #80 S1b")
+                    && text.contains("declare the database again, with --peers, on a new empty \
+                                      control store")
+                    && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert_eq!(snapshot(&rt, &*store), s1a, "{what}: nothing was written");
+    }
 }
 
 /// #80 S1b ruling 4 (ADR-rdb-0023): a store an S1a build declared holds a formation record and

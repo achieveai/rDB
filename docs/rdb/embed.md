@@ -1192,7 +1192,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     to 8. It writes one `nodes/N` record per node: its address and its machine
     (ADR-rdb-0023). `--machines N=LABEL,...` names a node's machine; unset, the machine is
     the address's host. Two nodes on one machine are refused: the same label, or the same
-    host whatever the labels say. Then start each node process with its own empty `--dir`,
+    host whatever the labels say (two spellings of one IP, such as `[::1]` and
+    `[0:0:0:0:0:0:0:1]`, are one host). An address with port 0, or a bracketed host that is
+    not an IPv6 address, is refused. Then start each node process with its own empty `--dir`,
     `--listen` on its recorded address, and the same `--peers`. A node whose `--listen` or
     any `--peers` entry disagrees with the records is refused before it binds, naming the
     record. Partitions are placed round the ring: partition p's owner is node
@@ -1204,15 +1206,18 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - An embedded `Db` of a declared database runs exactly one node (`DbConfig::local` of one
     node); more is refused. It must set `DbConfig::addresses`: the address its listener is
     bound to, and every node's address as it was given them. The open compares them with the
-    `nodes/` records, on every open (first, retry and restart), before it creates anything,
-    and is refused naming the record that disagrees; `None` is refused too. `Db::open` binds
+    `nodes/` records, on every open (first, retry and restart). By then the open has created
+    its folder (`DbConfig::dir`); it creates nothing inside it and writes nothing to the store
+    before the check. It is refused naming the record that disagrees; `None` is refused too. `Db::open` binds
     nothing itself: your listener is already bound when you call it. To refuse before
     binding, as `rdb_node` does, call `admin::read_formation`, `admin::read_nodes` and
     `admin::node_start_refusal` first. A store declared by an earlier build (no `nodes/`
     records) is refused; declare again on a new store.
 
-  This has been run with up to five processes on 127.0.0.1 to .5 of one host: each loopback
-  address counts as its own machine. It has not been run on separate machines. A machine
+  This can be run with up to eight processes on 127.0.0.1 to .8 of one host: each loopback
+  address counts as its own machine. The tests run five to eight nodes this way in one
+  process, and four `rdb_node` start paths; five separate processes have not been run at
+  this commit. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
   Copies are uneven by up to 3 per node when K does not divide P. Still missing: TLS to
   rEtcd from `rdb_node`, and adding or removing a node. A node process started
