@@ -15,7 +15,7 @@
 //! purpose, as [`crate::authority::partition`]'s codec is: a layout of one record family, not a
 //! seam between teams.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bytes::Bytes;
 
