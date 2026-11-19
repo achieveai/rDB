@@ -1293,6 +1293,118 @@ fn s1a_a_whole_database_open_of_a_declared_store_is_refused() {
     assert_eq!(snapshot(&rt, &*store), declared, "nothing was written");
 }
 
+/// PR #138 review r6 (blocker): the declared refusal does not rest on `partitions/1`. An empty
+/// declared store with `partitions/1` and the counter both deleted by hand still holds its
+/// formation record, so a whole-database open is refused before anything is bound: it does
+/// not form a database of its own, or count N = 1 on a counter of its own. No `nodes/` is left
+/// and the store is unchanged. Unit (<1 s, an in-memory store).
+/// Cut: refuse only over an untouched `partitions/1` (b53bd7a's condition in `Db::check`); the
+/// open forms a fresh instance and creates its counter, red at `expect_err`.
+#[config_log::retcd_test]
+fn s1a_a_whole_open_of_a_declared_store_without_partitions_1_or_its_counter_is_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(formation)) =
+        rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    for key in [
+        ControlKey::Partition(PARTITION).encode(),
+        admin::instance_key(&formation.instance),
+    ] {
+        rt.block_on(store.delete(config_core::DeleteRequest {
+            key: Bytes::from(key.clone()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .unwrap_or_else(|error| panic!("{key} is deleted: {error}"));
+    }
+    let before = snapshot(&rt, &*store);
+    assert_eq!(
+        keys(&before),
+        declared_keys(PARTITIONS, &[], true)
+            .into_iter()
+            .filter(|key| *key != ControlKey::Partition(PARTITION).encode())
+            .collect::<Vec<_>>(),
+        "partitions/1 and the counter are gone"
+    );
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(Db::open_with(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|_| ())
+        .expect_err("a whole-database open does not form a declared database");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Config(_))
+            && text.contains(&admin::instance_hex(&formation.instance))
+            && text.contains("nothing was created"),
+        "{text}"
+    );
+    assert!(!has_copies(dir.path()), "nothing was bound");
+    assert_eq!(snapshot(&rt, &*store), before, "nothing was written");
+}
+
+/// PR #138 review r6 (sweep): a node process of a declared store does not read a missing record
+/// as one still to write. With `routes/0` deleted by hand, node 1 does not open the 8-partition
+/// declaration as a 1-partition database; with `partitions/2` deleted, it does not mark that
+/// partition as one to form from nothing: the declaration wrote every partition record. Each is
+/// refused, naming the formation record's count or the missing record: nothing is written and
+/// no `nodes/` is left. Unit (<1 s per case, one node process refused before it starts).
+/// Cut: drop the count comparison in `open_spawning` (case `routes/0`) or the `declared` guard
+/// on `PartitionState::Absent` in `check_others` (case `partitions/2`); node 1 opens, red.
+#[config_log::retcd_test]
+fn s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused() {
+    for gone in [
+        ControlKey::Route(RangeId(0)).encode(),
+        ControlKey::Partition(PartitionId(2)).encode(),
+    ] {
+        let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+        rig.declare_created();
+        rig.rt
+            .block_on(rig.store.delete(config_core::DeleteRequest {
+                key: Bytes::from(gone.clone()),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .unwrap_or_else(|error| panic!("{gone} is deleted: {error}"));
+        let before = snapshot(&rig.rt, &*rig.store);
+        assert!(!keys(&before).contains(&gone), "{gone} is gone");
+        let (dir, _keep) = folder();
+        let (listeners, addrs) = listeners(&rig.rt);
+        let opened = open_node(
+            &rig.rt,
+            &rig.store,
+            &rig.cert_dir,
+            NodeId(1),
+            &dir,
+            listeners.into_iter().next().expect("a listener"),
+            &addrs,
+        );
+        let Err(refused) = opened.map(|(mut db, _net)| db.shutdown()) else {
+            panic!("{gone}: node 1 opened a declared store missing it");
+        };
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, OpenError::Config(_))
+                && text.contains(&gone)
+                && text.contains(&format!("declared with {PARTITIONS} partitions")),
+            "{gone}: {text}"
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            before,
+            "{gone}: nothing written"
+        );
+        assert!(!has_copies(&dir), "{gone}: no copy was made");
+    }
+}
+
 /// PR #138 review: a node process's first read, the formation record, failing `Unavailable`
 /// says `control store:` once and gives the step to take. Unit (<100 ms).
 /// Cut: `formation_refused` maps `Store` through `to_string` as before; the text says
