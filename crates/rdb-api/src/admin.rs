@@ -514,14 +514,16 @@ pub struct Declaration {
 
 /// One declared node (#80 S1b): its id, the address it listens on (`host:port`, as its
 /// `--listen` and every `--peers` name it), and the machine it runs on. `None` takes the
-/// address's host part as the machine.
+/// address's host as [`parse_addr`] parses it as the machine: `[0:0:0:0:0:0:0:1]:7100` gives
+/// `::1`, and `DB-A.example.:7100` gives `db-a.example`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDecl {
     /// The node.
     pub node: NodeId,
     /// Where it listens.
     pub addr: String,
-    /// Its machine label; `None` is the host part of [`Self::addr`]. Lowercased.
+    /// Its machine label; `None` is the host of [`Self::addr`] as [`parse_addr`] parses it,
+    /// not as written. Lowercased.
     pub machine: Option<String>,
 }
 
@@ -599,9 +601,10 @@ impl Declaration {
     }
 
     /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the
-    /// node set ([`node_set_refusal`]), then each address (a `host:port` whose port parses, at
-    /// most 255 bytes, none twice), then each machine label ([`machine_refusal`], after
-    /// lowercasing; unset, the address's host part), then [`machine_clash`].
+    /// node set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes, so not
+    /// port 0, a bad bracketed host, or a broadcast or multicast host; at most 255 bytes; none
+    /// twice), then each machine label ([`machine_refusal`], after lowercasing; unset, the
+    /// address's host as [`parse_addr`] parses it), then [`machine_clash`].
     ///
     /// # Errors
     ///
@@ -723,7 +726,7 @@ impl Declaration {
 /// So `127.0.0.1` and `127.0.0.2` are two hosts, and two ports of one address are one. Labels
 /// are compared as written, lowercase ([`Declaration::records`] lowercases them). Hosts are
 /// compared as [`host_of`] parses them: an IP by value, so `[::1]` and `[0:0:0:0:0:0:0:1]` are
-/// one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`; a name lowercase and without a trailing
+/// one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`; a name lowercase and less one trailing
 /// dot. A name and an IP of one machine are not caught; only the labels can say so.
 #[must_use]
 pub fn machine_clash(records: &[NodeRecord]) -> Option<String> {
@@ -889,7 +892,7 @@ pub async fn read_nodes(
 /// Why node `node` may not start with `listen` and `peers` on a database declared as
 /// `formation` with node records `records` (#80 S1b rulings 2 and 4, ADR-rdb-0023), or `None`.
 /// Pure: `rdb_node` calls it before it writes its boot or binds, and a declared `Db::open` calls
-/// it with `DbConfig::addresses` before it creates anything.
+/// it with `DbConfig::addresses` before it creates `nodes/` or writes anything.
 ///
 /// - No formation record: `None`; an undeclared database has no node records.
 /// - `node` not among the declared nodes: refused.
@@ -900,7 +903,8 @@ pub async fn read_nodes(
 /// - Every `peers` entry, this node's included, must be its node's record's address, and every
 ///   declared node other than `node` must have one.
 ///
-/// Each refusal names the record (`nodes/N`) and both values.
+/// Each refusal that compares a value with a record names the record (`nodes/N`) and both
+/// values.
 #[must_use]
 pub fn node_start_refusal(
     node: NodeId,
@@ -1187,12 +1191,15 @@ fn s1a_reservation_refused(key: &str, held: &Reservation) -> DeclareError {
 }
 
 /// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
-/// prefix of what this declaration writes, which it then adopts. That is `routes/0` at this
-/// count, if any, and untouched generation-0 records of partitions 1 to `partitions` only. So a
-/// database formed some other way (a rooted `partitions/1`), or an interrupted declaration of
-/// another count (its `routes/0`, or a record past this count), refuses it with nothing
-/// written. This is a read: two declarations of different counts **at once** can both pass it,
-/// and [`reserve`], the first write, is what lets only one of them go on.
+/// prefix of what this declaration writes, which it then adopts. It reads, in order: the
+/// reservation, refused when an S1a build wrote it (#80 S1b); every `nodes/` record, each of which
+/// must be this declaration's record for its node, byte for byte; `routes/0`, which must be at this
+/// count, if any; and the partition records, which must be untouched generation-0 records of
+/// partitions 1 to `partitions` only. So a database formed some other way (a rooted
+/// `partitions/1`), or an interrupted declaration of another count (its `routes/0`, or a record
+/// past this count), refuses it with nothing written. This is a read: two declarations of different
+/// counts **at once** can both pass it, and [`reserve`], the first write, is what lets only one of
+/// them go on.
 ///
 /// # Errors
 ///
@@ -5636,10 +5643,14 @@ mod tests {
         }
     }
 
-    /// #80 S1b (ADR-rdb-0023 Decision 2): the reservation's layout 2 carries every node's
-    /// address and machine, so it is pinned as a literal too: two nodes, one with a machine label
-    /// and one taking its host. It decodes back, and a body cut short, a trailing byte, a count
-    /// past the entries and a bad machine byte each decode as nothing. Unit.
+    /// #80 S1b (ADR-rdb-0023 Decision 2): the reservation's layout 2 carries every node's address
+    /// and machine, so it is pinned as a literal too: one node with a machine label and two taking
+    /// their host, one of them an IPv6 host in long form, whose stored label is the parsed `::3`
+    /// (PR #144 review r2), so a change to the default label is red. It decodes back, and a body
+    /// cut short, a trailing byte, a count past the entries and a bad machine byte each decode as
+    /// nothing. Unit.
+    /// Cut: `Declaration::records` takes the host as written, less its brackets
+    /// (`0:0:0:0:0:0:0:3`); red at the pinned bytes.
     #[test]
     fn s1b_reservation_layout_2_bytes_are_pinned() {
         let declaration = Declaration {
@@ -5656,7 +5667,7 @@ mod tests {
                 },
                 NodeDecl {
                     node: NodeId(3),
-                    addr: "10.0.0.3:7100".to_owned(),
+                    addr: "[0:0:0:0:0:0:0:3]:7100".to_owned(),
                     machine: None,
                 },
             ],
@@ -5666,9 +5677,14 @@ mod tests {
             .records()
             .expect("a declaration this build takes");
         let mut pinned = vec![2, 8, 0, 0, 0, 3];
-        for (n, machine) in [(1u8, &b"m1"[..]), (2, b"10.0.0.2"), (3, b"10.0.0.3")] {
-            pinned.extend_from_slice(&[n, 0, 0, 0, 13]);
-            pinned.extend_from_slice(format!("10.0.0.{n}:7100").as_bytes());
+        for (n, addr, machine) in [
+            (1u8, &b"10.0.0.1:7100"[..], &b"m1"[..]),
+            (2, b"10.0.0.2:7100", b"10.0.0.2"),
+            (3, b"[0:0:0:0:0:0:0:3]:7100", b"::3"),
+        ] {
+            pinned.extend_from_slice(&[n, 0, 0, 0]);
+            pinned.push(u8::try_from(addr.len()).expect("short"));
+            pinned.extend_from_slice(addr);
             pinned.push(u8::try_from(machine.len()).expect("short"));
             pinned.extend_from_slice(machine);
         }

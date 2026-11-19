@@ -69,7 +69,7 @@ pub enum Host {
     /// An IP address, canonical: an IPv4-mapped IPv6 address is the IPv4 address, so `::1` and
     /// `0:0:0:0:0:0:0:1` are one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`.
     Ip(IpAddr),
-    /// A host name, lowercase, without a trailing dot. Two names are one host only when they
+    /// A host name, lowercase, less one trailing dot. Two names are one host only when they
     /// are equal so: a name and an IP of the same machine are not caught.
     Name(String),
 }
@@ -86,7 +86,9 @@ impl std::fmt::Display for Host {
 /// The host of `addr`, a `host:port` a node is declared at, or why it is not one a peer can
 /// dial: no `:port`, a port that is not 1 to 65535 (0 is refused, since no peer can dial it and
 /// a record is never rewritten), an empty host, a bracketed host that is not an IPv6 address,
-/// or an IPv6 address without brackets.
+/// an IPv6 address without brackets, a host of only digits and dots that is not a four-octet
+/// IPv4 address (`127.1`), or a broadcast or multicast address (`255.255.255.255`,
+/// `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped forms), which TCP cannot dial.
 ///
 /// # Errors
 ///
@@ -113,7 +115,7 @@ pub fn parse_addr(addr: &str) -> Result<Host, String> {
             .strip_suffix(']')
             .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
             .ok_or_else(|| format!("address {addr:?}: a bracketed host must be an IPv6 address"))?;
-        return Ok(Host::Ip(ip.to_canonical()));
+        return dialable(addr, ip.to_canonical());
     }
     if host.contains(':') {
         return Err(format!(
@@ -121,13 +123,37 @@ pub fn parse_addr(addr: &str) -> Result<Host, String> {
         ));
     }
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(Host::Ip(IpAddr::V4(ip)));
+        return dialable(addr, IpAddr::V4(ip));
+    }
+    // A name is compared as text, so `127.1` (which a resolver may read as 127.0.0.1) would
+    // pass beside `127.0.0.1` as another host.
+    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') && host.bytes().any(|b| b != b'.') {
+        return Err(format!(
+            "address {addr:?}: a host of only digits and dots must be an IPv4 address of four \
+             octets, as 127.0.0.1"
+        ));
     }
     let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     if name.is_empty() {
         return Err(format!("address {addr:?} has no host"));
     }
     Ok(Host::Name(name))
+}
+
+/// `ip` as [`parse_addr`]'s host, or why no peer can dial it over TCP: a broadcast or
+/// multicast address.
+fn dialable(addr: &str, ip: IpAddr) -> Result<Host, String> {
+    let undialable = match ip {
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast(),
+        IpAddr::V6(v6) => v6.is_multicast(),
+    };
+    if undialable {
+        return Err(format!(
+            "address {addr:?} is a broadcast or multicast address, which no peer can dial over \
+             TCP; a node record is never rewritten, so give the address the node listens on"
+        ));
+    }
+    Ok(Host::Ip(ip))
 }
 
 /// [`parse_addr`]'s host, or `None` when it refuses `addr`.
@@ -237,10 +263,14 @@ mod tests {
     }
 
     /// #80 S1b: the host of an address, which `admin::declare` compares, and the machine
-    /// label set. Two spellings of one IP are one host; a name is lowercased and loses a
+    /// label set. Two spellings of one IP are one host; a name is lowercased and loses one
     /// trailing dot. Port 0, a bracketed host that is not IPv6 and an unbracketed IPv6 host are
-    /// refused, each with its reason (PR #144 review). Unit.
-    /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`.
+    /// refused, each with its reason (PR #144 review). So are a host of digits and dots that is
+    /// not four octets (`127.1`), and broadcast and multicast addresses, IPv4, IPv6 and
+    /// IPv4-mapped (PR #144 review r2). Neighbours that stay hosts: `223.255.255.255`,
+    /// `240.0.0.1`, `[fe80::1]` and the name `1a.2`. Unit.
+    /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`. Cut: the digits-and-dots check;
+    /// red at `127.1:7101`. Cut: `dialable` refuses nothing; red at `255.255.255.255:7100`.
     #[test]
     fn s1b_host_of_and_machine_labels() {
         let ip = |text: &str| Some(Host::Ip(text.parse().expect("an IP")));
@@ -252,6 +282,10 @@ mod tests {
             host_of("DB-A.example.:1"),
             Some(Host::Name("db-a.example".to_owned()))
         );
+        assert_eq!(host_of("223.255.255.255:7100"), ip("223.255.255.255"));
+        assert_eq!(host_of("240.0.0.1:7100"), ip("240.0.0.1"));
+        assert_eq!(host_of("[fe80::1]:7100"), ip("fe80::1"));
+        assert_eq!(host_of("1a.2:7100"), Some(Host::Name("1a.2".to_owned())));
         for (bad, why) in [
             ("127.0.0.2", "not host:port"),
             ("127.0.0.2:x", "no port"),
@@ -263,6 +297,15 @@ mod tests {
             ("[::1:7100", "must be an IPv6 address"),
             ("::1:7100", "in brackets"),
             (".:7100", "no host"),
+            ("127.1:7101", "four octets"),
+            ("127.0.0.1.:7100", "four octets"),
+            ("1:7100", "four octets"),
+            ("255.255.255.255:7100", "broadcast or multicast"),
+            ("224.0.0.1:7100", "broadcast or multicast"),
+            ("239.255.255.255:7100", "broadcast or multicast"),
+            ("[ff02::1]:7100", "broadcast or multicast"),
+            ("[::ffff:224.0.0.1]:7100", "broadcast or multicast"),
+            ("[::ffff:255.255.255.255]:7100", "broadcast or multicast"),
         ] {
             let refused = parse_addr(bad).expect_err(bad);
             assert!(

@@ -29,14 +29,17 @@
    length byte and that many bytes. The address is UTF-8 `host:port`, 1 to 255 bytes, that a
    peer can dial: the port is 1 to 65535 (port 0 is refused, since a record is never
    rewritten), an IPv6 host is in brackets and parses as an IPv6 address (`[::gg]:7100` is
-   refused), and an unbracketed host holds no `:`. A declaration is refused, with nothing
-   written, for an address that breaks this (`rdb_core::authority::node::parse_addr`). The
-   machine is 1 to 63 bytes of `[a-z0-9._:-]`. Nothing may follow. A body that is anything
-   else, or whose node is not the key's, is not a record (`Undecodable`). Codec:
-   `rdb_core::authority::node::NodeRecord`, outside `contracts/`, beside the partition codec.
-   `admin::declare` writes one per declared node, create-or-adopt, after `routes/0` and
-   before any `partitions/{p}`, so a store that holds a partition record holds every node's
-   address. Nothing updates one in place.
+   refused), an unbracketed host holds no `:`, a host of only digits and dots is a four-octet
+   IPv4 address (`127.1` is refused), and the host is not a broadcast or multicast address
+   (`255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, or an IPv4-mapped form of one), which TCP
+   cannot dial. A declaration is refused, with nothing written, for an address that breaks
+   this: `admin::Declaration::records` runs `rdb_core::authority::node::parse_addr`, which
+   checks all but the length, and then the 255-byte length check. The machine is 1 to 63 bytes
+   of `[a-z0-9._:-]`. Nothing may follow. A body that is anything else, or whose node is not the
+   key's, is not a record (`Undecodable`). Codec: `rdb_core::authority::node::NodeRecord`,
+   outside `contracts/`, beside the partition codec. `admin::declare` writes one per declared
+   node, create-or-adopt, after `routes/0` and before any `partitions/{p}`, so a store that
+   holds a partition record holds every node's address. Nothing updates one in place.
    **This amends ADR-rdb-0008's `nodes/{id}` row:** the writer is the declaration (later
    add-node), not the node at start-up; the body is the address and the machine; the boot
    comes from the link handshake, not from this record; role, failure domain, capacity, cores
@@ -57,13 +60,14 @@
    **This amends ADR-rdb-0022 Decision 6:** a declaration now names nodes 1 to K, K from 3 to
    8, with no gap. Adding or removing a node is still a later slice.
 4. **One data node per machine.** The machine is an operator's label (`--machines N=label`),
-   lowercased; unset, it is the host of the node's address as compared below. A declaration
-   is refused, with nothing written, when:
+   lowercased; unset, it is the host of the node's address as parsed and compared below (so
+   `[0:0:0:0:0:0:0:1]:7100` gives `::1`). A declaration is refused, with nothing written,
+   when:
    - two nodes have the same label;
    - two addresses have the same host, whatever the labels say (so the same address on two
      ports is one machine). Hosts are compared as parsed, not as written: an IP address by
      value, so `[::1]` and `[0:0:0:0:0:0:0:1]` are one host, and an IPv4-mapped address
-     (`[::ffff:127.0.0.1]`) is its IPv4 address; a host name lowercase and without a trailing
+     (`[::ffff:127.0.0.1]`) is its IPv4 address; a host name lowercase and less one trailing
      dot, as a string, with no DNS lookup (`DB-A.example.` and `db-a.example` are one host);
    - two nodes have the same address.
    A declared open whose `DbConfig::local` is not exactly one node is refused: one process is
@@ -83,16 +87,18 @@
      accepted);
    - a peer address that is not its node's recorded address, or names a node with no record;
    - a declared node given no peer address.
-   Each of these texts names the record (`nodes/N`) and both values, and ends "nothing was
-   started", on both paths below. The refusals `Db::open` adds itself (below, and two local
-   nodes or no `DbConfig::addresses`) end "nothing was created".
+   Each of these texts ends "nothing was started", on both paths below. Those that compare a
+   value with a record (the listen address and a peer address) name the record (`nodes/N`)
+   and both values. The refusals `Db::open` adds itself (below, and two local nodes or no
+   `DbConfig::addresses`) end "nothing but its folder was created".
    It runs on two paths:
    - `rdb_node --node N` calls it with `--listen` and `--peers` before it writes its boot or
      binds.
    - `Db::open` of a declared database calls it with `DbConfig::addresses` (the listen address
      and every peer address) on every open: a first open, a retry and a restart. The open has
      already created its folder (`DbConfig::dir`), which may be empty; the check comes before
-     it creates `nodes/` or anything else in it, and before it writes to the store. `None` is refused, so an embedded node cannot skip it. The open
+     it creates `nodes/` or anything else in it, and before it writes to the store. `None` is
+     refused, so an embedded node cannot skip it. The open
      binds nothing itself; an embedder's listener is bound before `Db::open` is called, so an
      embedder that must not bind a wrong address calls `admin::read_formation`,
      `admin::read_nodes` and `admin::node_start_refusal` first, as `rdb_node` does.
@@ -161,15 +167,19 @@ every rig open passes the address check it would meet in use.
   `s1b_a_declared_open_with_no_addresses_is_refused` (each on a first open, a retry and a
   restart),
   `s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare`,
-  `s1b_a_half_written_s1a_declaration_is_refused_with_how_to_redeclare`.
+  `s1b_a_half_written_s1a_declaration_is_refused_with_how_to_redeclare`,
+  `s1b_a_failing_reservation_read_in_the_preflight_is_refused`.
 - `crates/rdb-api/examples/rdb_node.rs`:
   `s1b_declare_takes_peers_and_machines_and_prints_the_records`,
   `s1b_a_listen_that_disagrees_with_its_record_is_refused_before_boot_or_bind`,
+  `s1b_a_listener_bound_to_another_address_is_refused_before_boot`,
   `s1b_four_declared_node_processes_run_on_one_machine` (ruling 1: four node processes on
   127.0.0.1 to .4 form every partition and each reaches ready; each listens on the socket
   the row reserved, so no other process can take its port in between).
 - Manual: `rdb_node --declare --control E --partitions 16 --peers 1=127.0.0.1:7100,...,5=127.0.0.5:7100`,
-  then five `rdb_node --node N` processes, each with its own `--dir`.
+  then `rdb_node --gen-certs --cert-dir C --nodes 5`, then five
+  `rdb_node --node N --dir D --listen 127.0.0.N:7100 --peers <the same list> --control E --cert-dir C`
+  processes, each with its own `--dir`.
 
 ## References
 

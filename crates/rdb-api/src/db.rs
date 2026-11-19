@@ -6102,7 +6102,8 @@ fn roll_forward_copies(
 /// process runs one declared node: a process is certainly one machine, so two local nodes would
 /// be two data nodes on one machine. That node's `nodes/{id}` record must exist: a store with
 /// none was declared by an S1a build ([`admin::S1A_STORE`]). And its [`DbConfig::addresses`]
-/// must agree with the records, by [`admin::node_start_refusal`]. Nothing is written either way.
+/// must agree with the records, by [`admin::node_start_refusal`]. Nothing is written either way,
+/// and the open has created only its folder ([`DbConfig::dir`]).
 async fn declared_open_refusal(
     local: &[NodeId],
     addresses: Option<&NodeAddresses>,
@@ -6113,7 +6114,7 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(format!(
             "this open runs nodes {:?} of a declared database, and a declared database runs one \
              data node per process and per machine: open each node in its own process; nothing \
-             was created",
+             but its folder was created",
             local.iter().map(|node| node.0).collect::<Vec<_>>()
         )));
     };
@@ -6127,14 +6128,14 @@ async fn declared_open_refusal(
         })?;
     if records.is_empty() {
         return Err(OpenError::Config(format!(
-            "{}; nothing was created",
+            "{}; nothing but its folder was created",
             admin::S1A_STORE
         )));
     }
     if !records.contains_key(node) {
         return Err(OpenError::Config(format!(
             "{} is absent, so node {} is not a declared node of this database (it declares \
-             nodes {:?}); nothing was created",
+             nodes {:?}); nothing but its folder was created",
             ControlKey::Node(*node).encode(),
             node.0,
             formation
@@ -6149,7 +6150,7 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(format!(
             "node {} of a declared database opened with no DbConfig::addresses: a declared node \
              says where it listens and where each peer does, and they are checked against the \
-             nodes/ records; nothing was created",
+             nodes/ records; nothing but its folder was created",
             node.0
         )));
     };

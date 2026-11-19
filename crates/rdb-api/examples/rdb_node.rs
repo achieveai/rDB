@@ -1312,6 +1312,61 @@ mod tests {
         }
     }
 
+    /// #80 S1b, PR #144 review r2: a node process handed a listener (`serve_on_ready`'s
+    /// `bound`) that is bound to another address than `--listen` is refused before it writes
+    /// its boot: the error names `--listen` and where the listener is bound, and no `--dir` is
+    /// created. `--listen` and `--peers` are the records', so the start check passes and only
+    /// the listener's address can refuse it. Unit (<200 ms, an in-memory store).
+    /// Cut: drop the bound-address check from `serve_on_ready`; the start goes on, writes the
+    /// boot and fails at the missing certificates, red at the error's text (and the folder
+    /// exists).
+    #[config_log::retcd_test]
+    fn s1b_a_listener_bound_to_another_address_is_refused_before_boot() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        declare_on(
+            &parsed(&["--declare", "--peers", PEERS, "--partitions", "8"]).expect("parses"),
+            &store,
+            &rt,
+        )
+        .expect("declared");
+        let bound = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.3:0"))
+            .expect("a free port");
+        let at = bound.local_addr().expect("bound").to_string();
+        let path = |p: &std::path::Path| p.display().to_string();
+        let dir = root.path().join("node-3");
+        let args = parsed(&[
+            "--node",
+            "3",
+            "--dir",
+            &path(&dir),
+            "--listen",
+            "127.0.0.3:7100",
+            "--peers",
+            PEERS,
+            "--control",
+            "http://127.0.0.1:1",
+            "--cert-dir",
+            &path(&root.path().join("certs")),
+        ])
+        .expect("parses");
+        let refused = serve_on_ready(&args, &rt, Arc::clone(&store), Some(bound), &|_| {});
+        assert!(
+            matches!(&refused, Err(text)
+                if text.contains("--listen 127.0.0.3:7100")
+                    && text.contains(&format!("the listener given is bound to {at}"))
+                    && text.ends_with("nothing was started")),
+            "{refused:?}"
+        );
+        assert!(!dir.exists(), "a boot was written in {}", dir.display());
+    }
+
     /// #80 S1b ruling 1 (single machine): a whole declared database runs on one box. Four
     /// node processes' start paths (`serve_on`, one thread each) on 127.0.0.1 to .4, the hosts
     /// `--declare` recorded, pass the start check, open their own empty folders and form every

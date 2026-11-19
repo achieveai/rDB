@@ -2936,10 +2936,11 @@ fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
 }
 
 /// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
-/// written, since a node record is never rewritten: port 0, and a bracketed host that is not
-/// an IPv6 address (`[::gg]`). The same store then takes the corrected addresses. Unit
-/// (<100 ms). Cut: `parse_addr` accepts port 0 and parses no bracketed host; both declare, red
-/// at the first.
+/// written, since a node record is never rewritten: port 0, a bracketed host that is not an
+/// IPv6 address (`[::gg]`), and (PR #144 review r2) a broadcast or multicast host
+/// (`255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same store then takes the corrected
+/// addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and parses no bracketed host;
+/// both declare, red at the first. Cut: `dialable` refuses nothing; red at `255.255.255.255`.
 #[config_log::retcd_test]
 fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
     let rt = runtime();
@@ -2952,6 +2953,21 @@ fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
         (
             "[::gg]:7100",
             "a bracketed host must be an IPv6 address",
+            "[::3]:7100",
+        ),
+        (
+            "255.255.255.255:7100",
+            "a broadcast or multicast address",
+            "127.0.0.3:7100",
+        ),
+        (
+            "224.0.0.1:7100",
+            "a broadcast or multicast address",
+            "127.0.0.3:7100",
+        ),
+        (
+            "[ff02::1]:7100",
+            "a broadcast or multicast address",
             "[::3]:7100",
         ),
     ] {
@@ -3252,7 +3268,7 @@ fn s1b_a_declared_open_of_two_local_nodes_is_refused() {
         matches!(refused, OpenError::Config(_))
             && text.contains("runs nodes [1, 2] of a declared database")
             && text.contains("one data node per process")
-            && text.contains("nothing was created"),
+            && text.contains("nothing but its folder was created"),
         "{text}"
     );
     assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
@@ -3385,7 +3401,46 @@ fn s1b_a_declared_open_given_a_peer_address_that_disagrees_is_refused() {
 /// Cut: `declared_open_refusal` lets `None` through; the first open opens, red at `expect_err`.
 #[config_log::retcd_test]
 fn s1b_a_declared_open_with_no_addresses_is_refused() {
-    refused_on_every_open(None, &["no DbConfig::addresses", "nothing was created"]);
+    refused_on_every_open(
+        None,
+        &[
+            "no DbConfig::addresses",
+            "nothing but its folder was created",
+        ],
+    );
+}
+
+/// #80 S1b, PR #144 review r2: the preflight's reservation read failing is a refusal naming
+/// that read, not a reservation taken as absent: the store's error stays typed
+/// (`DeclareError::Store`, step `get operations/<reservation>`) and nothing is written. The same
+/// declaration then declares once the store answers. Unit (<100 ms, an in-memory store).
+/// Cut: `declare_preflight` takes a failed reservation read as no reservation; the declaration
+/// goes on and creates, red at the first `matches!`.
+#[config_log::retcd_test]
+fn s1b_a_failing_reservation_read_in_the_preflight_is_refused() {
+    let rt = runtime();
+    // The formation record's read passes; the next get, the preflight's reservation read, fails.
+    let scripted = Arc::new(Scripted::new(Script {
+        pass_gets: 1,
+        fail_gets: 1,
+        ..Script::default()
+    }));
+    let store: Arc<dyn ConfigStore> = scripted.clone();
+    let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
+    let failed = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&failed, Err(admin::DeclareError::Store { step, error })
+            if *step == format!("get {reservation}")
+                && error.to_string().contains("scripted: the read failed")),
+        "{failed:?}"
+    );
+    assert!(snapshot(&rt, &*store).is_empty(), "nothing written");
+    scripted.rescript(Script::default());
+    let declared = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(_))),
+        "{declared:?}"
+    );
 }
 
 /// #80 S1b ruling 4, PR #144 review: a store an S1a build began declaring and did not finish
@@ -3488,7 +3543,7 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
         .expect_err("an S1a store does not open");
     let text = refused.to_string();
     assert!(
-        text.contains(admin::S1A_STORE) && text.contains("nothing was created"),
+        text.contains(admin::S1A_STORE) && text.contains("nothing but its folder was created"),
         "{text}"
     );
     assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
