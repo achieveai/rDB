@@ -1535,6 +1535,7 @@ pub fn spawn(
         BOOT,
         StorageOptions::default(),
         1,
+        crate::db::ALL_NODES.into(),
     )
 }
 
@@ -1557,6 +1558,7 @@ pub(crate) fn spawn_with(
     boot: BootId,
     storage: StorageOptions,
     partitions: u32,
+    nodes: Arc<[NodeId]>,
 ) -> Result<NodeHandle, String> {
     // The open's storage options, on a restart too (A-R253).
     let engine = RocksEngine::open_with(&dir, storage)
@@ -1573,6 +1575,7 @@ pub(crate) fn spawn_with(
         live_readd,
         boot,
         partitions,
+        nodes,
     )
 }
 
@@ -1592,6 +1595,7 @@ pub(crate) fn spawn_on(
     live_readd: bool,
     boot: BootId,
     partitions: u32,
+    nodes: Arc<[NodeId]>,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone(), boot);
@@ -1604,6 +1608,7 @@ pub(crate) fn spawn_on(
     host.unreachable_drop_after_millis = unreachable_drop_after_millis;
     host.live_readd.on = live_readd;
     host.partition_count = partitions;
+    host.nodes = nodes;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
     // reads its own nodes' lines from its own file rather than the shared untagged one.
@@ -2669,6 +2674,9 @@ struct Host {
     /// How many partitions the database has (#79). Above 1, this node refuses a client call
     /// addressed to a partition its group does not map to.
     partition_count: u32,
+    /// The nodes partitions were first placed over (#80 S1b): the formation record's, or nodes
+    /// 1 to 3. [`Self::restore_left_out`] re-seats a partition's copies from them.
+    nodes: Arc<[NodeId]>,
 
     authority: Authority,
     transaction: Transaction,
@@ -3001,6 +3009,7 @@ impl Host {
             clock,
             budgets: Budgets::SPEC_DEFAULTS,
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             authority: Authority::new(),
             transaction: Transaction::default(),
             replication: Replication::default(),
@@ -6984,7 +6993,7 @@ impl Host {
     fn readd_candidate(&self, partition: PartitionId, config: &PartitionConfig) -> Option<Member> {
         // A-R455 (T11): a shadow holds a slot too, so a re-add pins only up to the free slots;
         // an extra left-out node stays out rather than becoming a shadow with no slot to fill.
-        if config.members.len() >= crate::admin::members().len() {
+        if config.members.len() >= crate::admin::RF {
             return None;
         }
         self.left_out.get(&partition)?.iter().copied().find(|left| {
@@ -7817,7 +7826,7 @@ impl Host {
             return Some("read_only");
         }
         let members = &committed.committed.pinned_config.members;
-        if members.len() >= crate::admin::members().len() {
+        if members.len() >= crate::admin::RF {
             return Some("no_free_slot");
         }
         // A rebuild of this partition, or of this node on any partition (the candidate's).
@@ -7913,7 +7922,9 @@ impl Host {
             return;
         };
         let members = &committed.committed.pinned_config.members;
-        let seats = crate::admin::members();
+        // #80 S1b: the seats are where the partition was first placed over the declared nodes,
+        // not nodes 1 to 3: a partition on {2, 3, 4} never re-seats node 1.
+        let seats = crate::admin::placed(&self.nodes, partition, BOOT);
         if members.len() >= seats.len() {
             return;
         }
@@ -7959,7 +7970,7 @@ impl Host {
             return;
         };
         let members = &committed.committed.pinned_config.members;
-        if members.len() >= crate::admin::members().len() {
+        if members.len() >= crate::admin::RF {
             return;
         }
         let Some(left_out) = self.left_out.get(&partition) else {
@@ -8667,7 +8678,7 @@ impl Host {
             .iter()
             .filter(|member| member.role != ReplicaRole::Shadow)
             .count();
-        let rf = crate::admin::members().len();
+        let rf = crate::admin::RF;
         // A-R457 (a): below rf regular copies the promote fills the free slot and keeps the
         // source, so the line says that instead of "leaving node N out".
         let fills = regular < rf;
@@ -8721,7 +8732,7 @@ impl Host {
                 .filter(|member| member.role != ReplicaRole::Shadow)
                 .count();
             // A-R455: "catching up" names only a shadow that holds a free slot.
-            if regular < crate::admin::members().len() {
+            if regular < crate::admin::RF {
                 return wait(format!(
                     "node {} is pinned as a shadow of partition {} and still catching up: run \
                      the move again once it is regular",
@@ -9203,12 +9214,12 @@ impl Host {
             .get(&partition)
             .filter(|mv| mv.to == shadow.node && mv.abandoned.is_none())
             .map(|mv| mv.from);
-        if moving.is_none() && regular >= crate::admin::members().len() {
+        if moving.is_none() && regular >= crate::admin::RF {
             return;
         }
         // A-R457 (a): below rf regular copies the shadow fills the free slot and the source
         // keeps its copy; dropping it would leave fewer copies than were reachable.
-        let rf = crate::admin::members().len();
+        let rf = crate::admin::RF;
         let drop = moving
             .filter(|from| regular >= rf && members.iter().any(|member| member.node == *from));
         let generation = committed.new_generation;
@@ -10380,7 +10391,7 @@ impl Host {
         // and say it comes back, so it is refused before anything is stopped.
         let full = self.committed.get(&partition).and_then(|committed| {
             let members = &committed.committed.pinned_config.members;
-            (members.len() >= crate::admin::members().len()).then(|| member_list(members))
+            (members.len() >= crate::admin::RF).then(|| member_list(members))
         });
         if let Some(list) = full.filter(|_| left) {
             return Err(crate::db::rebuild_refused(crate::admin::rebuild::Refused {
@@ -10433,7 +10444,7 @@ impl Host {
         node: NodeId,
         members: &[Member],
     ) -> Result<(), crate::admin::rebuild::Refused> {
-        let rf = crate::admin::members().len();
+        let rf = crate::admin::RF;
         let list = member_list(members);
         if members.len() >= rf {
             return Err(crate::admin::rebuild::Refused {

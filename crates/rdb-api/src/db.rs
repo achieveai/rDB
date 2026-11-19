@@ -577,6 +577,10 @@ struct Opened {
     /// nodes, so a later restart that starts one hands it to the node. Weak: what keeps a
     /// subscriber alive is the nodes holding it, so a dropped one still ends.
     waiting: Mutex<Vec<Waiting>>,
+    /// The nodes partitions are placed over (#80 S1b): the formation record's for a declared
+    /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
+    /// given it, so an owner re-seats the copies its partition was placed on.
+    nodes: Arc<[NodeId]>,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -619,6 +623,7 @@ impl Default for Opened {
             control: None,
             instance: None,
             waiting: Mutex::new(Vec::new()),
+            nodes: ALL_NODES.into(),
         }
     }
 }
@@ -1520,7 +1525,7 @@ impl Db {
             store,
             rt,
             budgets,
-            move |node, engine, links, control, clock, boot, partitions| {
+            move |node, engine, links, control, clock, boot, partitions, nodes| {
                 host::spawn_on(
                     node,
                     engine,
@@ -1533,6 +1538,7 @@ impl Db {
                     live_readd,
                     boot,
                     partitions,
+                    nodes,
                 )
             },
         )
@@ -1669,6 +1675,7 @@ impl Db {
             HostClock,
             BootId,
             u32,
+            Arc<[NodeId]>,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
         std::fs::create_dir_all(&config.dir)?;
@@ -1687,6 +1694,12 @@ impl Db {
             None
         };
         let declared = formation.as_ref().map(|formation| formation.instance);
+        // #80 S1b: partitions are placed over the declared nodes; a database no declaration
+        // made keeps nodes 1 to 3.
+        let nodes: Arc<[NodeId]> = formation.as_ref().map_or_else(
+            || ALL_NODES.into(),
+            |formation| formation.nodes.as_slice().into(),
+        );
         if partial && declared.is_none() {
             let missing: Vec<NodeId> = config
                 .local
@@ -1728,6 +1741,7 @@ impl Db {
             &store,
             partial,
             declared,
+            &nodes,
         )
         .await?;
         let partitions = open_partition_count(&store, config.partitions, found.fresh).await?;
@@ -1749,6 +1763,7 @@ impl Db {
                 &store,
                 partial,
                 declared.is_some(),
+                &nodes,
                 partitions,
                 &found.instance,
             )
@@ -1860,6 +1875,7 @@ impl Db {
                 base_boot: boot,
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
+                nodes: Arc::clone(&nodes),
                 ..Opened::default()
             },
             route: Route {
@@ -1891,6 +1907,7 @@ impl Db {
                 db.clock,
                 boot,
                 partitions,
+                Arc::clone(&nodes),
             ) {
                 Ok(handle) => lock(&db.nodes).push(handle),
                 Err(detail) => {
@@ -1923,7 +1940,7 @@ impl Db {
                         .is_some_and(|owner| config.local.contains(owner))
                 });
             }
-            let formed = admin::write_records(&store, &forming).await?;
+            let formed = admin::write_records(&store, &nodes, &forming).await?;
             // One heal per owner this process runs, over all its partitions (issue #79).
             let mut heals: BTreeMap<NodeId, OwnerHeal> = BTreeMap::new();
             for (partition, owner) in found.owners() {
@@ -1960,6 +1977,7 @@ impl Db {
         store: &Arc<dyn ConfigStore>,
         partial: bool,
         declared: Option<[u8; INSTANCE_LEN]>,
+        nodes: &[NodeId],
     ) -> Result<Found, OpenError> {
         let bound: BTreeSet<[u8; INSTANCE_LEN]> =
             engines.values().filter_map(RocksEngine::instance).collect();
@@ -1987,7 +2005,7 @@ impl Db {
         let declared_found = |instance: [u8; INSTANCE_LEN]| Found {
             instance,
             fresh: false,
-            owner: admin::initial_owner(PARTITION),
+            owner: admin::owner_in(nodes, PARTITION),
             roll: None,
             others: Vec::new(),
             forms_first: true,
@@ -2231,7 +2249,7 @@ impl Db {
         // A-R467: a reopen does not re-add a copy the record left out (M11 T6 pins the
         // record's members), so the open says which local copy is out and the step that brings
         // it back, while the partition pins fewer copies than its count.
-        if pinned.len() < admin::members().len() {
+        if pinned.len() < admin::RF {
             let local: Vec<(NodeId, bool)> = engines
                 .iter()
                 .map(|(node, engine)| (*node, holds_partition(engine)))
@@ -2292,6 +2310,7 @@ impl Db {
         store: &Arc<dyn ConfigStore>,
         partial: bool,
         declared: bool,
+        nodes: &[NodeId],
         count: u32,
         instance: &[u8; INSTANCE_LEN],
     ) -> Result<Vec<(PartitionId, PartitionFound)>, OpenError> {
@@ -2322,7 +2341,7 @@ impl Db {
             let (record, root) = match state {
                 PartitionState::Absent | PartitionState::Unrooted { untouched: true } if !holds => {
                     let found = PartitionFound {
-                        owner: admin::initial_owner(partition),
+                        owner: admin::owner_in(nodes, partition),
                         roll: None,
                         forms: true,
                     };
@@ -2542,6 +2561,7 @@ impl Db {
                 owner_node: owner,
                 partitions,
                 partition_count: self.route.partitions(),
+                nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
             });
         }
@@ -4574,6 +4594,7 @@ impl Db {
                 boot,
                 config.storage,
                 1,
+                ALL_NODES.into(),
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -4888,6 +4909,7 @@ impl Db {
                 boot,
                 respawn.storage,
                 self.route.partitions(),
+                Arc::clone(&self.opened.nodes),
             )
         };
         match started {
@@ -5035,6 +5057,7 @@ impl Db {
             respawn.live_readd,
             boot,
             self.route.partitions(),
+            Arc::clone(&self.opened.nodes),
         )
     }
 
@@ -7784,7 +7807,7 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot, partitions| {
+        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot, partitions, nodes| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
@@ -7800,6 +7823,7 @@ mod tests {
                 false,
                 boot,
                 partitions,
+                nodes,
             )
         };
 
@@ -7892,31 +7916,37 @@ mod tests {
                 let race = Arc::clone(&race);
                 std::thread::spawn(move || {
                     let other = 1 - me;
-                    let spawn = |node: NodeId, engine, links, control, clock, boot, partitions| {
-                        if node == NodeId(1) {
-                            race.mark(me, |state| state.0 = true);
-                            race.wait("the other opener reaches node 1 or returns", other, |s| {
-                                s.0 || s.1
-                            });
-                        }
-                        let started = host::spawn_on(
-                            node,
-                            engine,
-                            links,
-                            control,
-                            clock,
-                            fast(),
-                            Limits::default(),
-                            host::UNREACHABLE_DROP_AFTER_MILLIS,
-                            false,
-                            boot,
-                            partitions,
-                        )?;
-                        if node == NodeId(3) {
-                            race.wait("the loser returns while these nodes run", other, |s| s.1);
-                        }
-                        Ok(started)
-                    };
+                    let spawn =
+                        |node: NodeId, engine, links, control, clock, boot, partitions, nodes| {
+                            if node == NodeId(1) {
+                                race.mark(me, |state| state.0 = true);
+                                race.wait(
+                                    "the other opener reaches node 1 or returns",
+                                    other,
+                                    |s| s.0 || s.1,
+                                );
+                            }
+                            let started = host::spawn_on(
+                                node,
+                                engine,
+                                links,
+                                control,
+                                clock,
+                                fast(),
+                                Limits::default(),
+                                host::UNREACHABLE_DROP_AFTER_MILLIS,
+                                false,
+                                boot,
+                                partitions,
+                                nodes,
+                            )?;
+                            if node == NodeId(3) {
+                                race.wait("the loser returns while these nodes run", other, |s| {
+                                    s.1
+                                });
+                            }
+                            Ok(started)
+                        };
                     let opened = handle.block_on(Db::open_spawning(
                         config(&path),
                         store,

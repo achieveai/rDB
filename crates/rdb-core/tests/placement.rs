@@ -861,3 +861,119 @@ fn a_primary_handoff_never_prints_as_an_rdb_dev_command_line() {
         plan.steps
     );
 }
+
+// ---- #80 S1b: the ring a declaration places by (`placement::initial`) ----
+
+/// Every partition count the S1b rows sweep: one, a few per node, many, the most.
+const S1B_COUNTS: [u32; 5] = [1, 8, 16, 64, rdb_core::partition_map::MAX_PARTITIONS];
+
+/// #80 S1b row 1: over nodes 1, 2 and 3 the ring is the placement every database had before
+/// S1b, for every partition a database may have: copies on 1, 2 and 3, and the primary
+/// `(p - 1) % 3 + 1`, the formula `admin::initial_owner` and `admin::members_for` hold. Written
+/// out here, not called, so a change on either side is red. Unit.
+/// Cut: a ring offset of `p % K` (primary `nodes[p % K]`); partition 1's primary is node 2, red.
+#[retcd_test]
+fn s1b_ring_placement_at_three_nodes_is_todays_placement() {
+    for p in 1..=rdb_core::partition_map::MAX_PARTITIONS {
+        let placed = rdb_core::placement::initial(&[1, 2, 3], p);
+        assert_eq!(
+            placed,
+            part(p, &[1, 2, 3], (p - 1) % 3 + 1),
+            "partition {p}"
+        );
+    }
+}
+
+/// #80 S1b row 2: for every node count 3 to 8 and every count of `S1B_COUNTS`, each partition
+/// gets three distinct copies on declared nodes with its primary among them, primaries differ
+/// by at most one per node, and copies by at most three (ruling 3: uneven, not rebalanced).
+/// K = 5, P = 64 gives primaries 13, 13, 13, 13, 12. The planner, given the result with a
+/// machine per node, finds no machine rule to repair. Unit.
+/// Cut: copies `{nodes[first], nodes[first + 1], nodes[first + 1]}`; two copies on one node, red.
+#[retcd_test]
+fn s1b_ring_placement_places_three_distinct_nodes_and_balances_primaries() {
+    for k in 3..=8u32 {
+        let nodes: Vec<u32> = (1..=k).collect();
+        for count in S1B_COUNTS {
+            let partitions: Vec<Partition> = (1..=count)
+                .map(|p| rdb_core::placement::initial(&nodes, p))
+                .collect();
+            for placed in &partitions {
+                let distinct: BTreeSet<u32> = placed.copies.iter().copied().collect();
+                assert_eq!(distinct.len(), 3, "k={k} p={}: {placed:?}", placed.id);
+                assert!(distinct.iter().all(|n| nodes.contains(n)), "{placed:?}");
+                assert!(placed.copies.contains(&placed.primary), "{placed:?}");
+            }
+            let mut primaries: BTreeMap<u32, usize> = nodes.iter().map(|n| (*n, 0)).collect();
+            let mut copies: BTreeMap<u32, usize> = nodes.iter().map(|n| (*n, 0)).collect();
+            for placed in &partitions {
+                *primaries.get_mut(&placed.primary).expect("a declared node") += 1;
+                for node in &placed.copies {
+                    *copies.get_mut(node).expect("a declared node") += 1;
+                }
+            }
+            if count >= k {
+                assert!(skew(&primaries) <= 1, "k={k} P={count}: {primaries:?}");
+            }
+            assert!(skew(&copies) <= 3, "k={k} P={count}: {copies:?}");
+            let inventory = inv(nodes.iter().map(|n| node(*n)).collect(), partitions);
+            let planned = plan(&inventory, 1_000).expect("a valid inventory");
+            assert!(
+                planned
+                    .steps
+                    .iter()
+                    .all(|step| step.why != Why::Repair(Rule::SameMachine)),
+                "k={k} P={count}: {:?}",
+                planned.steps
+            );
+            assert!(
+                !planned.residuals.iter().any(|residual| matches!(
+                    residual,
+                    Residual::Unrepaired {
+                        rule: Rule::SameMachine,
+                        ..
+                    }
+                )),
+                "k={k} P={count}: {:?}",
+                planned.residuals
+            );
+        }
+    }
+    let five: Vec<u32> = (1..=5).collect();
+    let mut primaries = BTreeMap::<u32, usize>::new();
+    for p in 1..=64 {
+        *primaries
+            .entry(rdb_core::placement::initial(&five, p).primary)
+            .or_default() += 1;
+    }
+    assert_eq!(
+        primaries.into_values().collect::<Vec<_>>(),
+        [13, 13, 13, 13, 12]
+    );
+}
+
+/// #80 S1b row 3: where a partition is placed depends on the node list and on it alone, never
+/// on how many partitions the database has: partition `p` of a database of P partitions sits
+/// where it sits in one of `MAX_PARTITIONS`. So a declaration and every owner writing a
+/// generation-0 record compute the same bytes. Unit.
+/// What it guards is the signature: `initial` takes no count, so no cut inside it can make it
+/// depend on one. A change that adds the count as an input stops this row compiling, and one
+/// that reads it some other way (a partition's place cached from a shorter sweep) is red here.
+#[retcd_test]
+fn s1b_placement_of_a_partition_does_not_depend_on_the_count() {
+    for k in 3..=8u32 {
+        let nodes: Vec<u32> = (1..=k).collect();
+        let most: Vec<Partition> = (1..=rdb_core::partition_map::MAX_PARTITIONS)
+            .map(|p| rdb_core::placement::initial(&nodes, p))
+            .collect();
+        for count in S1B_COUNTS {
+            for p in 1..=count {
+                assert_eq!(
+                    rdb_core::placement::initial(&nodes, p),
+                    most[p as usize - 1],
+                    "k={k} P={count} p={p}"
+                );
+            }
+        }
+    }
+}

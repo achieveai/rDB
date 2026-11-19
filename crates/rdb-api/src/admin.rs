@@ -128,6 +128,59 @@ pub const fn initial_owner(partition: PartitionId) -> NodeId {
     NodeId((partition.0 - 1) % 3 + 1)
 }
 
+/// How many copies every partition has: rf3, at any node count (#80 S1b). Every check that
+/// asks "does the partition hold all its copies" compares with this, never with a node count.
+pub const RF: usize = rdb_core::placement::INITIAL_COPIES;
+
+/// The members a declaration first places `partition` on, every node at `boot` (#80 S1b,
+/// ADR-rdb-0023): [`rdb_core::placement::initial`]'s ring over the declared `nodes`, in node
+/// order, each node's copy number `node - 1`, the Primary role on the ring's primary. Over
+/// [`crate::db::ALL_NODES`] it equals [`members_for`].
+///
+/// # Panics
+///
+/// As [`rdb_core::placement::initial`]: fewer than three nodes, or not in order. Every caller
+/// passes a declared node list, which [`declare`] and [`Formation::decode`] check.
+#[must_use]
+pub fn placed(nodes: &[NodeId], partition: PartitionId, boot: BootId) -> Vec<Member> {
+    let ids: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    let ring = rdb_core::placement::initial(&ids, partition.0);
+    ring.copies
+        .iter()
+        .map(|node| Member {
+            copy: copy_of(NodeId(*node)),
+            node: NodeId(*node),
+            boot,
+            role: if *node == ring.primary {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+        })
+        .collect()
+}
+
+/// The owner a declaration places `partition` with over `nodes` (#80 S1b): the ring's primary.
+/// Over [`crate::db::ALL_NODES`] it equals [`initial_owner`].
+///
+/// # Panics
+///
+/// As [`placed`].
+#[must_use]
+pub fn owner_in(nodes: &[NodeId], partition: PartitionId) -> NodeId {
+    let ids: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    NodeId(rdb_core::placement::initial(&ids, partition.0).primary)
+}
+
+/// The copy number a node's copy takes when it is first placed: `node - 1`, as [`members`]
+/// numbers nodes 1 to 3 (#80 S1b).
+fn copy_of(node: NodeId) -> CopyId {
+    CopyId(
+        u8::try_from(node.0 - 1)
+            .unwrap_or_else(|_| panic!("node {} is past MAX_NODES: no copy number", node.0)),
+    )
+}
+
 /// [`members_at`] for `partition`: each node keeps its copy number, and the Primary role sits on
 /// [`initial_owner`].
 #[must_use]
@@ -250,7 +303,7 @@ pub(crate) async fn form(
         tracing::info!(key = %key, revision = revision.0, partitions, "bootstrap_routes_root");
     }
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
-    let written = write_records(store, &all).await?;
+    let written = write_records(store, &crate::db::ALL_NODES, &all).await?;
     for (partition, revision) in &written {
         let members = members_for(*partition, boot);
         start_recovery(now, boot, *partition, *revision, members, &send)?;
@@ -258,14 +311,17 @@ pub(crate) async fn form(
     Ok(written[0].1)
 }
 
-/// Create the generation-0 record of each of `partitions`, or adopt one an earlier attempt
-/// wrote (issue #79): the half of [`form`] before any plan goes out. Answers each one's revision.
+/// Create the generation-0 record of each of `partitions`, placed over `nodes`, or adopt one an
+/// earlier attempt wrote (issue #79): the half of [`form`] before any plan goes out. Answers
+/// each one's revision. `nodes` is the declared node list, or [`crate::db::ALL_NODES`] for a
+/// database no declaration made (#80 S1b).
 ///
 /// # Errors
 ///
 /// As [`bootstrap`].
 pub(crate) async fn write_records(
     store: &Arc<dyn ConfigStore>,
+    nodes: &[NodeId],
     partitions: &[PartitionId],
 ) -> Result<Vec<(PartitionId, Revision)>, BootstrapError> {
     let mut written = Vec::with_capacity(partitions.len());
@@ -273,18 +329,19 @@ pub(crate) async fn write_records(
         let key = ControlKey::Partition(partition).encode();
         written.push((
             partition,
-            create_or_adopt(store, &key, &initial_record(partition).encode()).await?,
+            create_or_adopt(store, &key, &initial_record(nodes, partition).encode()).await?,
         ));
     }
     Ok(written)
 }
 
-/// The generation-0 record [`write_records`] creates for `partition`, placed as
-/// [`initial_owner`].
-fn initial_record(partition: PartitionId) -> PartitionRecord {
+/// The generation-0 record [`write_records`] creates for `partition`, its owner the one
+/// [`owner_in`] places over `nodes` (#80 S1b). Layout 2, as before S1b: the record names its
+/// owner and no members, so over nodes 1 to 3 its bytes are what they always were.
+fn initial_record(nodes: &[NodeId], partition: PartitionId) -> PartitionRecord {
     PartitionRecord {
         partition,
-        owner: initial_owner(partition),
+        owner: owner_in(nodes, partition),
         generation: Generation(0),
         owner_epoch: OwnerEpoch(0),
         config_version: CONFIG_VERSION,
@@ -317,7 +374,8 @@ async fn create_or_adopt(
     }
 }
 
-/// Send `partition`'s bootstrap plan, pinning `members`, and fence to its [`initial_owner`].
+/// Send `partition`'s bootstrap plan, pinning `members`, and fence to the member they pin
+/// Primary: the placement's owner (#80 S1b).
 fn start_recovery(
     now: Tick,
     boot: BootId,
@@ -326,7 +384,16 @@ fn start_recovery(
     members: Vec<Member>,
     send: &impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
 ) -> Result<(), BootstrapError> {
-    let owner = initial_owner(partition);
+    let owner = members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .map(|member| member.node)
+        .ok_or_else(|| {
+            BootstrapError::Control(format!(
+                "partition {}'s bootstrap plan pins no primary",
+                partition.0
+            ))
+        })?;
     let lineage = Lineage {
         partition,
         generation: Generation(0),
@@ -428,7 +495,7 @@ const RESERVATION_LAYOUT: u8 = 1;
 /// What a declaration asks for (#80 S1a): the database's nodes and its partition count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
-    /// The data nodes. This build declares nodes 1, 2 and 3 only.
+    /// The data nodes: 1 to K, K from 3 to [`crate::db::MAX_NODES`] ([`node_set_refusal`]).
     pub nodes: Vec<NodeId>,
     /// The partition count, fixed from then on.
     pub partitions: u32,
@@ -472,13 +539,19 @@ impl Formation {
         if !tail.is_empty() {
             return None;
         }
+        let nodes: Vec<NodeId> = nodes
+            .iter()
+            .map(|node| NodeId(u32::from_le_bytes(*node)))
+            .collect();
+        // #80 S1b: placement runs over this list, so a list no declaration could write is not
+        // a formation record this build reads.
+        if node_set_refusal(&nodes).is_some() {
+            return None;
+        }
         Some(Self {
             instance: instance.try_into().ok()?,
             partitions: u32::from_le_bytes(partitions.try_into().ok()?),
-            nodes: nodes
-                .iter()
-                .map(|node| NodeId(u32::from_le_bytes(*node)))
-                .collect(),
+            nodes,
         })
     }
 }
@@ -554,6 +627,27 @@ pub enum DeclareError {
     },
 }
 
+/// Why `nodes` is not a node set a declaration takes (#80 S1b), or `None`: nodes 1 to K with no
+/// gap and none twice, K from 3 to [`crate::db::MAX_NODES`]. Ids are never reused, so a
+/// database declared with K nodes may add only `MAX_NODES - K` over its life (ruling C3).
+#[must_use]
+pub fn node_set_refusal(nodes: &[NodeId]) -> Option<String> {
+    let max = crate::db::MAX_NODES;
+    let named: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    let k = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+    if !(3..=max).contains(&k) {
+        return Some(format!(
+            "nodes {named:?}: a database is declared with 3 to {max} nodes"
+        ));
+    }
+    if named.iter().copied().ne(1..=k) {
+        return Some(format!(
+            "nodes {named:?}: a declaration names nodes 1 to K, each once, in order, with no gap"
+        ));
+    }
+    None
+}
+
 /// The formation record, `None` when no declaration wrote one (#80 S1a).
 ///
 /// # Errors
@@ -578,7 +672,7 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
 
 /// Declare a database (#80 S1a, ADR-rdb-0022): first the reservation under
 /// [`RESERVATION_OPERATION`] ([`reserve`]), then `routes/0` at more than one partition, every
-/// partition's generation-0 record ([`write_records`], placement as [`initial_owner`]), then
+/// partition's generation-0 record ([`write_records`], owner as [`owner_in`] places it), then
 /// **last** the formation record under [`FORMATION_OPERATION`], naming a new instance. No copy is
 /// written: each node process forms the partitions it owns from its own empty folder.
 ///
@@ -596,12 +690,8 @@ pub async fn declare(
     store: &Arc<dyn ConfigStore>,
     declaration: &Declaration,
 ) -> Result<Declared, DeclareError> {
-    let wanted = crate::db::ALL_NODES.to_vec();
-    if declaration.nodes != wanted {
-        return Err(DeclareError::Refused(format!(
-            "nodes {:?}: this build declares nodes 1, 2 and 3 only; nothing was written",
-            declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
-        )));
+    if let Some(why) = node_set_refusal(&declaration.nodes) {
+        return Err(DeclareError::Refused(format!("{why}; nothing was written")));
     }
     let max = rdb_core::partition_map::MAX_PARTITIONS;
     if !(1..=max).contains(&declaration.partitions) {
@@ -632,7 +722,7 @@ pub async fn declare(
         return same(found);
     }
     let partitions = declaration.partitions;
-    declare_preflight(&**store, partitions).await?;
+    declare_preflight(&**store, &declaration.nodes, partitions).await?;
     reserve(store, declaration).await?;
     if partitions > 1 {
         let key = ControlKey::Route(RangeId(0)).encode();
@@ -643,7 +733,7 @@ pub async fn declare(
         create_or_adopt(store, &key, &value).await?;
     }
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
-    write_records(store, &all).await?;
+    write_records(store, &declaration.nodes, &all).await?;
     let formation = Formation {
         instance: *uuid::Uuid::new_v4().as_bytes(),
         partitions,
@@ -768,7 +858,11 @@ async fn reserve(
 ///
 /// [`DeclareError::Refused`] naming the record in the way, [`DeclareError::Store`] when the
 /// store fails, [`DeclareError::Undecodable`] for a record this build does not read.
-async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(), DeclareError> {
+async fn declare_preflight(
+    store: &dyn ConfigStore,
+    nodes: &[NodeId],
+    partitions: u32,
+) -> Result<(), DeclareError> {
     let refused = |what: String| {
         DeclareError::Refused(format!(
             "{what}: the store holds part of another database or of another declaration, which \
@@ -825,7 +919,7 @@ async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(
                 "{key} exists and this declaration asks for {partitions} partitions"
             )));
         }
-        if found.value != initial_record(partition).encode()
+        if found.value != initial_record(nodes, partition).encode()
             || found.create_revision != found.mod_revision
         {
             return Err(refused(format!(
@@ -1576,6 +1670,9 @@ pub(crate) struct HealCtx {
     pub(crate) partitions: Vec<PartitionId>,
     /// How many partitions the database has: what a frozen grant's next step says depends on it.
     pub(crate) partition_count: u32,
+    /// The nodes partitions are placed over (#80 S1b): the formation record's, or nodes 1 to 3
+    /// for a database no declaration made. A partition still to form pins [`placed`] over them.
+    pub(crate) nodes: Arc<[NodeId]>,
     /// The partitions of that node still to form, each with its record's revision (design 7.2):
     /// their plans go out after the clear, so a bootstrap F1 cannot acquire before it.
     pub(crate) bootstrap: Vec<(PartitionId, Revision)>,
@@ -1626,7 +1723,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         .bootstrap
         .iter()
         .map(|(partition, _)| {
-            members_for(*partition, BOOT)
+            placed(&ctx.nodes, *partition, BOOT)
                 .iter()
                 .map(RecordMember::of)
                 .collect()
@@ -1952,6 +2049,7 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
             member_boot: Arc::clone(&ctx.member_boot),
             partitions: ctx.partitions.clone(),
             bootstrap: ctx.bootstrap.clone(),
+            nodes: Arc::clone(&ctx.nodes),
             ..ctx
         };
         match heal(again).await {
@@ -4563,6 +4661,7 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store,
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -4822,6 +4921,58 @@ mod tests {
         assert!(sent.is_empty(), "{} messages sent", sent.len());
     }
 
+    /// #80 S1b (risk: K = 3 bytes or members move): over nodes 1 to 3 the ring places every
+    /// partition a database may have exactly as before S1b. `placed` is `members_for`,
+    /// `owner_in` is `initial_owner`, and each generation-0 record is byte for byte the record
+    /// the pre-S1b `initial_record` wrote (its owner `initial_owner`), so a store declared or
+    /// formed before S1b still passes `declare_preflight` and adopts. Two records are pinned as
+    /// literal layout-2 bytes: partition 5 over nodes 1 to 3 (owner 2) and over nodes 1 to 5
+    /// (owner 5). Unit.
+    /// Cut: `placed` numbers copies from 0 in ring order instead of `node - 1`; partition 2's
+    /// members differ, red.
+    #[test]
+    fn s1b_placement_over_nodes_one_to_three_is_unchanged_and_its_records_keep_their_bytes() {
+        let three = crate::db::ALL_NODES;
+        for p in 1..=rdb_core::partition_map::MAX_PARTITIONS {
+            let partition = PartitionId(p);
+            assert_eq!(
+                placed(&three, partition, BOOT),
+                members_for(partition, BOOT)
+            );
+            assert_eq!(owner_in(&three, partition), initial_owner(partition));
+            let before = PartitionRecord {
+                partition,
+                owner: initial_owner(partition),
+                generation: Generation(0),
+                owner_epoch: OwnerEpoch(0),
+                config_version: CONFIG_VERSION,
+                lifecycle: PartitionLifecycle::Serving,
+            };
+            assert_eq!(
+                initial_record(&three, partition).encode(),
+                before.encode(),
+                "partition {p}"
+            );
+        }
+        let five: Vec<NodeId> = (1..=5).map(NodeId).collect();
+        let layout_2 = |owner: u8| {
+            let mut bytes = vec![2, 5, 0, 0, 0, owner, 0, 0, 0];
+            bytes.extend_from_slice(&[0; 8]); // generation 0
+            bytes.extend_from_slice(&[0; 8]); // owner epoch 0
+            bytes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]); // config version 1
+            bytes.push(0); // Serving
+            bytes
+        };
+        assert_eq!(
+            initial_record(&three, PartitionId(5)).encode().as_ref(),
+            layout_2(2)
+        );
+        assert_eq!(
+            initial_record(&five, PartitionId(5)).encode().as_ref(),
+            layout_2(5)
+        );
+    }
+
     /// PR #138 review: the formation record and the declaration's reservation are written once
     /// and read by every later build, so their keys and layout-1 bytes are pinned as literals, as
     /// are the key and bytes of the counter a declaration creates (r5):
@@ -4987,6 +5138,7 @@ mod tests {
             let (owner, mailbox) = std::sync::mpsc::channel();
             let ctx = HealCtx {
                 partition_count: 2,
+                nodes: crate::db::ALL_NODES.into(),
                 store,
                 boot: OPEN_2,
                 budgets: Budgets::SPEC_DEFAULTS,
@@ -6400,6 +6552,7 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -6838,6 +6991,7 @@ mod tests {
         drop(mailbox);
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -7734,6 +7888,7 @@ mod tests {
         let within = Duration::from_secs(10);
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::new(config_testkit::MemStore::new()),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,

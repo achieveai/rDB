@@ -16,10 +16,15 @@ const PARTITIONS: u32 = 8;
 struct Proc {
     node: NodeId,
     db: Db,
-    _net: Arc<Net>,
+    /// `None` once [`Rig::stop`] took the node down: its listener and links are gone.
+    _net: Option<Arc<Net>>,
     dir: PathBuf,
     /// The `TempDir` that removes `dir` when dropped.
     _dir: Box<dyn std::any::Any>,
+    /// This process's own runtime when the rig gives each one its own (#80 S1b): dropped,
+    /// it ends every task the process ran, its peers' accepted links included, as a process
+    /// exit does. Last, so it outlives the `Db` and net that run on it.
+    own_rt: Option<tokio::runtime::Runtime>,
 }
 
 struct Rig {
@@ -28,6 +33,16 @@ struct Rig {
     cert_dir: PathBuf,
     _cert_dir: Box<dyn std::any::Any>,
     procs: Vec<Proc>,
+    /// How many nodes the rig runs: nodes 1 to `k` (#80 S1b).
+    k: u32,
+    /// The timeouts [`Rig::open_all`] opens every node with.
+    timeouts: Timeouts,
+    /// Whether [`Rig::open_all`] runs each process on a runtime of its own, so that
+    /// [`Rig::stop`] and [`Rig::restart`] end it as a process exit would (#80 S1b).
+    own_runtimes: bool,
+    /// Where each node listens once [`Rig::open_all`] has bound them: node N on 127.0.0.N, so
+    /// every node of the rig is a different host on one machine (#80 S1b ruling 1).
+    addrs: BTreeMap<NodeId, String>,
 }
 
 impl Drop for Rig {
@@ -39,13 +54,18 @@ impl Drop for Rig {
 }
 
 fn declaration() -> admin::Declaration {
+    declaration_of(3, PARTITIONS)
+}
+
+/// A declaration of nodes 1 to `k` and `partitions` partitions (#80 S1b).
+fn declaration_of(k: u32, partitions: u32) -> admin::Declaration {
     admin::Declaration {
-        nodes: ALL_NODES.to_vec(),
-        partitions: PARTITIONS,
+        nodes: (1..=k).map(NodeId).collect(),
+        partitions,
     }
 }
 
-/// Open `node`'s process on `dir` alone, linked to the other two at `addrs`.
+/// Open `node`'s process on `dir` alone, linked to every other node of `addrs`.
 fn open_node(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
@@ -54,6 +74,30 @@ fn open_node(
     dir: &Path,
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
+) -> Result<(Db, Arc<Net>), OpenError> {
+    open_node_with(
+        rt,
+        store,
+        cert_dir,
+        node,
+        dir,
+        listener,
+        addrs,
+        Timeouts::default(),
+    )
+}
+
+/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop).
+#[allow(clippy::too_many_arguments)]
+fn open_node_with(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
@@ -64,7 +108,7 @@ fn open_node(
             tls: certs::load(cert_dir, &label).expect("node certs"),
             label,
             boot,
-            peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
+            peers: addrs.keys().copied().filter(|n| *n != node).collect(),
             dial: NetConfig::dial_lower(node, addrs),
             protocol_version: PROTOCOL_VERSION,
             admin_apps: BTreeSet::new(),
@@ -79,6 +123,7 @@ fn open_node(
             local: vec![node],
             links: Some(links),
             boot: Some(boot),
+            timeouts,
             ..config(dir)
         },
         Arc::clone(store),
@@ -88,27 +133,37 @@ fn open_node(
     Ok((db, net))
 }
 
-/// Listeners for nodes 1 to 3, and the address each is reached at.
+/// Listeners for nodes 1 to `k`, node N on 127.0.0.N at a port from the test range, and the
+/// address each is reached at (#80 S1b: one machine, `k` hosts).
 fn listeners(
     rt: &tokio::runtime::Runtime,
+    k: u32,
 ) -> (Vec<tokio::net::TcpListener>, BTreeMap<NodeId, String>) {
-    let listeners: Vec<tokio::net::TcpListener> = ALL_NODES
-        .iter()
-        .map(|_| rt.block_on(config_testkit::ports::ephemeral_listener()).0)
+    let listeners: Vec<tokio::net::TcpListener> = (1..=k)
+        .map(|n| {
+            let host = std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(n).expect("a node id"));
+            rt.block_on(config_testkit::ports::ephemeral_listener_on(host))
+                .0
+        })
         .collect();
-    let addrs = ALL_NODES
-        .iter()
+    let addrs = (1..=k)
+        .map(NodeId)
         .zip(&listeners)
-        .map(|(node, listener)| (*node, listener.local_addr().expect("bound").to_string()))
+        .map(|(node, listener)| (node, listener.local_addr().expect("bound").to_string()))
         .collect();
     (listeners, addrs)
 }
 
 /// A runtime, `store` and certificates for nodes 1 to 3; no node process yet.
 fn bare_rig(store: Arc<dyn ConfigStore>) -> Rig {
+    bare_rig_of(store, 3)
+}
+
+/// A runtime, `store` and certificates for nodes 1 to `k`; no node process yet.
+fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
     let rt = runtime();
     let cert_dir = config_testkit::fs::temp_dir();
-    let labels: Vec<Label> = ALL_NODES.iter().map(|node| Label::Node(*node)).collect();
+    let labels: Vec<Label> = (1..=k).map(|node| Label::Node(NodeId(node))).collect();
     certs::generate(cert_dir.path(), &labels).expect("certs");
     Rig {
         rt,
@@ -116,6 +171,10 @@ fn bare_rig(store: Arc<dyn ConfigStore>) -> Rig {
         cert_dir: cert_dir.path().to_path_buf(),
         _cert_dir: Box::new(cert_dir),
         procs: Vec::new(),
+        k,
+        timeouts: Timeouts::default(),
+        own_runtimes: false,
+        addrs: BTreeMap::new(),
     }
 }
 
@@ -138,7 +197,12 @@ fn folder() -> Folder {
 
 /// Three new empty folders, for nodes 1 to 3.
 fn fresh_dirs() -> Vec<Folder> {
-    ALL_NODES.iter().map(|_| folder()).collect()
+    fresh_dirs_of(3)
+}
+
+/// `k` new empty folders, for nodes 1 to `k`.
+fn fresh_dirs_of(k: u32) -> Vec<Folder> {
+    (1..=k).map(|_| folder()).collect()
 }
 
 /// Every record in `store`: key, value, create and mod revision, in key order. Equal snapshots
@@ -215,33 +279,38 @@ impl Rig {
         }
     }
 
-    /// Open nodes 1 to 3, each on its folder in `dirs`, in that order; none waited on yet.
+    /// Open nodes 1 to `k`, each on its folder in `dirs`, in that order; none waited on yet.
     fn open_all(&mut self, dirs: Vec<Folder>) {
-        let (listeners, addrs) = listeners(&self.rt);
-        for ((node, listener), (dir, keep)) in ALL_NODES.iter().zip(listeners).zip(dirs) {
-            let (db, net) = open_node(
-                &self.rt,
+        let (listeners, addrs) = listeners(&self.rt, self.k);
+        let nodes: Vec<NodeId> = addrs.keys().copied().collect();
+        for ((node, listener), (dir, keep)) in nodes.iter().zip(listeners).zip(dirs) {
+            let own_rt = self.own_runtimes.then(runtime);
+            let (db, net) = open_node_with(
+                own_rt.as_ref().unwrap_or(&self.rt),
                 &self.store,
                 &self.cert_dir,
                 *node,
                 &dir,
                 listener,
                 &addrs,
+                self.timeouts,
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
                 node: *node,
                 db,
-                _net: net,
+                _net: Some(net),
                 dir,
                 _dir: keep,
+                own_rt,
             });
         }
+        self.addrs = addrs;
     }
 
     /// Open `node`'s process once more on its folder, alone, the others down.
     fn reopen(&self, node: NodeId) -> Result<(Db, Arc<Net>), OpenError> {
-        let (mut listeners, addrs) = listeners(&self.rt);
+        let (mut listeners, addrs) = listeners(&self.rt, self.k);
         open_node(
             &self.rt,
             &self.store,
@@ -285,7 +354,7 @@ impl Rig {
         for proc in &mut self.procs {
             proc.db.shutdown();
         }
-        let (listeners, addrs) = listeners(&self.rt);
+        let (listeners, addrs) = listeners(&self.rt, self.k);
         for (proc, listener) in self.procs.iter_mut().zip(listeners) {
             let (db, net) = open_node(
                 &self.rt,
@@ -298,7 +367,7 @@ impl Rig {
             )
             .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", proc.node.0));
             proc.db = db;
-            proc._net = net;
+            proc._net = Some(net);
         }
     }
 }
@@ -417,21 +486,24 @@ fn s1a_restart_of_each_node_reopens_its_own_folder() {
 }
 
 /// S1a: `declare` is write-once. The same declaration again answers `Already` with the same
-/// instance; another partition count, or nodes other than 1 to 3, is refused, before and after
-/// the declaration. None of the later calls writes anything: every record's bytes and create and
+/// instance; another partition count, or another node set, is refused, before and after the
+/// declaration. None of the later calls writes anything: every record's bytes and create and
 /// mod revisions are as they were (PR #138 review: an identical-byte rewrite would pass a
 /// compare of the decoded record). Unit (<100 ms, an in-memory store).
+/// #80 S1b changed what this row pins: four nodes are now a valid declaration, so before the
+/// declaration a node set with a gap (1, 2, 4) is the refused one, and after it four nodes are
+/// refused because they are not the declared three.
 #[config_log::retcd_test]
 fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let four = admin::Declaration {
-        nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+    let gap = admin::Declaration {
+        nodes: vec![NodeId(1), NodeId(2), NodeId(4)],
         partitions: PARTITIONS,
     };
-    let refused = rt.block_on(admin::declare(&store, &four));
+    let refused = rt.block_on(admin::declare(&store, &gap));
     assert!(
-        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
+        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes [1, 2, 4]")),
         "{refused:?}"
     );
     assert!(snapshot(&rt, &*store).is_empty(), "nothing was written");
@@ -476,9 +548,14 @@ fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
         "another count wrote nothing"
     );
 
+    let four = admin::Declaration {
+        nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+        partitions: PARTITIONS,
+    };
     let refused = rt.block_on(admin::declare(&store, &four));
     assert!(
-        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
+        matches!(&refused, Err(admin::DeclareError::Refused(text))
+            if text.contains("already declared with 8 partitions and nodes [1, 2, 3]")),
         "{refused:?}"
     );
     assert_eq!(snapshot(&rt, &*store), declared, "four nodes wrote nothing");
@@ -1028,7 +1105,7 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     );
 
     let (kept_dir, keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt);
+    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let refused = open_node(
         &rig.rt,
         &rig.store,
@@ -1171,7 +1248,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
         refuse: std::sync::atomic::AtomicBool::new(false),
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
-    let (listeners, addrs) = listeners(&rig.rt);
+    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let mut listeners: Vec<Option<tokio::net::TcpListener>> =
         listeners.into_iter().map(Some).collect();
     let dirs = fresh_dirs();
@@ -1248,9 +1325,10 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
         rig.procs.push(Proc {
             node,
             db,
-            _net: net,
+            _net: Some(net),
             dir,
             _dir: keep,
+            own_rt: None,
         });
     }
     rig.wait_ready();
@@ -1376,7 +1454,7 @@ fn s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused()
         let before = snapshot(&rig.rt, &*rig.store);
         assert!(!keys(&before).contains(&gone), "{gone} is gone");
         let (dir, _keep) = folder();
-        let (listeners, addrs) = listeners(&rig.rt);
+        let (listeners, addrs) = listeners(&rig.rt, rig.k);
         let opened = open_node(
             &rig.rt,
             &rig.store,
@@ -1607,7 +1685,7 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
     let dirs = fresh_dirs();
-    let (listeners, addrs) = listeners(&rig.rt);
+    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let mut listeners: Vec<Option<tokio::net::TcpListener>> =
         listeners.into_iter().map(Some).collect();
     assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
@@ -1680,7 +1758,7 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     assert!(!keys(&before).contains(&counter), "{counter} is gone");
     for node in [NodeId(2), NodeId(3), NodeId(1)] {
         let dir = &dirs[node.0 as usize - 1].0;
-        let (listeners, addrs) = self::listeners(&rig.rt);
+        let (listeners, addrs) = self::listeners(&rig.rt, rig.k);
         let opened = open_node(
             &rig.rt,
             &rig.store,
@@ -2129,7 +2207,7 @@ fn s1a_counter_deleted_after_lost_create_is_not_recreated() {
     });
     let raced: Arc<dyn ConfigStore> = race.clone();
     let (dir, _keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt);
+    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let opened = open_node(
         &rig.rt,
         &raced,
@@ -2182,7 +2260,7 @@ fn s1a_a_declared_restart_with_its_counter_gone_before_any_root_is_refused() {
     let gated_store: Arc<dyn ConfigStore> = gated;
     let dirs = fresh_dirs();
     let open = |store: &Arc<dyn ConfigStore>, node: NodeId| {
-        let (listeners, addrs) = listeners(&rig.rt);
+        let (listeners, addrs) = listeners(&rig.rt, rig.k);
         open_node(
             &rig.rt,
             store,
@@ -2285,5 +2363,357 @@ fn s1a_a_declared_store_still_forming_names_its_node_processes_never_form() {
                  --declare again"
             ),
         "{undeclared}"
+    );
+}
+
+// ---- #80 S1b: more than three nodes, placed on a ring (ADR-rdb-0023) ----
+
+/// Declare nodes 1 to `k` and `partitions`, then open each on a new empty folder of its own,
+/// node N listening on 127.0.0.N; none waited on yet.
+fn declared_rig_of(k: u32, partitions: u32) -> Rig {
+    declared_rig_with(k, partitions, false)
+}
+
+/// [`declared_rig_of`], each process on a runtime of its own when `own_runtimes`.
+fn declared_rig_with(k: u32, partitions: u32, own_runtimes: bool) -> Rig {
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), k);
+    rig.own_runtimes = own_runtimes;
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &declaration_of(k, partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration of {k} nodes is written: {other:?}"),
+    }
+    rig.open_all(fresh_dirs_of(k));
+    rig
+}
+
+/// Where the ring places `partition` over nodes 1 to `k`.
+fn ring(k: u32, partition: u32) -> rdb_core::placement::Partition {
+    let nodes: Vec<u32> = (1..=k).collect();
+    rdb_core::placement::initial(&nodes, partition)
+}
+
+/// The partitions `node`'s copy in `dir` holds a lineage of, read from its engine after the
+/// process is shut down.
+fn held_partitions(dir: &Path, node: NodeId) -> BTreeSet<u32> {
+    let engine = RocksEngine::open_with(
+        dir.join("nodes").join(node.0.to_string()),
+        crate::StorageOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("node {}'s copy opens: {e}", node.0));
+    engine
+        .lineages()
+        .into_iter()
+        .map(|(partition, _)| partition.0)
+        .collect()
+}
+
+impl Rig {
+    /// Take `node`'s process down, the others running: shut its `Db` down and drop its net, so
+    /// its listener and every link to it are gone. [`Rig::restart`] brings it back.
+    fn stop(&mut self, node: NodeId) {
+        let proc = &mut self.procs[node.0 as usize - 1];
+        proc.db.shutdown();
+        proc._net = None;
+        if let Some(rt) = proc.own_rt.take() {
+            rt.shutdown_background();
+        }
+    }
+
+    /// Restart `node`'s process on its own folder and its own address, the others running:
+    /// shut it down, let go of its listener, bind the same address again, open again.
+    fn restart(&mut self, node: NodeId, timeouts: Timeouts) {
+        let at = node.0 as usize - 1;
+        let Proc {
+            node,
+            mut db,
+            _net,
+            dir,
+            _dir,
+            own_rt,
+        } = self.procs.remove(at);
+        db.shutdown();
+        drop(db);
+        // The old net holds the listener until it is dropped and its tasks end; its own
+        // runtime, dropped, ends every task it ran, as the process's exit would.
+        drop(_net);
+        if let Some(rt) = own_rt {
+            rt.shutdown_background();
+        }
+        let own_rt = self.own_runtimes.then(runtime);
+        let rt = own_rt.as_ref().unwrap_or(&self.rt);
+        let addr: std::net::SocketAddr = self.addrs[&node].parse().expect("an address");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let listener = loop {
+            match rt.block_on(tokio::net::TcpListener::bind(addr)) {
+                Ok(listener) => break listener,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "rebind {addr}: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let (db, net) = open_node_with(
+            rt,
+            &self.store,
+            &self.cert_dir,
+            node,
+            &dir,
+            listener,
+            &self.addrs,
+            timeouts,
+        )
+        .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
+        self.procs.insert(
+            at,
+            Proc {
+                node,
+                db,
+                _net: Some(net),
+                dir,
+                _dir,
+                own_rt,
+            },
+        );
+    }
+}
+
+/// The node count and partition count the S1b integration rows declare.
+const S1B_K: u32 = 5;
+const S1B_P: u32 = 16;
+
+/// #80 S1b row 11, acceptance: five nodes declared, each node process on its own empty folder
+/// and its own host on this machine (127.0.0.1 to 127.0.0.5), sixteen partitions. Every node
+/// becomes ready; each partition's route names the ring's primary, and a put through it reads
+/// back; each node's copy holds exactly the partitions the ring places on it and no other, so
+/// nodes 4 and 5 hold partitions and no node holds every partition; and each folder holds only
+/// its own copy. Integration (~5 s): one formation of 16 partitions over five processes' links.
+/// Red before S1b: `declare` refuses five nodes. Cut: the heal's forming members back to
+/// `members_for` (nodes 1 to 3): partition 4's plan pins node 1 primary, and its route names
+/// node 1, not node 4, red at the route.
+#[config_log::retcd_test]
+fn s1b_five_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    let mut rig = declared_rig_of(S1B_K, S1B_P);
+    rig.wait_ready();
+    for partition in 1..=S1B_P {
+        let owner = NodeId(ring(S1B_K, partition).primary);
+        let db = rig.of(owner);
+        let group = group_of(db, partition);
+        let route = db.route(group).expect("a route");
+        assert_eq!(
+            (route.partition, route.owner),
+            (PartitionId(partition), owner),
+            "{route:?}"
+        );
+        let key = format!("k{partition}");
+        let put = put_lands(db, group, key.as_bytes(), b"v");
+        assert_eq!(put.partition, PartitionId(partition), "{put:?}");
+        let got = db.get_in(group, key.as_bytes()).expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"v"[..]),
+            "{got:?}"
+        );
+    }
+    rig.shutdown_all();
+    for proc in &rig.procs {
+        assert_eq!(
+            copies_in(&proc.dir),
+            [proc.node.0.to_string()],
+            "node {}'s folder holds only its own copy",
+            proc.node.0
+        );
+        let placed: BTreeSet<u32> = (1..=S1B_P)
+            .filter(|p| ring(S1B_K, *p).copies.contains(&proc.node.0))
+            .collect();
+        assert!(!placed.is_empty(), "node {} is placed", proc.node.0);
+        assert!(placed.len() < S1B_P as usize, "node {}", proc.node.0);
+        assert_eq!(
+            held_partitions(&proc.dir, proc.node),
+            placed,
+            "node {} holds exactly what the ring places on it",
+            proc.node.0
+        );
+    }
+}
+
+/// #80 S1b row 12: each of five node processes restarted on its own folder, the others
+/// running, reopens its copy and serves what was written before; nodes 4 and 5 hold no copy of
+/// partition 1, so their reopen decides partition 1 from the record alone. New puts land after.
+/// A rolling restart: each node is ready again before the next stops, since a recovery that
+/// loses a copy mid-barrier stops for that open by design. Integration (~10 s): a formation,
+/// then five restarts one by one.
+/// Cut: `Db::check`'s owner of a still-forming partition 1 is not the ring's: it holds as at
+/// S1a for partition 1 (node 1 at every K), so this row is red only through the cuts it shares
+/// with row 11; what it adds is the reopen of a node holding no partition 1.
+#[config_log::retcd_test]
+fn s1b_restart_of_each_of_five_nodes_reopens_its_own_folder() {
+    let mut rig = declared_rig_with(S1B_K, S1B_P, true);
+    rig.wait_ready();
+    let groups: Vec<(u32, AffinityId)> = (1..=S1B_P)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    for (partition, group) in &groups {
+        let owner = rig.of(NodeId(ring(S1B_K, *partition).primary));
+        put_lands(owner, *group, b"before", b"1");
+    }
+    for node in (1..=S1B_K).map(NodeId) {
+        rig.restart(node, Timeouts::default());
+        rig.wait_ready();
+    }
+    for (partition, group) in &groups {
+        let owner = rig.of(NodeId(ring(S1B_K, *partition).primary));
+        let got = owner.get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(owner, *group, b"after", b"2");
+    }
+    rig.shutdown_all();
+    for node in [NodeId(4), NodeId(5)] {
+        let held = held_partitions(&rig.procs[node.0 as usize - 1].dir, node);
+        assert!(!held.contains(&1), "node {} holds {held:?}", node.0);
+    }
+    for proc in &rig.procs {
+        assert_eq!(copies_in(&proc.dir), [proc.node.0.to_string()]);
+    }
+}
+
+/// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
+fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(partition)).encode()),
+        }))
+        .expect("the store answers");
+    read.record
+        .and_then(|found| RecordMember::decode_all(&found.value))
+        .map(|members| members.iter().map(|member| member.node.0).collect())
+        .unwrap_or_default()
+}
+
+/// Poll `partitions/{partition}`'s pinned nodes until `done` holds of them, and answer every
+/// set seen on the way, the last one included. Panics after `within`.
+fn pins_until(
+    rig: &Rig,
+    partition: u32,
+    within: Duration,
+    what: &str,
+    done: impl Fn(&BTreeSet<u32>) -> bool,
+) -> Vec<BTreeSet<u32>> {
+    let deadline = Instant::now() + crate::host::test_patience(within);
+    let mut seen = Vec::new();
+    loop {
+        let now = pinned_nodes(rig, partition);
+        if seen.last() != Some(&now) {
+            seen.push(now.clone());
+        }
+        if done(&now) {
+            return seen;
+        }
+        assert!(Instant::now() < deadline, "{what}: pins seen {seen:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// #80 S1b row 13: partition 2 is placed on nodes 2, 3 and 4. Node 4 goes down and its owner,
+/// node 2, drops it after the unreachable clock. Node 2 then restarts, which empties what it
+/// remembered was left out, while node 4 is still down. Node 4 comes back (owner 2 relearns it
+/// at that boot, the seat the ring placed it on) and restarts once more, and owner 2 pins it
+/// again. Node 1, which the ring never placed partition 2 on, is never pinned. Each process
+/// runs on its own runtime, so a stop ends its links as a process exit does. Integration
+/// (~15 s): a formation, a 2 s drop clock, three restarts.
+/// Cut: `Host::restore_left_out`'s seats back to `admin::members()` (nodes 1 to 3): owner 2
+/// relearns node 1, whose copy slot 0 is free, and never node 4: red at the wait for
+/// `left_out_restored` of node 4.
+#[config_log::retcd_test]
+fn s1b_a_dropped_copy_outside_nodes_one_to_three_is_restored_after_an_owner_restart() {
+    const PARTITION_2: u32 = 2;
+    let fast_drop = Timeouts {
+        unreachable_drop_after: Duration::from_secs(2),
+        ..Timeouts::default()
+    };
+    assert_eq!(ring(S1B_K, PARTITION_2).copies, [2, 3, 4]);
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), S1B_K);
+    rig.timeouts = fast_drop;
+    rig.own_runtimes = true;
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &declaration_of(S1B_K, S1B_P)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("declared: {other:?}"),
+    }
+    rig.open_all(fresh_dirs_of(S1B_K));
+    rig.wait_ready();
+    let group = group_of(rig.of(NodeId(2)), PARTITION_2);
+    put_lands(rig.of(NodeId(2)), group, b"before", b"1");
+    let mut seen = pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(10),
+        "formed",
+        |pins| *pins == BTreeSet::from([2, 3, 4]),
+    );
+
+    rig.stop(NodeId(4));
+    seen.extend(pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(30),
+        "owner 2 drops node 4",
+        |pins| *pins == BTreeSet::from([2, 3]),
+    ));
+    // Owner 2's other partitions are on nodes 2, 3 and 4 too: its heal after the restart waits
+    // for every member it pins, so each must have dropped node 4 first.
+    for other in (1..=S1B_P).filter(|p| *p != PARTITION_2 && ring(S1B_K, *p).primary == 2) {
+        assert_eq!(ring(S1B_K, other).copies, [2, 3, 4], "partition {other}");
+        pins_until(
+            &rig,
+            other,
+            Duration::from_secs(30),
+            "owner 2 drops node 4",
+            |pins| *pins == BTreeSet::from([2, 3]),
+        );
+    }
+    rig.restart(NodeId(2), fast_drop);
+    rig.of(NodeId(2))
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("owner 2 is ready again on nodes 2 and 3");
+    rig.restart(NodeId(4), fast_drop);
+    let relearned = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while !config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "s1b_a_dropped_copy_outside_nodes_one_to_three_is_restored_after_an_owner_restart",
+    )
+    .iter()
+    .any(|line| line["@m"] == "left_out_restored" && line["left_out"] == 4)
+    {
+        assert!(Instant::now() < relearned, "owner 2 never relearned node 4");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rig.restart(NodeId(4), fast_drop);
+    seen.extend(pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(30),
+        "owner 2 pins node 4 again",
+        |pins| pins.contains(&4),
+    ));
+    assert!(
+        seen.iter().all(|pins| !pins.contains(&1)),
+        "node 1 is never pinned in partition 2: {seen:?}"
+    );
+    rig.wait_ready();
+    let got = rig.of(NodeId(2)).get_in(group, b"before").expect("a get");
+    assert_eq!(
+        got.value.as_ref().map(|(_, value)| &value[..]),
+        Some(&b"1"[..]),
+        "{got:?}"
     );
 }
