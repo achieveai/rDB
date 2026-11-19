@@ -607,6 +607,18 @@ fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> Da
     let node = harness.nodes[index].clone();
     // #141: keep the reserved peer listener as the holder. Dropping it and binding again left
     // the port free in between, and another reservation could take it (AddrInUse).
+    // A clone of the reserved peer listener keeps the port bound across the handover, so a
+    // helper that drops the reservation and binds again fails here instead of passing whenever
+    // the port happens to be free.
+    let continuity = node
+        .reserved
+        .lock()
+        .expect("reservation lock")
+        .as_ref()
+        .expect("the node's ports are still reserved")
+        .0
+        .try_clone()
+        .expect("clone the reserved peer listener");
     let (holder, client) = node
         .reserved
         .lock()
@@ -619,6 +631,7 @@ fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> Da
         node.peer,
         "the reserved listener holds the node's peer port"
     );
+    drop(continuity);
 
     let log_file = support::log_file(&node);
     let node_id = node.node_id;
