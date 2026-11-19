@@ -252,7 +252,8 @@ pub(crate) async fn form(
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
     let written = write_records(store, &all).await?;
     for (partition, revision) in &written {
-        start_recovery(now, boot, *partition, *revision, &send)?;
+        let members = members_for(*partition, boot);
+        start_recovery(now, boot, *partition, *revision, members, &send)?;
     }
     Ok(written[0].1)
 }
@@ -269,21 +270,26 @@ pub(crate) async fn write_records(
 ) -> Result<Vec<(PartitionId, Revision)>, BootstrapError> {
     let mut written = Vec::with_capacity(partitions.len());
     for partition in partitions.iter().copied() {
-        let record = PartitionRecord {
-            partition,
-            owner: initial_owner(partition),
-            generation: Generation(0),
-            owner_epoch: OwnerEpoch(0),
-            config_version: CONFIG_VERSION,
-            lifecycle: PartitionLifecycle::Serving,
-        };
         let key = ControlKey::Partition(partition).encode();
         written.push((
             partition,
-            create_or_adopt(store, &key, &record.encode()).await?,
+            create_or_adopt(store, &key, &initial_record(partition).encode()).await?,
         ));
     }
     Ok(written)
+}
+
+/// The generation-0 record [`write_records`] creates for `partition`, placed as
+/// [`initial_owner`].
+fn initial_record(partition: PartitionId) -> PartitionRecord {
+    PartitionRecord {
+        partition,
+        owner: initial_owner(partition),
+        generation: Generation(0),
+        owner_epoch: OwnerEpoch(0),
+        config_version: CONFIG_VERSION,
+        lifecycle: PartitionLifecycle::Serving,
+    }
 }
 
 /// Create `key` with `value`, or adopt it when an earlier attempt's create landed (F-004).
@@ -311,12 +317,13 @@ async fn create_or_adopt(
     }
 }
 
-/// Send `partition`'s bootstrap plan and fence to its [`initial_owner`].
+/// Send `partition`'s bootstrap plan, pinning `members`, and fence to its [`initial_owner`].
 fn start_recovery(
     now: Tick,
     boot: BootId,
     partition: PartitionId,
     revision: Revision,
+    members: Vec<Member>,
     send: &impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
 ) -> Result<(), BootstrapError> {
     let owner = initial_owner(partition);
@@ -333,7 +340,7 @@ fn start_recovery(
     let plan = recovery_plan(
         anchor,
         CONFIG_VERSION,
-        members_for(partition, boot),
+        members,
         boot,
         GrantId(1),
         AuthorityGeneration(1),
@@ -401,6 +408,436 @@ async fn adopt(
     Ok(Revision(found.mod_revision))
 }
 
+/// The `operations/` key of the formation record (#80 S1a, ADR-rdb-0022): tag `0x00E0` in bits
+/// 48..64, apart from the promote tag and F1's, as [`PROMOTE_OPERATION_BASE`] is.
+pub const FORMATION_OPERATION: OperationId = OperationId(0x00E0 << 48);
+
+/// The version byte of the formation record: layout 1 is the instance, the partition count as
+/// a little-endian u32, then one little-endian u32 per declared node.
+const FORMATION_LAYOUT: u8 = 1;
+
+/// The `operations/` key of the declaration's reservation (PR #138 review, ADR-rdb-0022): the
+/// formation record's tag block, one past it. [`declare`] creates it before any other write, so
+/// of two declarations of different counts exactly one goes on to write.
+pub const RESERVATION_OPERATION: OperationId = OperationId(FORMATION_OPERATION.0 + 1);
+
+/// The version byte of the reservation: layout 1 is the partition count as a little-endian
+/// u32, then one little-endian u32 per declared node.
+const RESERVATION_LAYOUT: u8 = 1;
+
+/// What a declaration asks for (#80 S1a): the database's nodes and its partition count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// The data nodes. This build declares nodes 1, 2 and 3 only.
+    pub nodes: Vec<NodeId>,
+    /// The partition count, fixed from then on.
+    pub partitions: u32,
+}
+
+/// The formation record a declaration wrote: the database's identity, its partition count and
+/// its nodes. Written once and never changed (ADR-rdb-0022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Formation {
+    /// The rDB instance every node's copy binds.
+    pub instance: [u8; INSTANCE_LEN],
+    /// The partition count.
+    pub partitions: u32,
+    /// The declared nodes, in order.
+    pub nodes: Vec<NodeId>,
+}
+
+impl Formation {
+    /// Layout 1 ([`FORMATION_LAYOUT`]).
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut out = Vec::with_capacity(1 + INSTANCE_LEN + 4 + 4 * self.nodes.len());
+        out.push(FORMATION_LAYOUT);
+        out.extend_from_slice(&self.instance);
+        out.extend_from_slice(&self.partitions.to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&node.0.to_le_bytes());
+        }
+        Bytes::from(out)
+    }
+
+    /// `None` for a body that is not layout 1.
+    #[must_use]
+    pub fn decode(body: &[u8]) -> Option<Self> {
+        let [FORMATION_LAYOUT, rest @ ..] = body else {
+            return None;
+        };
+        let (instance, rest) = rest.split_at_checked(INSTANCE_LEN)?;
+        let (partitions, rest) = rest.split_at_checked(4)?;
+        let (nodes, tail) = rest.as_chunks::<4>();
+        if !tail.is_empty() {
+            return None;
+        }
+        Some(Self {
+            instance: instance.try_into().ok()?,
+            partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+            nodes: nodes
+                .iter()
+                .map(|node| NodeId(u32::from_le_bytes(*node)))
+                .collect(),
+        })
+    }
+}
+
+impl Declaration {
+    /// The reservation's body, layout 1 ([`RESERVATION_LAYOUT`]).
+    #[must_use]
+    pub fn encode_reservation(&self) -> Bytes {
+        let mut out = Vec::with_capacity(1 + 4 + 4 * self.nodes.len());
+        out.push(RESERVATION_LAYOUT);
+        out.extend_from_slice(&self.partitions.to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&node.0.to_le_bytes());
+        }
+        Bytes::from(out)
+    }
+
+    /// `None` for a body that is not reservation layout 1.
+    #[must_use]
+    pub fn decode_reservation(body: &[u8]) -> Option<Self> {
+        let [RESERVATION_LAYOUT, rest @ ..] = body else {
+            return None;
+        };
+        let (partitions, rest) = rest.split_at_checked(4)?;
+        let (nodes, tail) = rest.as_chunks::<4>();
+        if !tail.is_empty() {
+            return None;
+        }
+        Some(Self {
+            partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+            nodes: nodes
+                .iter()
+                .map(|node| NodeId(u32::from_le_bytes(*node)))
+                .collect(),
+        })
+    }
+}
+
+/// How [`declare`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared {
+    /// This call wrote the formation record.
+    Created(Formation),
+    /// The same declaration was already there; nothing was written.
+    Already(Formation),
+}
+
+/// Why [`declare`] wrote no formation record.
+#[derive(Debug, thiserror::Error)]
+pub enum DeclareError {
+    /// The declaration is not one this build makes, or differs from the one already there.
+    #[error("{0}")]
+    Refused(String),
+    /// A control record was in the way, or the store failed a write.
+    #[error(transparent)]
+    Records(#[from] BootstrapError),
+    /// The store failed a read: `step` names it (`get <key>`, `list <prefix>`). The error stays
+    /// typed, so an open can say what to do about an `Unavailable` store.
+    #[error("{step}: {error}")]
+    Store {
+        /// The read that failed.
+        step: String,
+        /// How it failed.
+        #[source]
+        error: ConfigError,
+    },
+    /// A control record a declaration reads (the formation record, its reservation,
+    /// `routes/0` or a partition record) does not decode.
+    #[error("{key} does not decode as a record this build reads")]
+    Undecodable {
+        /// Its key.
+        key: String,
+    },
+}
+
+/// The formation record, `None` when no declaration wrote one (#80 S1a).
+///
+/// # Errors
+///
+/// [`DeclareError::Store`] when the store fails, [`DeclareError::Undecodable`] for a record this
+/// build does not read.
+pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>, DeclareError> {
+    let key = ControlKey::Operation(FORMATION_OPERATION).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
+    read.record
+        .map(|found| Formation::decode(&found.value).ok_or(DeclareError::Undecodable { key }))
+        .transpose()
+}
+
+/// Declare a database (#80 S1a, ADR-rdb-0022): first the reservation under
+/// [`RESERVATION_OPERATION`] ([`reserve`]), then `routes/0` at more than one partition, every
+/// partition's generation-0 record ([`write_records`], placement as [`initial_owner`]), then
+/// **last** the formation record under [`FORMATION_OPERATION`], naming a new instance. No copy is
+/// written: each node process forms the partitions it owns from its own empty folder.
+///
+/// Write-once and idempotent: the same declaration again answers [`Declared::Already`] and
+/// writes nothing; a different one is refused, naming what is there. A declaration that stopped
+/// before its formation record is finished by running it again: the records it wrote, its
+/// reservation included, are adopted.
+///
+/// # Errors
+///
+/// [`DeclareError`]. A database formed some other way (`--form`, `lr up`) holds a rooted
+/// `partitions/1`, and another declaration holds its reservation: each refuses this one with
+/// nothing written, [`DeclareError::Refused`].
+pub async fn declare(
+    store: &Arc<dyn ConfigStore>,
+    declaration: &Declaration,
+) -> Result<Declared, DeclareError> {
+    let wanted = crate::db::ALL_NODES.to_vec();
+    if declaration.nodes != wanted {
+        return Err(DeclareError::Refused(format!(
+            "nodes {:?}: this build declares nodes 1, 2 and 3 only; nothing was written",
+            declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+        )));
+    }
+    let max = rdb_core::partition_map::MAX_PARTITIONS;
+    if !(1..=max).contains(&declaration.partitions) {
+        return Err(DeclareError::Refused(format!(
+            "partitions {} is out of range: a database has 1 to {max} partitions; nothing was \
+             written",
+            declaration.partitions
+        )));
+    }
+    let same = |found: Formation| {
+        if found.partitions == declaration.partitions && found.nodes == declaration.nodes {
+            tracing::info!(
+                instance_hex = %instance_hex(&found.instance),
+                partitions = found.partitions,
+                "declare_already"
+            );
+            Ok(Declared::Already(found))
+        } else {
+            Err(DeclareError::Refused(format!(
+                "the database is already declared with {} partitions and nodes {:?}: a \
+                 declaration is written once; nothing was written",
+                found.partitions,
+                found.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+            )))
+        }
+    };
+    if let Some(found) = read_formation(&**store).await? {
+        return same(found);
+    }
+    let partitions = declaration.partitions;
+    declare_preflight(&**store, partitions).await?;
+    reserve(store, declaration).await?;
+    if partitions > 1 {
+        let key = ControlKey::Route(RangeId(0)).encode();
+        let value = RoutesRoot {
+            partition_count: partitions,
+        }
+        .encode();
+        create_or_adopt(store, &key, &value).await?;
+    }
+    let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
+    write_records(store, &all).await?;
+    let formation = Formation {
+        instance: *uuid::Uuid::new_v4().as_bytes(),
+        partitions,
+        nodes: declaration.nodes.clone(),
+    };
+    // PR #138 review r5: the declaration, not an open, creates the instance's counter, at no
+    // opens yet. So a declared open never writes it from absent: an absent counter is refused
+    // on a first open, a retry and a restart alike, and a manual delete can never hand N = 1
+    // out twice. It goes before the formation record, so every formation record names a
+    // counter; one written by a run that stopped before its formation record names an
+    // instance no formation record will name, and nothing reads it.
+    let counter = instance_key(&formation.instance);
+    let revision = create_or_adopt(store, &counter, &encode_count(NO_OPENS)).await?;
+    tracing::info!(
+        key = %counter,
+        revision = revision.0,
+        "declare_counter_created"
+    );
+    let key = ControlKey::Operation(FORMATION_OPERATION).encode();
+    let created = store
+        .put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: formation.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        })
+        .await;
+    match created {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(
+                instance_hex = %instance_hex(&formation.instance),
+                partitions,
+                revision = response.revision,
+                "declare_formation_written"
+            );
+            Ok(Declared::Created(formation))
+        }
+        // Another declaration's record landed first, or this one's reply was lost: read it.
+        Ok(_) | Err(ConfigError::DeadlineExceededUnknownOutcome) => {
+            match read_formation(&**store).await? {
+                Some(found) if found == formation => Ok(Declared::Created(found)),
+                Some(found) => same(found),
+                None => Err(BootstrapError::Control(format!(
+                    "{key} is absent after a create that was not reported applied"
+                ))
+                .into()),
+            }
+        }
+        Err(error) => Err(BootstrapError::Control(format!("put {key}: {error}")).into()),
+    }
+}
+
+/// [`declare`]'s first write (PR #138 review): create the reservation under
+/// [`RESERVATION_OPERATION`], or adopt it when this same declaration made it earlier. The
+/// preflight is a read, so two declarations of different counts can both pass it; this one
+/// create-only write is where exactly one of them goes on. The other is refused here, before
+/// any write of its own.
+///
+/// # Errors
+///
+/// [`DeclareError::Refused`] naming the reserved count, [`DeclareError::Records`] or
+/// [`DeclareError::Store`] when the store fails, [`DeclareError::Undecodable`] for a
+/// reservation this build does not read.
+async fn reserve(
+    store: &Arc<dyn ConfigStore>,
+    declaration: &Declaration,
+) -> Result<(), DeclareError> {
+    let key = ControlKey::Operation(RESERVATION_OPERATION).encode();
+    match create_or_adopt(store, &key, &declaration.encode_reservation()).await {
+        Ok(revision) => {
+            tracing::info!(
+                key = %key,
+                revision = revision.0,
+                partitions = declaration.partitions,
+                "declare_reserved"
+            );
+            Ok(())
+        }
+        Err(BootstrapError::AlreadyExists { .. }) => {
+            let read = store
+                .get(GetRequest {
+                    key: Bytes::from(key.clone()),
+                })
+                .await
+                .map_err(|error| DeclareError::Store {
+                    step: format!("get {key}"),
+                    error,
+                })?;
+            let held = read
+                .record
+                .and_then(|found| Declaration::decode_reservation(&found.value))
+                .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+            tracing::info!(
+                key = %key,
+                reserved = held.partitions,
+                asked = declaration.partitions,
+                "declare_reservation_refused"
+            );
+            Err(DeclareError::Refused(format!(
+                "{key} reserves the store for a declaration of {} partitions and nodes {:?}, and \
+                 this declaration asks for {} partitions and nodes {:?}: only that declaration \
+                 may go on; nothing was written",
+                held.partitions,
+                held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+                declaration.partitions,
+                declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
+/// prefix of what this declaration writes, which it then adopts. That is `routes/0` at this
+/// count, if any, and untouched generation-0 records of partitions 1 to `partitions` only. So a
+/// database formed some other way (a rooted `partitions/1`), or an interrupted declaration of
+/// another count (its `routes/0`, or a record past this count), refuses it with nothing
+/// written. This is a read: two declarations of different counts **at once** can both pass it,
+/// and [`reserve`], the first write, is what lets only one of them go on.
+///
+/// # Errors
+///
+/// [`DeclareError::Refused`] naming the record in the way, [`DeclareError::Store`] when the
+/// store fails, [`DeclareError::Undecodable`] for a record this build does not read.
+async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(), DeclareError> {
+    let refused = |what: String| {
+        DeclareError::Refused(format!(
+            "{what}: the store holds part of another database or of another declaration, which \
+             this declaration cannot adopt; nothing was written"
+        ))
+    };
+    let key = ControlKey::Route(RangeId(0)).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
+    if let Some(found) = read.record {
+        let stored = RoutesRoot::decode(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?
+            .partition_count;
+        if stored != partitions {
+            return Err(refused(format!(
+                "{key} says {stored} partitions and this declaration asks for {partitions}"
+            )));
+        }
+    }
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("list {prefix}"),
+            error,
+        })?;
+    if listed.truncated {
+        return Err(DeclareError::Store {
+            step: format!("list {prefix}"),
+            error: ConfigError::Unavailable {
+                reason: format!("truncated at revision {}", listed.read_revision),
+            },
+        });
+    }
+    for found in &listed.records {
+        let key = String::from_utf8_lossy(&found.key).into_owned();
+        let record = PartitionRecord::decode(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        let partition = record.partition;
+        if partition.0 > partitions {
+            return Err(refused(format!(
+                "{key} exists and this declaration asks for {partitions} partitions"
+            )));
+        }
+        if found.value != initial_record(partition).encode()
+            || found.create_revision != found.mod_revision
+        {
+            return Err(refused(format!(
+                "{key} is not the untouched generation-0 record a declaration writes (revision \
+                 {})",
+                found.mod_revision
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The most opens one data directory may have (arch R3b): `N <= 2^23`, so a boot and a
 /// request id derived from N never wrap, and every id a `Db` numbers its own writes with
 /// (`(N - 1) << 40` and up) stays below 2^63, out of the range an app's ids take
@@ -418,6 +855,13 @@ const COUNTER_LAYOUT_N_ONLY: u8 = 1;
 /// The activated generation a layout-1 counter leaves unknown: no generation is ever rolled
 /// forward on it, and the next activation replaces it.
 pub const ACTIVATED_UNKNOWN: Generation = Generation(u64::MAX);
+
+/// The counter [`declare`] creates (PR #138 review r5): no opens yet, nothing activated. The
+/// first open's CAS makes it N = 1.
+const NO_OPENS: Count = Count {
+    n: 0,
+    activated: Generation(0),
+};
 
 /// An open counter's value (arch R3b, rulings A-R160 and A-R184).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,7 +959,11 @@ pub enum CounterError {
 }
 
 /// Count one more open of `instance` and return its number N (arch R3b): N = 1 by a create-only
-/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. A
+/// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. Once
+/// any read has found the counter, or this open's create has conflicted with another's, `fresh`
+/// no longer applies: a counter gone on a later read is [`CounterError::Absent`], never created
+/// again. A declared database's counter is created by [`declare`], and its opens count with
+/// `fresh` false. A
 /// conflict or a lost reply reads again and CASes again, so a lost reply can waste a number but
 /// never hand one out twice. A transient store error waits 50 ms and tries again; all of it is
 /// bounded by `within`. Logged as `open_counted{instance_hex, n, revision}` and each retry as
@@ -534,6 +982,10 @@ pub async fn count_open(
     let hex = instance_hex(instance);
     let deadline = tokio::time::Instant::now() + within;
     let mut last = String::from("nothing answered");
+    // Whether this open may still create the counter: only until a read finds one. A counter
+    // that was seen and is then gone was deleted, and a new N = 1 would overlap the request
+    // range of the open that holds 1 (PR #138 review r4).
+    let mut may_create = fresh;
     while tokio::time::Instant::now() < deadline {
         let read = match store
             .get(GetRequest {
@@ -550,8 +1002,11 @@ pub async fn count_open(
             }
             Err(error) => return Err(CounterError::Control(format!("get {key}: {error}"))),
         };
+        if read.record.is_some() {
+            may_create = false;
+        }
         let (next, expected) = match read.record {
-            None if fresh => (
+            None if may_create => (
                 Count {
                     n: 1,
                     activated: Generation(0),
@@ -595,12 +1050,21 @@ pub async fn count_open(
                 );
                 return Ok(next.n);
             }
-            Ok(_) => last = format!("CAS at {expected} was not applied"),
+            // A create that conflicts proves another open created the counter (PR #138 review
+            // r5): this open may no longer create it, so a counter gone on the next read was
+            // deleted. A lost reply proves nothing, and the next read finds this open's own
+            // create if it landed.
+            Ok(_) => {
+                may_create = false;
+                last = format!("CAS at {expected} was not applied");
+            }
+            Err(error @ ConfigError::Conflict { .. }) => {
+                may_create = false;
+                last = error.to_string();
+            }
             Err(error)
-                if matches!(
-                    error,
-                    ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome
-                ) || crate::control::transient(&error) =>
+                if matches!(error, ConfigError::DeadlineExceededUnknownOutcome)
+                    || crate::control::transient(&error) =>
             {
                 last = error.to_string();
             }
@@ -1156,9 +1620,22 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // M11 T6: the members are the ones `partitions/1` pins, not nodes 1 to 3. A move may have
     // put a copy on node 4; re-pinning node 3 would recover from a copy the move left behind.
     let pinned = pinned_members(&ctx).await?;
+    // A partition still to form pins its formed members (#80 S1a): in a node process they run
+    // in other processes, at the boots their handshakes report, not at this open's.
+    let forming: Vec<Vec<RecordMember>> = ctx
+        .bootstrap
+        .iter()
+        .map(|(partition, _)| {
+            members_for(*partition, BOOT)
+                .iter()
+                .map(RecordMember::of)
+                .collect()
+        })
+        .collect();
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
     // fence's reads and decision tick as fresh as they were. One union over the partitions.
-    let boots = member_boots(&ctx, &member_union(&pinned), deadline).await?;
+    let union = member_union(&[pinned.as_slice(), forming.as_slice()].concat());
+    let boots = member_boots(&ctx, &union, deadline).await?;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle. Once, for
     // every partition this node owns (issue #79).
@@ -1216,12 +1693,19 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
                 })?;
         }
     }
-    for (partition, revision) in ctx.bootstrap.iter().copied() {
+    for ((partition, revision), was) in ctx.bootstrap.iter().copied().zip(&forming) {
         let send = |_, msg| ctx.owner.send(msg).map_err(|_| NodeStopped(ctx.owner_node));
-        start_recovery(ctx.clock.now(), ctx.boot, partition, revision, &send).map_err(|_| {
-            HealError::NodeStopped {
-                node: ctx.owner_node,
-            }
+        let members = members_at_boots(was, &boots);
+        start_recovery(
+            ctx.clock.now(),
+            ctx.boot,
+            partition,
+            revision,
+            members,
+            &send,
+        )
+        .map_err(|_| HealError::NodeStopped {
+            node: ctx.owner_node,
         })?;
     }
     Ok(healed)
@@ -4338,6 +4822,91 @@ mod tests {
         assert!(sent.is_empty(), "{} messages sent", sent.len());
     }
 
+    /// PR #138 review: the formation record and the declaration's reservation are written once
+    /// and read by every later build, so their keys and layout-1 bytes are pinned as literals, as
+    /// are the key and bytes of the counter a declaration creates (r5):
+    /// changing `encode` and `decode` together cannot pass while old stores stop opening. A wrong
+    /// version byte, a count cut short and a trailing byte each decode as nothing. Unit.
+    #[test]
+    fn s1a_formation_and_reservation_layout_1_bytes_are_pinned() {
+        assert_eq!(
+            ControlKey::Operation(FORMATION_OPERATION).encode(),
+            "operations/63050394783186944"
+        );
+        assert_eq!(
+            ControlKey::Operation(RESERVATION_OPERATION).encode(),
+            "operations/63050394783186945"
+        );
+        let nodes = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let formation = Formation {
+            instance: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+            partitions: 8,
+            nodes: nodes.clone(),
+        };
+        let formation_bytes: [u8; 33] = [
+            1, // layout
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, // instance
+            8, 0, 0, 0, // partitions
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // nodes
+        ];
+        assert_eq!(formation.encode().as_ref(), formation_bytes);
+        assert_eq!(Formation::decode(&formation_bytes), Some(formation));
+        let declaration = Declaration {
+            nodes,
+            partitions: 8,
+        };
+        let reservation_bytes: [u8; 17] = [
+            1, // layout
+            8, 0, 0, 0, // partitions
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // nodes
+        ];
+        assert_eq!(declaration.encode_reservation().as_ref(), reservation_bytes);
+        assert_eq!(
+            Declaration::decode_reservation(&reservation_bytes),
+            Some(declaration)
+        );
+        // PR #138 review r5: the counter `declare` creates, under the formation's instance, is
+        // counter layout 2 at N = 0, nothing activated; the first open's CAS reads it as such.
+        assert_eq!(
+            instance_key(
+                &formation_bytes[1..=INSTANCE_LEN]
+                    .try_into()
+                    .expect("16 bytes")
+            ),
+            "rdb/instances/0102030405060708090a0b0c0d0e0f10"
+        );
+        let no_opens: [u8; 17] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(encode_count(NO_OPENS).as_ref(), no_opens);
+        assert_eq!(decode_count(&no_opens), Some(NO_OPENS));
+
+        let malformed = |good: &[u8], count_at: usize| {
+            let mut wrong_version = good.to_vec();
+            wrong_version[0] = 2;
+            let mut trailing = good.to_vec();
+            trailing.push(0);
+            [
+                ("a wrong version", wrong_version),
+                ("a count cut short", good[..count_at + 2].to_vec()),
+                ("a trailing byte", trailing),
+                ("an empty body", Vec::new()),
+            ]
+        };
+        for (what, body) in malformed(&formation_bytes, 1 + INSTANCE_LEN) {
+            assert_eq!(Formation::decode(&body), None, "formation: {what}");
+        }
+        for (what, body) in malformed(&reservation_bytes, 1) {
+            assert_eq!(
+                Declaration::decode_reservation(&body),
+                None,
+                "reservation: {what}"
+            );
+        }
+    }
+
     /// Design 7.2 (Critic R2): a partition still to form joins its owner's heal, after the
     /// rooted partitions' plans, and nothing goes out until the grant is cleared. An owner with
     /// only partitions to form heals too. Cut: bootstrap plans sent before the clear.
@@ -4402,6 +4971,71 @@ mod tests {
             "{healed:?}"
         );
         assert!(sent.is_empty(), "{} messages before the clear", sent.len());
+    }
+
+    /// PR #138 review (#80 S1a): a heal with only partitions to form waits for every member of
+    /// them too, not only the rooted partitions' members. With node 3 never linked, it ends
+    /// `PeersUnknown` naming node 3 and sends nothing. With three distinct boots, each plan
+    /// pins every member at its own boot. Unit (~150 ms): `MemStore`, a 100 ms budget.
+    /// Cut: the heal waits on `member_union(&pinned)` alone; the first heal sends plans, red.
+    #[test]
+    fn s1a_a_bootstrap_only_heal_waits_for_every_member_and_pins_its_boot() {
+        let rt = runtime();
+        let two = PartitionId(2);
+        let heal_with = |member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>| {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let (owner, mailbox) = std::sync::mpsc::channel();
+            let ctx = HealCtx {
+                partition_count: 2,
+                store,
+                boot: OPEN_2,
+                budgets: Budgets::SPEC_DEFAULTS,
+                clock: HostClock::start(),
+                owner,
+                within: Duration::from_millis(100),
+                member_boot,
+                owner_node: OWNER,
+                partitions: Vec::new(),
+                bootstrap: vec![(two, Revision(4))],
+            };
+            let healed = rt.block_on(heal(ctx));
+            (healed, mailbox.try_iter().collect::<Vec<Msg>>())
+        };
+
+        let (refused, sent) = heal_with(Arc::new(|node: NodeId| {
+            (node != NodeId(3)).then_some(BootId(10 + u64::from(node.0)))
+        }));
+        assert!(
+            matches!(&refused, Err(HealError::PeersUnknown { nodes, .. }) if nodes == &[3]),
+            "{refused:?}"
+        );
+        assert!(sent.is_empty(), "{} messages sent", sent.len());
+
+        let boot_of = |node: NodeId| BootId(10 + u64::from(node.0));
+        let (healed, sent) = heal_with(Arc::new(move |node| Some(boot_of(node))));
+        healed.expect("every member answered");
+        let pinned: Vec<Vec<(NodeId, BootId)>> = sent
+            .iter()
+            .filter_map(|msg| match msg {
+                Msg::Inject {
+                    kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))),
+                    ..
+                } => Some(
+                    plan.config
+                        .members
+                        .iter()
+                        .map(|member| (member.node, member.boot))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<(NodeId, BootId)> = members_for(two, BOOT)
+            .iter()
+            .map(|member| (member.node, boot_of(member.node)))
+            .collect();
+        assert_eq!(want.len(), 3, "{want:?}");
+        assert_eq!(pinned, [want], "one plan, every member at its own boot");
     }
 
     /// The `FencingProof` a heal sent node 1, if it sent one.

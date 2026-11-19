@@ -2496,8 +2496,9 @@ fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
     };
     assert!(
         refused.to_string().contains(
-            "database not formed yet: partitions/1 names no instance. Wait for its first open \
-             (lr up) to finish, then start node 3 again"
+            "database not formed yet: partitions/1 names no instance. Wait for it to finish \
+             forming (lr up, or the node processes of a declared database), then start node 3 \
+             again"
         ),
         "{refused}"
     );
@@ -2520,14 +2521,14 @@ fn m11_a_node_past_the_members_opens_as_a_spare() {
     let dir = config_testkit::fs::temp_dir();
     written_and_closed(&rt, dir.path(), &store);
     let (record, instance) = rt
-        .block_on(formed_member(&store, &[NodeId(2)]))
+        .block_on(formed_member(&store, &[NodeId(2)], false))
         .expect("node 2 is a member");
     assert!(
         !messages(METHOD).iter().any(|m| m == "db_open_spare_copy"),
         "a member is no spare"
     );
     let (spare_record, spare_instance) = rt
-        .block_on(formed_member(&store, &[NodeId(4)]))
+        .block_on(formed_member(&store, &[NodeId(4)], false))
         .expect("node 4 opens as a spare");
     assert_eq!(
         (record.owner, Some(instance)),
