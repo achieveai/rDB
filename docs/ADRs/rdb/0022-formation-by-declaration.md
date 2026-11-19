@@ -26,7 +26,7 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
    partition), each partition's generation-0 record, and **last** the formation record
    `operations/{FORMATION_OPERATION}`. The formation record's presence is what lets
    a node process form. With no formation record, a node process on an empty folder is refused
-   word for word as before.
+   with the same cause as before; its recovery text now also names `--declare`.
 2. **The formation record is write-once.** Layout 1: one version byte (1), then the instance (16
    bytes), the partition count (u32 LE), then one u32 LE per declared node. The same declaration
    again answers `already` and writes nothing. A different count or node set is refused, naming
@@ -36,6 +36,14 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
    its own count, and untouched generation-0 records of its own partitions only. Anything else
    (a database formed with `--form`, or a stopped declaration of another count) refuses it with
    nothing written.
+   Until the formation record is written nothing is declared, and the reservation stops only
+   other declarations. The recovery for a stopped declaration is to run the same `--declare`
+   again. A whole-database open (`--form`, `lr up`) of the same count may instead take the store
+   over: it forms all three copies in its one folder over the untouched records, and the
+   database is then a `--form` database, so the stopped declaration run again is refused
+   (`s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record`). That is allowed
+   on purpose: it is the operator's choice of a one-folder database, and nothing was declared
+   that it could contradict.
 3. **The count is reserved before anything else is written.** The check above is a read, so two
    declarations of different counts run at once can both pass it. The reservation is one
    create-only write (expected revision 0) of `operations/{RESERVATION_OPERATION}`, which is
@@ -69,10 +77,12 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
   node's copy.
 - Two more control records, the reservation and the formation record. Neither is ever
   rewritten, so they need no CAS discipline after creation.
-- The open counter is created only by an open that forms partition 1: a fresh whole-database
-  open, or a declared node process while partition 1 is untouched. A later open of a declared
-  database, like any other, refuses an absent counter (a manual delete, or a restore of some
-  prefixes only) rather than count N = 1 again.
+- The open counter is created only by the database's first open: a fresh whole-database open,
+  or a declared node process while nothing of the database is formed yet (partition 1
+  untouched, no copy in its folder holding data, and no other partition rooted). Every open
+  counts before it roots anything, so any of those means an earlier open counted. A later open
+  of a declared database, like any other, refuses an absent counter (a manual delete, or a
+  restore of some prefixes only) rather than count N = 1 again, after a partial formation too.
 - Not covered: an owner whose copy is empty after its partition got its first root, before any
   write was admitted. It is refused as before ("has not finished forming"), and running the
   declaration again does not recover it (#137). The refusal says so; it does not give the
@@ -93,6 +103,13 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
   and a full store snapshot is unchanged by it. Red in both orders with `reserve` cut.
 - `s1a_a_declared_reopen_with_its_counter_gone_is_refused`. Red with the counter created on every
   declared open.
+- `s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused`: partition 2 rooted
+  and written, partition 1 untouched, the counter deleted; nodes 2 and 3 reopening and node 1's
+  first open are each refused. Red with the counter created whenever partition 1 is still to
+  form, and (node 1) with the "no other partition rooted" clause cut.
+- `s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry` (applied and
+  unapplied) and `s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing`.
+- `s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record`.
 - `s1a_the_formation_record_is_published_after_every_prerequisite`.
 - `s1a_a_delayed_declared_opener_does_not_write_another_owners_partition`. Red with the owner
   filter in `Db::open_spawning` cut.
@@ -109,7 +126,7 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
 - `crates/rdb-api/examples/rdb_node.rs`: `s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing`,
   `s1a_declare_rejects_five_mode_and_copy_flags`, `s1a_declare_rejects_each_planner_knob`,
   `s1a_declare_node_counts_parse_as_gen_certs_does`, `s1a_declare_rejects_failover`.
-- Manual: `rdb_node --declare`, then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
+- Manual: `rdb_node --declare --partitions 8`, then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
   its own `--dir`, 8 partitions. A write commits on each node's partitions.
 
 ## References

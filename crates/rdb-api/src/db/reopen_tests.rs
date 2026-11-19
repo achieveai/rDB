@@ -2496,8 +2496,9 @@ fn m10_s2_a_node_process_before_the_first_open_finishes_is_told_to_wait() {
     };
     assert!(
         refused.to_string().contains(
-            "database not formed yet: partitions/1 names no instance. Wait for its first open \
-             (lr up) to finish, then start node 3 again"
+            "database not formed yet: partitions/1 names no instance. Wait for it to finish \
+             forming (lr up, or the node processes of a declared database), then start node 3 \
+             again"
         ),
         "{refused}"
     );

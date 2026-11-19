@@ -25,8 +25,8 @@
 //!   it. `--partitions` defaults to 1; `--nodes` is the node count, and this build declares 3.
 //!   Run again with the same arguments it says `already`; with another count it is refused.
 //!   It takes no `--form`, `--gen-certs`, `--node`, `--dir` or `--live-readd`: each of these
-//!   five is refused. Other node-process flags, such as `--listen` and `--peers`, still parse
-//!   and are ignored.
+//!   five is refused, and so are `--failover` and its knobs. Other node-process flags, such as
+//!   `--listen` and `--peers`, still parse and are ignored.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
 //!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
@@ -279,8 +279,9 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
 
 /// Five mode and copy flags `--declare` refuses (PR #138 review): it writes control records
 /// only, so it makes no copy (`--form`), certificates (`--gen-certs`) or node process (`--node`,
-/// `--dir`, `--live-readd`). Not every flag it does not read: `--listen`, `--peers` and the
-/// other node-process flags still parse and are ignored.
+/// `--dir`, `--live-readd`). Not every flag it does not read: `--failover` and its knobs are
+/// refused by `failover_refusal`, while `--listen`, `--peers` and the other node-process flags
+/// still parse and are ignored.
 fn declare_refusal(args: &Args) -> Result<(), String> {
     if !args.declare {
         return Ok(());

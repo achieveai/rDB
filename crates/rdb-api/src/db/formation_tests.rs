@@ -945,11 +945,13 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
 }
 
 /// A control store whose puts under `partitions/` wait at a gate until [`PartitionGate::open`],
-/// after notifying [`PartitionGate::arrived`]; every other call passes.
+/// after notifying [`PartitionGate::arrived`]; every other call passes. When `refuse` is set by
+/// then, a put let through fails `Unavailable` instead, as if the opener had stopped there.
 struct PartitionGate {
     inner: Arc<dyn ConfigStore>,
     gate: tokio::sync::Semaphore,
     arrived: tokio::sync::Notify,
+    refuse: std::sync::atomic::AtomicBool,
 }
 
 impl PartitionGate {
@@ -1000,6 +1002,11 @@ impl ConfigStore for PartitionGate {
             tracing::info!(key = %String::from_utf8_lossy(&request.key), "test_partition_put_gated");
             self.arrived.notify_one();
             let _permit = self.gate.acquire().await.expect("never closed");
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(config_core::ConfigError::Unavailable {
+                    reason: "scripted: the opener stopped at its partition record".to_owned(),
+                });
+            }
         }
         self.inner.put(request).await
     }
@@ -1045,6 +1052,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
         inner: Arc::clone(&rig.store),
         gate: tokio::sync::Semaphore::new(0),
         arrived: tokio::sync::Notify::new(),
+        refuse: std::sync::atomic::AtomicBool::new(false),
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
     let (listeners, addrs) = listeners(&rig.rt);
@@ -1346,4 +1354,304 @@ fn s1a_a_declared_reopen_with_its_counter_gone_is_refused() {
             node.0
         );
     }
+}
+
+/// PR #138 review r3 (blocker): the counter-gone case after a partial formation. Node 1's open
+/// is held at its `partitions/1` write while nodes 2 and 3 open, so partition 2 (node 2's) is
+/// rooted and takes a write; node 1's open then stops there, leaving partition 1 untouched. With the counter then deleted, node 2 and node 3 reopening their folders,
+/// and node 1 opening its first, empty one, are each refused, naming the absent counter: none
+/// creates it again at N = 1. Nothing is written, nodes 2 and 3 keep their copies, and node 1's
+/// open leaves no `nodes/`. Integration (~4 s): a partial formation over real links.
+/// Cut 1: count with `create` whenever partition 1 is still to form (`found.fresh ||
+/// found.forms_first`, as at 54db485); node 2's reopen counts N = 1 and opens, red.
+/// Cut 2: drop only the "no other partition rooted" clause; node 2 and 3 are refused, but node
+/// 1's first open, which holds no data, counts N = 1 and opens, red.
+#[config_log::retcd_test]
+fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
+    let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let formation = rig.declare_created();
+    let gated = Arc::new(PartitionGate {
+        inner: Arc::clone(&rig.store),
+        gate: tokio::sync::Semaphore::new(0),
+        arrived: tokio::sync::Notify::new(),
+        refuse: std::sync::atomic::AtomicBool::new(true),
+    });
+    let gated_store: Arc<dyn ConfigStore> = gated.clone();
+    let dirs = fresh_dirs();
+    let (listeners, addrs) = listeners(&rig.rt);
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
+        listeners.into_iter().map(Some).collect();
+    assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
+    std::thread::scope(|scope| {
+        let _release = OpenOnDrop(&gated);
+        let first_listener = listeners[0].take().expect("node 1's listener");
+        let first_dir = dirs[0].0.clone();
+        let (rt, cert_dir, addrs) = (&rig.rt, &rig.cert_dir, &addrs);
+        let gated_store = &gated_store;
+        let held = scope.spawn(move || {
+            open_node(
+                rt,
+                gated_store,
+                cert_dir,
+                NodeId(1),
+                &first_dir,
+                first_listener,
+                addrs,
+            )
+            .map(|_| ())
+        });
+        rig.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), gated.arrived.notified())
+                .await
+                .expect("node 1's open reaches its partition 1 record write");
+        });
+        let mut opened = Vec::new();
+        for node in [NodeId(2), NodeId(3)] {
+            let (db, net) = open_node(
+                &rig.rt,
+                &rig.store,
+                &rig.cert_dir,
+                node,
+                &dirs[node.0 as usize - 1].0,
+                listeners[node.0 as usize - 1].take().expect("a listener"),
+                addrs,
+            )
+            .unwrap_or_else(|e| panic!("node {} opens: {e}", node.0));
+            opened.push((db, net));
+        }
+        put_lands(&opened[0].0, group_of(&opened[0].0, 2), b"k", b"v");
+        for (db, _) in &mut opened {
+            db.shutdown();
+        }
+        gated.open();
+        let stopped = held.join().expect("node 1's thread");
+        assert!(stopped.is_err(), "node 1's open stopped before partition 1");
+    });
+    let first = rig
+        .rt
+        .block_on(partition_states(&rig.store, PARTITION.0))
+        .expect("partitions/1 reads")
+        .pop();
+    assert!(
+        matches!(
+            first,
+            Some((_, PartitionState::Unrooted { untouched: true }))
+        ),
+        "partition 1 is still untouched"
+    );
+    let counter = admin::instance_key(&formation.instance);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(counter.clone()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the counter is deleted");
+    let before = snapshot(&rig.rt, &*rig.store);
+    assert!(!keys(&before).contains(&counter), "{counter} is gone");
+    for node in [NodeId(2), NodeId(3), NodeId(1)] {
+        let dir = &dirs[node.0 as usize - 1].0;
+        let (listeners, addrs) = self::listeners(&rig.rt);
+        let opened = open_node(
+            &rig.rt,
+            &rig.store,
+            &rig.cert_dir,
+            node,
+            dir,
+            listeners
+                .into_iter()
+                .nth(node.0 as usize - 1)
+                .expect("a listener"),
+            &addrs,
+        );
+        let Err(refused) = opened else {
+            panic!("node {}: an open with no counter opened", node.0);
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("{counter} is absent")),
+            "node {}: {refused}",
+            node.0
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            before,
+            "node {}: nothing written",
+            node.0
+        );
+        if node == NodeId(1) {
+            assert!(!has_copies(dir), "node 1: no copy was made");
+        } else {
+            assert_eq!(
+                copies_in(dir),
+                [node.0.to_string()],
+                "node {}: the folder keeps its copy",
+                node.0
+            );
+        }
+    }
+}
+
+/// PR #138 review r3 (ADR question): a declaration stopped after every partition record and
+/// before its formation record has declared nothing yet, so a whole-database open (`--form`,
+/// `lr up`) of the same count may take the store over: it forms all three copies in its one
+/// folder over the untouched records. The database is then a `--form` database, and running
+/// the stopped declaration again is refused (partition 1 is rooted) and writes nothing; no
+/// formation record is ever published. Integration (~2 s): one whole-database formation.
+#[config_log::retcd_test]
+fn s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record() {
+    let rt = runtime();
+    let scripted = Arc::new(Scripted::new(Script {
+        pass_puts: 2 + PARTITIONS,
+        fail_put_with: Some(config_core::ConfigError::Unavailable {
+            reason: "scripted: the declaring process stopped".to_owned(),
+        }),
+        ..Script::default()
+    }));
+    let store: Arc<dyn ConfigStore> = scripted.clone();
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        keys(&snapshot(&rt, &*store)),
+        declared_keys(PARTITIONS, false)
+    );
+    scripted.rescript(Script::default());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(PARTITIONS),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .unwrap_or_else(|e| panic!("the whole-database open forms: {e}"));
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("ready: {e}"));
+    assert_eq!(copies_in(dir.path()), ["1", "2", "3"]);
+    db.shutdown();
+    let formed = snapshot(&rt, &*store);
+    let again = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&again, Err(admin::DeclareError::Refused(_))),
+        "{again:?}"
+    );
+    assert_eq!(snapshot(&rt, &*store), formed, "the retry wrote nothing");
+    assert_eq!(
+        rt.block_on(admin::read_formation(&*store)).expect("reads"),
+        None
+    );
+}
+
+/// PR #138 review r3: the reservation's unknown outcome. The reservation put answers
+/// `DeadlineExceededUnknownOutcome`, once having applied (a lost reply) and once not (a dropped
+/// put), and the read that resolves it fails, on two attempts in a row. Each attempt fails
+/// naming that read, and leaves only what landed: the reservation in the applied case, nothing
+/// in the other. A third attempt, with the store whole again, adopts or creates the reservation
+/// and finishes: every record written before keeps its bytes and revisions. A declaration of
+/// another count is then refused and writes nothing. Unit (<100 ms, an in-memory store).
+/// Cut: `create_or_adopt` takes an unknown outcome as created; the first attempt goes on and
+/// publishes, red.
+#[config_log::retcd_test]
+fn s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry() {
+    let rt = runtime();
+    for applied in [true, false] {
+        let scripted = Arc::new(Scripted::new(Script::default()));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
+        let mut before = snapshot(&rt, &*store);
+        for attempt in 1..=2 {
+            // The formation record and `routes/0` reads pass; the read after the put fails.
+            scripted.rescript(Script {
+                pass_gets: 2,
+                fail_gets: 1,
+                lose_put_replies: u32::from(applied),
+                drop_puts: u32::from(!applied),
+                ..Script::default()
+            });
+            let failed = rt.block_on(admin::declare(&store, &declaration()));
+            assert!(
+                matches!(&failed, Err(admin::DeclareError::Records(error))
+                    if error.to_string().contains("scripted: the read failed")),
+                "applied {applied}, attempt {attempt}: {failed:?}"
+            );
+            let after = snapshot(&rt, &*store);
+            let expected: Vec<String> = if applied {
+                vec![reservation.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                keys(&after),
+                expected,
+                "applied {applied}, attempt {attempt}"
+            );
+            assert!(
+                kept(&before, &after),
+                "applied {applied}, attempt {attempt}"
+            );
+            before = after;
+        }
+        scripted.rescript(Script::default());
+        let done = rt.block_on(admin::declare(&store, &declaration()));
+        assert!(
+            matches!(&done, Ok(admin::Declared::Created(formation))
+                if formation.partitions == PARTITIONS),
+            "applied {applied}: {done:?}"
+        );
+        let finished = snapshot(&rt, &*store);
+        assert!(
+            kept(&before, &finished),
+            "applied {applied}: {before:?} -> {finished:?}"
+        );
+        assert_eq!(keys(&finished), declared_keys(PARTITIONS, true));
+        let other = rt.block_on(admin::declare(
+            &store,
+            &admin::Declaration {
+                partitions: 1,
+                ..declaration()
+            },
+        ));
+        assert!(
+            matches!(&other, Err(admin::DeclareError::Refused(_))),
+            "applied {applied}: {other:?}"
+        );
+        assert_eq!(
+            snapshot(&rt, &*store),
+            finished,
+            "applied {applied}: the other count wrote nothing"
+        );
+    }
+}
+
+/// PR #138 review r3: a reservation that does not decode (another build's layout, or damage)
+/// refuses a declaration as `Undecodable`, naming the reservation's key, and the whole store,
+/// bytes and revisions, is unchanged. Unit (<100 ms, an in-memory store).
+/// Cut: `adopt` adopts a record whatever its bytes; the declaration adopts the seeded bytes
+/// and publishes, red.
+#[config_log::retcd_test]
+fn s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(reservation.clone()),
+        value: Bytes::from_static(&[9, 0, 0]),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("seed an undecodable reservation");
+    let before = snapshot(&rt, &*store);
+    let refused = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&refused, Err(admin::DeclareError::Undecodable { key }) if *key == reservation),
+        "{refused:?}"
+    );
+    assert_eq!(snapshot(&rt, &*store), before, "nothing was written");
 }

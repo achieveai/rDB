@@ -796,7 +796,8 @@ async fn read_owner(
     let root = PartitionRoot::decode(&found.value).ok_or_else(|| {
         OpenError::Config(format!(
             "partitions/{} names no instance yet, so the database is still forming: wait for \
-             its first open (lr up) to finish, then open again",
+             it to finish forming (lr up, or the node processes of a declared database), then \
+             open again",
             partition.0
         ))
     })?;
@@ -966,7 +967,11 @@ enum PartitionState {
 }
 
 /// The step for a formation that did not finish. `--form` (what `lr up` runs) forms in a folder,
-/// so it names `--dir`; `--declare` writes control records only, so it does not.
+/// so it names `--dir`; `--declare` writes control records only, so it does not. "The command
+/// that formed it" is the intended recovery: a declaration stopped before its formation record
+/// is finished by the same `--declare`. A `--form` of the same count run over it instead takes
+/// the store over as a one-folder database, after which the declaration is refused
+/// (ADR-rdb-0022, Decision 2).
 const RERUN_FORM: &str = "run the command that formed it again: rdb_node --form (what lr up runs) \
                           with the same --dir, --control and --partitions, or, for a declared \
                           database, rdb_node --declare with the same --control and --partitions";
@@ -1037,8 +1042,9 @@ fn unformed_refusal(
              formation did not finish; {RERUN_FORM}"
         ))),
         PartitionState::Unrooted { .. } => Some(OpenError::Config(format!(
-            "{key} names no instance yet, so the database is still forming: wait for its first \
-             open (lr up) to finish, then open again; if that open stopped, {RERUN_FORM}"
+            "{key} names no instance yet, so the database is still forming: wait for it to \
+             finish forming (lr up, or the node processes of a declared database), then open \
+             again; if that open stopped, {RERUN_FORM}"
         ))),
         PartitionState::Rooted(..) => None,
     }
@@ -1107,8 +1113,9 @@ async fn formed_member(
         .ok_or_else(|| undecodable(&key, "not a partition record this build reads"))?;
     let Some(root) = PartitionRoot::decode(&found.value) else {
         return Err(OpenError::Config(format!(
-            "database not formed yet: partitions/1 names no instance. Wait for its first open \
-             (lr up) to finish, then start node {named} again; if that open stopped, {RERUN_FORM}"
+            "database not formed yet: partitions/1 names no instance. Wait for it to finish \
+             forming (lr up, or the node processes of a declared database), then start node \
+             {named} again; if that open stopped, {RERUN_FORM}"
         )));
     };
     // M11 WS A: a node past the formed members is a spare. Its empty copy binds the instance
@@ -1619,9 +1626,10 @@ impl Db {
         std::fs::create_dir_all(&config.dir)?;
         let partial = local_nodes(&config.local)?;
         let nodes_dir = config.dir.join("nodes");
-        // A node process opens only its own copy, and never bootstraps or forms (ruling
-        // A-R231(a)). It creates an empty copy only for a formed database it is a member of
-        // (A-R328): that copy binds the database's instance in `check` and is rebuilt.
+        // A node process opens only its own copy. It never bootstraps or forms an undeclared
+        // database (ruling A-R231(a)); a declared one's owners form their own partitions in
+        // their heal (#80 S1a). It creates an empty copy only for a formed database it is a
+        // member of (A-R328): that copy binds the database's instance in `check` and is rebuilt.
         // #80 S1a: or for a declared database, whose formation record names the instance.
         let declared = if partial {
             admin::read_formation(&*store)
@@ -1689,13 +1697,19 @@ impl Db {
         }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
-            // The counter is created only by an open that forms partition 1: a fresh one, or a
-            // declared node process while partition 1 is untouched (#80 S1a). Any later open,
-            // declared or not, refuses an absent counter rather than count N = 1 again.
+            // The counter is created only by the database's first open: a fresh one, or a
+            // declared node process (#80 S1a) while nothing of the database is formed yet:
+            // partition 1 untouched, no copy here holding data, and no other partition rooted.
+            // Every open counts before it roots anything, so any of those means an earlier open
+            // counted, and an absent counter was lost (PR #138 review r3). Any later open,
+            // declared or not, refuses it rather than count N = 1 again.
             None => admin::count_open(
                 &*store,
                 &found.instance,
-                found.fresh || found.forms_first,
+                found.fresh
+                    || (found.forms_first
+                        && claim.engines.values().all(|e| e.lineages().is_empty())
+                        && found.others.iter().all(|(_, other)| other.forms)),
                 admin::COUNT_WITHIN,
             )
             .await
@@ -1909,8 +1923,9 @@ impl Db {
         // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
         // it (ruling A-R328). It never forms one, with one exception (#80 S1a): a declared
         // database whose partition 1 is still untouched. Every node process of it whose copies
-        // hold no data binds the declared instance here (below) and counts its open with
-        // create; only partition 1's owner then forms it (the owner filter in `open_spawning`).
+        // hold no data binds the declared instance here (below); each owner then forms its own
+        // partitions, partition 1's owner partition 1 (the owner filter in `open_spawning`).
+        // It creates the open counter only while nothing of the database is formed yet.
         let first_unformed = match declared {
             Some(_) => matches!(
                 partition_states(store, PARTITION.0).await?.pop(),
@@ -2104,7 +2119,8 @@ impl Db {
             forms_first: false,
         };
         // A node process never forms (ruling A-R231(a)), unless the database is declared and
-        // its copies name the declared instance (#80 S1a): partition 1's owner forms it.
+        // its copies name the declared instance (#80 S1a): each owner forms its own partitions,
+        // partition 1's owner partition 1.
         let form = || {
             if partial && first_unformed && declared == Some(instance) {
                 Ok(declared_found(instance))
@@ -5717,8 +5733,10 @@ struct Found {
     /// Partitions 2 to N, in order, once `routes/0` exists (issue #79). Otherwise empty.
     others: Vec<(PartitionId, PartitionFound)>,
     /// A node process of a declared database whose partition 1 is still to form (#80 S1a): it
-    /// may create the open counter, and if it runs partition 1's owner, that owner's heal forms
-    /// partition 1 (`open_spawning` drops partitions this process does not own).
+    /// may create the open counter while nothing of the database is formed yet (no copy here
+    /// holds data and no other partition is rooted), and if it runs partition 1's owner, that
+    /// owner's heal forms partition 1 (`open_spawning` drops partitions this process does not
+    /// own).
     forms_first: bool,
 }
 
