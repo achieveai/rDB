@@ -1232,9 +1232,13 @@ mod tests {
     /// node processes' start paths (`serve_on`, one thread each) on 127.0.0.1 to .4, the hosts
     /// `--declare` recorded, pass the start check, open their own empty folders and form every
     /// partition: each `partitions/{p}` gains its root. Stopped through `--stop-file`, each
-    /// ends cleanly and its folder holds only its own `nodes/N`. Cluster row (~0.5 s measured,
-    /// bounded at 30 s): four nodes link over TLS and form four partitions. The node threads
-    /// log outside this row's span, so their lines land in the run's `_untagged-<pid>.jsonl`.
+    /// ends cleanly and its folder holds only its own `nodes/N`. The row asserts forming, not
+    /// readiness: the stop file is written once every root is there, which can be before a
+    /// node's first `wait_ready` returns, and a node reads the stop file only between waits.
+    /// So `--ready-secs 1` bounds each stop at about a second; with 30, one run took 30 s.
+    /// Cluster row (~0.5 s measured, at most ~1.5 s after forming, forming bounded at 30 s):
+    /// four nodes link over TLS and form four partitions. The node threads log outside this
+    /// row's span, so their lines land in the run's `_untagged-<pid>.jsonl`.
     /// Cut: `machine_clash` compares only a host's first three characters, so every loopback
     /// address is one machine; the declaration is refused, red.
     #[config_log::retcd_test]
@@ -1297,7 +1301,7 @@ mod tests {
                         "--stop-file",
                         &path(&stop),
                         "--ready-secs",
-                        "30",
+                        "1",
                     ])
                     .expect("parses");
                     let store = Arc::clone(&store);
