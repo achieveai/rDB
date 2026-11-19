@@ -176,14 +176,16 @@ fn keys(snap: &[(Bytes, Bytes, u64, u64)]) -> Vec<String> {
         .collect()
 }
 
-/// The control keys a whole declaration of `partitions` (more than one) writes, its reservation
-/// first and the formation record last.
-fn declared_keys(partitions: u32, marker: bool) -> Vec<String> {
+/// The keys a whole declaration of `partitions` (more than one) writes, its reservation first,
+/// then `routes/0`, the partition records and its open counter (`counters`: the counter keys
+/// expected), and the formation record last.
+fn declared_keys(partitions: u32, counters: &[&str], marker: bool) -> Vec<String> {
     let mut keys: Vec<String> = (1..=partitions)
         .map(|id| ControlKey::Partition(PartitionId(id)).encode())
         .collect();
     keys.push(ControlKey::Route(RangeId(0)).encode());
     keys.push(ControlKey::Operation(admin::RESERVATION_OPERATION).encode());
+    keys.extend(counters.iter().map(|key| (*key).to_owned()));
     if marker {
         keys.push(ControlKey::Operation(admin::FORMATION_OPERATION).encode());
     }
@@ -439,7 +441,11 @@ fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
     };
     assert_eq!(first.partitions, PARTITIONS);
     let declared = snapshot(&rt, &*store);
-    assert_eq!(keys(&declared), declared_keys(PARTITIONS, true));
+    let counter = admin::instance_key(&first.instance);
+    assert_eq!(
+        keys(&declared),
+        declared_keys(PARTITIONS, &[&counter], true)
+    );
 
     let again = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
@@ -578,9 +584,11 @@ fn s1a_declare_on_a_formed_store_is_refused_and_writes_nothing() {
 /// writes nothing. The declaration of 8 runs again, adopts its reservation and stops after
 /// `routes/0` and three records; a declaration of 1 is refused by the preflight and writes
 /// nothing (it would publish count 1 beside `routes/0` = 8). Running the declaration of 8 again
-/// stops after a longer prefix, and a last run finishes it. Every record written by an earlier
-/// run keeps its bytes and revisions, and the formation record exists only after the run that
-/// finished. Unit (<200 ms, an in-memory store).
+/// stops after a longer prefix, then once more right after its counter (r5), and a last run
+/// finishes it under a new instance with a counter of its own at N = 0; the stopped run's
+/// counter stays, named by no formation record. Every record written by an earlier run keeps
+/// its bytes and revisions, and the formation record exists only after the run that finished.
+/// Unit (<200 ms, an in-memory store).
 /// Cut: drop `declare_preflight` from `admin::declare`; the second declaration of 1 is refused
 /// at the reservation instead, with another text, red. Drop `reserve` too and it adopts
 /// `partitions/1` and writes a formation record of 1 partition.
@@ -677,12 +685,51 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         None
     );
 
-    scripted.rescript(Script::default());
-    let done = rt.block_on(admin::declare(&store, &declaration()));
-    assert!(matches!(done, Ok(admin::Declared::Created(_))), "{done:?}");
+    // PR #138 review r5: stopped after its counter, at the formation record. The run that
+    // finishes names a new instance and a counter of its own; the stopped run's counter stays at
+    // no opens, for an instance no formation record names.
+    stop_after(2 + PARTITIONS + 1);
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
     let third = snapshot(&rt, &*store);
     assert!(kept(&second, &third), "{second:?} -> {third:?}");
-    assert_eq!(keys(&third), declared_keys(PARTITIONS, true));
+    let orphan: Vec<String> = keys(&third)
+        .into_iter()
+        .filter(|key| key.starts_with("rdb/instances/"))
+        .collect();
+    assert_eq!(orphan.len(), 1, "{:?}", keys(&third));
+    assert_eq!(
+        keys(&third),
+        declared_keys(PARTITIONS, &[&orphan[0]], false)
+    );
+    assert_eq!(
+        rt.block_on(admin::read_formation(&*store)).expect("reads"),
+        None
+    );
+
+    scripted.rescript(Script::default());
+    let done = rt.block_on(admin::declare(&store, &declaration()));
+    let Ok(admin::Declared::Created(formation)) = done else {
+        panic!("the last run finishes: {done:?}");
+    };
+    let fourth = snapshot(&rt, &*store);
+    assert!(kept(&third, &fourth), "{third:?} -> {fourth:?}");
+    let counter = admin::instance_key(&formation.instance);
+    assert_ne!(
+        counter, orphan[0],
+        "the finishing run names its own instance"
+    );
+    assert_eq!(
+        keys(&fourth),
+        declared_keys(PARTITIONS, &[&orphan[0], &counter], true)
+    );
+    let (count, _) = rt
+        .block_on(admin::read_count(&*store, &formation.instance))
+        .expect("the declared counter reads");
+    assert_eq!(count.n, 0, "the declared counter counts no opens yet");
 }
 
 /// One declaration's view of a store shared with another, for the race row. Its `list` of
@@ -851,6 +898,63 @@ fn s1a_concurrent_declarations_of_one_and_eight_partitions_publish_one_count() {
     }
 }
 
+/// PR #138 review r5: two identical declarations at once. Both pass the preflight and adopt one
+/// reservation; one is held at its formation record while the other runs to its end and
+/// publishes. Released, the held one finds that record and answers `Already` with it. Each
+/// wrote a counter of its own instance at no opens; the published formation record names one
+/// of them, and the other is never named. Unit (<200 ms, an in-memory store).
+#[config_log::retcd_test]
+fn s1a_concurrent_identical_declarations_publish_one_formation_with_its_counter() {
+    let rt = runtime();
+    let mem: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let both = Arc::new(tokio::sync::Barrier::new(2));
+    let held = Arc::new(DeclareRace::new(Arc::clone(&mem), Arc::clone(&both), true));
+    let other = Arc::new(DeclareRace::new(Arc::clone(&mem), both, false));
+    let declare = |store: Arc<DeclareRace>| {
+        let store: Arc<dyn ConfigStore> = store;
+        rt.spawn(async move { admin::declare(&store, &declaration()).await })
+    };
+    let holding = declare(Arc::clone(&held));
+    let running = declare(Arc::clone(&other));
+    let within = Duration::from_secs(10);
+    rt.block_on(async {
+        tokio::time::timeout(within, held.at_marker.notified())
+            .await
+            .expect("the held declaration reaches its formation record");
+    });
+    other.go.add_permits(1);
+    let ran = rt
+        .block_on(async { tokio::time::timeout(within, running).await })
+        .expect("the other declaration ends")
+        .expect("the task ends");
+    let Ok(admin::Declared::Created(published)) = ran else {
+        panic!("the declaration that ran publishes: {ran:?}");
+    };
+    held.marker.add_permits(1);
+    let late = rt
+        .block_on(async { tokio::time::timeout(within, holding).await })
+        .expect("the held declaration ends")
+        .expect("the task ends");
+    assert!(
+        matches!(&late, Ok(admin::Declared::Already(found)) if *found == published),
+        "{late:?}"
+    );
+    assert_eq!(
+        rt.block_on(admin::read_formation(&*mem)).expect("reads"),
+        Some(published.clone())
+    );
+    let (count, _) = rt
+        .block_on(admin::read_count(&*mem, &published.instance))
+        .expect("the published instance's counter reads");
+    assert_eq!(count.n, 0, "no opens yet");
+    let counters: Vec<String> = keys(&snapshot(&rt, &*mem))
+        .into_iter()
+        .filter(|key| key.starts_with("rdb/instances/"))
+        .collect();
+    assert_eq!(counters.len(), 2, "one counter each: {counters:?}");
+    assert!(counters.contains(&admin::instance_key(&published.instance)));
+}
+
 /// PR #138 review: the formation record is published last. Held at its put, the store
 /// already holds `routes/0` and all 8 untouched generation-0 records, and no formation record.
 /// A declaration stopped before its last record writes no formation record; a node process on
@@ -872,7 +976,19 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
             .expect("the formation record's put arrives");
     });
     let at_marker = snapshot(&rt, &*mem);
-    assert_eq!(keys(&at_marker), declared_keys(PARTITIONS, false));
+    let counter: Vec<String> = keys(&at_marker)
+        .into_iter()
+        .filter(|key| key.starts_with("rdb/instances/"))
+        .collect();
+    assert_eq!(
+        counter.len(),
+        1,
+        "the counter is written before the formation record"
+    );
+    assert_eq!(
+        keys(&at_marker),
+        declared_keys(PARTITIONS, &[&counter[0]], false)
+    );
     for (key, value, create, modified) in &at_marker {
         assert_eq!(create, modified, "{key:?} is untouched");
         if key.starts_with(b"partitions/") {
@@ -1362,10 +1478,10 @@ fn s1a_a_declared_reopen_with_its_counter_gone_is_refused() {
 /// and node 1 opening its first, empty one, are each refused, naming the absent counter: none
 /// creates it again at N = 1. Nothing is written, nodes 2 and 3 keep their copies, and node 1's
 /// open leaves no `nodes/`. Integration (~4 s): a partial formation over real links.
-/// Cut 1: count with `create` whenever partition 1 is still to form (`found.fresh ||
-/// found.forms_first`, as at 54db485); node 2's reopen counts N = 1 and opens, red.
-/// Cut 2: drop only the "no other partition rooted" clause; node 2 and 3 are refused, but node
-/// 1's first open, which holds no data, counts N = 1 and opens, red.
+/// Cut: count with `create` whenever partition 1 is still to form (`found.fresh ||
+/// found.forms_first`, as at 54db485); node 2's reopen counts N = 1 and opens, red. Since r5 a
+/// declared open never counts with `create` (`admin::declare` wrote the counter), so the r3 cut
+/// of the "no other partition rooted" clause has no code left to cut.
 #[config_log::retcd_test]
 fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
@@ -1517,7 +1633,7 @@ fn s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record() {
     );
     assert_eq!(
         keys(&snapshot(&rt, &*store)),
-        declared_keys(PARTITIONS, false)
+        declared_keys(PARTITIONS, &[], false)
     );
     scripted.rescript(Script::default());
     let dir = config_testkit::fs::temp_dir();
@@ -1600,17 +1716,20 @@ fn s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry(
         }
         scripted.rescript(Script::default());
         let done = rt.block_on(admin::declare(&store, &declaration()));
-        assert!(
-            matches!(&done, Ok(admin::Declared::Created(formation))
-                if formation.partitions == PARTITIONS),
-            "applied {applied}: {done:?}"
-        );
+        let Ok(admin::Declared::Created(formation)) = &done else {
+            panic!("applied {applied}: {done:?}");
+        };
+        assert_eq!(formation.partitions, PARTITIONS, "applied {applied}");
         let finished = snapshot(&rt, &*store);
         assert!(
             kept(&before, &finished),
             "applied {applied}: {before:?} -> {finished:?}"
         );
-        assert_eq!(keys(&finished), declared_keys(PARTITIONS, true));
+        let counter = admin::instance_key(&formation.instance);
+        assert_eq!(
+            keys(&finished),
+            declared_keys(PARTITIONS, &[&counter], true)
+        );
         let other = rt.block_on(admin::declare(
             &store,
             &admin::Declaration {
@@ -1659,8 +1778,8 @@ fn s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing() {
 /// A store whose counter puts race other opens, for the counter rows. Each of the first
 /// `conflicts` puts on the counter first lets another open count (`count_open` straight on
 /// `inner`, which creates the counter if it is absent), so the put it then forwards conflicts.
-/// When `vanish` and the last of them is a CAS (not a create), the counter is deleted after the
-/// other open counts, and every counter put after that is counted in `late_puts`.
+/// When `vanish`, the counter is deleted once the last of them has conflicted, whether it was a
+/// create or a CAS, and every counter put after that is counted in `late_puts`.
 struct CounterRace {
     inner: Arc<dyn ConfigStore>,
     key: Bytes,
@@ -1712,7 +1831,8 @@ impl ConfigStore for CounterRace {
             admin::count_open(&*self.inner, &self.instance, true, admin::COUNT_WITHIN)
                 .await
                 .expect("the other open counts");
-            if left == 1 && self.vanish && request.expected_mod_revision != Some(0) {
+            if left == 1 && self.vanish {
+                let answer = self.inner.put(request).await;
                 let deleted = self
                     .inner
                     .delete(config_core::DeleteRequest {
@@ -1723,7 +1843,6 @@ impl ConfigStore for CounterRace {
                     .await
                     .expect("delete the counter");
                 assert_eq!(deleted.outcome, config_core::MutationOutcome::Applied);
-                let answer = self.inner.put(request).await;
                 self.vanished.store(true, Ordering::SeqCst);
                 return answer;
             }
@@ -1761,11 +1880,13 @@ impl ConfigStore for CounterRace {
 /// loses its CAS to other opens one or more times, and the counter is then deleted before it
 /// reads again. It is refused `Absent` and writes nothing: a counter it has seen is never
 /// recreated, since a new N = 1 would overlap the request range of the open that already holds
-/// 1. Started on an empty store too, where its own create loses to another open's. Against an
-/// intact counter the same conflicts are retried and counted after the others, and a first
-/// creation with no race is N = 1. Unit (<1 s, an in-memory store; each conflict waits 50 ms).
-/// Cut: `count_open` keeps `fresh` across a read that found the counter; the retry recreates
-/// N = 1, red.
+/// 1. Started on an empty store too, where its own create loses to another open's, and the
+/// counter may be deleted right after that lost create (r5). Against an intact counter the same
+/// conflicts are retried and counted after the others, and a first creation with no race is
+/// N = 1. Unit (<1 s, an in-memory store; each conflict waits 50 ms).
+/// Cut 1: `count_open` keeps `fresh` across a read that found the counter; the retry recreates
+/// N = 1, red. Cut 2: a conflicting create leaves `may_create` set; the unseeded 1-conflict case
+/// recreates N = 1, red.
 #[config_log::retcd_test]
 fn s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated() {
     let rt = runtime();
@@ -1795,9 +1916,10 @@ fn s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated() {
         }
     };
     for seeded in [true, false] {
-        // Unseeded, the first conflict is on the create, so the delete needs a later CAS.
-        let lost = if seeded { [1, 3] } else { [2, 3] };
-        for conflicts in lost {
+        // Unseeded, the first conflict is on the open's own create: with 1, the counter is
+        // deleted right after that lost create (PR #138 review r5).
+        let lost: &[u32] = if seeded { &[1, 3] } else { &[1, 2, 3] };
+        for &conflicts in lost {
             let case = format!("seeded {seeded}, {conflicts} conflicts, then deleted");
             let store = race(true, conflicts, seeded);
             let counted = rt.block_on(admin::count_open(
@@ -1844,4 +1966,210 @@ fn s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated() {
             );
         }
     }
+}
+
+/// The declared counter of `formation`, deleted by hand, and the store as it was before the
+/// delete, less that one record.
+fn delete_counter(
+    rig: &Rig,
+    formation: &admin::Formation,
+) -> (String, Vec<(Bytes, Bytes, u64, u64)>) {
+    let counter = admin::instance_key(&formation.instance);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(counter.clone()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the counter is deleted");
+    let after = snapshot(&rig.rt, &*rig.store);
+    assert!(!keys(&after).contains(&counter), "{counter} is gone");
+    (counter, after)
+}
+
+/// PR #138 review r5 (blocker): on an untouched declared store, node 1's open meets the counter
+/// moving under it. Its first counter write loses to node 2's open, which takes N = 1 and has
+/// rooted nothing yet, and the counter is then deleted before node 1 reads it again. Node 1 is
+/// refused, naming the absent counter: it sends no counter put after the delete, the store is
+/// what it was less the counter, and no `nodes/` is left. A declared open never creates the
+/// counter, since `admin::declare` wrote it. Unit (<1 s, one node process refused before it
+/// spawns anything).
+/// Cut: `declare` writes no counter and a declared open with partition 1 untouched may create
+/// it (as at 168f56e); node 1's create loses, and its retry creates N = 1 again and opens, red.
+#[config_log::retcd_test]
+fn s1a_counter_deleted_after_lost_create_is_not_recreated() {
+    let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let formation = rig.declare_created();
+    let counter = admin::instance_key(&formation.instance);
+    let before: Vec<_> = snapshot(&rig.rt, &*rig.store)
+        .into_iter()
+        .filter(|(key, ..)| key.as_ref() != counter.as_bytes())
+        .collect();
+    let race = Arc::new(CounterRace {
+        inner: Arc::clone(&rig.store),
+        key: Bytes::from(counter.clone()),
+        instance: formation.instance,
+        conflicts: std::sync::atomic::AtomicU32::new(1),
+        vanish: true,
+        vanished: std::sync::atomic::AtomicBool::new(false),
+        late_puts: std::sync::atomic::AtomicU32::new(0),
+    });
+    let raced: Arc<dyn ConfigStore> = race.clone();
+    let (dir, _keep) = folder();
+    let (listeners, addrs) = listeners(&rig.rt);
+    let opened = open_node(
+        &rig.rt,
+        &raced,
+        &rig.cert_dir,
+        NodeId(1),
+        &dir,
+        listeners.into_iter().next().expect("a listener"),
+        &addrs,
+    );
+    let Err(refused) = opened.map(|_| ()) else {
+        panic!("node 1 opened over a counter deleted under it");
+    };
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("{counter} is absent")),
+        "{refused}"
+    );
+    assert!(
+        race.vanished.load(std::sync::atomic::Ordering::SeqCst),
+        "the counter was deleted"
+    );
+    assert_eq!(
+        race.late_puts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no counter put after the delete"
+    );
+    assert_eq!(snapshot(&rig.rt, &*rig.store), before, "nothing written");
+    assert!(!has_copies(&dir), "no copy was made");
+}
+
+/// PR #138 review r5 (restart variant): node 2's first open of an untouched declared store
+/// counts N = 1 and stops at its first partition record, so nothing is rooted and no copy holds
+/// data. The counter is then deleted by hand. Node 2 restarting on its folder, and nodes 1 and
+/// 3 opening theirs for the first time, are each refused, naming the absent counter: nothing
+/// is written and no `nodes/` is left. The declaration's counter is the evidence of the
+/// database's first open, and no open writes it from absent. Unit (<1 s, an in-memory store).
+/// Cut: as `s1a_counter_deleted_after_lost_create_is_not_recreated`; node 2's restart creates
+/// N = 1 again and opens, red.
+#[config_log::retcd_test]
+fn s1a_a_declared_restart_with_its_counter_gone_before_any_root_is_refused() {
+    let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let formation = rig.declare_created();
+    let gated = Arc::new(PartitionGate {
+        inner: Arc::clone(&rig.store),
+        gate: tokio::sync::Semaphore::new(tokio::sync::Semaphore::MAX_PERMITS / 2),
+        arrived: tokio::sync::Notify::new(),
+        refuse: std::sync::atomic::AtomicBool::new(true),
+    });
+    let gated_store: Arc<dyn ConfigStore> = gated;
+    let dirs = fresh_dirs();
+    let open = |store: &Arc<dyn ConfigStore>, node: NodeId| {
+        let (listeners, addrs) = listeners(&rig.rt);
+        open_node(
+            &rig.rt,
+            store,
+            &rig.cert_dir,
+            node,
+            &dirs[node.0 as usize - 1].0,
+            listeners
+                .into_iter()
+                .nth(node.0 as usize - 1)
+                .expect("a listener"),
+            &addrs,
+        )
+        .map(|_| ())
+    };
+    let stopped = open(&gated_store, NodeId(2));
+    assert!(
+        matches!(&stopped, Err(error) if error.to_string().contains("the opener stopped")),
+        "node 2's first open stops at its partition record: {stopped:?}"
+    );
+    let count = rig
+        .rt
+        .block_on(admin::read_count(&*rig.store, &formation.instance))
+        .expect("the counter reads");
+    assert_eq!(count.0.n, 1, "node 2's first open took N = 1");
+    let (counter, before) = delete_counter(&rig, &formation);
+    for node in [NodeId(2), NodeId(1), NodeId(3)] {
+        let refused = open(&rig.store, node).expect_err("an open with no counter is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("{counter} is absent")),
+            "node {}: {refused}",
+            node.0
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            before,
+            "node {}: nothing written",
+            node.0
+        );
+        assert!(
+            !has_copies(&dirs[node.0 as usize - 1].0),
+            "node {}: no copy was made",
+            node.0
+        );
+    }
+}
+
+/// PR #138 review r5 (author question): an open refused because a declared database is still
+/// forming names what forms it, its node processes, and never `--form`, `lr up` or `--declare`
+/// as the step, since `--form` is refused on a declared store and `--declare` answers that it is
+/// already declared. On a store with no formation record the step still names `--form`, and
+/// `--declare` only for a declaration stopped before its formation record. Unit (<100 ms, an
+/// in-memory store and the refusal texts).
+#[config_log::retcd_test]
+fn s1a_a_declared_store_still_forming_names_its_node_processes_never_form() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    let declared_texts = [
+        rt.block_on(formed_member(&store, &[NodeId(2)], true))
+            .map(|_| ())
+            .expect_err("partitions/1 names no instance yet")
+            .to_string(),
+        unformed_refusal(PartitionId(2), PARTITIONS, &PartitionState::Absent, true)
+            .expect("refused")
+            .to_string(),
+        unformed_refusal(
+            PartitionId(2),
+            PARTITIONS,
+            &PartitionState::Unrooted { untouched: true },
+            true,
+        )
+        .expect("refused")
+        .to_string(),
+    ];
+    for text in &declared_texts {
+        assert!(
+            text.contains("its node processes form it")
+                && text.contains("rdb_node --node N")
+                && text.contains("rdb_node --form and --declare do not form it"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("lr up") && !text.contains("again with the same"),
+            "{text}"
+        );
+    }
+    let undeclared = unformed_refusal(PartitionId(2), PARTITIONS, &PartitionState::Absent, false)
+        .expect("refused")
+        .to_string();
+    assert!(
+        undeclared.contains("rdb_node --form (what lr up runs) with the same --dir")
+            && undeclared.contains(
+                "if a declaration of it stopped before its formation record, that rdb_node \
+                 --declare again"
+            ),
+        "{undeclared}"
+    );
 }

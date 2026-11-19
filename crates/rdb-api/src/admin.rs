@@ -649,6 +649,19 @@ pub async fn declare(
         partitions,
         nodes: declaration.nodes.clone(),
     };
+    // PR #138 review r5: the declaration, not an open, creates the instance's counter, at no
+    // opens yet. So a declared open never writes it from absent: an absent counter is refused
+    // on a first open, a retry and a restart alike, and a manual delete can never hand N = 1
+    // out twice. It goes before the formation record, so every formation record names a
+    // counter; one written by a run that stopped before its formation record names an
+    // instance no formation record will name, and nothing reads it.
+    let counter = instance_key(&formation.instance);
+    let revision = create_or_adopt(store, &counter, &encode_count(NO_OPENS)).await?;
+    tracing::info!(
+        key = %counter,
+        revision = revision.0,
+        "declare_counter_created"
+    );
     let key = ControlKey::Operation(FORMATION_OPERATION).encode();
     let created = store
         .put(PutRequest {
@@ -843,6 +856,13 @@ const COUNTER_LAYOUT_N_ONLY: u8 = 1;
 /// forward on it, and the next activation replaces it.
 pub const ACTIVATED_UNKNOWN: Generation = Generation(u64::MAX);
 
+/// The counter [`declare`] creates (PR #138 review r5): no opens yet, nothing activated. The
+/// first open's CAS makes it N = 1.
+const NO_OPENS: Count = Count {
+    n: 0,
+    activated: Generation(0),
+};
+
 /// An open counter's value (arch R3b, rulings A-R160 and A-R184).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Count {
@@ -940,8 +960,10 @@ pub enum CounterError {
 
 /// Count one more open of `instance` and return its number N (arch R3b): N = 1 by a create-only
 /// write when `fresh` finds no counter, otherwise N + 1 by a CAS at the revision just read. Once
-/// any read has found the counter, `fresh` no longer applies: a counter gone on a later read is
-/// [`CounterError::Absent`], never created again. A
+/// any read has found the counter, or this open's create has conflicted with another's, `fresh`
+/// no longer applies: a counter gone on a later read is [`CounterError::Absent`], never created
+/// again. A declared database's counter is created by [`declare`], and its opens count with
+/// `fresh` false. A
 /// conflict or a lost reply reads again and CASes again, so a lost reply can waste a number but
 /// never hand one out twice. A transient store error waits 50 ms and tries again; all of it is
 /// bounded by `within`. Logged as `open_counted{instance_hex, n, revision}` and each retry as
@@ -1028,12 +1050,21 @@ pub async fn count_open(
                 );
                 return Ok(next.n);
             }
-            Ok(_) => last = format!("CAS at {expected} was not applied"),
+            // A create that conflicts proves another open created the counter (PR #138 review
+            // r5): this open may no longer create it, so a counter gone on the next read was
+            // deleted. A lost reply proves nothing, and the next read finds this open's own
+            // create if it landed.
+            Ok(_) => {
+                may_create = false;
+                last = format!("CAS at {expected} was not applied");
+            }
+            Err(error @ ConfigError::Conflict { .. }) => {
+                may_create = false;
+                last = error.to_string();
+            }
             Err(error)
-                if matches!(
-                    error,
-                    ConfigError::Conflict { .. } | ConfigError::DeadlineExceededUnknownOutcome
-                ) || crate::control::transient(&error) =>
+                if matches!(error, ConfigError::DeadlineExceededUnknownOutcome)
+                    || crate::control::transient(&error) =>
             {
                 last = error.to_string();
             }
@@ -4792,7 +4823,8 @@ mod tests {
     }
 
     /// PR #138 review: the formation record and the declaration's reservation are written once
-    /// and read by every later build, so their keys and layout-1 bytes are pinned as literals:
+    /// and read by every later build, so their keys and layout-1 bytes are pinned as literals, as
+    /// are the key and bytes of the counter a declaration creates (r5):
     /// changing `encode` and `decode` together cannot pass while old stores stop opening. A wrong
     /// version byte, a count cut short and a trailing byte each decode as nothing. Unit.
     #[test]
@@ -4837,6 +4869,19 @@ mod tests {
             Declaration::decode_reservation(&reservation_bytes),
             Some(declaration)
         );
+        // PR #138 review r5: the counter `declare` creates, under the formation's instance, is
+        // counter layout 2 at N = 0, nothing activated; the first open's CAS reads it as such.
+        assert_eq!(
+            instance_key(
+                &formation_bytes[1..=INSTANCE_LEN]
+                    .try_into()
+                    .expect("16 bytes")
+            ),
+            "rdb/instances/0102030405060708090a0b0c0d0e0f10"
+        );
+        let no_opens: [u8; 17] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(encode_count(NO_OPENS).as_ref(), no_opens);
+        assert_eq!(decode_count(&no_opens), Some(NO_OPENS));
 
         let malformed = |good: &[u8], count_at: usize| {
             let mut wrong_version = good.to_vec();

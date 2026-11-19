@@ -23,7 +23,8 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
 
 1. **A declaration is the only switch.** `admin::declare` (CLI: `rdb_node --declare`) writes
    first its reservation `operations/{RESERVATION_OPERATION}`, then `routes/0` (more than one
-   partition), each partition's generation-0 record, and **last** the formation record
+   partition), each partition's generation-0 record, the open counter of the instance it names
+   (`rdb/instances/<hex>`, layout 2 at N = 0, create-only), and **last** the formation record
    `operations/{FORMATION_OPERATION}`. The formation record's presence is what lets
    a node process form. With no formation record, a node process on an empty folder is refused
    with the same cause as before; its recovery text now also names `--declare`.
@@ -53,7 +54,8 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
    retry of the same count after an interruption still finishes. Layout 1: one version byte
    (1), the partition count (u32 LE), then one u32 LE per declared node. Like the formation
    record (`operations/63050394783186944`), it is write-once, and both layouts are pinned as
-   literal bytes in `admin::tests::s1a_formation_and_reservation_layout_1_bytes_are_pinned`.
+   literal bytes in `admin::tests::s1a_formation_and_reservation_layout_1_bytes_are_pinned`, as
+   are the key and N = 0 bytes of the counter a declaration creates.
 4. **The declaration names the instance.** A node process of a declared database binds the
    formation record's instance into its empty copy. It does not invent one at open.
 5. **Each owner forms its own partitions.** A node process of a declared database marks each
@@ -70,6 +72,9 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
    records. A database made by `--form` cannot be declared afterwards: its rooted `partitions/1` is
    in the way. A declared database cannot be formed by a whole-database open either: on copies
    with no data that open would bind an instance of its own, so it is refused before binding.
+   So an open refused because a declared database is still forming names its node processes
+   (`rdb_node --node N`, each with its own `--dir`) as what forms it, never `--form`; `--declare`
+   is named only for a declaration stopped before its formation record.
 
 ## Consequences
 
@@ -77,16 +82,23 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
   node's copy.
 - Two more control records, the reservation and the formation record. Neither is ever
   rewritten, so they need no CAS discipline after creation.
-- The open counter may be created by a fresh whole-database open, or by a declared node
-  process that finds, at that moment, partition 1 untouched, no copy in its folder holding
-  data, and every other partition still to form. Otherwise an absent counter is refused (a
-  manual delete, or a restore of some prefixes only) rather than counted N = 1 again, after a
-  partial formation too. Every open counts before it roots anything, so a rooted partition or
-  a copy holding data proves an earlier open counted. The reverse does not hold: the checks
-  read the current state, and an earlier open that counted and stopped before writing anything
-  leaves them all true, so they do not prove this is the first open. Once `count_open` has read
-  the counter present it never creates it, so a counter deleted between its retries is refused
-  too (`s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`).
+- A declared database's open counter is created by the declaration, at N = 0, before the
+  formation record, so every formation record names an instance whose counter was written. A
+  declared node process never creates the counter: once the formation record exists, an absent
+  counter is refused (`CounterError::Absent`) on every declared open, a first open, a retry and
+  a restart alike, whether or not any partition is rooted or any copy holds data. So a manual
+  delete, or a restore of some prefixes only, is refused rather than counted N = 1 again, and
+  no request id is handed out twice. The record that proves a first open may have happened is
+  the counter itself: the declaration wrote it, and no declared open writes it from absent.
+- A declaration stopped before its counter is finished by running the same `--declare` again.
+  One stopped after its counter and before its formation record leaves that counter at N = 0
+  for an instance no formation record will name; the run that finishes names a new instance
+  and a counter of its own. Two identical declarations run at once leave one such counter too.
+  Nothing reads it.
+- A fresh whole-database open (`--form`, `lr up`) still creates its own counter at N = 1. Once
+  `count_open` has read the counter present, or lost its create to another open's, it never
+  creates it, so a counter deleted between its retries is refused too
+  (`s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`).
 - Not covered: an owner whose copy is empty after its partition got its first root, before any
   write was admitted. It is refused as before ("has not finished forming"), and running the
   declaration again does not recover it (#137). The refusal says so; it does not give the
@@ -99,23 +111,34 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
 - `s1a_declared_database_forms_with_no_shared_folder`. Red with the formation read cut out of
   `Db::open_spawning`.
 - `s1a_an_interrupted_declaration_is_finished_by_its_own_count_only`: a declaration stopped
-  twice, at a longer prefix each time, then finished; a one-partition declaration in between is
-  refused. Red with `declare_preflight` cut.
+  three times, at a longer prefix each time (the last after its counter), then finished; a
+  one-partition declaration in between is refused. Red with `declare_preflight` cut.
 - `s1a_declare_on_a_formed_store_is_refused_and_writes_nothing`. Red with `declare_preflight` cut.
 - `s1a_concurrent_declarations_of_one_and_eight_partitions_publish_one_count`: declarations of 1
   and 8 both pass the preflight; in both winner orders the loser is refused at the reservation
   and a full store snapshot is unchanged by it. Red in both orders with `reserve` cut.
+- `s1a_concurrent_identical_declarations_publish_one_formation_with_its_counter`: one formation
+  record, and its instance's counter at N = 0.
 - `s1a_a_declared_reopen_with_its_counter_gone_is_refused`. Red with the counter created on every
   declared open.
 - `s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused`: partition 2 rooted
   and written, partition 1 untouched, the counter deleted; nodes 2 and 3 reopening and node 1's
   first open are each refused. Red with the counter created whenever partition 1 is still to
-  form, and (node 1) with the "no other partition rooted" clause cut.
+  form.
+- `s1a_counter_deleted_after_lost_create_is_not_recreated`: on an untouched declared store,
+  node 1's first counter write loses to node 2's open (N = 1) and the counter is then deleted;
+  node 1 is refused `Absent`, sends no counter put after the delete, and the store is unchanged
+  but for the delete. `s1a_a_declared_restart_with_its_counter_gone_before_any_root_is_refused`:
+  node 2's first open counts and stops before any root, the counter is deleted, and node 2's
+  restart and nodes 1 and 3's first opens are each refused with nothing written. Both red with
+  `declare` writing no counter and a declared open with partition 1 untouched creating it.
 - `s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`: an open that may create the
-  counter reads it present, loses its CAS once or three times, and the counter is deleted
+  counter loses one to three of its counter writes to other opens, and the counter is deleted
   before its retry; it is refused `Absent` and writes nothing. Intact-counter retries and a
   first creation still count. Red with `count_open` keeping `fresh` across a read that found
-  the counter.
+  the counter, and (its own create lost once) across a conflicting create.
+- `s1a_a_declared_store_still_forming_names_its_node_processes_never_form`: the still-forming
+  refusals of a declared store name its node processes, and an undeclared store's name `--form`.
 - `s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry` (applied and
   unapplied) and `s1a_an_undecodable_reservation_refuses_the_declaration_and_writes_nothing`.
 - `s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record`.
@@ -135,7 +158,7 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
 - `crates/rdb-api/examples/rdb_node.rs`: `s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing`,
   `s1a_declare_rejects_five_mode_and_copy_flags`, `s1a_declare_rejects_each_planner_knob`,
   `s1a_declare_node_counts_parse_as_gen_certs_does`, `s1a_declare_rejects_failover`.
-- Manual: `rdb_node --declare --partitions 8`, then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
+- Manual: `rdb_node --declare --control <endpoints> --partitions 8`, then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
   its own `--dir`, 8 partitions. A write commits on each node's partitions.
 
 ## References
