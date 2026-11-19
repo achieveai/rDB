@@ -1393,7 +1393,8 @@ fn s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused()
         assert!(
             matches!(refused, OpenError::Config(_))
                 && text.contains(&gone)
-                && text.contains(&format!("declared with {PARTITIONS} partitions")),
+                && text.contains(&format!("declared with {PARTITIONS} partitions"))
+                && !text.contains("  "),
             "{gone}: {text}"
         );
         assert_eq!(
@@ -2263,13 +2264,14 @@ fn s1a_a_declared_store_still_forming_names_its_node_processes_never_form() {
     ];
     for text in &declared_texts {
         assert!(
-            text.contains("its node processes form it")
-                && text.contains("rdb_node --node N")
-                && text.contains("rdb_node --form and --declare do not form it"),
+            text.contains("its node processes form it") && text.contains("rdb_node --node N"),
             "{text}"
         );
         assert!(
-            !text.contains("lr up") && !text.contains("again with the same"),
+            !text.contains("lr up")
+                && !text.contains("--form")
+                && !text.contains("--declare")
+                && !text.contains("again with the same"),
             "{text}"
         );
     }

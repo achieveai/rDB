@@ -983,8 +983,7 @@ const RERUN_FORM: &str = "run the command that formed it again: rdb_node --form 
 /// of it again answers that it is already declared and writes nothing.
 const DECLARED_FORMING: &str = "the database is declared, so its node processes form it: each \
                                 forms the partitions it owns (rdb_node --node N, with its own \
-                                --dir and the same --control); rdb_node --form and --declare do \
-                                not form it";
+                                --dir and the same --control)";
 
 /// [`RERUN_FORM`], or [`DECLARED_FORMING`] for a store that holds a formation record.
 const fn forming_step(declared: bool) -> &'static str {
@@ -1737,7 +1736,9 @@ impl Db {
         if let Some(formation) = formation.as_ref().filter(|f| f.partitions != partitions) {
             let key = ControlKey::Route(RangeId(0)).encode();
             return Err(OpenError::Config(format!(
-                "the database is declared with {} partitions, and {key} gives {partitions}: the                  declaration wrote {key}, which is gone or changed, so this open would not run                  the declared partitions; nothing was created",
+                "the database is declared with {} partitions, but {key} is gone or says another \
+                 count ({partitions}): the declaration wrote {key}, so this open would not run \
+                 the declared partitions; nothing was created",
                 formation.partitions
             )));
         }
