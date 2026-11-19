@@ -1190,34 +1190,52 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `rdb_node --declare --control E --partitions P --peers 1=ADDR,...,K=ADDR` writes only the
     control records and a formation record that names the database (ADR-rdb-0022). K is 3
     to 8. It writes one `nodes/N` record per node: its address and its machine
-    (ADR-rdb-0023). `--machines N=LABEL,...` names a node's machine; unset, the machine is the
-    address's host as parsed (`[0:0:0:0:0:0:0:1]` gives `::1`). Two nodes on one machine are
-    refused: the same label, or the same host whatever the labels say (two spellings of one IP,
-    such as `[::1]` and `[0:0:0:0:0:0:0:1]`, are one host). An address no peer can dial is
-    refused: port 0, a bracketed host that is not an IPv6 address, a host of digits and dots
-    that is not four octets (`127.1`), or an unspecified (`0.0.0.0`, `[::]`), broadcast or
-    multicast address. Then make the certificates once, `rdb_node --gen-certs --cert-dir C
-    --nodes K`, and start each node process with `rdb_node --node N --dir D --listen ADDR
-    --peers ... --control E --cert-dir C`: its own empty `--dir`, `--listen` on its recorded
-    address, the same `--peers`, and the same `--control` and `--cert-dir`. A node whose
-    `--listen` or any `--peers` entry disagrees with the records is refused before it binds,
-    naming the record. Partitions are placed round the ring: partition p's owner is node ((p -
-    1) mod K) + 1, and its copies are that node and the next two. The owner of each partition
-    forms it when its three nodes are linked. Each folder ends up holding only its own
-    `nodes/<n>`. The same `--declare` run again answers `already`. A different `--partitions`,
-    node set or address is refused. Of two `--declare` runs that differ at the same moment, one
-    is refused and writes nothing.
+    (ADR-rdb-0023). `--machines N=LABEL,...` names a node's machine: 1 to 63 bytes of
+    `[a-z0-9._:-]` after lowercasing. Unset, the machine is the address's host as parsed
+    (`[0:0:0:0:0:0:0:1]` gives `::1`, `DB-A.example.` gives `db-a.example`). Two nodes on one
+    machine are refused: the same label, or the same host whatever the labels say (two
+    spellings of one IP, such as `[::1]` and `[0:0:0:0:0:0:0:1]`, are one host).
+  - An address must be one a peer can dial, since a record is never rewritten. The port is 1
+    to 65535. The host is one of:
+    - a four-octet IPv4 address, or an IPv6 address in brackets, that is not unspecified,
+      broadcast or multicast;
+    - a host name, checked against a whitelist: only ASCII letters, digits, `-` and `.`;
+      after one trailing dot is removed, 1 to 253 bytes of labels of 1 to 63 bytes each, none
+      empty and none starting or ending with `-`; and the last label starts with a letter.
+
+    Anything else is refused, with nothing written. For example: port 0, `[::gg]`, `0.0.0.0`,
+    `255.255.255.255`, `127.1`, `0xffffffff`, `..`, or a host holding a space or control byte.
+  - Then make the certificates once, `rdb_node --gen-certs --cert-dir C --nodes K`, and start
+    each node process with
+    `rdb_node --node N --dir D --listen ADDR --peers ... --control E --cert-dir C`: its own
+    empty `--dir`, `--listen` on its recorded address, the same `--peers`, and the same
+    `--control` and `--cert-dir`. A node whose `--listen` or any `--peers` entry disagrees with
+    the records is refused before it binds, naming the record. Partitions are placed round the
+    ring: partition p's owner is node ((p - 1) mod K) + 1, and its copies are that node and the
+    next two. The owner of each partition forms it when its three nodes are linked. Each folder
+    ends up holding only its own `nodes/<n>`. The same `--declare` run again answers `already`.
+    A different `--partitions`, node set or address is refused. Of two `--declare` runs that
+    differ at the same moment, one is refused and writes nothing.
   - An embedded `Db` of a declared database runs exactly one node (`DbConfig::local` of one
     node); more is refused. It must set `DbConfig::addresses`: the address its listener is
     bound to, and every node's address as it was given them. The open compares them with the
     `nodes/` records, on every open (first, retry and restart). By then the open has created
     its folder (`DbConfig::dir`); it creates nothing inside it and writes nothing to the store
-    before the check. It is refused naming the record that disagrees; `None` is refused too.
-    A refusal of the open itself ends "nothing but its folder was created". `Db::open` binds
-    nothing itself: your listener is already bound when you call it. To refuse before
-    binding, as `rdb_node` does, call `admin::read_formation`, `admin::read_nodes` and
-    `admin::node_start_refusal` first. A store declared by an earlier build (no `nodes/`
-    records) is refused; declare again on a new store.
+    before the check. `None` is refused too. Two kinds of refusal end differently:
+    - The node-start check (`admin::node_start_refusal`), which `rdb_node` and `Db::open` both
+      run, ends "nothing was started". It refuses an undeclared node, a store with no `nodes/`
+      records, a missing record of its own, a listen or peer address that disagrees with its
+      record (those name the record and both addresses), a peer that names a node with no
+      record, and a declared node given no peer address.
+    - The checks `Db::open` adds itself end "nothing but its folder was created": two local
+      nodes, a store with no `nodes/` records, the local node's record absent, and no
+      `DbConfig::addresses`. They run before the node-start check, so on `Db::open` a store
+      with no records, or a missing record of its own, ends this way.
+
+    `Db::open` binds nothing itself: your listener is already bound when you call it. To
+    refuse before binding, as `rdb_node` does, call `admin::read_formation`,
+    `admin::read_nodes` and `admin::node_start_refusal` first. A store declared by an earlier
+    build (no `nodes/` records) is refused; declare again on a new store.
 
   This can be run with up to eight processes on 127.0.0.1 to .8 of one host: each loopback
   address counts as its own machine. The tests run five to eight nodes this way in one

@@ -523,7 +523,8 @@ pub struct NodeDecl {
     /// Where it listens.
     pub addr: String,
     /// Its machine label; `None` is the host of [`Self::addr`] as [`parse_addr`] parses it,
-    /// not as written. Lowercased.
+    /// not as written. Lowercased, then held to [`machine_refusal`]: 1 to 63 bytes of
+    /// `[a-z0-9._:-]`, so no whitespace, control byte or other character is ever stored.
     pub machine: Option<String>,
 }
 
@@ -601,10 +602,10 @@ impl Declaration {
     }
 
     /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the node
-    /// set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes, so not port 0, a
-    /// bad bracketed host, or an unspecified, broadcast or multicast host; at most 255 bytes; none
-    /// twice), then each machine label ([`machine_refusal`], after lowercasing; unset, the
-    /// address's host as [`parse_addr`] parses it), then [`machine_clash`].
+    /// set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes: a port of 1 to
+    /// 65535, and a dialable IP or a whitelisted host name; at most 255 bytes; none twice), then
+    /// each machine label ([`machine_refusal`], after lowercasing; unset, the address's host as
+    /// [`parse_addr`] parses it), then [`machine_clash`].
     ///
     /// # Errors
     ///
@@ -5712,6 +5713,47 @@ mod tests {
         ] {
             assert_eq!(Declaration::decode_reservation(&body), None, "{what}");
         }
+    }
+
+    /// #80 S1b, PR #144 review r3: a default machine label is the host as `parse_addr` parses
+    /// it, not as written: an upper-case name with a trailing dot (`DB-A.example.`) gives
+    /// `db-a.example`, a long-form IPv6 host gives `::3`, and an IPv4-mapped host in upper case
+    /// gives its IPv4 address. Each record keeps its address as written. Unit.
+    /// Cut: `Declaration::records` takes the host as written, lowercased and less its brackets;
+    /// red at `db-a.example.`.
+    #[test]
+    fn s1b_default_labels_are_the_parsed_host() {
+        let declaration = Declaration {
+            nodes: [
+                "DB-A.example.:7100",
+                "[0:0:0:0:0:0:0:3]:7100",
+                "[::FFFF:127.0.0.2]:7100",
+            ]
+            .iter()
+            .zip(1..)
+            .map(|(addr, n)| NodeDecl {
+                node: NodeId(n),
+                addr: (*addr).to_owned(),
+                machine: None,
+            })
+            .collect(),
+            partitions: 8,
+        };
+        let records = declaration
+            .records()
+            .expect("a declaration this build takes");
+        let got: Vec<(&str, &str)> = records
+            .iter()
+            .map(|record| (record.addr.as_str(), record.machine.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("DB-A.example.:7100", "db-a.example"),
+                ("[0:0:0:0:0:0:0:3]:7100", "::3"),
+                ("[::FFFF:127.0.0.2]:7100", "127.0.0.2"),
+            ]
+        );
     }
 
     /// Design 7.2 (Critic R2): a partition still to form joins its owner's heal, after the

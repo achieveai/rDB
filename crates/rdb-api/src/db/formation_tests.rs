@@ -2993,6 +2993,70 @@ fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
     }
 }
 
+/// #80 S1b, PR #144 review r3: a host that is not an IP address must be a whitelisted host name,
+/// and a machine label is `[a-z0-9._:-]`, 1 to 63 bytes, so nothing a peer cannot resolve and
+/// no control byte is stored forever. Each case is declared with an explicit machine label, so
+/// the label cannot be what refuses a bad host: a host holding a space, tab, CR, LF or NUL,
+/// hosts of only dots, and the hex and short numeric spellings of an IPv4 address. Then an
+/// explicit label holding a space, tab, CR, LF, NUL or DEL. Each is refused naming node 3, with
+/// nothing written; the same store then takes `db-c.example` with label `m3`. Unit (<100 ms).
+/// Cut: `name_refusal` answers `None`; `db c.example` declares, red at the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_a_host_or_label_outside_the_whitelist() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let hosts = [
+        "db c.example:7100",
+        "db\tc.example:7100",
+        "db\rc.example:7100",
+        "db\nc.example:7100",
+        "db\0c.example:7100",
+        "..:7100",
+        "...:7100",
+        "0xffffffff:7100",
+        "0xe0000001:7100",
+        "0x7f.1:7100",
+        "127.1:7100",
+    ];
+    for bad in hosts {
+        let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, Some("m3"))));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains(&format!("{bad:?}"))
+                    && text.contains("host name") && text.contains("nothing was written")),
+            "{bad:?}: {refused:?}"
+        );
+        assert!(
+            snapshot(&rt, &*store).is_empty(),
+            "{bad:?}: nothing written"
+        );
+    }
+    for label in ["m 3", "m\t3", "m\r3", "m\n3", "m\0x", "m\u{7f}3"] {
+        let refused = rt.block_on(admin::declare(
+            &store,
+            &with_node(3, "db-c.example:7100", Some(label)),
+        ));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains("is not one of a-z")
+                    && text.contains("nothing was written")),
+            "{label:?}: {refused:?}"
+        );
+        assert!(
+            snapshot(&rt, &*store).is_empty(),
+            "{label:?}: nothing written"
+        );
+    }
+    let declared = rt.block_on(admin::declare(
+        &store,
+        &with_node(3, "db-c.example:7100", Some("m3")),
+    ));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(formation)) if formation.nodes.len() == 3),
+        "{declared:?}"
+    );
+}
+
 /// #80 S1b row 6: the node sets and addresses a declaration refuses, each with nothing
 /// written: 2 nodes, 9 nodes, a gap (1, 2, 4), a node named twice, one address for two nodes,
 /// and an address with no port. Four nodes, refused at S1a, now declare. This replaces the S1a

@@ -26,9 +26,10 @@
 //!   it. `--partitions` defaults to 1. `--peers` is required: nodes 1 to K, K from 3 to 8, each
 //!   with the address its node process will `--listen` on, as the node processes take
 //!   `--peers` (#80 S1b, ADR-rdb-0023). It writes one `nodes/N` record per node. `--machines`
-//!   gives a node's machine label; unset, it is the address's host. Two nodes on one machine
-//!   are refused: the same label, or the same host whatever the labels say. So 127.0.0.1 and
-//!   127.0.0.2 are two machines, and a whole database runs on one box over loopback addresses.
+//!   gives a node's machine label; unset, it is the host as `parse_addr` parses it (so
+//!   `DB-A.example.` gives `db-a.example`, and `[0:0:0:0:0:0:0:1]` gives `::1`). Two nodes on one
+//!   machine are refused: the same label, or the same host whatever the labels say. So 127.0.0.1
+//!   and 127.0.0.2 are two machines, and a whole database runs on one box over loopback addresses.
 //!   `--nodes`, if given, must count the `--peers` nodes. It prints the records it reads back,
 //!   `nodes=N@ADDR/MACHINE,...`. Run again with the same arguments it says `already`; with
 //!   another count or another address it is refused. It takes no `--form`, `--gen-certs`,
@@ -133,7 +134,7 @@ struct Args {
     /// `--live-readd` (#107).
     live_readd: bool,
     /// `--machines N=label,...` (#80 S1b): `--declare`'s machine label per node; a node left
-    /// out takes its `--peers` address's host.
+    /// out takes its `--peers` address's host as `parse_addr` parses it.
     machines: BTreeMap<NodeId, String>,
 }
 

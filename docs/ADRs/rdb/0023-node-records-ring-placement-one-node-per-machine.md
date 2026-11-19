@@ -27,20 +27,29 @@
 1. **`nodes/{id}` layout 1.** Key `nodes/{id}`, the id in decimal (`ControlKey::Node`). Body:
    one version byte (1), the node (u32 LE), then the address and the machine, each as one
    length byte and that many bytes. The address is UTF-8 `host:port`, 1 to 255 bytes, that a
-   peer can dial: the port is 1 to 65535 (port 0 is refused, since a record is never rewritten),
-   an IPv6 host is in brackets and parses as an IPv6 address (`[::gg]:7100` is refused), an
-   unbracketed host holds no `:`, a host of only digits and dots is a four-octet IPv4 address
-   (`127.1` is refused), and the host is not an unspecified, broadcast or multicast address
-   (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, or an IPv4-mapped form of
-   one), which a peer on another machine cannot dial (`--listen` may still use the wildcard
-   host). A declaration is refused, with nothing written, for an address that breaks this:
+   peer can dial. It is checked by a rule of what is allowed, not by a list of bad hosts, since
+   a record is never rewritten:
+   - the port is 1 to 65535 (port 0 is refused);
+   - the host is a four-octet IPv4 address, or an IPv6 address in brackets, that is not
+     unspecified, broadcast or multicast (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`,
+     `ff00::/8`, or an IPv4-mapped form of one), which a peer on another machine cannot dial
+     (`--listen` may still use the wildcard host);
+   - or the host is a DNS host name: only ASCII letters, digits, `-` and `.`; after one
+     trailing dot is removed, 1 to 253 bytes of labels of 1 to 63 bytes each, none empty and
+     none starting or ending with `-`; and the last label starts with a letter. That last rule
+     refuses every numeric form a resolver may read as an IPv4 address (`127.1`, `0x7f.1`,
+     `0xffffffff`), so no such host is compared as a name beside the IP it names.
+
+   A declaration is refused, with nothing written, for an address that breaks this:
    `admin::Declaration::records` runs `rdb_core::authority::node::parse_addr`, which checks all
    but the length, and then the 255-byte length check. The machine is 1 to 63 bytes of
-   `[a-z0-9._:-]`. Nothing may follow. A body that is anything else, or whose node is not the
-   key's, is not a record (`Undecodable`). Codec: `rdb_core::authority::node::NodeRecord`,
-   outside `contracts/`, beside the partition codec. `admin::declare` writes one per declared
-   node, create-or-adopt, after `routes/0` and before any `partitions/{p}`, so a store that
-   holds a partition record holds every node's address. Nothing updates one in place.
+   `[a-z0-9._:-]`, after lowercasing an explicit label
+   (`rdb_core::authority::node::machine_refusal`), so no whitespace or control byte is stored.
+   Nothing may follow. A body that is anything else, or whose node is not the key's, is not a
+   record (`Undecodable`). Codec: `rdb_core::authority::node::NodeRecord`, outside `contracts/`,
+   beside the partition codec. `admin::declare` writes one per declared node, create-or-adopt,
+   after `routes/0` and before any `partitions/{p}`, so a store that holds a partition record
+   holds every node's address. Nothing updates one in place.
    **This amends ADR-rdb-0008's `nodes/{id}` row:** the writer is the declaration (later
    add-node), not the node at start-up; the body is the address and the machine; the boot
    comes from the link handshake, not from this record; role, failure domain, capacity, cores
@@ -169,7 +178,8 @@ every rig open passes the address check it would meet in use.
   restart),
   `s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare`,
   `s1b_a_half_written_s1a_declaration_is_refused_with_how_to_redeclare`,
-  `s1b_a_failing_reservation_read_in_the_preflight_is_refused`.
+  `s1b_a_failing_reservation_read_in_the_preflight_is_refused`,
+  `s1b_declare_refuses_a_host_or_label_outside_the_whitelist`.
 - `crates/rdb-api/examples/rdb_node.rs`:
   `s1b_declare_takes_peers_and_machines_and_prints_the_records`,
   `s1b_a_listen_that_disagrees_with_its_record_is_refused_before_boot_or_bind`,

@@ -265,13 +265,13 @@ pub struct DbConfig {
     /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
     /// default, never promotes: failover stays the operator's `promote`.
     pub failover: Option<crate::planner::Failover>,
-    /// Where this node process listens and where it was told each node listens (#80 S1b ruling
-    /// 2, ADR-rdb-0023 Decision 5). An open of a declared database compares them with the
-    /// `nodes/` records before it creates anything, and is refused naming the record that
-    /// disagrees, or when this is `None`: a declared node must say where it and its peers
-    /// are. The open does not bind; the caller's listener is bound before `Db::open`, so a
-    /// caller that must not bind a wrong address checks first with
-    /// [`admin::node_start_refusal`], as `rdb_node` does. Unused by an undeclared open.
+    /// Where this node process listens and where it was told each node listens (#80 S1b ruling 2,
+    /// ADR-rdb-0023 Decision 5). An open of a declared database compares them with the `nodes/`
+    /// records before it creates `nodes/` or writes to the store, and is refused naming the record
+    /// that disagrees, or when this is `None`: a declared node must say where it and its peers are.
+    /// The open does not bind; the caller's listener is bound before `Db::open`, so a caller that
+    /// must not bind a wrong address checks first with [`admin::node_start_refusal`], as `rdb_node`
+    /// does. Unused by an undeclared open.
     pub addresses: Option<NodeAddresses>,
 }
 

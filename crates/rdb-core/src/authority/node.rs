@@ -86,12 +86,19 @@ impl std::fmt::Display for Host {
 /// The host of `addr`, a `host:port` a node is declared at, or why it is not one a peer can
 /// dial: no `:port`, a port that is not 1 to 65535 (0 is refused, since no peer can dial it and
 /// a record is never rewritten), an empty host, a bracketed host that is not an IPv6 address,
-/// an IPv6 address without brackets, a host of only digits and dots that is not a four-octet
-/// IPv4 address (`127.1`), or an unspecified, broadcast or multicast address (`0.0.0.0`,
-/// `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped forms), which a
-/// peer on another machine cannot dial.
-/// The unspecified address is a listener's wildcard, not a place to dial: `--listen 0.0.0.0`
-/// stays legal (`admin::node_start_refusal`), but a record holds an address peers dial.
+/// an IPv6 address without brackets, or an unspecified, broadcast or multicast IP address
+/// (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped
+/// forms), which a peer on another machine cannot dial. The unspecified address is a
+/// listener's wildcard, not a place to dial: `--listen 0.0.0.0` stays legal
+/// (`admin::node_start_refusal`), but a record holds an address peers dial.
+///
+/// A host that is not an IP address must be a DNS host name, checked against a whitelist
+/// ([`name_refusal`]) rather than by listing bad hosts, since a record is never rewritten: only
+/// ASCII letters, digits, `-` and `.`; after one trailing dot is removed, 1 to 253 bytes of
+/// labels of 1 to 63 bytes each, none empty and none starting or ending with `-`; and the last
+/// label starts with a letter. That last rule refuses every numeric form a resolver may read
+/// as an IPv4 address (`127.1`, `0x7f.1`, `0xffffffff`), so such a host is never compared as a
+/// name beside the IP it names. Four-octet IPv4 addresses are parsed as IPs, above.
 ///
 /// # Errors
 ///
@@ -128,19 +135,57 @@ pub fn parse_addr(addr: &str) -> Result<Host, String> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return dialable(addr, IpAddr::V4(ip));
     }
-    // A name is compared as text, so `127.1` (which a resolver may read as 127.0.0.1) would
-    // pass beside `127.0.0.1` as another host.
-    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') && host.bytes().any(|b| b != b'.') {
-        return Err(format!(
-            "address {addr:?}: a host of only digits and dots must be an IPv4 address of four \
-             octets, as 127.0.0.1"
-        ));
-    }
-    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let name = host.strip_suffix('.').unwrap_or(host);
     if name.is_empty() {
         return Err(format!("address {addr:?} has no host"));
     }
-    Ok(Host::Name(name))
+    if let Some(why) = name_refusal(name) {
+        return Err(format!("address {addr:?}: {why}"));
+    }
+    Ok(Host::Name(name.to_ascii_lowercase()))
+}
+
+/// The longest host name, in bytes, without its trailing dot (RFC 1035).
+const MAX_NAME_LEN: usize = 253;
+
+/// The longest label of a host name, in bytes (RFC 1035).
+const MAX_LABEL_LEN: usize = 63;
+
+/// Why `name`, a host with one trailing dot removed, is not a host name [`parse_addr`] takes,
+/// or `None`. A whitelist: ASCII letters, digits, `-` and `.` only; 1 to [`MAX_NAME_LEN`]
+/// bytes; labels split at `.`, each 1 to [`MAX_LABEL_LEN`] bytes and neither starting nor
+/// ending with `-`; and the last label starts with a letter, so no numeric spelling of an IPv4
+/// address passes as a name.
+fn name_refusal(name: &str) -> Option<&'static str> {
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return Some("a host name holds only ASCII letters, digits, '-' and '.'");
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Some("a host name is at most 253 bytes, less one trailing dot");
+    }
+    let bad_label = |label: &str| {
+        label.is_empty()
+            || label.len() > MAX_LABEL_LEN
+            || label.starts_with('-')
+            || label.ends_with('-')
+    };
+    if name.split('.').any(bad_label) {
+        return Some(
+            "each label of a host name is 1 to 63 bytes, with no empty label and no leading or \
+             trailing '-'",
+        );
+    }
+    let last = name.rsplit('.').next().unwrap_or(name);
+    if !last.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Some(
+            "the last label of a host name starts with a letter; a numeric host is an IPv4 \
+             address of four decimal octets, as 127.0.0.1",
+        );
+    }
+    None
 }
 
 /// `ip` as [`parse_addr`]'s host, or why no peer can dial it over TCP: an unspecified,
@@ -269,13 +314,18 @@ mod tests {
     /// #80 S1b: the host of an address, which `admin::declare` compares, and the machine
     /// label set. Two spellings of one IP are one host; a name is lowercased and loses one
     /// trailing dot. Port 0, a bracketed host that is not IPv6 and an unbracketed IPv6 host are
-    /// refused, each with its reason (PR #144 review). So are a host of digits and dots that is
-    /// not four octets (`127.1`), and unspecified, broadcast and multicast addresses, IPv4,
-    /// IPv6 and IPv4-mapped (PR #144 review r2). Neighbours that stay hosts: `223.255.255.255`,
-    /// `240.0.0.1`, `[fe80::1]` and the name `1a.2`. Unit.
-    /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`. Cut: the digits-and-dots check;
-    /// red at `127.1:7101`. Cut: `dialable` refuses nothing; red at `255.255.255.255:7100`.
-    /// Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0:7100`.
+    /// refused, each with its reason (PR #144 review). So are unspecified, broadcast and
+    /// multicast addresses, IPv4, IPv6 and IPv4-mapped (PR #144 review r2). A name passes only
+    /// the whitelist (PR #144 review r3, `name_refusal`): numeric and hex spellings (`127.1`,
+    /// `1a.2`, `0xffffffff`, `0x7f.1`), empty labels (`..`), a leading or trailing `-`, a name
+    /// over 253 bytes, and any byte outside letters, digits, `-` and `.` (space, tab, CR, LF,
+    /// NUL, `_`, non-ASCII) are refused. Neighbours that stay hosts: `223.255.255.255`,
+    /// `240.0.0.1`, `[fe80::1]`, `localhost`, `1a.example`, and a 253-byte name. A machine
+    /// label is `[a-z0-9._:-]`, 1 to 63 bytes, so whitespace and control bytes are refused
+    /// there too. Unit.
+    /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`. Cut: `dialable` refuses nothing;
+    /// red at `255.255.255.255:7100`. Cut: `dialable` skips `is_unspecified`; red at
+    /// `0.0.0.0:7100`. Cut: `name_refusal` answers `None`; red at `127.1:7101`.
     #[test]
     fn s1b_host_of_and_machine_labels() {
         let ip = |text: &str| Some(Host::Ip(text.parse().expect("an IP")));
@@ -290,7 +340,26 @@ mod tests {
         assert_eq!(host_of("223.255.255.255:7100"), ip("223.255.255.255"));
         assert_eq!(host_of("240.0.0.1:7100"), ip("240.0.0.1"));
         assert_eq!(host_of("[fe80::1]:7100"), ip("fe80::1"));
-        assert_eq!(host_of("1a.2:7100"), Some(Host::Name("1a.2".to_owned())));
+        for (name, host) in [
+            ("localhost:7100", "localhost"),
+            ("db-a.example:7100", "db-a.example"),
+            ("1a.example:7100", "1a.example"),
+            ("a:7100", "a"),
+        ] {
+            assert_eq!(host_of(name), Some(Host::Name(host.to_owned())), "{name}");
+        }
+        let longest = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(longest.len(), 253);
+        assert!(
+            host_of(&format!("{longest}.:1")).is_some(),
+            "253 bytes and a trailing dot"
+        );
         for (bad, why) in [
             ("127.0.0.2", "not host:port"),
             ("127.0.0.2:x", "no port"),
@@ -302,9 +371,27 @@ mod tests {
             ("[::1:7100", "must be an IPv6 address"),
             ("::1:7100", "in brackets"),
             (".:7100", "no host"),
-            ("127.1:7101", "four octets"),
-            ("127.0.0.1.:7100", "four octets"),
-            ("1:7100", "four octets"),
+            ("127.1:7101", "starts with a letter"),
+            ("127.0.0.1.:7100", "starts with a letter"),
+            ("1:7100", "starts with a letter"),
+            ("1a.2:7100", "starts with a letter"),
+            ("0xffffffff:7100", "starts with a letter"),
+            ("0xe0000001:7100", "starts with a letter"),
+            ("0x7f.1:7100", "starts with a letter"),
+            ("0x7f000001:7100", "starts with a letter"),
+            ("..:7100", "no empty label"),
+            ("...:7100", "no empty label"),
+            ("db-a..example:7100", "no empty label"),
+            ("db-a.example..:7100", "no empty label"),
+            ("-db.example:7100", "trailing '-'"),
+            ("db-.example:7100", "trailing '-'"),
+            ("db a:7100", "only ASCII letters"),
+            ("db\ta:7100", "only ASCII letters"),
+            ("db\ra:7100", "only ASCII letters"),
+            ("db\na:7100", "only ASCII letters"),
+            ("db\0a:7100", "only ASCII letters"),
+            ("db_a:7100", "only ASCII letters"),
+            ("dé.example:7100", "only ASCII letters"),
             ("255.255.255.255:7100", "broadcast or multicast"),
             ("224.0.0.1:7100", "broadcast or multicast"),
             ("239.255.255.255:7100", "broadcast or multicast"),
@@ -317,12 +404,35 @@ mod tests {
         ] {
             let refused = parse_addr(bad).expect_err(bad);
             assert!(
-                refused.contains(why) && refused.contains(bad),
+                refused.contains(why) && refused.contains(&format!("{bad:?}")),
                 "{bad}: {refused}"
             );
         }
+        let too_long = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        let refused = parse_addr(&format!("{too_long}:1")).expect_err("254 bytes");
+        assert!(refused.contains("at most 253 bytes"), "{refused}");
+        let label = format!("{}.example:1", "a".repeat(64));
+        let refused = parse_addr(&label).expect_err("a 64-byte label");
+        assert!(refused.contains("1 to 63 bytes"), "{refused}");
         assert_eq!(machine_refusal("host-a.rack_1:x"), None);
-        for bad in ["", "HostA", "a b", &"m".repeat(64)] {
+        for bad in [
+            "",
+            "HostA",
+            "a b",
+            "a\tb",
+            "a\rb",
+            "a\nb",
+            "a\0b",
+            "a\u{7f}b",
+            "dé",
+            &"m".repeat(64),
+        ] {
             assert!(machine_refusal(bad).is_some(), "{bad:?}");
         }
     }
