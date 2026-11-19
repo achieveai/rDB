@@ -24,8 +24,9 @@
 //!   Each node process then opens its own empty `--dir`, and the owner of each partition forms
 //!   it. `--partitions` defaults to 1; `--nodes` is the node count, and this build declares 3.
 //!   Run again with the same arguments it says `already`; with another count it is refused.
-//!   It takes no `--form`, `--gen-certs`, `--node`, `--dir` or `--live-readd`: each is refused,
-//!   not ignored.
+//!   It takes no `--form`, `--gen-certs`, `--node`, `--dir` or `--live-readd`: each of these
+//!   five is refused. Other node-process flags, such as `--listen` and `--peers`, still parse
+//!   and are ignored.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
 //!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
@@ -276,9 +277,10 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(args)
 }
 
-/// What `--declare` does not read, refused rather than ignored (PR #138 review): it writes
-/// control records only, so it makes no copy (`--form`), certificates (`--gen-certs`) or node
-/// process (`--node`, `--dir`, `--live-readd`).
+/// Five mode and copy flags `--declare` refuses (PR #138 review): it writes control records
+/// only, so it makes no copy (`--form`), certificates (`--gen-certs`) or node process (`--node`,
+/// `--dir`, `--live-readd`). Not every flag it does not read: `--listen`, `--peers` and the
+/// other node-process flags still parse and are ignored.
 fn declare_refusal(args: &Args) -> Result<(), String> {
     if !args.declare {
         return Ok(());
@@ -902,11 +904,12 @@ mod tests {
         }
     }
 
-    /// PR #138 review: `--declare` refuses at parse time each flag it would otherwise ignore,
-    /// or (`--form`, `--gen-certs`) run instead of declaring. Unit.
+    /// PR #138 review: `--declare` refuses at parse time the five mode and copy flags
+    /// `declare_refusal` names: three it would ignore (`--node`, `--dir`, `--live-readd`) and
+    /// two (`--form`, `--gen-certs`) that would run instead of declaring. Unit.
     /// Cut: drop `declare_refusal` from `parse`; every pair parses, red.
     #[test]
-    fn s1a_declare_rejects_flags_it_does_not_read() {
+    fn s1a_declare_rejects_five_mode_and_copy_flags() {
         for (flags, named) in [
             (&["--form"][..], "--form"),
             (&["--gen-certs"][..], "--gen-certs"),

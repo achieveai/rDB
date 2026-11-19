@@ -1172,7 +1172,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     with its own empty `--dir` and its own `--listen` address. The owner of each partition
     forms that partition when all three nodes are linked. Each folder ends up holding only
     its own `nodes/<n>`. The same `--declare` run again answers `already`. A different
-    `--partitions` is refused.
+    `--partitions` is refused. Of two `--declare` runs with different `--partitions` at the
+    same moment, one is refused and writes nothing.
 
   This has been run with three processes on 127.0.0.1, .2 and .3 of one host. It has not been
   run on separate machines. Still missing: more than 3 nodes, a rule against two nodes on one

@@ -965,9 +965,11 @@ enum PartitionState {
     Rooted(PartitionRecord, PartitionRoot),
 }
 
-/// The step for a formation that did not finish.
-const RERUN_FORM: &str =
-    "run the command that formed it again, with the same --dir, --control and --partitions";
+/// The step for a formation that did not finish. `--form` (what `lr up` runs) forms in a folder,
+/// so it names `--dir`; `--declare` writes control records only, so it does not.
+const RERUN_FORM: &str = "run the command that formed it again: rdb_node --form (what lr up runs) \
+                          with the same --dir, --control and --partitions, or, for a declared \
+                          database, rdb_node --declare with the same --control and --partitions";
 
 /// How partition 1 to `count` each stand, in that order, from one `list` of `partitions/` (issue
 /// #79). A failed or truncated list is never read as a complete one.
@@ -1687,11 +1689,13 @@ impl Db {
         }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
-            // A declared database's first open creates its counter (#80 S1a).
+            // The counter is created only by an open that forms partition 1: a fresh one, or a
+            // declared node process while partition 1 is untouched (#80 S1a). Any later open,
+            // declared or not, refuses an absent counter rather than count N = 1 again.
             None => admin::count_open(
                 &*store,
                 &found.instance,
-                found.fresh || declared.is_some(),
+                found.fresh || found.forms_first,
                 admin::COUNT_WITHIN,
             )
             .await
@@ -1882,7 +1886,8 @@ impl Db {
     /// `partitions/1` and counter of that instance, and a copy that holds the generation the
     /// record names. A `partial` open (a node process) refuses a copy that holds no data before
     /// binding anything: only a formed database's copy opens there (ruling A-R231(a)), or a
-    /// declared one's (#80 S1a). A whole-database open of a declared database is refused.
+    /// declared one's (#80 S1a). A whole-database open that would form a declared database (no
+    /// copy holds partition 1, whose record is untouched at generation 0) is refused.
     async fn check(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
         absent: Vec<Absent>,
@@ -1903,8 +1908,9 @@ impl Db {
         // A node process's empty copy (wiped, or created above) joins a formed database it is a
         // member of as a behind copy, bound to that database's instance, and F1's rebuild fills
         // it (ruling A-R328). It never forms one, with one exception (#80 S1a): a declared
-        // database whose partition 1 is still untouched. Its owner's process forms it, whose
-        // copy may be empty, and the copy binds the declared instance (below).
+        // database whose partition 1 is still untouched. Every node process of it whose copies
+        // hold no data binds the declared instance here (below) and counts its open with
+        // create; only partition 1's owner then forms it (the owner filter in `open_spawning`).
         let first_unformed = match declared {
             Some(_) => matches!(
                 partition_states(store, PARTITION.0).await?.pop(),
@@ -5710,8 +5716,9 @@ struct Found {
     roll: Option<Roll>,
     /// Partitions 2 to N, in order, once `routes/0` exists (issue #79). Otherwise empty.
     others: Vec<(PartitionId, PartitionFound)>,
-    /// A node process of a declared database whose partition 1 is still to form (#80 S1a):
-    /// its owner's process forms it in its heal.
+    /// A node process of a declared database whose partition 1 is still to form (#80 S1a): it
+    /// may create the open counter, and if it runs partition 1's owner, that owner's heal forms
+    /// partition 1 (`open_spawning` drops partitions this process does not own).
     forms_first: bool,
 }
 
@@ -5797,7 +5804,8 @@ async fn read_mark(
 
 /// Why a node process cannot run the empty copy of the owner of `record`'s partition. A formation
 /// that stopped right after the partition's first commit (design 7.2 row 4) is finished by running
-/// it again; anything else needs another owner.
+/// `--form` again; a declared database's is not, and its refusal says so (issue #137). Anything
+/// else needs another owner.
 async fn empty_owner_refusal(
     store: &Arc<dyn ConfigStore>,
     instance: &[u8; INSTANCE_LEN],
@@ -5812,10 +5820,19 @@ async fn empty_owner_refusal(
         && root.predecessor_cutoff == Seq::ZERO
         && !count.may_have_admitted(record.generation)
     {
-        return OpenError::Config(format!(
-            "partition {} has not finished forming; {RERUN_FORM}",
-            record.partition.0
-        ));
+        return match admin::read_formation(&**store).await {
+            Ok(Some(_)) => OpenError::Config(format!(
+                "partition {} has not finished forming: its owner's copy is empty after the \
+                 partition's first root, and a declared database does not form a partition \
+                 again, so running rdb_node --declare again does not finish it (issue #137)",
+                record.partition.0
+            )),
+            Ok(None) => OpenError::Config(format!(
+                "partition {} has not finished forming; {RERUN_FORM}",
+                record.partition.0
+            )),
+            Err(error) => formation_refused(error),
+        };
     }
     match read_partition_count(store).await {
         Ok(Some(partitions)) if partitions > 1 => {
@@ -5955,8 +5972,9 @@ fn roll_forward_copies(
     Ok(copies)
 }
 
-/// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and
-/// the step to take when the store was not reachable, as every other read of an open says.
+/// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and,
+/// when the store was not reachable, the rEtcd step the open's other `get` reads add
+/// (`partition_states`' `list` does not add it).
 fn formation_refused(error: admin::DeclareError) -> OpenError {
     match error {
         admin::DeclareError::Undecodable { key } => {

@@ -416,6 +416,15 @@ pub const FORMATION_OPERATION: OperationId = OperationId(0x00E0 << 48);
 /// a little-endian u32, then one little-endian u32 per declared node.
 const FORMATION_LAYOUT: u8 = 1;
 
+/// The `operations/` key of the declaration's reservation (PR #138 review, ADR-rdb-0022): the
+/// formation record's tag block, one past it. [`declare`] creates it before any other write, so
+/// of two declarations of different counts exactly one goes on to write.
+pub const RESERVATION_OPERATION: OperationId = OperationId(FORMATION_OPERATION.0 + 1);
+
+/// The version byte of the reservation: layout 1 is the partition count as a little-endian
+/// u32, then one little-endian u32 per declared node.
+const RESERVATION_LAYOUT: u8 = 1;
+
 /// What a declaration asks for (#80 S1a): the database's nodes and its partition count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
@@ -474,6 +483,40 @@ impl Formation {
     }
 }
 
+impl Declaration {
+    /// The reservation's body, layout 1 ([`RESERVATION_LAYOUT`]).
+    #[must_use]
+    pub fn encode_reservation(&self) -> Bytes {
+        let mut out = Vec::with_capacity(1 + 4 + 4 * self.nodes.len());
+        out.push(RESERVATION_LAYOUT);
+        out.extend_from_slice(&self.partitions.to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&node.0.to_le_bytes());
+        }
+        Bytes::from(out)
+    }
+
+    /// `None` for a body that is not reservation layout 1.
+    #[must_use]
+    pub fn decode_reservation(body: &[u8]) -> Option<Self> {
+        let [RESERVATION_LAYOUT, rest @ ..] = body else {
+            return None;
+        };
+        let (partitions, rest) = rest.split_at_checked(4)?;
+        let (nodes, tail) = rest.as_chunks::<4>();
+        if !tail.is_empty() {
+            return None;
+        }
+        Some(Self {
+            partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+            nodes: nodes
+                .iter()
+                .map(|node| NodeId(u32::from_le_bytes(*node)))
+                .collect(),
+        })
+    }
+}
+
 /// How [`declare`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Declared {
@@ -502,8 +545,9 @@ pub enum DeclareError {
         #[source]
         error: ConfigError,
     },
-    /// The formation record does not decode.
-    #[error("{key} is not a formation record this build reads")]
+    /// A control record a declaration reads (the formation record, its reservation,
+    /// `routes/0` or a partition record) does not decode.
+    #[error("{key} does not decode as a record this build reads")]
     Undecodable {
         /// Its key.
         key: String,
@@ -532,20 +576,22 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
         .transpose()
 }
 
-/// Declare a database (#80 S1a, ADR-rdb-0022): `routes/0` at more than one partition, every
+/// Declare a database (#80 S1a, ADR-rdb-0022): first the reservation under
+/// [`RESERVATION_OPERATION`] ([`reserve`]), then `routes/0` at more than one partition, every
 /// partition's generation-0 record ([`write_records`], placement as [`initial_owner`]), then
 /// **last** the formation record under [`FORMATION_OPERATION`], naming a new instance. No copy is
 /// written: each node process forms the partitions it owns from its own empty folder.
 ///
 /// Write-once and idempotent: the same declaration again answers [`Declared::Already`] and
 /// writes nothing; a different one is refused, naming what is there. A declaration that stopped
-/// before its formation record is finished by running it again: the records it wrote are
-/// adopted.
+/// before its formation record is finished by running it again: the records it wrote, its
+/// reservation included, are adopted.
 ///
 /// # Errors
 ///
 /// [`DeclareError`]. A database formed some other way (`--form`, `lr up`) holds a rooted
-/// `partitions/1`, which is in the way: [`DeclareError::Records`].
+/// `partitions/1`, and another declaration holds its reservation: each refuses this one with
+/// nothing written, [`DeclareError::Refused`].
 pub async fn declare(
     store: &Arc<dyn ConfigStore>,
     declaration: &Declaration,
@@ -587,6 +633,7 @@ pub async fn declare(
     }
     let partitions = declaration.partitions;
     declare_preflight(&**store, partitions).await?;
+    reserve(store, declaration).await?;
     if partitions > 1 {
         let key = ControlKey::Route(RangeId(0)).encode();
         let value = RoutesRoot {
@@ -636,13 +683,73 @@ pub async fn declare(
     }
 }
 
+/// [`declare`]'s first write (PR #138 review): create the reservation under
+/// [`RESERVATION_OPERATION`], or adopt it when this same declaration made it earlier. The
+/// preflight is a read, so two declarations of different counts can both pass it; this one
+/// create-only write is where exactly one of them goes on. The other is refused here, before
+/// any write of its own.
+///
+/// # Errors
+///
+/// [`DeclareError::Refused`] naming the reserved count, [`DeclareError::Records`] or
+/// [`DeclareError::Store`] when the store fails, [`DeclareError::Undecodable`] for a
+/// reservation this build does not read.
+async fn reserve(
+    store: &Arc<dyn ConfigStore>,
+    declaration: &Declaration,
+) -> Result<(), DeclareError> {
+    let key = ControlKey::Operation(RESERVATION_OPERATION).encode();
+    match create_or_adopt(store, &key, &declaration.encode_reservation()).await {
+        Ok(revision) => {
+            tracing::info!(
+                key = %key,
+                revision = revision.0,
+                partitions = declaration.partitions,
+                "declare_reserved"
+            );
+            Ok(())
+        }
+        Err(BootstrapError::AlreadyExists { .. }) => {
+            let read = store
+                .get(GetRequest {
+                    key: Bytes::from(key.clone()),
+                })
+                .await
+                .map_err(|error| DeclareError::Store {
+                    step: format!("get {key}"),
+                    error,
+                })?;
+            let held = read
+                .record
+                .and_then(|found| Declaration::decode_reservation(&found.value))
+                .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+            tracing::info!(
+                key = %key,
+                reserved = held.partitions,
+                asked = declaration.partitions,
+                "declare_reservation_refused"
+            );
+            Err(DeclareError::Refused(format!(
+                "{key} reserves the store for a declaration of {} partitions and nodes {:?}, and \
+                 this declaration asks for {} partitions and nodes {:?}: only that declaration \
+                 may go on; nothing was written",
+                held.partitions,
+                held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+                declaration.partitions,
+                declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
 /// prefix of what this declaration writes, which it then adopts. That is `routes/0` at this
 /// count, if any, and untouched generation-0 records of partitions 1 to `partitions` only. So a
 /// database formed some other way (a rooted `partitions/1`), or an interrupted declaration of
 /// another count (its `routes/0`, or a record past this count), refuses it with nothing
-/// written. This is a read: two declarations of different counts **at once** can still both
-/// pass it (ADR-rdb-0022, Consequences).
+/// written. This is a read: two declarations of different counts **at once** can both pass it,
+/// and [`reserve`], the first write, is what lets only one of them go on.
 ///
 /// # Errors
 ///
@@ -4673,6 +4780,77 @@ mod tests {
         let (healed, sent) = heal_over(Arc::clone(&store), &rt, within, vec![PARTITION, two]);
         assert!(healed.is_err(), "a partition with no record");
         assert!(sent.is_empty(), "{} messages sent", sent.len());
+    }
+
+    /// PR #138 review: the formation record and the declaration's reservation are written once
+    /// and read by every later build, so their keys and layout-1 bytes are pinned as literals:
+    /// changing `encode` and `decode` together cannot pass while old stores stop opening. A wrong
+    /// version byte, a count cut short and a trailing byte each decode as nothing. Unit.
+    #[test]
+    fn s1a_formation_and_reservation_layout_1_bytes_are_pinned() {
+        assert_eq!(
+            ControlKey::Operation(FORMATION_OPERATION).encode(),
+            "operations/63050394783186944"
+        );
+        assert_eq!(
+            ControlKey::Operation(RESERVATION_OPERATION).encode(),
+            "operations/63050394783186945"
+        );
+        let nodes = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let formation = Formation {
+            instance: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+            partitions: 8,
+            nodes: nodes.clone(),
+        };
+        let formation_bytes: [u8; 33] = [
+            1, // layout
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, // instance
+            8, 0, 0, 0, // partitions
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // nodes
+        ];
+        assert_eq!(formation.encode().as_ref(), formation_bytes);
+        assert_eq!(Formation::decode(&formation_bytes), Some(formation));
+        let declaration = Declaration {
+            nodes,
+            partitions: 8,
+        };
+        let reservation_bytes: [u8; 17] = [
+            1, // layout
+            8, 0, 0, 0, // partitions
+            1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // nodes
+        ];
+        assert_eq!(declaration.encode_reservation().as_ref(), reservation_bytes);
+        assert_eq!(
+            Declaration::decode_reservation(&reservation_bytes),
+            Some(declaration)
+        );
+
+        let malformed = |good: &[u8], count_at: usize| {
+            let mut wrong_version = good.to_vec();
+            wrong_version[0] = 2;
+            let mut trailing = good.to_vec();
+            trailing.push(0);
+            [
+                ("a wrong version", wrong_version),
+                ("a count cut short", good[..count_at + 2].to_vec()),
+                ("a trailing byte", trailing),
+                ("an empty body", Vec::new()),
+            ]
+        };
+        for (what, body) in malformed(&formation_bytes, 1 + INSTANCE_LEN) {
+            assert_eq!(Formation::decode(&body), None, "formation: {what}");
+        }
+        for (what, body) in malformed(&reservation_bytes, 1) {
+            assert_eq!(
+                Declaration::decode_reservation(&body),
+                None,
+                "reservation: {what}"
+            );
+        }
     }
 
     /// Design 7.2 (Critic R2): a partition still to form joins its owner's heal, after the

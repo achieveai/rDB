@@ -176,12 +176,14 @@ fn keys(snap: &[(Bytes, Bytes, u64, u64)]) -> Vec<String> {
         .collect()
 }
 
-/// The control keys a whole declaration of `partitions` writes, the formation record last.
+/// The control keys a whole declaration of `partitions` (more than one) writes, its reservation
+/// first and the formation record last.
 fn declared_keys(partitions: u32, marker: bool) -> Vec<String> {
     let mut keys: Vec<String> = (1..=partitions)
         .map(|id| ControlKey::Partition(PartitionId(id)).encode())
         .collect();
     keys.push(ControlKey::Route(RangeId(0)).encode());
+    keys.push(ControlKey::Operation(admin::RESERVATION_OPERATION).encode());
     if marker {
         keys.push(ControlKey::Operation(admin::FORMATION_OPERATION).encode());
     }
@@ -528,8 +530,8 @@ fn s1a_undeclared_partial_open_is_refused_as_before() {
 /// writes anything: no `routes/0` that would make later opens expect 8 partitions. The
 /// database then reopens at its own count. Integration (~3 s): a whole-database formation and
 /// a reopen.
-/// Cut: drop `declare_preflight` from `admin::declare`; the declaration writes `routes/0`, then
-/// stops at the rooted record with `Records`, red at the first refusal.
+/// Cut: drop `declare_preflight` from `admin::declare`; the declaration writes its reservation
+/// and `routes/0`, then stops at the rooted record with `Records`, red at the first refusal.
 #[config_log::retcd_test]
 fn s1a_declare_on_a_formed_store_is_refused_and_writes_nothing() {
     let rt = runtime();
@@ -572,13 +574,16 @@ fn s1a_declare_on_a_formed_store_is_refused_and_writes_nothing() {
 }
 
 /// PR #138 review (blocker, and the missing interrupted-retry row): a declaration of 8 stops
-/// after `routes/0` and three records. A declaration of 1 is then refused and writes nothing
-/// (it would publish count 1 beside `routes/0` = 8). Running the declaration of 8 again stops
-/// after a longer prefix, and a third run finishes it. Every record written by an earlier run
-/// keeps its bytes and revisions, and the formation record exists only after the run that
+/// right after its reservation; a declaration of 1 is then refused at that reservation and
+/// writes nothing. The declaration of 8 runs again, adopts its reservation and stops after
+/// `routes/0` and three records; a declaration of 1 is refused by the preflight and writes
+/// nothing (it would publish count 1 beside `routes/0` = 8). Running the declaration of 8 again
+/// stops after a longer prefix, and a last run finishes it. Every record written by an earlier
+/// run keeps its bytes and revisions, and the formation record exists only after the run that
 /// finished. Unit (<200 ms, an in-memory store).
-/// Cut: drop `declare_preflight` from `admin::declare`; the declaration of 1 adopts
-/// `partitions/1` and writes a formation record of 1 partition, red.
+/// Cut: drop `declare_preflight` from `admin::declare`; the second declaration of 1 is refused
+/// at the reservation instead, with another text, red. Drop `reserve` too and it adopts
+/// `partitions/1` and writes a formation record of 1 partition.
 #[config_log::retcd_test]
 fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
     let rt = runtime();
@@ -594,31 +599,59 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         });
     };
 
-    stop_after(1 + 3);
+    let one = || {
+        rt.block_on(admin::declare(
+            &store,
+            &admin::Declaration {
+                partitions: 1,
+                ..declaration()
+            },
+        ))
+    };
+    stop_after(1);
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    let reserved = snapshot(&rt, &*store);
+    assert_eq!(
+        keys(&reserved),
+        [ControlKey::Operation(admin::RESERVATION_OPERATION).encode()]
+    );
+    scripted.rescript(Script::default());
+    let refused = one();
+    assert!(
+        matches!(&refused, Err(admin::DeclareError::Refused(text))
+            if text.contains("reserves the store for a declaration of 8 partitions")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        snapshot(&rt, &*store),
+        reserved,
+        "the declaration of 1 wrote nothing at the reservation"
+    );
+
+    stop_after(2 + 3);
     let stopped = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
         "{stopped:?}"
     );
     let first = snapshot(&rt, &*store);
-    assert_eq!(
-        keys(&first),
-        [
-            "partitions/1",
-            "partitions/2",
-            "partitions/3",
-            ControlKey::Route(RangeId(0)).encode().as_str()
-        ]
-    );
+    assert!(kept(&reserved, &first), "{reserved:?} -> {first:?}");
+    let mut expected = vec![
+        ControlKey::Operation(admin::RESERVATION_OPERATION).encode(),
+        "partitions/1".to_owned(),
+        "partitions/2".to_owned(),
+        "partitions/3".to_owned(),
+        ControlKey::Route(RangeId(0)).encode(),
+    ];
+    expected.sort();
+    assert_eq!(keys(&first), expected);
 
     scripted.rescript(Script::default());
-    let one = rt.block_on(admin::declare(
-        &store,
-        &admin::Declaration {
-            partitions: 1,
-            ..declaration()
-        },
-    ));
+    let one = one();
     assert!(
         matches!(&one, Err(admin::DeclareError::Refused(text))
             if text.contains("says 8 partitions and this declaration asks for 1")),
@@ -630,7 +663,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         "the declaration of 1 wrote nothing"
     );
 
-    stop_after(1 + 5);
+    stop_after(2 + 5);
     let stopped = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
@@ -638,7 +671,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
     );
     let second = snapshot(&rt, &*store);
     assert!(kept(&first, &second), "{first:?} -> {second:?}");
-    assert_eq!(keys(&second).len(), 6, "{:?}", keys(&second));
+    assert_eq!(keys(&second).len(), 7, "{:?}", keys(&second));
     assert_eq!(
         rt.block_on(admin::read_formation(&*store)).expect("reads"),
         None
@@ -650,6 +683,172 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
     let third = snapshot(&rt, &*store);
     assert!(kept(&second, &third), "{second:?} -> {third:?}");
     assert_eq!(keys(&third), declared_keys(PARTITIONS, true));
+}
+
+/// One declaration's view of a store shared with another, for the race row. Its `list` of
+/// `partitions/` (the preflight's last read) returns only once both declarations have made it,
+/// so both have passed the preflight, then waits at `go`. When `hold_marker`, its put of the
+/// formation record notifies `at_marker` and waits at `marker`. Every other call passes.
+struct DeclareRace {
+    inner: Arc<dyn ConfigStore>,
+    both: Arc<tokio::sync::Barrier>,
+    go: tokio::sync::Semaphore,
+    hold_marker: bool,
+    marker: tokio::sync::Semaphore,
+    at_marker: tokio::sync::Notify,
+}
+
+impl DeclareRace {
+    fn new(inner: Arc<dyn ConfigStore>, both: Arc<tokio::sync::Barrier>, winner: bool) -> Self {
+        Self {
+            inner,
+            both,
+            go: tokio::sync::Semaphore::new(if winner { 1 } else { 0 }),
+            hold_marker: winner,
+            marker: tokio::sync::Semaphore::new(0),
+            at_marker: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for DeclareRace {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        let preflight = request.prefix.as_ref() == ControlPrefix::Partitions.encode().as_bytes();
+        let listed = self.inner.list(request).await;
+        if preflight {
+            self.both.wait().await;
+            let _permit = self.go.acquire().await.expect("never closed");
+        }
+        listed
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        let marker = ControlKey::Operation(admin::FORMATION_OPERATION).encode();
+        if self.hold_marker && request.key.as_ref() == marker.as_bytes() {
+            self.at_marker.notify_one();
+            let _permit = self.marker.acquire().await.expect("never closed");
+        }
+        self.inner.put(request).await
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// PR #138 review (blocker): declarations of 1 and of 8 partitions run at once and both pass
+/// the preflight before either writes. The winner then writes up to its formation record and is
+/// held there; the loser runs to its end. In both winner orders the loser is refused at the
+/// reservation, and a full snapshot of the store (bytes and revisions) is the same before and
+/// after it: it wrote nothing. Released, the winner publishes its own count, and `routes/0`
+/// agrees with it. Unit (<200 ms, an in-memory store).
+/// Cut: drop `reserve` from `admin::declare`. With 1 winning, the 8 writes `routes/0` and seven
+/// records and publishes 8; with 8 winning, the 1 publishes 1 beside `routes/0` = 8. Red in both
+/// orders, at the loser's outcome.
+#[config_log::retcd_test]
+fn s1a_concurrent_declarations_of_one_and_eight_partitions_publish_one_count() {
+    let rt = runtime();
+    for (won, lost) in [(1, PARTITIONS), (PARTITIONS, 1)] {
+        let mem: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let both = Arc::new(tokio::sync::Barrier::new(2));
+        let winner = Arc::new(DeclareRace::new(Arc::clone(&mem), Arc::clone(&both), true));
+        let loser = Arc::new(DeclareRace::new(Arc::clone(&mem), both, false));
+        let declare = |store: Arc<DeclareRace>, partitions: u32| {
+            let store: Arc<dyn ConfigStore> = store;
+            rt.spawn(async move {
+                admin::declare(
+                    &store,
+                    &admin::Declaration {
+                        partitions,
+                        ..declaration()
+                    },
+                )
+                .await
+            })
+        };
+        let winning = declare(Arc::clone(&winner), won);
+        let losing = declare(Arc::clone(&loser), lost);
+        let within = Duration::from_secs(10);
+        rt.block_on(async {
+            tokio::time::timeout(within, winner.at_marker.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{won} wins: its formation record's put arrives"));
+        });
+        let before = snapshot(&rt, &*mem);
+        loser.go.add_permits(1);
+        let outcome = rt
+            .block_on(async { tokio::time::timeout(within, losing).await })
+            .unwrap_or_else(|_| panic!("{won} wins: the {lost} ends"))
+            .expect("the task ends");
+        assert!(
+            matches!(&outcome, Err(admin::DeclareError::Refused(text))
+                if text.contains(&format!("reserves the store for a declaration of {won} partitions"))
+                    && text.contains("nothing was written")),
+            "{won} wins: the {lost} is refused at the reservation: {outcome:?}"
+        );
+        assert_eq!(
+            snapshot(&rt, &*mem),
+            before,
+            "{won} wins: the {lost} wrote nothing"
+        );
+        winner.marker.add_permits(1);
+        let outcome = rt
+            .block_on(async { tokio::time::timeout(within, winning).await })
+            .unwrap_or_else(|_| panic!("{won} wins: it ends"))
+            .expect("the task ends");
+        assert!(
+            matches!(&outcome, Ok(admin::Declared::Created(formation)) if formation.partitions == won),
+            "{won} wins: {outcome:?}"
+        );
+        assert_eq!(
+            rt.block_on(read_partition_count(&mem))
+                .expect("routes/0 reads"),
+            (won > 1).then_some(won),
+            "{won} wins: routes/0 agrees with the published count"
+        );
+    }
 }
 
 /// PR #138 review: the formation record is published last. Held at its put, the store
@@ -687,7 +886,7 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     drop(rt);
 
     let scripted = Arc::new(Scripted::new(Script {
-        pass_puts: 1 + (PARTITIONS - 1),
+        pass_puts: 2 + (PARTITIONS - 1),
         fail_put_with: Some(config_core::ConfigError::Unavailable {
             reason: "scripted: the declaring process stopped".to_owned(),
         }),
@@ -707,7 +906,7 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     );
     assert_eq!(
         keys(&prefix).len(),
-        PARTITIONS as usize,
+        PARTITIONS as usize + 1,
         "{:?}",
         keys(&prefix)
     );
@@ -1009,7 +1208,10 @@ fn s1a_an_unreachable_store_at_the_formation_read_says_what_to_do() {
 /// admitted (the commit hook faults it before activation), then loses its whole folder. With
 /// the formation record present, its reopen is refused "has not finished forming", and running
 /// the same declaration again (`Already`) does not change that: today's limit, which #137
-/// owns. The refused opens bind nothing, start nothing and write nothing. Integration (~4 s).
+/// owns. The refusal says so and does not tell the operator to run the formation again. The
+/// refused opens bind nothing, start nothing and write nothing. Integration (~4 s).
+/// Cut: `empty_owner_refusal` answers the shared `RERUN_FORM` step for a declared database
+/// too; red at the text.
 #[config_log::retcd_test]
 fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
     let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
@@ -1044,7 +1246,13 @@ fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
             .map(|_| ())
             .expect_err("the wiped owner is refused");
         assert!(
-            refused.to_string().contains("has not finished forming"),
+            refused.to_string().contains("has not finished forming")
+                && refused
+                    .to_string()
+                    .contains("does not finish it (issue #137)")
+                && !refused
+                    .to_string()
+                    .contains("run the command that formed it again"),
             "{attempt}: {refused}"
         );
         assert!(!has_copies(&rig.procs[0].dir), "{attempt}: nothing bound");
@@ -1083,4 +1291,59 @@ fn s1a_a_declared_owner_wiped_after_acknowledged_writes_is_told_to_promote() {
     assert!(refused.to_string().contains("admin promote"), "{refused}");
     assert!(!has_copies(&rig.procs[0].dir), "nothing bound");
     assert_eq!(snapshot(&rig.rt, &*rig.store), before, "nothing written");
+}
+
+/// PR #138 review (author question): the open counter is its own key, `rdb/instances/<hex>`, so
+/// a manual delete, or a restore of some prefixes and not others, can leave it absent beside
+/// rooted partitions and copies with data. A declared node process reopening its folder then
+/// is refused, naming the absent counter: it does not create it again at N = 1 and repeat the
+/// request ids N derives. Nothing is written and the folder keeps its copy. Integration (~3 s).
+/// Cut: count with `create` whenever the database is declared (`found.fresh ||
+/// declared.is_some()` in `open_spawning`); the reopen counts N = 1 and opens, red.
+#[config_log::retcd_test]
+fn s1a_a_declared_reopen_with_its_counter_gone_is_refused() {
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let formation = rig.declare_created();
+    rig.open_all(fresh_dirs());
+    rig.wait_ready();
+    rig.shutdown_all();
+    let counter = admin::instance_key(&formation.instance);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(counter.clone()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the counter is deleted");
+    let before = snapshot(&rig.rt, &*rig.store);
+    assert!(
+        !keys(&before).contains(&counter),
+        "{counter} is gone: {:?}",
+        keys(&before)
+    );
+    for node in ALL_NODES {
+        let refused = rig
+            .reopen(node)
+            .map(|_| ())
+            .expect_err("a reopen with no counter is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("{counter} is absent")),
+            "node {}: {refused}",
+            node.0
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            before,
+            "node {}: nothing written",
+            node.0
+        );
+        assert_eq!(
+            copies_in(&rig.procs[node.0 as usize - 1].dir),
+            [node.0.to_string()],
+            "node {}: the folder keeps its copy",
+            node.0
+        );
+    }
 }
