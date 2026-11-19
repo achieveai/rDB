@@ -469,7 +469,8 @@ anywhere else. (It does find `complete_fenced` in `operation_manager.rs`, which 
 operation lease token: a lease fence, not an owner fence.) So none of this fence is in place for
 SBX yet, on one machine or across machines.
 - Per-sandbox serialization is in-memory state in one gateway process, and on the sandbox create
-  path it is not held across container creation. (The per-parent lock `ops_locks` is held
+  path (`create_sandbox` in `backend/docker_backend.rs`) it is not held across container
+  creation. (The per-parent lock `ops_locks` is held
   across the ops-sibling create, `ensure_ops_container` in `docker.rs`.)
 - Durable state is one SQLite file per gateway. Its OS advisory lock stops only a second gateway
   on the same host and file.
