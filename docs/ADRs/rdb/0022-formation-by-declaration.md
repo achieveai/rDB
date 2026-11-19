@@ -4,8 +4,8 @@
 **Date:** 2026-11-17
 **Spec:** `docs/rdb/design-specification.md` §7.1 (authoritative records)
 **Extends:** [ADR-rdb-0008](0008-control-records-in-retcd.md) (two new `operations/` records).
-ADR-rdb-0008 is not edited here; its amendment for the record body and for `nodes/{id}` comes with
-#80 S1b.
+**Amended by:** [ADR-rdb-0023](0023-node-records-ring-placement-one-node-per-machine.md) (#80 S1b:
+nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decision 6 below).
 **Issue:** #80 slice S1a.
 
 ## Context
@@ -68,6 +68,10 @@ ADR-rdb-0008 is not edited here; its amendment for the record body and for `node
 6. **The node set is the initial declaration only.** This build declares nodes 1, 2 and 3 and keeps
    today's placement (`initial_owner`). More nodes, `nodes/{id}` records and add or remove are
    later slices.
+   *Amended by ADR-rdb-0023 (#80 S1b):* a declaration names nodes 1 to K, K from 3 to 8, each
+   with a `nodes/{id}` record, and partitions are placed round the ring of all K
+   (`placement::initial`), which at K = 3 is the placement above. The reservation is layout 2
+   (ADR-rdb-0023 Decision 2); layout 1 below is still read. Add and remove are still later.
 7. **`--form` stays** for one process with all three copies. The two paths write the same partition
    records. A database made by `--form` cannot be declared afterwards: its rooted `partitions/1` is
    in the way. A declared database cannot be formed or opened by a whole-database open either:
@@ -167,10 +171,12 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
   `s1a_an_unreachable_store_at_the_formation_read_says_what_to_do`.
 - `admin::tests::s1a_a_bootstrap_only_heal_waits_for_every_member_and_pins_its_boot`
   (`crates/rdb-api/src/admin.rs`).
-- `crates/rdb-api/examples/rdb_node.rs`: `s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing`,
-  `s1a_declare_rejects_five_mode_and_copy_flags`, `s1a_declare_rejects_each_planner_knob`,
+- `crates/rdb-api/examples/rdb_node.rs`: `s1a_declare_rejects_five_mode_and_copy_flags`, `s1a_declare_rejects_each_planner_knob`,
   `s1a_declare_node_counts_parse_as_gen_certs_does`, `s1a_declare_rejects_failover`.
-- Manual: `rdb_node --declare --control <endpoints> --partitions 8`, then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
+- `s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing` was retired by #80 S1b: four
+  nodes are legal now. ADR-rdb-0023 lists the rows that replace it.
+- Manual: `rdb_node --declare --control <endpoints> --partitions 8` (since #80 S1b also
+  `--peers 1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100`), then three `rdb_node` processes on 127.0.0.1, .2 and .3, each with
   its own `--dir`, 8 partitions. A write commits on each node's partitions.
 
 ## References

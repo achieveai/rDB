@@ -1181,21 +1181,33 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
   So plan for about 80 MB per 1 million records on each node.
   Neither list is trimmed or bounded yet.
-- **A three-process database can now be formed with no shared folder, but only nodes 1, 2
-  and 3, and only tested on one machine.** There are two ways to make one:
+- **A database of 3 to 8 node processes can now be formed with no shared folder, one node per
+  machine, but only tested on one machine.** There are two ways to make one:
   - `rdb_node --form` (what `lr up` runs) forms it once, in one process, in one folder. Each
     node process then opens its own `nodes/<n>` in that shared folder.
-  - `rdb_node --declare --control E --partitions P` writes only the control records and a
-    formation record that names the database (ADR-rdb-0022). Then start each node process
-    with its own empty `--dir` and its own `--listen` address. The owner of each partition
-    forms that partition when all three nodes are linked. Each folder ends up holding only
-    its own `nodes/<n>`. The same `--declare` run again answers `already`. A different
-    `--partitions` is refused. Of two `--declare` runs with different `--partitions` at the
-    same moment, one is refused and writes nothing.
+  - `rdb_node --declare --control E --partitions P --peers 1=ADDR,...,K=ADDR` writes only the
+    control records and a formation record that names the database (ADR-rdb-0022). K is 3
+    to 8. It writes one `nodes/N` record per node: its address and its machine
+    (ADR-rdb-0023). `--machines N=LABEL,...` names a node's machine; unset, the machine is
+    the address's host. Two nodes on one machine are refused: the same label, or the same
+    host whatever the labels say. Then start each node process with its own empty `--dir`,
+    `--listen` on its recorded address, and the same `--peers`. A node whose `--listen` or
+    any `--peers` entry disagrees with the records is refused before it binds, naming the
+    record. Partitions are placed round the ring: partition p's owner is node
+    ((p - 1) mod K) + 1, and its copies are that node and the next two. The owner of each
+    partition forms it when its three nodes are linked. Each folder ends up holding only its
+    own `nodes/<n>`. The same `--declare` run again answers `already`. A different
+    `--partitions`, node set or address is refused. Of two `--declare` runs that differ at
+    the same moment, one is refused and writes nothing.
+  - An embedded `Db` of a declared database runs exactly one node (`DbConfig::local` of one
+    node); more is refused. A store declared by an earlier build (no `nodes/` records) is
+    refused; declare again on a new store.
 
-  This has been run with three processes on 127.0.0.1, .2 and .3 of one host. It has not been
-  run on separate machines. Still missing: more than 3 nodes, a rule against two nodes on one
-  machine, TLS to rEtcd from `rdb_node`, and adding or removing a node. A node process started
+  This has been run with up to five processes on 127.0.0.1 to .5 of one host: each loopback
+  address counts as its own machine. It has not been run on separate machines. A machine
+  label is the operator's word: two labels on one box with two addresses are not caught.
+  Copies are uneven by up to 3 per node when K does not divide P. Still missing: TLS to
+  rEtcd from `rdb_node`, and adding or removing a node. A node process started
   on a folder of a database that was neither formed nor declared is still refused with
   "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
   of a declared database is refused: its node processes form it.

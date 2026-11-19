@@ -274,10 +274,11 @@ pub const DEFAULT_CLIENT: ClientId = ClientId(1);
 /// this process.
 pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
-/// The highest node number a node process may run (M11 WS A). Nodes past [`ALL_NODES`] are
-/// spares: a formed database's spare opens an empty copy bound to its instance and holds
-/// nothing until `admin move` pins it. Eight, the most members a `partitions/1` record pins
-/// (`MAX_RECORD_MEMBERS`).
+/// The highest node number a node process may run (M11 WS A). On a database `--form` made,
+/// nodes past [`ALL_NODES`] are spares: a spare opens an empty copy bound to its instance and
+/// holds nothing until `admin move` pins it. On a declared database every declared node holds
+/// the partitions ring placement gives it (#80 S1b, ADR-rdb-0023). Eight, the most members a
+/// `partitions/1` record pins (`MAX_RECORD_MEMBERS`), and the most a declaration names.
 pub const MAX_NODES: u32 = 8;
 
 impl DbConfig {
