@@ -1195,17 +1195,18 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     refused: the same label, or the same host whatever the labels say (two spellings of one IP,
     such as `[::1]` and `[0:0:0:0:0:0:0:1]`, are one host). An address no peer can dial is
     refused: port 0, a bracketed host that is not an IPv6 address, a host of digits and dots
-    that is not four octets (`127.1`), or a broadcast or multicast address. Then make the
-    certificates once, `rdb_node --gen-certs --cert-dir C --nodes K`, and start each node
-    process with `rdb_node --node N --dir D --listen ADDR --peers ... --control E --cert-dir C`:
-    its own empty `--dir`, `--listen` on its recorded address, the same `--peers`, and the same
-    `--control` and `--cert-dir`. A node whose `--listen` or any `--peers` entry disagrees with
-    the records is refused before it binds, naming the record. Partitions are placed round the
-    ring: partition p's owner is node ((p - 1) mod K) + 1, and its copies are that node and the
-    next two. The owner of each partition forms it when its three nodes are linked. Each folder
-    ends up holding only its own `nodes/<n>`. The same `--declare` run again answers `already`.
-    A different `--partitions`, node set or address is refused. Of two `--declare` runs that
-    differ at the same moment, one is refused and writes nothing.
+    that is not four octets (`127.1`), or an unspecified (`0.0.0.0`, `[::]`), broadcast or
+    multicast address. Then make the certificates once, `rdb_node --gen-certs --cert-dir C
+    --nodes K`, and start each node process with `rdb_node --node N --dir D --listen ADDR
+    --peers ... --control E --cert-dir C`: its own empty `--dir`, `--listen` on its recorded
+    address, the same `--peers`, and the same `--control` and `--cert-dir`. A node whose
+    `--listen` or any `--peers` entry disagrees with the records is refused before it binds,
+    naming the record. Partitions are placed round the ring: partition p's owner is node ((p -
+    1) mod K) + 1, and its copies are that node and the next two. The owner of each partition
+    forms it when its three nodes are linked. Each folder ends up holding only its own
+    `nodes/<n>`. The same `--declare` run again answers `already`. A different `--partitions`,
+    node set or address is refused. Of two `--declare` runs that differ at the same moment, one
+    is refused and writes nothing.
   - An embedded `Db` of a declared database runs exactly one node (`DbConfig::local` of one
     node); more is refused. It must set `DbConfig::addresses`: the address its listener is
     bound to, and every node's address as it was given them. The open compares them with the

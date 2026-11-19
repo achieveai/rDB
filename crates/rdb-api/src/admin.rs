@@ -600,9 +600,9 @@ impl Declaration {
         self.nodes.iter().map(|decl| decl.node).collect()
     }
 
-    /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the
-    /// node set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes, so not
-    /// port 0, a bad bracketed host, or a broadcast or multicast host; at most 255 bytes; none
+    /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the node
+    /// set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes, so not port 0, a
+    /// bad bracketed host, or an unspecified, broadcast or multicast host; at most 255 bytes; none
     /// twice), then each machine label ([`machine_refusal`], after lowercasing; unset, the
     /// address's host as [`parse_addr`] parses it), then [`machine_clash`].
     ///

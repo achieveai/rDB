@@ -87,8 +87,11 @@ impl std::fmt::Display for Host {
 /// dial: no `:port`, a port that is not 1 to 65535 (0 is refused, since no peer can dial it and
 /// a record is never rewritten), an empty host, a bracketed host that is not an IPv6 address,
 /// an IPv6 address without brackets, a host of only digits and dots that is not a four-octet
-/// IPv4 address (`127.1`), or a broadcast or multicast address (`255.255.255.255`,
-/// `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped forms), which TCP cannot dial.
+/// IPv4 address (`127.1`), or an unspecified, broadcast or multicast address (`0.0.0.0`,
+/// `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped forms), which a
+/// peer on another machine cannot dial.
+/// The unspecified address is a listener's wildcard, not a place to dial: `--listen 0.0.0.0`
+/// stays legal (`admin::node_start_refusal`), but a record holds an address peers dial.
 ///
 /// # Errors
 ///
@@ -140,17 +143,18 @@ pub fn parse_addr(addr: &str) -> Result<Host, String> {
     Ok(Host::Name(name))
 }
 
-/// `ip` as [`parse_addr`]'s host, or why no peer can dial it over TCP: a broadcast or
-/// multicast address.
+/// `ip` as [`parse_addr`]'s host, or why no peer can dial it over TCP: an unspecified,
+/// broadcast or multicast address.
 fn dialable(addr: &str, ip: IpAddr) -> Result<Host, String> {
     let undialable = match ip {
-        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast(),
-        IpAddr::V6(v6) => v6.is_multicast(),
+        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast(),
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast(),
     };
     if undialable {
         return Err(format!(
-            "address {addr:?} is a broadcast or multicast address, which no peer can dial over \
-             TCP; a node record is never rewritten, so give the address the node listens on"
+            "address {addr:?} is an unspecified, broadcast or multicast address, which no peer \
+             can dial over TCP; a node record is never rewritten, so give the address the node \
+             listens on"
         ));
     }
     Ok(Host::Ip(ip))
@@ -266,11 +270,12 @@ mod tests {
     /// label set. Two spellings of one IP are one host; a name is lowercased and loses one
     /// trailing dot. Port 0, a bracketed host that is not IPv6 and an unbracketed IPv6 host are
     /// refused, each with its reason (PR #144 review). So are a host of digits and dots that is
-    /// not four octets (`127.1`), and broadcast and multicast addresses, IPv4, IPv6 and
-    /// IPv4-mapped (PR #144 review r2). Neighbours that stay hosts: `223.255.255.255`,
+    /// not four octets (`127.1`), and unspecified, broadcast and multicast addresses, IPv4,
+    /// IPv6 and IPv4-mapped (PR #144 review r2). Neighbours that stay hosts: `223.255.255.255`,
     /// `240.0.0.1`, `[fe80::1]` and the name `1a.2`. Unit.
     /// Cut: `parse_addr` accepts port 0; red at `127.0.0.2:0`. Cut: the digits-and-dots check;
     /// red at `127.1:7101`. Cut: `dialable` refuses nothing; red at `255.255.255.255:7100`.
+    /// Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0:7100`.
     #[test]
     fn s1b_host_of_and_machine_labels() {
         let ip = |text: &str| Some(Host::Ip(text.parse().expect("an IP")));
@@ -306,6 +311,9 @@ mod tests {
             ("[ff02::1]:7100", "broadcast or multicast"),
             ("[::ffff:224.0.0.1]:7100", "broadcast or multicast"),
             ("[::ffff:255.255.255.255]:7100", "broadcast or multicast"),
+            ("0.0.0.0:7100", "unspecified"),
+            ("[::]:7100", "unspecified"),
+            ("[::ffff:0.0.0.0]:7100", "unspecified"),
         ] {
             let refused = parse_addr(bad).expect_err(bad);
             assert!(

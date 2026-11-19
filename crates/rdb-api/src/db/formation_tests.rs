@@ -2936,11 +2936,12 @@ fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
 }
 
 /// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
-/// written, since a node record is never rewritten: port 0, a bracketed host that is not an
-/// IPv6 address (`[::gg]`), and (PR #144 review r2) a broadcast or multicast host
-/// (`255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same store then takes the corrected
-/// addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and parses no bracketed host;
-/// both declare, red at the first. Cut: `dialable` refuses nothing; red at `255.255.255.255`.
+/// written, since a node record is never rewritten: port 0, a bracketed host that is not an IPv6
+/// address (`[::gg]`), and (PR #144 review r2) an unspecified, broadcast or multicast host
+/// (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`, `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same
+/// store then takes the corrected addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
+/// parses no bracketed host; both declare, red at the first. Cut: `dialable` refuses nothing; red
+/// at `255.255.255.255`. Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0`.
 #[config_log::retcd_test]
 fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
     let rt = runtime();
@@ -2957,19 +2958,22 @@ fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
         ),
         (
             "255.255.255.255:7100",
-            "a broadcast or multicast address",
+            "broadcast or multicast address",
             "127.0.0.3:7100",
         ),
         (
             "224.0.0.1:7100",
-            "a broadcast or multicast address",
+            "broadcast or multicast address",
             "127.0.0.3:7100",
         ),
         (
             "[ff02::1]:7100",
-            "a broadcast or multicast address",
+            "broadcast or multicast address",
             "[::3]:7100",
         ),
+        ("0.0.0.0:7100", "an unspecified", "127.0.0.3:7100"),
+        ("[::]:7100", "an unspecified", "[::3]:7100"),
+        ("[::ffff:0.0.0.0]:7100", "an unspecified", "127.0.0.3:7100"),
     ] {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, None)));

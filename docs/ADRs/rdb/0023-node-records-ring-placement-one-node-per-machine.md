@@ -27,15 +27,16 @@
 1. **`nodes/{id}` layout 1.** Key `nodes/{id}`, the id in decimal (`ControlKey::Node`). Body:
    one version byte (1), the node (u32 LE), then the address and the machine, each as one
    length byte and that many bytes. The address is UTF-8 `host:port`, 1 to 255 bytes, that a
-   peer can dial: the port is 1 to 65535 (port 0 is refused, since a record is never
-   rewritten), an IPv6 host is in brackets and parses as an IPv6 address (`[::gg]:7100` is
-   refused), an unbracketed host holds no `:`, a host of only digits and dots is a four-octet
-   IPv4 address (`127.1` is refused), and the host is not a broadcast or multicast address
-   (`255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, or an IPv4-mapped form of one), which TCP
-   cannot dial. A declaration is refused, with nothing written, for an address that breaks
-   this: `admin::Declaration::records` runs `rdb_core::authority::node::parse_addr`, which
-   checks all but the length, and then the 255-byte length check. The machine is 1 to 63 bytes
-   of `[a-z0-9._:-]`. Nothing may follow. A body that is anything else, or whose node is not the
+   peer can dial: the port is 1 to 65535 (port 0 is refused, since a record is never rewritten),
+   an IPv6 host is in brackets and parses as an IPv6 address (`[::gg]:7100` is refused), an
+   unbracketed host holds no `:`, a host of only digits and dots is a four-octet IPv4 address
+   (`127.1` is refused), and the host is not an unspecified, broadcast or multicast address
+   (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, or an IPv4-mapped form of
+   one), which a peer on another machine cannot dial (`--listen` may still use the wildcard
+   host). A declaration is refused, with nothing written, for an address that breaks this:
+   `admin::Declaration::records` runs `rdb_core::authority::node::parse_addr`, which checks all
+   but the length, and then the 255-byte length check. The machine is 1 to 63 bytes of
+   `[a-z0-9._:-]`. Nothing may follow. A body that is anything else, or whose node is not the
    key's, is not a record (`Undecodable`). Codec: `rdb_core::authority::node::NodeRecord`,
    outside `contracts/`, beside the partition codec. `admin::declare` writes one per declared
    node, create-or-adopt, after `routes/0` and before any `partitions/{p}`, so a store that
