@@ -206,6 +206,7 @@ async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         failover: None,
+        addresses: None,
     };
     let started = Instant::now();
     let db = match Db::open(config, store, rt.handle().clone()).await {

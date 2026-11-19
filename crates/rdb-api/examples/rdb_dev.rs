@@ -965,6 +965,7 @@ where
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        addresses: None,
     };
     // Before the voters start (PC-2): a refused option starts nothing.
     if let Err(e) = config.check() {
@@ -9456,6 +9457,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9537,6 +9539,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9594,6 +9597,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9657,6 +9661,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))

@@ -265,6 +265,26 @@ pub struct DbConfig {
     /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
     /// default, never promotes: failover stays the operator's `promote`.
     pub failover: Option<crate::planner::Failover>,
+    /// Where this node process listens and where it was told each node listens (#80 S1b ruling
+    /// 2, ADR-rdb-0023 Decision 5). An open of a declared database compares them with the
+    /// `nodes/` records before it creates anything, and is refused naming the record that
+    /// disagrees, or when this is `None`: a declared node must say where it and its peers
+    /// are. The open does not bind; the caller's listener is bound before `Db::open`, so a
+    /// caller that must not bind a wrong address checks first with
+    /// [`admin::node_start_refusal`], as `rdb_node` does. Unused by an undeclared open.
+    pub addresses: Option<NodeAddresses>,
+}
+
+/// What [`DbConfig::addresses`] holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddresses {
+    /// The address the node's listener is bound to, `host:port`: its record's, or the same
+    /// port on `0.0.0.0` or `::`.
+    pub listen: String,
+    /// Every node's address as this process was given it, `host:port`: each must be that
+    /// node's record's, and every declared node needs one. This node's own entry may be
+    /// left out.
+    pub peers: BTreeMap<NodeId, String>,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -1695,7 +1715,8 @@ impl Db {
             None
         };
         if let Some(formation) = &formation {
-            declared_open_refusal(&config.local, formation, &*store).await?;
+            declared_open_refusal(&config.local, config.addresses.as_ref(), formation, &*store)
+                .await?;
         }
         let declared = formation.as_ref().map(|formation| formation.instance);
         // #80 S1b: partitions are placed over the declared nodes; a database no declaration
@@ -6077,10 +6098,12 @@ fn roll_forward_copies(
 /// #80 S1b (ADR-rdb-0023 Decisions 4 and 5): what a node process of a declared database must
 /// be before it opens, checked before this open creates `nodes/` or reads anything else. One
 /// process runs one declared node: a process is certainly one machine, so two local nodes would
-/// be two data nodes on one machine. And that node's `nodes/{id}` record must exist: a store
-/// with none was declared by an S1a build ([`admin::S1A_STORE`]). Nothing is written either way.
+/// be two data nodes on one machine. That node's `nodes/{id}` record must exist: a store with
+/// none was declared by an S1a build ([`admin::S1A_STORE`]). And its [`DbConfig::addresses`]
+/// must agree with the records, by [`admin::node_start_refusal`]. Nothing is written either way.
 async fn declared_open_refusal(
     local: &[NodeId],
+    addresses: Option<&NodeAddresses>,
     formation: &admin::Formation,
     store: &dyn ConfigStore,
 ) -> Result<(), OpenError> {
@@ -6118,6 +6141,22 @@ async fn declared_open_refusal(
                 .map(|node| node.0)
                 .collect::<Vec<_>>()
         )));
+    }
+    // Ruling 2: the embedded node is held to its records as `rdb_node` is.
+    let Some(addresses) = addresses else {
+        return Err(OpenError::Config(format!(
+            "node {} of a declared database opened with no DbConfig::addresses: a declared node              says where it listens and where each peer does, and they are checked against the              nodes/ records; nothing was created",
+            node.0
+        )));
+    };
+    if let Some(refused) = admin::node_start_refusal(
+        *node,
+        &addresses.listen,
+        &addresses.peers,
+        Some(formation),
+        &records,
+    ) {
+        return Err(OpenError::Config(refused));
     }
     Ok(())
 }
@@ -7004,6 +7043,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         }
     }
 
@@ -7046,6 +7086,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -7141,6 +7182,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -7276,6 +7318,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))

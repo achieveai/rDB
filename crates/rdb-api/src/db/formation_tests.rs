@@ -19,7 +19,9 @@ const NODE_PUTS: u32 = 3;
 /// One node process, its own folder kept alive with it.
 struct Proc {
     node: NodeId,
-    db: Db,
+    /// `None` once the process ended ([`Rig::stop`], [`Rig::shutdown_all`]): its `Links` held
+    /// its net, so only dropping it lets go of its listener, as a process exit does.
+    db: Option<Db>,
     /// `None` once [`Rig::stop`] took the node down: its listener and links are gone.
     _net: Option<Arc<Net>>,
     dir: PathBuf,
@@ -44,15 +46,20 @@ struct Rig {
     /// Whether [`Rig::open_all`] runs each process on a runtime of its own, so that
     /// [`Rig::stop`] and [`Rig::restart`] end it as a process exit would (#80 S1b).
     own_runtimes: bool,
-    /// Where each node listens once [`Rig::open_all`] has bound them: node N on 127.0.0.N, so
-    /// every node of the rig is a different host on one machine (#80 S1b ruling 1).
+    /// Where each node listens: node N on 127.0.0.N, so every node of the rig is a different
+    /// host on one machine (#80 S1b ruling 1). Bound when the rig is made, before anything is
+    /// declared, so [`Rig::declaration`] records the ports the nodes listen on.
     addrs: BTreeMap<NodeId, String>,
+    /// The listeners bound when the rig was made, each until its node's first open takes it.
+    reserved: std::sync::Mutex<BTreeMap<NodeId, tokio::net::TcpListener>>,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         for proc in &mut self.procs {
-            proc.db.shutdown();
+            if let Some(db) = &mut proc.db {
+                db.shutdown();
+            }
         }
     }
 }
@@ -62,18 +69,46 @@ fn declaration() -> admin::Declaration {
 }
 
 /// A declaration of nodes 1 to `k` and `partitions` partitions (#80 S1b), node N at
-/// `127.0.0.N:7100` on machine `127.0.0.N`. The library never dials a record's address, so the
-/// rig's listeners need not be on it; `rdb_node` is what checks them.
+/// `127.0.0.N:7100` on machine `127.0.0.N`: for rows that only declare. A row that opens a node
+/// declares [`Rig::declaration`], the addresses its listeners are bound to, since a declared
+/// open checks them against the records.
 fn declaration_of(k: u32, partitions: u32) -> admin::Declaration {
+    declaration_at(
+        &(1..=k)
+            .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
+            .collect(),
+        partitions,
+    )
+}
+
+/// A declaration of the nodes of `addrs`, each at its address, and `partitions` partitions.
+fn declaration_at(addrs: &BTreeMap<NodeId, String>, partitions: u32) -> admin::Declaration {
     admin::Declaration {
-        nodes: (1..=k)
-            .map(|n| admin::NodeDecl {
-                node: NodeId(n),
-                addr: format!("127.0.0.{n}:7100"),
+        nodes: addrs
+            .iter()
+            .map(|(node, addr)| admin::NodeDecl {
+                node: *node,
+                addr: addr.clone(),
                 machine: None,
             })
             .collect(),
         partitions,
+    }
+}
+
+/// Bind `addr` again once whatever held it let go: a restarted process listens where its
+/// record says. Bounded at 5 s.
+fn rebind(rt: &tokio::runtime::Runtime, addr: &str) -> tokio::net::TcpListener {
+    let addr: std::net::SocketAddr = addr.parse().expect("an address");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match rt.block_on(tokio::net::TcpListener::bind(addr)) {
+            Ok(listener) => return listener,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "rebind {addr}: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -136,6 +171,10 @@ fn open_node_with(
             links: Some(links),
             boot: Some(boot),
             timeouts,
+            addresses: Some(NodeAddresses {
+                listen: addrs[&node].clone(),
+                peers: addrs.clone(),
+            }),
             ..config(dir)
         },
         Arc::clone(store),
@@ -177,6 +216,8 @@ fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
     let cert_dir = config_testkit::fs::temp_dir();
     let labels: Vec<Label> = (1..=k).map(|node| Label::Node(NodeId(node))).collect();
     certs::generate(cert_dir.path(), &labels).expect("certs");
+    let (held, addrs) = listeners(&rt, k);
+    let reserved = addrs.keys().copied().zip(held).collect();
     Rig {
         rt,
         store,
@@ -186,7 +227,8 @@ fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
         k,
         timeouts: Timeouts::default(),
         own_runtimes: false,
-        addrs: BTreeMap::new(),
+        addrs,
+        reserved: std::sync::Mutex::new(reserved),
     }
 }
 
@@ -288,11 +330,33 @@ fn has_copies(dir: &Path) -> bool {
 }
 
 impl Rig {
-    /// `declaration()` on this rig's store, which must write it.
+    /// The rig's declaration: nodes 1 to `k` at the addresses its listeners are bound to, and
+    /// [`PARTITIONS`] partitions.
+    fn declaration(&self) -> admin::Declaration {
+        self.declaration_of(PARTITIONS)
+    }
+
+    /// [`Rig::declaration`] with `partitions` partitions.
+    fn declaration_of(&self, partitions: u32) -> admin::Declaration {
+        declaration_at(&self.addrs, partitions)
+    }
+
+    /// The listener `node` opens on: the one bound when the rig was made, or its address
+    /// bound again once that one is gone.
+    fn listen(&self, rt: &tokio::runtime::Runtime, node: NodeId) -> tokio::net::TcpListener {
+        let held = self
+            .reserved
+            .lock()
+            .expect("the reserved listeners")
+            .remove(&node);
+        held.unwrap_or_else(|| rebind(rt, &self.addrs[&node]))
+    }
+
+    /// [`Rig::declaration`] on this rig's store, which must write it.
     fn declare_created(&self) -> admin::Formation {
         match self
             .rt
-            .block_on(admin::declare(&self.store, &declaration()))
+            .block_on(admin::declare(&self.store, &self.declaration()))
         {
             Ok(admin::Declared::Created(formation)) => formation,
             other => panic!("the declaration is written: {other:?}"),
@@ -301,9 +365,10 @@ impl Rig {
 
     /// Open nodes 1 to `k`, each on its folder in `dirs`, in that order; none waited on yet.
     fn open_all(&mut self, dirs: Vec<Folder>) {
-        let (listeners, addrs) = listeners(&self.rt, self.k);
+        let addrs = self.addrs.clone();
         let nodes: Vec<NodeId> = addrs.keys().copied().collect();
-        for ((node, listener), (dir, keep)) in nodes.iter().zip(listeners).zip(dirs) {
+        for (node, (dir, keep)) in nodes.iter().zip(dirs) {
+            let listener = self.listen(&self.rt, *node);
             let own_rt = self.own_runtimes.then(runtime);
             let (db, net) = open_node_with(
                 own_rt.as_ref().unwrap_or(&self.rt),
@@ -318,34 +383,39 @@ impl Rig {
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
                 node: *node,
-                db,
+                db: Some(db),
                 _net: Some(net),
                 dir,
                 _dir: keep,
                 own_rt,
             });
         }
-        self.addrs = addrs;
     }
 
     /// Open `node`'s process once more on its folder, alone, the others down.
     fn reopen(&self, node: NodeId) -> Result<(Db, Arc<Net>), OpenError> {
-        let (mut listeners, addrs) = listeners(&self.rt, self.k);
         open_node(
             &self.rt,
             &self.store,
             &self.cert_dir,
             node,
             &self.procs[node.0 as usize - 1].dir,
-            listeners.remove(node.0 as usize - 1),
-            &addrs,
+            self.listen(&self.rt, node),
+            &self.addrs,
         )
     }
 
-    /// Shut every process down.
+    /// End every process as an exit does: shut its `Db` down and drop it, its net and its
+    /// runtime, so its listener is free for a reopen at its recorded address. Its folder stays.
     fn shutdown_all(&mut self) {
         for proc in &mut self.procs {
-            proc.db.shutdown();
+            if let Some(mut db) = proc.db.take() {
+                db.shutdown();
+            }
+            proc._net = None;
+            if let Some(rt) = proc.own_rt.take() {
+                rt.shutdown_background();
+            }
         }
     }
 
@@ -359,6 +429,8 @@ impl Rig {
     fn wait_ready(&self) {
         for proc in &self.procs {
             proc.db
+                .as_ref()
+                .expect("a running process")
                 .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
                 .unwrap_or_else(|e| panic!("node {} is ready: {e}", proc.node.0));
         }
@@ -366,16 +438,19 @@ impl Rig {
 
     /// The process that runs `node`.
     fn of(&self, node: NodeId) -> &Db {
-        &self.procs[node.0 as usize - 1].db
+        self.procs[node.0 as usize - 1]
+            .db
+            .as_ref()
+            .expect("a running process")
     }
 
     /// Shut every process down and open each again on its own folder, at a new boot.
     fn restart_all(&mut self) {
+        // Each process listens again where its record says, once the old one let go.
+        self.shutdown_all();
+        let addrs = self.addrs.clone();
         for proc in &mut self.procs {
-            proc.db.shutdown();
-        }
-        let (listeners, addrs) = listeners(&self.rt, self.k);
-        for (proc, listener) in self.procs.iter_mut().zip(listeners) {
+            let listener = rebind(&self.rt, &addrs[&proc.node]);
             let (db, net) = open_node(
                 &self.rt,
                 &self.store,
@@ -386,7 +461,7 @@ impl Rig {
                 &addrs,
             )
             .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", proc.node.0));
-            proc.db = db;
+            proc.db = Some(db);
             proc._net = Some(net);
         }
     }
@@ -1102,7 +1177,9 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
         ..Script::default()
     }));
     let mut rig = bare_rig(scripted.clone());
-    let stopped = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+    let stopped = rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
         "{stopped:?}"
@@ -1121,15 +1198,14 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     );
 
     let (kept_dir, keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let refused = open_node(
         &rig.rt,
         &rig.store,
         &rig.cert_dir,
         NodeId(1),
         &kept_dir,
-        listeners.into_iter().next().expect("a listener"),
-        &addrs,
+        rig.listen(&rig.rt, NodeId(1)),
+        &rig.addrs,
     )
     .map(|_| ())
     .expect_err("an unfinished declaration forms nothing");
@@ -1264,9 +1340,10 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
         refuse: std::sync::atomic::AtomicBool::new(false),
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
-    let (listeners, addrs) = listeners(&rig.rt, rig.k);
-    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
-        listeners.into_iter().map(Some).collect();
+    let addrs = rig.addrs.clone();
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> = (1..=rig.k)
+        .map(|n| Some(rig.listen(&rig.rt, NodeId(n))))
+        .collect();
     let dirs = fresh_dirs();
     let rooted_first = |rig: &Rig| {
         let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
@@ -1340,7 +1417,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
     for ((node, db, net), (dir, keep)) in opened.into_iter().zip(dirs) {
         rig.procs.push(Proc {
             node,
-            db,
+            db: Some(db),
             _net: Some(net),
             dir,
             _dir: keep,
@@ -1470,15 +1547,14 @@ fn s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused()
         let before = snapshot(&rig.rt, &*rig.store);
         assert!(!keys(&before).contains(&gone), "{gone} is gone");
         let (dir, _keep) = folder();
-        let (listeners, addrs) = listeners(&rig.rt, rig.k);
         let opened = open_node(
             &rig.rt,
             &rig.store,
             &rig.cert_dir,
             NodeId(1),
             &dir,
-            listeners.into_iter().next().expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, NodeId(1)),
+            &rig.addrs,
         );
         let Err(refused) = opened.map(|(mut db, _net)| db.shutdown()) else {
             panic!("{gone}: node 1 opened a declared store missing it");
@@ -1592,7 +1668,9 @@ fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
             before,
             "{attempt}: nothing written"
         );
-        let again = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+        let again = rig
+            .rt
+            .block_on(admin::declare(&rig.store, &rig.declaration()));
         assert!(
             matches!(again, Ok(admin::Declared::Already(_))),
             "{again:?}"
@@ -1701,9 +1779,10 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
     let dirs = fresh_dirs();
-    let (listeners, addrs) = listeners(&rig.rt, rig.k);
-    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
-        listeners.into_iter().map(Some).collect();
+    let addrs = rig.addrs.clone();
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> = (1..=rig.k)
+        .map(|n| Some(rig.listen(&rig.rt, NodeId(n))))
+        .collect();
     assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
     std::thread::scope(|scope| {
         let _release = OpenOnDrop(&gated);
@@ -1774,18 +1853,14 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     assert!(!keys(&before).contains(&counter), "{counter} is gone");
     for node in [NodeId(2), NodeId(3), NodeId(1)] {
         let dir = &dirs[node.0 as usize - 1].0;
-        let (listeners, addrs) = self::listeners(&rig.rt, rig.k);
         let opened = open_node(
             &rig.rt,
             &rig.store,
             &rig.cert_dir,
             node,
             dir,
-            listeners
-                .into_iter()
-                .nth(node.0 as usize - 1)
-                .expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, node),
+            &rig.addrs,
         );
         let Err(refused) = opened else {
             panic!("node {}: an open with no counter opened", node.0);
@@ -2223,15 +2298,14 @@ fn s1a_counter_deleted_after_lost_create_is_not_recreated() {
     });
     let raced: Arc<dyn ConfigStore> = race.clone();
     let (dir, _keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt, rig.k);
     let opened = open_node(
         &rig.rt,
         &raced,
         &rig.cert_dir,
         NodeId(1),
         &dir,
-        listeners.into_iter().next().expect("a listener"),
-        &addrs,
+        rig.listen(&rig.rt, NodeId(1)),
+        &rig.addrs,
     );
     let Err(refused) = opened.map(|_| ()) else {
         panic!("node 1 opened over a counter deleted under it");
@@ -2276,18 +2350,14 @@ fn s1a_a_declared_restart_with_its_counter_gone_before_any_root_is_refused() {
     let gated_store: Arc<dyn ConfigStore> = gated;
     let dirs = fresh_dirs();
     let open = |store: &Arc<dyn ConfigStore>, node: NodeId| {
-        let (listeners, addrs) = listeners(&rig.rt, rig.k);
         open_node(
             &rig.rt,
             store,
             &rig.cert_dir,
             node,
             &dirs[node.0 as usize - 1].0,
-            listeners
-                .into_iter()
-                .nth(node.0 as usize - 1)
-                .expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, node),
+            &rig.addrs,
         )
         .map(|_| ())
     };
@@ -2396,7 +2466,7 @@ fn declared_rig_with(k: u32, partitions: u32, own_runtimes: bool) -> Rig {
     rig.own_runtimes = own_runtimes;
     match rig
         .rt
-        .block_on(admin::declare(&rig.store, &declaration_of(k, partitions)))
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
     {
         Ok(admin::Declared::Created(_)) => {}
         other => panic!("the declaration of {k} nodes is written: {other:?}"),
@@ -2431,7 +2501,9 @@ impl Rig {
     /// its listener and every link to it are gone. [`Rig::restart`] brings it back.
     fn stop(&mut self, node: NodeId) {
         let proc = &mut self.procs[node.0 as usize - 1];
-        proc.db.shutdown();
+        if let Some(mut db) = proc.db.take() {
+            db.shutdown();
+        }
         proc._net = None;
         if let Some(rt) = proc.own_rt.take() {
             rt.shutdown_background();
@@ -2444,14 +2516,15 @@ impl Rig {
         let at = node.0 as usize - 1;
         let Proc {
             node,
-            mut db,
+            db,
             _net,
             dir,
             _dir,
             own_rt,
         } = self.procs.remove(at);
-        db.shutdown();
-        drop(db);
+        if let Some(mut db) = db {
+            db.shutdown();
+        }
         // The old net holds the listener until it is dropped and its tasks end; its own
         // runtime, dropped, ends every task it ran, as the process's exit would.
         drop(_net);
@@ -2460,17 +2533,7 @@ impl Rig {
         }
         let own_rt = self.own_runtimes.then(runtime);
         let rt = own_rt.as_ref().unwrap_or(&self.rt);
-        let addr: std::net::SocketAddr = self.addrs[&node].parse().expect("an address");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let listener = loop {
-            match rt.block_on(tokio::net::TcpListener::bind(addr)) {
-                Ok(listener) => break listener,
-                Err(e) => {
-                    assert!(Instant::now() < deadline, "rebind {addr}: {e}");
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        };
+        let listener = rebind(rt, &self.addrs[&node]);
         let (db, net) = open_node_with(
             rt,
             &self.store,
@@ -2486,7 +2549,7 @@ impl Rig {
             at,
             Proc {
                 node,
-                db,
+                db: Some(db),
                 _net: Some(net),
                 dir,
                 _dir,
@@ -2660,7 +2723,7 @@ fn s1b_a_dropped_copy_outside_nodes_one_to_three_is_restored_after_an_owner_rest
     rig.own_runtimes = true;
     match rig
         .rt
-        .block_on(admin::declare(&rig.store, &declaration_of(S1B_K, S1B_P)))
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(S1B_P)))
     {
         Ok(admin::Declared::Created(_)) => {}
         other => panic!("declared: {other:?}"),
@@ -3084,6 +3147,135 @@ fn s1b_a_declared_open_of_two_local_nodes_is_refused() {
     );
     assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
     assert_eq!(snapshot(&rt, &*store), declared, "nothing was written");
+}
+
+/// Node 1 of `declaration()` opened alone on `dir` with `addresses` (#80 S1b ruling 2): no
+/// net, since the address check comes before anything an open links or creates.
+fn open_declared_one(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    dir: &Path,
+    addresses: Option<NodeAddresses>,
+) -> Result<Db, OpenError> {
+    rt.block_on(Db::open_with(
+        DbConfig {
+            local: vec![NodeId(1)],
+            addresses,
+            ..config(dir)
+        },
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))
+}
+
+/// `declaration()`'s addresses as node 1 was given them: its own and every node's.
+fn declared_addresses() -> NodeAddresses {
+    NodeAddresses {
+        listen: "127.0.0.1:7100".to_owned(),
+        peers: (1..=3)
+            .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
+            .collect(),
+    }
+}
+
+/// The names in a folder's `nodes/`, or none when it has no `nodes/`.
+fn folder_listing(dir: &Path) -> Vec<String> {
+    if dir.join("nodes").exists() {
+        copies_in(dir)
+    } else {
+        Vec::new()
+    }
+}
+
+/// #80 S1b ruling 2: node 1 opened with `wrong` addresses is refused, naming every one of
+/// `names`, on its first open, a retry of it, and a restart after an open with the right
+/// addresses. Each refusal leaves the store and the folder as they were.
+fn refused_on_every_open(wrong: Option<NodeAddresses>, names: &[&str]) {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    let dir = config_testkit::fs::temp_dir();
+    let refused_here = |what: &str| {
+        let before = snapshot(&rt, &*store);
+        let listing = folder_listing(dir.path());
+        let refused = open_declared_one(&rt, &store, dir.path(), wrong.clone())
+            .map(|mut db| db.shutdown())
+            .expect_err("a declared node whose addresses disagree is refused");
+        let text = refused.to_string();
+        assert!(matches!(refused, OpenError::Config(_)), "{what}: {text}");
+        for name in names {
+            assert!(text.contains(name), "{what}: {name:?} in {text}");
+        }
+        assert_eq!(snapshot(&rt, &*store), before, "{what}: nothing written");
+        assert_eq!(
+            folder_listing(dir.path()),
+            listing,
+            "{what}: the folder is as it was"
+        );
+    };
+    refused_here("the first open");
+    refused_here("a retry");
+    let mut db = open_declared_one(&rt, &store, dir.path(), Some(declared_addresses()))
+        .expect("node 1 opens with its recorded addresses");
+    db.shutdown();
+    drop(db);
+    assert_eq!(
+        folder_listing(dir.path()),
+        ["1"],
+        "the right open made node 1's copy"
+    );
+    refused_here("a restart");
+}
+
+/// #80 S1b ruling 2 (ADR-rdb-0023 Decision 5): an embedded node of a declared database whose
+/// `DbConfig::addresses.listen` is not its `nodes/1` record's address is refused, naming the
+/// record and both addresses, on the first open, a retry and a restart; nothing is written and
+/// the folder is as it was. Unit (<1 s, an in-memory store, no net).
+/// Cut: `declared_open_refusal` skips its `node_start_refusal` call; the first open opens, red
+/// at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_whose_listen_address_disagrees_with_its_record_is_refused() {
+    refused_on_every_open(
+        Some(NodeAddresses {
+            listen: "127.0.0.1:7101".to_owned(),
+            ..declared_addresses()
+        }),
+        &[
+            "listen address 127.0.0.1:7101",
+            "nodes/1",
+            "records 127.0.0.1:7100",
+        ],
+    );
+}
+
+/// #80 S1b ruling 2 (ADR-rdb-0023 Decision 5): an embedded node given an address for one peer
+/// that its `nodes/` record does not hold is refused naming that entry and the record, on the
+/// first open, a retry and a restart; nothing is written. Unit (<1 s).
+/// Cut: as the listen row; red at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_given_a_peer_address_that_disagrees_is_refused() {
+    let mut wrong = declared_addresses();
+    wrong.peers.insert(NodeId(3), "127.0.0.33:7100".to_owned());
+    refused_on_every_open(
+        Some(wrong),
+        &[
+            "peer address 3=127.0.0.33:7100",
+            "nodes/3",
+            "records 127.0.0.3:7100",
+        ],
+    );
+}
+
+/// #80 S1b ruling 2: a declared open with no `DbConfig::addresses` is refused, so the check
+/// cannot be skipped by leaving them out; first open, retry and restart. Unit (<1 s).
+/// Cut: `declared_open_refusal` lets `None` through; the first open opens, red at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_with_no_addresses_is_refused() {
+    refused_on_every_open(None, &["no DbConfig::addresses", "nothing was created"]);
 }
 
 /// #80 S1b ruling 4 (ADR-rdb-0023): a store an S1a build declared holds a formation record and

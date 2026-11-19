@@ -147,6 +147,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         failover: None,
+        // Only a node of a declared database uses it (#80 S1b): see below.
+        addresses: None,
     };
     // The same call opens a new folder or one that already holds data.
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;
@@ -1200,8 +1202,14 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     `--partitions`, node set or address is refused. Of two `--declare` runs that differ at
     the same moment, one is refused and writes nothing.
   - An embedded `Db` of a declared database runs exactly one node (`DbConfig::local` of one
-    node); more is refused. A store declared by an earlier build (no `nodes/` records) is
-    refused; declare again on a new store.
+    node); more is refused. It must set `DbConfig::addresses`: the address its listener is
+    bound to, and every node's address as it was given them. The open compares them with the
+    `nodes/` records, on every open (first, retry and restart), before it creates anything,
+    and is refused naming the record that disagrees; `None` is refused too. `Db::open` binds
+    nothing itself: your listener is already bound when you call it. To refuse before
+    binding, as `rdb_node` does, call `admin::read_formation`, `admin::read_nodes` and
+    `admin::node_start_refusal` first. A store declared by an earlier build (no `nodes/`
+    records) is refused; declare again on a new store.
 
   This has been run with up to five processes on 127.0.0.1 to .5 of one host: each loopback
   address counts as its own machine. It has not been run on separate machines. A machine

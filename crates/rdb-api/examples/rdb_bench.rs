@@ -726,6 +726,7 @@ fn run(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
                 block_cache_bytes: None,
                 sync_stuck_millis: None,
             },
+            addresses: None,
         };
         let opened = Instant::now();
         let mut db = rt
@@ -864,6 +865,7 @@ fn run_remote(args: &Args, ladder_cost: f64) -> Result<ExitCode, String> {
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::db::StorageOptions::default(),
+        addresses: None,
     };
     let opened = Instant::now();
     let mut db = rt

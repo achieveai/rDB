@@ -2021,6 +2021,7 @@ fn db_config(dir: &FsPath) -> crate::db::DbConfig {
         boot: None,
         storage: crate::StorageOptions::default(),
         failover: None,
+        addresses: None,
     }
 }
 

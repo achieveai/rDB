@@ -19,6 +19,7 @@ fn config(dir: &Path) -> DbConfig {
         boot: None,
         storage: crate::StorageOptions::default(),
         failover: None,
+        addresses: None,
     }
 }
 

@@ -559,6 +559,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         client: DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        addresses: None,
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))
@@ -847,6 +848,17 @@ fn serve_on(
     rt: &tokio::runtime::Runtime,
     store: Arc<dyn ConfigStore>,
 ) -> Result<(), String> {
+    serve_on_ready(args, rt, store, &|_| {})
+}
+
+/// [`serve_on`], calling `on_ready` with the node each time it prints its `ready` line, so a
+/// row can wait for every node of a database to be ready (#80 S1b).
+fn serve_on_ready(
+    args: &Args,
+    rt: &tokio::runtime::Runtime,
+    store: Arc<dyn ConfigStore>,
+    on_ready: &(dyn Fn(NodeId) + Sync),
+) -> Result<(), String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
     let dir = need(args.dir.as_ref(), "--dir")?;
     let listen = need(args.listen.as_ref(), "--listen")?;
@@ -912,6 +924,11 @@ fn serve_on(
         boot: Some(boot),
         storage: rdb_api::StorageOptions::default(),
         failover: failover(args),
+        // #80 S1b ruling 2: checked against the records by the open too, as an embedded node is.
+        addresses: Some(rdb_api::NodeAddresses {
+            listen: listen.clone(),
+            peers: args.peers.clone(),
+        }),
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))
@@ -921,7 +938,11 @@ fn serve_on(
     let waited = std::time::Instant::now();
     // A missed deadline is a line, not a stop (tester-s2 `lr up` race, A-R271): only a time-out
     // keeps waiting, and the late `ready` line says how long it took. Any other refusal ends it.
-    let mut retrying = report_ready(node, db.wait_ready(within));
+    let first = db.wait_ready(within);
+    if first.is_ok() {
+        on_ready(node);
+    }
+    let mut retrying = report_ready(node, first);
     let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -937,6 +958,7 @@ fn serve_on(
                     let after = waited.elapsed().as_secs();
                     tracing::info!(node = node.0, after_s = after, "rdb_node_ready_late");
                     println!("rdb_node ready node={} (after {after}s)", node.0);
+                    on_ready(node);
                     retrying = false;
                 }
                 Err(ReadyError::TimedOut { .. }) => {}
@@ -959,7 +981,7 @@ fn serve_on(
 mod tests {
     use std::sync::Arc;
 
-    use super::{admin_apps, declare_on, parse, serve_on, ConfigStore};
+    use super::{admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore};
 
     /// The `--peers` value of three nodes on three loopback hosts (#80 S1b).
     const PEERS: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
@@ -1188,7 +1210,7 @@ mod tests {
                 wrong.as_str(),
                 PEERS.to_owned(),
                 vec![
-                    format!("--listen {wrong}"),
+                    format!("listen address {wrong}"),
                     "nodes/3".to_owned(),
                     "127.0.0.3:7100".to_owned(),
                 ],
@@ -1196,7 +1218,10 @@ mod tests {
             (
                 "127.0.0.3:7100",
                 "1=127.0.0.1:7100,2=127.0.0.2:7101".to_owned(),
-                vec!["--peers 2=127.0.0.2:7101".to_owned(), "nodes/2".to_owned()],
+                vec![
+                    "peer address 2=127.0.0.2:7101".to_owned(),
+                    "nodes/2".to_owned(),
+                ],
             ),
         ] {
             let args = parsed(&[
@@ -1231,16 +1256,16 @@ mod tests {
     /// #80 S1b ruling 1 (single machine): a whole declared database runs on one box. Four
     /// node processes' start paths (`serve_on`, one thread each) on 127.0.0.1 to .4, the hosts
     /// `--declare` recorded, pass the start check, open their own empty folders and form every
-    /// partition: each `partitions/{p}` gains its root. Stopped through `--stop-file`, each
-    /// ends cleanly and its folder holds only its own `nodes/N`. The row asserts forming, not
-    /// readiness: the stop file is written once every root is there, which can be before a
-    /// node's first `wait_ready` returns, and a node reads the stop file only between waits.
-    /// So `--ready-secs 1` bounds each stop at about a second; with 30, one run took 30 s.
-    /// Cluster row (~0.5 s measured, at most ~1.5 s after forming, forming bounded at 30 s):
-    /// four nodes link over TLS and form four partitions. The node threads log outside this
-    /// row's span, so their lines land in the run's `_untagged-<pid>.jsonl`.
+    /// partition: each `partitions/{p}` gains its root, and every node reaches ready (its
+    /// `ready` line, through `serve_on_ready`). Only then is the stop file written, so no node
+    /// is still in a readiness wait when its peers go. Stopped through `--stop-file`, each ends
+    /// cleanly and its folder holds only its own `nodes/N`. Cluster row (~0.5 s measured,
+    /// bounded at 30 s): four nodes link over TLS, form four partitions and admit writes. The
+    /// node threads log outside this row's span, so their lines land in the run's
+    /// `_untagged-<pid>.jsonl`.
     /// Cut: `machine_clash` compares only a host's first three characters, so every loopback
-    /// address is one machine; the declaration is refused, red.
+    /// address is one machine; the declaration is refused, red. Cut: `serve_on_ready` never
+    /// calls `on_ready`; red at "every node is ready" after the 30 s bound.
     #[config_log::retcd_test]
     fn s1b_four_declared_node_processes_run_on_one_machine() {
         const K: u32 = 4;
@@ -1279,6 +1304,10 @@ mod tests {
         assert!(line.starts_with("rdb_node declared "), "{line}");
         let stop = root.path().join("stop");
         let path = |p: &std::path::Path| p.display().to_string();
+        let ready = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let on_ready = |node: rdb_api::NodeId| {
+            ready.lock().expect("the ready set").insert(node.0);
+        };
         let dirs: Vec<std::path::PathBuf> = (1..=K)
             .map(|n| root.path().join(format!("node-{n}")))
             .collect();
@@ -1301,12 +1330,12 @@ mod tests {
                         "--stop-file",
                         &path(&stop),
                         "--ready-secs",
-                        "1",
+                        "30",
                     ])
                     .expect("parses");
                     let store = Arc::clone(&store);
-                    let rt = &rt;
-                    scope.spawn(move || serve_on(&args, rt, store))
+                    let (rt, on_ready) = (&rt, &on_ready);
+                    scope.spawn(move || serve_on_ready(&args, rt, store, on_ready))
                 })
                 .collect();
             let rooted = |p: u32| {
@@ -1324,10 +1353,11 @@ mod tests {
                 })
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let mut formed = false;
+            let (mut formed, mut all_ready) = (false, false);
             while std::time::Instant::now() < deadline {
-                if (1..=4).all(rooted) {
-                    formed = true;
+                formed = formed || (1..=4).all(rooted);
+                all_ready = ready.lock().expect("the ready set").len() == K as usize;
+                if formed && all_ready {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1338,6 +1368,11 @@ mod tests {
                 .map(|handle| handle.join().expect("a node thread"))
                 .collect();
             assert!(formed, "every partition formed: {ended:?}");
+            assert!(
+                all_ready,
+                "every node is ready: {:?} of {K}: {ended:?}",
+                ready.lock().expect("the ready set")
+            );
             ended
         });
         for (n, outcome) in (1..=K).zip(ended) {

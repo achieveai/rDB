@@ -889,7 +889,8 @@ pub async fn read_nodes(
 
 /// Why node `node` may not start with `listen` and `peers` on a database declared as
 /// `formation` with node records `records` (#80 S1b rulings 2 and 4, ADR-rdb-0023), or `None`.
-/// Pure: `rdb_node` calls it before it writes its boot or binds.
+/// Pure: `rdb_node` calls it before it writes its boot or binds, and a declared `Db::open` calls
+/// it with `DbConfig::addresses` before it creates anything.
 ///
 /// - No formation record: `None`; an undeclared database has no node records.
 /// - `node` not among the declared nodes: refused.
@@ -938,8 +939,8 @@ pub fn node_start_refusal(
     };
     if listen != own.addr && wildcard_same_port().is_none() {
         return Some(format!(
-            "--listen {listen} disagrees with {}, which records {}: a node listens where its \
-             record says; {NOTHING}",
+            "listen address {listen} disagrees with {}, which records {}: a node listens where \
+             its record says; {NOTHING}",
             key(node),
             own.addr
         ));
@@ -947,7 +948,7 @@ pub fn node_start_refusal(
     for (peer, addr) in peers {
         let Some(record) = records.get(peer) else {
             return Some(format!(
-                "--peers {}={addr} names node {}, which has no {}: the database declares \
+                "peer address {}={addr} names node {}, which has no {}: the database declares \
                  nodes {:?}; {NOTHING}",
                 peer.0,
                 peer.0,
@@ -957,7 +958,7 @@ pub fn node_start_refusal(
         };
         if *addr != record.addr {
             return Some(format!(
-                "--peers {}={addr} disagrees with {}, which records {}; {NOTHING}",
+                "peer address {}={addr} disagrees with {}, which records {}; {NOTHING}",
                 peer.0,
                 key(*peer),
                 record.addr
@@ -970,7 +971,7 @@ pub fn node_start_refusal(
                 .get(declared_node)
                 .map_or("no address", |record| record.addr.as_str());
             return Some(format!(
-                "--peers names no address for node {}, which {} records at {addr}; {NOTHING}",
+                "no peer address for node {}, which {} records at {addr}; {NOTHING}",
                 declared_node.0,
                 key(*declared_node)
             ));
@@ -5508,7 +5509,7 @@ mod tests {
                 "127.0.0.3:7101",
                 good.clone(),
                 records.clone(),
-                vec!["--listen 127.0.0.3:7101", "nodes/3", "127.0.0.3:7100"],
+                vec!["listen address 127.0.0.3:7101", "nodes/3", "127.0.0.3:7100"],
             ),
             (
                 "--listen on the wildcard at another port",
@@ -5516,7 +5517,7 @@ mod tests {
                 "0.0.0.0:7101",
                 good.clone(),
                 records.clone(),
-                vec!["--listen 0.0.0.0:7101", "nodes/3", "127.0.0.3:7100"],
+                vec!["listen address 0.0.0.0:7101", "nodes/3", "127.0.0.3:7100"],
             ),
             (
                 "a peer elsewhere",
@@ -5529,7 +5530,7 @@ mod tests {
                 ]),
                 records.clone(),
                 vec![
-                    "--peers 2=127.0.0.2:7101",
+                    "peer address 2=127.0.0.2:7101",
                     "nodes/2",
                     "records 127.0.0.2:7100",
                 ],
@@ -5545,7 +5546,7 @@ mod tests {
                 ]),
                 records.clone(),
                 vec![
-                    "--peers 3=127.0.0.9:7100",
+                    "peer address 3=127.0.0.9:7100",
                     "nodes/3",
                     "records 127.0.0.3:7100",
                 ],
@@ -5560,7 +5561,7 @@ mod tests {
                     (4, "127.0.0.4:7100"),
                 ]),
                 records.clone(),
-                vec!["--peers 4=127.0.0.4:7100", "nodes/4", "[1, 2, 3]"],
+                vec!["peer address 4=127.0.0.4:7100", "nodes/4", "[1, 2, 3]"],
             ),
             (
                 "a declared peer left out",
@@ -5568,7 +5569,7 @@ mod tests {
                 "127.0.0.3:7100",
                 peers(&[(1, "127.0.0.1:7100")]),
                 records.clone(),
-                vec!["no address for node 2", "nodes/2", "127.0.0.2:7100"],
+                vec!["no peer address for node 2", "nodes/2", "127.0.0.2:7100"],
             ),
         ] {
             let refused = node_start_refusal(node, listen, &given, Some(&formation), &held);

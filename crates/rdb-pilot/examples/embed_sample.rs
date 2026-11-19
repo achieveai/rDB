@@ -49,6 +49,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         failover: None,
+        // Only a node of a declared database uses it (#80 S1b): see below.
+        addresses: None,
     };
     // The same call opens a new folder or one that already holds data.
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;
