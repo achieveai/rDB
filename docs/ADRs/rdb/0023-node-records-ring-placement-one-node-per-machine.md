@@ -65,20 +65,29 @@
    how the 127.0.0.N rig runs a whole database on one box), a DNS name next to that host's IP,
    and two containers on one host. A machine-wide lock file was rejected: it cannot see across
    containers, and it would break every one-box rig.
-5. **A node checks its records before it starts.** `admin::node_start_refusal`, called by
-   `rdb_node --node N` before it writes its boot or binds, on a declared database refuses:
+5. **A node checks its records before it starts, embedded or not.** `admin::node_start_refusal`
+   takes the node, the address it listens on and every node's address as it was given them.
+   On a declared database it refuses:
    - a node the formation record does not declare;
    - a store with no `nodes/` records (an S1a build's), with `admin::S1A_STORE`, which says to
      declare again with `--peers` on a new empty control store;
    - its own record absent;
-   - a `--listen` that is not its record's address (the same port on `0.0.0.0` or `::` is
+   - a listen address that is not its record's address (the same port on `0.0.0.0` or `::` is
      accepted);
-   - a `--peers` entry that is not its node's recorded address, or names a node with no
-     record;
-   - a declared node that `--peers` gives no address.
+   - a peer address that is not its node's recorded address, or names a node with no record;
+   - a declared node given no peer address.
    Each text names the record (`nodes/N`) and both values, and ends "nothing was started".
-   `Db::open` of a declared database refuses, before it creates anything, an open whose local
-   node has no record and a store with no records at all (the S1a text).
+   It runs on two paths:
+   - `rdb_node --node N` calls it with `--listen` and `--peers` before it writes its boot or
+     binds.
+   - `Db::open` of a declared database calls it with `DbConfig::addresses` (the listen address
+     and every peer address), before it creates anything, on every open: a first open, a
+     retry and a restart. `None` is refused, so an embedded node cannot skip it. The open
+     binds nothing itself; an embedder's listener is bound before `Db::open` is called, so an
+     embedder that must not bind a wrong address calls `admin::read_formation`,
+     `admin::read_nodes` and `admin::node_start_refusal` first, as `rdb_node` does.
+   `Db::open` also refuses, first, an open whose local node has no record and a store with no
+   records at all (the S1a text).
 
 ## Consequences
 
@@ -91,16 +100,21 @@
   start check. S1a never shipped, so nothing in use is stranded.
 - Node ids are not reused, and at most 8 are ever declared.
 - `rdb_node --declare` now requires `--peers`; `--nodes`, when given, must count them.
-- Not covered: an embedded `Db` given a `Net` is not checked against the records' addresses.
-  Its dial addresses come from the caller, and only `rdb_node`'s `--listen` and `--peers` are
-  compared. `Db::open` checks only that the local node's record exists.
+- `DbConfig` gains a field, `addresses`, so every caller that builds one names it; `None`
+  everywhere except on a declared node.
+- The open cannot see what the caller's `Net` is really bound to or dials: it compares what
+  `DbConfig::addresses` says. A caller that passes one thing there and another to its `Net`
+  is not caught.
 
 ## Verification
 
 Each row's doc names the cut that turns it red. Two have no such cut:
 `s1b_placement_of_a_partition_does_not_depend_on_the_count` holds by construction, because
 `placement::initial` takes no count, and `s1b_restart_of_each_of_five_nodes_reopens_its_own_folder`
-pins behaviour that no single cut in this slice removes.
+pins behaviour that no single cut in this slice removes: it goes red only through the cuts it
+shares with the five-node acceptance row. That is accepted as is (lead decision, #80 S1b).
+The library rows' rig binds each node's listener first and declares those real addresses, so
+every rig open passes the address check it would meet in use.
 
 - `crates/rdb-core/tests/placement.rs`: `s1b_ring_placement_at_three_nodes_is_todays_placement`,
   `s1b_ring_placement_places_three_distinct_nodes_and_balances_primaries`,
@@ -121,12 +135,16 @@ pins behaviour that no single cut in this slice removes.
   `s1b_concurrent_declarations_differing_only_in_an_address_publish_one`,
   `s1b_an_interrupted_declaration_is_finished_by_its_own_node_records_only`,
   `s1b_a_declared_open_of_two_local_nodes_is_refused`,
+  `s1b_a_declared_open_whose_listen_address_disagrees_with_its_record_is_refused`,
+  `s1b_a_declared_open_given_a_peer_address_that_disagrees_is_refused`,
+  `s1b_a_declared_open_with_no_addresses_is_refused` (each on a first open, a retry and a
+  restart),
   `s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare`.
 - `crates/rdb-api/examples/rdb_node.rs`:
   `s1b_declare_takes_peers_and_machines_and_prints_the_records`,
   `s1b_a_listen_that_disagrees_with_its_record_is_refused_before_boot_or_bind`,
   `s1b_four_declared_node_processes_run_on_one_machine` (ruling 1: four node processes on
-  127.0.0.1 to .4 form every partition).
+  127.0.0.1 to .4 form every partition and each reaches ready).
 - Manual: `rdb_node --declare --control E --partitions 16 --peers 1=127.0.0.1:7100,...,5=127.0.0.5:7100`,
   then five `rdb_node --node N` processes, each with its own `--dir`.
 
