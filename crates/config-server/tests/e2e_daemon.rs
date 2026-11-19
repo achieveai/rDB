@@ -605,8 +605,20 @@ async fn harness_wait_formed_requires_a_linearizable_read() {
 /// the port only once the daemon has logged its `bind_failed` refusal.
 fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> DaemonProcess {
     let node = harness.nodes[index].clone();
-    drop(node.reserved.lock().expect("reservation lock").take());
-    let holder = std::net::TcpListener::bind(node.peer).expect("take the node's peer port");
+    // #141: keep the reserved peer listener as the holder. Dropping it and binding again left
+    // the port free in between, and another reservation could take it (AddrInUse).
+    let (holder, client) = node
+        .reserved
+        .lock()
+        .expect("reservation lock")
+        .take()
+        .expect("the node's ports are still reserved");
+    drop(client);
+    assert_eq!(
+        holder.local_addr().expect("the holder's address"),
+        node.peer,
+        "the reserved listener holds the node's peer port"
+    );
 
     let log_file = support::log_file(&node);
     let node_id = node.node_id;
