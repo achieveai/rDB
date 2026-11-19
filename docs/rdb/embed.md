@@ -462,20 +462,22 @@ because the new owner restores and acts **after** its register.
 For a sandbox gateway (SBX), this section says what SBX **must build**. It does not describe
 SBX today.
 
-**Where SBX is today** (SBX master `287f4ee`, checked 2026-11-19): **no SBX code registers or
-checks an rDB owner token.** That covers register, container create and snapshot upload alike.
-So none of this fence is in place for SBX yet, on one machine or across machines.
-- Per-sandbox serialization is in-memory state in one gateway process, and it is not held across
-  container creation.
+**Where SBX is today** (SBX master `287f4ee`, checked 2026-11-19, on the register, container
+create and snapshot upload paths): **none of them registers or checks an rDB owner token**, and
+a search of SBX's crates for `owner_token`, `OwnerToken` and `fence` found no token fence
+anywhere else. So none of this fence is in place for SBX yet, on one machine or across machines.
+- Per-sandbox serialization is in-memory state in one gateway process, and on the sandbox create
+  path it is not held across container creation. (The per-parent ops lock is held across the
+  ops-sibling create.)
 - Durable state is one SQLite file per gateway. Its OS advisory lock stops only a second gateway
   on the same host and file.
-- The only cross-host coordination is S3 conditional-create locks for repository-wide backup
+- The cross-host coordination found is S3 conditional-create locks for repository-wide backup
   work (`backup/locks.rs`: repository init and prune) and per-workspace purge tombstones. Those
   are not an ownership fence.
 - An upload checks tombstones and snapshot divergence, not an owner token.
 
 Until SBX builds the requirements below, rDB claims no fence for SBX. SBX's distributed-gateway
-design (SBX PR 245, a draft) is where they belong.
+design (SBX PR 245, a draft as of 2026-11-19) is where they belong.
 
 - **Requirement: one shared serialization and record per workspace.** SBX must use one lock and
   one highest-token record per workspace (one sandbox is one workspace). Every machine's gateway
