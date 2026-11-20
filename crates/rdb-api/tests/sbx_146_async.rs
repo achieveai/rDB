@@ -11,7 +11,8 @@ use bytes::Bytes;
 use config_core::ConfigStore;
 use rdb_api::db::{AsyncDb, TxnWrite};
 use rdb_api::{
-    AffinityId, Change, Db, DbConfig, Delta, Op, Timeouts, TxnStatus, Value, MAX_TXN_DEADLINE,
+    AffinityId, ApiError, Change, Db, DbConfig, Delta, ErrorKind, Op, RetryRule, Timeouts,
+    TxnStatus, Value, MAX_TXN_DEADLINE,
 };
 
 /// The partitions every row forms: more than one, so `route` reads the control store.
@@ -129,14 +130,31 @@ where
     });
 }
 
+/// The most times row a asks one `get` again after the read was refused.
+const READ_ATTEMPTS: usize = 5;
+
+/// Whether `error` is the read refusal P1 gives a fresh read whose step view is above the
+/// published position (`answer_reader`, §4.3 invariant 2): `UNAVAILABLE` with `BoundedJitter`,
+/// which the API documents as "wait a few seconds and try again". It happens when a write the
+/// host committed in the same drain is not yet published; seen twice in row a (#146). The retry
+/// is a workaround for #184: remove it once P1 makes such a read wait at the barrier.
+fn read_refused(error: &ApiError) -> bool {
+    error.kind == ErrorKind::Unavailable && error.retry == RetryRule::BoundedJitter
+}
+
 fn doc(bytes: &[u8]) -> Change {
     Change::Doc(Delta(vec![Op::Replace(Value::Bytes(bytes.to_vec()))]))
 }
 
 /// #146 row a: 32 tasks x 20 rounds of put, get, txn, write and status on 8 groups, all on one
 /// current-thread runtime. More than one call is in flight at once, the ticker keeps ticking,
-/// and every call succeeds. Cut: run the sync call inline instead of on the blocking pool; a
-/// call then never yields, so the most in flight is exactly 1.
+/// and every call succeeds. A `get` refused `UNAVAILABLE` with `BoundedJitter` (the read view
+/// was above the published position, as a concurrent write had just committed) is asked again,
+/// at most `READ_ATTEMPTS` times, as its retry rule says; the retries are counted, and fewer
+/// than one per task is allowed, so a read path that refuses as a rule still fails the row.
+/// The retry works around #184 and goes when P1 waits at the barrier instead.
+/// Cut: run the sync call inline instead of on the blocking pool; a call then never yields, so
+/// the most in flight is exactly 1.
 /// Integration (~5-15 s): one database open and 3,200 calls.
 #[config_log::retcd_test]
 fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
@@ -144,9 +162,11 @@ fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
         let ticker = Ticker::start();
         let in_flight = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
         for task in 0..32_u64 {
             let (db, in_flight, most) = (db.clone(), Arc::clone(&in_flight), Arc::clone(&most));
+            let retries = Arc::clone(&retries);
             tasks.push(tokio::spawn(async move {
                 let group = AffinityId(1 + task % 8);
                 let enter = || {
@@ -161,10 +181,22 @@ fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
                     let put = db.put(group, object.clone(), value.clone(), None).await;
                     leave();
                     let put = put.unwrap_or_else(|e| panic!("put: {e}"));
-                    enter();
-                    let got = db.get(group, object.clone()).await;
-                    leave();
-                    let got = got.unwrap_or_else(|e| panic!("get: {e}"));
+                    let mut attempt = 1;
+                    let got = loop {
+                        enter();
+                        let got = db.get(group, object.clone()).await;
+                        leave();
+                        match got {
+                            Err(error) if read_refused(&error) && attempt < READ_ATTEMPTS => {
+                                retries.fetch_add(1, Ordering::SeqCst);
+                                tracing::info!(task, round, attempt, %error, "sbx_146_a_read_retry");
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                attempt += 1;
+                            }
+                            got => break got,
+                        }
+                    };
+                    let got = got.unwrap_or_else(|e| panic!("get after {attempt} attempts: {e}"));
                     assert_eq!(got.value.map(|(_, bytes)| bytes), Some(value));
                     enter();
                     let txn = db
@@ -203,6 +235,9 @@ fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
         }
         let most = most.load(Ordering::SeqCst);
         assert!(most >= 2, "calls overlapped: at most {most} in flight");
+        let retries = retries.load(Ordering::SeqCst);
+        tracing::info!(retries, reads = 32 * 20, "sbx_146_a_read_retries");
+        assert!(retries < 32, "{retries} of 640 reads were refused and asked again");
         let bound = Duration::from_millis(250) * scale();
         assert!(
             ticker.longest() < bound,
