@@ -147,8 +147,16 @@ pub enum InheritError {
     #[error("history cannot rebuild the parent as of base: at={at}")]
     HistoryMissing {
         /// `history:<seq>` for a missing or undecodable record, `<ns>:<key hex>` for a record
-        /// above `base` that no `History` record names.
+        /// above `base` that no `History` record names, `below_floor:<seq>` when the parent's
+        /// History was trimmed below the seq it needs (issue #61).
         at: String,
+    },
+    /// The parent is mid snapshot install (`installing_inherit_refused`, issue #61): its view
+    /// is half written, so neither a link nor a copy may read it. Nothing written.
+    #[error("parent is mid snapshot install at {}", at.0)]
+    ParentInstalling {
+        /// The barrier seq of the install in progress.
+        at: Seq,
     },
     /// A batch failed (`inherit_failed`). A copy left staged is cleared by a re-run.
     #[error("storage fault {0:?}")]
@@ -200,6 +208,10 @@ impl RocksEngine {
                 target: LOG_TARGET, partition = p, from = f, to = t, base = b, at = %at,
                 "inherit_history_missing"
             ),
+            Err(InheritError::ParentInstalling { at }) => tracing::error!(
+                target: LOG_TARGET, partition = p, from = f, to = t, base = b, at = at.0,
+                "installing_inherit_refused"
+            ),
             Err(InheritError::Storage(fault)) => tracing::error!(
                 target: LOG_TARGET, partition = p, from = f, to = t, base = b,
                 fault = ?fault, "inherit_failed"
@@ -241,6 +253,11 @@ impl RocksEngine {
             .unwrap_or_default();
         if parent.staging.is_some() {
             return conflict(ConflictReason::ParentStaging);
+        }
+        // Before the cutoff check: an installing parent holds applied 0, so a base above 0
+        // would read as behind and a base of 0 would link an empty, half-written view.
+        if let Some((_, at)) = parent.installing {
+            return Err(InheritError::ParentInstalling { at });
         }
         let sibling_staging = self.lineages.iter().any(|(&(p, g), marks)| {
             p == partition && g != to && marks.staging.is_some_and(|(of, _)| of == from)
@@ -322,6 +339,11 @@ impl RocksEngine {
     ///    scan, or stays absent;
     /// 4. Progress is derived: `base` LE, then the record digest at `base`;
     /// 5. a visible record above `base` that no `History` record names is refused.
+    ///
+    /// On a trimmed parent (issue #61) the backward scan stops at its floor F, whose record is
+    /// kept: a key still open there has no after-image left to find, so the copy is refused
+    /// `below_floor:<F-1>` rather than read as absent. That is always the case once the tail
+    /// creates a key. A `base` below F is refused `below_floor:<base>`: its record is gone.
     fn as_of_base(
         &self,
         partition: PartitionId,
@@ -329,6 +351,12 @@ impl RocksEngine {
         base: Seq,
         held: AppliedSeq,
     ) -> Result<Vec<CopyRecord>, InheritError> {
+        let floor = self.floor_seq(partition, from);
+        if base.0 > 0 && base < floor {
+            return Err(InheritError::HistoryMissing {
+                at: format!("below_floor:{}", base.0),
+            });
+        }
         let mut touched: BTreeSet<(Namespace, Bytes)> = BTreeSet::new();
         for seq in base.0 + 1..=held.0 {
             let envelope = self.record(partition, from, Seq(seq))?;
@@ -360,7 +388,7 @@ impl RocksEngine {
             .filter(|(ns, _)| COPIED_NAMESPACES.contains(ns) && *ns != Namespace::Progress)
             .collect();
         let mut seq = base.0;
-        while seq > 0 && !open.is_empty() {
+        while seq > 0 && seq >= floor.0 && !open.is_empty() {
             let envelope = self.record(partition, from, Seq(seq))?;
             // The last write of a key in a batch is its after-image.
             for write in envelope.mutations.into_iter().rev() {
@@ -371,6 +399,12 @@ impl RocksEngine {
                 }
             }
             seq -= 1;
+        }
+        // Stopped by the floor, not by seq 0: the after-images below it are gone.
+        if seq > 0 && !open.is_empty() {
+            return Err(InheritError::HistoryMissing {
+                at: format!("below_floor:{seq}"),
+            });
         }
         if base.0 > 0 {
             let envelope = self.record(partition, from, base)?;
@@ -526,6 +560,9 @@ impl RocksEngine {
                 link: Some(link),
                 sealed_by: None,
                 staging: None,
+                floor: None,
+                installing: None,
+                tail_release: None,
             },
         );
         self.lineages

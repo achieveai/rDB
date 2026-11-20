@@ -33,6 +33,7 @@ use bytes::Bytes;
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq, SnapshotHandle};
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageFault};
 use rdb_core::contracts::trace::Version;
+use rdb_core::replication::append::PROGRESS_KEY;
 use rocksdb::ReadOptions;
 
 use crate::engine::{RocksEngine, LOG_TARGET};
@@ -201,6 +202,56 @@ impl RocksSnapshot {
             self.merge(ns, &[], |(key, value, version, from)| {
                 out.push((ns, key, value, version, from));
                 true
+            })?;
+        }
+        Ok(out)
+    }
+
+    /// One page of the view for a snapshot transfer (issue #61, M3): at most `limit` records
+    /// strictly after `after` in [`Self::entries`]'s `(namespace, key)` order, from the start
+    /// when `after` is `None`. The head `Progress` record (`PROGRESS_KEY`) is left out: the
+    /// installer writes its own from the barrier. A page is read by the paged merge, which
+    /// stops at the limit, so the source never holds more than one page. An empty page means
+    /// the view is done; `limit` 0 returns an empty page.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a stored value's frame does not decode,
+    /// or when `after` names `History`, which no view shows (logs `snapshot_cursor_invalid`).
+    pub fn entries_after(
+        &self,
+        after: Option<(Namespace, &[u8])>,
+        limit: usize,
+    ) -> Result<Vec<SnapshotEntry>, StorageFault> {
+        let (first, from) = match after {
+            None => (0, Vec::new()),
+            Some((ns, key)) => {
+                let Some(at) = NAMESPACES.iter().position(|held| *held == ns) else {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        partition = self.partition.0,
+                        ns = ?ns,
+                        "snapshot_cursor_invalid"
+                    );
+                    return Err(StorageFault::Corrupt);
+                };
+                // The smallest key after `key`: the merge seeks at or after its `from`.
+                let mut from = key.to_vec();
+                from.push(0);
+                (at, from)
+            }
+        };
+        let mut out = Vec::new();
+        for (i, ns) in NAMESPACES.iter().copied().enumerate().skip(first) {
+            if out.len() >= limit {
+                break;
+            }
+            let start: &[u8] = if i == first { &from } else { &[] };
+            self.merge(ns, start, |(key, value, version, level)| {
+                if !(ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY) {
+                    out.push((ns, key, value, version, level));
+                }
+                out.len() < limit
             })?;
         }
         Ok(out)

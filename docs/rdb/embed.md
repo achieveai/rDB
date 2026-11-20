@@ -918,6 +918,14 @@ So a partition sustains about `cap / retention` writes per second:
 | 10 min | 109 |
 
 - **Bursts are free.** A burst may use the whole cap at once.
+- **You are warned before the cap is full.** The owner logs `dedup_cap_high` (warn) once when a
+  partition's kept answers reach 80% of the cap, and `dedup_cap_full` (warn) once when they
+  reach the cap. Each line has `node`, `partition`, `len`, `cap`, `retention_ms` and, when
+  known, `frees_in_ms` (the earliest an answer frees). Each is logged again only after the count
+  falls 5% of the cap (at least one answer) below its mark, so a count sitting on a mark does
+  not log on every write.
+- **`Db::node_status` shows how full it is:** `lengths.dedup` (kept answers) beside
+  `lengths.dedup_cap` (the cap), on the owner. A node holding no answers reports 0 for both.
 - **A full cap answers `OVERLOADED`.** Its `retry_after` (on `ApiError`, also in the message)
   is the earliest time an entry frees. Wait at least that long before you send again. It is
   left out when no time is known.

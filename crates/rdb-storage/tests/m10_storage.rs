@@ -14,17 +14,22 @@ use std::path::PathBuf;
 
 use config_log::retcd_test;
 use rdb_core::contracts::authority::Lineage;
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
     ConfigVersion, Generation, OwnerEpoch, PartitionId, Seq, SnapshotHandle,
 };
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageFault};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
+use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_core::transaction::dedup::{DedupIndex, SeedPending};
-use rdb_sim::storage::history::canonical_history;
+use rdb_sim::storage::history::{canonical_history, canonical_history_from, CanonicalHistory};
+#[cfg(debug_assertions)]
+use rdb_storage::LineageFault;
 use rdb_storage::{
-    dump, BindError, OpenError, PublishMark, RocksEngine, StorageOptions,
-    DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN, WAL_BUDGETS,
+    dump, verify_lineage, BindError, OpenError, PublishMark, RocksEngine, RocksSnapshot,
+    SnapshotEntry, StorageOptions, TrimFloor, DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN,
+    WAL_BUDGETS,
 };
 
 const X: [u8; INSTANCE_LEN] = [0x11; INSTANCE_LEN];
@@ -1185,4 +1190,963 @@ fn a_r315_block_cache_memory_stays_within_the_store_capacity() {
         DEFAULT_BLOCK_CACHE_BYTES as u64,
         "the default is one 64 MiB cache"
     );
+}
+
+// Issue #61 A1: the trim floor mark and the trim walk.
+
+const P61: PartitionId = PartitionId(1);
+
+/// The canonical records `start.0 + 1..=n` of `(P61, generation)`, chained from `start`, committed.
+fn t61_commit(
+    engine: &mut RocksEngine,
+    generation: Generation,
+    start: (Seq, Digest),
+    n: u64,
+) -> CanonicalHistory {
+    let lineage = Lineage {
+        partition: P61,
+        generation,
+        owner_epoch: OwnerEpoch(1),
+    };
+    let history =
+        canonical_history_from(lineage, ConfigVersion(1), start, n).expect("canonical history");
+    for batch in &history.batches {
+        engine.commit(batch.clone()).expect("commit");
+    }
+    history
+}
+
+/// A floor at `seq` whose root is the lineage root.
+const fn t61_floor(seq: u64) -> TrimFloor {
+    TrimFloor {
+        seq: Seq(seq),
+        root_base: Seq::ZERO,
+        root_digest: Digest::ROOT,
+    }
+}
+
+/// Whether `level`'s **own** key range holds the History record at `seq` (a read of `level`
+/// that falls through to a parent does not count).
+fn t61_own(engine: &RocksEngine, level: Generation, seq: u64) -> bool {
+    engine
+        .get(P61, level, Namespace::History, &seq.to_be_bytes())
+        .expect("read history")
+        .is_some_and(|(from, _, _)| from == level)
+}
+
+/// The seqs in `range` that lineage `generation` reads a History record at, through its chain.
+fn t61_seen(
+    engine: &RocksEngine,
+    generation: Generation,
+    range: std::ops::RangeInclusive<u64>,
+) -> Vec<u64> {
+    range
+        .filter(|seq| {
+            engine
+                .history_at(P61, generation, Seq(*seq))
+                .expect("history_at")
+                .is_some()
+        })
+        .collect()
+}
+
+/// The trim walk deletes below F on every linked level and keeps the record at F (B1): g1 holds
+/// 1..=10, g2 is linked at 10 and holds 11..=20, g3 is linked at 20 and holds 21..=30. A trim of
+/// g3 at 25 empties g1 and g2 and g3's 21..=24, keeps 25..=30, and verifies with the same head
+/// digest. The trim is staged: it syncs nothing (M6). A second trim at F = applied keeps the head
+/// record. Red if the delete ends at F + 1 (the record at F goes), or the walk stops at g3.
+#[retcd_test]
+fn t61_trim_keeps_the_record_at_f_and_deletes_below() {
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-trim-at-f");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    let h2 = t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+    engine.inherit(P61, g2, g3, Seq(20)).expect("link g3");
+    let h3 = t61_commit(&mut engine, g3, (Seq(20), h2.digest(20)), 30);
+    assert_eq!(
+        t61_seen(&engine, g3, 1..=30).len(),
+        30,
+        "whole before the trim"
+    );
+    #[cfg(debug_assertions)]
+    let syncs = engine.wal_syncs();
+
+    assert_eq!(engine.stage_trim_history(P61, g3, t61_floor(25)), Ok(3));
+
+    assert_eq!(engine.floor_seq(P61, g3), Seq(25));
+    assert_eq!(engine.floor(P61, g3), Some((g3, t61_floor(25))));
+    assert_eq!(t61_seen(&engine, g3, 1..=30), (25..=30).collect::<Vec<_>>());
+    assert!(
+        (1..=10).all(|seq| !t61_own(&engine, g1, seq)),
+        "g1's History is gone"
+    );
+    assert!(
+        (11..=20).all(|seq| !t61_own(&engine, g2, seq)),
+        "g2's History is gone"
+    );
+    let verified = verify_lineage(&engine, P61, g3).expect("g3 verifies from its floor");
+    assert_eq!(verified.head_digest, h3.digest(30));
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        engine.wal_syncs(),
+        syncs,
+        "the trim is staged, never synced (M6)"
+    );
+
+    assert_eq!(engine.stage_trim_history(P61, g3, t61_floor(30)), Ok(3));
+    assert_eq!(
+        t61_seen(&engine, g3, 1..=30),
+        vec![30],
+        "the head record stays (B1)"
+    );
+    let verified = verify_lineage(&engine, P61, g3).expect("g3 verifies at F = head");
+    assert_eq!(verified.head_digest, h3.digest(30));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// B2: a parent's records above the child's base are its own tail (#105 keeps them), so a child's
+/// trim with F above the base keeps them. g1 holds 1..=12, g2 is a copied inherit at base 10 and
+/// holds 11..=20 of its own. A trim of g2 at 15 deletes g1's 1..=10 only. Red if the parent level
+/// is deleted over `[0, F)`.
+#[retcd_test]
+fn t61_trim_keeps_a_parent_tail_above_base() {
+    let (g1, g2) = (Generation(1), Generation(2));
+    let dir = data_dir("t61-parent-tail");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 12);
+    assert!(matches!(
+        engine.inherit(P61, g1, g2, Seq(10)),
+        Ok(rdb_storage::Inherited::Copied { .. })
+    ));
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+
+    assert_eq!(engine.stage_trim_history(P61, g2, t61_floor(15)), Ok(2));
+
+    assert!(
+        t61_own(&engine, g1, 11) && t61_own(&engine, g1, 12),
+        "g1's tail stays"
+    );
+    assert!(
+        (1..=10).all(|seq| !t61_own(&engine, g1, seq)),
+        "g1 below the base goes"
+    );
+    assert_eq!(t61_seen(&engine, g2, 1..=20), (15..=20).collect::<Vec<_>>());
+    verify_lineage(&engine, P61, g2).expect("g2 verifies from its floor");
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// B2: History falls through a `copied` link, so the trim walk follows it. A flatten makes g2's
+/// link to g1 `copied`; a trim of g2 at 15 deletes g1's 1..=10. Red if the walk follows
+/// `levels()`, which stops at a copied link (the rows would leak for good).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn t61_trim_reaches_history_behind_a_copied_link() {
+    let (g1, g2) = (Generation(1), Generation(2));
+    let dir = data_dir("t61-copied-link");
+    rdb_storage::flatten_at_depth(&dir, 1);
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    assert!(matches!(
+        engine.inherit(P61, g1, g2, Seq(10)),
+        Ok(rdb_storage::Inherited::Copied { .. })
+    ));
+    assert!(
+        engine.link(P61, g2).is_some_and(|link| link.copied),
+        "a flatten"
+    );
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+
+    assert_eq!(engine.stage_trim_history(P61, g2, t61_floor(15)), Ok(2));
+
+    assert!(
+        (1..=10).all(|seq| !t61_own(&engine, g1, seq)),
+        "g1's History is gone"
+    );
+    assert_eq!(t61_seen(&engine, g2, 1..=20), (15..=20).collect::<Vec<_>>());
+    verify_lineage(&engine, P61, g2).expect("g2 verifies from its floor");
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Every refusal is named and writes nothing: a lineage mid full copy (`staging`), a sealed one,
+/// a floor above applied, a floor below the current one, an unknown lineage. The same floor again
+/// is accepted. Red if a guard is removed (the staging row trims at 0, which only that guard
+/// refuses).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn t61_trim_refused_while_staging_and_never_lowers() {
+    use rdb_storage::{InjectedFault, TrimRefused};
+
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-refused");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 11);
+    engine.inject_fault(InjectedFault::CopyBatch);
+    engine
+        .inherit(P61, g1, g2, Seq(10))
+        .expect_err("the copy batch fails");
+    assert!(engine.staging(P61, g2).is_some(), "g2 is left staging");
+    assert_eq!(engine.stage_trim_history(P61, g1, t61_floor(8)), Ok(1));
+    drop(engine);
+    let before = dump(&db).expect("dump");
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+    for (asked, (generation, floor)) in [
+        (TrimRefused::Staging, (g2, 0)),
+        (
+            TrimRefused::AboveApplied {
+                floor: Seq(12),
+                applied: rdb_core::contracts::ids::AppliedSeq(11),
+            },
+            (g1, 12),
+        ),
+        (
+            TrimRefused::BelowFloor {
+                floor: Seq(6),
+                current: Seq(8),
+            },
+            (g1, 6),
+        ),
+        (TrimRefused::UnknownLineage, (g3, 0)),
+    ] {
+        assert_eq!(
+            engine.stage_trim_history(P61, generation, t61_floor(floor)),
+            Err(asked),
+            "{}",
+            asked.reason()
+        );
+    }
+    assert_eq!(
+        engine.floor_seq(P61, g1),
+        Seq(8),
+        "the floor never moves down"
+    );
+    drop(engine);
+    assert_eq!(
+        dump(&db).expect("dump"),
+        before,
+        "a refusal wrote something"
+    );
+
+    // A sealed parent is trimmed only through its child's walk.
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+    let p2 = PartitionId(2);
+    write_partition(&mut engine, p2, 10);
+    engine.inherit(p2, g1, g2, Seq(10)).expect("link");
+    assert_eq!(
+        engine.stage_trim_history(p2, g1, t61_floor(5)),
+        Err(TrimRefused::Sealed { child: g2 })
+    );
+    assert_eq!(
+        engine.stage_trim_history(P61, g1, t61_floor(8)),
+        Ok(1),
+        "the same floor again is accepted"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Commit `n` canonical batches into lineage `(partition, 1)`.
+fn write_partition(engine: &mut RocksEngine, partition: PartitionId, n: u64) {
+    let lineage = Lineage {
+        partition,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    };
+    let history = canonical_history(lineage, ConfigVersion(1), n).expect("canonical history");
+    for batch in history.batches {
+        engine.commit(batch).expect("commit");
+    }
+}
+
+/// The mark is restored at open, writable and read-only, root and level included, and `dump`
+/// names it. A linked child reads under its parent's mark and `floor` names the parent's level.
+/// A mark above applied, or of the wrong length, is refused at open. Red if the open does not
+/// restore the mark (the floor reads 0 after a reopen).
+#[retcd_test]
+fn t61_floor_survives_reopen() {
+    let g1 = Generation(1);
+    let dir = data_dir("t61-reopen");
+    let db = dir.join("db");
+    let mark = {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+        let mark = TrimFloor {
+            seq: Seq(6),
+            root_base: Seq(3),
+            root_digest: h1.digest(3),
+        };
+        engine.stage_trim_history(P61, g1, mark).expect("trim");
+        mark
+    };
+    {
+        let mut engine = RocksEngine::open(&db).expect("reopen");
+        assert_eq!(
+            engine.floor(P61, g1),
+            Some((g1, mark)),
+            "the mark and its level"
+        );
+        assert_eq!(t61_seen(&engine, g1, 1..=10), (6..=10).collect::<Vec<_>>());
+        verify_lineage(&engine, P61, g1).expect("verifies after a reopen");
+        // A child reads under its parent's mark, and is told whose it is (critic m-e).
+        engine
+            .inherit(P61, g1, Generation(2), Seq(10))
+            .expect("link");
+        assert_eq!(engine.floor(P61, Generation(2)), Some((g1, mark)));
+    }
+    let reader = RocksEngine::open_read_only(&db).expect("read-only open");
+    assert_eq!(reader.floor(P61, g1), Some((g1, mark)));
+    drop(reader);
+    assert!(
+        dump(&db).expect("dump").iter().any(|r| r
+            .to_string()
+            .contains("engine.trim_floor=seq:6 root_base:3")),
+        "dump names the mark"
+    );
+
+    let key = rdb_storage::keys::encode_key(P61, g1, Namespace::User, b"")[..12].to_vec();
+    let mut mark_key = key.clone();
+    mark_key.push(0xFF);
+    mark_key.extend_from_slice(b"trim_floor");
+    let mut above = vec![0; 48];
+    // g1 is g2's parent here, so a mark one past its applied (11) is a cut level's (rev 5c).
+    above[0..8].copy_from_slice(&12_u64.to_be_bytes());
+    for (case, value, says) in [
+        ("above applied", above, "trim floor 12 above applied 10"),
+        (
+            "47 bytes",
+            vec![0; 47],
+            "trim_floor record is 47 bytes, not 48",
+        ),
+    ] {
+        put_raw(&db, &mark_key, &value);
+        let refused = RocksEngine::open(&db).expect_err(case);
+        assert!(
+            matches!(&refused, OpenError::CorruptRecord { problem, .. } if problem.contains(says)),
+            "{case}: {refused}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// `verify_lineage` walks a trimmed lineage from its floor: the record at F is checked on its
+/// own and its digest starts the chain. Damaging the record at F fails the check at F. Red if
+/// the walk starts at 1 (`Missing(1)`), or skips the check of the record at F.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn t61_verify_lineage_from_floor() {
+    let g1 = Generation(1);
+    let dir = data_dir("t61-verify");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine
+        .stage_trim_history(P61, g1, t61_floor(6))
+        .expect("trim");
+    let verified = verify_lineage(&engine, P61, g1).expect("verifies from the floor");
+    assert_eq!(verified.head_digest, h1.digest(10));
+
+    engine
+        .damage_record(P61, g1, Namespace::History, &6_u64.to_be_bytes())
+        .expect("damage the record at F");
+    let fault = verify_lineage(&engine, P61, g1).expect_err("the record at F is checked");
+    assert!(
+        matches!(
+            fault,
+            LineageFault::Undecodable(Seq(6)) | LineageFault::DigestMismatch(Seq(6))
+        ),
+        "{fault}"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// A floor at `seq` whose root is record `root` of `h`: a mark whose root a reader can tell apart.
+fn t61_rooted(seq: u64, h: &CanonicalHistory, root: u64) -> TrimFloor {
+    TrimFloor {
+        seq: Seq(seq),
+        root_base: Seq(root),
+        root_digest: h.digest(root),
+    }
+}
+
+/// Design rev 5c: the trim marks every level it cuts, in its batch, at that level's cut
+/// `min(F, base+1)`, with the child's root. g1 holds 1..=10, g2 is linked at 10 and holds
+/// 11..=20, g3 is linked at 20 and holds 21..=30. A trim of g3 at 25 marks g3 at 25, g2 at 21 and
+/// g1 at 11, each `head + 1` on a parent emptied, and each mark survives a reopen. Red if the trim
+/// marks only its own level (`floor(g2)` is `None`).
+#[retcd_test]
+fn t61_trim_marks_each_cut_parent_level() {
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-marks-each-level");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    let h2 = t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+    engine.inherit(P61, g2, g3, Seq(20)).expect("link g3");
+    t61_commit(&mut engine, g3, (Seq(20), h2.digest(20)), 30);
+
+    assert_eq!(
+        engine.stage_trim_history(P61, g3, t61_rooted(25, &h1, 3)),
+        Ok(3)
+    );
+
+    for round in ["staged", "reopened"] {
+        for (level, seq) in [(g3, 25), (g2, 21), (g1, 11)] {
+            assert_eq!(
+                engine.floor(P61, level),
+                Some((level, t61_rooted(seq, &h1, 3))),
+                "{round}: the mark on g{}",
+                level.0
+            );
+        }
+        drop(engine);
+        engine = RocksEngine::open(&db).expect("reopen");
+    }
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Design rev 5d: on one engine a cut level is always on the trimmed lineage's own chain, so a
+/// sealed intermediate lineage reads under its **own** mark, and so does its parent. g1 holds
+/// 1..=10; g2 is linked at 10 and holds 11..=22; g3 is a copied inherit of g2 at 20 (g2 keeps
+/// its tail 21..=22) and holds 21..=30. A trim of g3 at 25 marks g2 at 21, inside its tail, and
+/// g1 at 11, past its head. `floor(g2)` is g2's own 21 and g2 verifies from it, head 22;
+/// `floor(g1)` is g1's own 11 and g1 verifies as empty, through a reopen. Red if the trim marks
+/// only its own level (`floor(g2)` falls back to `None`).
+#[retcd_test]
+fn t61_floor_of_a_sealed_intermediate_lineage() {
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-sealed-intermediate");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    let h2 = t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 22);
+    assert!(matches!(
+        engine.inherit(P61, g2, g3, Seq(20)),
+        Ok(rdb_storage::Inherited::Copied { .. })
+    ));
+    t61_commit(&mut engine, g3, (Seq(20), h2.digest(20)), 30);
+
+    assert_eq!(
+        engine.stage_trim_history(P61, g3, t61_rooted(25, &h1, 3)),
+        Ok(3)
+    );
+
+    for round in ["staged", "reopened"] {
+        assert_eq!(engine.sealed_by(P61, g2), Some(g3), "{round}: g2 is sealed");
+        assert_eq!(
+            engine.floor(P61, g2),
+            Some((g2, t61_rooted(21, &h1, 3))),
+            "{round}: g2 reads under its own mark"
+        );
+        assert_eq!(
+            t61_seen(&engine, g2, 1..=22),
+            vec![21, 22],
+            "{round}: g2's tail stays"
+        );
+        let verified = verify_lineage(&engine, P61, g2).expect("g2 verifies from 21");
+        assert_eq!(verified.head_digest, h2.digest(22), "{round}");
+        assert_eq!(
+            engine.floor(P61, g1),
+            Some((g1, t61_rooted(11, &h1, 3))),
+            "{round}: g1 reads under its own mark"
+        );
+        let verified = verify_lineage(&engine, P61, g1).expect("g1 verifies as empty");
+        assert_eq!(verified.head_digest, h1.digest(10), "{round}");
+        drop(engine);
+        engine = RocksEngine::open(&db).expect("reopen");
+    }
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Design rev 5c, B1 per level: a parent with no records above the child's base is cut whole and
+/// marked `head + 1`; it verifies as empty, its head digest named by its `Progress`, and opens
+/// again. A parent with a tail keeps the record at its mark and verifies from it. Red if verify
+/// reads the record at an emptied level's mark (`Missing(11)`), or open refuses a parent's mark
+/// one past its applied.
+#[retcd_test]
+fn t61_a_parent_with_no_tail_verifies_empty_after_the_cut() {
+    let (g1, g2) = (Generation(1), Generation(2));
+    let dir = data_dir("t61-parent-empty");
+    let db = dir.join("empty");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+    assert_eq!(engine.stage_trim_history(P61, g2, t61_floor(15)), Ok(2));
+    for round in ["staged", "reopened"] {
+        assert_eq!(engine.floor(P61, g1), Some((g1, t61_floor(11))), "{round}");
+        assert_eq!(t61_seen(&engine, g1, 1..=10), Vec::<u64>::new(), "{round}");
+        let verified = verify_lineage(&engine, P61, g1).expect("g1 verifies as empty");
+        assert_eq!(verified.head_digest, h1.digest(10), "{round}");
+        drop(engine);
+        engine = RocksEngine::open(&db).expect("reopen with g1 marked head + 1");
+    }
+    drop(engine);
+
+    let db = dir.join("tail");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 12);
+    assert!(matches!(
+        engine.inherit(P61, g1, g2, Seq(10)),
+        Ok(rdb_storage::Inherited::Copied { .. })
+    ));
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+    assert_eq!(engine.stage_trim_history(P61, g2, t61_floor(15)), Ok(2));
+    assert_eq!(engine.floor(P61, g1), Some((g1, t61_floor(11))));
+    assert_eq!(
+        t61_seen(&engine, g1, 1..=12),
+        vec![11, 12],
+        "the tail keeps 11"
+    );
+    let verified = verify_lineage(&engine, P61, g1).expect("g1 verifies from 11");
+    assert_eq!(verified.head_digest, h1.digest(12));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+// Issue #61 A7: the paged export and the snapshot install.
+
+/// g1 holds 1..=10, g2 is linked at 10 and holds 11..=15: a two-level view.
+fn t61_two_levels(engine: &mut RocksEngine) -> CanonicalHistory {
+    let (g1, g2) = (Generation(1), Generation(2));
+    let h1 = t61_commit(engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    t61_commit(engine, g2, (Seq(10), h1.digest(10)), 15)
+}
+
+/// Every page of `view` at `limit`, cursor from the last entry of the page before.
+fn t61_pages(view: &RocksSnapshot, limit: usize) -> Vec<Vec<SnapshotEntry>> {
+    let mut pages = Vec::new();
+    let mut after: Option<(Namespace, bytes::Bytes)> = None;
+    loop {
+        let page = view
+            .entries_after(after.as_ref().map(|(ns, key)| (*ns, key.as_ref())), limit)
+            .expect("page");
+        if page.is_empty() {
+            return pages;
+        }
+        let last = page.last().expect("a page");
+        let next = Some((last.0, last.1.clone()));
+        // A cursor that does not move would page forever: fail at once instead.
+        assert_ne!(next, after, "the cursor did not advance past {next:?}");
+        after = next;
+        pages.push(page);
+    }
+}
+
+/// The paged export covers the view exactly once, in order, without the head `Progress`, and no
+/// page is longer than its limit (M3: the source never holds the whole partition). A cursor in
+/// `History` is refused. Red if the cursor is inclusive (a key twice) or the head `Progress`
+/// is sent.
+#[retcd_test]
+fn t61_entries_after_pages_cover_the_view_once() {
+    let dir = data_dir("t61-pages");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    t61_two_levels(&mut engine);
+    let view = engine
+        .snapshot(P61, Generation(2), SnapshotHandle(1))
+        .expect("view");
+    let whole: Vec<SnapshotEntry> = view
+        .entries()
+        .expect("entries")
+        .into_iter()
+        .filter(|(ns, key, ..)| !(*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY))
+        .collect();
+    assert!(whole.len() > 10, "a view of both levels: {}", whole.len());
+    for limit in [1, 3, 1000] {
+        let pages = t61_pages(&view, limit);
+        assert!(
+            pages.iter().all(|page| page.len() <= limit),
+            "limit {limit}"
+        );
+        assert_eq!(
+            pages.concat(),
+            whole,
+            "limit {limit}: every entry once, in order"
+        );
+    }
+    assert_eq!(
+        view.entries_after(Some((Namespace::History, b"")), 3),
+        Err(StorageFault::Corrupt),
+        "History is not in the view"
+    );
+    drop((view, engine));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// The lineage-keyed records of `partition` in the closed copy at `db`, as `dump` prints them.
+fn t61_partition_records(db: &std::path::Path, partition: PartitionId) -> Vec<String> {
+    dump(db)
+        .expect("dump")
+        .iter()
+        .filter(|r| r.key.len() >= 13 && r.key[0..4] == partition.0.to_be_bytes())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// An install of a source view on a copy that holds an older lineage of the partition: the old
+/// lineage goes, the installed lineage reads the source's state, holds the barrier record at its
+/// floor S and verifies with the source's head digest, through a reopen. Another partition is
+/// untouched. A newer generation held, or a barrier that is not the record at S, is refused and
+/// writes nothing. Red if finish omits the barrier record (`Missing(15)`) or a chunk is lost.
+#[retcd_test]
+fn t61_install_round_trip_equals_source_view() {
+    use rdb_storage::InstallError;
+
+    let (g1, g2) = (Generation(1), Generation(2));
+    let dir = data_dir("t61-install");
+    let mut source = RocksEngine::open(dir.join("source")).expect("open source");
+    let h2 = t61_two_levels(&mut source);
+    let view = source.snapshot(P61, g2, SnapshotHandle(1)).expect("view");
+    let at = Seq(15);
+    let barrier = source
+        .history_at(P61, g2, at)
+        .expect("read")
+        .expect("the barrier record")
+        .0;
+    let state = |entries: Vec<SnapshotEntry>| -> Vec<(Namespace, bytes::Bytes, bytes::Bytes, u64)> {
+        entries
+            .into_iter()
+            .map(|(ns, key, value, version, _)| (ns, key, value, version))
+            .collect()
+    };
+
+    let db = dir.join("target");
+    let mut target = RocksEngine::open(&db).expect("open target");
+    t61_commit(&mut target, g1, (Seq::ZERO, Digest::ROOT), 5);
+    write_partition(&mut target, PartitionId(2), 3);
+    target.install_begin(P61, g2, at).expect("begin");
+    for page in t61_pages(&view, 4) {
+        target.install_chunk(P61, g2, at, &page).expect("chunk");
+    }
+    let wrong = source
+        .history_at(P61, g2, Seq(14))
+        .expect("read")
+        .expect("14")
+        .0;
+    assert_eq!(
+        target.install_finish(P61, g2, at, &wrong, (Seq::ZERO, Digest::ROOT)),
+        Err(InstallError::BadBarrier { at })
+    );
+    target
+        .install_finish(P61, g2, at, &barrier, (Seq::ZERO, Digest::ROOT))
+        .expect("finish");
+    let mark = TrimFloor {
+        seq: at,
+        root_base: Seq::ZERO,
+        root_digest: Digest::ROOT,
+    };
+    for round in ["installed", "reopened"] {
+        assert_eq!(
+            target.generations(P61),
+            vec![g2],
+            "{round}: the old lineage is gone"
+        );
+        assert_eq!(target.buffered_applied(P61, g2).0, 15, "{round}");
+        assert_eq!(target.floor(P61, g2), Some((g2, mark)), "{round}");
+        let installed = target.snapshot(P61, g2, SnapshotHandle(2)).expect("view");
+        assert_eq!(
+            state(installed.entries().expect("entries")),
+            state(view.entries().expect("entries")),
+            "{round}: the source's state, head Progress included"
+        );
+        let verified = verify_lineage(&target, P61, g2).expect("verifies from S");
+        assert_eq!(verified.head_digest, h2.digest(15), "{round}");
+        assert_eq!(t61_seen(&target, g2, 1..=15), vec![15], "{round}");
+        assert_eq!(
+            target.buffered_applied(PartitionId(2), g1).0,
+            3,
+            "{round}: p2"
+        );
+        drop((installed, target));
+        target = RocksEngine::open(&db).expect("reopen target");
+    }
+    drop(target);
+    let before = dump(&db).expect("dump");
+    let mut target = RocksEngine::open(&db).expect("reopen target");
+    assert_eq!(
+        target.install_begin(P61, g1, Seq(20)),
+        Err(InstallError::NewerGeneration { held: g2 })
+    );
+    drop(target);
+    assert_eq!(
+        dump(&db).expect("dump"),
+        before,
+        "a refused begin wrote something"
+    );
+    drop((view, source));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// A crash mid install leaves the lineage `installing`: verify refuses it as `CopyIncomplete`, a
+/// commit and a trim into it are refused, and the next open clears it, so the copy rejoins empty.
+/// Two cuts: (a) right after `install_begin`, with no chunk, and (b) a failed chunk 2 after
+/// chunk 1 landed. Either way neither the old lineage's levels nor its engine records survive
+/// (`install_begin` wiped them in the same batch as the marker). Red if the open refuses an
+/// `installing` lineage, or keeps its keys.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn t61_install_crash_mid_chunks_clears_at_open() {
+    use rdb_storage::{InjectedFault, LineageFault, TrimRefused};
+
+    let (g1, g2) = (Generation(1), Generation(2));
+    let dir = data_dir("t61-install-crash");
+    let mut source = RocksEngine::open(dir.join("source")).expect("open source");
+    let h2 = t61_two_levels(&mut source);
+    let view = source.snapshot(P61, g2, SnapshotHandle(1)).expect("view");
+    let pages = t61_pages(&view, 4);
+    assert!(pages.len() >= 3, "enough pages to cut after the first");
+    for (cut, chunks) in [("after-begin", 0), ("after-chunk-1", 1)] {
+        let db = dir.join(cut);
+        let mut target = RocksEngine::open(&db).expect("open target");
+        t61_commit(&mut target, g1, (Seq::ZERO, Digest::ROOT), 5);
+        target.install_begin(P61, g2, Seq(15)).expect("begin");
+        for page in &pages[..chunks] {
+            target.install_chunk(P61, g2, Seq(15), page).expect("chunk");
+        }
+        if chunks > 0 {
+            target.inject_fault(InjectedFault::InstallChunk);
+            target
+                .install_chunk(P61, g2, Seq(15), &pages[chunks])
+                .expect_err("the injected chunk fails");
+        }
+        assert_eq!(target.installing(P61, g2), Some((g2, Seq(15))), "{cut}");
+        assert_eq!(
+            verify_lineage(&target, P61, g2),
+            Err(LineageFault::CopyIncomplete),
+            "{cut}"
+        );
+        assert_eq!(
+            target.stage_trim_history(P61, g2, t61_floor(0)),
+            Err(TrimRefused::Installing),
+            "{cut}"
+        );
+        assert_eq!(
+            target.commit(h2.batch(11).clone()),
+            Err(StorageFault::WriteFailed),
+            "{cut}: a commit into an installing lineage"
+        );
+        drop(target);
+        let target = RocksEngine::open(&db).expect("the open clears the install");
+        assert_eq!(target.generations(P61), Vec::<Generation>::new(), "{cut}");
+        drop(target);
+        assert_eq!(
+            t61_partition_records(&db, P61),
+            Vec::<String>::new(),
+            "{cut}: no level or engine record of the partition survives"
+        );
+    }
+    drop((view, source));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// `install_begin` is one batch (design rev 5b): the old levels, their engine records and the
+/// `tail_release` mark go in the same write that marks the lineage installing. Cut before the
+/// batch (fault point `install-begin`): every level, the release mark and the keys stay, through
+/// a reopen, and nothing is installing. Cut after it: only the `installing` record of the
+/// partition is on disk, and the open clears it. Another partition is untouched. Red if the
+/// wipe misses the private prefix (the release mark survives) or is a write of its own.
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn t61_install_begin_is_one_batch_with_the_release_mark() {
+    use rdb_storage::{InjectedFault, InstallError};
+
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-install-begin");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    t61_two_levels(&mut engine);
+    engine
+        .put_tail_release(P61, g2, Seq(12))
+        .expect("release the tail");
+    write_partition(&mut engine, PartitionId(2), 3);
+    drop(engine);
+    let before = dump(&db).expect("dump");
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+
+    engine.inject_fault(InjectedFault::InstallBegin);
+    assert_eq!(
+        engine.install_begin(P61, g3, Seq(15)),
+        Err(InstallError::Storage(StorageFault::WriteFailed)),
+        "the cut before the batch"
+    );
+    for round in ["cut before", "reopened"] {
+        assert_eq!(engine.generations(P61), vec![g1, g2], "{round}");
+        assert_eq!(engine.tail_release(P61), Some((g2, Seq(12))), "{round}");
+        assert_eq!(engine.installing(P61, g3), None, "{round}");
+        assert_eq!(
+            t61_seen(&engine, g2, 1..=15),
+            (1..=15).collect::<Vec<_>>(),
+            "{round}"
+        );
+        drop(engine);
+        assert_eq!(
+            dump(&db).expect("dump"),
+            before,
+            "{round}: nothing was written"
+        );
+        engine = RocksEngine::open(&db).expect("reopen");
+    }
+
+    engine.install_begin(P61, g3, Seq(15)).expect("begin");
+    assert_eq!(engine.generations(P61), vec![g3], "cut after");
+    assert_eq!(engine.tail_release(P61), None, "cut after");
+    assert_eq!(engine.installing(P61, g3), Some((g3, Seq(15))), "cut after");
+    drop(engine);
+    assert_eq!(
+        t61_partition_records(&db, P61),
+        vec!["metadata p=1 g=3 engine.installing=generation:3 at:15".to_owned()],
+        "cut after: no level, engine record or release mark of the old lineages survives"
+    );
+    let engine = RocksEngine::open(&db).expect("the open clears the install");
+    assert_eq!(engine.generations(P61), Vec::<Generation>::new());
+    assert_eq!(
+        engine.buffered_applied(PartitionId(2), g1).0,
+        3,
+        "p2 is untouched"
+    );
+    drop(engine);
+    assert_eq!(t61_partition_records(&db, P61), Vec::<String>::new());
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// The host's `tail_release` mark (design rev 5c) is a synced lineage record: it survives a
+/// reopen, `dump` names it, the newest lineage holding one answers, and a lineage the engine
+/// does not hold is refused. A finished install leaves none, through a reopen. Red if the mark
+/// is not restored at open, or the install keeps the old lineage's mark.
+#[retcd_test]
+fn t61_tail_release_survives_reopen_and_is_cleared_by_install_begin() {
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-tail-release");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    assert_eq!(engine.tail_release(P61), None);
+    assert_eq!(
+        engine.put_tail_release(P61, g2, Seq(4)),
+        Err(StorageFault::WriteFailed),
+        "no such lineage"
+    );
+    engine.put_tail_release(P61, g1, Seq(7)).expect("release");
+    drop(engine);
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+    assert_eq!(
+        engine.tail_release(P61),
+        Some((g1, Seq(7))),
+        "restored at open"
+    );
+    assert!(
+        t61_partition_records(&db, P61)
+            .contains(&"metadata p=1 g=1 engine.tail_release=7".to_owned()),
+        "dump names it"
+    );
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 12);
+    engine
+        .put_tail_release(P61, g2, Seq(11))
+        .expect("release g2");
+    assert_eq!(
+        engine.tail_release(P61),
+        Some((g2, Seq(11))),
+        "the newest lineage answers"
+    );
+
+    let mut source = RocksEngine::open(dir.join("source")).expect("open source");
+    let h2 = t61_two_levels(&mut source);
+    let view = source.snapshot(P61, g2, SnapshotHandle(1)).expect("view");
+    let barrier = source
+        .history_at(P61, g2, Seq(15))
+        .expect("read")
+        .expect("15")
+        .0;
+    engine.install_begin(P61, g3, Seq(15)).expect("begin");
+    for page in t61_pages(&view, 1000) {
+        engine
+            .install_chunk(P61, g3, Seq(15), &page)
+            .expect("chunk");
+    }
+    engine
+        .install_finish(P61, g3, Seq(15), &barrier, (Seq::ZERO, Digest::ROOT))
+        .expect("finish");
+    assert_eq!(engine.tail_release(P61), None, "installed");
+    drop(engine);
+    let engine = RocksEngine::open(&db).expect("reopen");
+    assert_eq!(engine.tail_release(P61), None, "reopened");
+    assert_eq!(
+        verify_lineage(&engine, P61, g3)
+            .expect("verifies")
+            .head_digest,
+        h2.digest(15)
+    );
+    drop((view, source, engine));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// An inherit from a lineage mid snapshot install is refused (`installing_inherit_refused`):
+/// its view is half written, so neither a link nor a copy may read it. Refused at base 0 (an
+/// empty view a link would accept) and at the barrier S (which would otherwise read as behind
+/// the cutoff), and nothing is written. After `install_finish` the same inherit at S links. Red
+/// if the refusal is dropped (base 0 links a half-installed parent).
+#[retcd_test]
+fn t61_inherit_from_installing_lineage_is_refused() {
+    use rdb_storage::{InheritError, Inherited};
+
+    let (g2, g3) = (Generation(2), Generation(3));
+    let at = Seq(15);
+    let dir = data_dir("t61-inherit-installing");
+    let mut source = RocksEngine::open(dir.join("source")).expect("open source");
+    t61_two_levels(&mut source);
+    let view = source.snapshot(P61, g2, SnapshotHandle(1)).expect("view");
+    let barrier = source.history_at(P61, g2, at).expect("read").expect("15").0;
+    let pages = t61_pages(&view, 4);
+
+    let db = dir.join("target");
+    let mut target = RocksEngine::open(&db).expect("open target");
+    target.install_begin(P61, g2, at).expect("begin");
+    target.install_chunk(P61, g2, at, &pages[0]).expect("chunk");
+    drop(target);
+    let before = dump(&db).expect("dump");
+    let mut target = RocksEngine::open(&db).expect("reopen");
+    // The reopen cleared that install; start one again and stop mid chunks.
+    target.install_begin(P61, g2, at).expect("begin");
+    target.install_chunk(P61, g2, at, &pages[0]).expect("chunk");
+    for base in [Seq::ZERO, at] {
+        assert_eq!(
+            target.inherit(P61, g2, g3, base),
+            Err(InheritError::ParentInstalling { at }),
+            "base {}",
+            base.0
+        );
+    }
+    assert_eq!(
+        target.generations(P61),
+        vec![g2],
+        "no child lineage was made"
+    );
+    drop(target);
+    assert_eq!(
+        dump(&db).expect("dump"),
+        before,
+        "a refused inherit wrote something"
+    );
+
+    let mut target = RocksEngine::open(&db).expect("reopen");
+    target.install_begin(P61, g2, at).expect("begin");
+    for page in &pages {
+        target.install_chunk(P61, g2, at, page).expect("chunk");
+    }
+    target
+        .install_finish(P61, g2, at, &barrier, (Seq::ZERO, Digest::ROOT))
+        .expect("finish");
+    assert_eq!(target.inherit(P61, g2, g3, at), Ok(Inherited::Linked));
+    drop((view, source, target));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
