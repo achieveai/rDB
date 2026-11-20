@@ -6102,8 +6102,10 @@ fn roll_forward_copies(
 /// process runs one declared node: a process is certainly one machine, so two local nodes would
 /// be two data nodes on one machine. That node's `nodes/{id}` record must exist: a store with
 /// none was declared by an S1a build ([`admin::S1A_STORE`]). And its [`DbConfig::addresses`]
-/// must agree with the records, by [`admin::node_start_refusal`]. Nothing is written either way,
-/// and the open has created only its folder ([`DbConfig::dir`]).
+/// must agree with the records, by [`admin::node_start_refusal`]. #80 S2: and a store whose
+/// link is plaintext is refused when a record names a host that is not a loopback IP
+/// ([`admin::control_tls_refusal`], ADR-rdb-0024). Nothing is written either way, and the open
+/// has created only its folder ([`DbConfig::dir`]).
 async fn declared_open_refusal(
     local: &[NodeId],
     addresses: Option<&NodeAddresses>,
@@ -6130,6 +6132,17 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(format!(
             "{}; nothing but its folder was created",
             admin::S1A_STORE
+        )));
+    }
+    // #80 S2 ruling 1 (ADR-rdb-0024): records on another machine need a TLS control link.
+    if let Some(why) = admin::control_tls_refusal(
+        records
+            .values()
+            .map(|record| (record.node, record.addr.as_str())),
+        store.capabilities().transport_security,
+    ) {
+        return Err(OpenError::Config(format!(
+            "{why}; nothing but its folder was created"
         )));
     }
     if !records.contains_key(node) {

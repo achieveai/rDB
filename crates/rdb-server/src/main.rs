@@ -3,7 +3,13 @@
 //! ```text
 //! rdb-server --control E --nodes 1=A,2=B,3=C --cert-dir D --listen 127.0.0.1:P
 //!            [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]
+//!            [--control-tls T]
 //! ```
+//!
+//! `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
+//! `T/client.key`, the cluster id read from the client certificate (#80 S2, ADR-rdb-0024).
+//! Without it the link is plaintext; rdb-server refuses no plaintext link itself, and an open
+//! of a database whose nodes are not all on loopback IPs refuses it.
 //!
 //! It checks `--listen` first (loopback only, `rdb_server::check_listen`), then opens its `Db`
 //! as an app (`local = []`, links to every node in `--nodes` as app `NAME`, default `pilot-b`,
@@ -32,7 +38,8 @@ use rdb_server::{check_listen, serve, Gateway};
 
 const USAGE: &str = "usage: rdb-server --control host:port[,host:port...] \
                      --nodes 1=ADDR,2=ADDR,3=ADDR[,...] --cert-dir D --listen 127.0.0.1:PORT \
-                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]\n\
+                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F] \
+                     [--control-tls T]\n\
                      exits: 0 stopped by Ctrl-C or the stop file; 2 bad arguments, a non-loopback --listen, or \
                      setup; 3 the open or a link was refused; 5 not ready in time; 6 the \
                      listener could not bind";
@@ -51,6 +58,8 @@ struct Args {
     log_dir: PathBuf,
     ready: Duration,
     stop_file: Option<PathBuf>,
+    /// `--control-tls T` (#80 S2): mutual TLS to rEtcd, from `certs::load_control(T)`.
+    control_tls: Option<PathBuf>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -63,6 +72,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut log_dir = None;
     let mut ready = Duration::from_secs(60);
     let mut stop_file = None;
+    let mut control_tls = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -101,6 +111,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--stop-file" => stop_file = Some(PathBuf::from(value("--stop-file")?)),
+            "--control-tls" => control_tls = Some(PathBuf::from(value("--control-tls")?)),
             "--ready-secs" => {
                 let text = value("--ready-secs")?;
                 let secs = text
@@ -131,6 +142,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         log_dir,
         ready,
         stop_file,
+        control_tls,
     })
 }
 
@@ -174,14 +186,35 @@ fn run(args: &Args) -> ExitCode {
     code
 }
 
-async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
-    let client = match config_client::GrpcClient::connect(
+/// The rEtcd client: plaintext, or mutual TLS under `--control-tls` with the cluster id from
+/// the client certificate, so a leader hint is followed with its voter's identity checked.
+fn connect_control(args: &Args) -> Result<config_client::GrpcClient, String> {
+    let Some(dir) = &args.control_tls else {
+        return config_client::GrpcClient::connect(
+            args.control.clone(),
+            config_client::GrpcClientOptions::default(),
+        )
+        .map_err(|e| format!("--control: {e}"));
+    };
+    let tls = certs::load_control(dir).map_err(|e| format!("--control-tls: {e}"))?;
+    let client = config_client::GrpcClient::connect(
         args.control.clone(),
-        config_client::GrpcClientOptions::default(),
-    ) {
+        config_client::GrpcClientOptions {
+            tls: config_client::TlsMode::MutualTls(tls.mtls),
+            ..config_client::GrpcClientOptions::default()
+        },
+    )
+    .map_err(|e| format!("--control: {e}"))?
+    .with_cluster_id(tls.cluster);
+    tracing::info!(cluster = %tls.cluster, principal = %tls.principal, "control_tls");
+    Ok(client)
+}
+
+async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
+    let client = match connect_control(args) {
         Ok(client) => client,
         Err(error) => {
-            eprintln!("rdb-server: --control: {error}");
+            eprintln!("rdb-server: {error}");
             return ExitCode::from(2);
         }
     };

@@ -5,6 +5,7 @@
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
+//!                                           [--control-tls T]
 //!                                           [--abort-after-commit] [--pause-before-sync N=MS]
 //!                                           [--nodes N=E[,N=E...] --cert-dir D [--app NAME]]
 //!                                           [--partitions N]
@@ -17,7 +18,11 @@
 //! endpoints E instead of three in-process voters. `--dir` is then never removed, so a second
 //! run with the same `--dir` and E reopens it. The `control` verbs reach rdb_dev's own voters
 //! and are refused under `--control`, except a bare `control`, which lists E's partitions/
-//! and grants/ records. Each endpoint must be host:port. Without `--control`, a `--dir` that
+//! and grants/ records. Each endpoint must be host:port. `--control-tls T` dials E over mutual
+//! TLS with `T/ca.pem`, `T/client.pem` and `T/client.key`, the cluster id read from the client
+//! certificate (#80 S2, ADR-rdb-0024; `rdb_node --gen-certs --control-cluster` writes them); it
+//! needs `--control`. Without it the link is plaintext, which a TLS-only rEtcd refuses. rdb_dev
+//! refuses no plaintext link itself. Without `--control`, a `--dir` that
 //! held anything before this run is never removed either; `Db::open` decides whether it can be
 //! opened. An empty `--dir` made beforehand is removed like one this run created.
 //!
@@ -552,6 +557,8 @@ struct Args {
     /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
     /// never removes `--dir`, so a later run can reopen it.
     control: Option<Vec<String>>,
+    /// `--control-tls T` (#80 S2): mutual TLS to `--control`, from `certs::load_control(T)`.
+    control_tls: Option<PathBuf>,
     /// `--requests F`: where each recorded write request is appended, for a later run's `retry`.
     requests: Option<PathBuf>,
     /// `--abort-after-commit`: abort the whole process once a recovery commits, before it is
@@ -605,6 +612,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         dedup_cap: None,
         dedup_retention: None,
         control: None,
+        control_tls: None,
         requests: None,
         abort_after_commit: false,
         pause_before_sync: Vec::new(),
@@ -697,6 +705,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             "--cert-dir" => parsed.cert_dir = Some(PathBuf::from(value("--cert-dir")?)),
+            "--control-tls" => parsed.control_tls = Some(PathBuf::from(value("--control-tls")?)),
             "--app" => parsed.app = value("--app")?,
             // A slice 2 flag this build does not run yet (W7 day 1): refused by name before
             // anything starts, never as an unknown argument.
@@ -743,6 +752,33 @@ fn app_only_check(args: &Args) -> Result<(), String> {
 }
 
 /// Whether `text` is `host:port`: a host, a colon, and a port number from 1 to 65535.
+/// The rEtcd client for `--control E`: plaintext, or mutual TLS under `--control-tls T` with
+/// the cluster id from the client certificate (#80 S2, ADR-rdb-0024).
+fn connect_control(
+    endpoints: &[String],
+    tls: Option<&std::path::Path>,
+) -> Result<config_client::GrpcClient, String> {
+    let Some(dir) = tls else {
+        return config_client::GrpcClient::connect(
+            endpoints.to_vec(),
+            config_client::GrpcClientOptions::default(),
+        )
+        .map_err(|e| e.to_string());
+    };
+    let tls = rdb_api::net::certs::load_control(dir).map_err(|e| format!("--control-tls: {e}"))?;
+    let client = config_client::GrpcClient::connect(
+        endpoints.to_vec(),
+        config_client::GrpcClientOptions {
+            tls: config_client::TlsMode::MutualTls(tls.mtls),
+            ..config_client::GrpcClientOptions::default()
+        },
+    )
+    .map_err(|e| e.to_string())?
+    .with_cluster_id(tls.cluster);
+    tracing::info!(cluster = %tls.cluster, principal = %tls.principal, "control_tls");
+    Ok(client)
+}
+
 fn is_host_port(text: &str) -> bool {
     text.rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
@@ -992,24 +1028,19 @@ where
         ));
     }
     let (store, local) = match &args.control {
-        Some(endpoints) => {
-            match config_client::GrpcClient::connect(
-                endpoints.clone(),
-                config_client::GrpcClientOptions::default(),
-            ) {
-                Ok(client) => {
-                    say(&format!(
-                        "control: external rEtcd at {}",
-                        endpoints.join(",")
-                    ));
-                    (Arc::new(client) as Arc<dyn ConfigStore>, None)
-                }
-                Err(e) => {
-                    eprintln!("rdb_dev: --control: {e}");
-                    return ExitCode::from(1);
-                }
+        Some(endpoints) => match connect_control(endpoints, args.control_tls.as_deref()) {
+            Ok(client) => {
+                say(&format!(
+                    "control: external rEtcd at {}",
+                    endpoints.join(",")
+                ));
+                (Arc::new(client) as Arc<dyn ConfigStore>, None)
             }
-        }
+            Err(e) => {
+                eprintln!("rdb_dev: --control: {e}");
+                return ExitCode::from(1);
+            }
+        },
         None => {
             // The voters' data goes under --dir by name, not through RETCD_TEST_DATA_DIR: the
             // environment is the process's, and the rows that call `run` share one process.
@@ -7388,6 +7419,7 @@ mod tests {
             dedup_cap: None,
             dedup_retention: None,
             control: None,
+            control_tls: None,
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
@@ -7552,6 +7584,7 @@ mod tests {
             dedup_cap: Some(65_537),
             dedup_retention: None,
             control: None,
+            control_tls: None,
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),
@@ -8340,6 +8373,7 @@ mod tests {
             dedup_cap: None,
             dedup_retention: None,
             control: None,
+            control_tls: None,
             requests: None,
             abort_after_commit: false,
             pause_before_sync: Vec::new(),

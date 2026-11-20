@@ -3,10 +3,12 @@
 //!
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
-//! rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
-//! rdb_node --declare --control E --peers 1=ADDR,...,K=ADDR [--machines N=LABEL,...]
-//!          [--partitions P] [--nodes K] [--log-dir L]
+//!          [--control-cluster CID --control-voters 1=HOST,...]
+//! rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
+//! rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
+//!          [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
+//!          [--control-tls T]
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
@@ -16,6 +18,17 @@
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
 //!   certificates is how a walk presents a certificate this run's nodes do not trust.
+//!   With `--control-cluster CID` (32 hex digits) and `--control-voters 1=HOST,...` (both or
+//!   neither) it also writes `C/control/`: the rEtcd client certificate every rDB process
+//!   presents (`retcd://CID/client/rdb`), and one certificate per rEtcd voter, for its node id,
+//!   `node-N.CID.retcd` and HOST, all signed by the same development CA (#80 S2,
+//!   ADR-rdb-0024). Production brings its own files in that layout.
+//! * `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
+//!   `T/client.key`, the cluster id read from the client certificate's SAN; it prints
+//!   `rdb_node control tls cluster=CID principal=P`. Without it the link is plaintext, and
+//!   `--declare`, and a node process's start, are refused for a database whose `--peers` or
+//!   `nodes/` records name any host that is not a loopback IP (#80 S2 ruling 1): one machine on
+//!   127.0.0.N needs no certificates; anything else does.
 //! * `--form` makes the database once (ruling A-R231): all three copies in this process on
 //!   `--dir`, until ready, then shuts down. A node process opens only a formed or declared database.
 //!   `--partitions` is how many partitions the database is formed with (issue #79), fixed from
@@ -136,6 +149,12 @@ struct Args {
     /// `--machines N=label,...` (#80 S1b): `--declare`'s machine label per node; a node left
     /// out takes its `--peers` address's host as `parse_addr` parses it.
     machines: BTreeMap<NodeId, String>,
+    /// `--control-tls DIR` (#80 S2): mutual TLS to rEtcd from `certs::load_control(DIR)`.
+    control_tls: Option<PathBuf>,
+    /// `--control-cluster CID` (#80 S2): `--gen-certs` writes the rEtcd material for it.
+    control_cluster: Option<config_core::ClusterId>,
+    /// `--control-voters 1=HOST,...` (#80 S2): the rEtcd voters `--gen-certs` certifies.
+    control_voters: Vec<(u64, String)>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -146,10 +165,12 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
-  rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
-  rdb_node --declare --control E --peers 1=ADDR,...,K=ADDR [--machines N=LABEL,...]
-           [--partitions P] [--nodes K] [--log-dir L]
+           [--control-cluster CID --control-voters 1=HOST,...]
+  rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
+  rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
+           [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
+           [--control-tls T]
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
@@ -226,6 +247,28 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .collect();
             }
             "--cert-dir" => args.cert_dir = Some(value("--cert-dir")?.into()),
+            "--control-tls" => args.control_tls = Some(value("--control-tls")?.into()),
+            "--control-cluster" => {
+                let text = value("--control-cluster")?;
+                args.control_cluster = Some(text.parse().map_err(|_| {
+                    format!("--control-cluster {text:?} is not a cluster id: 32 hex digits")
+                })?);
+            }
+            "--control-voters" => {
+                for pair in value("--control-voters")?.split(',') {
+                    let (n, host) = pair
+                        .split_once('=')
+                        .filter(|(_, host)| !host.is_empty())
+                        .ok_or_else(|| format!("--control-voters: {pair:?} is not N=HOST"))?;
+                    let n: u64 = n
+                        .parse()
+                        .map_err(|_| format!("--control-voters: {n:?} is not a voter id"))?;
+                    if args.control_voters.iter().any(|(m, _)| *m == n) {
+                        return Err(format!("--control-voters names voter {n} twice"));
+                    }
+                    args.control_voters.push((n, host.to_owned()));
+                }
+            }
             "--protocol-version" => {
                 args.protocol_version = Some(
                     value("--protocol-version")?
@@ -311,7 +354,26 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     failover_refusal(&args)?;
     declare_refusal(&args)?;
+    control_certs_refusal(&args)?;
     Ok(args)
+}
+
+/// `--control-cluster` and `--control-voters` (#80 S2) are read by `--gen-certs` only, and
+/// only together: one names the rEtcd cluster, the other the voters to certify for it.
+fn control_certs_refusal(args: &Args) -> Result<(), String> {
+    let cluster = args.control_cluster.is_some();
+    let voters = !args.control_voters.is_empty();
+    if (cluster || voters) && !args.gen_certs {
+        return Err("--control-cluster and --control-voters are read only by --gen-certs".into());
+    }
+    if cluster != voters {
+        return Err(
+            "--control-cluster and --control-voters go together: the rEtcd cluster, and its \
+             voters as 1=HOST,..."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Five mode and copy flags `--declare` refuses (PR #138 review): it writes control records
@@ -523,7 +585,11 @@ fn gen_certs(args: &Args) -> ExitCode {
         .map(|n| Label::Node(NodeId(n)))
         .chain(args.apps.iter().cloned().map(Label::App))
         .collect();
-    match certs::generate(dir, &labels) {
+    let generated = certs::generate(dir, &labels).and_then(|()| match args.control_cluster {
+        Some(cluster) => certs::generate_control(dir, cluster, &args.control_voters),
+        None => Ok(()),
+    });
+    match generated {
         Ok(()) => {
             let names: Vec<String> = labels.iter().map(ToString::to_string).collect();
             println!(
@@ -531,6 +597,19 @@ fn gen_certs(args: &Args) -> ExitCode {
                 dir.display(),
                 names.join(",")
             );
+            if let Some(cluster) = args.control_cluster {
+                let voters: Vec<String> = args
+                    .control_voters
+                    .iter()
+                    .map(|(n, host)| format!("{n}={host}"))
+                    .collect();
+                println!(
+                    "rdb_node control certs dir={} cluster={cluster} client={} voters={}",
+                    dir.join(certs::CONTROL_DIR).display(),
+                    certs::CONTROL_CLIENT,
+                    voters.join(",")
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -544,12 +623,37 @@ fn control(args: &Args) -> Result<Arc<dyn ConfigStore>, String> {
     if args.control.is_empty() {
         return Err("--control is required: the rEtcd client endpoints (lr up starts one)".into());
     }
-    config_client::GrpcClient::connect(
+    let Some(dir) = &args.control_tls else {
+        return config_client::GrpcClient::connect(
+            args.control.clone(),
+            config_client::GrpcClientOptions::default(),
+        )
+        .map(|client| Arc::new(client) as Arc<dyn ConfigStore>)
+        .map_err(|e| format!("--control {}: {e}", args.control.join(",")));
+    };
+    // #80 S2 (ADR-rdb-0024): mutual TLS, and the cluster id from the client certificate, so
+    // a leader hint is followed with the hinted voter's identity checked.
+    let tls = certs::load_control(dir).map_err(|e| format!("--control-tls: {e}"))?;
+    let client = config_client::GrpcClient::connect(
         args.control.clone(),
-        config_client::GrpcClientOptions::default(),
+        config_client::GrpcClientOptions {
+            tls: config_client::TlsMode::MutualTls(tls.mtls),
+            ..config_client::GrpcClientOptions::default()
+        },
     )
-    .map(|client| Arc::new(client) as Arc<dyn ConfigStore>)
-    .map_err(|e| format!("--control {}: {e}", args.control.join(",")))
+    .map_err(|e| format!("--control {}: {e}", args.control.join(",")))?
+    .with_cluster_id(tls.cluster);
+    tracing::info!(
+        cluster = %tls.cluster,
+        principal = %tls.principal,
+        endpoints = ?args.control,
+        "control_tls"
+    );
+    println!(
+        "rdb_node control tls cluster={} principal={}",
+        tls.cluster, tls.principal
+    );
+    Ok(Arc::new(client))
 }
 
 /// Make the database once: all three copies here, until ready, then shut down (A-R231).
@@ -654,13 +758,20 @@ fn start_check_on(
             .map_err(|e| format!("start check: {e}"))?,
         None => BTreeMap::new(),
     };
-    match rdb_api::admin::node_start_refusal(
-        node,
-        listen,
-        &args.peers,
-        formation.as_ref(),
-        &records,
-    ) {
+    // #80 S2 ruling 1 (ADR-rdb-0024): before the boot is written or anything is bound, as the
+    // open would refuse it after.
+    let plaintext = formation.as_ref().and_then(|_| {
+        rdb_api::admin::control_tls_refusal(
+            records
+                .values()
+                .map(|record| (record.node, record.addr.as_str())),
+            store.capabilities().transport_security,
+        )
+        .map(|why| format!("{why}; nothing was started"))
+    });
+    match plaintext.or_else(|| {
+        rdb_api::admin::node_start_refusal(node, listen, &args.peers, formation.as_ref(), &records)
+    }) {
         Some(refused) => {
             tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
             Err(format!("start check: {refused}"))
@@ -1805,5 +1916,204 @@ mod tests {
             "joined after {:?}",
             started.elapsed()
         );
+    }
+
+    /// The `--peers` value of three nodes on three private hosts (#80 S2).
+    const REMOTE: &str = "1=10.9.9.1:7100,2=10.9.9.2:7100,3=10.9.9.3:7100";
+
+    /// A control store that reports mutual TLS, as a `GrpcClient` under `--control-tls` does
+    /// (#80 S2); every call goes to `inner`.
+    struct TlsReported(Arc<dyn ConfigStore>);
+
+    #[async_trait::async_trait]
+    impl ConfigStore for TlsReported {
+        async fn get(
+            &self,
+            request: config_core::GetRequest,
+        ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+            self.0.get(request).await
+        }
+        async fn list(
+            &self,
+            request: config_core::ListRequest,
+        ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+            self.0.list(request).await
+        }
+        async fn put(
+            &self,
+            request: config_core::PutRequest,
+        ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+            self.0.put(request).await
+        }
+        async fn delete(
+            &self,
+            request: config_core::DeleteRequest,
+        ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+            self.0.delete(request).await
+        }
+        fn capabilities(&self) -> config_core::Capabilities {
+            config_core::Capabilities {
+                transport_security: config_core::TransportSecurity::MutualTls,
+                ..self.0.capabilities()
+            }
+        }
+        async fn watch(
+            &self,
+            request: config_core::WatchRequest,
+        ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+            self.0.watch(request).await
+        }
+        async fn watch_leader(
+            &self,
+            request: config_core::WatchRequest,
+        ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+            self.0.watch_leader(request).await
+        }
+    }
+
+    /// #80 S2 SC7 (ruling 1, AC2): `--declare` without `--control-tls` of peers on other
+    /// machines is refused, naming node 1's address and `--control-tls`, with nothing written;
+    /// the same peers over a TLS store declare. And a node process of that database, started
+    /// over a plaintext store, is refused at its start check, before it writes its boot or
+    /// binds. Unit (an in-memory store).
+    /// Cut 1: `declare` skips `control_tls_refusal`: the plaintext declaration is written, red.
+    /// Cut 2: `start_check_on` skips it: node 1's start check passes, red.
+    #[config_log::retcd_test]
+    fn s2_rdb_node_declare_without_control_tls_is_refused_for_remote_peers() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let args = parsed(&["--declare", "--peers", REMOTE]).expect("parses");
+        let memory: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = declare_on(&args, &memory, &rt);
+        assert!(
+            matches!(&refused, Err(text) if text.contains("node 1's address 10.9.9.1:7100")
+                && text.contains("not TLS") && text.contains("--control-tls")
+                && text.contains("nothing was written")),
+            "{refused:?}"
+        );
+        let listed = rt
+            .block_on(memory.list(config_core::ListRequest {
+                prefix: bytes::Bytes::from_static(b""),
+                max_items: 0,
+                max_bytes: 0,
+            }))
+            .expect("the store answers");
+        assert!(listed.records.is_empty(), "nothing written");
+
+        let tls: Arc<dyn ConfigStore> = Arc::new(TlsReported(Arc::clone(&memory)));
+        let line = declare_on(&args, &tls, &rt).expect("over TLS the peers declare");
+        assert!(line.starts_with("rdb_node declared "), "{line}");
+
+        let node = parsed(&[
+            "--node",
+            "1",
+            "--listen",
+            "10.9.9.1:7100",
+            "--peers",
+            REMOTE,
+        ])
+        .expect("parses");
+        let refused =
+            super::start_check_on(&node, rdb_api::NodeId(1), "10.9.9.1:7100", &*memory, &rt);
+        assert!(
+            matches!(&refused, Err(text) if text.contains("not TLS")
+                && text.contains("nothing was started")),
+            "{refused:?}"
+        );
+        super::start_check_on(&node, rdb_api::NodeId(1), "10.9.9.1:7100", &*tls, &rt)
+            .expect("over TLS node 1's start check passes");
+    }
+
+    /// #80 S2: `--control-cluster` and `--control-voters` are read by `--gen-certs` only, and
+    /// together; `--control-tls` parses for every mode. Unit.
+    #[test]
+    fn s2_control_cert_flags_parse_only_with_gen_certs_and_together() {
+        const CID: &str = "80808080808080808080808080808080";
+        for (argv, refused) in [
+            (
+                &["--control-cluster", CID, "--control-voters", "1=10.0.0.2"][..],
+                "read only by --gen-certs",
+            ),
+            (
+                &["--gen-certs", "--control-cluster", CID][..],
+                "go together",
+            ),
+            (
+                &["--gen-certs", "--control-voters", "1=10.0.0.2"][..],
+                "go together",
+            ),
+            (
+                &["--gen-certs", "--control-cluster", "80"][..],
+                "is not a cluster id",
+            ),
+            (
+                &[
+                    "--gen-certs",
+                    "--control-cluster",
+                    CID,
+                    "--control-voters",
+                    "1",
+                ][..],
+                "is not N=HOST",
+            ),
+            (
+                &[
+                    "--gen-certs",
+                    "--control-cluster",
+                    CID,
+                    "--control-voters",
+                    "1=a,1=b",
+                ][..],
+                "names voter 1 twice",
+            ),
+        ] {
+            assert!(
+                matches!(parsed(argv), Err(text) if text.contains(refused)),
+                "{argv:?}: {:?}",
+                parsed(argv).map(|_| ())
+            );
+        }
+        let args = parsed(&["--declare", "--peers", PEERS, "--control-tls", "t"]).expect("parses");
+        assert_eq!(args.control_tls, Some(std::path::PathBuf::from("t")));
+    }
+
+    /// #80 S2 (lead decision: dev certificates come from `--gen-certs`): `--gen-certs` with
+    /// `--control-cluster` and `--control-voters` exits 0 and writes `control/`, which
+    /// `certs::load_control` reads as client `rdb` of that cluster, with one certificate per
+    /// voter. Unit.
+    #[config_log::retcd_test]
+    fn s2_gen_certs_writes_the_control_folder() {
+        const CID: &str = "80808080808080808080808080808080";
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        let argv: Vec<String> = [
+            "--gen-certs",
+            "--cert-dir",
+            &dir.display().to_string(),
+            "--nodes",
+            "5",
+            "--apps",
+            "admin",
+            "--control-cluster",
+            CID,
+            "--control-voters",
+            "1=172.30.80.2,2=172.30.80.3,3=172.30.80.4",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+        let code = super::run(argv.into_iter(), |_| Ok(None));
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        let control = dir.join(rdb_api::net::certs::CONTROL_DIR);
+        let loaded = rdb_api::net::certs::load_control(&control).expect("control/ loads");
+        assert_eq!(loaded.cluster.to_string(), CID);
+        assert_eq!(loaded.principal, "rdb");
+        for n in 1..=3 {
+            assert!(control.join(format!("voter-{n}.pem")).exists(), "voter {n}");
+            assert!(control.join(format!("voter-{n}.key")).exists(), "voter {n}");
+        }
+        assert!(dir.join("node-5.pem").exists() && dir.join("app-admin.pem").exists());
     }
 }
