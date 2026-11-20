@@ -6909,11 +6909,6 @@ mod dormant_twin_tests {
     /// tick 0. So node 1 is a fresh primary that has heard neither secondary: copies 1 and 2
     /// stand at `known` durable 0, below the floor in force, and would be uncounted.
     fn failed_over_owner() -> (Dispatcher, DormantSeed) {
-        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, ModuleName};
-        use rdb_core::contracts::ids::{CorrelationId, EventId};
-
-        use crate::storage::snapshot::EmptySnapshot;
-
         let (mut dispatcher, seed) = serving_owner();
         dispatcher.replication.forget_node(OWNER);
         sync_owner(&mut dispatcher, HEAD);
@@ -6931,6 +6926,18 @@ mod dormant_twin_tests {
                 },
             )
             .expect("a trim");
+        step_recovered(&mut dispatcher, &seed);
+        (dispatcher, seed)
+    }
+
+    /// Step [`recovered_result`] into node 1's R1 through [`Dispatcher::step`] at tick 0, so the
+    /// harness's ladder alignment and grace run, and assert a primary stands after it.
+    fn step_recovered(dispatcher: &mut Dispatcher, seed: &DormantSeed) {
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, ModuleName};
+        use rdb_core::contracts::ids::{CorrelationId, EventId};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
         let snapshot = EmptySnapshot::new();
         let budgets = Budgets::SPEC_DEFAULTS;
         let ctx = rdb_core::contracts::event::StepCtx {
@@ -6938,7 +6945,7 @@ mod dormant_twin_tests {
             ..owner_ctx(&snapshot, &budgets, seed.lineage)
         };
         Dispatcher::step(
-            &mut dispatcher,
+            dispatcher,
             ModuleName::Replication,
             &ctx,
             &Event {
@@ -6948,12 +6955,11 @@ mod dormant_twin_tests {
                 boot: BootId(1),
                 partition: P,
                 correlation: CorrelationId(1),
-                kind: EventKind::Kernel(KernelEvent::Recovered(Box::new(recovered_result(&seed)))),
+                kind: EventKind::Kernel(KernelEvent::Recovered(Box::new(recovered_result(seed)))),
             },
         )
         .expect("R1 answers its own event");
         assert!(dispatcher.replication.primary(OWNER, P).is_some(), "built");
-        (dispatcher, seed)
     }
 
     /// Copy `copy` (on node `copy + 1`) acks [`HEAD`], durable, to node 1's R1: the frame its
@@ -7153,5 +7159,64 @@ mod dormant_twin_tests {
             .collect();
         assert_eq!(behind, vec![Some(1), Some(2)], "each warned once");
         assert!(grace_ends(METHOD).is_empty(), "grace never ended");
+    }
+
+    /// Issue #61 design 3.4 (M6): floors stay equal after a crash, whether it kept or lost a
+    /// staged trim. Node 1 serves [`HEAD`] alone, synced, and its duty trims ladder and engine
+    /// to [`HEAD`] with no sync after. It crashes and restarts, and a `Recovered` stepped
+    /// through [`Dispatcher::step`] rebuilds its R1 side from the engine.
+    ///
+    /// **Asserted.** A host crash loses the unsynced trim mark, so the engine reopens at floor
+    /// 0, and the rebuilt ladder's floor is 0 too. A process crash keeps the staged mark, so the
+    /// engine reopens at [`HEAD`], and the rebuilt ladder is aligned to [`HEAD`]. Either way
+    /// the restarted node's first round holds on its boot pin.
+    ///
+    /// Cuts: a host crash keeping the staged mark, red (engine floor 3 after the host crash);
+    /// the alignment after `Recovered` skipped, red (ladder 0, engine 3 after the process
+    /// crash). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_floors_stay_equal_after_a_crash_keeps_or_loses_a_staged_trim() {
+        use rdb_core::contracts::storage::StorageFault;
+
+        for (fault, boot_floor) in [
+            (StorageFault::HostCrash, Seq::ZERO),
+            (StorageFault::ProcessCrash, Seq(HEAD)),
+        ] {
+            let (mut dispatcher, seed) = owner_of(1, HEAD);
+            sync_owner(&mut dispatcher, HEAD);
+            dispatcher
+                .retention_duty(OWNER, P, Tick(0), RETAIN)
+                .expect("a round");
+            assert_eq!(
+                dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+                Ok(floor_at(HEAD)),
+                "{fault:?}: trimmed, unsynced"
+            );
+            assert_eq!(floors(&dispatcher), (Some(Seq(HEAD)), Seq(HEAD)));
+            dispatcher
+                .engines
+                .get_mut(&OWNER)
+                .expect("node 1's engine")
+                .inject(crate::storage::StorageOp::Crash { node: OWNER, fault })
+                .expect("planned");
+            assert_eq!(dispatcher.crash_check(OWNER), Ok(true), "down");
+            dispatcher.restart(OWNER, BootId(2)).expect("restarted");
+            assert_eq!(
+                dispatcher.engines[&OWNER].floor_seq(P, Generation(1)),
+                boot_floor,
+                "{fault:?}: the engine reopens at its surviving mark"
+            );
+            step_recovered(&mut dispatcher, &seed);
+            assert_eq!(
+                floors(&dispatcher),
+                (Some(boot_floor), boot_floor),
+                "{fault:?}: the rebuilt ladder's floor is the engine's"
+            );
+            assert_eq!(
+                dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
+                Ok(RetentionDecision::Held(RetentionHold::InventoryPinned)),
+                "{fault:?}: the restarted holder is pinned"
+            );
+        }
     }
 }
