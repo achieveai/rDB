@@ -16,7 +16,13 @@
 //! * **The cap is hard.** It overrides a lagging member and a transfer pin. A pin `F` passes is
 //!   reported in [`RetentionFloor::overran_pins`], for the caller to log as
 //!   [`HISTORY_BUDGET_OVERRAN_PIN`] and restart that transfer.
-//! * **No trim** while any [`RetentionHold`] is true: the floor in force stays.
+//! * **No trim** while any [`RetentionHold`] but [`RetentionHold::Grace`] is true: the floor in
+//!   force stays.
+//! * **Grace stops the window, not the cap** (lead ruling R23). Under it `need` and `keep` move
+//!   nothing and only `min(cap, own_durable)` can raise `F`. When the cap does, every copy whose
+//!   durable it passed is reported in [`RetentionFloor::behind`] in that round, since a copy in
+//!   grace has not acked yet and its `known` durable says nothing; when it does not, the round
+//!   is [`RetentionDecision::Held`] with [`RetentionHold::Grace`].
 //! * A secondary passes no copies: its `need` is `min(own_durable, pins)`, and it keeps the same
 //!   window.
 //!
@@ -50,7 +56,8 @@ pub enum RetentionHold {
     /// This node answered an inventory and holds its pin (design §3.5).
     InventoryPinned,
     /// A primary built by `Recovered` or by an install, before every pinned copy has an admitted
-    /// ack and before `history_keep` has passed since the build (design §3.1, m2).
+    /// ack and before `max(history_keep, inventory_pin_millis)` has passed since the build
+    /// (design §3.1, m2; lead ruling R23). The only hold the cap passes.
     Grace,
 }
 
@@ -114,10 +121,33 @@ pub enum RetentionDecision {
 /// `F` for one partition on this node (module docs).
 #[must_use]
 pub fn retention_floor(input: &RetentionInput) -> RetentionDecision {
-    if let Some(hold) = input.hold {
+    let grace = input.hold == Some(RetentionHold::Grace);
+    if let Some(hold) = input.hold.filter(|_| !grace) {
         return RetentionDecision::Held(hold);
     }
     let own = Seq(input.own_durable.0);
+    if grace {
+        let floor = input.prev.max(input.cap.min(own).min(input.applied));
+        if floor == input.prev {
+            return RetentionDecision::Held(RetentionHold::Grace);
+        }
+        return RetentionDecision::Floor(RetentionFloor {
+            floor,
+            behind: input
+                .copies
+                .iter()
+                .flatten()
+                .filter(|(_, durable)| Seq(durable.0) < floor)
+                .map(|entry| entry.0)
+                .collect(),
+            overran_pins: input
+                .transfer_pins
+                .iter()
+                .copied()
+                .filter(|pin| *pin < floor)
+                .collect(),
+        });
+    }
     let (counted, behind): (Vec<_>, Vec<_>) = input
         .copies
         .iter()
@@ -386,7 +416,7 @@ mod tests {
         assert_eq!(floor_of(&secondary).floor, Seq(75));
     }
 
-    /// Every hold trims nothing. Red if a hold is ignored.
+    /// Every hold trims nothing while the cap binds nothing. Red if a hold is ignored.
     #[test]
     fn every_hold_trims_nothing() {
         for hold in [
@@ -401,6 +431,36 @@ mod tests {
             held.hold = Some(hold);
             assert_eq!(retention_floor(&held), RetentionDecision::Held(hold));
         }
+    }
+
+    /// Grace freezes `need` and `keep`, but the cap still raises `F` (lead ruling R23), naming
+    /// every copy and pin it passed in that round. Red if grace stops the cap, or if it lets the
+    /// window move, or if the passed copies are not named.
+    #[test]
+    fn grace_stops_the_window_but_not_the_cap() {
+        let mut grace = input();
+        grace.hold = Some(RetentionHold::Grace);
+        grace.copies = Some(vec![
+            (CopyId(1), DurableSeq(0)),
+            (CopyId(2), DurableSeq(90)),
+        ]);
+        assert_eq!(
+            retention_floor(&grace),
+            RetentionDecision::Held(RetentionHold::Grace),
+            "the window would reach 90; grace holds it"
+        );
+
+        grace.transfer_pins = vec![Seq(50)];
+        grace.cap = Seq(80);
+        assert_eq!(
+            retention_floor(&grace),
+            RetentionDecision::Floor(RetentionFloor {
+                floor: Seq(80),
+                behind: vec![CopyId(1)],
+                overran_pins: vec![Seq(50)],
+            }),
+            "the cap passes copy 1 and the pin, not copy 2"
+        );
     }
 
     /// `cap_seq` finds the lowest seq whose bytes through the head fit, keeps everything that

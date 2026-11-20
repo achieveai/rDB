@@ -328,6 +328,11 @@ pub struct Dispatcher {
     /// inventory it reports. While held the retention duty trims nothing (`InventoryPinned`).
     /// Process memory.
     inventory_pins: BTreeMap<(NodeId, PartitionId), InventoryPin>,
+    /// When each primary a `Recovered` built began its grace (issue #61, design 3.1 m2; lead
+    /// ruling R23): until every other copy its tracker names has an admitted ack, or
+    /// `max(history_keep, inventory_pin_millis)` has passed, the retention duty's window moves
+    /// nothing (`Grace`), though the cap still can. Process memory.
+    grace: BTreeMap<(NodeId, PartitionId), Tick>,
     /// The host's debug-only snapshot hooks, for unit rows only.
     #[cfg(test)]
     snapshot_hooks: SnapshotHooks,
@@ -480,6 +485,7 @@ impl Dispatcher {
             retention_samples: BTreeMap::new(),
             behind_floor: BTreeSet::new(),
             inventory_pins: BTreeMap::new(),
+            grace: BTreeMap::new(),
             #[cfg(test)]
             snapshot_hooks: SnapshotHooks::default(),
             committed: BTreeMap::new(),
@@ -925,6 +931,7 @@ impl Dispatcher {
         self.retention_samples.retain(|(held, _), _| *held != node);
         self.behind_floor.retain(|(held, _, _)| *held != node);
         self.inventory_pins.retain(|(held, _), _| *held != node);
+        self.grace.retain(|(held, _), _| *held != node);
         let to_node: Vec<_> = self
             .snapshot_transfers
             .iter()
@@ -1336,6 +1343,17 @@ impl Dispatcher {
         let effects = self.module_mut(module).step(&ctx, event)?;
         if let EventKind::Kernel(KernelEvent::Recovered(result)) = &event.kind {
             self.align_ladders(node, partition, result.new_generation);
+            // A primary this `Recovered` left in place has heard no copy since it (design 3.1
+            // m2): its window waits for their acks.
+            if self.replication.primary(node, partition).is_some() {
+                self.grace.insert((node, partition), ctx.now);
+                tracing::info!(
+                    node = node.0,
+                    partition = partition.0,
+                    generation = result.new_generation.0,
+                    "history_grace_begun"
+                );
+            }
         }
         // A catch-up with no source after the step and no `CopyCaughtUp` among its effects will
         // never be answered: R1 refused to start it (tester-kb-r1 A4, S2), or its cursor stopped
@@ -3407,8 +3425,9 @@ impl Dispatcher {
     /// * A copy behind the floor is logged `history_copy_behind_floor` once, until it is counted
     ///   again.
     /// * A hold ([`Self::retention_hold`]) trims nothing, logged `history_trim_held{reason}`.
-    ///   An inventory pin is released first when it no longer holds
-    ///   ([`Self::release_inventory_pin`]).
+    ///   An inventory pin and a grace are released first when they no longer hold
+    ///   ([`Self::release_inventory_pin`], [`Self::release_grace`]). Under `Grace` the cap
+    ///   still trims, and the copies it passed are warned behind in that round.
     ///
     /// # Errors
     ///
@@ -3446,6 +3465,12 @@ impl Dispatcher {
             .map_err(|field| SimError::Config { field })?;
         let keep = samples.keep_seq(now, config.keep_millis);
         self.release_inventory_pin(node, partition, now, config.inventory_pin_millis);
+        self.release_grace(
+            node,
+            partition,
+            now,
+            config.keep_millis.max(config.inventory_pin_millis),
+        );
         let copies = self.replication.primary(node, partition).map(|primary| {
             let tracker = primary.tracker();
             tracker
@@ -3528,9 +3553,10 @@ impl Dispatcher {
     ///
     /// * `InventoryPinned`: the node holds an inventory pin on the partition
     ///   ([`Self::inventory_pins`]).
+    /// * `Grace`, last, because the cap passes it and no other: a primary a `Recovered` built is
+    ///   in its grace ([`Self::grace`]). No simulator path builds a primary by an install.
     ///
-    /// Not found here: `Staging` (the memory engine has no staged copy), and `Grace`, which the
-    /// simulator does not keep yet.
+    /// Not found here: `Staging` (the memory engine has no staged copy).
     fn retention_hold(
         &self,
         node: NodeId,
@@ -3562,9 +3588,48 @@ impl Dispatcher {
         if landing {
             return Some(RetentionHold::LandingPending);
         }
-        self.inventory_pins
+        if self.inventory_pins.contains_key(&(node, partition)) {
+            return Some(RetentionHold::InventoryPinned);
+        }
+        self.grace
             .contains_key(&(node, partition))
-            .then_some(RetentionHold::InventoryPinned)
+            .then_some(RetentionHold::Grace)
+    }
+
+    /// End `node`'s grace on `partition` when it no longer holds at `now` (design 3.1 m2; lead
+    /// ruling R23), logged `history_grace_ended{why}`: `acked` once every other copy its
+    /// tracker names has an admitted ack (its last admitted ACK's `received` above 0),
+    /// `expired` after `wait_millis`, `no_primary` when the node no longer holds one.
+    fn release_grace(&mut self, node: NodeId, partition: PartitionId, now: Tick, wait_millis: u64) {
+        let Some(since) = self.grace.get(&(node, partition)).copied() else {
+            return;
+        };
+        let why = match self.replication.primary(node, partition) {
+            None => Some("no_primary"),
+            Some(primary) => {
+                let tracker = primary.tracker();
+                let acked = tracker
+                    .peers()
+                    .filter(|(copy, _)| *copy != tracker.own())
+                    .all(|(_, peer)| peer.progress.received.0 > 0);
+                if acked {
+                    Some("acked")
+                } else if now >= since.plus_millis(wait_millis) {
+                    Some("expired")
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(why) = why {
+            self.grace.remove(&(node, partition));
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                why,
+                "history_grace_ended"
+            );
+        }
     }
 
     /// Release `node`'s inventory pin on `partition` when it no longer holds at `now` (design
@@ -6828,5 +6893,265 @@ mod dormant_twin_tests {
             Ok(floor_at(10))
         );
         assert_eq!(engine_floor(&dispatcher), Seq(10));
+    }
+
+    /// The retention duty's configuration in the grace rows: S3-R5's `history_keep = 0`, no
+    /// cap, and the host's 10-minute pin window, so grace lasts `max(0, 600 000)` ms.
+    const NO_KEEP: super::RetentionConfig = super::RetentionConfig {
+        keep_millis: 0,
+        budget_bytes: u64::MAX,
+        inventory_pin_millis: 600_000,
+    };
+
+    /// A failover onto node 1 (issue #61 S3-R5): its old primary is gone, its engine holds
+    /// generation 1 through [`HEAD`], synced, trimmed to 1, and a `Recovered` at cutoff
+    /// [`HEAD`] whose barrier requires copy 0 alone is stepped through [`Dispatcher::step`] at
+    /// tick 0. So node 1 is a fresh primary that has heard neither secondary: copies 1 and 2
+    /// stand at `known` durable 0, below the floor in force, and would be uncounted.
+    fn failed_over_owner() -> (Dispatcher, DormantSeed) {
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, ModuleName};
+        use rdb_core::contracts::ids::{CorrelationId, EventId};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.replication.forget_node(OWNER);
+        sync_owner(&mut dispatcher, HEAD);
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .trim_history(
+                P,
+                seed.lineage.generation,
+                crate::storage::memory::TrimFloor {
+                    seq: Seq(1),
+                    root_base: Seq::ZERO,
+                    root_digest: Digest::ROOT,
+                },
+            )
+            .expect("a trim");
+        let snapshot = EmptySnapshot::new();
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let ctx = rdb_core::contracts::event::StepCtx {
+            now: Tick(0),
+            ..owner_ctx(&snapshot, &budgets, seed.lineage)
+        };
+        Dispatcher::step(
+            &mut dispatcher,
+            ModuleName::Replication,
+            &ctx,
+            &Event {
+                id: EventId(1),
+                at: Tick(0),
+                node: OWNER,
+                boot: BootId(1),
+                partition: P,
+                correlation: CorrelationId(1),
+                kind: EventKind::Kernel(KernelEvent::Recovered(Box::new(recovered_result(&seed)))),
+            },
+        )
+        .expect("R1 answers its own event");
+        assert!(dispatcher.replication.primary(OWNER, P).is_some(), "built");
+        (dispatcher, seed)
+    }
+
+    /// Copy `copy` (on node `copy + 1`) acks [`HEAD`], durable, to node 1's R1: the frame its
+    /// receiver would send, delivered authenticated.
+    fn copy_acks(dispatcher: &mut Dispatcher, seed: &DormantSeed, copy: u8) {
+        use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, ReplicaProgress};
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, Module};
+        use rdb_core::contracts::ids::{CorrelationId, EventId, MessageId, ReceivedSeq};
+        use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let lineage = seed.lineage;
+        let digest = canonical_history(lineage, ConfigVersion(1), HEAD)
+            .expect("history")
+            .digest(HEAD);
+        let from = NodeId(u32::from(copy) + 1);
+        let frame = Frame {
+            id: MessageId(u32::from(copy)),
+            protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
+            config: ConfigVersion(1),
+            sender: lineage,
+            body: rdb_core::replication::wire::encode_reply(&AppendOutcome::Accepted(AppendAck {
+                partition: P,
+                generation: lineage.generation,
+                owner_epoch: lineage.owner_epoch,
+                config_version: ConfigVersion(1),
+                from,
+                boot: BootId(1),
+                role: ReplicaRole::RegularSecondary,
+                progress: ReplicaProgress {
+                    received: ReceivedSeq(HEAD),
+                    buffered_applied: AppliedSeq(HEAD),
+                    durable: DurableSeq(HEAD),
+                },
+                digest_at_buffered: digest,
+            })),
+        };
+        let snapshot = EmptySnapshot::new();
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let ctx = owner_ctx(&snapshot, &budgets, lineage);
+        dispatcher
+            .replication
+            .step(
+                &ctx,
+                &Event {
+                    id: EventId(100 + u64::from(copy)),
+                    at: Tick(1),
+                    node: OWNER,
+                    boot: BootId(1),
+                    partition: P,
+                    correlation: CorrelationId(100 + u64::from(copy)),
+                    kind: EventKind::Transport(TransportEvent::Delivered {
+                        from: PeerLabel {
+                            node: from,
+                            boot: BootId(1),
+                            authenticated: true,
+                        },
+                        frame,
+                    }),
+                },
+            )
+            .expect("R1 answers the ack");
+        let tracker = dispatcher
+            .replication
+            .primary(OWNER, P)
+            .expect("node 1's primary")
+            .tracker();
+        assert_eq!(
+            tracker.known(CopyId(copy)).map(|known| known.durable),
+            Some(DurableSeq(HEAD)),
+            "copy {copy}'s ack was admitted"
+        );
+    }
+
+    /// The `why` of each `history_grace_ended` logged in `method`.
+    fn grace_ends(method: &str) -> Vec<Option<String>> {
+        logged(method, "history_grace_ended")
+            .iter()
+            .map(|line| line["why"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Issue #61 S3-R5 (design 3.1 m2; lead ruling R23): after a failover with
+    /// `history_keep = 0`, the new primary does not trim past its secondaries before their
+    /// first acks.
+    ///
+    /// **The world.** [`failed_over_owner`]: node 1 at floor 1 and head [`HEAD`], neither
+    /// secondary heard. With keep 0 and no grace, both secondaries are below the floor and
+    /// uncounted, so a round would trim to [`HEAD`].
+    ///
+    /// **Asserted.** The build logs `history_grace_begun`. Rounds hold `Grace` with the engine
+    /// floor at 1, after copy 1's ack too. Once copy 2 acks, the next round ends grace `acked`
+    /// and trims to [`HEAD`], where both now stand.
+    ///
+    /// **Differs.** No simulator path builds a primary by an install, so only the `Recovered`
+    /// half of m2 has a row here.
+    ///
+    /// Cuts: no grace, red (the first round trims to 3); grace released on the first ack
+    /// (`any` for `all`), red (the round after copy 1's ack trims). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r5_a_failed_over_primary_trims_nothing_before_its_secondaries_ack() {
+        const METHOD: &str =
+            "t61_sim_s3_r5_a_failed_over_primary_trims_nothing_before_its_secondaries_ack";
+        let (mut dispatcher, seed) = failed_over_owner();
+        assert_eq!(logged(METHOD, "history_grace_begun").len(), 1);
+        let engine_floor =
+            |dispatcher: &Dispatcher| dispatcher.engines[&OWNER].floor_seq(P, Generation(1));
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), NO_KEEP),
+            Ok(RetentionDecision::Held(RetentionHold::Grace)),
+            "nobody has acked"
+        );
+        copy_acks(&mut dispatcher, &seed, 1);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), NO_KEEP),
+            Ok(RetentionDecision::Held(RetentionHold::Grace)),
+            "copy 2 has not acked"
+        );
+        assert_eq!(engine_floor(&dispatcher), Seq(1), "nothing trimmed");
+        copy_acks(&mut dispatcher, &seed, 2);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(3_000), NO_KEEP),
+            Ok(floor_at(HEAD))
+        );
+        assert_eq!(engine_floor(&dispatcher), Seq(HEAD));
+        assert_eq!(grace_ends(METHOD), vec![Some("acked".to_owned())]);
+    }
+
+    /// Issue #61 S3-R5, grace's time limit (lead ruling R23): with no ack, grace ends once
+    /// `max(history_keep, inventory_pin_millis)` has passed since the build, here
+    /// `max(0, 600 000)`, and not before. Then both unheard secondaries are uncounted, each
+    /// warned `history_copy_behind_floor` once, and the round trims to [`HEAD`].
+    ///
+    /// Cuts: the limit `history_keep` alone (the design's text before R23), red (the first round
+    /// trims); no time release, red (the round at the limit holds). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r5_grace_ends_after_the_longer_of_keep_and_the_pin_window() {
+        const METHOD: &str = "t61_sim_s3_r5_grace_ends_after_the_longer_of_keep_and_the_pin_window";
+        let (mut dispatcher, _seed) = failed_over_owner();
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(599_999), NO_KEEP),
+            Ok(RetentionDecision::Held(RetentionHold::Grace))
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(600_000), NO_KEEP),
+            Ok(RetentionDecision::Floor(RetentionFloor {
+                floor: Seq(HEAD),
+                behind: vec![CopyId(1), CopyId(2)],
+                overran_pins: Vec::new(),
+            }))
+        );
+        assert_eq!(grace_ends(METHOD), vec![Some("expired".to_owned())]);
+        let behind: Vec<_> = logged(METHOD, "history_copy_behind_floor")
+            .iter()
+            .map(|line| line["copy"].as_u64())
+            .collect();
+        assert_eq!(behind, vec![Some(1), Some(2)]);
+    }
+
+    /// Issue #61, lead ruling R23: the byte cap passes grace. While grace holds, a budget that
+    /// fits only the head record raises `F` to [`HEAD`] past both unacked secondaries, and each
+    /// is warned `history_copy_behind_floor` in that round, once. The next round, still in
+    /// grace, holds and warns nothing more.
+    ///
+    /// Cuts: grace stops the cap (the kernel's old hold), red (the capped round holds); the
+    /// passed copies not named, red (no warn). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_the_cap_passes_grace_and_warns_the_unacked_copies_behind() {
+        const METHOD: &str = "t61_sim_the_cap_passes_grace_and_warns_the_unacked_copies_behind";
+        let (mut dispatcher, _seed) = failed_over_owner();
+        let capped = super::RetentionConfig {
+            budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(HEAD)),
+            ..NO_KEEP
+        };
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), capped),
+            Ok(RetentionDecision::Floor(RetentionFloor {
+                floor: Seq(HEAD),
+                behind: vec![CopyId(1), CopyId(2)],
+                overran_pins: Vec::new(),
+            })),
+            "the cap passes both unacked copies"
+        );
+        assert_eq!(
+            dispatcher.engines[&OWNER].floor_seq(P, Generation(1)),
+            Seq(HEAD)
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), capped),
+            Ok(RetentionDecision::Held(RetentionHold::Grace)),
+            "still in grace"
+        );
+        let behind: Vec<_> = logged(METHOD, "history_copy_behind_floor")
+            .iter()
+            .map(|line| line["copy"].as_u64())
+            .collect();
+        assert_eq!(behind, vec![Some(1), Some(2)], "each warned once");
+        assert!(grace_ends(METHOD).is_empty(), "grace never ended");
     }
 }
