@@ -513,18 +513,24 @@ fn need<T: Clone>(value: Option<&T>, name: &str) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
-    run(std::env::args().skip(1), |config| {
-        config_log::init(config)
-            .map(Some)
-            .map_err(|e| e.to_string())
-    })
+    run(
+        std::env::args().skip(1),
+        |config| {
+            config_log::init(config)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        },
+        serve,
+    )
 }
 
-/// `main`, with how logging starts passed in: a row runs this same path under the subscriber
-/// its `#[config_log::retcd_test]` installed, where a second `config_log::init` is refused.
+/// `main`, with how logging starts and how a node process serves passed in: a row runs this
+/// same path under the subscriber its `#[config_log::retcd_test]` installed, where a second
+/// `config_log::init` is refused, and over its own store in place of [`serve`]'s `--control`.
 fn run(
     argv: impl Iterator<Item = String>,
     start_logging: impl FnOnce(config_log::LogConfig) -> Result<Option<config_log::LogGuard>, String>,
+    serve: impl FnOnce(&Args, &tokio::runtime::Runtime) -> Result<Served, String>,
 ) -> ExitCode {
     let args = match parse(argv) {
         Ok(args) => args,
@@ -1793,7 +1799,7 @@ mod tests {
         ]
         .into();
         argv.extend(extra.iter().map(|a| (*a).to_owned()));
-        let code = super::run(argv.into_iter(), |_| Ok(None));
+        let code = super::run(argv.into_iter(), |_| Ok(None), super::serve);
         assert_eq!(code, std::process::ExitCode::from(2), "{extra:?}: exit 2");
         assert!(
             !dir.exists(),
@@ -1971,25 +1977,39 @@ mod tests {
         );
     }
 
-    /// V10 (#81), PR #171 review: `run` maps how the serve ended to the exit code, and a serve
-    /// that asks for a restart exits 75 (`EX_TEMPFAIL`), whichever reason it gave; a stop file
-    /// exits 0 and a failure 1. `run` calls this mapping on every outcome. Unit.
-    /// Cut: map `Restart` to 0; red.
+    /// V10 (#81), PR #171 review: `run`, the node process's whole `main` after logging starts,
+    /// exits 75 (`EX_TEMPFAIL`) when its serve asks for a restart, whichever reason it gave; a
+    /// stop file exits 0 and a failure 1. The row runs `run` itself, with a serve that ends as
+    /// told, so what `run` returns for each outcome is what the process exits with. The serve
+    /// really ending `Restart` is `own81_v10_frozen_returning_node_exits_after_the_sweep`'s.
+    /// Unit (no store, no sockets).
+    /// Cut: `run` returns 0 for a `Restart` serve; red at the first reason.
     #[config_log::retcd_test]
     fn own81_v10_a_restart_wanted_exits_75() {
         use std::process::ExitCode;
+        let run = |ended: Result<Served, String>| {
+            let mut served = 0;
+            let code = super::run(
+                ["--node", "1"].iter().map(|a| (*a).to_owned()),
+                |_| Ok(None),
+                |args, _| {
+                    served += 1;
+                    assert_eq!(args.node, Some(1), "run serves the node it parsed");
+                    ended
+                },
+            );
+            assert_eq!(served, 1, "run served once");
+            code
+        };
         for reason in [RestartReason::ReplaceStopped, RestartReason::HostFaulted] {
             assert_eq!(
-                super::exit_code(Ok(Served::Restart(reason))),
+                run(Ok(Served::Restart(reason))),
                 ExitCode::from(75),
                 "{reason}"
             );
         }
-        assert_eq!(super::exit_code(Ok(Served::Stopped)), ExitCode::SUCCESS);
-        assert_eq!(
-            super::exit_code(Err("a failure".to_owned())),
-            ExitCode::from(1)
-        );
+        assert_eq!(run(Ok(Served::Stopped)), ExitCode::SUCCESS);
+        assert_eq!(run(Err("a failure".to_owned())), ExitCode::from(1));
     }
 
     /// #81 D1 (ADR-0019: off by default): a node process started without `--failover` runs no
@@ -2427,7 +2447,7 @@ mod tests {
         .iter()
         .map(|a| (*a).to_owned())
         .collect();
-        let code = super::run(argv.into_iter(), |_| Ok(None));
+        let code = super::run(argv.into_iter(), |_| Ok(None), super::serve);
         assert_eq!(code, std::process::ExitCode::SUCCESS);
         let control = dir.join(rdb_api::net::certs::CONTROL_DIR);
         let loaded = rdb_api::net::certs::load_control(&control).expect("control/ loads");
