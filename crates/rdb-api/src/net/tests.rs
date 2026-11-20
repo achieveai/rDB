@@ -3094,3 +3094,34 @@ fn a_registration_racing_shutdown_leaves_no_link_up() {
     assert_eq!(id, 0, "the registration is refused");
     no_link_to_2(&net, &mut out);
 }
+
+/// PR #171 review: a link task that panics after its link came up never reaches its own
+/// `close`. `Net::shutdown` still ends the link: it closes every recorded connection, whatever
+/// became of the task that recorded it. The task is a plain spawned task that registers as the
+/// link task does ([`Net::link_up_unsocketed`]) and then panics. Unit (no sockets).
+/// Cut: `shutdown` closes no connection (it only aborts tasks); node 2's route stays `Up`, red.
+#[config_log::retcd_test]
+fn a_link_whose_task_panicked_is_still_closed_by_shutdown() {
+    let (rt, net) = shutdown_rig();
+    let (handed, out) = mpsc::channel();
+    let task = {
+        let net = Arc::clone(&net);
+        rt.spawn(async move {
+            let (_, out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+            handed.send(out).expect("the row holds the stream");
+            panic!("the link task panics after its link came up");
+        })
+    };
+    let joined = rt.block_on(task);
+    assert!(
+        joined.as_ref().is_err_and(|error| error.is_panic()),
+        "{joined:?}"
+    );
+    let mut out = out.recv_timeout(PATIENCE).expect("the link's stream");
+    assert!(
+        matches!(net.states()[&NodeId(2)], LinkState::Up(BootId(22))),
+        "the panicked task's link is still up before the shutdown"
+    );
+    net.shutdown();
+    no_link_to_2(&net, &mut out);
+}
