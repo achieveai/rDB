@@ -376,6 +376,23 @@
 //!                                         i=I at_ms=T ms=M <answer>`: T the wall clock (Unix
 //!                                         ms) it was sent at, M how long its answer took.
 //!                                         Not remembered for `retry`
+//! probe-all <for-ms> <gap-ms> <object>    #80 S3: for for-ms, one thread per partition puts
+//!                                         i = 1, 2, .. to <object> in a group of that
+//!                                         partition, gap-ms apart. Each i keeps one app
+//!                                         request id across its retries, so a resend after a
+//!                                         lost reply is deduplicated, never applied twice; a
+//!                                         refused i is sent again one gap later, until it
+//!                                         lands or the time is up. Each put waits the put
+//!                                         timeout (`--put-timeout-ms`). Then one line per
+//!                                         partition, `probe partition=P group=G ok=N err=E
+//!                                         max_gap_ms=M first_err_at_ms=T first_ok_after_err_at_ms=U
+//!                                         last_ok_i=I owner=O token=K errs=<KIND:n,..>`, and
+//!                                         `probe: P partitions, max_gap_ms=M`. Times are wall
+//!                                         clock Unix ms (`-` when none); a gap is the longest
+//!                                         time with no acknowledged put, from the start, between
+//!                                         acks, and to the end; owner and token are `admin
+//!                                         route`'s at the end. A partition whose last put was
+//!                                         refused fails the command. Not remembered for `retry`
 //! client drop-reply                       the next `put` that applies loses its reply on the
 //!                                         way to the app: it prints the `UNKNOWN_OUTCOME` the
 //!                                         app then holds, with its request, and `status` says
@@ -2057,6 +2074,9 @@ fn repl<'scope, 'env>(
                 })
             }
             ["put-loop", ..] => Err(PUT_LOOP_USAGE.to_owned()),
+            ["probe-all", rest @ ..] => parse_probe_all(rest).map(|(run_for, gap, object)| {
+                bad |= !probe_all(db, run_for, gap, object, deadline);
+            }),
             ["barrier", "--group", group, generation, seq, rest @ ..] => parse_group(group)
                 .and_then(|group| barrier_line(db, group, generation, seq, rest))
                 .map(|ok| bad |= !ok),
@@ -2616,14 +2636,7 @@ fn members_text(
 ) -> String {
     let roles = pinned
         .iter()
-        .map(|(node, role)| {
-            let role = match role {
-                ReplicaRole::Primary => "owner",
-                ReplicaRole::RegularSecondary => "regular",
-                ReplicaRole::Shadow => "shadow",
-            };
-            format!("{}={role}", node.0)
-        })
+        .map(|(node, role)| format!("{}={}", node.0, role_word(*role)))
         .collect::<Vec<_>>()
         .join(" ");
     let pinned: Vec<NodeId> = pinned.iter().map(|(node, _)| *node).collect();
@@ -2973,10 +2986,36 @@ fn log_command(line: &str) {
 /// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
 /// object it writes or reads, when it names one. A line `split_words` refuses names no object.
 fn command_fields(line: &str) -> (&'static str, Option<String>) {
-    const VERBS: [&str; 28] = [
-        "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
-        "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
-        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
+    const VERBS: [&str; 29] = [
+        "put",
+        "put&",
+        "txn",
+        "txn&",
+        "retry",
+        "doc",
+        "map",
+        "set",
+        "members",
+        "list",
+        "items",
+        "get",
+        "read",
+        "status",
+        "nodes",
+        "node",
+        "admin",
+        "control",
+        "links",
+        "link",
+        "wait",
+        "sleep",
+        "quit",
+        "exit",
+        "blob",
+        "client",
+        "put-loop",
+        "barrier",
+        "probe-all",
     ];
     const SUBVERBS: [&str; 28] = [
         "put --as",
@@ -3023,7 +3062,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "put" | "put&" | "get" | "read" | "doc" | "map" | "set" | "members" | "list" | "items" => 1,
         "blob upload" | "blob chunk" | "blob publish" | "blob gc" | "admin damage-chunk"
         | "admin damage" | "admin clear" => 2,
-        "put --as" | "put-loop" | "admin repair-element" => 3,
+        "put --as" | "put-loop" | "admin repair-element" | "probe-all" => 3,
         _ => return (verb, None),
     };
     let object = split_words(line)
@@ -4889,6 +4928,301 @@ fn put_loop(db: &Db, count: u64, gap: Duration, object: &str) -> bool {
     all_ok
 }
 
+const PROBE_ALL_USAGE: &str = "probe-all <for-ms> <gap-ms> <object>";
+
+/// `probe-all`'s run time, gap and object. The time is whole milliseconds above 0.
+fn parse_probe_all<'a>(rest: &[&'a str]) -> Result<(Duration, Duration, &'a str), String> {
+    let [run_for, gap, object] = rest else {
+        return Err(PROBE_ALL_USAGE.to_owned());
+    };
+    let run_for = run_for
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("{PROBE_ALL_USAGE}: for-ms is whole milliseconds above 0"))?;
+    let gap = gap
+        .parse::<u64>()
+        .map_err(|_| format!("{PROBE_ALL_USAGE}: gap-ms is whole milliseconds"))?;
+    Ok((
+        Duration::from_millis(run_for),
+        Duration::from_millis(gap),
+        object,
+    ))
+}
+
+/// The wall clock in Unix ms, as `put-loop`'s `at_ms` reads it.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The app request numbers one `probe-all` run may use: `PROBE_IDS_PER_MILLI` from its start
+/// millisecond, above the numbers `put --as` is given by hand, so a later run in this or another
+/// process never reuses an id an earlier one sent.
+const PROBE_REQUEST_BASE: u64 = 1 << 62;
+const PROBE_IDS_PER_MILLI: u64 = 1 << 20;
+
+/// The first group, counting from 1, whose partition is `partition` out of `partitions`, as
+/// `admin where` computes it. `None` past a million groups, which no real count reaches.
+fn probe_group(partition: PartitionId, partitions: u32) -> Option<rdb_api::AffinityId> {
+    (1..=1_000_000_u64).map(rdb_api::AffinityId).find(|group| {
+        rdb_api::partition_of(rdb_api::affinity_hash(rdb_api::TENANT, *group), partitions)
+            == partition
+    })
+}
+
+/// One partition's `probe-all` count. Times are Unix ms.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProbeTally {
+    ok: u64,
+    err: u64,
+    /// Each refusal's kind, and how many.
+    errs: std::collections::BTreeMap<String, u64>,
+    /// When the last ack came, or the run started.
+    since_ok: u64,
+    max_gap_ms: u64,
+    first_err_at_ms: Option<u64>,
+    first_ok_after_err_at_ms: Option<u64>,
+    last_ok_i: u64,
+    /// Whether the last answer was an ack.
+    last_ok: bool,
+}
+
+impl ProbeTally {
+    fn started(at_ms: u64) -> Self {
+        Self {
+            since_ok: at_ms,
+            ..Self::default()
+        }
+    }
+
+    /// Put `i` was acknowledged at `at_ms`.
+    fn ok(&mut self, i: u64, at_ms: u64) {
+        self.ok += 1;
+        self.max_gap_ms = self.max_gap_ms.max(at_ms.saturating_sub(self.since_ok));
+        self.since_ok = at_ms;
+        self.last_ok_i = self.last_ok_i.max(i);
+        if self.first_err_at_ms.is_some() && self.first_ok_after_err_at_ms.is_none() {
+            self.first_ok_after_err_at_ms = Some(at_ms);
+        }
+        self.last_ok = true;
+    }
+
+    /// A put sent at `sent_ms` was refused with `kind`.
+    fn err(&mut self, kind: &str, sent_ms: u64) {
+        self.err += 1;
+        *self.errs.entry(kind.to_owned()).or_default() += 1;
+        self.first_err_at_ms.get_or_insert(sent_ms);
+        self.last_ok = false;
+    }
+
+    /// The run ended at `end_ms`: the time since the last ack is a gap too.
+    fn finish(&mut self, end_ms: u64) {
+        self.max_gap_ms = self.max_gap_ms.max(end_ms.saturating_sub(self.since_ok));
+    }
+
+    fn line(&self, partition: PartitionId, group: rdb_api::AffinityId, route: &str) -> String {
+        let at = |ms: Option<u64>| ms.map_or_else(|| "-".to_owned(), |ms| ms.to_string());
+        let errs = if self.errs.is_empty() {
+            "-".to_owned()
+        } else {
+            self.errs
+                .iter()
+                .map(|(kind, n)| format!("{kind}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "probe partition={} group={} ok={} err={} max_gap_ms={} first_err_at_ms={} \
+             first_ok_after_err_at_ms={} last_ok_i={} {route} errs={errs}",
+            partition.0,
+            group.0,
+            self.ok,
+            self.err,
+            self.max_gap_ms,
+            at(self.first_err_at_ms),
+            at(self.first_ok_after_err_at_ms),
+            self.last_ok_i,
+        )
+    }
+}
+
+/// `owner=O token=K` from `Db::route`, or `owner=- token=-` when it does not answer.
+fn probe_route(db: &Db, group: rdb_api::AffinityId) -> String {
+    match db.route(group) {
+        Ok(route) => format!("owner={} token={}", route.owner.0, route.token),
+        Err(error) => {
+            tracing::warn!(group = group.0, error = %error, "repl_probe_route_failed");
+            "owner=- token=-".to_owned()
+        }
+    }
+}
+
+/// One `probe-all` put's answer, as [`probe_partition`] counts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeAnswer {
+    /// Acknowledged.
+    Acked,
+    /// Refused with this kind; the value is sent again under the same id.
+    Refused(String),
+    /// Refused with this kind, and the id cannot be sent again: the next value takes a new one.
+    Spent(String),
+}
+
+/// One partition's `probe-all` loop: while `more()`, send value `i` (from 1) under app request
+/// number `n` through `send(n, i)`, then sleep `gap`. An ack moves to the next value and a new
+/// number from `next_id`; a refusal sends the same value under the **same** number again, so a
+/// resend after a lost reply is deduplicated rather than applied twice (#80 S3).
+fn probe_partition(
+    gap: Duration,
+    start_ms: u64,
+    more: &mut dyn FnMut() -> bool,
+    next_id: &dyn Fn() -> u64,
+    send: &mut dyn FnMut(u64, u64) -> ProbeAnswer,
+) -> ProbeTally {
+    let mut tally = ProbeTally::started(start_ms);
+    let mut i = 1_u64;
+    let mut id = None;
+    while more() {
+        let n = *id.get_or_insert_with(next_id);
+        let sent_ms = unix_ms();
+        match send(n, i) {
+            ProbeAnswer::Acked => {
+                tally.ok(i, unix_ms());
+                i += 1;
+                id = None;
+            }
+            ProbeAnswer::Refused(kind) => tally.err(&kind, sent_ms),
+            ProbeAnswer::Spent(kind) => {
+                tally.err(&kind, sent_ms);
+                i += 1;
+                id = None;
+            }
+        }
+        std::thread::sleep(gap);
+    }
+    tally.finish(unix_ms());
+    tally
+}
+
+/// `probe-all`'s send of value `i` under app request number `n`: a one-put `txn_as` in `group`,
+/// waiting `put_timeout`. `REQUEST_ID_REUSE` means an earlier send of this id applied, since
+/// nothing else sends it, which `status` is asked to confirm: resolved is an ack, anything else
+/// spends the id.
+fn probe_send(
+    db: &Db,
+    partition: PartitionId,
+    group: rdb_api::AffinityId,
+    object: &str,
+    put_timeout: Duration,
+    n: u64,
+    i: u64,
+) -> ProbeAnswer {
+    let request = rdb_api::app_request_id(n).expect("probe ids are below 2^63");
+    let value = i.to_string();
+    let answer = db.txn_as(
+        request,
+        &[TxnPut {
+            group,
+            object: object.as_bytes(),
+            value: value.as_bytes(),
+            if_version: None,
+        }],
+        put_timeout,
+    );
+    let refused = match answer {
+        Ok(_) => return ProbeAnswer::Acked,
+        Err(refused) => refused.error,
+    };
+    tracing::info!(partition = partition.0, i, request = request.0, kind = %refused.name(), "repl_probe_refused");
+    if refused.kind != rdb_core::contracts::errors::ErrorKind::RequestIdReuse {
+        return ProbeAnswer::Refused(refused.name());
+    }
+    let status = db.status_in(group, request, None);
+    tracing::info!(partition = partition.0, i, status = ?status, "repl_probe_reuse_status");
+    if matches!(status, Ok(TxnStatus::Resolved(_))) {
+        ProbeAnswer::Acked
+    } else {
+        ProbeAnswer::Spent(refused.name())
+    }
+}
+
+/// `probe-all` (#80 S3): one thread per partition runs [`probe_partition`] for `run_for`, with
+/// [`probe_send`]. Logged as `repl_probe{partition, group, ok, err, max_gap_ms, last_ok_i}`.
+/// False when any partition's last answer was a refusal.
+fn probe_all(
+    db: &Db,
+    run_for: Duration,
+    gap: Duration,
+    object: &str,
+    put_timeout: Duration,
+) -> bool {
+    let partitions = db.partition_count();
+    let start_ms = unix_ms();
+    let ids =
+        std::sync::atomic::AtomicU64::new(PROBE_REQUEST_BASE + start_ms * PROBE_IDS_PER_MILLI);
+    let started = Instant::now();
+    // Each thread hands back its tally; the lines and logs come from this thread, in partition
+    // order, so they land in the caller's log span.
+    let tallies: Vec<(PartitionId, Option<(rdb_api::AffinityId, ProbeTally)>)> =
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (1..=partitions)
+                .map(PartitionId)
+                .map(|partition| {
+                    let ids = &ids;
+                    scope.spawn(move || {
+                        let group = probe_group(partition, partitions)?;
+                        let tally = probe_partition(
+                            gap,
+                            start_ms,
+                            &mut || started.elapsed() < run_for,
+                            &|| ids.fetch_add(1, Ordering::SeqCst),
+                            &mut |n, i| probe_send(db, partition, group, object, put_timeout, n, i),
+                        );
+                        Some((group, tally))
+                    })
+                })
+                .collect();
+            (1..=partitions)
+                .map(PartitionId)
+                .zip(tasks)
+                .map(|(partition, task)| (partition, task.join().expect("a probe thread panicked")))
+                .collect()
+        });
+    let mut all_ok = true;
+    let mut max_gap_ms = 0;
+    for (partition, probed) in &tallies {
+        let Some((group, tally)) = probed else {
+            tracing::error!(partition = partition.0, "repl_probe_no_group");
+            say(&format!(
+                "probe partition={} err: no group maps to it",
+                partition.0
+            ));
+            all_ok = false;
+            continue;
+        };
+        tracing::info!(
+            partition = partition.0,
+            group = group.0,
+            ok = tally.ok,
+            err = tally.err,
+            max_gap_ms = tally.max_gap_ms,
+            last_ok_i = tally.last_ok_i,
+            "repl_probe"
+        );
+        say(&tally.line(*partition, *group, &probe_route(db, *group)));
+        all_ok &= tally.last_ok;
+        max_gap_ms = max_gap_ms.max(tally.max_gap_ms);
+    }
+    say(&format!(
+        "probe: {partitions} partitions, max_gap_ms={max_gap_ms}"
+    ));
+    all_ok
+}
+
 /// [`put_line`] with `label` before the answer, as `chunk 0 ok ...`.
 fn labelled_put_line(
     db: &Db,
@@ -5357,7 +5691,36 @@ fn partition_body(body: &[u8]) -> Option<String> {
             )
         },
     );
-    Some(format!("{record:?} root={root}"))
+    Some(format!(
+        "{record:?} root={root} members={}",
+        members_suffix(body)
+    ))
+}
+
+/// `admin status`'s and `control`'s ` members=` suffix on a `partitions/` line (#80 S3): each
+/// node the record pins, in slot order, as `[node:role,..]` with the role `owner`, `regular` or
+/// `shadow`, so a script can see RF3 restored. `-` for a body that names no members (layout 3
+/// and older). It ends the line, so a row that reads a prefix keeps passing.
+fn members_suffix(body: &[u8]) -> String {
+    rdb_core::authority::partition::RecordMember::decode_all(body).map_or_else(
+        || "-".to_owned(),
+        |members| {
+            let listed: Vec<String> = members
+                .iter()
+                .map(|member| format!("{}:{}", member.node.0, role_word(member.role)))
+                .collect();
+            format!("[{}]", listed.join(","))
+        },
+    )
+}
+
+/// A pinned role as the members lines say it.
+const fn role_word(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Primary => "owner",
+        ReplicaRole::RegularSecondary => "regular",
+        ReplicaRole::Shadow => "shadow",
+    }
 }
 
 /// `admin clear-grant`'s error as one line, with its retry rule and mutation proof as a `put`
@@ -8485,7 +8848,8 @@ mod tests {
     /// `PartitionRoot` (base, owner boot, instance, run), and `control` printed the record's
     /// Debug only, so a walk could not see which instance or base a heal wrote. It now ends
     /// `root={..}`, or `root=-` for a layout-2 body. Cut: drop the root and the first assert is
-    /// red. Unit.
+    /// red. Unit. #80 S3 moved the line's end on purpose: ` members=..` now follows the root
+    /// (`s80s3_a_partition_line_ends_with_the_members_it_pins`), `-` for these bodies.
     #[test]
     fn control_prints_the_partition_root() {
         use rdb_core::contracts::digest::Digest;
@@ -8510,7 +8874,7 @@ mod tests {
         assert!(
             rooted.ends_with(&format!(
                 "root={{mode=Committed owner_boot=5 base=7 base_digest={} predecessor=6@2 \
-                 instance={} run=42}}",
+                 instance={} run=42}} members=-",
                 "ab".repeat(32),
                 "11".repeat(16)
             )),
@@ -8518,8 +8882,252 @@ mod tests {
         );
         assert!(rooted.starts_with("PartitionRecord {"), "{rooted}");
         let plain = partition_body(&record.encode()).expect("decodes");
-        assert!(plain.ends_with(" root=-"), "{plain}");
+        assert!(plain.ends_with(" root=- members=-"), "{plain}");
         assert_eq!(partition_body(b"\x09junk"), None);
+    }
+
+    /// #80 S3 P1: a `partitions/` line, as `admin status` and `control` print it, ends
+    /// ` members=[node:role,..]`, the members the record pins in slot order, so the Docker
+    /// script can see RF3 restored on every partition; `members=-` for a body that names none.
+    /// Cut: `members_suffix` answers `-` always, and the first assert is red, observed
+    /// 2026-11-19. Unit.
+    #[test]
+    fn s80s3_a_partition_line_ends_with_the_members_it_pins() {
+        use rdb_core::authority::partition::{PartitionRoot, RecordMember, RecordMode};
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{Revision, Seq};
+        use rdb_core::contracts::membership::CopyId;
+        let record = PartitionRecord {
+            partition: PartitionId(4),
+            owner: NodeId(5),
+            generation: Generation(2),
+            ..PartitionRecord::default()
+        };
+        let root = PartitionRoot {
+            mode: RecordMode::Committed,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest([0; 32]),
+            predecessor_generation: Generation(1),
+            predecessor_cutoff: Seq(6),
+            instance: [0x11; 16],
+            run: Revision(42),
+        };
+        let member = |copy: u8, node: u32, role: ReplicaRole| RecordMember {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            role,
+        };
+        let members = [
+            member(1, 5, ReplicaRole::Primary),
+            member(2, 1, ReplicaRole::RegularSecondary),
+            member(3, 2, ReplicaRole::RegularSecondary),
+            member(4, 6, ReplicaRole::Shadow),
+        ];
+        let line = partition_body(&record.encode_with_members(&root, &members, None, None))
+            .expect("decodes");
+        assert!(
+            line.ends_with(" members=[5:owner,1:regular,2:regular,6:shadow]"),
+            "{line}"
+        );
+        let plain = partition_body(&record.encode()).expect("decodes");
+        assert!(plain.ends_with(" members=-"), "{plain}");
+    }
+
+    /// #80 S3 P1, the scenario: on a database of 4 partitions, `probe-all 1500 100 pr` puts to
+    /// every partition from its own thread, and each partition's `repl_probe` line counts acks
+    /// and no refusal, with `last_ok_i` at its ack count; then a `get` of the object in each
+    /// probe group answers (a refused one exits 1), and the run exits 0. Cut: `probe_all` skips
+    /// partition 1 (`.skip(1)` on its partitions), and three lines come back, not four: red,
+    /// observed 2026-11-19. Integration (~10 s): three real rEtcd voters and an open.
+    #[config_log::retcd_test]
+    fn s80s3_probe_all_writes_every_partition() {
+        const METHOD: &str = "s80s3_probe_all_writes_every_partition";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let mut script = String::from("wait ready 60\nprobe-all 1500 100 pr\n");
+        for p in 1..=4 {
+            let group = probe_group(PartitionId(p), 4).expect("a group");
+            script.push_str(&format!("get --group {} pr\n", group.0));
+        }
+        let path = root.path().join("script.txt");
+        std::fs::write(&path, &script).expect("write the script");
+        let args = Args {
+            dir: root.path().join("run"),
+            log_dir: root.path().join("logs"),
+            script: Some(path),
+            partitions: Some(4),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let code = run(&args, Db::open);
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let probes: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "repl_probe")
+            .collect();
+        assert_eq!(probes.len(), 4, "{probes:#?}");
+        let mut partitions: Vec<u64> = probes
+            .iter()
+            .map(|line| line["partition"].as_u64().expect("partition"))
+            .collect();
+        partitions.sort_unstable();
+        assert_eq!(partitions, [1, 2, 3, 4]);
+        for line in &probes {
+            let ok = line["ok"].as_u64().expect("ok");
+            assert!(ok > 0, "{line}");
+            assert_eq!(line["err"].as_u64(), Some(0), "{line}");
+            assert_eq!(line["last_ok_i"].as_u64(), Some(ok), "{line}");
+        }
+        assert_eq!(code, ExitCode::SUCCESS, "{script}");
+    }
+
+    /// #80 S3 P1: `probe-all <for-ms> <gap-ms> <object>` reads its three words, and refuses
+    /// a missing or extra word, a time that is not whole milliseconds, and a run of 0 ms, each
+    /// with its usage. Cut: drop the `> 0` filter and the `0` row is red, observed 2026-11-19.
+    /// Unit.
+    #[test]
+    fn s80s3_probe_all_reads_its_words_and_refuses_the_rest() {
+        assert_eq!(
+            parse_probe_all(&["45000", "200", "s3-run"]),
+            Ok((
+                Duration::from_millis(45_000),
+                Duration::from_millis(200),
+                "s3-run"
+            ))
+        );
+        assert_eq!(
+            parse_probe_all(&["10", "0", "o"]),
+            Ok((Duration::from_millis(10), Duration::ZERO, "o"))
+        );
+        let usage = PROBE_ALL_USAGE.to_owned();
+        let for_ms = format!("{PROBE_ALL_USAGE}: for-ms is whole milliseconds above 0");
+        let gap_ms = format!("{PROBE_ALL_USAGE}: gap-ms is whole milliseconds");
+        for (words, said) in [
+            (&[][..], &usage),
+            (&["1000", "200"][..], &usage),
+            (&["1000", "200", "o", "x"][..], &usage),
+            (&["0", "200", "o"][..], &for_ms),
+            (&["1s", "200", "o"][..], &for_ms),
+            (&["-5", "200", "o"][..], &for_ms),
+            (&["1000", "0.5", "o"][..], &gap_ms),
+        ] {
+            assert_eq!(parse_probe_all(words).as_ref(), Err(said), "{words:?}");
+        }
+        assert_eq!(
+            command_fields("probe-all 1000 200 o"),
+            ("probe-all", Some("o".to_owned()))
+        );
+    }
+
+    /// #80 S3 P1, the probe's own contract: a refused value is sent again under the **same**
+    /// app request number until it is acknowledged, so a resend after `UNKNOWN_OUTCOME` is
+    /// deduplicated, never applied as a second write; an ack takes a new number for the next
+    /// value; a spent id (`REQUEST_ID_REUSE` not resolved) moves on to a new number. The tally
+    /// counts each kind, the first refusal and the first ack after it, and `last_ok_i`.
+    /// Cut: in `probe_partition`, set `id = None` after a refusal too, so every send takes a fresh
+    /// number, and the retries' numbers differ: red, observed 2026-11-19. Unit.
+    #[test]
+    fn s80s3_probe_all_keeps_one_request_id_across_a_values_retries() {
+        let issued = std::cell::Cell::new(100_u64);
+        let next_id = || {
+            let n = issued.get();
+            issued.set(n + 1);
+            n
+        };
+        let answers = [
+            ProbeAnswer::Acked,
+            ProbeAnswer::Refused("UNKNOWN_OUTCOME".to_owned()),
+            ProbeAnswer::Refused("UNAVAILABLE".to_owned()),
+            ProbeAnswer::Acked,
+            ProbeAnswer::Spent("REQUEST_ID_REUSE".to_owned()),
+            ProbeAnswer::Acked,
+        ];
+        let mut sends: Vec<(u64, u64)> = Vec::new();
+        let mut left = answers.len();
+        let tally = probe_partition(
+            Duration::ZERO,
+            unix_ms(),
+            &mut || {
+                let go = left > 0;
+                left = left.saturating_sub(1);
+                go
+            },
+            &next_id,
+            &mut |n, i| {
+                sends.push((n, i));
+                answers[sends.len() - 1].clone()
+            },
+        );
+        assert_eq!(
+            sends,
+            [(100, 1), (101, 2), (101, 2), (101, 2), (102, 3), (103, 4)],
+            "a value keeps its number across retries; an ack or a spent id takes the next"
+        );
+        assert_eq!((tally.ok, tally.err, tally.last_ok_i), (3, 3, 4));
+        assert_eq!(
+            tally
+                .errs
+                .iter()
+                .map(|(k, n)| (k.as_str(), *n))
+                .collect::<Vec<_>>(),
+            [
+                ("REQUEST_ID_REUSE", 1),
+                ("UNAVAILABLE", 1),
+                ("UNKNOWN_OUTCOME", 1)
+            ]
+        );
+        assert!(tally.first_err_at_ms.is_some() && tally.first_ok_after_err_at_ms.is_some());
+        assert!(tally.last_ok, "the last answer was an ack");
+    }
+
+    /// #80 S3 P1: the probe's numbers. A gap is the longest time with no ack: from the start,
+    /// between acks, and to the end, so a partition that stops answering near the end still
+    /// shows its gap. The first refusal and the first ack after it are kept, and a later
+    /// refusal moves neither. Cut: `finish` leaves out the time to the end, and the second
+    /// `max_gap_ms` is red, observed 2026-11-19. Unit.
+    #[test]
+    fn s80s3_probe_tally_measures_gaps_and_the_first_recovery() {
+        let mut tally = ProbeTally::started(1_000);
+        tally.ok(1, 1_200);
+        tally.err("UNAVAILABLE", 1_400);
+        tally.err("UNAVAILABLE", 1_600);
+        tally.ok(2, 4_200);
+        tally.err("NOT_PRIMARY", 4_400);
+        tally.ok(3, 4_600);
+        tally.finish(4_700);
+        assert_eq!(tally.max_gap_ms, 3_000, "1_200 to 4_200");
+        assert_eq!(
+            tally.line(PartitionId(3), rdb_api::AffinityId(7), "owner=2 token=1.1"),
+            "probe partition=3 group=7 ok=3 err=3 max_gap_ms=3000 first_err_at_ms=1400 \
+             first_ok_after_err_at_ms=4200 last_ok_i=3 owner=2 token=1.1 \
+             errs=NOT_PRIMARY:1,UNAVAILABLE:2"
+        );
+        let mut silent = ProbeTally::started(1_000);
+        silent.ok(1, 1_100);
+        silent.finish(9_100);
+        assert_eq!(
+            silent.max_gap_ms, 8_000,
+            "the time after the last ack is a gap"
+        );
+        assert_eq!(
+            silent.line(PartitionId(1), rdb_api::AffinityId(1), "owner=- token=-"),
+            "probe partition=1 group=1 ok=1 err=0 max_gap_ms=8000 first_err_at_ms=- \
+             first_ok_after_err_at_ms=- last_ok_i=1 owner=- token=- errs=-"
+        );
+        for partitions in [1, 3, 16] {
+            for p in 1..=partitions {
+                let group = probe_group(PartitionId(p), partitions).expect("a group");
+                assert_eq!(
+                    rdb_api::partition_of(
+                        rdb_api::affinity_hash(rdb_api::TENANT, group),
+                        partitions
+                    ),
+                    PartitionId(p)
+                );
+            }
+        }
     }
 
     /// Lead ruling on dev-a item 3 (`promote_hint` named a node with no copy): with the owner
