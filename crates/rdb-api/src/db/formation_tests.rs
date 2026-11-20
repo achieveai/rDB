@@ -4241,6 +4241,11 @@ impl Fence {
         self.dir.0.join(APP_ADDR_PENDING_FILE).exists()
     }
 
+    /// How many `nodes/` puts reached the store so far.
+    fn node_puts(&self) -> usize {
+        self.store.marked.lock().expect("marked").len()
+    }
+
     /// Whether every scripted put found the marker on disk when it arrived.
     fn marker_before_every_put(&self) -> bool {
         let marked = self.store.marked.lock().expect("marked");
@@ -4666,6 +4671,48 @@ fn own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses() {
     fence.open(A).expect("readable: the open goes on");
     assert!(fence.record().1 > before, "it fenced");
     assert!(!fence.marked(), "and resolved the marker");
+}
+
+/// own83_b2_12 (#83 B2, PR #159 review r3, T47): the marker cannot be staged while an earlier
+/// marker already says B may apply. With B pending, `app-addr-pending.new` is a folder, so
+/// staging the next marker fails: the open with A is refused twice, before any host starts,
+/// with no `nodes/` put sent, the marker and the record as they were. The folder removed, the
+/// open with A fences, and the late B is refused. Cut: a staging failure ignored (the put sent
+/// without a fresh marker), red at "refused". Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_12_a_marker_that_cannot_be_staged_refuses_until_it_can() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let marker = fence.dir.0.join(APP_ADDR_PENDING_FILE);
+    let staged = fence.dir.0.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    let held = std::fs::read(&marker).expect("the marker B left");
+    std::fs::create_dir(&staged).expect("a folder where the staged file goes");
+    let puts = fence.node_puts();
+    for attempt in 1..=2 {
+        let refused = fence
+            .open(A)
+            .expect_err("refused: the marker cannot be staged");
+        assert!(
+            matches!(refused, OpenError::Io(_)),
+            "{attempt}: {refused:?}"
+        );
+        assert_eq!(fence.node_puts(), puts, "{attempt}: no put sent");
+        assert_eq!(
+            std::fs::read(&marker).expect("the marker is kept"),
+            held,
+            "{attempt}: the marker as it was"
+        );
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: the record as it was"
+        );
+    }
+    std::fs::remove_dir(&staged).expect("the folder is removed");
+    fence
+        .open(A)
+        .expect("stageable again: the open with A fences");
+    late_b_is_refused(&fence, A, r);
 }
 
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
