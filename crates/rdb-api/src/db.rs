@@ -3633,6 +3633,20 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        match self.compile(identity, puts, deadline)? {
+            Some(request) => self.send_compiled(identity, request, wait).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The compile half of [`Self::compile_and_send`]: `puts` compiled at the owner under
+    /// `identity`, and nothing sent. `Ok(None)` when they change nothing.
+    fn compile(
+        &self,
+        identity: RequestIdentity,
+        puts: Vec<PutOp>,
+        deadline: Duration,
+    ) -> Result<Option<TxnRequest>, PutError> {
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
         if let Some(error) = write_refusal(&puts, identity) {
@@ -3666,17 +3680,7 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(partition, call, self.timeouts.put) {
-            Some(Answer::Compiled(mut request)) => {
-                // The ack floor rides the first send and every resend of it unchanged; it is
-                // not part of the request's digest (A-R252). Only this `Db`'s own write ids
-                // in flight carry one.
-                let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
-                if let Some(carried) = carried {
-                    request.acked_below = Some(carried.acked_below);
-                    request.pinned = carried.pinned;
-                }
-                self.send(ClientCall::Resend { request }, wait).map(Some)
-            }
+            Some(Answer::Compiled(request)) => Ok(Some(request)),
             Some(Answer::Unchanged) => Ok(None),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
@@ -3690,6 +3694,23 @@ impl Db {
                 ),
             )),
         }
+    }
+
+    /// The send half of [`Self::compile_and_send`]: `request`, compiled under `identity`.
+    fn send_compiled(
+        &self,
+        identity: RequestIdentity,
+        mut request: TxnRequest,
+        wait: Duration,
+    ) -> Result<PutOk, PutError> {
+        // The ack floor rides the first send and every resend of it unchanged; it is not part
+        // of the request's digest (A-R252). Only this `Db`'s own write ids in flight carry one.
+        let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
+        if let Some(carried) = carried {
+            request.acked_below = Some(carried.acked_below);
+            request.pinned = carried.pinned;
+        }
+        self.send(ClientCall::Resend { request }, wait)
     }
 
     /// Send `request` again, unchanged: same identity, same payload.
@@ -4109,20 +4130,9 @@ impl Db {
                 if matches!(listed.root, Some((_, ObjectKind::Document))) {
                     continue;
                 }
-                let mut emptied = false;
-                loop {
-                    let put = PutOp {
-                        group,
-                        object: Bytes::copy_from_slice(&listed.id),
-                        change: Change::Delete,
-                        expect: None,
-                    };
-                    match self.changes(vec![put], deadline) {
-                        Ok(Some(_)) => emptied = true,
-                        Ok(None) => break,
-                        Err(error) => return Err(stop(deleted, error)),
-                    }
-                }
+                let emptied = self
+                    .drain(group, &listed.id, None, deadline)
+                    .map_err(|error| stop(deleted, error))?;
                 deleted += u64::from(emptied);
             }
             match objects.last() {
@@ -4132,8 +4142,11 @@ impl Db {
         }
     }
 
-    /// Delete documents `docs`, each at its listed version, up to [`MAX_OPS`] to a transaction,
-    /// counting each transaction's documents into `deleted` once it is answered.
+    /// Delete documents `docs`, each at its listed version, counting each into `deleted` once
+    /// its root is gone (PR #178 review r1, T1 and T2). A pack of up to [`MAX_OPS`] documents is
+    /// compiled first and sent only when it fits one request and deletes every root in it;
+    /// otherwise it is halved. A document that does not fit alone (more records under it than
+    /// one request carries, such as a 255-chunk upload) is drained a batch at a time.
     fn delete_docs(
         &self,
         group: AffinityId,
@@ -4141,21 +4154,99 @@ impl Db {
         deadline: Duration,
         deleted: &mut u64,
     ) -> Result<(), PutError> {
-        for batch in docs.chunks(MAX_OPS) {
-            let puts = batch
-                .iter()
-                .map(|(id, version)| PutOp {
-                    group,
-                    object: Bytes::copy_from_slice(id),
-                    change: Change::Delete,
-                    expect: Some(Expected::Version(*version)),
-                })
-                .collect();
-            if self.changes(puts, deadline)?.is_some() {
-                *deleted += batch.len() as u64;
+        let mut rest = docs;
+        let mut take = MAX_OPS;
+        while !rest.is_empty() {
+            take = take.min(rest.len());
+            let pack = &rest[..take];
+            match self.delete_pack(group, pack, deadline)? {
+                Some(answer) => {
+                    if answer.is_some() {
+                        *deleted += pack.len() as u64;
+                    }
+                    rest = &rest[take..];
+                    take = MAX_OPS;
+                }
+                None if take > 1 => take /= 2,
+                None => {
+                    let (id, version) = pack[0];
+                    *deleted += u64::from(self.drain(group, id, Some(version), deadline)?);
+                    rest = &rest[1..];
+                }
             }
         }
         Ok(())
+    }
+
+    /// Compile the deletes of documents `pack`, each at its listed version, under one fresh
+    /// write id, and send them only when they fit one request ([`MAX_OPS`] mutations) and delete
+    /// every root in it. `Ok(None)`: they do not, and nothing was sent.
+    fn delete_pack(
+        &self,
+        group: AffinityId,
+        pack: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+    ) -> Result<Option<Option<PutOk>>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let puts = pack
+            .iter()
+            .map(|(id, version)| PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: Some(Expected::Version(*version)),
+            })
+            .collect();
+        let answer = match self.compile(identity, puts, deadline) {
+            Ok(Some(request)) => {
+                let deletes_root = |id: &[u8]| {
+                    let root = rdb_value::keys::root_key(TENANT, group, id).to_bytes();
+                    request.mutations.iter().any(
+                        |mutation| matches!(mutation, rdb_core::contracts::txn::Mutation::Delete { key, .. } if *key == root),
+                    )
+                };
+                if request.mutations.len() <= MAX_OPS && pack.iter().all(|(id, _)| deletes_root(id))
+                {
+                    self.send_compiled(identity, request, send_wait(deadline))
+                        .map(|ok| Some(Some(ok)))
+                } else {
+                    Ok(None)
+                }
+            }
+            Ok(None) => Ok(Some(None)),
+            Err(error) => Err(error),
+        };
+        self.finished(identity.request, answer)
+    }
+
+    /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch at
+    /// root version `version` when given. Whether any batch deleted something.
+    fn drain(
+        &self,
+        group: AffinityId,
+        id: &[u8],
+        version: Option<u64>,
+        deadline: Duration,
+    ) -> Result<bool, PutError> {
+        let mut emptied = false;
+        loop {
+            let put = PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: version.map(Expected::Version),
+            };
+            match self.changes(vec![put], deadline)? {
+                Some(_) => emptied = true,
+                None => return Ok(emptied),
+            }
+        }
     }
 
     /// Compile and send `puts` as one transaction under a fresh write id, with kernel deadline

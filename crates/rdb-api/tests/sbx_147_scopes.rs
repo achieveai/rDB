@@ -637,3 +637,78 @@ fn sbx_147_n_real_hash_spreads_a_scopes_groups() {
         }
     });
 }
+
+/// Shut `w` down and read every record of scope `scope`'s workspace `group` left in the store,
+/// as row g does: the engine's own range read, not a list.
+fn left_after(w: World, scope: &Scope, group: u64) -> Vec<Bytes> {
+    let partition = w.on(async { w.async_db.route(PIN).await.expect("route").partition });
+    let generation = w.db.list_in(PIN, &scope.prefix(group), None, 1).expect("list").generation;
+    let World {
+        db,
+        async_db,
+        rt,
+        path,
+        _dir,
+    } = w;
+    drop(async_db);
+    let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("a handle is still alive"));
+    drop(db);
+    let left = stored_under(&path, partition, generation, &raw_prefix(scope, group));
+    drop(rt);
+    left
+}
+
+/// Write `chunks` one-byte upload chunks under document `id` of scope `c`, workspace 0.
+async fn chunked_doc(c: &ScopedDb, id: &[u8], chunks: u32) {
+    c.put(0, b(id), b(b"doc"), None).await.expect("the document");
+    for index in 0..chunks {
+        let chunk = Change::Chunk {
+            upload: [7; 16],
+            index,
+            bytes: b(b"x"),
+        };
+        c.write(0, b(id), chunk, None).await.expect("a chunk");
+    }
+}
+
+/// PR #178 review r1 T1: a document with 255 upload chunks is one more record than a request
+/// deletes, so its first batch keeps the root and a chunk. Delete prefix drains it, counts it
+/// once, and leaves nothing. Cut: count a document deleted after one batch (send each pack as
+/// compiled, without the root check): red, the root and a chunk survive.
+#[config_log::retcd_test]
+fn sbx_147_o_delete_prefix_drains_a_document_with_255_chunks() {
+    let w = world(true);
+    let [_, _, c, _] = w.pinned();
+    let deleted = w.on(async {
+        chunked_doc(&c, b"big", 255).await;
+        c.delete_prefix(0, Bytes::new(), DEADLINE)
+            .await
+            .unwrap_or_else(|e| panic!("delete_prefix: {} after {}", e.error, e.deleted))
+    });
+    drop(c);
+    let [_, _, scope_c, _] = scopes();
+    let left = left_after(w, &scope_c, 0);
+    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert_eq!(deleted, 1, "one document");
+}
+
+/// PR #178 review r1 T2: two documents with 128 chunks each are 258 deletes, over the 255 a
+/// request carries, so they cannot go in one transaction. Delete prefix splits them by cost and
+/// counts both. Cut: send each pack of documents as compiled: red, admission refuses it.
+#[config_log::retcd_test]
+fn sbx_147_p_delete_prefix_splits_documents_by_their_cost() {
+    let w = world(true);
+    let [_, _, c, _] = w.pinned();
+    let deleted = w.on(async {
+        chunked_doc(&c, b"one", 128).await;
+        chunked_doc(&c, b"two", 128).await;
+        c.delete_prefix(0, Bytes::new(), DEADLINE)
+            .await
+            .unwrap_or_else(|e| panic!("delete_prefix: {} after {}", e.error, e.deleted))
+    });
+    drop(c);
+    let [_, _, scope_c, _] = scopes();
+    let left = left_after(w, &scope_c, 0);
+    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert_eq!(deleted, 2, "two documents");
+}
