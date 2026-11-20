@@ -13482,7 +13482,7 @@ impl Host {
         if !self.engine.generations(partition).contains(&to)
             || self.engine.staging(partition, to) == Some((hit.from, hit.head))
         {
-            // Check B at adoption (#121, ADR-rdb-0021 amendment): a link or a resume puts the
+            // Check B at adoption (#121, ADR-rdb-0026): a link or a resume puts the
             // anchor's generation onto the tail's lineage, so that lineage must reach seq 1, as
             // landing and the inventory link require. Neither reason is in
             // `ADOPTION_REFUSALS`, a wire vocabulary: `TailAdoption::of` holds the tail

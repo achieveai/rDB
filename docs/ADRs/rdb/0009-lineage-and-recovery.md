@@ -455,7 +455,7 @@ is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logge
 runs whatever the #107 live re-add switch says. Since issue #121, adoption runs it too, before an
 `Adopt::Link` or an `Adopt::Resume` links the anchor's generation onto a tail's lineage
 (`tail_has_no_floor`, `tail_history_read_failed`); the tail is then held `Unchecked`. See
-ADR-rdb-0021's 2026-11-19 amendment.
+[ADR-rdb-0026](0026-check-b-at-adoption.md), which supersedes ADR-rdb-0021 decision 7.
 
 **Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
 receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default)

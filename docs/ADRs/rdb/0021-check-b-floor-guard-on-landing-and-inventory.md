@@ -8,6 +8,8 @@
 **Extends:** [ADR-rdb-0010](0010-generation-inheritance.md) decision 8 (its two callers, landing and
 the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without editing it.
 **Issue:** #107 slice 1.
+**Amended by:** [ADR-rdb-0026](0026-check-b-at-adoption.md), which supersedes decision 7: adoption
+runs check B too (issue #121).
 
 ## Context
 
@@ -52,7 +54,7 @@ the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without 
 - A transient `History` read fault refuses a link that would otherwise have passed. That costs a
   retry, not a wrong link.
 - Check B depends on seq 1 being kept. A history trim (#61) must revisit this ADR.
-- Adoption can still take a holed lineage until #121 lands. (Closed by the 2026-11-19 amendment.)
+- Adoption can still take a holed lineage until #121 lands.
 
 ## Verification
 
@@ -68,50 +70,6 @@ Rows in `crates/rdb-api/src/host/catchup_tests.rs`:
 - `issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing`: the inventory refuses
   `missed_generation_history_read_failed`, logs `missed_generation_floor_read_failed`, and writes
   nothing.
-
-## Amendment 2026-11-19: check B at adoption (issue #121; proposed on its PR, for the reviewer)
-
-Decision 7 is replaced. Adoption runs check B too.
-
-1. **Where.** `Host::adoption`, in the shapes that link the anchor's generation onto the tail's
-   lineage: `Adopt::Link` and `Adopt::Resume`. It runs after the proofs P1 to P3 and before
-   `Host::link_preconditions`, so before anything is written. `Adopt::Replay` does not run it:
-   replay appends records above the base onto the anchor's own lineage, and links nothing onto
-   the tail's.
-2. **Reasons.** A holed tail lineage is `tail_has_no_floor`. A seq 1 read that fails is
-   `tail_history_read_failed`, and `adopt_floor_read_failed` logs the fault at error first. The
-   same proofs run in two places, which report differently:
-
-   | Where | Log line naming the reason | What carries the state |
-   |---|---|---|
-   | an inventory (`Host::inventory`) | `tail_not_adoptable` (warn) | the reply, `TailHeld` |
-   | a landing's tail scan (`Host::landing_scan`) | `land_tail_not_adoptable` (info) | the node's status, `tail_refused`, read by the owner's repair probe and a peer's look; no reply |
-
-3. **Held `Unchecked`, not `Refused`, in both places.** Neither reason is added to
-   `ADOPTION_REFUSALS`. That list is a wire vocabulary: a peer decoding a `NodeStatus` refuses a
-   reason it does not know and closes the link, so a new entry needs every node on a build that
-   has it. `TailAdoption::of` maps any reason outside the list to `Unchecked`, the conservative
-   state (PR #156 review: before that, a landing's scan named these two `Refused`, so its status
-   did not decode on a peer, and an in-process `forget-tail` over it needed no flag). An
-   `Unchecked` tail is still counted as one that could return, so giving it up still needs
-   `--give-up-live-copy`. Moving the reasons into `ADOPTION_REFUSALS`, as `Refused`, can ride a
-   later protocol bump.
-4. **Why refuse at all.** No supported lifecycle builds a holed tail once checks A and B are in
-   place (#118). Two ways remain: data written by a build from before checks A and B, and a seq 1
-   lost at rest. Adopting either links a new generation over the hole, which is the fault check B
-   exists to stop.
-
-Rows in `crates/rdb-api/src/host/catchup_tests.rs`:
-
-- `i121_adoption_refuses_a_tail_holed_below_its_base`: red with check B taken out of
-  `Host::adoption`.
-- `pr156_an_adoption_whose_floor_read_fails_holds_the_tail_unchecked`: readable base and head, seq
-  1 corrupt; `TailHeld`, `Unchecked`, the error log, nothing written. Red when the read error is
-  swallowed.
-- `pr156_a_landing_holds_a_tail_with_no_floor_unchecked` and
-  `pr156_a_landing_holds_a_tail_whose_floor_read_fails_unchecked`: the landing's scan holds the
-  tail `Unchecked`, its status round-trips through the wire, and a bare `forget-tail` needs
-  `--give-up-live-copy`. Red under the classification before PR #156.
 
 ## References
 
