@@ -1293,8 +1293,10 @@ impl TailAdoption {
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
 pub const ADOPTION_NOT_READY: usize = 3;
 
-/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first
-/// ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Every reason [`Host::adoption`] answers that crosses the wire, [`TailAdoption::NotReady`]'s
+/// first ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Check B's two (`tail_has_no_floor`, `tail_history_read_failed`, #121) are not: a peer on an
+/// older build would refuse them, so they hold the tail [`TailAdoption::Unchecked`].
 pub const ADOPTION_REFUSALS: [&str; 11] = [
     "replay_not_ready",
     "tail_parent_copying",
@@ -13408,7 +13410,11 @@ impl Host {
     /// * P2: every record from the base through the head reads, verifies, and chains from that
     ///   digest ([`Self::chain`]).
     /// * No lineage at the anchor's generation, or one staging a copy of the whole tail (G4):
-    ///   [`Adopt::Link`], or [`Adopt::Resume`], once [`Self::link_preconditions`] hold (G3).
+    ///   [`Adopt::Link`], or [`Adopt::Resume`], once check B and [`Self::link_preconditions`]
+    ///   hold (G3). Check B (#121): the tail's lineage reaches seq 1 ([`Self::has_floor`]); a
+    ///   hole is `tail_has_no_floor`, a failed seq 1 read `tail_history_read_failed`, logged
+    ///   `adopt_floor_read_failed`. Neither is in [`ADOPTION_REFUSALS`], so
+    ///   [`TailAdoption::of`] holds the tail `Unchecked`.
     ///   One held (walk A's shape):
     ///   [`Adopt::Replay`], only when it is linked and not staging, its head is at or above the
     ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first

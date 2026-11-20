@@ -1,5 +1,6 @@
 //! Automatic failover, slice C1 of issue #81: a planner in each node process that promotes the
-//! partitions of a node whose process has gone silent and whose grant has run out.
+//! partitions of a node whose grant has run out and whose process has gone silent, or whose
+//! host answers a look with a fault (#122).
 //!
 //! Off unless [`crate::DbConfig::failover`] is set. Only the holder of `planner/grant` acts, and
 //! it acts only while that grant passes the same UTC rule a node's own grant does
@@ -7,7 +8,7 @@
 //! [`admin::promote_looked`], the operator's path, so the `Fencing` CAS, the freeze, the expiry
 //! proof and the re-reads decide safety, and two planners at once give one commit.
 //!
-//! A node `X` that owns a partition is failed over when either holds:
+//! A node `X` that owns a partition is failed over when any of these holds:
 //!
 //! 1. `grants/X` is frozen. A frozen grant never comes back for that process, so the silence
 //!    check is skipped (ruling C-1): a process that resumes mid-sweep still has every partition

@@ -452,7 +452,10 @@ have applied nothing. That holds at the cutoff (arm 2) and below it (arm 3) alik
 is refused `from_has_no_floor`, a failed seq 1 read `history_read_failed` (logged
 `land_floor_read_failed`), and nothing is written. The guard order and the inventory's twin are in
 [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md). Check B is refusal-only and
-runs whatever the #107 live re-add switch says. Adoption does not run it (issue #121).
+runs whatever the #107 live re-add switch says. Since issue #121, adoption runs it too, before an
+`Adopt::Link` or an `Adopt::Resume` links the anchor's generation onto a tail's lineage
+(`tail_has_no_floor`, `tail_history_read_failed`); the tail is then held `Unchecked`. See
+ADR-rdb-0021's 2026-11-19 amendment.
 
 **Amended 2026-11-15 (issue #107 slice 2a, PR #126): the same-boot return, the refused
 receiver's anchor, and protocol 9.** Three rules. `Timeouts::live_readd` (off by default)

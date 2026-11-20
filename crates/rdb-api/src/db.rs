@@ -260,8 +260,9 @@ pub struct DbConfig {
     /// M10.
     pub ack_floor: bool,
     /// Automatic failover (#81 slice C1): this node process runs a planner that, while it holds
-    /// `planner/grant`, promotes each partition of a node whose process is silent and whose
-    /// grant has run out ([`crate::planner`]). Only a node process may set it: exactly one node
+    /// `planner/grant`, promotes each partition of a node whose grant has run out and whose
+    /// process is silent, or whose host answers the planner's look with a fault (#122: a host
+    /// fault lasts the boot, so that node serves nothing more) ([`crate::planner`]). Only a node process may set it: exactly one node
     /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
     /// default, never promotes: failover stays the operator's `promote`.
     pub failover: Option<crate::planner::Failover>,

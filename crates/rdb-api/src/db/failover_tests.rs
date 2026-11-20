@@ -659,7 +659,7 @@ fn own81_v3_a_lone_survivor_is_not_promoted() {
     assert!(logged(METHOD, "planner_promote_decision").is_empty());
 }
 
-/// V4, V5 and V6 share one shape: node 1's process still answers on its links, so it is never
+/// V4 and V6 share one shape: node 1's process still answers on its links, so it is never
 /// failed over (customer answers 2 and 3). With `alert`, its grant runs out and the planner
 /// raises `planner_owner_alive_not_serving` naming node 1 (`heard_on_link`). Either way, two
 /// grant periods later nothing has been written: no decision, no freeze, `partitions/1`
