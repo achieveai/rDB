@@ -6982,7 +6982,9 @@ mod dormant_twin_tests {
     /// `attempts` 1, 2, 3 and `gave_up` false, false, true. `needs_operator` is empty until the
     /// third and then reads [`needs_history_budget`] (copy 2, node 1, 3 attempts), logged once as
     /// `history_budget_gave_up`. A fourth ask opens nothing (`snapshot_catchup_given_up`), so
-    /// three transfers opened in all, and a further duty round warns nothing more.
+    /// three transfers opened in all. A further duty round at the give-up's own budget warns
+    /// nothing more and clears nothing (a higher one would, lead ruling R27): the copy is still
+    /// given up, `needs_operator` still set, and still not offered.
     ///
     /// Cuts: no give-up ([`overrun_action`] never answers `GiveUp`), red (the third warn's
     /// `gave_up`); the give-up at 1, red (the first warn's). Unit, under a second.
@@ -6996,6 +6998,7 @@ mod dormant_twin_tests {
         const METHOD: &str = "t61_sim_s3_r4b_three_overruns_in_a_row_give_up_the_copy";
         let (mut dispatcher, seed, _) = held_transfer_world();
         let mut scheduler = Scheduler::new();
+        let mut budget = 0;
         for round in 1..=3_u32 {
             assert_eq!(
                 dispatcher.needs_operator(OWNER, P, CopyId(2)),
@@ -7006,7 +7009,7 @@ mod dormant_twin_tests {
                 copy_2_asks(&mut dispatcher, &mut scheduler).is_some(),
                 "round {round} re-offers"
             );
-            overrun_copy_2(&mut dispatcher, &seed, Tick(u64::from(round)));
+            budget = overrun_copy_2(&mut dispatcher, &seed, Tick(u64::from(round)));
             assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), round);
         }
         assert_eq!(
@@ -7045,11 +7048,37 @@ mod dormant_twin_tests {
             .buffered_applied(P, Generation(1))
             .0;
         owner_applies(&mut dispatcher, seed.lineage, head + 1, head + 3);
+        // The budget the give-up was recorded at: a higher one would clear it (lead ruling R27).
         dispatcher
-            .retention_duty(OWNER, P, Tick(4), RETAIN)
+            .retention_duty(
+                OWNER,
+                P,
+                Tick(4),
+                super::RetentionConfig {
+                    keep_millis: 3_600_000,
+                    budget_bytes: budget,
+                    ..RETAIN
+                },
+            )
             .expect("duty");
         assert_eq!(overran_attempts(METHOD).len(), 3, "no further warn");
         assert_eq!(logged(METHOD, "history_budget_gave_up").len(), 1);
+        assert_eq!(give_up_cleared(METHOD), Vec::<Option<String>>::new());
+        assert_eq!(
+            dispatcher.overruns(OWNER, P, CopyId(2)),
+            3,
+            "still given up"
+        );
+        assert_eq!(
+            dispatcher.needs_operator(OWNER, P, CopyId(2)),
+            Some(needs.as_str()),
+            "still needs the operator"
+        );
+        assert_eq!(
+            copy_2_asks(&mut dispatcher, &mut scheduler),
+            None,
+            "still no offer"
+        );
     }
 
     /// Issue #61 S3-R4 part (b), owner ruling 2026-11-20, option 1: the count is of overruns
