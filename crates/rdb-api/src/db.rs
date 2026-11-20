@@ -4502,7 +4502,16 @@ impl Db {
     /// `Quarantined`, also names that state and the one step that helps, as the latest look at
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
+    ///
+    /// A feed refusal whose detail already ends with the feed's own step (read another copy, or
+    /// rebuild) is left as it is (review r1): a note after it would hide that step and add the
+    /// kind's generic "call again", which contradicts it.
     fn explained(&self, mut error: ApiError) -> ApiError {
+        if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
+            || error.detail.ends_with(error::FEED_HISTORY_STEP)
+        {
+            return error;
+        }
         // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
         // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
         // that does. That text ends with its step, so it goes last, after any restart note,

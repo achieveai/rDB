@@ -928,7 +928,10 @@ fn f87_2_a_slow_consumer_at_a_fresh_member_is_served_every_call() {
 /// generation that left it out and the owner, with the step to read another copy. It never
 /// answers "call again", and the refusal comes within a few grants of the drop.
 /// Cut: `Host::feed_fresh` treats a record that leaves this node out of a newer generation as
-/// "still landing" (`BoundedJitter`), red (no definitive answer).
+/// "still landing" (`BoundedJitter`), red (no definitive answer). Review r1: with a restart
+/// note (node 2 restarted), the answer keeps its one step and no retry of node 3.
+/// Cut: `Db::explained` without its feed-step check, red (the note and the generic step after
+/// the feed's).
 /// Integration (~12 s): a 2 s drop clock, 2.25 s gaps.
 #[config_log::retcd_test]
 fn f87_2_a_copy_left_out_while_held_answers_definitively_within_a_bound() {
@@ -1014,6 +1017,24 @@ fn f87_2_a_copy_left_out_while_held_answers_definitively_within_a_bound() {
         .changes(PARTITION, FeedCursor::START, 10, three)
         .expect_err("still left out");
     assert_eq!(again.retry, RetryRule::Definitive, "{again:?}");
+    // Review r1: with a restart note to tell (node 2 restarted), the refusal still ends with
+    // its one step, read another member, and says nothing of calling node 3 again.
+    db.restart_node(NodeId(2)).expect("node 2 restarts");
+    assert!(db.restart_note().is_some(), "a note to tell");
+    let noted = db
+        .changes(PARTITION, FeedCursor::START, 10, three)
+        .expect_err("still left out");
+    let text = noted.to_string();
+    assert_eq!(noted.retry, RetryRule::Definitive, "{noted:?}");
+    assert_eq!(text.matches("next:").count(), 1, "{text}");
+    assert!(
+        text.ends_with("calling this copy again will not help while it holds no current copy)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("restarted") && !text.contains("call again"),
+        "{text}"
+    );
     db.links().heal(NodeId(1), NodeId(3));
     db.links().heal(NodeId(2), NodeId(3));
 }
