@@ -3,8 +3,9 @@
 //!
 //! `admin::declare` writes one per declared node, create-only, and nothing updates it in place.
 //! A node process reads its own and every `--peers` entry's at start, and refuses to start when
-//! one disagrees with what it was given. The machine is an operator's label, checked only for
-//! a clash at declaration: nothing can prove which machine a process runs on.
+//! one disagrees with what it was given. The machine is an operator's label, checked at
+//! declaration for its form ([`machine_refusal`]) and for a clash (rdb-api's
+//! `admin::machine_clash`) only: nothing can prove which machine a process runs on.
 //!
 //! # Layout 1
 //!

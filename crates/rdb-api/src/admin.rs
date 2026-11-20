@@ -602,10 +602,11 @@ impl Declaration {
     }
 
     /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the node
-    /// set ([`node_set_refusal`]), then each address (one [`parse_addr`] takes: a port of 1 to
-    /// 65535, and a dialable IP or a whitelisted host name; at most 255 bytes; none twice), then
-    /// each machine label ([`machine_refusal`], after lowercasing; unset, the address's host as
-    /// [`parse_addr`] parses it), then [`machine_clash`].
+    /// set ([`node_set_refusal`]), then each node in turn: its address (one [`parse_addr`]
+    /// takes: a port of 1 to 65535, and a dialable IP or a whitelisted host name; at most 255
+    /// bytes; not an earlier node's), then its machine label ([`machine_refusal`], after
+    /// lowercasing; unset, the address's host as [`parse_addr`] parses it). Last, across all
+    /// nodes, [`machine_clash`].
     ///
     /// # Errors
     ///

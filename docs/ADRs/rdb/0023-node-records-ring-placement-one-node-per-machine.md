@@ -100,7 +100,9 @@
    Each of these texts ends "nothing was started", on both paths below. Those that compare a
    value with a record (the listen address and a peer address) name the record (`nodes/N`)
    and both values. The refusals `Db::open` adds itself (below, and two local nodes or no
-   `DbConfig::addresses`) end "nothing but its folder was created".
+   `DbConfig::addresses`) end "nothing but its folder was created". They run before this
+   check, so on `Db::open` a store with no `nodes/` records, or the local node's own record
+   absent, ends "nothing but its folder was created", as `docs/rdb/embed.md` says.
    It runs on two paths:
    - `rdb_node --node N` calls it with `--listen` and `--peers` before it writes its boot or
      binds.
