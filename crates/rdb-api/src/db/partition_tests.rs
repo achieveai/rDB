@@ -3399,6 +3399,65 @@ fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
     db.shutdown();
 }
 
+/// own83_34 (#83 B2, PR #159 review r3, T46): a reader dropped before it finishes, as a panic
+/// mid-read drops it, still ends its read. A flight is joined by hand: node 1's slot holds a
+/// read in flight and its [`AddrReader`], and a caller waits on it (the read timeout is 10 s).
+/// Dropping the reader answers that caller `UNAVAILABLE` (retry `BoundedJitter`) at once, well
+/// inside its timeout, and leaves no read in flight in the slot. The next call reads `nodes/1`
+/// itself and names its address. Cut: `AddrReader`'s `Drop` does not call `end`, red at
+/// "at once" (the caller waits out its 10 s). Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_34_a_reader_dropped_unfinished_ends_its_read() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    db.timeouts.read = Duration::from_secs(10);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let read = Arc::new(AddrRead::default());
+    lock(&db.route.addrs).entry(NodeId(1)).or_default().reading = Some(Arc::clone(&read));
+    let reader = AddrReader {
+        route: &db.route,
+        node: NodeId(1),
+        read: Arc::clone(&read),
+        finished: false,
+    };
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let started = Instant::now();
+            (db.app_address_of(NodeId(1)), started)
+        });
+        // The slot, the reader, this row and the waiter each hold the read.
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        while Arc::strong_count(&read) < 4 {
+            assert!(Instant::now() < until, "the caller never joined the read");
+            std::thread::yield_now();
+        }
+        drop(reader);
+        let (answer, started) = waiter.join().expect("the caller");
+        let refused = answer.expect_err("the read ended without an answer");
+        assert!(retryable_unavailable(&refused), "{refused}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "at once: {:?}",
+            started.elapsed()
+        );
+    });
+    assert!(
+        lock(&db.route.addrs)[&NodeId(1)].reading.is_none(),
+        "no read left in flight"
+    );
+    assert_eq!(
+        store.node_reads.load(Ordering::SeqCst),
+        0,
+        "nothing read yet"
+    );
+    assert_eq!(
+        db.app_address_of(NodeId(1)).expect("a healthy read"),
+        Some("gw-1:8443".to_owned())
+    );
+    assert_eq!(store.node_reads.load(Ordering::SeqCst), 1, "read itself");
+    db.shutdown();
+}
+
 /// own83_30 (#83 B2, PR #159 review): an app address is opaque and may carry a credential, so
 /// no log line holds it: `route` and `leader_of` of an owner whose address holds a synthetic
 /// credential return it byte for byte, while every line this row logged lacks it. The address
