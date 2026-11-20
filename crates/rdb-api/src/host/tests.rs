@@ -7523,3 +7523,42 @@ fn a_status_or_failed_reply_for_another_identity_does_not_take_the_status_waiter
         other => panic!("the status query's own answer: {other:?}"),
     }
 }
+
+/// Issue #130 (tick 0 is never a real step tick): a host whose clock reads tick 0, here a
+/// guarded clock stepped back as `rdb_node --clock-step-file` steps it, refuses to step a
+/// kernel and faults instead, so no `StepCtx` ever carries tick 0.
+/// Cut: the tick-0 refusal in `Host::offer` removed, red (A1 steps at tick 0).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_host_clock_at_tick_zero_steps_no_kernel() {
+    use rdb_core::contracts::control::{ControlEvent, ControlPrefix};
+    use rdb_core::contracts::ids::{CorrelationId, EventId, Revision};
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    clock.step_back(u64::MAX);
+    assert_eq!(
+        clock.now(),
+        Tick::ZERO,
+        "precondition: the clock reads tick 0"
+    );
+    host.clock = clock;
+    let event = Event {
+        id: EventId(1),
+        at: Tick::ZERO,
+        node: host.node,
+        boot: host.boot,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Control(ControlEvent::WatchProgress {
+            prefix: ControlPrefix::Partitions,
+            revision: Revision(1),
+        }),
+    };
+    match host.offer(ModuleName::Authority, &event) {
+        Err(StepError::Host(fault)) => assert!(fault.detail.contains("tick 0"), "{fault:?}"),
+        Ok(effects) => panic!("A1 stepped at tick 0: {effects:?}"),
+        Err(StepError::Module(error)) => panic!("A1 stepped at tick 0 and failed: {error}"),
+    }
+}

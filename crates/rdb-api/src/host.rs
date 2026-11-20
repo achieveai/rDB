@@ -6123,6 +6123,15 @@ impl Host {
                 .map_err(StepError::Host)?;
         }
         let now = self.clock.now();
+        // No kernel steps at tick 0 (issue #130). There A1's "already past" view saturates to
+        // the step tick itself, so check 6 would admit a view A1 denies. `HostClock` counts
+        // Unix-epoch ms, so only its dev hooks (`--clock-step-file`, `--clock-offset-ms`)
+        // can reach 0, and a fault is the honest answer to that clock.
+        if now == Tick::ZERO {
+            return Err(StepError::Host(Fault::from(format!(
+                "{module:?} not stepped: the host clock reads tick 0"
+            ))));
+        }
         self.stepped_at = now;
         let empty = EmptyView;
         let snapshot: &dyn SnapshotRead = match (self.views.get(&partition), reads_storage) {
