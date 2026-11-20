@@ -13470,6 +13470,25 @@ impl Host {
         if !self.engine.generations(partition).contains(&to)
             || self.engine.staging(partition, to) == Some((hit.from, hit.head))
         {
+            // Check B at adoption (#121, ADR-rdb-0021 amendment): a link or a resume puts the
+            // anchor's generation onto the tail's lineage, so that lineage must reach seq 1, as
+            // landing and the inventory link require. Neither reason is in
+            // `ADOPTION_REFUSALS`, a wire vocabulary: each holds the tail `Unchecked`.
+            match self.has_floor(partition, hit.from) {
+                Ok(true) => {}
+                Ok(false) => return Err("tail_has_no_floor"),
+                Err(fault) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        from = hit.from.0,
+                        to = to.0,
+                        ?fault,
+                        "adopt_floor_read_failed"
+                    );
+                    return Err("tail_history_read_failed");
+                }
+            }
             return self.link_preconditions(partition, to, hit);
         }
         if self.engine.staging(partition, to).is_some() || self.engine.link(partition, to).is_none()

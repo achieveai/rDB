@@ -3251,6 +3251,54 @@ fn u2_r7_1_a_backlogged_ask_with_the_same_l_adopts_from_the_newer_lineage() {
     assert_eq!(host.tail_refused_of(p), None);
 }
 
+/// Issue #121, check B at adoption, the at-rest case: generation 2 holds a tail at seqs 2 and 3
+/// with its seq 1 gone (lost at rest, or written by a build from before checks A and B). An ask
+/// at anchor 3 with L = 2 passes every adoption proof above the base, so before #121 it linked
+/// generation 3 onto the holed lineage. Now it is refused `tail_has_no_floor`: `TailHeld`, the
+/// tail held `Unchecked` (the reason is not in the `ADOPTION_REFUSALS` wire vocabulary), no
+/// `tail_adopted`, and nothing written. The same tail whole from seq 1 adopts (R7-1), so the
+/// refusal is the hole's.
+/// Cut: drop check B from `Host::adoption`; the ask adopts by a link, red.
+/// Unit.
+#[config_log::retcd_test]
+fn i121_adoption_refuses_a_tail_holed_below_its_base() {
+    const METHOD: &str = "i121_adoption_refuses_a_tail_holed_below_its_base";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain_after(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(2),
+        vec![Digest::ROOT],
+        2,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let held = host.engine.lineages();
+    let answer = host.inventory(
+        p,
+        CopyId(1),
+        anchor_at(3, 2, digests[1]),
+        Some(Generation(2)),
+        None,
+    );
+    assert!(
+        matches!(answer, RecoveryEvent::TailHeld { .. }),
+        "a holed tail is held, not adopted: {answer:?}"
+    );
+    assert_eq!(host.engine.lineages(), held, "the refusal wrote nothing");
+    assert!(adoptions(METHOD).is_empty(), "{:?}", adoptions(METHOD));
+    let refused: Vec<_> = logged!(METHOD, "tail_not_adoptable")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(refused, [serde_json::Value::from("tail_has_no_floor")]);
+    assert_eq!(
+        host.tail_refused.get(&p).map(|refused| refused.adoption),
+        Some(TailAdoption::Unchecked)
+    );
+}
+
 /// R7-2 (design section 16, G1 and G3): after R7-1's first link (generation 3 onto 2), a
 /// `ReadOnly` landing of generation 4 at cutoff 2 reports the tail `Adoptable`, and the next
 /// inventory at generation 4 does adopt it: what the landing tells the owner's repair is what the

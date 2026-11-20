@@ -52,7 +52,7 @@ the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without 
 - A transient `History` read fault refuses a link that would otherwise have passed. That costs a
   retry, not a wrong link.
 - Check B depends on seq 1 being kept. A history trim (#61) must revisit this ADR.
-- Adoption can still take a holed lineage until #121 lands.
+- Adoption can still take a holed lineage until #121 lands. (Closed by the 2026-11-19 amendment.)
 
 ## Verification
 
@@ -68,6 +68,32 @@ Rows in `crates/rdb-api/src/host/catchup_tests.rs`:
 - `issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing`: the inventory refuses
   `missed_generation_history_read_failed`, logs `missed_generation_floor_read_failed`, and writes
   nothing.
+
+## Amendment 2026-11-19: check B at adoption (issue #121; proposed on its PR, for the reviewer)
+
+Decision 7 is replaced. Adoption runs check B too.
+
+1. **Where.** `Host::adoption`, in the shapes that link the anchor's generation onto the tail's
+   lineage: `Adopt::Link` and `Adopt::Resume`. It runs after the proofs P1 to P3 and before
+   `Host::link_preconditions`, so before anything is written. `Adopt::Replay` does not run it:
+   replay appends records above the base onto the anchor's own lineage, and links nothing onto
+   the tail's.
+2. **Reasons.** A holed tail lineage is `tail_has_no_floor`. A seq 1 read that fails is
+   `tail_history_read_failed`, logged as `adopt_floor_read_failed` at error. Both reach the log as
+   `tail_not_adoptable` and answer `TailHeld`.
+3. **Held `Unchecked`, not `Refused`.** Neither reason is added to `ADOPTION_REFUSALS`. That list is
+   a wire vocabulary: a peer decoding a `NodeStatus` refuses a reason it does not know, so a new
+   entry needs every node on a build that has it. `Unchecked` is the conservative state: the tail
+   is still counted as one that could return, so giving it up still needs
+   `--give-up-live-copy`. Moving the reason into `ADOPTION_REFUSALS`, as `Refused`, can ride a
+   later protocol bump.
+4. **Why refuse at all.** No supported lifecycle builds a holed tail once checks A and B are in
+   place (#118). Two ways remain: data written by a build from before checks A and B, and a seq 1
+   lost at rest. Adopting either links a new generation over the hole, which is the fault check B
+   exists to stop.
+
+Row: `i121_adoption_refuses_a_tail_holed_below_its_base` in
+`crates/rdb-api/src/host/catchup_tests.rs`. It is red with check B taken out of `Host::adoption`.
 
 ## References
 
