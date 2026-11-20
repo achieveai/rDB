@@ -7718,8 +7718,10 @@ fn given_up_stays_out(trio: &mut Trio, method: &str, boot: BootId) {
 /// the held shadow's commit. One millisecond short, nothing; at the bound, one warn
 /// `live_readd_shadow_unpromoted` (reason `clock`, no blocks), and the re-plan leaves node 3 out
 /// at the boot it runs, where five holds of a live link do not re-add it.
+/// Node 1's duty is the real [`Host::drop_duty`] at both instants (review r1).
 /// Cuts: the bound compared with `>`, red (nothing at the bound); the give-up revoking without
-/// a drop, red (node 3 stays pinned).
+/// a drop, red (node 3 stays pinned); `drop_duty` without its `live_readd_shadow_duty` call,
+/// red (no re-plan at the bound).
 /// Integration (~6 s): the drop, 100 puts, the re-add, the give-up re-plan, five holds.
 #[config_log::retcd_test]
 fn issue107_m3_an_unpromoted_re_added_shadow_is_given_up_on_the_clock() {
@@ -7770,17 +7772,15 @@ fn issue107_m3_an_unpromoted_re_added_shadow_is_given_up_on_the_clock() {
         "precondition: node 3 is too far behind to be promoted"
     );
 
-    owner.live_readd_shadow_duty(
-        P1,
-        held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS - 1),
-    );
+    // Review r1: the real `drop_duty`, so deleting its call of the shadow duty fails the row.
+    owner.drop_duty(held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS - 1));
     assert!(
         !owner.rejoins.contains_key(&P1),
         "given up short of the bound"
     );
     assert!(logged!(METHOD, "live_readd_shadow_unpromoted").is_empty());
 
-    owner.live_readd_shadow_duty(P1, held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS));
+    owner.drop_duty(held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS));
     assert!(
         matches!(
             owner.rejoins.get(&P1),
