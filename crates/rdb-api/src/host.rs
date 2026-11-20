@@ -14671,7 +14671,26 @@ impl Host {
             level = link.parent;
         }
         let (source, cap) = if let Some(primary) = self.replication.primary(self.node, partition) {
-            if primary.tracker().lineage().generation != newest {
+            // The grant bounds the owner's cap (design-87 section 2). A promote that leaves this
+            // node out keeps its tracker here, fenced: it is refused as a write would be
+            // (`LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner), as
+            // `Self::start_barrier` refuses, so `Source::Owner` re-routes.
+            let lineage = primary.tracker().lineage();
+            if let Verdict::Deny(reason) =
+                self.authority
+                    .may_admit_at(lineage, self.clock.now(), &self.budgets)
+            {
+                let mut error =
+                    crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+                error.detail = format!(
+                    "node {node} may not serve partition {p}'s feed now ({reason:?}); call the \
+                     owner"
+                );
+                error.no_mutation = true;
+                tracing::info!(node, partition = p, ?reason, "feed_owner_refused");
+                return Ok(Err(error));
+            }
+            if lineage.generation != newest {
                 return refused(
                     ErrorKind::Unavailable,
                     format!(
@@ -14795,7 +14814,8 @@ impl Host {
                 return refused(
                     ErrorKind::CorruptHistory,
                     format!(
-                        "the cursor's record at seq {} of generation {} has another digest on                          node {node}: the histories diverged",
+                        "the cursor's record at seq {} of generation {} has another digest on \
+                         node {node}: the histories diverged",
                         seq.0, from.generation.0
                     ),
                 );
@@ -14871,7 +14891,8 @@ impl Host {
             .filter(|_| age.is_some_and(|age| age < grant))
         else {
             return Some(format!(
-                "no control read of partitions/{} within the grant ({grant} ms); one is under                  way, so call again",
+                "no control read of partitions/{} within the grant ({grant} ms); one is under \
+                 way, so call again",
                 partition.0
             ));
         };

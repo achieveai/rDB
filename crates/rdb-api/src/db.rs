@@ -3264,6 +3264,8 @@ impl Db {
     /// nothing in its generation, or (a secondary) has no fresh read of `partitions/{p}` naming
     /// its generation with it pinned. The first call to a secondary starts that read and is
     /// refused: call again. `UNAVAILABLE` also when no answer came within the read timeout.
+    /// An owner whose grant no longer admits, such as one a promote left out, answers as a write
+    /// would: `LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner.
     /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the
     /// same lineage. `INVALID_ARGUMENT` for `max` 0 or a partition this database does not have.
     pub fn changes(

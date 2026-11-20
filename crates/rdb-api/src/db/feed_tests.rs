@@ -48,14 +48,18 @@ fn patience() -> Duration {
     crate::host::test_patience(Duration::from_secs(30))
 }
 
-/// One feed call, `UNAVAILABLE` answers retried until `patience` ends. The first call to a
-/// secondary starts its control read and is refused, as is a call while a copy lands.
+/// One feed call, `UNAVAILABLE` and `LEASE_EXPIRED` answers retried until `patience` ends. The
+/// first call to a secondary starts its control read and is refused; a new owner refuses until
+/// it holds its grant.
 fn page_from(db: &Db, from: FeedCursor, source: Source) -> FeedPage {
     let deadline = Instant::now() + patience();
     loop {
         match db.changes(PARTITION, from, FEED_PAGE_RECORDS, source) {
             Ok(page) => return page,
-            Err(error) if error.kind == ErrorKind::Unavailable && Instant::now() < deadline => {
+            Err(error)
+                if matches!(error.kind, ErrorKind::Unavailable | ErrorKind::LeaseExpired)
+                    && Instant::now() < deadline =>
+            {
                 assert!(error.no_mutation, "{error:?}");
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -430,7 +434,11 @@ fn f87_1_owner_and_secondary_partitioned_together_secondary_stops_within_bound()
             Ok(other) => panic!("node 2 while cut: {other:?}"),
             Err(error) => {
                 assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-                assert!(error.detail.contains("no control read"), "{error:?}");
+                assert!(
+                    error.detail.contains("no control read")
+                        && error.detail.contains("one is under way, so call again"),
+                    "{error:?}"
+                );
                 break cut.elapsed();
             }
         }
@@ -629,6 +637,97 @@ fn f87_1_lagging_copy_answers_behind() {
     );
 }
 
+/// A shadow copy refuses the feed: it holds what catch-up gave it, which no regular copy has
+/// vouched for. As in `m11_t7`, node 4's frames to node 1 are lost, so `move 3 4` pins node 4
+/// as a shadow that never catches up; asked directly, node 4 answers `UNAVAILABLE` naming its
+/// role, and never a page.
+/// Cut: `Host::changes` lets a shadow past the role check, red (refused for another reason).
+/// Integration (~3 s): a fresh open, a second process, the move's re-plan.
+#[config_log::retcd_test]
+fn f87_1_shadow_copy_refuses() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let links = Arc::new(Links::default());
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open of nodes 1 to 3");
+    db.wait_ready(patience()).expect("ready");
+    let spare = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(4)],
+                links: Some(Arc::clone(&links)),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 4's process");
+    db.put(b"k1", b"one", None).expect("k1");
+    links.drop_direction(NodeId(4), NodeId(1));
+    let moved = db.move_copy(NodeId(3), NodeId(4)).expect("move 3 4");
+    assert!(!moved.done, "{moved:?}");
+    let four = Source::Node(NodeId(4));
+    let deadline = Instant::now() + patience();
+    let refused = loop {
+        match spare.changes(PARTITION, FeedCursor::START, 10, four) {
+            Ok(page) => panic!("a shadow served {page:?}"),
+            Err(error) => {
+                assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+                assert!(error.no_mutation, "{error:?}");
+                if error.detail.contains("no regular copy") && error.detail.contains("Shadow") {
+                    break error;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "node 4 never refused as a shadow: {error:?}"
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    tracing::info!(detail = %refused.detail, "f87_1_shadow_refused");
+}
+
+/// The old owner a promote left out refuses the feed, as a write would: its grant no longer
+/// admits, so it cannot serve its published prefix, which may hold records the new generation
+/// cut. Node 1 is cut off, node 2 promoted, node 1 asked directly.
+/// Cut: `Host::changes` logs the owner's denial and serves on, red (a page, or `UNAVAILABLE`).
+/// Integration (~6 s): a grant wait.
+#[config_log::retcd_test]
+fn f87_1_left_out_owner_refuses() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    let (_, at_k1) = tail(&db, FeedCursor::START, Source::Node(NodeId(1)), k1.seq);
+    db.links().hold(NodeId(1), NodeId(2));
+    db.links().hold(NodeId(1), NodeId(3));
+    let promoted = db.promote(NodeId(2), None).expect("the promote commits");
+    assert_eq!(promoted.dropped, NodeId(1), "{promoted:?}");
+    for from in [FeedCursor::START, at_k1] {
+        let error = db
+            .changes(PARTITION, from, 10, Source::Node(NodeId(1)))
+            .expect_err("node 1 is left out");
+        assert!(
+            matches!(error.kind, ErrorKind::LeaseExpired | ErrorKind::NotPrimary),
+            "{error:?}"
+        );
+        assert!(error.no_mutation, "{error:?}");
+    }
+}
+
 /// M6, measured not asserted: write latency at 100 writes/s with no consumer, then with one
 /// consumer tailing each copy (owner, node 2, node 3) every 10 ms. Prints p50/p99/max for each.
 /// Run by hand: `cargo test -p rdb-api --lib -- --ignored f87_1_measure --nocapture`.
@@ -651,7 +750,13 @@ fn f87_1_measure_write_p99_with_tailing_consumers() {
                         match db.changes(PARTITION, at, FEED_PAGE_RECORDS, *source) {
                             Ok(FeedPage::Records { next, .. }) => at = next,
                             Ok(other) => panic!("{source:?}: {other:?}"),
-                            Err(error) => assert_eq!(error.kind, ErrorKind::Unavailable),
+                            Err(error) => assert!(
+                                matches!(
+                                    error.kind,
+                                    ErrorKind::Unavailable | ErrorKind::LeaseExpired
+                                ),
+                                "{error:?}"
+                            ),
                         }
                         pages += 1;
                         std::thread::sleep(Duration::from_millis(10));

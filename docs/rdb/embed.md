@@ -1619,8 +1619,11 @@ loop {
   `partitions/{p}` in rEtcd began within the grant (`grant_millis`, 6 s by default), names the
   generation it holds and pins it as a regular copy. Cut off from rEtcd, it stops within about
   one grant, even while its old owner still talks to it. The first call to a secondary starts
-  that read and answers `UNAVAILABLE`: call again. A shadow, a copy left out, or a copy still
-  landing a new generation answers `UNAVAILABLE` too.
+  that read and answers `UNAVAILABLE`: call again. A shadow, a secondary left out, or a copy still
+  landing a new generation answers `UNAVAILABLE` too. An owner whose grant does not admit answers
+  as a write would, `LEASE_EXPIRED` or `NOT_PRIMARY`. Right after a promote the new owner
+  answers `LEASE_EXPIRED` until it holds its grant: call again. An old owner the promote left
+  out keeps answering so: ask the new owner, or another copy.
 - **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
   may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
   undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last
