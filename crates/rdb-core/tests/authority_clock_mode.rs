@@ -1699,3 +1699,99 @@ fn m7a_166_every_fence_publishes_an_already_past_view() {
         "{horizons:?}"
     );
 }
+
+/// Hold the grant from tick 0, switch the clock to `Unbounded` (a failed clock check that
+/// denies and never fences), then install `PARTITION` at tick `t`. Returns the kernel and the
+/// views that install published.
+fn unbounded_install_at(t: u64) -> (Authority, Vec<AuthorityView>) {
+    let mut kernel = held_kernel();
+    kernel.set_clock_mode(ClockMode::Unbounded);
+    let snapshot = Event {
+        id: EventId(10),
+        at: Tick(t),
+        node: NODE,
+        boot: BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(10),
+        kind: EventKind::Control(ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(10),
+            records: vec![ControlRecord {
+                key: ControlKey::Partition(PARTITION),
+                revision: Revision(10),
+                value: PartitionRecord {
+                    partition: PARTITION,
+                    owner: NODE,
+                    generation: Generation(1),
+                    owner_epoch: OwnerEpoch(1),
+                    config_version: ConfigVersion(1),
+                    lifecycle: PartitionLifecycle::Serving,
+                }
+                .encode(),
+            }],
+        }),
+    };
+    let effects = kernel
+        .step(&pinned(t), &snapshot)
+        .expect("the family-snapshot install is built");
+    (kernel, published(&effects))
+}
+
+/// Issue #130, item 3: what check 6 does with a view `admission_horizon` publishes when the
+/// clock check already fails at the publishing tick.
+///
+/// `admission_horizon` answers "no solution" with `now - 1`, so the view is already past and
+/// check 6 ([`view_admits`]) refuses it. At tick 1 that holds. At tick 0, `now - 1` saturates
+/// to 0, `0 > 0` is false, and check 6 **admits** a view whose own conjunct
+/// ([`Authority::may_admit_at`]) denies. `Tick` has no value below 0, so no view can say "admits
+/// nothing" there.
+///
+/// This pins today's behaviour, both ticks, so a change to either side shows up here. It is not
+/// reached by a real node: `rdb_api`'s `HostClock::now` counts ticks from the Unix epoch in
+/// milliseconds. Whether the kernel itself should refuse tick 0 is open on #130.
+///
+/// [`view_admits`]: rdb_core::transaction::view_admits
+#[retcd_test]
+fn tick_zero_failed_clock_check_view_still_passes_check_6() {
+    use rdb_core::transaction::{view_admits, ViewAdmits};
+
+    // Tick 1: the no-solution view is past, so check 6 and A1 agree.
+    let (kernel, views) = unbounded_install_at(1);
+    let [view] = views[..] else {
+        panic!("one view for the installed partition at tick 1: {views:?}")
+    };
+    assert_eq!(
+        (view.valid_through_tick, view.past_horizon),
+        (Tick(0), DenyReason::ClockModeUnbounded),
+        "tick 1: horizon is now - 1"
+    );
+    assert_eq!(
+        kernel.may_admit_at(lineage(), Tick(1), &BUDGETS),
+        Verdict::Deny(DenyReason::ClockModeUnbounded)
+    );
+    assert_eq!(
+        view_admits(&view, lineage(), Tick(1)),
+        ViewAdmits::PastHorizon
+    );
+
+    // Tick 0: the same failure, but now - 1 saturates to now, and check 6 admits.
+    let (kernel, views) = unbounded_install_at(0);
+    let [view] = views[..] else {
+        panic!("one view for the installed partition at tick 0: {views:?}")
+    };
+    assert_eq!(
+        (view.valid_through_tick, view.past_horizon),
+        (Tick(0), DenyReason::ClockModeUnbounded),
+        "tick 0: horizon saturates to the publishing tick itself"
+    );
+    assert_eq!(
+        kernel.may_admit_at(lineage(), Tick(0), &BUDGETS),
+        Verdict::Deny(DenyReason::ClockModeUnbounded),
+        "A1's own check denies at tick 0"
+    );
+    assert_eq!(
+        view_admits(&view, lineage(), Tick(0)),
+        ViewAdmits::Admits,
+        "check 6 still admits the tick-0 view: the divergence #130 asks about"
+    );
+}

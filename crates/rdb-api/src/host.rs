@@ -14812,31 +14812,22 @@ impl Host {
         };
         tracing::info!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
         // A status query's answer, or its refusal, goes to the query being stepped, never to a
-        // write waiting under the same identity (F-014).
-        let for_status = matches!(
-            reply,
-            ReplyEffect::Status { .. } | ReplyEffect::Failed { .. }
-        ) && self
-            .answering
-            .as_ref()
-            .is_some_and(|(asked, _)| *asked == identity);
-        if let Some((_, waiter)) = self.answering.take_if(|_| for_status) {
-            let answer = match reply {
-                ReplyEffect::Status { status, .. } => Answer::Status(*status),
-                ReplyEffect::Failed { error, .. } => Answer::Error {
-                    error: ApiError::from_kernel(error),
-                    request: None,
-                },
-                ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => {
-                    return Err(fail_waiter(
-                        &self.owner_views,
-                        &waiter,
-                        format!("reply {} to a status query", reply_name(reply)),
-                    ));
-                }
-            };
-            let _ = waiter.send(answer);
-            return Ok(());
+        // write waiting under the same identity (F-014). Only those two replies can answer a
+        // status query, so a transaction or read reply never reaches its waiter: it has no
+        // `status_answer` and goes on to the pending table below (issue #130).
+        let status_answer = match reply {
+            ReplyEffect::Status { status, .. } => Some(Answer::Status(*status)),
+            ReplyEffect::Failed { error, .. } => Some(Answer::Error {
+                error: ApiError::from_kernel(error),
+                request: None,
+            }),
+            ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => None,
+        };
+        if let Some(answer) = status_answer {
+            if let Some((_, waiter)) = self.answering.take_if(|(asked, _)| *asked == identity) {
+                let _ = waiter.send(answer);
+                return Ok(());
+            }
         }
         if let ReplyEffect::Status { .. } = reply {
             return Err(Fault::from(format!(

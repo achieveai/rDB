@@ -1572,7 +1572,13 @@ impl Authority {
     /// (finding E, lead ruling A-R53.4).
     ///
     /// Pure, and it saturates to `now - 1` when there is no solution — a view that is already
-    /// past cannot admit anything (finding K-A-53). The local conjunct's horizon is arithmetic.
+    /// past cannot admit anything (finding K-A-53). **Except at tick 0:** `now - 1` saturates to
+    /// `now`, and check 6 (`transaction::view_admits`) admits that view at tick 0 while
+    /// [`Self::may_admit_at`] denies. `Tick` has no value that admits nothing there. A real node
+    /// never steps at tick 0 (`rdb_api`'s `HostClock` counts Unix-epoch milliseconds); the
+    /// simulator starts at tick 0. Pinned by
+    /// `tick_zero_failed_clock_check_view_still_passes_check_6`; open on issue #130.
+    /// The local conjunct's horizon is arithmetic.
     /// The bounded-clock conjunct's is found by asking [`utc_ok`] itself, because the effective
     /// epsilon grows with age and a closed form would restate the drift rule in a second place.
     ///
