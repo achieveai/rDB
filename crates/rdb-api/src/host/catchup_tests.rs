@@ -2135,7 +2135,11 @@ fn installed_at_four(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> (H
         digests
     };
     let host = host_over(path, rt);
-    assert_eq!(host.engine.link(PartitionId(1), Generation(2)), None, "unlinked");
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        None,
+        "unlinked"
+    );
     (host, digests)
 }
 
