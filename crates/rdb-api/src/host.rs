@@ -13497,22 +13497,7 @@ impl Host {
             if let Some(hit) = hit {
                 match release_through.filter(|through| hit.head <= *through) {
                     Some(through) => {
-                        if let Err(fault) =
-                            self.tail_released(partition, copy, anchor, hit, through)
-                        {
-                            // Issue #61 M1: no answer before the mark is durable. Without it
-                            // a later offer would be refused for the tail given up here.
-                            tracing::warn!(
-                                node = self.node.0,
-                                partition = partition.0,
-                                copy = copy.0,
-                                from = hit.from.0,
-                                through = through.0,
-                                ?fault,
-                                "tail_release_write_failed"
-                            );
-                            return RecoveryEvent::InventoryFailed { copy };
-                        }
+                        self.tail_released(partition, copy, anchor, hit, through);
                         released = Some(hit);
                     }
                     None => match self.adopt(partition, copy, anchor, last_writable, hit) {
@@ -13996,10 +13981,8 @@ impl Host {
         anchor: LineageAnchor,
         hit: TailHit,
         through: Seq,
-    ) -> Result<(), StorageFault> {
-        // Issue #61 (design rev 5 M1, 5c): the release is durable before the inventory answers,
-        // so a later snapshot offer is accepted over this tail, even after a restart.
-        self.engine.put_tail_release(partition, hit.from, through)?;
+    ) {
+        // Issue #61: an offer refusal this copy holds for that tail clears too.
         if self
             .offer_tail_held
             .get(&partition)
@@ -14026,7 +14009,6 @@ impl Host {
         {
             self.tail_refused.remove(&partition);
         }
-        Ok(())
     }
 
     /// Issue #105 unit 2 (design section 5.1): whether `hit` can be adopted onto `anchor`'s

@@ -9341,16 +9341,17 @@ fn t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_in
 /// `t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_install`). Every
 /// step after the one in-memory change is real.
 ///
-/// Flow: node 3 refuses node 1's offer `tail_held` and warns `copy_needs_forget_tail` once with
-/// the full command; both nodes' `NodeStatus::needs_operator` name `H` (the owner's is what
+/// Flow: node 3 refuses node 1's offer `tail_held` and warns `copy_needs_forget_tail` with the
+/// full command; offered again at the same `S`, it refuses again and does not warn again; both
+/// nodes' `NodeStatus::needs_operator` name `H` (the owner's is what
 /// `Db::readiness` reports as `PartitionReady::degraded`); a bare `--through H` is refused,
 /// unchecked, and with `--give-up-live-copy` accepted, naming the copy; its re-plan commits
 /// writable, the next ordinary catch-up offer (no re-offer) is accepted, the install discards
-/// the planted records, node 3 catches up, nobody needs the operator, and no `TAIL_RELEASE`
-/// mark is left.
+/// the planted records, node 3 catches up, and nobody needs the operator.
 /// Cuts: `snapshots_served` keyed by barrier alone (as before R18), red (no second offer: the
 /// one refused at the same `S` holds it back); `offer_holds` not counted in `forget_tail_asked`,
-/// red (the ask is refused, nothing to give up).
+/// red (the ask is refused, nothing to give up); `copy_needs_forget_tail` without its once
+/// check, red (two warns).
 /// Integration (~10 s): the drop, the restart's re-plan, the forget-tail's re-plan, a transfer.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
@@ -9440,6 +9441,22 @@ fn t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_th
     let refused = logged!(METHOD, "snapshot_offer_refused");
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0]["reason"], "tail_held");
+    // Lead ruling R19: the same held tail offered twice warns once.
+    let at = Seq(refused[0]["at"].as_u64().expect("the offer's S"));
+    let owner = &mut trio.nodes[0].0;
+    owner.snapshots_served.remove(&(p, CopyId(2)));
+    owner.snapshot_catchup(p, CopyId(2), at);
+    trio.until("node 3 refused the second offer", |_| {
+        (logged!(METHOD, "snapshot_offer_refused").len() == 2).then_some(())
+    });
+    for refused in logged!(METHOD, "snapshot_offer_refused") {
+        assert_eq!(refused["reason"], "tail_held", "{refused}");
+    }
+    assert_eq!(
+        logged!(METHOD, "copy_needs_forget_tail").len(),
+        1,
+        "warned once"
+    );
     let h = warned[0]["head"].as_u64().expect("a head");
     let command = format!("admin forget-tail --partition 1 --through {h} --give-up-live-copy");
     assert_eq!(warned[0]["command"], command.as_str());
@@ -9507,7 +9524,6 @@ fn t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_th
         None,
         "the install discarded the planted key"
     );
-    assert_eq!(three.engine.tail_release(p), None, "no TAIL_RELEASE left");
     assert_eq!(trio.status(0).needs_operator, None);
     assert_eq!(trio.status(2).needs_operator, None);
 }

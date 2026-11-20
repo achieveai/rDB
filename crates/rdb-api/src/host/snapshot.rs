@@ -325,9 +325,6 @@ pub(crate) struct Install {
     pub(crate) chunks: u64,
     /// When the offer was accepted.
     pub(crate) started: std::time::Instant,
-    /// A held tail the offer is accepted over because a release covers it: `(from, head,
-    /// through)`. `install_begin` deletes it, logged `snapshot_install_discards_released_tail`.
-    pub(crate) released: Option<(Generation, Seq, Seq)>,
 }
 
 impl Host {
@@ -858,8 +855,8 @@ impl Host {
     /// An offer reached this target (module docs, "Target").
     pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) {
         let partition = offer.lineage.partition;
-        let released = match self.offer_check(&offer) {
-            Ok(released) => released,
+        match self.offer_check(&offer) {
+            Ok(()) => {}
             Err((reason, held)) => {
                 tracing::warn!(
                     node = self.node.0,
@@ -879,7 +876,7 @@ impl Host {
                 self.refuse_offer(&offer, reason, held.map(|hit| hit.head));
                 return;
             }
-        };
+        }
         if let Some(held) = self.installs.get(&partition) {
             tracing::info!(
                 node = self.node.0,
@@ -909,7 +906,6 @@ impl Host {
             entries: 0,
             chunks: 0,
             started: std::time::Instant::now(),
-            released,
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
@@ -917,12 +913,9 @@ impl Host {
 
     /// Design section 2 step 2: the offer's authority and freshness, or why not.
     ///
-    /// Last, the held-tail check ([`Self::offer_tail`]): a tail no release covers is refused
-    /// `tail_held`, with the hit; one a release covers is answered as `(from, head, through)`.
-    fn offer_check(
-        &self,
-        offer: &SnapshotOffer,
-    ) -> Result<Option<(Generation, Seq, Seq)>, OfferRefusal> {
+    /// Last, the held-tail check ([`Self::offer_tail`]): a held tail is refused `tail_held`,
+    /// with the hit.
+    fn offer_check(&self, offer: &SnapshotOffer) -> Result<(), OfferRefusal> {
         let partition = offer.lineage.partition;
         let Some(receiver) = self
             .replication
@@ -953,15 +946,18 @@ impl Host {
             return Err((SnapshotRefusal::BadBarrier, None));
         }
         match self.offer_tail(offer)? {
-            None => Ok(None),
-            Some((hit, Some(through))) => Ok(Some((hit.from, hit.head, through))),
-            Some((hit, None)) => Err((SnapshotRefusal::TailHeld, Some(hit))),
+            None => Ok(()),
+            Some(hit) => Err((SnapshotRefusal::TailHeld, Some(hit))),
         }
     }
 
     /// Issue #61 (design rev 4 N2, rev 5 M1 and 5b): the #105 tail this copy holds under the
-    /// offer's lineage, and the release that covers it, if any: the durable mark
-    /// ([`rdb_storage::RocksEngine::tail_release`]) at or above the tail's head.
+    /// offer's lineage, if any.
+    ///
+    /// No release mark is read (lead ruling R19): a forget-tail's run commits writable, which
+    /// supersedes the tail before any later offer, and a run that does not commit leaves the
+    /// next run to report the tail held again, so a mark could never spare the operator a
+    /// second command.
     ///
     /// **L comes from the landed commit (lead ruling R15)**, as [`Host::landing_scan`] takes it.
     /// A writable commit at generation L was formed through a barrier that already carries every
@@ -978,10 +974,7 @@ impl Host {
     ///
     /// The landed commit anchors the scan; with none at the offer's lineage nothing proves the
     /// tail superseded, so the offer is refused `not_adopted`.
-    fn offer_tail(
-        &self,
-        offer: &SnapshotOffer,
-    ) -> Result<Option<(super::TailHit, Option<Seq>)>, OfferRefusal> {
+    fn offer_tail(&self, offer: &SnapshotOffer) -> Result<Option<super::TailHit>, OfferRefusal> {
         let partition = offer.lineage.partition;
         let Some(committed) = self
             .committed
@@ -995,15 +988,7 @@ impl Host {
             base_seq: committed.selected.cutoff_seq,
             base_digest: committed.selected.cutoff_digest,
         };
-        let Some(hit) = self.tail_scan(partition, anchor, committed.ledger.last_writable) else {
-            return Ok(None);
-        };
-        let covered = self
-            .engine
-            .tail_release(partition)
-            .map(|(_, through)| through)
-            .filter(|through| *through >= hit.head);
-        Ok(Some((hit, covered)))
+        Ok(self.tail_scan(partition, anchor, committed.ledger.last_writable))
     }
 
     /// Warn `copy_needs_forget_tail` for `hit` once per `(partition, copy)` (rev 5 M1), with the
@@ -1116,17 +1101,6 @@ impl Host {
             }
             install.begun = true;
             self.offer_tail_held.remove(&partition);
-            if let Some((from, head, through)) = install.released {
-                tracing::warn!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    copy = install.offer.copy.0,
-                    from = from.0,
-                    head = head.0,
-                    through = through.0,
-                    "snapshot_install_discards_released_tail"
-                );
-            }
             self.dormant_ladders.remove(&partition);
             self.inventory_ladders.remove(&partition);
             self.ladders.remove(&partition);
