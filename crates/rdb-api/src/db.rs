@@ -6959,6 +6959,8 @@ mod failover_tests;
 mod formation_tests;
 #[cfg(test)]
 pub(crate) mod reopen_tests;
+#[cfg(test)]
+mod s80s3_tests;
 
 #[cfg(test)]
 mod rebuild_tests;
