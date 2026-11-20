@@ -15083,21 +15083,27 @@ impl Host {
                 );
                 return Ok(FeedCall::Answer(Ok(page)));
             }
+            // The caller's input, not this node's state: a cursor from another partition's
+            // history reads the same way as divergence. Refused, and logged at warn.
             feed::Resume::Diverged { seq, held } => {
-                tracing::error!(
+                tracing::warn!(
                     node,
                     partition = p,
+                    client = identity.client.0,
                     generation = from.generation.0,
                     seq = seq.0,
                     cursor_digest = %from.digest,
                     held_digest = %held,
+                    why = "the cursor may not belong to this partition's history, or the \
+                           histories diverged",
                     "feed_cursor_diverged"
                 );
                 return refused(
                     ErrorKind::CorruptHistory,
                     format!(
                         "the cursor's record at seq {} of generation {} has another digest on \
-                         node {node}: the histories diverged; next: {FEED_HISTORY_STEP}",
+                         node {node}: the cursor may not belong to partition {p}'s history, or \
+                         the histories diverged; next: {FEED_HISTORY_STEP}",
                         seq.0, from.generation.0
                     ),
                 );

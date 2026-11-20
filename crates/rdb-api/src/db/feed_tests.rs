@@ -257,11 +257,15 @@ fn f87_1_promote_to_tailing_secondary_resumes_without_gap_or_repeat() {
 
 /// The owner's feed is every published write in order with its object ids (the open's own
 /// record, with no `User` write, is skipped), and a cursor whose digest is not the record's is
-/// `CORRUPT_HISTORY`, claiming no mutation.
-/// Cut: `feed::resume` skips the digest comparison, red (a page, not the error).
+/// `CORRUPT_HISTORY`, claiming no mutation. That cursor is the caller's input, so the node logs
+/// it at warn and says it may not belong to this partition's history (review r1).
+/// Cuts: `feed::resume` skips the digest comparison, red (a page, not the error);
+/// `feed_cursor_diverged` back at error, red (level `Error`).
 /// Integration (~2 s): a fresh open.
 #[config_log::retcd_test]
 fn f87_1_owner_feed_matches_puts_in_order_and_a_wrong_digest_is_corrupt_history() {
+    const METHOD: &str =
+        "f87_1_owner_feed_matches_puts_in_order_and_a_wrong_digest_is_corrupt_history";
     let rt = runtime();
     let store = store();
     let dir = config_testkit::fs::temp_dir();
@@ -291,6 +295,24 @@ fn f87_1_owner_feed_matches_puts_in_order_and_a_wrong_digest_is_corrupt_history(
         .expect_err("another digest at the same position");
     assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
     assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error
+            .detail
+            .contains("may not belong to partition 1's history"),
+        "{error:?}"
+    );
+    let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "feed_cursor_diverged")
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["@l"], "Warning", "{lines:?}");
+    assert!(
+        lines[0]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("may not belong to this partition's history")),
+        "{lines:?}"
+    );
 }
 
 /// B1 through a real promote: the owner's feed reaches k2, written while node 2 was cut off, so
