@@ -124,7 +124,15 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
 /// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// Issue #61 (PR-A, design rev 5 M2): this bump adds `WirePeerAsk::Probe`, F1's digest probe of
+/// a copy that another node holds, answered by `Host::probe` in the plan anchor's generation. A
+/// build before it has no such ask and faults on F1's `ProbeDigestAt`, so a mixed cluster is
+/// refused at the handshake. The numbers between main's and this one are held by other branches
+/// in flight (#107, #148), so no two name one number for two vocabularies; whichever merges later
+/// renumbers this constant alone, since every row and message derives the number from it. The
+/// snapshot transfer frames of the same PR ride this bump.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;

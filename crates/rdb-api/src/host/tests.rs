@@ -7464,3 +7464,132 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
     }
     assert!(host.fault.is_none(), "{:?}", host.fault);
 }
+
+/// Issue #61: put on node 2 (index 1) with only nodes 2 and 3 stepped, node 1 being gone,
+/// until one lands; refusals (a pause, a re-plan) are retried. Answers node 2's head after it.
+#[cfg(debug_assertions)]
+fn lands_on_two(trio: &mut Trio, request: u64) -> u64 {
+    let patience = test_patience(Trio::PATIENCE);
+    let deadline = Instant::now() + patience;
+    loop {
+        let (reply, answer) = mpsc::channel();
+        trio.nodes[1]
+            .1
+            .send(Msg::Client(Client {
+                partition: PartitionId(1),
+                call: super::seal_tests::put(request, b"k", 2_000),
+                reply,
+            }))
+            .expect("node 2's mailbox");
+        let last = super::seal_tests::only_until(trio, &[1, 2], "node 2 answers", |_| {
+            answer.try_recv().ok()
+        });
+        if matches!(last, Answer::Txn { .. }) {
+            return trio.status(1).holds.map_or(0, |held| held.applied);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no put landed on node 2: {last:?}"
+        );
+    }
+}
+
+/// Issue #61: every copy of a formed trio applied `writes` puts, then each was trimmed to
+/// `head - keep`; node 1, the primary, is then lost (never stepped again) and node 2 is
+/// promoted. Answers `(through, the generation node 2 committed)` once node 2 serves it.
+#[cfg(debug_assertions)]
+fn trimmed_then_primary_lost(trio: &mut Trio, writes: u64, keep: u64) -> (u64, Generation) {
+    let mut head = 0;
+    let mut request = 1;
+    while head < writes {
+        head = super::catchup_tests::lands(trio, request);
+        request += 1;
+    }
+    trio.until("every copy applied the head", |trio| {
+        (0..3)
+            .all(|at| {
+                trio.status(at)
+                    .holds
+                    .is_some_and(|held| held.applied >= head)
+            })
+            .then_some(())
+    });
+    let through = head - keep;
+    for at in 0..3 {
+        assert_eq!(super::trio::trim(trio, at, through), Ok(Seq(through)));
+    }
+    let committed = |trio: &Trio| {
+        trio.nodes[1]
+            .0
+            .committed
+            .get(&PartitionId(1))
+            .map(|result| result.new_generation)
+    };
+    let before = committed(trio).expect("the bootstrap committed");
+    let promote = super::seal_tests::spawn_promote(trio, 2);
+    let generation = super::seal_tests::only_until(trio, &[1, 2], "node 2 committed", |trio| {
+        committed(trio).filter(|generation| *generation > before)
+    });
+    super::seal_tests::only_until(trio, &[1, 2], "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    (through, generation)
+}
+
+/// Issue #61 S1-R2 (design section 2, A5): the survivor check after a trim. 12 writes, every
+/// copy trimmed to `head - 4`, then the primary (node 1) is lost and node 2 promoted. F1 takes
+/// both survivors, nodes 2 and 3: their inventories prove the anchor's base (seq 0, below F)
+/// from their trim marks, never from a record. The commit pins nodes 2 and 3 and node 2 serves
+/// writes.
+/// Cut: `survivor` reads the base record below F (no mark branch), red (nodes 2 and 3 each log
+/// `inventory_failed{reason=below_floor}`, and node 2 never commits).
+/// Integration (~3 s): bootstrap, writes, the promote's window.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r2_a_trimmed_trio_loses_its_primary_and_lands_on_two_survivors() {
+    const METHOD: &str = "s1_r2_a_trimmed_trio_loses_its_primary_and_lands_on_two_survivors";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), super::catchup_tests::trim_tuned);
+    let (through, generation) = trimmed_then_primary_lost(&mut trio, 12, 4);
+    let reported: BTreeSet<u64> = logged!(METHOD, "inventory_reported")
+        .into_iter()
+        .filter(|line| line["generation"] == generation.0 - 1)
+        .filter_map(|line| line["node"].as_u64())
+        .collect();
+    assert_eq!(reported, BTreeSet::from([2, 3]), "both survivors reported");
+    let pinned: Vec<NodeId> = trio.nodes[1].0.committed[&PartitionId(1)]
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .map(|member| member.node)
+        .collect();
+    assert!(
+        pinned.contains(&NodeId(2)) && pinned.contains(&NodeId(3)),
+        "the commit holds both survivors: {pinned:?}"
+    );
+    let head = lands_on_two(&mut trio, 1_000);
+    assert!(head > through, "node 2 serves past the floor: {head}");
+    assert!(logged!(METHOD, "inventory_failed").is_empty());
+}
+
+/// Issue #61 S1-R10 cut (ii) (design B1): an idle partition trimmed at its head, F = head, then
+/// the primary is lost and node 2 promoted. Both survivors prove the base from their marks and
+/// the record at F, F1 commits, and node 2 serves writes.
+/// Cut: the trim deletes `<= F` (the record at F too), red (node 2 never commits).
+/// Integration (~3 s).
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r10_ii_an_idle_partition_trimmed_at_its_head_survives_its_primary() {
+    const METHOD: &str = "s1_r10_ii_an_idle_partition_trimmed_at_its_head_survives_its_primary";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), super::catchup_tests::trim_tuned);
+    let (through, _) = trimmed_then_primary_lost(&mut trio, 3, 0);
+    let head = lands_on_two(&mut trio, 1_000);
+    assert!(head > through, "node 2 serves past the floor: {head}");
+    assert!(logged!(METHOD, "inventory_failed").is_empty());
+}

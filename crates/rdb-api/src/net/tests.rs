@@ -508,6 +508,17 @@ fn every_message_kind_crosses_the_wire_unchanged() {
                 barrier: 7,
             },
         },
+        // Issue #61 (PR-A's protocol bump): F1's digest probe.
+        Msg::PeerAsk {
+            asker: NodeId(3),
+            partition: PartitionId(1),
+            correlation: zero(),
+            ask: PeerAsk::Probe {
+                copy: CopyId(2),
+                anchor: zero(),
+                seq: rdb_core::contracts::ids::Seq(800),
+            },
+        },
         Msg::DurableProved {
             partition: PartitionId(1),
             barrier: 7,
@@ -1781,7 +1792,34 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
+    assert_eq!(
+        reason,
+        format!("node-2 speaks protocol_version 3, node-1 speaks {PROTOCOL_VERSION}")
+    );
+}
+
+/// Issue #61 (PR-A, design rev 5 M2): a build one protocol version behind this one, which has no
+/// `WirePeerAsk::Probe`, is refused at the handshake naming both versions, never linked to fault
+/// on F1's probe. The number is derived from `PROTOCOL_VERSION`, so a renumber is one line.
+/// Cut: the handshake accepts an older peer (`>` for `!=`) → the link comes up. Integration
+/// (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn t61_a_peer_one_protocol_version_behind_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let previous = PROTOCOL_VERSION - 1;
+    let older = Spec {
+        version: previous,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(
+        reason,
+        format!("node-2 speaks protocol_version {previous}, node-1 speaks {PROTOCOL_VERSION}")
+    );
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

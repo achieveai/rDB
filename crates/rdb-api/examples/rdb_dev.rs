@@ -428,6 +428,11 @@
 //!                                         whose adoption was refused needs no flag), or
 //!                                         the intact rule not holding the partition.
 //!                                         Under `--nodes`, only an admin app may run it
+//! admin trim-history --through N [--node n]
+//!                                         debug builds only (issue #61): delete partition 1's
+//!                                         History below seq N on node n, or on every node this
+//!                                         process runs, keeping the record at N; answers
+//!                                         `trimmed: node n history_floor N` per node
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
@@ -2186,6 +2191,9 @@ fn repl<'scope, 'env>(
                 bad |= !answer(&fork_copy_line(db, node));
             }),
             ["admin", "fork-copy", ..] => Err(FORK_COPY_USAGE.to_owned()),
+            ["admin", "trim-history", rest @ ..] => {
+                trim_history_lines(db, rest).map(|lines| bad |= !answer_all(&lines))
+            }
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
                 bad |= !kind_write_line(
@@ -2942,7 +2950,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
     ];
-    const SUBVERBS: [&str; 28] = [
+    const SUBVERBS: [&str; 29] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -2971,6 +2979,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "client drop-reply",
         "admin repair-element",
         "admin fork-copy",
+        "admin trim-history",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -4082,6 +4091,51 @@ fn root_rewrite(
 /// Why `admin damage <set> --element K` takes only `--as digest` (A-R211).
 const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
      damage a set member with --as digest, or a newer build's set with the root and --as newer";
+
+/// `admin trim-history`'s usage (issue #61).
+const TRIM_HISTORY_USAGE: &str =
+    "admin trim-history --through N [--node n]: N a seq, n is 1, 2 or 3; debug builds only";
+
+/// `admin trim-history --through N [--node n]` (issue #61): a debug-build hook that trims
+/// partition 1's History on node n, or on every node this process runs, to N
+/// ([`Db::trim_history`]). One line per node: `trimmed: node n history_floor N`, or `err ...`
+/// for a node that refused. Release builds answer `err` and change nothing.
+fn trim_history_lines(db: &Db, rest: &[&str]) -> Result<Vec<String>, String> {
+    let (through, node) = match rest {
+        ["--through", n] => (n, None),
+        ["--through", n, "--node", node] | ["--node", node, "--through", n] => {
+            (n, Some(parse_node(node)?))
+        }
+        _ => return Err(TRIM_HISTORY_USAGE.to_owned()),
+    };
+    let through: u64 = through.parse().map_err(|_| TRIM_HISTORY_USAGE.to_owned())?;
+    #[cfg(debug_assertions)]
+    {
+        let nodes: Vec<NodeId> = match node {
+            Some(node) => vec![node],
+            None => db
+                .node_status()
+                .into_iter()
+                .map(|status| status.node)
+                .collect(),
+        };
+        Ok(nodes
+            .into_iter()
+            .map(|node| match db.trim_history(node, through) {
+                Ok(floor) => format!("trimmed: node {} history_floor {floor}", node.0),
+                Err(error) => format!("err admin trim-history node {}: {error}", node.0),
+            })
+            .collect())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (db, through, node);
+        Ok(vec![
+            "err admin trim-history: a debug-build hook; this release build changes nothing"
+                .to_owned(),
+        ])
+    }
+}
 
 /// `admin fork-copy`'s usage (#65 mode C walk).
 const FORK_COPY_USAGE: &str = "admin fork-copy <n>: n is 1, 2 or 3; debug builds only";

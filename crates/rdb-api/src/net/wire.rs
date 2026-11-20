@@ -434,6 +434,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         }
         #[cfg(debug_assertions)]
         local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
+        #[cfg(debug_assertions)]
+        local @ Msg::TrimHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("TrimHistory"), local)))
+        }
     };
     Ok(Outbound::Plain(plain))
 }
@@ -704,6 +708,12 @@ pub enum WirePeerAsk {
         generation: Generation,
         barrier: u64,
     },
+    /// Issue #61 (PR-A's protocol bump): F1's digest probe of one copy, under the plan's anchor.
+    Probe {
+        copy: CopyId,
+        anchor: LineageAnchor,
+        seq: Seq,
+    },
 }
 
 impl From<PeerAsk> for WirePeerAsk {
@@ -742,6 +752,7 @@ impl From<PeerAsk> for WirePeerAsk {
                 generation,
                 barrier,
             },
+            PeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }
@@ -782,6 +793,7 @@ impl From<WirePeerAsk> for PeerAsk {
                 generation,
                 barrier,
             },
+            WirePeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }

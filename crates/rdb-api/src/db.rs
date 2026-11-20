@@ -1831,12 +1831,17 @@ impl Db {
                     },
                     other => refused(other),
                 })?;
-                Self::link_roll(&mut claim.engines, &config.dir, PARTITION, roll)?;
+                let rolled = Self::link_roll(&mut claim.engines, &config.dir, PARTITION, roll)?;
+                if rolled.is_empty() {
+                    return Err(
+                        Self::unrolled(&claim.engines, &store, &found.instance, roll).await,
+                    );
+                }
                 tracing::info!(
                     generation = roll.to.0,
                     from = roll.from.0,
                     base = roll.base.0,
-                    copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    copies = ?rolled.iter().map(|node| node.0).collect::<Vec<_>>(),
                     n,
                     "db_open_rolled_forward"
                 );
@@ -1860,13 +1865,16 @@ impl Db {
                 },
                 other => refused(other),
             })?;
-            Self::link_roll(&mut claim.engines, &config.dir, *partition, roll)?;
+            let rolled = Self::link_roll(&mut claim.engines, &config.dir, *partition, roll)?;
+            if rolled.is_empty() {
+                return Err(Self::unrolled(&claim.engines, &store, &found.instance, roll).await);
+            }
             tracing::info!(
                 partition = partition.0,
                 generation = roll.to.0,
                 from = roll.from.0,
                 base = roll.base.0,
-                copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                copies = ?rolled.iter().map(|node| node.0).collect::<Vec<_>>(),
                 "db_open_rolled_forward"
             );
         }
@@ -2484,6 +2492,8 @@ impl Db {
                         to: record.generation,
                         base: root.predecessor_cutoff,
                         copies,
+                        record: *record,
+                        root: *root,
                     }),
                 }),
                 Err(why) => Err(OpenError::Stale {
@@ -2510,13 +2520,22 @@ impl Db {
         })
     }
 
-    /// Link `roll` on each of its copies, once the decision is claimed.
+    /// Link `roll` on each of its copies, once the decision is claimed, and answer the copies
+    /// linked.
+    ///
+    /// Issue #61 (design section 1a): a copy whose copied inherit meets its own trim floor
+    /// (`HistoryMissing{below_floor:..}`: its History cannot rebuild the parent as of the base)
+    /// is skipped, logged `roll_forward_below_floor` (warn), and left to rejoin behind and be
+    /// rebuilt by snapshot. Nothing was written to it. A roll that skips every copy links none,
+    /// and the caller refuses the open ([`Self::unrolled`]): no open proceeds holding no copy
+    /// of the generation (t4, #137).
     fn link_roll(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
         #[cfg_attr(not(test), allow(unused_variables))] dir: &Path,
         partition: PartitionId,
         roll: &Roll,
-    ) -> Result<(), OpenError> {
+    ) -> Result<Vec<NodeId>, OpenError> {
+        let mut rolled = Vec::new();
         for node in &roll.copies {
             // #62: a crash part way through the roll-forward, in one process.
             #[cfg(test)]
@@ -2526,15 +2545,69 @@ impl Db {
                     node.0
                 )));
             }
-            engines
+            let inherited = engines
                 .get_mut(node)
                 .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
-                .inherit(partition, roll.from, roll.to, roll.base)
-                .map_err(|error| {
-                    OpenError::Node(format!("node {}: roll forward: {error}", node.0))
-                })?;
+                .inherit(partition, roll.from, roll.to, roll.base);
+            match inherited {
+                Ok(_) => rolled.push(*node),
+                Err(rdb_storage::InheritError::HistoryMissing { at })
+                    if at.starts_with("below_floor") =>
+                {
+                    tracing::warn!(
+                        node = node.0,
+                        partition = partition.0,
+                        from = roll.from.0,
+                        to = roll.to.0,
+                        base = roll.base.0,
+                        at,
+                        "roll_forward_below_floor"
+                    );
+                }
+                Err(error) => {
+                    return Err(OpenError::Node(format!(
+                        "node {}: roll forward: {error}",
+                        node.0
+                    )))
+                }
+            }
         }
-        Ok(())
+        Ok(rolled)
+    }
+
+    /// Issue #61 (t4, #137): why an open whose roll-forward linked no copy is refused. The
+    /// owner's copy here and empty is #137's case and says what [`empty_owner_refusal`] says;
+    /// any other open is `Stale`, naming the generation no copy could take.
+    async fn unrolled(
+        engines: &BTreeMap<NodeId, RocksEngine>,
+        store: &Arc<dyn ConfigStore>,
+        instance: &[u8; INSTANCE_LEN],
+        roll: &Roll,
+    ) -> OpenError {
+        let partition = roll.record.partition;
+        let empty_owner = engines
+            .get(&roll.record.owner)
+            .is_some_and(|engine| !engine.lineages().iter().any(|(held, _)| *held == partition));
+        tracing::warn!(
+            partition = partition.0,
+            generation = roll.to.0,
+            from = roll.from.0,
+            base = roll.base.0,
+            empty_owner,
+            "roll_forward_linked_none"
+        );
+        if empty_owner {
+            return empty_owner_refusal(store, instance, &roll.record, &roll.root).await;
+        }
+        OpenError::Stale {
+            generation: roll.to.0,
+            detail: format!(
+                "not rolled forward: no copy of partition {} holds generation {}'s history \
+                 through seq {} any more (each was trimmed below it), so none can take \
+                 generation {}",
+                partition.0, roll.from.0, roll.base.0, roll.to.0
+            ),
+        }
     }
 
     /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
@@ -4216,6 +4289,70 @@ impl Db {
         }
         match answer.recv_timeout(self.timeouts.read) {
             Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
+    /// **Dev tool only**, debug builds (issue #61; `rdb_dev admin trim-history --through N`):
+    /// trim `node`'s copy of partition 1 to `through` ([`Msg::TrimHistory`]): every History
+    /// record below it is deleted, the record at it kept. Answers the new floor, which
+    /// [`NodeStatus::lengths`]' `history_floor` reports from then on.
+    ///
+    /// # Errors
+    ///
+    /// The host's refusal as text (nothing was changed): `inventory_pinned`, `root_unknown`,
+    /// `below_floor`, `engine:<reason>` and the like; `node` not run by this process, stopped,
+    /// or not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn trim_history(&self, node: NodeId, through: u64) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("trim_history", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
+        self.trim_history_for_tests(node, PARTITION, through)
+    }
+
+    /// **Tests only**, debug builds, hidden (issue #61, lead ruling for the S2-R1 and S2-R4
+    /// parity rows): [`Self::trim_history`] on any `partition`, through the same
+    /// [`Msg::TrimHistory`] path, so a row in another crate trims the copy it runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::trim_history`].
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn trim_history_for_tests(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        through: u64,
+    ) -> Result<u64, String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::TrimHistory {
+            partition,
+            through: Seq(through),
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: trim its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done
+                .map(|floor| floor.0)
+                .map_err(|refused| format!("node {}: {refused}", node.0)),
             Err(_) => Err(format!(
                 "node {} did not answer within {:?}",
                 node.0, self.timeouts.read
@@ -5908,6 +6045,10 @@ struct Roll {
     to: Generation,
     base: Seq,
     copies: Vec<NodeId>,
+    /// The record and root the decision read: an open whose roll links no copy (issue #61,
+    /// every copy below its trim floor) is refused from them, as an empty owner is (#137).
+    record: PartitionRecord,
+    root: PartitionRoot,
 }
 
 /// Whether `engine` holds `generation` of partition 1 as a generation it can serve. A full copy

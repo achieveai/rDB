@@ -4448,3 +4448,685 @@ fn issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing() {
         .collect();
     assert_eq!(logged, [(1.into(), 1.into(), true)]);
 }
+
+// ------------------------------------------------------------------ issue #61 (A5) rows
+
+/// Issue #61: trim `generation`'s History on `engine` to `seq`, rooted at `(0, ROOT)`, as the
+/// host's trim stages it. The record at `seq` is kept.
+fn trimmed_to(engine: &mut RocksEngine, generation: Generation, seq: u64) {
+    trimmed_at(engine, generation, seq, (0, Digest::ROOT));
+}
+
+/// [`trimmed_to`], with the mark rooted at `(root_base, root_digest)`.
+fn trimmed_at(engine: &mut RocksEngine, generation: Generation, seq: u64, root: (u64, Digest)) {
+    engine
+        .stage_trim_history(
+            PartitionId(1),
+            generation,
+            TrimFloor {
+                seq: Seq(seq),
+                root_base: Seq(root.0),
+                root_digest: root.1,
+            },
+        )
+        .expect("the trim is staged");
+}
+
+/// Issue #61 (t4's note, design rev 5): check B after a trim. Generation 1 holds seqs 1-6,
+/// trimmed to 4: seqs 4-6 are kept and 1-3 are gone. `has_floor` reads the record at the floor
+/// and finds it, so the trimmed lineage passes check B: a landing of 2 at base 6 links onto it,
+/// as does a missed generation 2 asked of an inventory at base 6.
+/// Cut: `has_floor` reads seq 1 (not the floor), red (`Ok(false)`, the landing refused
+/// `from_has_no_floor`). Unit.
+#[config_log::retcd_test]
+fn t61_trimmed_lineage_passes_check_b() {
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 6);
+        trimmed_to(&mut engine, Generation(1), 4);
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(4));
+    assert_eq!(
+        host.has_floor(p, Generation(1)),
+        Ok(true),
+        "the record at F reads"
+    );
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 6, digests[5])),
+        Ok((Generation(1), Seq(6), digests[5])),
+        "a landing links onto the trimmed lineage"
+    );
+}
+
+/// Issue #61 S1-R3: check B after a trim, both paths and the hole. Generation 1 trimmed to 4
+/// (seqs 4-6 kept): the landing (`land_at`) and the missed link (`inherit_missed_link`, through
+/// an inventory) both pass. A lineage whose floor is 4 and which holds only 5-6, the record at
+/// F missing, is refused `from_has_no_floor` by the landing and
+/// `missed_generation_from_has_no_floor` by the inventory, and nothing is written.
+/// The design's damaged record is a written hole here: `damage_record` leaves a record that
+/// still reads as a value, which is the read-error arm's case, not a hole at F.
+/// Cut: `has_floor` reads seq 1, red (both passing cases refused). Unit.
+#[config_log::retcd_test]
+fn s1_r3_check_b_after_a_trim_links_and_a_hole_at_the_floor_refuses() {
+    const METHOD: &str = "s1_r3_check_b_after_a_trim_links_and_a_hole_at_the_floor_refuses";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    // The trimmed lineage: a landing links, and so does a missed generation.
+    for path_of in ["land", "inventory"] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 6);
+            trimmed_to(&mut engine, Generation(1), 4);
+            digests
+        };
+        let mut host = host_over(&path, &rt);
+        if path_of == "land" {
+            assert_eq!(
+                host.land_at(p, anchor_at(2, 6, digests[5])),
+                Ok((Generation(1), Seq(6), digests[5]))
+            );
+        } else {
+            let answer = host.inventory(p, CopyId(1), anchor_at(2, 6, digests[5]), None, None);
+            assert!(
+                matches!(&answer, RecoveryEvent::InventoryReported(inventory)
+                    if inventory.head == (Seq(6), digests[5])),
+                "the missed generation links onto the trimmed lineage: {answer:?}"
+            );
+            assert!(
+                host.engine.lineages().contains(&(p, Generation(2))),
+                "generation 2 linked"
+            );
+        }
+    }
+
+    // The record at F missing: seqs 5-6 only, floor 4.
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain_after(&mut engine, Generation(1), vec![Digest::ROOT; 4], 2);
+        trimmed_to(&mut engine, Generation(1), 4);
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 6, digests[5])),
+        Err("from_has_no_floor")
+    );
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor_at(2, 6, digests[5]), None, None),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing linked");
+    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        failed,
+        [serde_json::Value::from(
+            "missed_generation_from_has_no_floor"
+        )]
+    );
+}
+
+/// Issue #61 (design rev 4 m-e): `survivor` takes its root rung from a trim mark only when the
+/// mark is the anchor's own generation's and its `root_base` is the anchor's base.
+/// * Own mark: generation 1 holds seqs 1-3, generation 2 is linked onto it at 3 and holds 4-8,
+///   trimmed to 5 at root `(3, d3)`. An anchor at generation 2, base 3, answers: its ladder is
+///   the root rung `(3, d3)` and then the kept records 5-8.
+/// * The same, trimmed at root `(0, ROOT)`: the mark is not rooted at the anchor's base:
+///   `base_below_floor`, never `base_digest_differs`.
+/// * Parent mark: generation 1 holds seqs 1-6, trimmed to 5 at root `(3, d3)`, and generation 2
+///   is linked onto it at 6 (an adopted tail's link, above the anchor's base 3). The mark that
+///   cuts generation 2 is its parent's: `base_below_floor`.
+///
+/// Cut: drop the generation check (`level != generation`), red (the parent mark answers).
+/// Unit.
+#[config_log::retcd_test]
+fn t61_survivor_refuses_a_parent_mark() {
+    let p = PartitionId(1);
+    let rt = current_thread();
+    for root_base in [3, 0] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 3);
+            engine
+                .inherit(p, Generation(1), Generation(2), Seq(3))
+                .expect("link generation 2 at 3");
+            let digests = write_chain_after(&mut engine, Generation(2), digests, 5);
+            let root_digest = if root_base == 3 {
+                digests[2]
+            } else {
+                Digest::ROOT
+            };
+            trimmed_at(&mut engine, Generation(2), 5, (root_base, root_digest));
+            digests
+        };
+        let mut host = host_over(&path, &rt);
+        assert_eq!(
+            host.engine.floor(p, Generation(2)).map(|(level, _)| level),
+            Some(Generation(2))
+        );
+        let answer = host.survivor(p, CopyId(1), anchor_at(2, 3, digests[2]), None);
+        if root_base == 3 {
+            let own = answer.expect("its own mark at its base");
+            assert_eq!(own.head, (Seq(8), digests[7]));
+            assert_eq!(
+                own.ladder,
+                [
+                    (Seq(3), digests[2]),
+                    (Seq(5), digests[4]),
+                    (Seq(6), digests[5]),
+                    (Seq(7), digests[6]),
+                    (Seq(8), digests[7]),
+                ]
+            );
+        } else {
+            assert_eq!(
+                answer.map(|_| ()),
+                Err("base_below_floor"),
+                "rooted elsewhere"
+            );
+        }
+    }
+
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 6);
+        trimmed_at(&mut engine, Generation(1), 5, (3, digests[2]));
+        engine
+            .inherit(p, Generation(1), Generation(2), Seq(6))
+            .expect("link generation 2 at 6");
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    assert_eq!(
+        host.engine.floor(p, Generation(2)).map(|(level, _)| level),
+        Some(Generation(1)),
+        "generation 2 reads under its parent's mark"
+    );
+    assert_eq!(
+        host.survivor(p, CopyId(1), anchor_at(2, 3, digests[2]), None)
+            .map(|_| ()),
+        Err("base_below_floor")
+    );
+}
+
+/// Issue #61 (design rev 4 m-a, N4; rev 5e): a probe is answered in the generation of the
+/// anchor it names, never in a newer one this copy landed since. Generation 1 holds seqs 1-6;
+/// generation 2 takes it at seq 4 and holds its own 5 and 6, whose digests differ from
+/// generation 1's, and is trimmed to 3.
+/// * Generation 1 at seq 6: generation 1's digest. Generation 2 at seq 6: generation 2's.
+/// * Generation 2 at seq 2 (below its floor) and generation 1 at seq 7 (above its head):
+///   `ProbeUnavailable`.
+/// * Generation 3, not held: no answer, `probe_unanswered{anchor_generation_not_held}`.
+///
+/// Cut: answer from the newest held generation, red (generation 1's seq 6 answered with 2's).
+/// Unit.
+#[config_log::retcd_test]
+fn t61_probe_is_answered_in_the_pinned_generation() {
+    const METHOD: &str = "t61_probe_is_answered_in_the_pinned_generation";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let (one, two) = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let one = write_chain(&mut engine, Generation(1), 6);
+        engine
+            .inherit(p, Generation(1), Generation(2), Seq(4))
+            .expect("generation 2 at 4");
+        let two = write_chain_after(&mut engine, Generation(2), one[..4].to_vec(), 2);
+        trimmed_to(&mut engine, Generation(2), 3);
+        (one, two)
+    };
+    assert_ne!(one[5], two[5], "the generations differ at seq 6");
+    let host = host_over(&path, &rt);
+    let probe = |generation: u64, seq: u64| {
+        host.probe(
+            p,
+            CopyId(1),
+            anchor_at(generation, 0, Digest::ROOT),
+            Seq(seq),
+        )
+    };
+    assert_eq!(
+        probe(1, 6),
+        Some(RecoveryEvent::ProbeAnswered {
+            copy: CopyId(1),
+            seq: Seq(6),
+            digest: one[5]
+        })
+    );
+    assert_eq!(
+        probe(2, 6),
+        Some(RecoveryEvent::ProbeAnswered {
+            copy: CopyId(1),
+            seq: Seq(6),
+            digest: two[5]
+        })
+    );
+    for (generation, seq) in [(2, 2), (1, 7)] {
+        assert_eq!(
+            probe(generation, seq),
+            Some(RecoveryEvent::ProbeUnavailable {
+                copy: CopyId(1),
+                seq: Seq(seq)
+            }),
+            "generation {generation} holds no record at {seq}"
+        );
+    }
+    assert_eq!(probe(3, 6), None, "generation 3 is not held");
+    let unanswered: Vec<_> = logged!(METHOD, "probe_unanswered")
+        .into_iter()
+        .map(|line| (line["generation"].clone(), line["reason"].clone()))
+        .collect();
+    assert_eq!(
+        unanswered,
+        [(3.into(), "anchor_generation_not_held".into())]
+    );
+}
+
+/// Issue #61 (design rev 4 m-c): after boot a copy is not trimmed until it has adopted the
+/// partition's newest lineage, or the inventory pin's time has passed. Generation 1 holds seqs
+/// 1-6, trimmed to 2 before this boot. The restarted host refuses a trim to 4
+/// `inventory_pinned` (logged `history_trim_pinned`) and the floor stays 2. Once it lands a
+/// newer generation the pin is released and the same trim goes on; on a second host the pin
+/// expires instead (`inventory_pin_expired`) and the trim goes on too.
+/// Cut: `Host::new` seeds no boot pin, red (the first trim goes on). Unit.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_restarted_holder_does_not_trim_before_adopting() {
+    const METHOD: &str = "t61_a_restarted_holder_does_not_trim_before_adopting";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    for release in ["landed", "expired"] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            write_chain(&mut engine, Generation(1), 6);
+            trimmed_to(&mut engine, Generation(1), 2);
+        }
+        let mut host = host_over(&path, &rt);
+        assert_eq!(
+            host.trim_history_through(p, Seq(4)),
+            Err("inventory_pinned".to_owned()),
+            "{release}: pinned after boot"
+        );
+        assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(2));
+        if release == "landed" {
+            host.landed.insert((p, Generation(2)));
+        } else {
+            host.inventory_pin_millis = 0;
+        }
+        assert_eq!(
+            host.trim_history_through(p, Seq(4)),
+            Ok(Seq(4)),
+            "{release}: released"
+        );
+        assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(4));
+    }
+    assert_eq!(logged!(METHOD, "history_trim_pinned").len(), 2);
+    assert_eq!(logged!(METHOD, "inventory_pin_expired").len(), 1);
+    assert_eq!(logged!(METHOD, "host_history_trimmed").len(), 2);
+}
+
+/// Issue #61 (design rev 4 N4): until the snapshot transfer (A8) lands, a primary whose engine
+/// is trimmed refuses a copy's snapshot catch-up and reads nothing below its floor. Node 1, the
+/// primary, is trimmed to its head; R1's `SnapshotCatchupRequired` for copy 3 logs
+/// `snapshot_catchup_unservable{reason=below_floor, floor}`, no ladder is restored, and
+/// nothing is served.
+/// Cut: the floor refusal removed, red (`snapshot_catchup_served`, rungs from F).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor() {
+    const METHOD: &str = "t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    assert_eq!(
+        super::trio::trim(&mut trio, 0, head),
+        Ok(Seq(head)),
+        "node 1 trimmed to its head"
+    );
+    let site = Site {
+        partition: PartitionId(1),
+        correlation: CorrelationId(u64::MAX),
+    };
+    let host = &mut trio.nodes[0].0;
+    assert_eq!(
+        host.kernel(
+            ModuleName::Replication,
+            &KernelEffect::SnapshotCatchupRequired {
+                copy: CopyId(3),
+                barrier: Seq(head),
+            },
+            site,
+            &[],
+            &StepFences::default(),
+        ),
+        Ok(())
+    );
+    assert_eq!(host.fault, None);
+    assert!(host.primary_ladders.is_empty(), "no ladder restored");
+    let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| {
+            line["@m"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("snapshot_catchup_"))
+        })
+        .map(|line| {
+            (
+                line["@m"].as_str().unwrap_or_default().to_owned(),
+                line["copy"].as_u64(),
+                line["reason"].as_str().map(str::to_owned),
+                line["floor"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [(
+            "snapshot_catchup_unservable".to_owned(),
+            Some(3),
+            Some("below_floor".to_owned()),
+            Some(head)
+        )]
+    );
+}
+
+/// Issue #61: put on whichever trio node admits writes (as `Db` routes a put to the owner)
+/// until one lands, retrying any refusal (a pause, a re-plan) for [`Trio::PATIENCE`]. Answers
+/// the head that node holds after it.
+pub(super) fn lands(trio: &mut Trio, request: u64) -> u64 {
+    let patience = test_patience(Trio::PATIENCE);
+    let deadline = Instant::now() + patience;
+    loop {
+        let owner = (0..trio.nodes.len()).find(|at| trio.status(*at).admits == Some(true));
+        if let Some(at) = owner {
+            let (reply, answer) = mpsc::channel();
+            trio.nodes[at]
+                .1
+                .send(Msg::Client(Client {
+                    partition: PartitionId(1),
+                    call: super::seal_tests::put(request, b"k", 2_000),
+                    reply,
+                }))
+                .expect("the node's mailbox");
+            if matches!(trio.answer(&answer), Answer::Txn { .. }) {
+                return trio.status(at).holds.map_or(0, |held| held.applied);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no put landed within {patience:?}"
+        );
+        for _ in 0..20 {
+            trio.step();
+        }
+    }
+}
+
+/// Issue #61 Trio rows: `note_tests::tune` on the regular rejoin path (no restart shadow).
+pub(super) fn trim_tuned(host: &mut Host) {
+    super::note_tests::tune(host);
+    host.restart_shadow = false;
+}
+
+/// Issue #61: every trio node's `history_floor` and R1 ladder floor, in node order.
+pub(super) fn floors(trio: &Trio) -> Vec<(u64, Option<Seq>)> {
+    trio.nodes
+        .iter()
+        .map(|(host, _, _)| {
+            (
+                host.status(PartitionId(1))
+                    .lengths
+                    .map_or(0, |lengths| lengths.history_floor),
+                super::trio::ladder_floor(host),
+            )
+        })
+        .collect()
+}
+
+/// Issue #61 S1-R1 (design section 2, A5): write, trim every copy, restart every node. Puts
+/// land, each copy is trimmed to `head - 4` (`Msg::TrimHistory`), and every copy then reports
+/// `history_floor` = its R1 ladder's first rung = F. Nodes 3 and then 2 restart one at a
+/// time (a restarted owner stays out until the folder is opened again, `Db::restart_node`, so
+/// the owner's half is `s1_r1_a_trimmed_folder_reopens_and_serves`, a reopen of every node).
+/// Each restarted copy reports its inventory from its engine, the ladder rebuilt from F
+/// (the root rung, then F through its head: `inventory_ladder{rungs = head - F + 2}`), never
+/// from `(0, ROOT)`, and a put lands after every restart. Every copy keeps `history_floor` F and
+/// no R1 ladder holds a rung below F. After a re-plan the receivers of the new generation start
+/// at its cutoff, above F (A3's `on_recovered`), so "first rung = F" is asserted right after
+/// the trim and "no rung below F" after each restart. The design's 1,000 writes and F = 800
+/// are 12 and 8 here: the claim is about where the ladder starts, not how long it is.
+/// Right after the trim, every node's full ladder read (`dormant_rungs`, what a dormant restore
+/// gives its receiver) starts at F with the digest kept there; that clause is function level,
+/// since no row restores a dormant copy of a trimmed generation. The inventory builds its own
+/// base (`inventory_ladder`), so the restarts do not reach `first_rung`.
+/// Cut: `first_rung` ignores the floor (`(0, ROOT)`), red (the full read is refused
+/// `below_floor`).
+/// Integration (~2 s): bootstrap, two restarts and their re-plans.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r1_a_trimmed_trio_restarts_and_serves_with_its_ladders_at_the_floor() {
+    const METHOD: &str = "s1_r1_a_trimmed_trio_restarts_and_serves_with_its_ladders_at_the_floor";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), trim_tuned);
+    let mut request = 1;
+    let mut head = 0;
+    while head < 12 {
+        head = lands(&mut trio, request);
+        request += 1;
+    }
+    let through = head - 4;
+    // Every copy must hold `through` before it is trimmed there.
+    trio.until("every copy applied the head", |trio| {
+        (0..3)
+            .all(|at| {
+                trio.status(at)
+                    .holds
+                    .is_some_and(|held| held.applied >= head)
+            })
+            .then_some(())
+    });
+    for at in 0..3 {
+        assert_eq!(
+            super::trio::trim(&mut trio, at, through),
+            Ok(Seq(through)),
+            "node {} trimmed",
+            at + 1
+        );
+    }
+    assert_eq!(floors(&trio), vec![(through, Some(Seq(through))); 3]);
+    // Function level: no row here restores a dormant copy of the trimmed generation, the one
+    // caller that reads `first_rung` there, so the full read it would restore is checked direct.
+    for (at, (host, _, _)) in trio.nodes.iter().enumerate() {
+        let generation = host.newest_held(PartitionId(1)).expect("a held generation");
+        let first = host
+            .dormant_rungs(PartitionId(1), generation)
+            .map(|rungs| rungs.first().copied());
+        let at_floor = host
+            .digest_at(PartitionId(1), generation, Seq(through))
+            .expect("the record at the floor is kept");
+        assert_eq!(
+            first,
+            Ok(Some((Seq(through), at_floor))),
+            "node {}'s full read starts at F",
+            at + 1
+        );
+    }
+    for n in [3, 2] {
+        // (base, head, rungs) of each inventory this node reported: its ladder holds the root
+        // and then F through its head when its base is below F, else its base through its head.
+        let ladders = |node: u32| -> Vec<(u64, u64, u64)> {
+            let rungs = logged!(METHOD, "inventory_ladder")
+                .into_iter()
+                .filter(|line| line["node"] == node)
+                .map(|line| line["rungs"].as_u64().expect("rungs"));
+            logged!(METHOD, "inventory_reported")
+                .into_iter()
+                .filter(|line| line["node"] == node)
+                .map(|line| {
+                    (
+                        line["base"].as_u64().expect("base"),
+                        line["head"].as_u64().expect("head"),
+                    )
+                })
+                .zip(rungs)
+                .map(|((base, head), rungs)| (base, head, rungs))
+                .collect()
+        };
+        let before = ladders(n).len();
+        super::note_tests::restart(&mut trio, dir.path(), n, trim_tuned);
+        head = lands(&mut trio, request);
+        request += 1;
+        trio.until("every copy holds a ladder", |trio| {
+            trio.nodes
+                .iter()
+                .all(|(host, _, _)| super::trio::ladder_floor(host).is_some())
+                .then_some(())
+        });
+        let (base, held, rungs) = ladders(n).get(before).copied().expect("an inventory");
+        let expected = if base < through {
+            held - through + 2
+        } else {
+            held - base + 1
+        };
+        assert_eq!(
+            rungs, expected,
+            "node {n}'s inventory ladder after its restart, base {base}, head {held}"
+        );
+        if n == 3 {
+            assert!(base < through, "the first restart reports below the floor");
+        }
+        for (node, (floor, ladder)) in floors(&trio).into_iter().enumerate() {
+            assert_eq!(floor, through, "node {}'s history_floor", node + 1);
+            assert!(
+                ladder.is_some_and(|first| first >= Seq(through)),
+                "node {}'s ladder starts at {ladder:?}, below {through}",
+                node + 1
+            );
+        }
+    }
+    assert!(
+        logged!(METHOD, "inventory_failed").is_empty(),
+        "every inventory answered"
+    );
+    tracing::info!(head, through, floors = ?floors(&trio), "s1_r1_done");
+}
+
+/// Issue #61 (t3's minor, design rev 5): with live re-add off, a refused receiver re-anchors on
+/// its highest rung at or below the cutoff; the host keeps its ladder floor at the engine's trim
+/// floor, so for a cutoff below F there is none and it anchors at the root (A3's
+/// `on_recovered`). Node 2, a secondary of a formed trio, applied 8 or more records and holds a
+/// live receiver whose ladder is dense from the root. The host trims node 2 to `head - 2`: the
+/// engine and the ladder both start there. Node 2 then hears generation `g + 1` committed
+/// `ReadOnly` at cutoff 2 (from node 1's commit), a prefix it holds past: its landing is
+/// refused `held_past_base`, and with re-add off its receiver stays, unmarked. The `Recovered`
+/// finds no rung at or below 2: the receiver anchors at the new generation's root `(0, ROOT)`,
+/// never on rung 2, whose History is gone.
+/// Cut: the host's trim leaves R1's ladder whole (no `Replication::trim_history`, no
+/// `align_ladders`), red (the receiver anchors at rung 2). The design's cut, `align_ladders`
+/// skipped after `Recovered`, is not observable in one step: that alignment runs after the
+/// step that re-anchors, so it guards the next `Recovered`, not this one.
+/// Integration (~2 s): bootstrap, writes, then direct calls on node 2.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_refused_receiver_without_live_readd_anchors_at_root_below_floor() {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), trim_tuned);
+    let mut head = 0;
+    let mut request = 1;
+    while head < 8 {
+        head = lands(&mut trio, request);
+        request += 1;
+    }
+    trio.until("node 2 applied the head", |trio| {
+        trio.status(1)
+            .holds
+            .is_some_and(|held| held.applied >= head)
+            .then_some(())
+    });
+    let generation = trio.status(1).holds.expect("node 2 holds").generation;
+    assert_eq!(
+        super::trio::ladder_floor(&trio.nodes[1].0),
+        Some(Seq::ZERO),
+        "node 2's ladder is dense from the root"
+    );
+    let cutoff_digest = trio.nodes[1]
+        .0
+        .digest_at(p, generation, Seq(2))
+        .expect("node 2 holds seq 2");
+    let mut result = (*trio.nodes[0].0.committed[&p]).clone();
+    result.new_generation = Generation(generation.0 + 1);
+    result.selected.root.generation = result.new_generation;
+    result.selected.cutoff_seq = Seq(2);
+    result.selected.cutoff_digest = cutoff_digest;
+    result.retained_status_map.predecessor_generation = generation;
+    result.mode = PartitionMode::ReadOnly;
+    let through = head - 2;
+    assert_eq!(super::trio::trim(&mut trio, 1, through), Ok(Seq(through)));
+    let host = &mut trio.nodes[1].0;
+    host.live_readd.on = false;
+    assert_eq!(
+        super::trio::ladder_floor(host),
+        Some(Seq(through)),
+        "the ladder is trimmed too"
+    );
+    assert_eq!(
+        host.land_link(p, &result),
+        Ok(None),
+        "the landing is refused"
+    );
+    host.push(
+        Site {
+            partition: p,
+            correlation: CorrelationId::default(),
+        },
+        EventKind::Kernel(KernelEvent::Recovered(Box::new(result.clone()))),
+        true,
+        None,
+    );
+    host.drain();
+    assert_eq!(host.fault, None);
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), p)
+        .expect("the receiver stays");
+    assert_eq!(receiver.lineage().generation, result.new_generation);
+    assert_eq!(
+        receiver.applied_head(),
+        Head {
+            seq: Seq::ZERO,
+            digest: Digest::ROOT
+        },
+        "anchored at the root, not at rung 2"
+    );
+}
