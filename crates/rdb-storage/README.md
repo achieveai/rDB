@@ -167,7 +167,7 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `inherit_copy_batch`, `inherit_copy_restart` | `partition, to, batch, batches, keys` / `partition, to, cleared` |
 | `rdb_storage` | `meta_write_refused`, `sealed_generation_write_refused`, `staging_generation_write_refused` (ERROR) | `partition, generation, seq` + `sealed_by` / `parent, base` |
 | `rdb_storage` | `wal_sync_ancestor` | `partition, generation, durable` |
-| `rdb_storage` | `batch_commit` | `partition, generation, seq, writes, applied` |
+| `rdb_storage::engine::batch` | `batch_commit` (DEBUG; one per batch, #158) | `partition, generation, seq, writes, applied` |
 | `rdb_storage` | `format_marker_moved_for_ack_floor` (the commit that first carries an ack floor on a format-1 copy) | `partition, generation, seq, from_format, format` |
 | `rdb_storage` | `dedup_delete_below` / `dedup_delete_unknown_lineage`, `dedup_delete_failed` (ERROR) | `partition, generation` + `levels, end_hex` / `error` |
 | `rdb_storage` | `dedup_trim_deleted` / `dedup_trim_unknown_lineage`, `dedup_trim_value_undecodable`, `dedup_trim_read_failed`, `dedup_trim_delete_failed` (ERROR) | `partition, generation` + `below, scanned, deleted` / `key_hex` / `error` |

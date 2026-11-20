@@ -2389,6 +2389,13 @@ pub(crate) fn clear_recovery_send_cap(node_dir: &std::path::Path) {
         .retain(|(dir, _)| dir != node_dir);
 }
 
+/// The target of the events a host logs once or more per write (#158): `reply`, `client_call`,
+/// `client_compile`, `txn_dispatch`, `step_view`, `authority_view` and `publication_fact`. In
+/// production they are debug (the change of state among them info), so `info` keeps them out;
+/// a target of their own lets a filter turn them on, in a test or a diagnosis, without every
+/// other debug line of `rdb_api`.
+pub const WRITE_LOG_TARGET: &str = "rdb_api::host::write";
+
 /// Test-only: node directories whose host, started afterwards, summarises refusals over the
 /// window given instead of [`refusals::WINDOW_MS`], so a row sees several windows close in
 /// well under a second (#158).
@@ -5964,6 +5971,7 @@ impl Host {
         macro_rules! authority_view {
             ($level:expr) => {
                 tracing::event!(
+                    target: WRITE_LOG_TARGET,
                     $level,
                     node = self.node.0,
                     partition = view.lineage.partition.0,
@@ -6045,6 +6053,7 @@ impl Host {
         }
         let view = self.authority_views.get(&batch.partition);
         tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = batch.partition.0,
             request = admitted.req.identity.request.0,
@@ -6322,6 +6331,7 @@ impl Host {
                 format!("step view of p{} g{}: {fault:?}", partition.0, generation.0)
             })?;
         tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
@@ -6651,11 +6661,11 @@ impl Host {
                     // A status is published every step (#158): debug. A mode change or a
                     // quarantine is a change of state: info.
                     PublicationEffect::Status(_) => {
-                        tracing::debug!(node, ?effect, "publication_fact");
+                        tracing::debug!(target: WRITE_LOG_TARGET, node, ?effect, "publication_fact");
                         Ok(())
                     }
                     PublicationEffect::Mode { .. } | PublicationEffect::Quarantined { .. } => {
-                        tracing::info!(node, ?effect, "publication_fact");
+                        tracing::info!(target: WRITE_LOG_TARGET, node, ?effect, "publication_fact");
                         Ok(())
                     }
                     _ => Err(unsupported(self.node, "publication_effect")),
@@ -14435,6 +14445,7 @@ impl Host {
                 macro_rules! client_compile {
                     ($level:expr) => {
                         tracing::event!(
+                            target: WRITE_LOG_TARGET,
                             $level,
                             node = self.node.0,
                             partition = partition.0,
@@ -14584,6 +14595,7 @@ impl Host {
             _ => None,
         };
         tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = partition.0,
             client = identity.client.0,
@@ -14945,7 +14957,7 @@ impl Host {
         };
         // Every reply is one line per request, at debug (#158). A refusal is also counted, so
         // info carries its key's first refusal and one summary per window, not one line each.
-        tracing::debug!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        tracing::debug!(target: WRITE_LOG_TARGET, node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
         if let ReplyEffect::Failed { error, .. } = reply {
             self.note_refusal(partition, identity, error);
         }
