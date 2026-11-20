@@ -1277,7 +1277,7 @@ mod routed {
     use rdb_core::contracts::version::ENVELOPE_VERSION;
     use rdb_core::protection::HEALTH_EVAL_TIMER;
     use rdb_core::replication::catchup::CatchupCursor;
-    use rdb_core::replication::progress::{ProgressTracker, TrackerInit};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
     use rdb_core::replication::wire::encode_reply;
     use rdb_core::replication::Replication;
 
@@ -1357,6 +1357,11 @@ mod routed {
 
     /// Replication hosting A's primary side, head 12, and no cursor.
     pub(super) fn primary() -> Replication {
+        primary_with(ladder())
+    }
+
+    /// [`primary`] vouching for `history` instead of the fixture's 5..=12.
+    pub(super) fn primary_with(history: DigestLadder) -> Replication {
         let mut config = PartitionConfig::new(
             P,
             CONFIG,
@@ -1371,7 +1376,7 @@ mod routed {
             config,
             own: CopyId(0),
             lineage: lineage(),
-            history: ladder(),
+            history,
             local: ReplicaProgress {
                 received: ReceivedSeq(HEAD),
                 buffered_applied: AppliedSeq(HEAD),
@@ -1675,4 +1680,70 @@ fn m9_f3_b_an_unverifiable_repeat_does_not_reach_a_cursor_with_no_mark() {
     let effects = step(&mut module, 1, from_b(&b_ack(0, 0))).expect("routed");
     assert_eq!(effects, vec![replica(ReplicaIgnoreReason::Recorded)]);
     assert_eq!(module, before, "the stale ACK changes nothing");
+}
+
+// ---- issue #61: the ladder floor ----
+
+/// Issue #61 A3 (history-trim design §1b): a primary whose ladder still holds the genesis rung
+/// walks a copy that asks from the root from record 1. After `Replication::trim_history` to 5,
+/// History holds 5..=12 only, so the same `NeedPrefix{have 0, ROOT}` must ask for a snapshot:
+/// record 1 is gone from the engine. A need at the floor still walks (6 is sent), and one below
+/// it asks for a snapshot. A refused trim — no side on the node, above the head, a contradicting
+/// digest — changes nothing.
+/// Cut: `trim_below` keeps `(0, ROOT)` (`*held >= seq || *held == Seq::ZERO`), red (record 1 is
+/// sent after the trim).
+#[retcd_test]
+fn t61_need_prefix_zero_after_trim_asks_snapshot() {
+    use rdb_core::contracts::errors::RdbError;
+    use rdb_core::contracts::ids::{NodeId, PartitionId};
+    use routed::{from_b, primary_with, sends, step};
+    const A: NodeId = NodeId(1);
+    const P: PartitionId = PartitionId(4);
+
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    for seq in 1..=HEAD {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut untrimmed = primary_with(history.clone());
+    let effects = step(&mut untrimmed, 0, from_b(&need_prefix(0, Digest::ROOT))).expect("routed");
+    assert_eq!(
+        sends(&effects),
+        vec![1],
+        "control: the root walks from 1 {effects:?}"
+    );
+
+    let mut module = primary_with(history);
+    let invalid = |field| Err(RdbError::InvalidArgument { field });
+    for (name, node, seq, digest, field) in [
+        ("no side on the node", NodeId(9), Seq(5), d(5), "side"),
+        ("above the head", A, Seq(HEAD + 1), d(HEAD + 1), "seq"),
+        ("contradicts the rung held", A, Seq(5), d(6), "digest"),
+    ] {
+        let before = module.clone();
+        assert_eq!(
+            module.trim_history(node, P, seq, digest),
+            invalid(field),
+            "{name}"
+        );
+        assert_eq!(module, before, "{name}: nothing changes");
+    }
+    assert_eq!(module.trim_history(A, P, Seq(5), d(5)), Ok(()));
+    let ladder = module.primary(A, P).expect("installed").tracker().history();
+    assert_eq!(ladder.floor(), Some(Seq(5)));
+    assert_eq!(
+        ladder.lookup(Seq::ZERO, Digest::ROOT),
+        DigestLookup::NotRetained
+    );
+
+    let effects = step(&mut module, 1, from_b(&need_prefix(0, Digest::ROOT))).expect("routed");
+    assert_eq!(effects, vec![snapshot()], "the root is below the floor");
+    let effects = step(&mut module, 2, from_b(&need_prefix(4, d(4)))).expect("routed");
+    assert_eq!(effects, vec![snapshot()], "4 is below the floor");
+    let effects = step(&mut module, 3, from_b(&need_prefix(5, d(5)))).expect("routed");
+    assert_eq!(
+        sends(&effects),
+        vec![6],
+        "the floor itself walks {effects:?}"
+    );
 }

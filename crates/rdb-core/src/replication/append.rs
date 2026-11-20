@@ -56,7 +56,7 @@ use crate::contracts::membership::{CopyId, Member, PartitionConfig};
 use crate::contracts::storage::{Batch, Namespace, StoreEffect, Write};
 use crate::contracts::transport::{Frame, PeerLabel, SendEffect};
 use crate::contracts::version::ENVELOPE_VERSION;
-use crate::replication::progress::{DigestLadder, DigestLookup};
+use crate::replication::progress::{dense_through, trim_refusal, DigestLadder, DigestLookup};
 use crate::replication::wire::{decode_recovery_append, encode_reply};
 use crate::replication::{ignored, quarantine_alert};
 
@@ -353,27 +353,23 @@ impl AppendReceiver {
         self.recovery_plan.as_ref()
     }
 
-    /// Give a dormant receiver the digests its engine verified, `(0, ROOT)` through its applied
-    /// head, so it can source a catch-up (critic-d7 F2): the cursor looks up the target's head
-    /// and every ACK in this ladder. Built when the first catch-up asks, not at open.
+    /// Give a dormant receiver the digests its engine verified, from the engine's floor
+    /// through its applied head, so it can source a catch-up (critic-d7 F2): the cursor looks up
+    /// the target's head and every ACK in this ladder. Built when the first catch-up asks, not
+    /// at open. The floor is `(0, ROOT)` on an engine never trimmed, and the trim floor
+    /// otherwise (issue #61).
     ///
     /// # Errors
     ///
     /// [`RdbError::InvalidArgument`] when this receiver is not dormant, when a rung is above
     /// the applied head or disagrees with a rung already held, or when the rungs leave a gap
-    /// between 0 and the head. Nothing is written then.
+    /// between their first rung and the head. Nothing is written then.
     pub fn restore_history(&mut self, rungs: &[(Seq, Digest)]) -> Result<(), RdbError> {
         let invalid = |field| Err(RdbError::InvalidArgument { field });
         if !self.dormant {
             return invalid("dormant");
         }
-        let head = self.applied_head.seq.0;
-        let dense = rungs.len() as u64 == head + 1
-            && rungs
-                .iter()
-                .enumerate()
-                .all(|(at, (seq, _))| seq.0 == at as u64);
-        if !dense {
+        if !dense_through(rungs, self.applied_head.seq) {
             return invalid("rungs");
         }
         let disagrees = rungs.iter().any(|&(seq, digest)| {
@@ -387,6 +383,25 @@ impl AppendReceiver {
         for &(seq, digest) in rungs {
             self.history.insert(seq, digest);
         }
+        Ok(())
+    }
+
+    /// Trim the ladder to the floor `(seq, digest)` the host is about to trim History to (issue
+    /// #61): every rung below `seq` is dropped, `(0, ROOT)` with them once `seq` is above 0, and
+    /// the rung at `seq` is kept or written. Live, dormant, retired and quarantined receivers
+    /// alike: a ladder never vouches for a record its engine no longer holds.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `seq` when it is above the applied head, and
+    /// `digest` when it contradicts the rung held at `seq`, or is not the root at 0. Nothing
+    /// changes then.
+    pub fn trim_history(&mut self, seq: Seq, digest: Digest) -> Result<(), RdbError> {
+        if let Some(field) = trim_refusal(&self.history, self.applied_head.seq, seq, digest) {
+            return Err(RdbError::InvalidArgument { field });
+        }
+        self.history.trim_below(seq);
+        self.history.insert(seq, digest);
         Ok(())
     }
 

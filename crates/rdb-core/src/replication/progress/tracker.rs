@@ -33,7 +33,9 @@ use crate::contracts::trace::AckRejectReason;
 use crate::contracts::transport::PeerLabel;
 use crate::replication::{ignored, quarantine_alert};
 
-use super::{proved_durable, view_refusal, DigestLadder, DigestLookup, HeldView};
+use super::{
+    dense_through, proved_durable, trim_refusal, view_refusal, DigestLadder, DigestLookup, HeldView,
+};
 
 /// One copy's progress as the primary believes it.
 ///
@@ -287,8 +289,9 @@ impl ProgressTracker {
     /// The consumer of `SnapshotCatchupRequired` reads them and gives them here, and the next
     /// `NeedPrefix` walks the copy record by record.
     ///
-    /// `rungs` must be dense from 0 through the head, `(Seq(0), Digest::ROOT)` first, and agree
-    /// with every rung the ladder holds. A record past the head was never applied here.
+    /// `rungs` must be dense from their first rung through the head, and agree with every rung
+    /// the ladder holds. The first rung is the engine's trim floor, or `(Seq(0), Digest::ROOT)`
+    /// on an engine never trimmed (issue #61). A record past the head was never applied here.
     ///
     /// # Errors
     ///
@@ -300,12 +303,7 @@ impl ProgressTracker {
         if self.retired {
             return invalid("retired");
         }
-        let head = self.head().0;
-        let dense = rungs.len() as u64 == head + 1
-            && rungs
-                .iter()
-                .enumerate()
-                .all(|(at, (seq, _))| seq.0 == at as u64);
+        let dense = dense_through(rungs, self.head());
         let disagrees = rungs.iter().any(|&(seq, digest)| {
             self.history
                 .digest_at(seq)
@@ -317,6 +315,26 @@ impl ProgressTracker {
         for &(seq, digest) in rungs {
             self.history.insert(seq, digest);
         }
+        Ok(())
+    }
+
+    /// Trim the ladder to the floor `(seq, digest)` the host is about to trim History to (issue
+    /// #61): every rung below `seq` is dropped, `(0, ROOT)` with them once `seq` is above 0, and
+    /// the rung at `seq` is kept or written. An ACK or a `NeedPrefix` below the floor then meets
+    /// `NotRetained` and asks for a snapshot, which is the only answer the trimmed engine can
+    /// give. A retired tracker is trimmed too: it serves nothing, and holds no rung its engine
+    /// lacks.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `seq` when it is above the head, and `digest` when
+    /// it contradicts the rung held at `seq`, or is not the root at 0. Nothing changes then.
+    pub fn trim_history(&mut self, seq: Seq, digest: Digest) -> Result<(), RdbError> {
+        if let Some(field) = trim_refusal(&self.history, self.head(), seq, digest) {
+            return Err(RdbError::InvalidArgument { field });
+        }
+        self.history.trim_below(seq);
+        self.history.insert(seq, digest);
         Ok(())
     }
 
