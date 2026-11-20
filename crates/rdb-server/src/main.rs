@@ -3,7 +3,13 @@
 //! ```text
 //! rdb-server --control E --nodes 1=A,2=B,3=C --cert-dir D --listen 127.0.0.1:P
 //!            [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]
+//!            [--log-max-mb M] [--log-files N]
 //! ```
+//!
+//! Its log is `--log-dir`/`rdb-server.jsonl` (default folder `rdb-server.logs`). It rotates by
+//! size (#158): before a write would take it past `--log-max-mb` (default 256) it becomes
+//! `rdb-server.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at least
+//! 2) files are kept, the live one included. `--log-max-mb 0` never rotates.
 //!
 //! It checks `--listen` first (loopback only, `rdb_server::check_listen`), then opens its `Db`
 //! as an app (`local = []`, links to every node in `--nodes` as app `NAME`, default `pilot-b`,
@@ -32,7 +38,9 @@ use rdb_server::{check_listen, serve, Gateway};
 
 const USAGE: &str = "usage: rdb-server --control host:port[,host:port...] \
                      --nodes 1=ADDR,2=ADDR,3=ADDR[,...] --cert-dir D --listen 127.0.0.1:PORT \
-                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F]\n\
+                     [--app NAME] [--client-id N] [--log-dir L] [--ready-secs S] [--stop-file F] \
+                     [--log-max-mb M] [--log-files N]\n\
+                     log rotation: default 256 MiB x 8 files; --log-max-mb 0 never rotates\n\
                      exits: 0 stopped by Ctrl-C or the stop file; 2 bad arguments, a non-loopback --listen, or \
                      setup; 3 the open or a link was refused; 5 not ready in time; 6 the \
                      listener could not bind";
@@ -49,6 +57,8 @@ struct Args {
     app: String,
     client_id: u32,
     log_dir: PathBuf,
+    /// From `--log-max-mb` and `--log-files`; `None` never rotates (#158).
+    rotate: Option<config_log::SizeRotation>,
     ready: Duration,
     stop_file: Option<PathBuf>,
 }
@@ -61,6 +71,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut app = "pilot-b".to_owned();
     let mut client_id = 100;
     let mut log_dir = None;
+    let mut log_max_mb = None;
+    let mut log_files = None;
     let mut ready = Duration::from_secs(60);
     let mut stop_file = None;
     while let Some(arg) = args.next() {
@@ -100,6 +112,20 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| format!("--client-id takes a number, got {text}"))?;
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
+            "--log-max-mb" => {
+                let text = value("--log-max-mb")?;
+                log_max_mb = Some(
+                    text.parse::<u64>()
+                        .map_err(|_| format!("--log-max-mb takes whole megabytes, got {text}"))?,
+                );
+            }
+            "--log-files" => {
+                let text = value("--log-files")?;
+                log_files = Some(
+                    text.parse::<usize>()
+                        .map_err(|_| format!("--log-files takes a file count, got {text}"))?,
+                );
+            }
             "--stop-file" => stop_file = Some(PathBuf::from(value("--stop-file")?)),
             "--ready-secs" => {
                 let text = value("--ready-secs")?;
@@ -121,6 +147,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let cert_dir = cert_dir.ok_or("--cert-dir is required")?;
     let listen = listen.ok_or("--listen is required")?;
     let log_dir = log_dir.unwrap_or_else(|| PathBuf::from("rdb-server.logs"));
+    let rotate = config_log::SizeRotation::from_flags(log_max_mb, log_files)?;
     Ok(Args {
         control,
         nodes,
@@ -129,6 +156,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         app,
         client_id,
         log_dir,
+        rotate,
         ready,
         stop_file,
     })
@@ -145,6 +173,7 @@ fn main() -> ExitCode {
     let mut log = config_log::LogConfig::for_application("rdb-server");
     log.dir.clone_from(&args.log_dir);
     log.file_name = "rdb-server.jsonl".to_owned();
+    log.rotate = args.rotate;
     let guard = match config_log::init(log) {
         Ok(guard) => guard,
         Err(error) => {

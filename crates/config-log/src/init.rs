@@ -8,6 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::layer::JsonlLayer;
+use crate::rotate::{SizeRotatingFile, SizeRotation};
 
 /// How a process logs.
 #[derive(Debug, Clone)]
@@ -26,6 +27,9 @@ pub struct LogConfig {
     pub also_stderr: bool,
     /// Per-test routing directory (tests only; see [`crate::testing`]).
     pub test_log_dir: Option<PathBuf>,
+    /// Size-based rotation of the file (#158); `None` never rotates. Default
+    /// [`SizeRotation::DEFAULT`]: 256 MiB a file, 8 files kept.
+    pub rotate: Option<SizeRotation>,
 }
 
 impl LogConfig {
@@ -40,6 +44,7 @@ impl LogConfig {
             include_location: true,
             also_stderr: false,
             test_log_dir: None,
+            rotate: Some(SizeRotation::DEFAULT),
         }
     }
 }
@@ -91,8 +96,17 @@ pub(crate) fn build(
     LogInitError,
 > {
     std::fs::create_dir_all(&cfg.dir)?;
-    let appender = tracing_appender::rolling::never(&cfg.dir, &cfg.file_name);
-    let (nb, guard) = tracing_appender::non_blocking(appender);
+    let (nb, guard) = match cfg.rotate {
+        Some(rotation) => tracing_appender::non_blocking(SizeRotatingFile::open(
+            &cfg.dir,
+            &cfg.file_name,
+            rotation,
+        )?),
+        None => tracing_appender::non_blocking(tracing_appender::rolling::never(
+            &cfg.dir,
+            &cfg.file_name,
+        )),
+    };
     let mut guards = vec![guard];
     let writer: Box<dyn Write + Send> = if cfg.also_stderr {
         let (nb_err, g2) = tracing_appender::non_blocking(std::io::stderr());
@@ -125,6 +139,7 @@ pub fn init(cfg: LogConfig) -> Result<LogGuard, LogInitError> {
         dir = %cfg.dir.display(),
         file = %cfg.file_name,
         filter = %cfg.filter,
+        rotate = ?cfg.rotate,
         "logging initialized"
     );
     Ok(LogGuard { _guards: guards })

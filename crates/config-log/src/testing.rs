@@ -99,6 +99,9 @@ pub fn init_test_logging() {
             include_location: true,
             also_stderr: false,
             test_log_dir: Some(dir),
+            // The untagged file holds only lines outside a test span; a test binary does not
+            // run long enough to need rotation.
+            rotate: None,
         };
         let (layer, filter, guards) = build(&cfg).expect("test logging init");
         let installed = tracing_subscriber::registry()
