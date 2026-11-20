@@ -15511,6 +15511,78 @@ mod tests {
         );
     }
 
+    /// #158 option B: a stop summarises the open window. With the production 10 s window, refused
+    /// puts and then a shutdown: the summaries count every refusal the debug lines hold, though
+    /// no window reached its end.
+    /// Cut: the host's stop does not close the open window: no summary, red.
+    /// Integration (~2 s): three node threads, a real pause, then a shutdown.
+    #[config_log::retcd_test]
+    fn r158_a_stop_summarises_the_refusals_of_the_open_window() {
+        const METHOD: &str = "r158_a_stop_summarises_the_refusals_of_the_open_window";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let refused = 30_u64;
+        for n in 0..refused {
+            let paused = db
+                .put(b"c", &n.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+        }
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let debug = lines
+            .iter()
+            .filter(|line| {
+                line["@m"] == "reply"
+                    && line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .count() as u64;
+        assert_eq!(debug, refused, "a debug reply per refusal");
+        let summarised: u64 = lines
+            .iter()
+            .filter(|line| line["@m"] == "refusal_summary")
+            .flat_map(|line| {
+                let top: serde_json::Value =
+                    serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                        .expect("top is JSON");
+                top.as_array().expect("top is an array").clone()
+            })
+            .filter(|key| key["reason"] == "ProtectionPaused")
+            .map(|key| key["count"].as_u64().expect("a count"))
+            .sum();
+        assert_eq!(
+            summarised, refused,
+            "the stop's summary counts every refusal"
+        );
+    }
+
     /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's
     /// last put is still answered after the reopen has written past it: its status is its
     /// outcome, never `Expired`, and never `Unknown` for want of its row.

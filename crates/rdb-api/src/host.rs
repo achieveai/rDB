@@ -3268,6 +3268,9 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // #158: the open window's refusals are summarised now, so a stop loses no count.
+        let closed = self.refusals.stop();
+        self.refusal_summaries(closed);
         // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
         // everywhere and subscribe again: a restarted node would otherwise never be heard. Before
         // the syncer stops and the final marks (#123 review): both wait on the disk, and a stuck

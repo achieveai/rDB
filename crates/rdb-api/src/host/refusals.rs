@@ -15,7 +15,8 @@
 //! refusals in it, the next window opens at its end, so windows chain back to back while
 //! refusals go on, and a key refused in every window is a first only once. When a window closes
 //! with none, a whole window passed quietly: nothing is "previous" any more, no window stays
-//! open, and the next refusal of any key is a first again.
+//! open, and the next refusal of any key is a first again. When the host stops, the open window
+//! closes early, so a stop loses no count.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -143,6 +144,19 @@ impl RefusalLog {
         closed
     }
 
+    /// The host is stopping: close the open window now, whatever its end, and return its summary
+    /// when it holds refusals.
+    pub(crate) fn stop(&mut self) -> Vec<Summary> {
+        self.previous.clear();
+        self.open
+            .take()
+            .map(|(_, tallies)| tallies)
+            .filter(|tallies| !tallies.is_empty())
+            .map(|tallies| self.summarise(tallies))
+            .into_iter()
+            .collect()
+    }
+
     fn summarise(&self, tallies: BTreeMap<Key, Tally>) -> Summary {
         let keys = tallies.len();
         let refusals = tallies.values().map(|tally| tally.count).sum();
@@ -240,6 +254,19 @@ mod tests {
             first,
             "a gap longer than a window ends the previous window's keys"
         );
+    }
+
+    #[test]
+    fn a_stop_summarises_the_open_window_before_its_end() {
+        let mut log = RefusalLog::new(10_000);
+        for request in 1..=5 {
+            log.record(request, (PAUSED, 1), request);
+        }
+        let closed = log.stop();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].refusals, 5);
+        assert_eq!(log.due(), None, "nothing is left open");
+        assert!(log.stop().is_empty(), "a second stop has nothing to say");
     }
 
     #[test]
