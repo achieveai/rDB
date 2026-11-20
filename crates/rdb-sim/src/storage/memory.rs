@@ -745,7 +745,7 @@ impl MemoryEngine {
 
     /// Trim lineage `(partition, generation)`'s History below `floor.seq`, the twin of
     /// `RocksEngine::stage_trim_history` (issue #61). Staged unsynced: a host crash before the
-    /// next sync loses it ([`Lineage::floor_synced`]).
+    /// next sync loses it (`Lineage::floor_synced`).
     ///
     /// The walk follows the chain: the own level is cut at `floor.seq`, a level reached through
     /// links at bases `b1, b2, ..` at `min(floor, b1+1, b2+1, ..)`, and each level cut is marked
