@@ -32,7 +32,9 @@ use config_core::{
 };
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
-use rdb_core::authority::node::{host_of, machine_refusal, parse_addr, NodeRecord, MAX_ADDR_LEN};
+use rdb_core::authority::node::{
+    host_of, machine_refusal, parse_addr, Host, NodeRecord, MAX_ADDR_LEN,
+};
 use rdb_core::authority::partition::{
     prior_of, PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
@@ -754,6 +756,33 @@ pub fn machine_clash(records: &[NodeRecord]) -> Option<String> {
     None
 }
 
+/// Why the control link may not be plaintext for a database whose nodes listen at `addrs`
+/// (#80 S2 ruling 1, ADR-rdb-0024), or `None`: `security` is `Insecure` and some node's address
+/// has a host that is not a loopback IP. A host name counts as another machine, `localhost`
+/// included: only an IP says it is this one. So a one-machine rig on 127.0.0.N (or `[::1]`)
+/// runs without certificates, and anything else needs mutual TLS to rEtcd. The text names the
+/// first such node and its address, and how to give the link TLS. The caller says what was
+/// left undone.
+#[must_use]
+pub fn control_tls_refusal<'a>(
+    addrs: impl IntoIterator<Item = (NodeId, &'a str)>,
+    security: config_core::TransportSecurity,
+) -> Option<String> {
+    if security != config_core::TransportSecurity::Insecure {
+        return None;
+    }
+    let (node, addr) = addrs
+        .into_iter()
+        .find(|(_, addr)| !matches!(host_of(addr), Some(Host::Ip(ip)) if ip.is_loopback()))?;
+    Some(format!(
+        "node {}'s address {addr} is on another machine and the control store link is not TLS: \
+         a database whose nodes are not all on loopback IPs talks to rEtcd over mutual TLS; \
+         pass --control-tls DIR (ca.pem, client.pem, client.key), or embed with a \
+         config_client::GrpcClient under TlsMode::MutualTls",
+        node.0
+    ))
+}
+
 /// How a node list prints in a refusal: `[1@127.0.0.1:7100/127.0.0.1, ...]`.
 fn records_in_words(records: &[NodeRecord]) -> String {
     let each: Vec<String> = records
@@ -1016,6 +1045,17 @@ pub async fn declare(
              written",
             declaration.partitions
         )));
+    }
+    // #80 S2 (ADR-rdb-0024): after the address and machine checks, so their refusals keep
+    // their order, and before anything is read or written.
+    if let Some(why) = control_tls_refusal(
+        records
+            .iter()
+            .map(|record| (record.node, record.addr.as_str())),
+        store.capabilities().transport_security,
+    ) {
+        tracing::warn!(%why, "declare_refused_plaintext_control");
+        return Err(DeclareError::Refused(format!("{why}; nothing was written")));
     }
     // #80 S1b: `Already` only when the node records are this declaration's too, so a run that
     // changed an address is refused, and an S1a store (no records) is refused, not adopted.
