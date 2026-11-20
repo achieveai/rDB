@@ -2016,8 +2016,9 @@ fn t61_install_begin_is_one_batch() {
 /// An inherit from a lineage mid snapshot install is refused (`installing_inherit_refused`):
 /// its view is half written, so neither a link nor a copy may read it. Refused at base 0 (an
 /// empty view a link would accept) and at the barrier S (which would otherwise read as behind
-/// the cutoff), and nothing is written. After `install_finish` the same inherit at S links. Red
-/// if the refusal is dropped (base 0 links a half-installed parent).
+/// the cutoff), and nothing is written. After `install_finish` the same inherit at S links, and
+/// the partition's mean History record size is the barrier's (issue #61 R25). Red if the refusal
+/// is dropped (base 0 links a half-installed parent), or `install_finish` learns nothing.
 #[retcd_test]
 fn t61_inherit_from_installing_lineage_is_refused() {
     use rdb_storage::{InheritError, Inherited};
@@ -2069,6 +2070,18 @@ fn t61_inherit_from_installing_lineage_is_refused() {
     target
         .install_finish(P61, g2, at, &barrier, (Seq::ZERO, Digest::ROOT))
         .expect("finish");
+    // Issue #61 R25: this engine learnt nothing since its reopen, and its History holds only the
+    // barrier, so the mean is that one record, key plus framed value, and not the seed.
+    let learnt = target.history_record_bytes(P61);
+    assert_ne!(
+        learnt, HISTORY_RECORD_BYTES_SEED,
+        "install_finish learnt nothing"
+    );
+    assert_eq!(
+        learnt,
+        t61_exact_history_bytes(&db, g2, 0),
+        "the barrier record"
+    );
     assert_eq!(target.inherit(P61, g2, g3, at), Ok(Inherited::Linked));
     drop((view, source, target));
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
