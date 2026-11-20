@@ -319,6 +319,23 @@ pub(crate) struct Memory {
     no_eligible: BTreeMap<PartitionId, &'static str>,
 }
 
+#[cfg(test)]
+impl Memory {
+    /// Believe `planner` wrote its grant this tick, as a planner that just renewed does,
+    /// without writing it: for rows that sweep directly, and for two planners that both
+    /// believe they hold (R3). Called before each sweep, since the belief lapses as a grant
+    /// does.
+    pub(crate) fn believe_held(&mut self, planner: &Planner) {
+        let now = planner.clock.now();
+        self.held = Some(Held {
+            grant: GrantId(1),
+            expiry_utc_ms: i64::try_from(now.0.saturating_add(planner.budgets.grant_millis))
+                .unwrap_or(i64::MAX),
+            dispatched: now,
+        });
+    }
+}
+
 /// One node process's planner.
 #[derive(Clone)]
 pub(crate) struct Planner {
@@ -503,15 +520,7 @@ impl Planner {
         }
         // Held only while both of A1's rules pass for the last record written: the UTC rule
         // on this clock, and the local rule from the write's dispatch.
-        let now = self.clock.now();
-        let valid = memory.held.filter(|held| {
-            utc_ok(&self.view(now), held.expiry_utc_ms, now, &self.budgets).is_ok()
-                && now
-                    .0
-                    .saturating_sub(held.dispatched.0)
-                    .saturating_add(self.budgets.dispatch_margin_millis)
-                    < self.budgets.grant_millis
-        });
+        let valid = self.still_held(memory.held);
         match (was, valid) {
             (false, Some(held)) => {
                 memory.held = Some(held);
@@ -530,6 +539,21 @@ impl Planner {
                 false
             }
         }
+    }
+
+    /// `held`, while both of A1's rules pass for it now: the UTC rule on this clock, and the
+    /// local rule from the write's dispatch. No side effect: [`Self::hold`] acts on it, and
+    /// [`Self::fail_over`] asks it again right before a promote and after one answers (#81).
+    fn still_held(&self, held: Option<Held>) -> Option<Held> {
+        let now = self.clock.now();
+        held.filter(|held| {
+            utc_ok(&self.view(now), held.expiry_utc_ms, now, &self.budgets).is_ok()
+                && now
+                    .0
+                    .saturating_sub(held.dispatched.0)
+                    .saturating_add(self.budgets.dispatch_margin_millis)
+                    < self.budgets.grant_millis
+        })
     }
 
     fn lose(&self, memory: &mut Memory, reason: &str) {
@@ -679,6 +703,7 @@ impl Planner {
         // Each promote owns what it reads: a future borrowing the sweep's locals is not `Send`
         // for every lifetime, which the planner's spawned task needs.
         let now = Instant::now();
+        let held = memory.held;
         let tasks: Vec<_> = todo
             .into_iter()
             .map(|(dead, (record, members))| {
@@ -691,7 +716,7 @@ impl Planner {
                     .is_some_and(|repeats| repeats.quiet(now));
                 async move {
                     let answer = planner
-                        .fail_over(partition, dead, members.as_deref(), &frozen, quiet)
+                        .fail_over(partition, dead, members.as_deref(), &frozen, quiet, held)
                         .await;
                     (partition, answer)
                 }
@@ -715,7 +740,13 @@ impl Planner {
                         );
                     }
                 }
-                Ok((to, answer)) => {
+                Ok((_, None)) => {
+                    // The grant ran out before this promote: the sweep promotes nothing more
+                    // (every later check reads a later tick), and the next hold renews or not.
+                    memory.no_eligible.remove(&partition);
+                    self.lose(memory, "expired");
+                }
+                Ok((to, Some(answer))) => {
                     memory.no_eligible.remove(&partition);
                     match &answer {
                         Ok(_) => {
@@ -803,6 +834,13 @@ impl Planner {
     /// Choose a target for `partition` and promote it, dropping `dead`: the target and the
     /// promote's answer. `quiet`, for a partition whose promote failed within the window, logs
     /// the decision at debug (PR #119 review); the sweep logs a failure.
+    ///
+    /// `held` is the grant the sweep started under. It is checked again ([`Self::still_held`])
+    /// right before the promote: one it no longer holds is not sent, and the answer is `None`
+    /// (`planner_promote_skipped_grant_expired`). It is checked once more after a promote
+    /// answers `Ok`: a grant that ran out in between is logged `planner_promote_observed`, not
+    /// `planner_promoted`, and the answer is kept. The checks narrow the window and cannot close
+    /// it; the store's fence and the `Fencing` CAS keep a late promote safe (#81).
     async fn fail_over(
         &self,
         partition: PartitionId,
@@ -810,7 +848,8 @@ impl Planner {
         members: Option<&[RecordMember]>,
         frozen: &BTreeSet<NodeId>,
         quiet: bool,
-    ) -> Result<(NodeId, Result<Promoted, PromoteError>), NoEligible> {
+        held: Option<Held>,
+    ) -> Result<(NodeId, Option<Result<Promoted, PromoteError>>), NoEligible> {
         let members = members.ok_or(NoEligible::MembersUnknown)?;
         let mut looks = Vec::new();
         for member in members.iter().filter(|member| member.node != dead) {
@@ -874,17 +913,37 @@ impl Planner {
             member_boot: Arc::new(member_boot),
             send: Arc::new(send),
         };
-        let answer = admin::promote_looked(ctx, refused).await;
-        if let Ok(promoted) = &answer {
+        if self.still_held(held).is_none() {
             tracing::info!(
                 partition = partition.0,
-                owner = promoted.owner.0,
-                prior = promoted.prior_owner.0,
-                generation = promoted.generation.0,
-                "planner_promoted"
+                dead = dead.0,
+                to = to.0,
+                "planner_promote_skipped_grant_expired"
             );
+            return Ok((to, None));
         }
-        Ok((to, answer))
+        let answer = admin::promote_looked(ctx, refused).await;
+        if let Ok(promoted) = &answer {
+            if self.still_held(held).is_some() {
+                tracing::info!(
+                    partition = partition.0,
+                    owner = promoted.owner.0,
+                    prior = promoted.prior_owner.0,
+                    generation = promoted.generation.0,
+                    "planner_promoted"
+                );
+            } else {
+                tracing::info!(
+                    partition = partition.0,
+                    dead = dead.0,
+                    to = to.0,
+                    owner = promoted.owner.0,
+                    generation = promoted.generation.0,
+                    "planner_promote_observed"
+                );
+            }
+        }
+        Ok((to, Some(answer)))
     }
 
     /// #81 X2 (owner answer (a) on #81, 2026-11-19): delete `grants/{node}` when it is a frozen

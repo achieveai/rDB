@@ -13,7 +13,7 @@ use super::*;
 use crate::net::faults::{CutStore, Faults};
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
 use crate::planner::Failover;
-use crate::test_store::{CutCalls, HoldAt, PrefixCut, PutHold};
+use crate::test_store::{ClockOnPut, CutCalls, HoldAt, PrefixCut, PutHold};
 use rdb_core::authority::partition::PartitionLifecycle;
 
 /// One node process.
@@ -1069,6 +1069,8 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
             crate::planner::Memory::default(),
             crate::planner::Memory::default(),
         );
+        ma.believe_held(&planners[0]);
+        mb.believe_held(&planners[1]);
         let (a, b) = rig.rt.block_on(async {
             tokio::join!(planners[0].sweep(&mut ma), planners[1].sweep(&mut mb))
         });
@@ -1562,6 +1564,7 @@ fn own81_promote_failure_warns_once() {
     let mut memory = crate::planner::Memory::default();
     let mut failed = 0;
     until("four promotes are tried", lifetimes(20), || {
+        memory.believe_held(&planner);
         let answers = rig.rt.block_on(planner.sweep(&mut memory));
         for (partition, answer) in &answers {
             assert_eq!(partition.0, p, "{answers:?}");
@@ -1583,6 +1586,7 @@ fn own81_promote_failure_warns_once() {
     assert_eq!(decisions.len(), 1, "the pair, once: {decisions:?}");
 
     cut.lift();
+    memory.believe_held(&planner);
     let answers = rig.rt.block_on(planner.sweep(&mut memory));
     assert!(
         answers
@@ -1627,6 +1631,7 @@ fn sweep_until_acted(
 )> {
     let mut answers = Vec::new();
     until("a sweep acts", lifetimes(20), || {
+        memory.believe_held(planner);
         answers = rig.rt.block_on(planner.sweep(memory));
         !answers.is_empty()
     });
@@ -1670,6 +1675,7 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
         "a promote reaches the freeze",
         Duration::from_secs(60),
         || {
+            memory.believe_held(&interrupted);
             rig.rt.block_on(async {
                 tokio::select! {
                     answers = interrupted.sweep(&mut memory) => {
@@ -1746,6 +1752,7 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
         .filter(|line| line["partition"] == 1)
         .collect();
     assert_eq!(promoted.len(), 1, "{promoted:?}");
+    fresh.believe_held(&restarted);
     let again = rig.rt.block_on(restarted.sweep(&mut fresh));
     assert!(again.is_empty(), "moved once: {again:?}");
     assert_eq!(rig.record(1).generation, after.generation);
@@ -1961,4 +1968,128 @@ fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
         });
     }
     println!("own81_x2 first={first:?} second={second:?}");
+}
+
+/// `G + eps + delta` on `budgets`, plus one: how far a held planner clock is moved past the
+/// moment node 1 stopped for node 1's grant expiry to be proven on it, whenever its last renewal
+/// was.
+fn past_node_grant(budgets: &Budgets) -> u64 {
+    budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis + 1
+}
+
+/// The planner rows of node 2's process over `store`, on a capped `clock` (#81, the grant
+/// re-check). No planner runs in `rig`, so this one alone writes `planner/grant`.
+fn held_planner(
+    rig: &Rig,
+    store: Arc<dyn ConfigStore>,
+    clock: crate::clock::HostClock,
+) -> crate::planner::Planner {
+    crate::planner::Planner {
+        store,
+        clock,
+        ..rig.procs[1]
+            .db
+            .planner(failover())
+            .expect("a node process's planner")
+    }
+}
+
+/// #81, the planner grant re-check, case (a): the planner holds `planner/grant` on a held
+/// clock, node 1 stops, and the grant runs out before the sweep reaches the promote. The
+/// promote is skipped: no `Fencing` write (partition 1 keeps its owner, generation and
+/// lifecycle), `planner_promote_skipped_grant_expired` said exactly once, and the grant lost.
+/// Integration (~5 s): waits for node 1 to be judged silent.
+/// Cut: no re-check before the promote in `fail_over`; the promote lands, red.
+#[config_log::retcd_test]
+fn own81_a_grant_that_ran_out_before_the_promote_sends_no_fence() {
+    const METHOD: &str = "own81_a_grant_that_ran_out_before_the_promote_sends_no_fence";
+    let rig = rig(1, None);
+    let before = rig.record(1);
+    assert_eq!(before.owner, NodeId(1), "{before:?}");
+    let clock = crate::clock::HostClock::capped(1);
+    let planner = held_planner(&rig, Arc::clone(&rig.store), clock);
+    rig.stop(0);
+    let hold = clock.hold();
+    hold.advance(past_node_grant(&planner.budgets));
+    let mut memory = crate::planner::Memory::default();
+    assert!(
+        rig.rt.block_on(planner.hold(&mut memory)),
+        "the planner holds"
+    );
+    hold.advance(planner.budgets.grant_millis);
+    until("a promote is reached", lifetimes(20), || {
+        let answers = rig.rt.block_on(planner.sweep(&mut memory));
+        assert!(answers.is_empty(), "nothing is promoted: {answers:?}");
+        !logged(METHOD, "planner_promote_skipped_grant_expired").is_empty()
+    });
+    let skipped = logged(METHOD, "planner_promote_skipped_grant_expired");
+    assert_eq!(skipped.len(), 1, "said once: {skipped:?}");
+    assert_eq!(
+        (&skipped[0]["partition"], &skipped[0]["dead"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{skipped:?}"
+    );
+    let after = rig.record(1);
+    assert_eq!(
+        (after.owner, after.generation, after.lifecycle),
+        (before.owner, before.generation, before.lifecycle),
+        "no Fencing write: {before:?} -> {after:?}"
+    );
+    let lost: Vec<_> = logged(METHOD, "planner_grant_lost")
+        .into_iter()
+        .filter(|line| line["reason"] == "expired")
+        .collect();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert!(logged(METHOD, "planner_promoted").is_empty());
+}
+
+/// #81, the planner grant re-check, case (b): the planner holds `planner/grant` on a held
+/// clock, node 1 stops, and the grant runs out during the promote: the clock moves past it as
+/// the first `partitions/` write (the `Fencing` CAS) arrives. The promote still lands, and the
+/// answer is unchanged (`Ok`), but it is logged `planner_promote_observed`, never
+/// `planner_promoted`: the count of promotes made under a held grant stays honest.
+/// Integration (~5 s): waits for node 1 to be judged silent.
+/// Cut: no re-check after the promote answers; `planner_promoted` is said, red.
+#[config_log::retcd_test]
+fn own81_a_grant_that_runs_out_during_the_promote_is_logged_observed() {
+    const METHOD: &str = "own81_a_grant_that_runs_out_during_the_promote_is_logged_observed";
+    let rig = rig(1, None);
+    let before = rig.record(1);
+    let clock = crate::clock::HostClock::capped(1);
+    let grant_millis = budgets().grant_millis;
+    let store = ClockOnPut::new(
+        Arc::clone(&rig.store),
+        ControlPrefix::Partitions.encode(),
+        clock.hold(),
+        grant_millis,
+    );
+    let planner = held_planner(&rig, Arc::clone(&store) as Arc<dyn ConfigStore>, clock);
+    assert_eq!(planner.budgets.grant_millis, grant_millis);
+    rig.stop(0);
+    store.hold.advance(past_node_grant(&planner.budgets));
+    let mut memory = crate::planner::Memory::default();
+    assert!(
+        rig.rt.block_on(planner.hold(&mut memory)),
+        "the planner holds"
+    );
+    let mut answers = Vec::new();
+    until("a promote answers", lifetimes(20), || {
+        answers = rig.rt.block_on(planner.sweep(&mut memory));
+        !answers.is_empty()
+    });
+    assert!(
+        answers
+            .iter()
+            .all(|(partition, answer)| partition.0 == 1 && answer.is_ok()),
+        "the promote lands and its answer is kept: {answers:?}"
+    );
+    let after = rig.record(1);
+    assert_ne!(after.owner, NodeId(1), "{after:?}");
+    assert_eq!(after.generation.0, before.generation.0 + 1, "{after:?}");
+    let observed = logged(METHOD, "planner_promote_observed");
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    assert_eq!(observed[0]["partition"], 1, "{observed:?}");
+    assert_eq!(logged(METHOD, "test_clock_moved_on_put").len(), 1);
+    let promoted = logged(METHOD, "planner_promoted");
+    assert!(promoted.is_empty(), "not counted as held: {promoted:?}");
 }
