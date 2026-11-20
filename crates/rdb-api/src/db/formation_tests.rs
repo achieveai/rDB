@@ -3769,8 +3769,10 @@ fn s2_declared_database_forms_and_writes_over_mtls_control() {
 /// leader: red at the declaration. Observed 2026-11-19: `NotLeader` with an unfollowed hint.
 /// Review r1: after the stop, a fresh control sentinel (not an rDB key) is put create-only and
 /// read back exactly, so a control plane that takes no mutation after the stop is red even
-/// when the data plane writes on grants it holds. Cut 2: stop a second voter just before the
-/// sentinel (no quorum for control mutations): the sentinel put fails, red.
+/// when the data plane writes on grants it holds. Cut 2: config-grpc's `put` handler refuses
+/// every put on a voter other than the first that took one (a new leader takes no control
+/// mutation): the sentinel put fails `DeadlineExceededUnknownOutcome`, red (observed
+/// 2026-11-19).
 #[config_log::retcd_test]
 fn s2_control_writes_go_on_after_the_voter_leader_stops() {
     let (mut rig, cluster, client, _certs) = mtls_rig(802);

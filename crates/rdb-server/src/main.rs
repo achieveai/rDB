@@ -497,9 +497,10 @@ mod tests {
     /// mutual-TLS rEtcd whose cluster is not the default, starting at a follower: a
     /// create-only put and its exact read back succeed. Cluster row (~3 s): a 3-voter TLS
     /// rEtcd, the only way to prove the constructor's TLS and cluster wiring.
-    /// Cut 1: `connect_control` uses `GrpcClientOptions::default()` under a TLS folder: the
-    /// TLS voters refuse plaintext, red. Cut 2: it drops `.with_cluster_id`: the follower's
-    /// hint is not followed, red.
+    /// Cut 1: `connect_control` builds a plaintext client under a TLS folder: it reports
+    /// `Insecure`, red at the transport-security assertion. Cut 2: it drops
+    /// `.with_cluster_id`: the put fails `NotLeader` with the hint unfollowed, red (both
+    /// observed 2026-11-19).
     #[config_log::retcd_test]
     fn s2_connect_control_puts_and_reads_back_over_tls_from_a_follower() {
         use config_core::ConfigStore as _;

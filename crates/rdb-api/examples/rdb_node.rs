@@ -2168,9 +2168,10 @@ mod tests {
     /// whose cluster is not the default, starting at a follower: a create-only put and its
     /// exact read back succeed, and the store reports mutual TLS. Cluster row (~3 s): a
     /// 3-voter TLS rEtcd, the only way to prove the constructor's TLS and cluster wiring.
-    /// Cut 1: `control` builds `GrpcClientOptions::default()` under `--control-tls`: the TLS
-    /// voters refuse plaintext, red. Cut 2: `control` drops `.with_cluster_id`: the follower's
-    /// hint is not followed, red.
+    /// Cut 1: `control` builds a plaintext client under `--control-tls`: it reports
+    /// `Insecure`, red at the transport-security assertion. Cut 2: `control` drops
+    /// `.with_cluster_id`: the put fails `NotLeader` with the hint unfollowed, red (both
+    /// observed 2026-11-19).
     #[config_log::retcd_test]
     fn s2_control_constructor_puts_and_reads_back_over_tls_from_a_follower() {
         let rt = tokio::runtime::Builder::new_multi_thread()
