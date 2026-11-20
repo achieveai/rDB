@@ -143,6 +143,19 @@ pub struct RetentionConfig {
     pub keep_millis: u64,
     /// The hard cap on one lineage's History bytes. It overrides a lagging member and a pin.
     pub budget_bytes: u64,
+    /// How long an inventory pin holds at most (design 3.5): the host's
+    /// `Host::inventory_pin_millis`, 10 minutes there.
+    pub inventory_pin_millis: u64,
+}
+
+/// A hold on trimming one partition's History on one node (issue #61, design 3.5), the twin of
+/// the host's `InventoryPin`: taken from boot or from an inventory the node answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InventoryPin {
+    /// Held until the node lands a generation newer than this one.
+    generation: Generation,
+    /// When it was taken: it expires [`RetentionConfig::inventory_pin_millis`] later.
+    since: Tick,
 }
 
 /// The lineage, epoch and membership pin a partition was last adopted at.
@@ -310,6 +323,11 @@ pub struct Dispatcher {
     /// `history_copy_behind_floor` for, until it is counted again: the alert is logged once.
     /// Process memory.
     behind_floor: BTreeSet<(NodeId, PartitionId, CopyId)>,
+    /// Each node's inventory pin per partition (issue #61, design 3.5; the host's
+    /// `inventory_pins`): taken at restart for every partition its engine holds, and on every
+    /// inventory it reports. While held the retention duty trims nothing (`InventoryPinned`).
+    /// Process memory.
+    inventory_pins: BTreeMap<(NodeId, PartitionId), InventoryPin>,
     /// The host's debug-only snapshot hooks, for unit rows only.
     #[cfg(test)]
     snapshot_hooks: SnapshotHooks,
@@ -461,6 +479,7 @@ impl Dispatcher {
             snapshot_installs: BTreeMap::new(),
             retention_samples: BTreeMap::new(),
             behind_floor: BTreeSet::new(),
+            inventory_pins: BTreeMap::new(),
             #[cfg(test)]
             snapshot_hooks: SnapshotHooks::default(),
             committed: BTreeMap::new(),
@@ -858,6 +877,7 @@ impl Dispatcher {
         self.engines.insert(node, image.reopen(node));
         self.members.insert(node, boot);
         self.rebuild_kernels(node);
+        self.pin_from_boot(node);
         self.reread_roots(node);
         // The control root is durable: a member that was down when its watch fired hears it now.
         self.release(self.clock.now(), |reason, watch| {
@@ -904,6 +924,7 @@ impl Dispatcher {
         self.snapshot_installs.retain(|(held, _), _| *held != node);
         self.retention_samples.retain(|(held, _), _| *held != node);
         self.behind_floor.retain(|(held, _, _)| *held != node);
+        self.inventory_pins.retain(|(held, _), _| *held != node);
         let to_node: Vec<_> = self
             .snapshot_transfers
             .iter()
@@ -3386,6 +3407,8 @@ impl Dispatcher {
     /// * A copy behind the floor is logged `history_copy_behind_floor` once, until it is counted
     ///   again.
     /// * A hold ([`Self::retention_hold`]) trims nothing, logged `history_trim_held{reason}`.
+    ///   An inventory pin is released first when it no longer holds
+    ///   ([`Self::release_inventory_pin`]).
     ///
     /// # Errors
     ///
@@ -3422,6 +3445,7 @@ impl Dispatcher {
             .record(now, applied, config.keep_millis)
             .map_err(|field| SimError::Config { field })?;
         let keep = samples.keep_seq(now, config.keep_millis);
+        self.release_inventory_pin(node, partition, now, config.inventory_pin_millis);
         let copies = self.replication.primary(node, partition).map(|primary| {
             let tracker = primary.tracker();
             tracker
@@ -3502,8 +3526,11 @@ impl Dispatcher {
     /// * `LandingPending`: a member watch for the node and partition has not landed, fired or
     ///   held.
     ///
-    /// Not found here: `Staging` (the memory engine has no staged copy), and `InventoryPinned`
-    /// and `Grace`, which the simulator does not keep yet.
+    /// * `InventoryPinned`: the node holds an inventory pin on the partition
+    ///   ([`Self::inventory_pins`]).
+    ///
+    /// Not found here: `Staging` (the memory engine has no staged copy), and `Grace`, which the
+    /// simulator does not keep yet.
     fn retention_hold(
         &self,
         node: NodeId,
@@ -3532,7 +3559,67 @@ impl Dispatcher {
             .values()
             .chain(self.held.iter().map(|(_, watch)| watch))
             .any(|watch| watch.member == node && watch.partition == partition);
-        landing.then_some(RetentionHold::LandingPending)
+        if landing {
+            return Some(RetentionHold::LandingPending);
+        }
+        self.inventory_pins
+            .contains_key(&(node, partition))
+            .then_some(RetentionHold::InventoryPinned)
+    }
+
+    /// Release `node`'s inventory pin on `partition` when it no longer holds at `now` (design
+    /// 3.5), as the host's trim does: silently once the node has landed a generation newer than
+    /// the pin's, else after `pin_millis`, logged `inventory_pin_expired`.
+    fn release_inventory_pin(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        now: Tick,
+        pin_millis: u64,
+    ) {
+        let Some(pin) = self.inventory_pins.get(&(node, partition)).copied() else {
+            return;
+        };
+        let landed_past = self
+            .landed
+            .iter()
+            .any(|(n, p, g)| (*n, *p) == (node, partition) && *g > pin.generation);
+        if landed_past {
+            self.inventory_pins.remove(&(node, partition));
+        } else if now >= pin.since.plus_millis(pin_millis) {
+            self.inventory_pins.remove(&(node, partition));
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                generation = pin.generation.0,
+                millis = pin_millis,
+                "inventory_pin_expired"
+            );
+        }
+    }
+
+    /// Pin every partition `node`'s engine holds at its newest generation, from now (the host's
+    /// boot pins, design 3.5 rev 4 m-c): a restarted holder trims nothing until it lands a newer
+    /// generation or the pin expires.
+    fn pin_from_boot(&mut self, node: NodeId) {
+        let now = self.clock.now();
+        let Some(engine) = self.engines.get(&node) else {
+            return;
+        };
+        let mut newest: BTreeMap<PartitionId, Generation> = BTreeMap::new();
+        for (&(partition, generation), _) in engine.lineages() {
+            let held = newest.entry(partition).or_insert(generation);
+            *held = (*held).max(generation);
+        }
+        for (partition, generation) in newest {
+            self.inventory_pins.insert(
+                (node, partition),
+                InventoryPin {
+                    generation,
+                    since: now,
+                },
+            );
+        }
     }
 
     /// Align `node`'s installed R1 sides of `partition` to its engine's trim floor in
@@ -3597,7 +3684,16 @@ impl Dispatcher {
     ) -> Result<(), SimError> {
         let answer = match self.survivors.get(&(site.1, copy)) {
             Some((holder, inventory)) if self.can_report(*holder) => {
-                let current = self.current_inventory(*holder, site.1, inventory)?;
+                let holder = *holder;
+                let current = self.current_inventory(holder, site.1, inventory)?;
+                // What this answer reported stays provable until the run lands (design 3.5).
+                self.inventory_pins.insert(
+                    (holder, site.1),
+                    InventoryPin {
+                        generation: current.anchor_seen.lineage.generation,
+                        since: now,
+                    },
+                );
                 RecoveryEvent::InventoryReported(Box::new(current))
             }
             _ => RecoveryEvent::InventoryFailed { copy },
@@ -6013,6 +6109,7 @@ mod dormant_twin_tests {
     const RETAIN: super::RetentionConfig = super::RetentionConfig {
         keep_millis: 1_000,
         budget_bytes: u64::MAX,
+        inventory_pin_millis: 600_000,
     };
 
     /// Sync node 1's engine through `through` of generation 1.
@@ -6503,6 +6600,7 @@ mod dormant_twin_tests {
         let tight = super::RetentionConfig {
             keep_millis: 3_600_000,
             budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(floor)),
+            ..RETAIN
         };
         assert_eq!(
             dispatcher.retention_duty(OWNER, P, Tick(0), tight),
@@ -6567,5 +6665,168 @@ mod dormant_twin_tests {
             1,
             "node 3's ACK at the head is queued for node 1"
         );
+    }
+
+    /// Node 1 answers an inventory for its own copy 0 now: the survivor is placed at its head
+    /// `head` and F1's `QueryInventory` is served (design 3.5's pin, taken on the answer).
+    fn owner_answers_inventory(
+        dispatcher: &mut Dispatcher,
+        seed: &DormantSeed,
+        head: u64,
+        scheduler: &mut Scheduler,
+    ) {
+        use rdb_core::contracts::ids::CorrelationId;
+        use rdb_core::contracts::recovery::{LineageAnchor, SurvivorInventory};
+
+        let history = canonical_history(seed.lineage, ConfigVersion(1), head).expect("history");
+        dispatcher
+            .place_survivor(
+                OWNER,
+                P,
+                SurvivorInventory {
+                    copy: CopyId(0),
+                    anchor_seen: LineageAnchor {
+                        lineage: seed.lineage,
+                        base_seq: Seq::ZERO,
+                        base_digest: Digest::ROOT,
+                    },
+                    head: (Seq(head), history.digest(head)),
+                    ladder: Vec::new(),
+                    quarantined: None,
+                    holds_last_writable: true,
+                },
+            )
+            .expect("placed");
+        dispatcher
+            .query_inventory(&[CopyId(0)], (OWNER, P, CorrelationId(1)), scheduler)
+            .expect("answered");
+    }
+
+    /// Issue #61 S3-R5, the inventory pin (design 3.5): a node that answered an inventory trims
+    /// nothing until it lands a generation newer than the one it reported; then the next round
+    /// trims, and no expiry is logged.
+    ///
+    /// Cuts: the answer takes no pin, red (the first held round trims); the landing does not
+    /// release, red (the last round stays held). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_an_answered_inventory_pins_the_duty_until_a_newer_generation_lands() {
+        const METHOD: &str =
+            "t61_sim_an_answered_inventory_pins_the_duty_until_a_newer_generation_lands";
+        let (mut dispatcher, seed) = owner_of(1, 10);
+        let mut scheduler = Scheduler::new();
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), RETAIN)
+            .expect("a round");
+        owner_answers_inventory(&mut dispatcher, &seed, 10, &mut scheduler);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(RetentionDecision::Held(RetentionHold::InventoryPinned))
+        );
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(1)), Seq::ZERO),
+            "nothing trimmed"
+        );
+        // The same generation landing again releases nothing; only a newer one does.
+        dispatcher
+            .landed
+            .insert((OWNER, P, seed.lineage.generation));
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
+            Ok(RetentionDecision::Held(RetentionHold::InventoryPinned))
+        );
+        dispatcher
+            .landed
+            .insert((OWNER, P, Generation(seed.lineage.generation.0 + 1)));
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(3_000), RETAIN),
+            Ok(floor_at(10))
+        );
+        assert!(logged(METHOD, "inventory_pin_expired").is_empty());
+    }
+
+    /// Issue #61 S3-R5, the pin's window (design 3.5): a pin nothing releases holds until
+    /// `inventory_pin_millis` has passed since it was taken, and no longer. The round at the
+    /// window logs `inventory_pin_expired` once and trims.
+    ///
+    /// Cuts: no expiry, red (the round at the window stays held); expiry one tick late
+    /// (`>` for `>=`), red at the window. Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_an_inventory_pin_expires_after_its_window() {
+        const METHOD: &str = "t61_sim_an_inventory_pin_expires_after_its_window";
+        let window = super::RetentionConfig {
+            inventory_pin_millis: 5_000,
+            ..RETAIN
+        };
+        let (mut dispatcher, seed) = owner_of(1, 10);
+        let mut scheduler = Scheduler::new();
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), window)
+            .expect("a round");
+        owner_answers_inventory(&mut dispatcher, &seed, 10, &mut scheduler);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(4_999), window),
+            Ok(RetentionDecision::Held(RetentionHold::InventoryPinned)),
+            "held inside the window"
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(5_000), window),
+            Ok(floor_at(10)),
+            "released at it"
+        );
+        let expired: Vec<_> = logged(METHOD, "inventory_pin_expired")
+            .iter()
+            .map(|line| (line["generation"].as_u64(), line["millis"].as_u64()))
+            .collect();
+        assert_eq!(
+            expired,
+            vec![(Some(seed.lineage.generation.0), Some(5_000))]
+        );
+    }
+
+    /// Issue #61 S3-R5, the boot pin (design 3.5 rev 4 m-c; the host's
+    /// `t61_a_restarted_holder_does_not_trim_before_adopting`): a restarted holder trims nothing
+    /// until it lands a newer generation or the pin's window passes.
+    ///
+    /// **Differs.** The process restarts with no R1 side, so only the engine floor is read.
+    ///
+    /// Cut: no pin at restart, red (the first round after it trims). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_a_restarted_holder_trims_nothing_until_its_boot_pin_expires() {
+        let window = super::RetentionConfig {
+            inventory_pin_millis: 5_000,
+            ..RETAIN
+        };
+        let (mut dispatcher, _seed) = owner_of(1, 10);
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .inject(crate::storage::StorageOp::Crash {
+                node: OWNER,
+                fault: rdb_core::contracts::storage::StorageFault::ProcessCrash,
+            })
+            .expect("planned");
+        assert_eq!(dispatcher.crash_check(OWNER), Ok(true), "down");
+        dispatcher.restart(OWNER, BootId(2)).expect("restarted");
+        let since = dispatcher.clock.now().0;
+        let engine_floor =
+            |dispatcher: &Dispatcher| dispatcher.engines[&OWNER].floor_seq(P, Generation(1));
+        for at in [since + 1_000, since + 4_999] {
+            assert_eq!(
+                dispatcher.retention_duty(OWNER, P, Tick(at), window),
+                Ok(RetentionDecision::Held(RetentionHold::InventoryPinned)),
+                "held at {at}"
+            );
+        }
+        assert_eq!(engine_floor(&dispatcher), Seq::ZERO, "nothing trimmed");
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(since + 5_000), window),
+            Ok(floor_at(10))
+        );
+        assert_eq!(engine_floor(&dispatcher), Seq(10));
     }
 }
