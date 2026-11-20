@@ -160,7 +160,10 @@ impl RocksEngine {
     /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
     /// [`InstallError::ForeignEntry`] for a `History` or `Meta` entry or the head `Progress`,
     /// which the export never sends; [`InstallError::Storage`] when the write fails. Nothing of
-    /// the chunk is written.
+    /// the chunk is written. `Meta` is refused because format 1 stores none (pinned by
+    /// `m8s_25a_a_meta_write_is_refused_at_commit` and `m8s_25b_open_refuses_a_stored_meta_key`);
+    /// the first Meta writer must decide whether Meta is exported and installed here, or
+    /// skipped as per-copy state.
     pub fn install_chunk(
         &mut self,
         partition: PartitionId,

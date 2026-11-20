@@ -48,6 +48,7 @@ use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::storage::Namespace;
 use rdb_core::contracts::transport::Frame;
 use rdb_core::replication::append::{AppendReceiver, ReceiverInit, UNSOLICITED};
+use rdb_core::replication::progress::DigestLadder;
 use rdb_core::replication::wire::encode_reply;
 use rdb_storage::{RocksSnapshot, SnapshotEntry};
 use serde::{Deserialize, Serialize};
@@ -184,6 +185,20 @@ pub struct SnapshotOfferRefused {
     pub through: Option<Seq>,
 }
 
+/// Lead ruling 1 (issue #61 A8a): `ladder` holds a rung at every seq from `floor` (the engine's
+/// floor) through its highest, with none below. Counted, never walked: rungs are distinct seqs,
+/// so a ladder whose lowest is `floor` is dense exactly when it has `highest - floor + 1`.
+/// An empty ladder is not dense.
+pub(crate) fn ladder_dense(ladder: &DigestLadder, floor: Seq) -> bool {
+    match (ladder.floor(), ladder.highest()) {
+        (Some(lowest), Some(highest)) => {
+            lowest == floor
+                && u64::try_from(ladder.len()).is_ok_and(|len| len == highest.0 - lowest.0 + 1)
+        }
+        _ => false,
+    }
+}
+
 /// The chain digest of a page: [`SNAPSHOT_CHUNK_LABEL`], `prev`, then each entry's namespace
 /// tag, key, value, version and generation. `Digest::of` length-prefixes every part, so the
 /// encoding is unambiguous.
@@ -299,12 +314,12 @@ impl Host {
         let tracker = primary.tracker();
         let lineage = tracker.lineage();
         let generation = lineage.generation;
-        let ladder_floor = tracker.history().floor();
         let config = tracker.config().clone();
         let floor = self.engine.floor_seq(partition, generation);
-        // Lead ruling (A8): "ladder floor > engine floor" means the ladder is not dense from the
-        // engine's floor to its head. Then the engine holds what the ladder lacks: refill.
-        if ladder_floor.is_some_and(|first| first > floor) {
+        // Lead ruling 1 (A8): a ladder that is not dense from the engine's floor to its head
+        // (its first rung above that floor, or a gap, as `Recovered`'s `{root, cutoff}` on an
+        // untrimmed engine) lacks rungs the engine holds: refill. Only a dense ladder transfers.
+        if !ladder_dense(tracker.history(), floor) {
             let started = std::time::Instant::now();
             let read = match self.dormant_rungs(partition, generation) {
                 Ok(read) => read,
@@ -604,6 +619,20 @@ impl Host {
         let Some(transfer) = self.transfers.get_mut(&key) else {
             return;
         };
+        #[cfg(debug_assertions)]
+        if self
+            .snapshot_pages_held_from
+            .is_some_and(|from| transfer.pages >= from)
+        {
+            tracing::info!(
+                node = self.node.0,
+                partition = pull.partition.0,
+                copy = pull.copy.0,
+                page = transfer.pages,
+                "snapshot_pull_held"
+            );
+            return;
+        }
         let page = transfer.view.entries_after(
             pull.after.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
             self.snapshot_page_keys,
