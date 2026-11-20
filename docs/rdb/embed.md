@@ -392,8 +392,32 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
   other non-zero exit as a failure to report, not a restart to loop on.
 - `lr` supervises nothing. `lr status` shows such a node as `exited 75: restart wanted`, and
   `lr start N` is the restart.
-- An embedder that runs `Db` itself, not `rdb_node`, makes the same check: `db.node_status()`
-  for its node, and a list of `partitions/`.
+- `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
+  embedder asks the same.
+
+**Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
+supervisor, restarts the node in place:
+
+1. Poll `db.restart_wanted()` about once a second. It blocks, as `node_status` does, and
+   keeps the 5 s hold between calls. It returns `Some(RestartReason::ReplaceStopped)` or
+   `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
+   cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
+   a partition, so a frozen node beside an owning one waits until the owner's partitions move.
+   Run one `Db` per node, as the gateway does, so each restarts on its own.
+2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
+   links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
+   than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
+   `Links` included), the old boot keeps answering its peers' probes, they keep their route
+   to it, and they never meet the new boot.
+3. Drop the `Db`, the `Net` and the `Links`.
+4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
+   at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
+   held.
+
+A peer sees every link to the old boot end, and its dials refused while nothing listens. When
+the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
+the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
+restart: the control store, the runtime and your app's own state stay as they are.
 
 ### Fencing your own side effects
 

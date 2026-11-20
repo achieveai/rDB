@@ -85,7 +85,8 @@
 //! `partitions/` record in the control store names it owner in any lifecycle, it prints
 //! `rdb_node restart-wanted node=N reason=R` (logged `rdb_node_restart_wanted`), shuts down,
 //! prints `rdb_node stopped node=N` and exits 75: its supervisor should start it again, at a new
-//! boot, and the owner re-adds it. A failed list keeps it up (`rdb_node_restart_check_unread`).
+//! boot, and the owner re-adds it. A failed list keeps it up (`db_restart_check_unread`). The
+//! rule is `Db::restart_wanted`'s, which an embedder polls the same way.
 //! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
 //! step failed, 2 bad arguments, 75 restart wanted (V10).
 
@@ -103,7 +104,9 @@ use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, Timeouts};
+use rdb_api::{
+    Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, RestartReason, Timeouts,
+};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -966,7 +969,7 @@ fn serve_on_ready(
         }),
     };
     let mut db = rt
-        .block_on(Db::open(config, Arc::clone(&store), rt.handle().clone()))
+        .block_on(Db::open(config, store, rt.handle().clone()))
         .map_err(|e| format!("open {} as node {}: {e}", dir.display(), node.0))?;
     println!("rdb_node open node={}", node.0);
     let within = Duration::from_secs(args.ready_secs.unwrap_or(60));
@@ -985,14 +988,13 @@ fn serve_on_ready(
         scope.spawn(|| print_ownership_events(&db, &done));
         let mut served = Served::Stopped;
         let mut checked = std::time::Instant::now();
-        let mut stopped_since = None;
         while !stopped() {
             // V10 (#81): about once a second, not every turn: `node_status` can wait out the
             // read timeout.
             if checked.elapsed() >= RESTART_CHECK_EVERY {
                 checked = std::time::Instant::now();
-                if let Some(reason) = restart_check(&db, node, &*store, rt, &mut stopped_since) {
-                    tracing::warn!(node = node.0, reason, "rdb_node_restart_wanted");
+                if let Some(reason) = db.restart_wanted() {
+                    tracing::warn!(node = node.0, %reason, "rdb_node_restart_wanted");
                     println!("rdb_node restart-wanted node={} reason={reason}", node.0);
                     served = Served::Restart(reason);
                     break;
@@ -1021,6 +1023,9 @@ fn serve_on_ready(
         tracing::info!(node = node.0, stop = %stop.display(), "rdb_node_stop_file");
     }
     db.shutdown();
+    // `Db::shutdown` leaves the links up; the process exits next anyway, but a peer should
+    // see this boot go at once, not when the sockets close.
+    net.shutdown();
     drop(db);
     drop(net);
     println!("rdb_node stopped node={}", node.0);
@@ -1033,8 +1038,8 @@ enum Served {
     /// `--stop-file` appeared: exit 0.
     Stopped,
     /// V10 (#81): this boot can serve nothing again, so it asks its supervisor for a restart,
-    /// [`RESTART_EXIT`]. The reason [`restart_due`] gave.
-    Restart(&'static str),
+    /// [`RESTART_EXIT`]. The reason `Db::restart_wanted` gave.
+    Restart(RestartReason),
 }
 
 /// The exit code that asks the supervisor to start this node process again (V10, #81):
@@ -1044,99 +1049,13 @@ const RESTART_EXIT: u8 = 75;
 /// How often the serve loop reads its own `NodeStatus` for V10.
 const RESTART_CHECK_EVERY: Duration = Duration::from_secs(1);
 
-/// How long `replace_stopped` must have stayed true before a restart is due.
-const RESTART_HOLD: Duration = Duration::from_secs(5);
-
-/// V10 (#81): whether this node process should exit [`RESTART_EXIT`], and why. Due only when
-/// `owns_none` (asked last, and only then) says no `partitions/` record names this node owner:
-/// a restart while it still owns a partition would cut that partition's writes short of the
-/// planner's move. Then due when the host faulted (V10b, lead ruling: a faulted host stays
-/// down until a restart), or when A1's self-replace has stayed stopped since `stopped_since`
-/// for [`RESTART_HOLD`]: its grant was frozen by a promote, and nothing at this boot lifts it.
-fn restart_due(
-    stopped_since: Option<std::time::Instant>,
-    faulted: bool,
-    now: std::time::Instant,
-    owns_none: impl FnOnce() -> bool,
-) -> Option<&'static str> {
-    let reason = if faulted {
-        "host_faulted"
-    } else if stopped_since.is_some_and(|since| now.saturating_duration_since(since) >= RESTART_HOLD)
-    {
-        "replace_stopped"
-    } else {
-        return None;
-    };
-    owns_none().then_some(reason)
-}
-
-/// One V10 check: this node's own `NodeStatus` (partition 1's; A1 and the fault are
-/// node-wide), `stopped_since` kept across checks, and [`restart_due`] over the control store.
-/// A status that does not answer within the read timeout starts the hold again.
-fn restart_check(
-    db: &Db,
-    node: NodeId,
-    store: &dyn ConfigStore,
-    rt: &tokio::runtime::Runtime,
-    stopped_since: &mut Option<std::time::Instant>,
-) -> Option<&'static str> {
-    let status = db.node_status().into_iter().find(|status| status.node == node);
-    let now = std::time::Instant::now();
-    *stopped_since = match &status {
-        Some(status) if status.replace_stopped => Some(stopped_since.unwrap_or(now)),
-        _ => None,
-    };
-    let faulted = status.is_some_and(|status| status.fault.is_some());
-    restart_due(*stopped_since, faulted, now, || {
-        match rt.block_on(owns_no_partition(store, node)) {
-            Ok(none) => none,
-            Err(error) => {
-                tracing::warn!(node = node.0, %error, "rdb_node_restart_check_unread");
-                false
-            }
-        }
-    })
-}
-
-/// Whether no `partitions/` record names `node` owner, in any lifecycle (`Fencing` too). Read
-/// from the control store, not from the `Db`'s route, which refreshes lazily. A failed or
-/// truncated list, or a record that does not decode, is an error: the caller stays up.
-async fn owns_no_partition(store: &dyn ConfigStore, node: NodeId) -> Result<bool, String> {
-    let prefix = rdb_core::contracts::control::ControlPrefix::Partitions.encode();
-    let listed = store
-        .list(config_core::ListRequest {
-            prefix: bytes::Bytes::from_static(prefix.as_bytes()),
-            max_items: 0,
-            max_bytes: 0,
-        })
-        .await
-        .map_err(|e| format!("list {prefix}: {e}"))?;
-    if listed.truncated {
-        return Err(format!(
-            "list {prefix} came back truncated at revision {}",
-            listed.read_revision
-        ));
-    }
-    for found in &listed.records {
-        let record = rdb_core::authority::partition::PartitionRecord::decode(&found.value)
-            .ok_or_else(|| {
-                format!(
-                    "{} is not a partition record",
-                    String::from_utf8_lossy(&found.key)
-                )
-            })?;
-        if record.owner == node {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore, Served};
+    use super::{
+        admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore, RestartReason, Served,
+    };
 
     /// The `--peers` value of three nodes on three loopback hosts (#80 S1b).
     const PEERS: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
@@ -1945,50 +1864,6 @@ mod tests {
         assert_eq!(super::failover(&on), Some(rdb_api::Failover::default()));
     }
 
-    /// V10 (#81) `restart_due`: a stopped self-replace is due only once held for
-    /// `RESTART_HOLD`, and only when the node owns no partition; the ownership read is not
-    /// made while nothing else is due. Unit.
-    /// Cut: drop the hold (due as soon as `stopped_since` is set); the 4.9 s case is red.
-    /// Cut: drop the owns-none guard (`Some(reason)` without asking); the owning cases are red.
-    #[test]
-    fn own81_v10_restart_due_holds_five_seconds_and_needs_no_partition_owned() {
-        use super::{restart_due, RESTART_HOLD};
-        use std::time::{Duration, Instant};
-        let at = Instant::now();
-        let since = Some(at);
-        let owns_none = || true;
-        let owns_some = || false;
-        assert_eq!(restart_due(None, false, at, || panic!("not asked")), None);
-        assert_eq!(
-            restart_due(since, false, at + RESTART_HOLD - Duration::from_millis(100), || {
-                panic!("not asked while the hold runs")
-            }),
-            None,
-            "held 4.9 s"
-        );
-        assert_eq!(
-            restart_due(since, false, at + RESTART_HOLD, owns_none),
-            Some("replace_stopped"),
-            "held 5 s, owns none"
-        );
-        assert_eq!(
-            restart_due(since, false, at + RESTART_HOLD * 4, owns_some),
-            None,
-            "held 20 s, still owns a partition"
-        );
-    }
-
-    /// V10b (#81, lead ruling): a faulted host is due at once, with no hold, and only when it
-    /// owns no partition. Unit.
-    /// Cut: drop the owns-none guard; the owning case is red.
-    #[test]
-    fn own81_v10b_a_faulted_host_owning_nothing_is_due_at_once() {
-        use super::restart_due;
-        let at = std::time::Instant::now();
-        assert_eq!(restart_due(None, true, at, || true), Some("host_faulted"));
-        assert_eq!(restart_due(None, true, at, || false), None);
-    }
-
     /// The node owning each partition, and each one's members, read from `partitions/`.
     fn placement(
         rt: &tokio::runtime::Runtime,
@@ -2028,8 +1903,11 @@ mod tests {
     /// ends `Stopped`, not `Restart` again.
     /// Cluster row (~30 s): one grant lapse (6 s), four promotes, the 5 s hold, a re-add. The
     /// node threads log outside this row's span (`_untagged-<pid>.jsonl`).
-    /// Cut: `restart_due` drops the owns-none guard; node 1 returns while the sweep still
-    /// moves its partitions, red at "owns none when it asked for a restart".
+    /// No cut is red here for the owns-none guard: the four promotes took 1.2 s in all
+    /// (measured), well inside the 5 s hold, so the guard is pinned by the `restart_due` units
+    /// (`rdb_api::db::restart`).
+    /// Cut: `Db::restart_wanted` always answers `None` (no V10); node 1 never returns, red at
+    /// "node 1's serve returns".
     #[config_log::retcd_test]
     fn own81_v10_frozen_returning_node_exits_after_the_sweep() {
         use rdb_api::NodeId;
@@ -2128,7 +2006,16 @@ mod tests {
                 .map(|(record, _)| record.partition.0)
                 .collect()
         };
+        /// Writes the stop file when dropped, so a failed assertion inside the scope ends every
+        /// node thread and the scope's join returns the panic instead of waiting forever.
+        struct StopOnDrop<'a>(&'a std::path::Path);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"");
+            }
+        }
         std::thread::scope(|scope| {
+            let _stop_on_panic = StopOnDrop(&stop);
             let mut running: Vec<_> = (1..=3usize)
                 .map(|n| {
                     let args = args_of(n);
@@ -2160,7 +2047,9 @@ mod tests {
             assert!(
                 matches!(
                     served,
-                    Ok(Served::Restart("replace_stopped" | "host_faulted"))
+                    Ok(Served::Restart(
+                        RestartReason::ReplaceStopped | RestartReason::HostFaulted
+                    ))
                 ),
                 "node 1 asks for a restart: {served:?}"
             );
@@ -2171,7 +2060,8 @@ mod tests {
             );
             println!("own81_v10 node 1 served {served:?}");
 
-            // The supervisor's part: start node 1 again on its folder, at a new boot.
+            // The supervisor's part: start node 1 again on its folder, at a new boot. The ended
+            // serve ran `Net::shutdown`, so nothing answers the peers at the old boot (#81).
             let again = {
                 let args = args_of(1);
                 let store = Arc::clone(&store);

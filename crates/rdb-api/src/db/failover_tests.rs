@@ -4,8 +4,9 @@
 //!
 //! A process is stopped, as `kill -STOP` stops one, with the fault file's `mute` and
 //! `cut-control` together: its links read nothing and write nothing, probes included, and its
-//! grant stops renewing. Dropping an in-process `Net` is not a stop: the listener's
-//! per-connection tasks are not its own and keep echoing probes.
+//! grant stops renewing. A stop is a pause, as `resume` shows. An exit is `Net::shutdown` (or
+//! dropping the last `Arc<Net>`): it ends every link, accepted ones too, and stops listening
+//! (`own81_net_shutdown_leaves_no_link_answering`).
 
 use super::reopen_tests::{config, fast, open_app, runtime};
 use super::*;
@@ -18,7 +19,7 @@ use rdb_core::authority::partition::PartitionLifecycle;
 /// One node process.
 struct Proc {
     db: Db,
-    _net: Arc<Net>,
+    net: Arc<Net>,
     faults: Arc<Faults>,
     boot: BootId,
 }
@@ -186,7 +187,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
                     .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
                 Proc {
                     db,
-                    _net: net,
+                    net,
                     faults,
                     boot,
                 }
@@ -1719,4 +1720,41 @@ fn own81_sweep_restarts_before_freeze() {
 #[config_log::retcd_test]
 fn own81_sweep_restarts_after_freeze() {
     interrupted_sweep("own81_sweep_restarts_after_freeze", HoldAt::BeforeReply);
+}
+
+/// #81 (lead, embedded restart): a process that ends its links goes silent to its peers. Node 1
+/// ends them by `Net::shutdown`, with no mute or cut fault set; node 1 is the one that accepts
+/// links (2 and 3 dial lower nodes), which a plain abort of `Net`'s own tasks left echoing
+/// probes. Then node 2's process is dropped whole, with no shutdown call: the last `Arc<Net>`
+/// goes, and `Drop` ends its links too. Each time, every peer drops its route and stops
+/// hearing the node. Integration (~10 s).
+/// Cut: `Net::shutdown` aborts only `Net`'s own tasks (no link tasks, no conns closed, plain
+/// `serve_with_incoming`); red at "nodes 2 and 3 stop hearing node 1".
+#[config_log::retcd_test]
+fn own81_net_shutdown_leaves_no_link_answering() {
+    let mut rig = rig(1, None);
+    let hears = |rig: &Rig, i: usize, node: NodeId| {
+        rig.procs[i].net.connection(node).is_some()
+            && rig.procs[i].net.heard_within(node, Duration::from_secs(1))
+    };
+    until("every node hears every other", lifetimes(5), || {
+        (0..3).all(|i| ALL_NODES.iter().filter(|n| **n != ALL_NODES[i]).all(|n| hears(&rig, i, *n)))
+    });
+
+    rig.procs[0].db.shutdown();
+    rig.procs[0].net.shutdown();
+    until("nodes 2 and 3 stop hearing node 1", lifetimes(3), || {
+        (1..3).all(|i| rig.procs[i].net.connection(NodeId(1)).is_none())
+            && (1..3).all(|i| !rig.procs[i].net.heard_within(NodeId(1), Duration::from_secs(1)))
+    });
+
+    let proc = rig.procs.remove(1);
+    let net = Arc::downgrade(&proc.net);
+    drop(proc);
+    until("node 2's Net is gone", lifetimes(3), || net.upgrade().is_none());
+    // `procs` is now nodes 1 and 3.
+    until("node 3 stops hearing node 2", lifetimes(3), || {
+        rig.procs[1].net.connection(NodeId(2)).is_none()
+            && !rig.procs[1].net.heard_within(NodeId(2), Duration::from_secs(1))
+    });
 }
