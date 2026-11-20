@@ -1230,7 +1230,14 @@ fn i127_a_planner_panic_is_logged() {
 /// owner that never answers holds its judge for the whole look. A sweep judges every owner at
 /// once, so four such owners cost one look, not four: a dead owner's failover is not held
 /// back by other owners that are slow in the same sweep (t1 S3, 15 s bound).
-/// Cut: judge the owners in turn in `judge_all`; it takes four looks, red.
+///
+/// The proof is that all four looks are outstanding at the same time, not a wall-clock cap
+/// (PR #156 review: a cap fails on a loaded host even when judging is parallel). The row holds
+/// every look it receives, unanswered, until it holds all four; only then does it let them go,
+/// by dropping their reply channels. Each look waits longer than the row's patience, so a
+/// look still held when the next arrives was outstanding beside it.
+/// Cut: judge the owners in turn in `judge_all`; the second look never comes while the first
+/// is held, red.
 #[config_log::retcd_test]
 fn i122_owners_are_judged_at_once() {
     let rt = crate::db::reopen_tests::runtime();
@@ -1238,26 +1245,44 @@ fn i122_owners_are_judged_at_once() {
         crate::test_store::Script::default(),
     ));
     let links = Links::new();
-    // Mailboxes that take a look and never answer it: each judge waits out `look_within`.
-    let mut held = Vec::new();
+    let mut mailboxes = Vec::new();
     for node in 1..=4u32 {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         links.register(NodeId(node), tx, BootId(1));
-        held.push(rx);
+        mailboxes.push(rx);
     }
+    let patience = crate::host::test_patience(Duration::from_secs(5));
+    let look_within = patience * 2;
     let planner = Planner {
-        look_within: Duration::from_millis(400),
+        look_within,
         ..planner(9, &store, links)
     };
-    let started = Instant::now();
+    // Takes each owner's look and keeps it, reply channel and all, until it holds all four or
+    // runs out of patience; then drops them, which answers each judge at once.
+    let holder = std::thread::spawn(move || {
+        let started = Instant::now();
+        let deadline = started + patience;
+        let mut held = Vec::new();
+        for mailbox in &mailboxes {
+            match mailbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(look @ Msg::Inspect { .. }) => held.push(look),
+                Ok(other) => panic!("not a look: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        (held.len(), started.elapsed())
+    });
     let verdicts = rt.block_on(
         planner.judge_all((1..=4u32).map(|node| (NodeId(node), None, PartitionId(node)))),
     );
-    let took = started.elapsed();
-    assert_eq!(verdicts, vec![Verdict::Dead("silent_and_expired"); 4]);
-    assert!(
-        took < Duration::from_millis(1_200),
-        "four slow owners cost one look (400 ms), not four: took {took:?}"
+    let (outstanding, took) = holder.join().expect("the holder ends");
+    assert_eq!(
+        outstanding, 4,
+        "all four looks were outstanding at once within {patience:?}"
     );
-    drop(held);
+    assert!(
+        took < look_within,
+        "held before the first look gave up: {took:?}"
+    );
+    assert_eq!(verdicts, vec![Verdict::Dead("silent_and_expired"); 4]);
 }
