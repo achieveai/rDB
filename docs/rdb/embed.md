@@ -1268,13 +1268,14 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
       record (those name the record and both addresses), a peer that names a node with no
       record, and a declared node given no peer address.
     - The checks `Db::open` adds itself end "nothing but its folder was created": two local
-      nodes, a store with no `nodes/` records, the local node's record absent, and no
-      `DbConfig::addresses`. They run before the node-start check, so on `Db::open` a store
+      nodes, a store with no `nodes/` records, a plaintext control link when a record names a
+      host that is not a loopback IP (`admin::control_tls_refusal`, section 3, "TLS to
+      rEtcd"), the local node's record absent, and no `DbConfig::addresses`. They run before the node-start check, so on `Db::open` a store
       with no records, or a missing record of its own, ends this way.
 
     `Db::open` binds nothing itself: your listener is already bound when you call it. To
     refuse before binding, as `rdb_node` does, call `admin::read_formation`,
-    `admin::read_nodes` and `admin::node_start_refusal` first. A store declared by an earlier
+    `admin::read_nodes`, `admin::node_start_refusal` and `admin::control_tls_refusal` first. A store declared by an earlier
     build (no `nodes/` records) is refused; declare again on a new store.
 
   This can be run with up to eight processes on 127.0.0.1 to .8 of one host: each loopback
@@ -1493,7 +1494,7 @@ column says what to change before the next open.
 |---|---|---|
 | `OpenError::Io` | The filesystem refused: a wrong path, no permission, or a full disk | Fix what the message names, then open again |
 | `OpenError::DedupCap` | `DbConfig::dedup_cap` is above the most allowed; nothing was started | Set it to at most the number the message names, or leave it unset |
-| `OpenError::Config` ("the control store link is not TLS") | A declared database names a node off loopback, and the store you passed is plaintext; only the folder was created | Pass a `GrpcClient` under `TlsMode::MutualTls` (section 3, "TLS to rEtcd"), or `--control-tls` |
+| `OpenError::Config` ("the control store link is not TLS") | A declared database names a node off loopback, and the store you passed is plaintext. A node open has created only its folder; an app-only open creates nothing | Pass a `GrpcClient` under `TlsMode::MutualTls` (section 3, "TLS to rEtcd"), or `--control-tls` |
 | `OpenError::Node` | A node did not start: a copy's storage refused to open, or a copy could not be bound or linked. Nothing was removed | A newer format: open the folder with the build that wrote it. A disk or permission error: fix it, then open again. Anything else, or the same error again: stop and report it with the message |
 
 **Worth retrying.**
@@ -1582,7 +1583,7 @@ count grows. rDB caps it (ruling A-R166):
 
 Source: `crates/rdb-storage/README.md`, "Chain-depth ceiling".
 
-## 8. Container image (voter and data node)
+## 8. Container image (voter, data node and app)
 
 `docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with three executables:
 `config-server` (the voter), `rdb_node` (the data node) and `rdb_dev` (the app):

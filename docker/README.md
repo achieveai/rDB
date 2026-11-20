@@ -44,9 +44,10 @@ each container on its own IP, one database of 16 partitions. It runs outside the
   overlaps. Voters sit at `.2`-`.4`, data nodes at `.11`-`.15`.
 - Every container, volume and the network carry the label `org.rdb.multihost=<name>`.
   `down` and `clean` remove only those.
-- `up` refuses, before it creates anything, when any network, volume or container it would
-  make already exists, whoever made it (`docker volume create` silently reuses a name), or
-  when Docker or `ip` cannot list the networks and routes.
+- `up` first builds `--image` and tags it (skipped with `--no-build`). Then, before it creates
+  any network, volume or container, it refuses when any of those it would make already
+  exists, whoever made it (`docker volume create` silently reuses a name), or when Docker or
+  `ip` cannot list the networks and routes.
 - `scripts/docker-multihost.sh selftest --image rdb-s2:dev` checks those guards and the read
   check on its own `rdbst-*` objects, and removes them.
 - Not supported in S2: `docker restart rdbmh-v1`. Voter 1 was started with `--form`, which a
