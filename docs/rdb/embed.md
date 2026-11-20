@@ -1058,6 +1058,11 @@ above comes back by itself once its link is back:
   again once that clears. A copy that does not answer (`live_readd_unanswered`), answers with a
   fault, or is not taken (`live_readd_not_planned`) waits another 5 s. Each drop gets one
   re-add: if that re-add fails, the copy stays out until its node restarts.
+- **A standby that never becomes a full copy.** If the re-added standby is still not a full
+  copy 30 min after it was added back, or 3 attempts to make it one fail, the owner gives it
+  up. It logs `live_readd_shadow_unpromoted` (warn) once, naming the copy (`shadow`), how long
+  it waited (`held_ms`), the failed attempts (`blocks`), how far it got (`acked`) and why
+  (`reason`: `clock` or `blocks`). The copy stays out until its node restarts.
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.

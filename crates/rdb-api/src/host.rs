@@ -246,6 +246,14 @@ pub const MIN_UNREACHABLE_DROP_AFTER_MILLIS: u64 = 2_000;
 /// reads that budget. Crate tests set the host field directly.
 pub const LIVE_READD_HOLD_MILLIS: u64 = 5_000;
 
+/// #107 M3 exit: how long a shadow the live re-add pinned may stay unpromoted, counted from the
+/// commit that pinned it. Past it the owner gives the shadow up ([`Host::live_readd_shadow_duty`]).
+pub const LIVE_READD_SHADOW_GIVE_UP_MILLIS: u64 = 30 * 60 * 1_000;
+
+/// #107 M3 exit: how many promote re-plans for a shadow the live re-add pinned may end without
+/// committing the promote before the owner gives it up ([`Host::live_readd_promote_ended`]).
+pub const LIVE_READD_SHADOW_GIVE_UP_BLOCKS: u32 = 3;
+
 /// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
 /// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
 /// this bounds the pause at promote: the catch-up cursor sends one record a round trip, and in the
@@ -1715,6 +1723,24 @@ struct LiveReadd {
     /// Each gate refusal ([`Host::live_readd_refusal`]) logged `live_readd_refused`, so the
     /// line comes once per partition, node and reason while the copy's entry lasts.
     refusals_logged: BTreeSet<(PartitionId, NodeId, &'static str)>,
+    /// M3 exit: the re-add re-plan the duty started, per partition, with the node and the boot
+    /// it pins. Read and cleared by the next commit of this owner's own re-plan.
+    readding: BTreeMap<PartitionId, (NodeId, BootId)>,
+    /// M3 exit: each shadow a live re-add pinned, from that commit until a commit pins it
+    /// regular or leaves it out. One entry per drop: the re-add is spent, so the give-up is
+    /// final until a restart.
+    shadows: BTreeMap<(PartitionId, NodeId), ReaddShadow>,
+}
+
+/// #107 M3 exit: a shadow a live re-add pinned, as the owner keeps it until the promote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReaddShadow {
+    /// The commit that pinned it: the drop it is the one re-add of.
+    generation: Generation,
+    /// When this owner saw that commit; [`LIVE_READD_SHADOW_GIVE_UP_MILLIS`] counts from here.
+    since: Tick,
+    /// Promote re-plans for it that ended without committing the promote.
+    blocks: u32,
 }
 
 impl LiveReadd {
@@ -1727,6 +1753,8 @@ impl LiveReadd {
             probe: None,
             armed: None,
             refusals_logged: BTreeSet::new(),
+            readding: BTreeMap::new(),
+            shadows: BTreeMap::new(),
         }
     }
 }
@@ -7493,6 +7521,16 @@ impl Host {
                         .any(|pin| pin.node == *node && pin.role == ReplicaRole::RegularSecondary)
             });
         }
+        // M3 exit: a re-added shadow promoted or left out is no longer held.
+        if let Some(committed) = self.committed.get(&partition) {
+            let pinned = &committed.committed.pinned_config.members;
+            self.live_readd.shadows.retain(|(at, node), _| {
+                *at != partition
+                    || pinned
+                        .iter()
+                        .any(|pin| pin.node == *node && pin.role == ReplicaRole::Shadow)
+            });
+        }
         let Some(Rejoin::Planned {
             generation: planned,
             replan,
@@ -7504,6 +7542,7 @@ impl Host {
             return;
         }
         self.rejoins.remove(&partition);
+        self.readd_shadow_pinned(partition, generation, replan);
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         self.move_committed(partition, generation, waited_ms);
         tracing::info!(
@@ -7546,6 +7585,7 @@ impl Host {
             self.repair_duty(partition, now);
             self.shadow_duty(partition, now);
             self.shadow_give_up_duty(partition, now);
+            self.live_readd_shadow_duty(partition, now);
             self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
@@ -7732,6 +7772,9 @@ impl Host {
             return;
         }
         let key = (partition, node);
+        if let Some(boot) = self.links.boot_of(node) {
+            self.live_readd.readding.insert(partition, (node, boot));
+        }
         let cause = self.live_readd.clocked.remove(&key);
         self.live_readd.links.remove(&key);
         self.live_readd
@@ -9144,6 +9187,156 @@ impl Host {
         );
     }
 
+    /// #107 M3 exit: the commit of this owner's re-plan `replan` for `generation`. When it is the
+    /// live re-add's ([`LiveReadd::readding`]) and pins the node as a shadow at the boot the
+    /// re-add saw, the shadow is held from now ([`LiveReadd::shadows`]). A restart's re-add pins
+    /// a newer boot, so it is never held.
+    fn readd_shadow_pinned(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        replan: Replan,
+    ) {
+        let Some((node, boot)) = self.live_readd.readding.remove(&partition) else {
+            return;
+        };
+        if replan.promote || replan.rejoiner != Some(node) {
+            return;
+        }
+        let pinned = self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| {
+                    member.node == node && member.role == ReplicaRole::Shadow && member.boot == boot
+                })
+        });
+        if pinned {
+            let since = self.clock.now();
+            self.live_readd.shadows.insert(
+                (partition, node),
+                ReaddShadow {
+                    generation,
+                    since,
+                    blocks: 0,
+                },
+            );
+        }
+    }
+
+    /// #107 M3 exit: a promote re-plan `replan` ended without committing, at F1's block
+    /// ([`Self::rejoin_blocked`]) or at a revocation A1 left unanswered
+    /// ([`Self::retry_blocked_rejoin`]). For a shadow the live re-add pinned, it counts one
+    /// block, and at [`LIVE_READD_SHADOW_GIVE_UP_BLOCKS`] the shadow is given up. `true` when
+    /// it was, so the caller does nothing more.
+    fn live_readd_promote_ended(
+        &mut self,
+        partition: PartitionId,
+        replan: Replan,
+        ended: &str,
+    ) -> bool {
+        let Some(node) = replan.rejoiner.filter(|_| replan.promote) else {
+            return false;
+        };
+        let Some(held) = self.live_readd.shadows.get_mut(&(partition, node)) else {
+            return false;
+        };
+        held.blocks += 1;
+        let blocks = held.blocks;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            blocks,
+            ended,
+            "live_readd_shadow_block"
+        );
+        if blocks < LIVE_READD_SHADOW_GIVE_UP_BLOCKS {
+            return false;
+        }
+        let now = self.clock.now();
+        self.live_readd_shadow_give_up(partition, node, now, "blocks");
+        true
+    }
+
+    /// #107 M3 exit: a shadow the live re-add pinned that is still unpromoted
+    /// [`LIVE_READD_SHADOW_GIVE_UP_MILLIS`] after its commit is given up. Only between re-plans,
+    /// on the commit's pinned primary.
+    fn live_readd_shadow_duty(&mut self, partition: PartitionId, now: Tick) {
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let due = self
+            .live_readd
+            .shadows
+            .iter()
+            .find(|((at, _), held)| {
+                *at == partition
+                    && HostClock::millis_until(held.since, now) >= LIVE_READD_SHADOW_GIVE_UP_MILLIS
+            })
+            .map(|((_, node), _)| *node);
+        if let Some(node) = due {
+            self.live_readd_shadow_give_up(partition, node, now, "clock");
+        }
+    }
+
+    /// #107 M3 exit: give up the shadow the live re-add pinned for `node`: re-plan without it,
+    /// so it is left out at the boot it runs, with no cause, and only a restart re-adds it.
+    /// Logged once, `live_readd_shadow_unpromoted` (warn), with `reason` (`clock` or `blocks`).
+    fn live_readd_shadow_give_up(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        now: Tick,
+        reason: &str,
+    ) {
+        let Some(held) = self.live_readd.shadows.remove(&(partition, node)) else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let owner = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        let copy = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == node)
+            .map(|member| member.copy);
+        let acked = copy.and_then(|copy| {
+            let primary = self.replication.primary(self.node, partition)?;
+            primary
+                .tracker()
+                .peer(copy)
+                .map(|peer| peer.progress.buffered_applied.0)
+        });
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            generation = held.generation.0,
+            held_ms = HostClock::millis_until(held.since, now),
+            blocks = held.blocks,
+            acked = ?acked,
+            reason,
+            "live_readd_shadow_unpromoted"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(node), None);
+    }
+
     /// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): `copy` sent `CopyCaughtUp`
     /// for `partition`, so if the commit pins it as the shadow, judge its promote now with
     /// [`Self::shadow_duty`] and every guard there: the owner, no re-plan running, the link,
@@ -9597,6 +9790,9 @@ impl Host {
         if self.move_blocked(partition, replan, reason, members, epoch) {
             return;
         }
+        if self.live_readd_promote_ended(partition, replan, "f1_blocked") {
+            return;
+        }
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
         // again. The member stays left out at the boot it was planned at, so only another
@@ -9718,6 +9914,9 @@ impl Host {
                     return;
                 }
                 if waited_ms >= self.peer_drop_after_millis {
+                    if self.live_readd_promote_ended(partition, replan, "revoke_unanswered") {
+                        return;
+                    }
                     tracing::warn!(
                         node = self.node.0,
                         partition = partition.0,
