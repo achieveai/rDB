@@ -1405,3 +1405,65 @@ fn own81_x2_a_clear_after_the_planner_grant_ran_out_deletes_nothing() {
     );
     assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
 }
+
+/// #81 X2, PR #171 review (CAS conflict): the frozen `grants/1` is written again, unchanged,
+/// right after the clear reads it, so the delete at the read's revision conflicts. The clear
+/// is refused and logged (`planner_frozen_grant_not_cleared`), and nothing is deleted; the next
+/// sweep reads the new revision and clears it (`planner_frozen_grant_cleared`). Unit.
+/// Cut: the delete at no expected revision; the first sweep clears, red.
+#[config_log::retcd_test]
+fn own81_x2_a_conflicting_clear_is_refused_then_retried() {
+    const METHOD: &str = "own81_x2_a_conflicting_clear_is_refused_then_retried";
+    let rt = crate::db::reopen_tests::runtime();
+    let after = crate::test_store::PutAfterGet::new(
+        Arc::new(config_testkit::MemStore::new()),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        frozen_grant(1),
+    );
+    let store: Arc<dyn ConfigStore> = Arc::clone(&after) as Arc<dyn ConfigStore>;
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    after.arm();
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    let refused = messages(METHOD, "planner_frozen_grant_not_cleared");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["revision"], revision, "{refused:?}");
+    let (_, moved) = grant_1_at(&rt, &store).expect("nothing deleted on the conflict");
+    assert!(moved > revision);
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    assert_eq!(grant_1_at(&rt, &store), None, "the retry clears it");
+    let cleared = messages(METHOD, "planner_frozen_grant_cleared");
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!(cleared[0]["revision"], moved, "{cleared:?}");
+}
+
+/// #81 X2, PR #171 review (delete error): the clear's delete fails `Unavailable`. It is warned
+/// (`planner_frozen_grant_clear_failed`) and nothing is deleted; the next sweep clears it. Unit.
+/// Cut: the error arm logs nothing; red at the warn.
+#[config_log::retcd_test]
+fn own81_x2_a_failed_clear_is_warned_then_retried() {
+    const METHOD: &str = "own81_x2_a_failed_clear_is_warned_then_retried";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script {
+            fail_delete_with: Some(ConfigError::Unavailable {
+                reason: "scripted: the delete failed".to_owned(),
+            }),
+            ..crate::test_store::Script::default()
+        },
+    ));
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    let failed = messages(METHOD, "planner_frozen_grant_clear_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["revision"], revision, "{failed:?}");
+    assert_eq!(
+        grant_1_at(&rt, &store).map(|(_, at)| at),
+        Some(revision),
+        "nothing deleted on the error"
+    );
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    assert_eq!(grant_1_at(&rt, &store), None, "the retry clears it");
+    assert_eq!(messages(METHOD, "planner_frozen_grant_cleared").len(), 1);
+}
