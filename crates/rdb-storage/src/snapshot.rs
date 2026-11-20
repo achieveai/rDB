@@ -41,6 +41,11 @@ use crate::keys::{encode_key, unframe, Frame, PREFIX_LEN};
 
 /// The namespaces a view shows, in the order [`RocksSnapshot::entries`] lists them. Not
 /// `History` (M10 decision 2, quick fix): no kernel module reads it through [`SnapshotRead`].
+/// `Meta` is listed but format 1 stores none: commit refuses a Meta write and the open refuses a
+/// stored Meta key (pinned by `m8s_25a_a_meta_write_is_refused_at_commit` and
+/// `m8s_25b_open_refuses_a_stored_meta_key`), so a snapshot transfer never carries one, and
+/// [`crate::RocksEngine::install_chunk`] refuses it (issue #61). The first Meta writer must
+/// decide whether Meta is exported and installed, or skipped as per-copy state.
 const NAMESPACES: [Namespace; 4] = [
     Namespace::User,
     Namespace::Dedup,

@@ -2867,6 +2867,10 @@ struct Host {
     /// can land writes past `S` first. Rows only.
     #[cfg(debug_assertions)]
     snapshot_offer_held: bool,
+    /// Issue #61 S2-R2b: while set, this source answers no pull for a page at or past this
+    /// index (0 is the first), so a row can stop a target mid-install. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_pages_held_from: Option<u64>,
     /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
     committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
@@ -3171,6 +3175,8 @@ impl Host {
             snapshot_chunk_fault: None,
             #[cfg(debug_assertions)]
             snapshot_offer_held: false,
+            #[cfg(debug_assertions)]
+            snapshot_pages_held_from: None,
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             caught_up_resends: BTreeMap::new(),

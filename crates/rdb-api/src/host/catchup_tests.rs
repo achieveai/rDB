@@ -5266,6 +5266,42 @@ fn t61_chunk_chain_known_answer() {
     }
 }
 
+/// Issue #61 lead ruling 1, density: `snapshot::ladder_dense` holds only for a ladder with a
+/// rung at every seq from the engine floor through its highest. `fresh_primary`'s
+/// `{(0, ROOT), cutoff}` on an untrimmed engine is not dense (a gap), nor is a ladder whose
+/// first rung is above the floor or below it, nor an empty one. The real promote path is
+/// `seal_tests::t61_a_copy_behind_a_promote_on_an_untrimmed_engine_is_caught_up_from_a_refilled_ladder`.
+/// Cut: the count check dropped (floor equality only), red (`{0, 3}` reads dense).
+/// Unit.
+#[test]
+fn t61_ladder_dense_needs_every_rung_from_the_engine_floor() {
+    use super::snapshot::ladder_dense;
+    use rdb_core::contracts::digest::Domain;
+    use rdb_core::replication::progress::DigestLadder;
+    let ladder = |seqs: &[u64]| {
+        let mut ladder = DigestLadder::new();
+        for &seq in seqs {
+            ladder.insert(Seq(seq), Digest::of(Domain::Record, &[&seq.to_le_bytes()]));
+        }
+        ladder
+    };
+    let cases = [
+        (&[0, 1, 2, 3][..], 0, true),
+        (&[0, 3][..], 0, false),
+        (&[2, 3][..], 0, false),
+        (&[2, 3][..], 2, true),
+        (&[0, 1, 2, 3][..], 2, false),
+        (&[2, 4][..], 2, false),
+        (&[][..], 0, false),
+    ];
+    let got: Vec<_> = cases
+        .iter()
+        .map(|&(seqs, floor, _)| ladder_dense(&ladder(seqs), Seq(floor)))
+        .collect();
+    let want: Vec<_> = cases.iter().map(|&(_, _, dense)| dense).collect();
+    assert_eq!(got, want, "{cases:?}");
+}
+
 /// Issue #61 S2-R5 (design section 2 step 2, rev 5 M1): an offer the target did not ask for is
 /// refused before anything is written. Node 3, a live copy at `applied`, is handed offers
 /// built from its own adopted view with one thing wrong each: the owner epoch below its own

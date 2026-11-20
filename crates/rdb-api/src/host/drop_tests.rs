@@ -2088,7 +2088,11 @@ fn role_of_three(trio: &Trio) -> Option<ReplicaRole> {
 /// sends them (`copy_caught_up`), or H2 refills its ladder first (`snapshot_catchup_served`).
 /// The row takes either, and asserts no ask went unserved and no snapshot offer or install
 /// was refused (issue #61 A8a: the old `snapshot_catchup_unservable` line is gone, so an
-/// assertion on it alone would pass on anything). A trimmed primary's transfer is S2-R1's.
+/// assertion on it alone would pass on anything). That assertion is a guard only: node 3
+/// catches up by the cursor (`copy_caught_up`, no `snapshot_*` line), so this row does not pin
+/// the served path; h2 does
+/// (`h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer`). Mutation a8_m12
+/// (every ask unserved) leaves this row green. A trimmed primary's transfer is S2-R1's.
 /// (e) A-R366: node 3's links stay held from its restart, so it is a shadow that is behind.
 /// It restarts again; the restart's re-plan pins it again as a shadow at its new boot, and
 /// nothing promotes it until the links heal and it catches up.
@@ -8798,7 +8802,7 @@ fn issue107_r2_the_gate_refuses_each_reason_before_the_probe_and_logs_it_once() 
 fn t61_s2_r1_a_wiped_copy_below_every_floor_is_rebuilt_from_a_snapshot() {
     const METHOD: &str = "t61_s2_r1_a_wiped_copy_below_every_floor_is_rebuilt_from_a_snapshot";
     let dir = config_testkit::fs::temp_dir();
-    let (mut trio, floor) = trimmed(dir.path(), None);
+    let (mut trio, floor) = trimmed(dir.path(), 4, |_| {});
     let head = trio.head().expect("node 1 holds a head");
     let installed = rebuilt(&mut trio, METHOD, floor);
     assert_eq!(installed, head, "S is the head");
@@ -8820,7 +8824,7 @@ fn t61_s2_r1_a_wiped_copy_below_every_floor_is_rebuilt_from_a_snapshot() {
 fn t61_s2_r1b_a_rebuilt_copy_walks_the_writes_past_its_snapshot() {
     const METHOD: &str = "t61_s2_r1b_a_rebuilt_copy_walks_the_writes_past_its_snapshot";
     let dir = config_testkit::fs::temp_dir();
-    let (mut trio, floor) = trimmed(dir.path(), None);
+    let (mut trio, floor) = trimmed(dir.path(), 4, |_| {});
     trio.nodes[0].0.snapshot_offer_held = true;
     trio.until("node 1 opened a transfer", |_| {
         (!logged!(METHOD, "snapshot_transfer_opened").is_empty()).then_some(())
@@ -8919,17 +8923,28 @@ fn promoted_and_durable(trio: &mut Trio, request: u64) {
 }
 
 /// Issue #61 S2 rows: D9's trio, 30 puts applied on every copy, every copy trimmed to
-/// `head - 4`, then node 3 restarted on an empty disk. Node 1 serves snapshot pages of 4
-/// entries, the page with index `corrupt` flipped (S2-R3). Answers the trio and the floor.
+/// `head - keep`, then node 3 restarted on an empty disk. Every node serves snapshot pages of
+/// 4 entries and is then set up by `each` (a row's hooks, by node). Answers the trio and the
+/// floor.
 #[cfg(debug_assertions)]
-fn trimmed(dir: &std::path::Path, corrupt: Option<u64>) -> (Trio, u64) {
-    let (mut trio, _) = started(dir, |host| {
+fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio, u64) {
+    // As `note_tests::formed`: the open counter first, so `admin::promote` reads the record
+    // (S2-R2); then D9's bootstrap.
+    let mut trio = Trio::new(dir, |host| {
         tuned(host);
         host.snapshot_page_keys = 4;
-        if host.node == NodeId(1) {
-            host.snapshot_chunk_fault = corrupt;
-        }
+        each(host);
     });
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &super::note_tests::INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
     for request in 1..=30 {
         match trio.ask(put(request)) {
             Answer::Txn { .. } => {}
@@ -8937,7 +8952,7 @@ fn trimmed(dir: &std::path::Path, corrupt: Option<u64>) -> (Trio, u64) {
         }
     }
     let head = trio.head().expect("node 1 holds a head");
-    let floor = head - 4;
+    let floor = head - keep;
     trio.until("every copy applied the head", |trio| {
         (1..3)
             .all(|at| {
@@ -8972,7 +8987,11 @@ fn trimmed(dir: &std::path::Path, corrupt: Option<u64>) -> (Trio, u64) {
 fn t61_s2_r3_a_corrupt_page_is_refused_and_nothing_is_switched() {
     const METHOD: &str = "t61_s2_r3_a_corrupt_page_is_refused_and_nothing_is_switched";
     let dir = config_testkit::fs::temp_dir();
-    let (mut trio, floor) = trimmed(dir.path(), Some(1));
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_chunk_fault = Some(1);
+        }
+    });
     trio.until("node 3 refused the corrupt page", |_| {
         (!logged!(METHOD, "snapshot_install_refused").is_empty()).then_some(())
     });
@@ -9010,4 +9029,177 @@ fn t61_s2_r3_a_corrupt_page_is_refused_and_nothing_is_switched() {
         released.iter().any(|line| line["why"] == "refused"),
         "{released:?}"
     );
+}
+
+/// Issue #61 S2-R2 (design section 2, A8): node 1, the source, dies after two pages of node
+/// 3's install (it holds the pull for page 2, then every link to it is cut) and node 2 is
+/// promoted. Node 3, still holding the install of the deposed lineage, asks node 2 and is rebuilt
+/// by node 2's transfer at its own `S`: node 2 first refills its `fresh_primary` ladder (ruling
+/// 1), then opens the transfer, node 3 replaces its half-done install with the new offer
+/// (`snapshot_install_replaced`), and one install finishes and is released on `caught_up`.
+/// Cut: an offer ignored while an install is open (no replacement), red.
+/// Integration (~14 s): S2-R1's setup bound to an instance, and a promote.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_s2_r2_a_source_lost_mid_transfer_is_replaced_by_the_new_primary() {
+    const METHOD: &str = "t61_s2_r2_a_source_lost_mid_transfer_is_replaced_by_the_new_primary";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        // Bound to an instance, so F1 writes the rooted layout `admin::promote` reads.
+        host.engine
+            .bind_instance(super::note_tests::INSTANCE)
+            .expect("bind instance");
+        host.instance = Some(super::note_tests::INSTANCE);
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    // Node 3 came back on an empty disk: bind it again, as its first start was.
+    let three = &mut trio.nodes[2].0;
+    three
+        .engine
+        .bind_instance(super::note_tests::INSTANCE)
+        .expect("bind instance");
+    three.instance = Some(super::note_tests::INSTANCE);
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let chunks = trio.nodes[2]
+        .0
+        .installs
+        .get(&PartitionId(1))
+        .map(|install| install.chunks);
+    assert_eq!(chunks, Some(2), "node 3 wrote two pages before node 1 died");
+    kill(&trio, 1, &[2, 3]);
+    let promote = super::seal_tests::spawn_promote(&trio, 2);
+    super::seal_tests::only_until(&mut trio, &[1, 2], "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let three = copy_of(&trio, 3);
+    super::seal_tests::only_until(
+        &mut trio,
+        &[1, 2],
+        "node 2 released node 3's transfer",
+        |_| {
+            logged!(METHOD, "snapshot_transfer_released")
+                .iter()
+                .any(|line| line["node"] == 2 && line["why"] == "caught_up")
+                .then_some(())
+        },
+    );
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert!(installed[0]["at"].as_u64() >= Some(floor), "{installed:?}");
+    let begun = logged!(METHOD, "snapshot_install_begun");
+    assert_eq!(begun.len(), 2, "node 1's install, then node 2's: {begun:?}");
+    let opened: Vec<_> = logged!(METHOD, "snapshot_transfer_opened")
+        .into_iter()
+        .filter(|line| line["copy"] == three.0)
+        .map(|line| line["node"].as_u64())
+        .collect();
+    assert_eq!(
+        opened,
+        vec![Some(1), Some(2)],
+        "re-offered by the new primary"
+    );
+    let replaced = logged!(METHOD, "snapshot_install_replaced");
+    assert_eq!(
+        replaced.len(),
+        1,
+        "node 2's offer replaced node 1's install: {replaced:?}"
+    );
+    for refused in ["snapshot_install_refused", "snapshot_reseed_ack_withheld"] {
+        let lines = logged!(METHOD, refused);
+        assert!(lines.is_empty(), "{refused}: {lines:?}");
+    }
+}
+
+/// Issue #61 S2-R2b (design section 2, A7 + A8): node 3 is stopped after two pages of its
+/// install (node 1 holds the pull for page 2, `snapshot_pages_held_from`) and restarts on
+/// the same disk. Its open finds the `installing` marker and clears the half-installed lineage
+/// (`snapshot_install_cleared_at_open`); node 1 abandons the transfer on the restart
+/// (`snapshot_transfer_abandoned{why = peer_booted}`), and node 3, at the root again, asks
+/// again and is rebuilt by a second transfer with no operator step: caught up, promoted, and
+/// a put durable on it.
+/// Cuts: the open keeps the half-installed lineage (no clear), red; the transfer kept on
+/// `PeerBooted`, red (no second offer until the idle clock).
+/// Integration (~5 s): S2-R1's setup and a restart.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_s2_r2b_a_target_restarted_mid_install_is_cleared_and_rebuilt() {
+    const METHOD: &str = "t61_s2_r2b_a_target_restarted_mid_install_is_cleared_and_rebuilt";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let chunks = trio.nodes[2]
+        .0
+        .installs
+        .get(&PartitionId(1))
+        .map(|install| install.chunks);
+    assert_eq!(chunks, Some(2), "node 3 wrote two pages before its restart");
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    restart_as(&mut trio, dir.path(), 3, false);
+    let cleared = logged!(METHOD, "snapshot_install_cleared_at_open");
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    let three = copy_of(&trio, 3);
+    rebuilt(&mut trio, METHOD, floor);
+    let abandoned: Vec<_> = logged!(METHOD, "snapshot_transfer_abandoned")
+        .into_iter()
+        .map(|line| line["why"].clone())
+        .collect();
+    assert_eq!(abandoned, vec![serde_json::json!("peer_booted")]);
+    let begun = logged!(METHOD, "snapshot_install_begun");
+    assert_eq!(begun.len(), 2, "one install per process: {begun:?}");
+    let opened: Vec<_> = logged!(METHOD, "snapshot_transfer_opened")
+        .into_iter()
+        .filter(|line| line["copy"] == three.0)
+        .collect();
+    assert_eq!(opened.len(), 2, "{opened:?}");
+    promoted_and_durable(&mut trio, 31);
+}
+
+/// Issue #61 S1-R10 cut (iii) (design B1, rev 4 N4): an idle partition trimmed at its head on
+/// every copy (F = head), node 3 rebuilt from a snapshot at `S = F`, and restarted on the same
+/// disk the moment its install finished. The installed lineage reopens from its barrier record
+/// at `F`, so node 3 rejoins without a second transfer, is promoted, and a put is durable on
+/// it; node 2 serves the same put.
+/// Cut: `install_finish` omits the barrier record, red (the restarted node 3 cannot reopen at
+/// `F` and is rebuilt again: 3 installs, not 1).
+/// Integration (~5 s): S2-R1's setup with F = head, and a restart.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r10_iii_a_target_restarted_right_after_its_install_serves() {
+    const METHOD: &str = "s1_r10_iii_a_target_restarted_right_after_its_install_serves";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 0, |_| {});
+    trio.until("node 3 installed", |_| {
+        (!logged!(METHOD, "snapshot_transfer_installed").is_empty()).then_some(())
+    });
+    restart_as(&mut trio, dir.path(), 3, false);
+    assert!(
+        logged!(METHOD, "snapshot_install_cleared_at_open").is_empty(),
+        "a finished install is kept"
+    );
+    promoted_and_durable(&mut trio, 31);
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    assert_eq!(installed.len(), 1, "no second transfer: {installed:?}");
+    assert_eq!(installed[0]["at"].as_u64(), Some(floor), "S = F = head");
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 2 applied the put", |trio| {
+        let host = &trio.nodes[1].0;
+        host.replication
+            .receiver(host.node, PartitionId(1))
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
 }
