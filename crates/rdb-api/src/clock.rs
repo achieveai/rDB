@@ -25,7 +25,7 @@
 //! and load that leave every round Inconclusive for [`VERDICT_FRESH_MILLIS`] cost the bound. A node `Fenced` and behind a majority of the cluster moves its clock forward
 //! ([`ClockGuard::reanchor_if_behind`]) and recovers with no restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -274,6 +274,9 @@ pub struct ClockGuard {
     /// The origin of the monotonic milliseconds the verdict table runs on.
     origin: Instant,
     verdicts: Mutex<Verdicts>,
+    /// The live members whose verdicts count (#80 S4, B-2), as the attached `Net` last set
+    /// them. `None`: every peer counts, as before membership could change.
+    members: Mutex<Option<BTreeSet<NodeId>>>,
 }
 
 impl ClockGuard {
@@ -285,6 +288,7 @@ impl ClockGuard {
             cluster: AtomicUsize::new(0),
             origin: Instant::now(),
             verdicts: Mutex::new(Verdicts::default()),
+            members: Mutex::new(None),
         }
     }
 
@@ -308,10 +312,37 @@ impl ClockGuard {
         self.attached.store(true, Ordering::Relaxed);
     }
 
+    /// Count verdicts only from `members` from now on (#80 S4, B-2): a non-member's round is
+    /// ignored by [`Self::observe`], and a verdict already held for one is dropped, so a node
+    /// that is no live member never counts toward [`Self::established`]. K is
+    /// [`Self::attach`]'s, which `Net::set_members` sets beside this.
+    pub(crate) fn set_members(&self, members: &BTreeSet<NodeId>) {
+        let mut verdicts = self.lock();
+        verdicts.peers.retain(|peer, _| members.contains(peer));
+        *self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(members.clone());
+    }
+
+    fn counts(&self, peer: NodeId) -> bool {
+        self.members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|members| members.contains(&peer))
+    }
+
     /// The control row's "guard off": as if no `Net` were attached (13e).
     #[cfg(test)]
     pub(crate) fn disable(&self) {
         self.attached.store(false, Ordering::Relaxed);
+    }
+
+    /// K, for rows (#80 S4).
+    #[cfg(test)]
+    pub(crate) fn cluster_k(&self) -> usize {
+        self.k()
     }
 
     /// The last conclusive verdict on `peer`, fresh or not, for rows.
@@ -322,6 +353,10 @@ impl ClockGuard {
 
     /// Fold one peer's round in, and report a change of the bound.
     pub(crate) fn observe(&self, peer: NodeId, sample: ClockSample) {
+        if !self.counts(peer) {
+            tracing::debug!(peer = peer.0, "clock_sample_not_a_member");
+            return;
+        }
         let now = self.mono();
         let mut verdicts = self.lock();
         let before = verdicts.peers.get(&peer).map(|seen| seen.verdict);
@@ -853,6 +888,44 @@ mod tests {
             verdicts.record(NodeId(*peer), *sample, EPS, now);
         }
         verdicts
+    }
+
+    /// #80 S4 M9, the grow half and the member filter (B-2): node 1's guard over members 1 to 5
+    /// (K = 5) is not established on one Agree (2 of 5 with itself), and a non-member's Agree
+    /// neither counts nor is kept, so it stays unestablished; a second member's Agree
+    /// establishes it (3 of 5). The members grow to 8 (K = 8): 3 of 8 is no majority, and two
+    /// Agrees from members old and new (4, then 6, which joined) restore it at 5 of 8. Unit.
+    /// The shrink half (K falls as members are removed) is T11b's.
+    /// Cut: `observe` counts non-members: node 9's Agree is kept ("a non-member is not kept":
+    /// left `Some(Agree)`), red, observed 2026-11-20.
+    #[test]
+    fn s80s4_clock_guard_k_follows_live_members() {
+        let agree = offset_by(0, 10);
+        let guard = ClockGuard::new();
+        let five: BTreeSet<NodeId> = (1..=5).map(NodeId).collect();
+        guard.set_members(&five);
+        guard.attach(five.len());
+        guard.observe(NodeId(2), agree);
+        assert!(!guard.established(), "2 of 5 is no majority");
+        guard.observe(NodeId(9), agree);
+        assert_eq!(
+            guard.verdict_of(NodeId(9)),
+            None,
+            "a non-member is not kept"
+        );
+        assert!(!guard.established(), "a non-member's Agree does not count");
+        guard.observe(NodeId(3), agree);
+        assert!(guard.established(), "3 of 5");
+
+        let eight: BTreeSet<NodeId> = (1..=8).map(NodeId).collect();
+        guard.set_members(&eight);
+        guard.attach(eight.len());
+        assert_eq!(guard.cluster_k(), 8);
+        assert!(!guard.established(), "3 of 8 is no majority");
+        guard.observe(NodeId(4), agree);
+        assert!(!guard.established(), "4 of 8 is no majority");
+        guard.observe(NodeId(6), agree);
+        assert!(guard.established(), "5 of 8, node 6 counting once a member");
     }
 
     /// 13a: the verdict arithmetic at its edges, and the bound rule. Cuts: `<=` to `<` on Agree,

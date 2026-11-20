@@ -2,15 +2,88 @@
 //! database by creating its `nodes/{id}` record. The formation record, the reservation,
 //! `routes/0` and generation-0 placement never change; the records are the membership.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use config_core::{ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest};
+use config_core::{
+    ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest, WatchItem, WatchRequest,
+};
 use rdb_core::authority::node::{machine_refusal, parse_addr, NodeRecord, MAX_ADDR_LEN};
 use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::control::ControlPrefix;
 use rdb_core::contracts::ids::NodeId;
+use tokio_stream::StreamExt;
 
-use super::{control_tls_refusal, machine_clash, read_formation, read_nodes, DeclareError};
+use super::{
+    control_tls_refusal, machine_clash, read_formation, read_nodes, read_nodes_at, DeclareError,
+};
+use crate::net::Net;
+
+/// How long [`watch_members`] waits before it lists again after a failed list or watch.
+const WATCH_RETRY: Duration = Duration::from_millis(250);
+
+/// Keep `net`'s members the live `nodes/` records on `store` (#80 S4, B-2): list `nodes/`,
+/// [`Net::set_members`] with every record's id at the list's revision, then watch the prefix
+/// from that revision and list again on any event, and again after a failed list or a watch
+/// that fails or ends (a store outage: the re-list catches what the watch missed, R11). Runs
+/// until its task is aborted. An empty `nodes/` (an undeclared database) admits nothing new.
+/// Logged `members_list_failed` and `members_watch_failed` at warn, once per run of failures.
+pub async fn watch_members(store: Arc<dyn ConfigStore>, net: Arc<Net>) {
+    let prefix = Bytes::from_static(ControlPrefix::Nodes.encode().as_bytes());
+    let mut failing = false;
+    loop {
+        let revision = match read_nodes_at(&*store).await {
+            Ok((records, revision)) => {
+                if !records.is_empty() {
+                    let live: BTreeSet<NodeId> = records.keys().copied().collect();
+                    net.set_members(&live, revision);
+                }
+                failing = false;
+                revision
+            }
+            Err(error) => {
+                if !failing {
+                    tracing::warn!(%error, "members_list_failed");
+                    failing = true;
+                }
+                tokio::time::sleep(WATCH_RETRY).await;
+                continue;
+            }
+        };
+        let watched = store
+            .watch(WatchRequest {
+                prefix: prefix.clone(),
+                start_after_revision: revision,
+                progress_interval: None,
+            })
+            .await;
+        let mut stream = match watched {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, revision, "members_watch_failed");
+                tokio::time::sleep(WATCH_RETRY).await;
+                continue;
+            }
+        };
+        loop {
+            match stream.next().await {
+                Some(Ok(WatchItem::Event(_))) => break,
+                Some(Ok(WatchItem::Progress { .. })) => {}
+                Some(Err(error)) => {
+                    tracing::warn!(%error, revision, "members_watch_failed");
+                    tokio::time::sleep(WATCH_RETRY).await;
+                    break;
+                }
+                None => {
+                    tokio::time::sleep(WATCH_RETRY).await;
+                    break;
+                }
+            }
+        }
+    }
+}
 
 /// What every [`add_node`] refusal ends with.
 const NOTHING: &str = "nothing was written";

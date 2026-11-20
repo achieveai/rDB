@@ -385,6 +385,11 @@ impl PrefixCut {
         self.cut.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Cut the calls again from now on (#80 S4: a watcher held after its node opened).
+    pub(crate) fn recut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn check(&self, calls: CutCalls, key: &[u8]) -> Result<(), ConfigError> {
         if calls == self.calls
             && key.starts_with(&self.prefix)

@@ -301,6 +301,12 @@ struct Shared {
     /// This process's clock, the one its [`Links`] owns.
     clock: HostClock,
     routes: Mutex<BTreeMap<NodeId, Route>>,
+    /// The live members (#80 S4, B-2): the nodes whose links this process takes. The boot peer
+    /// list and this node at start; [`Net::set_members`] from the `nodes/` records after. A
+    /// node's handshake from any other id is refused (`refusal`).
+    members: Mutex<BTreeSet<NodeId>>,
+    /// The `nodes/` revision [`Net::set_members`] last applied; 0 before any.
+    members_revision: AtomicU64,
     conns: Mutex<BTreeMap<u64, Arc<Conn>>>,
     next_conn: AtomicU64,
     rt: tokio::runtime::Handle,
@@ -366,6 +372,8 @@ impl Net {
                     })
                     .collect(),
             ),
+            members: Mutex::new(boot_members(&config.label, &config.peers)),
+            members_revision: AtomicU64::new(0),
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             rt: tokio::runtime::Handle::current(),
@@ -377,6 +385,7 @@ impl Net {
         if !config.peers.is_empty() {
             let k = config.peers.len() + usize::from(matches!(config.label, Label::Node(_)));
             if let Some(guard) = links.clock().guard() {
+                guard.set_members(&lock(&shared.members));
                 guard.attach(k);
             }
         }
@@ -453,6 +462,77 @@ impl Net {
     #[must_use]
     pub const fn addr(&self) -> Option<std::net::SocketAddr> {
         self.addr
+    }
+
+    /// Admit the live members the `nodes/` records name at `revision` (#80 S4, B-2): a node in
+    /// `live` gets a route, so its handshake is welcomed and installed, and the clock guard
+    /// counts its verdicts and takes K as the live members plus any id still linked (ruling
+    /// R8-7). A node outside `live` is refused at the handshake from now on. Retiring a member
+    /// (closing its links, K shrinking) is not done here yet: a record is never removed before
+    /// layout 3. This node is always a member of its own set. Logged `net_members_set` when the
+    /// set changes.
+    pub fn set_members(&self, live: &BTreeSet<NodeId>, revision: u64) {
+        let shared = &self.shared;
+        let own = match &shared.label {
+            Label::Node(own) => Some(*own),
+            Label::App(_) => None,
+        };
+        let members: BTreeSet<NodeId> = live.iter().copied().chain(own).collect();
+        let (added, linked) = {
+            let mut routes = lock(&shared.routes);
+            let mut added = Vec::new();
+            for node in members.iter().filter(|node| Some(**node) != own) {
+                if !routes.contains_key(node) {
+                    routes.insert(
+                        *node,
+                        Route {
+                            conn: None,
+                            queue: VecDeque::new(),
+                            boot: None,
+                            refused: None,
+                            last_error: None,
+                        },
+                    );
+                    added.push(node.0);
+                }
+            }
+            let linked: BTreeSet<NodeId> = routes
+                .iter()
+                .filter(|(_, route)| route.conn.is_some())
+                .map(|(node, _)| *node)
+                .collect();
+            (added, linked)
+        };
+        let changed = {
+            let mut held = lock(&shared.members);
+            let changed = *held != members;
+            held.clone_from(&members);
+            changed
+        };
+        shared.members_revision.store(revision, Ordering::Relaxed);
+        let k = members.union(&linked).count();
+        if let Some(guard) = shared.clock.guard() {
+            guard.set_members(&members);
+            if k > 1 {
+                guard.attach(k);
+            }
+        }
+        if changed || !added.is_empty() {
+            let live: Vec<u32> = members.iter().map(|node| node.0).collect();
+            tracing::info!(revision, live = ?live, added = ?added, k, "net_members_set");
+        }
+    }
+
+    /// The live members this process takes links from ([`Self::set_members`]).
+    #[must_use]
+    pub fn members(&self) -> BTreeSet<NodeId> {
+        lock(&self.shared.members).clone()
+    }
+
+    /// The `nodes/` revision [`Self::set_members`] last applied; 0 before any (#80 S4).
+    #[must_use]
+    pub fn members_revision(&self) -> u64 {
+        self.shared.members_revision.load(Ordering::Relaxed)
     }
 
     /// Call `observer(node, boot)` whenever a node's link comes up at a boot not seen before
@@ -721,6 +801,11 @@ impl Net {
             links: std::sync::Weak::new(),
             clock: HostClock::start(),
             routes: Mutex::new(peers.iter().map(|peer| (*peer, route())).collect()),
+            members: Mutex::new(boot_members(
+                &Label::Node(node),
+                &peers.iter().copied().collect(),
+            )),
+            members_revision: AtomicU64::new(0),
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             rt,
@@ -1665,5 +1750,23 @@ fn refusal(shared: &Shared, label: &Label, hello: &Hello) -> Option<String> {
             hello.label
         ));
     }
+    if let Label::Node(node) = label {
+        if !lock(&shared.members).contains(node) {
+            return Some(format!(
+                "{label} is not a live member of {}'s database: node {} has no nodes/ record \
+                 this node has applied yet; it is dialled again",
+                shared.label, node.0
+            ));
+        }
+    }
     None
+}
+
+/// A process's members at start: its boot peers, and itself for a node.
+fn boot_members(label: &Label, peers: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
+    let own = match label {
+        Label::Node(own) => Some(*own),
+        Label::App(_) => None,
+    };
+    peers.iter().copied().chain(own).collect()
 }

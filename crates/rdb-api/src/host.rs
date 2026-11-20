@@ -8557,6 +8557,22 @@ impl Host {
                 from.0, partition.0, from.0
             ));
         }
+        // #80 S4: a copy moves only onto a live member, the set this process's `Net` takes links
+        // from (`Net::set_members`). In-process links have no `Net` and no records to check.
+        if let Some(net) = self.links.net().filter(|net| !net.members().contains(&to)) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                to = to.0,
+                members_revision = net.members_revision(),
+                "move_target_not_live"
+            );
+            return refuse(format!(
+                "node {} is not a live member: no nodes/ record for it has reached node {}; add \
+                 it with `admin add-node` and wait for its record, then move",
+                to.0, self.node.0
+            ));
+        }
         let role = |node: NodeId| {
             members
                 .iter()

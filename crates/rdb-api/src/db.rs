@@ -583,6 +583,9 @@ struct Opened {
     heal_task: Option<tokio::task::JoinHandle<()>>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
+    /// The `nodes/` watcher of a declared node process (#80 S4, [`admin::watch_members`]),
+    /// aborted at shutdown.
+    members_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
@@ -640,6 +643,7 @@ impl Default for Opened {
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
             planner_task: None,
+            members_task: None,
             stuck: Mutex::new(None),
             control: None,
             instance: None,
@@ -1541,6 +1545,12 @@ impl Db {
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
         };
+        // #80 S4: a declared node process keeps its links' members the `nodes/` records.
+        let declared_net = config
+            .addresses
+            .as_ref()
+            .and(config.links.as_ref())
+            .and_then(|links| links.net());
         let mut db = Self::open_spawning(
             config,
             store,
@@ -1566,10 +1576,24 @@ impl Db {
         .await
         .map_err(open_refused)?;
         db.respawn = Some(respawn);
+        if let Some(net) = declared_net {
+            db.start_members(net);
+        }
         if let Some(failover) = failover {
             db.start_planner(failover);
         }
         Ok(db)
+    }
+
+    /// Start this declared node process's `nodes/` watcher ([`admin::watch_members`]).
+    fn start_members(&mut self, net: Arc<crate::net::Net>) {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return;
+        };
+        self.opened.members_task = Some(rt.spawn(tracing::Instrument::instrument(
+            admin::watch_members(store, net),
+            tracing::Span::current(),
+        )));
     }
 
     /// Start the failover planner of this node process ([`DbConfig::failover`]).
@@ -5284,6 +5308,52 @@ impl Db {
         }
     }
 
+    /// #80 S4: [`Self::move_copy`] for any partition: ask `partition`'s owner to move its copy
+    /// on node `from` to node `to`, or say where that move stands. The owner refuses a target
+    /// that is not a live member of its links (no `nodes/` record it has applied), changing
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::move_copy`]; `INVALID_ARGUMENT`, nothing sent, for a partition this database
+    /// does not have.
+    pub fn move_copy_in(
+        &self,
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<host::MoveAnswer, ApiError> {
+        let partitions = self.route.partitions();
+        if partition.0 == 0 || partition.0 > partitions {
+            let mut error = ApiError::invalid(format!(
+                "move_copy_in: partition {} is not one of this database's {partitions}; nothing \
+                 was sent",
+                partition.0
+            ));
+            error.no_mutation = true;
+            return Err(error);
+        }
+        match self.call(
+            partition,
+            ClientCall::Move {
+                identity: self.identity(),
+                from,
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(moved)) => Ok(moved),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a move was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the move in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
     /// Issue #105 (design section 8.1): `admin forget-tail`. Asks the owner to re-plan
     /// partition 1 once, giving up what `release` names: with `through`, every held tail at or
     /// below that seq; with `no_intact_copy`, the intact rule. `give_up_live_copy` allows giving
@@ -5627,6 +5697,9 @@ impl Db {
         if let Some(task) = self.opened.planner_task.take() {
             task.abort();
             tracing::info!("planner_stopped");
+        }
+        if let Some(task) = self.opened.members_task.take() {
+            task.abort();
         }
         if let Some(task) = self.opened.heal_task.take() {
             task.abort();
@@ -6953,6 +7026,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod s80s4_tests;
 
 #[cfg(test)]
 mod tests {

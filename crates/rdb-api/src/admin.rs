@@ -889,6 +889,18 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
 pub async fn read_nodes(
     store: &dyn ConfigStore,
 ) -> Result<BTreeMap<NodeId, NodeRecord>, DeclareError> {
+    read_nodes_at(store).await.map(|(records, _)| records)
+}
+
+/// [`read_nodes`], with the revision the list read at (#80 S4: the watcher's
+/// `members_revision`, and where its watch starts).
+///
+/// # Errors
+///
+/// As [`read_nodes`].
+pub async fn read_nodes_at(
+    store: &dyn ConfigStore,
+) -> Result<(BTreeMap<NodeId, NodeRecord>, u64), DeclareError> {
     let prefix = ControlPrefix::Nodes.encode();
     let listed = store
         .list(ListRequest {
@@ -917,7 +929,7 @@ pub async fn read_nodes(
             .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
         records.insert(record.node, record);
     }
-    Ok(records)
+    Ok((records, listed.read_revision))
 }
 
 /// Why node `node` may not start with `listen` and `peers` on a database declared as
@@ -4621,7 +4633,7 @@ async fn freeze(
 pub mod membership;
 pub(crate) mod rebuild;
 
-pub use membership::{add_node, AddNodeError};
+pub use membership::{add_node, watch_members, AddNodeError};
 
 #[cfg(test)]
 mod tests {
