@@ -20,6 +20,10 @@ pub const FEED_PAGE_BYTES: usize = 4 << 20;
 /// The most records one call examines. Above [`FEED_PAGE_RECORDS`] it binds only a call that
 /// skips records: those with no write under the caller's tenant.
 pub const FEED_SCAN_RECORDS: u32 = 1_024;
+/// The most encoded record bytes one call examines, returned or skipped. Counted after each
+/// read, so a call can pass it by one record; it always examines at least one. Twice
+/// [`FEED_PAGE_BYTES`], so it binds only a call that skips records.
+pub const FEED_SCAN_BYTES: usize = 2 * FEED_PAGE_BYTES;
 
 /// The position after one record: its header's stamp (the generation that wrote it, not the
 /// one that served it), its seq and its chained record digest. Equal digest at equal seq means
@@ -246,8 +250,10 @@ pub struct Scanned {
 }
 
 /// The records after `after` up to `cap`, read one seq at a time by `read`, stopped by `max`,
-/// [`FEED_PAGE_RECORDS`], [`FEED_PAGE_BYTES`] and [`FEED_SCAN_RECORDS`]. Whole records only, and
-/// at least one when any is due.
+/// [`FEED_PAGE_RECORDS`], [`FEED_PAGE_BYTES`], [`FEED_SCAN_RECORDS`] and [`FEED_SCAN_BYTES`].
+/// Whole records only, and at least one when any is due. `next` is after the last record
+/// examined, so skipped records still move it, and `more` is set whenever a cap stopped the
+/// call below `cap`.
 ///
 /// # Errors
 ///
@@ -260,8 +266,14 @@ pub fn page<E>(
 ) -> Result<FeedPage, E> {
     let returned = max.min(FEED_PAGE_RECORDS) as usize;
     let (mut records, mut bytes, mut scanned, mut next) = (Vec::new(), 0_usize, 0_u32, after);
-    while next.seq < cap && scanned < FEED_SCAN_RECORDS && records.len() < returned {
+    let mut examined = 0_usize;
+    while next.seq < cap
+        && scanned < FEED_SCAN_RECORDS
+        && examined < FEED_SCAN_BYTES
+        && records.len() < returned
+    {
         let found = read(Seq(next.seq.0 + 1))?;
+        examined = examined.saturating_add(found.bytes);
         if let Some(record) = found.record {
             if !records.is_empty() && bytes.saturating_add(found.bytes) > FEED_PAGE_BYTES {
                 break;

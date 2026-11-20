@@ -332,3 +332,32 @@ fn f87_1_page_and_scan_caps_hold_and_oversize_record_still_advances() {
     assert_eq!(page_of(5, 10, &skipped), (Vec::new(), 5, false));
     assert_eq!(page_of(0, 10, &small), (Vec::new(), 0, false));
 }
+
+/// Review r1 (PR #170): skipped records count toward [`FEED_SCAN_BYTES`], so a call that skips
+/// large records reads a bounded number of bytes, not up to [`FEED_SCAN_RECORDS`] of them. With
+/// 1 MiB records skipped, the call reads 8 (8 MiB), moves `next` past them and sets `more`; one
+/// skipped record larger than the cap is still read and passed alone. The returned-byte cap
+/// and `more` are unchanged, and a page that both returns and skips stops at the scan cap with
+/// what it returned so far.
+/// Cut: drop `examined < FEED_SCAN_BYTES` from the loop, red (1024 reads, 1 GiB examined).
+#[test]
+fn f87_1_skipped_bytes_count_toward_the_scan_cap() {
+    let mib = 1 << 20;
+    let count = |cap: u64, max: u32, read: &dyn Fn(u64) -> Scanned| {
+        let calls = std::cell::Cell::new(0_u32);
+        let Ok(page) = page::<Infallible>(FeedCursor::START, Seq(cap), max, |seq| {
+            calls.set(calls.get() + 1);
+            Ok(read(seq.0))
+        });
+        (records(&page), calls.get())
+    };
+    let skipped = |seq| scanned(seq, mib, false);
+    assert_eq!(count(5_000, 10, &skipped), ((Vec::new(), 8, true), 8));
+    let huge = |seq| scanned(seq, FEED_SCAN_BYTES + 1, false);
+    assert_eq!(count(5_000, 10, &huge), ((Vec::new(), 1, true), 1));
+    // Every other record returned: 3 returned (3 MiB) and 5 skipped by the 8th read.
+    let mixed = |seq: u64| scanned(seq, mib, seq % 2 == 0 && seq <= 6);
+    assert_eq!(count(5_000, 10, &mixed), ((vec![2, 4, 6], 8, true), 8));
+    // Under the scan cap nothing changes: the page ends at the cap with `more` unset.
+    assert_eq!(count(5, 10, &skipped), ((Vec::new(), 5, false), 5));
+}
