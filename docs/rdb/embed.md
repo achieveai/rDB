@@ -436,7 +436,9 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
   stops, that work stops with it and is moved elsewhere with the partition. An effect made by
   another process or machine is not covered by `still_owner`, only by the destination's fence.
 - From **any** process, `db.route(group).token` (or `db.leader_of(partition).token`) is the
-  token the partition's record names now: the one its owner stamps (#84). Use it to see that a
+  token the partition's record names: the one its owner stamps (#84). In a node's process it
+  can be a cached answer, kept while the control watch is open: a change of the record is
+  seen once its watch event arrives (see `route`, below). Use it to see that a
   new owner took over (its token is higher), or to check what a destination holds. It is a hint
   read from rEtcd, never ownership: only `still_owner`, in the owner's process, says you may act.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
@@ -806,12 +808,13 @@ record. Use it to send a request to the right node.
   read once its second is up, and that read can be slow or fail too: the call is then
   `UNAVAILABLE`, not an answer without the address.
 - `db.partition_of(group)` names the group's partition without reading anything. The count is
-  fixed when the database is declared (at most 512), so a group stays in its partition, and
+  fixed when the database is formed (at most 512), by its declaration or by `rdb_node --form`, so a group stays in its partition, and
   every group of a partition moves with it, while the database has its original partitions:
   a partition that later splits can move a group to another partition (see the key map,
   above).
-- `db.leader_of(partition)` is `route` by partition: what rEtcd's records say now, from any
-  process. A partition the database does not have is `INVALID_ARGUMENT`. It is not
+- `db.leader_of(partition)` is `route` by partition: what rEtcd's records say, from any
+  process, cached the same way, so in a node's process a change is seen once its watch event
+  arrives. A partition the database does not have is `INVALID_ARGUMENT`. It is not
   `db.owner_of(partition)`, which reads nothing and names the node this `Db` sends the
   partition's calls to; during a move the two can differ until this `Db` learns of it.
 - A record this build cannot decode is `INCOMPATIBLE_VERSION` (retry `Quarantine`): a newer
@@ -830,12 +833,21 @@ record. Use it to send a request to the right node.
 **Upgrading from an earlier build.** `NodeAddresses` gained `app`: add `app: None` to an
 existing `NodeAddresses { listen, peers }`, which behaves as before. `RouteInfo` is no longer
 `Copy` (it owns the address): add `.clone()` where an answer is used after it moved, and
-match it with `..`. Its equality now includes the address.
+match it with `..`. It can no longer be built with a struct literal outside rDB, since the
+address field is private: take it from `route` or `leader_of`. Its equality now includes the
+address.
 
 **No rollback after an app address is registered.** The first open with an app address
 rewrites the node's record in a newer layout (2), which an earlier build cannot read: it
 refuses to start on that store. No store of such a build is in use, so no rollback is
-supported. To run an earlier build, declare a new database on a new empty control store.
+supported. To run an earlier build, start over:
+
+- Declare a new database on a new, empty control store.
+- Give every node a new, empty folder. Keeping the node folders while changing only the
+  control store is refused (`Mismatch`): the folders belong to the old database.
+- The old data is not carried over.
+- Keep the old folders and the old store intact; do not delete them.
+
 Never hand-edit a record in a live store.
 
 **Try it.** `rdb_node` prints each event as

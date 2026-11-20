@@ -4434,15 +4434,19 @@ impl Db {
     /// A call takes at most two read timeouts ([`Timeouts::read`]) in all, however many calls
     /// run at once: one for the partition record, and one for the owner's address, waiting
     /// for another call's read of it included.
+    ///
     /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
-    /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read;
-    /// the address itself is never logged, since it may carry a credential.
+    /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read
+    /// that succeeds; `db_route_read_failed{what, detail}` (warn) when a read fails or does not
+    /// answer in time, and `db_route_read_undecodable{what, detail}` (warn) for a record this
+    /// build cannot decode. The address itself is never logged, since it may carry a
+    /// credential.
     ///
     /// # Errors
     ///
-    /// - `UNAVAILABLE` (retry `BoundedJitter`) when either record cannot be read within its read
-    ///   timeout, or the partition record is absent, and from a `Db` a crate test built by
-    ///   hand, which has no control store. This includes a cached owner whose address read
+    /// - `UNAVAILABLE` (retry `BoundedJitter`) in three cases: either record cannot be read, or
+    ///   is not read in time; the partition record is absent; or the `Db` is one a crate test
+    ///   built without a control store. The first includes a cached owner whose address read
     ///   fails: no answer is given without a current address. A later call can succeed. An
     ///   absent `nodes/{id}` record is not an error: the address is `None`.
     /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
@@ -4455,10 +4459,12 @@ impl Db {
     /// [`Self::route`] of a partition rather than a group (#83, SBX's `leader_of`): the owner,
     /// token and owner address that `partition`'s records name, cached the same way.
     ///
-    /// Not [`Self::owner_of`]: this reads the control records, what rEtcd says the owner is now,
-    /// from any process. `owner_of` reads nothing; it names the node this `Db` sends the
-    /// partition's calls to, from its own cache, and during a move the two can differ until
-    /// this `Db` learns of the move.
+    /// Not [`Self::owner_of`]: this reads the control records, what rEtcd says the owner is,
+    /// from any process. Like `route`, it can answer from the cache a node's control watch
+    /// keeps current, so a change of the record is seen once its watch event arrives.
+    /// `owner_of` reads nothing; it names the node this `Db` sends the partition's calls to,
+    /// from its own cache, and during a move the two can differ until this `Db` learns of the
+    /// move.
     ///
     /// # Errors
     ///

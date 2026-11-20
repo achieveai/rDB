@@ -170,9 +170,11 @@
      fields are what every check compares: the start check decodes them; declaring a formed
      database again reads `admin::read_nodes`, which decodes them, and compares those
      (`declare`'s `same`); and `declare_preflight` compares decoded fields too. `admin::adopt`
-     compares raw bytes, but only for a create whose reply was lost, during a declaration not
-     yet formed, before any node can register an address (a node registers only once the
-     formation record exists), so it only meets layout 1. `Db::route` returns the address as
+     compares raw bytes. It runs after a node-record create that did not apply: one answered
+     not applied, because the key already exists (as an interrupted declaration leaves it),
+     and one whose outcome is unknown (its reply was lost). Both happen only during a
+     declaration not yet formed, before any node can register an address (a node registers
+     only once the formation record exists), so it only meets layout 1. `Db::route` returns the address as
      `RouteInfo::app_address`. A read that succeeds is kept for a second per owner; a failed
      read keeps nothing, so the next call reads again.
    - **What this amends.** Decision 1's "nothing updates one in place" now means: nothing
@@ -181,7 +183,11 @@
      layout-2 record, so it refuses to start on such a store. S1b never shipped and no S1b
      store is in use (lead ruling, PR #159 review), so no rollback is supported once any node
      has registered an app address: to run an older build, declare a new database on a new
-     empty control store. Never hand-edit a record of a live store to get back to layout 1.
+     empty control store, and give every node a new, empty folder. Keeping the node folders
+     while changing only the control store is refused (`Mismatch`): the folders are bound to
+     the old database. Starting over does not carry the old data over. Keep the old folders
+     and the old store intact rather than deleting them. Never hand-edit a record of a live
+     store to get back to layout 1.
 
 ## Consequences
 
