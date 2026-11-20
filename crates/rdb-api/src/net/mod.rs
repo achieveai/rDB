@@ -1240,8 +1240,10 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
                 }),
             );
             if posted.is_err() {
-                let error =
-                    ApiError::host(&format!("node {} is not served by {}", to.0, shared.label));
+                let error = ApiError::owner_fault(&format!(
+                    "node {} is not served by {}",
+                    to.0, shared.label
+                ));
                 conn.out(Frame::Reply {
                     correlation: reply,
                     reply: WireReply::Answer(WireAnswer::carry(&Answer::Error {
@@ -1327,6 +1329,7 @@ fn undecodable_call(to: NodeId, error: &str) -> ApiError {
         ),
         retry_after: None,
         too_large: None,
+        owner_fault: false,
     }
 }
 

@@ -206,6 +206,23 @@ fn new_scope_variants_are_appended_and_an_unknown_tag_is_refused() {
     assert!(matches!(frame, wire::WireError::Decode(_)), "{frame}");
 }
 
+/// #134: a call the node could not decode is not an owner fault, so no takeover step: its
+/// detail already says to check both sides run the same build, and its step is "retrying will
+/// not help". It keeps that across the wire. Cut: build it with `ApiError::owner_fault`: red.
+#[test]
+fn an_undecodable_call_keeps_retrying_will_not_help() {
+    let error = super::undecodable_call(NodeId(2), "unknown variant tag 9");
+    let landed = crate::db::ApiError::from(wire::WireApiError::from(&error));
+    for error in [&error, &landed] {
+        assert!(!error.owner_fault, "{error}");
+        assert_eq!(
+            error.next_step(),
+            Some("retrying will not help: keep this Db's log and report this message"),
+            "{error}"
+        );
+    }
+}
+
 /// Every client call shape the API sends: each change, each look.
 fn calls() -> Vec<ClientCall> {
     let upload = [5u8; 16];

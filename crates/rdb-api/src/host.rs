@@ -2634,7 +2634,7 @@ impl Fault {
     fn error(&self) -> ApiError {
         match self.damage {
             Some(kind) => ApiError::new(kind, format!("host fault: {}", self.detail)),
-            None => ApiError::host(&self.detail),
+            None => ApiError::owner_fault(&self.detail),
         }
     }
 
@@ -11396,6 +11396,7 @@ impl Host {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         })
     }
 

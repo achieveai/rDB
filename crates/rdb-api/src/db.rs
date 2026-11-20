@@ -3089,7 +3089,7 @@ impl Db {
             let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
             return Some(Answer::Error {
                 error: if local {
-                    ApiError::host("the owner's node thread has stopped")
+                    ApiError::owner_fault("the owner's node thread has stopped")
                 } else {
                     ApiError::owner_unreachable(owner)
                 },
@@ -5142,6 +5142,7 @@ impl Db {
                 ),
                 retry_after: None,
                 too_large: None,
+                owner_fault: false,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -5740,7 +5741,7 @@ impl Db {
             reply: host::RebuildReply(reply),
         };
         if self.send_to(owner, asked).is_err() {
-            return Err(ApiError::host(&format!(
+            return Err(ApiError::owner_fault(&format!(
                 "node {} (the owner) stopped before it was asked to rebuild node {}",
                 owner.0, node.0
             )));
@@ -6023,7 +6024,7 @@ fn carries(call: &ClientCall) -> Carries {
 /// compile, a read, a status look) applied nothing (A-R394 E1).
 fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        return ApiError::host("the owner dropped the call unanswered");
+        return ApiError::owner_fault("the owner dropped the call unanswered");
     }
     match carried {
         Carries::Write => ApiError::owner_lost(owner),
@@ -6085,6 +6086,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
                 detail: "the read was refused".to_owned(),
                 retry_after: None,
                 too_large: None,
+                owner_fault: false,
             }
         }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
@@ -6110,6 +6112,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         detail: "the read was refused".to_owned(),
         retry_after: None,
         too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -6649,6 +6652,7 @@ fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiErro
         detail: format!("{detail}; {}", error::REBUILD_STEP),
         retry_after: None,
         too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -8199,8 +8203,8 @@ mod tests {
     /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
     /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
     /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, as does `Overloaded` (P1's
-    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host fault, never a
-    /// guess. The owner's mailbox is answered by hand.
+    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host error, never a
+    /// guess: `NotWired`, and not an owner fault, as no takeover fixes it (#134). The owner's mailbox is answered by hand.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn a_refused_get_takes_its_retry_rule_from_the_kernel() {
@@ -8259,7 +8263,8 @@ mod tests {
             assert_eq!(refused.retry, retry, "{kind:?}: {refused:?}");
             if retry == RetryRule::NotWired {
                 assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
-                assert!(refused.detail.starts_with("host fault: "), "{refused:?}");
+                assert!(refused.detail.starts_with("host error: "), "{refused:?}");
+                assert!(!refused.owner_fault, "{refused:?}");
             } else {
                 assert_eq!(refused.kind, kind, "{refused:?}");
             }
@@ -11004,6 +11009,7 @@ mod tests {
             detail: "lease expired for partition 1".to_owned(),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         });
         assert!(
             refused.detail.ends_with(error::QUARANTINED_STEP)
@@ -11749,7 +11755,8 @@ mod tests {
 
     /// A-R261: a `Db` with no control store (only one a crate test builds by hand, now that
     /// every open keeps one) refuses a promote with the real cause and the call that fixes it,
-    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent.
+    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent. #134 audit: the
+    /// text names its step, so no "retrying will not help: report this" follows it.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn m10_s2_a_promote_on_a_db_with_no_control_store_names_the_cause_and_the_open_to_use() {
@@ -11763,8 +11770,7 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             "UNAVAILABLE (this Db was opened without a control store, so it cannot run admin \
-             commands such as promote: open it with Db::open, which connects it to one; next: \
-             retrying will not help: keep this Db's log and report this message)"
+             commands such as promote: open it with Db::open, which connects it to one)"
         );
         assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
     }

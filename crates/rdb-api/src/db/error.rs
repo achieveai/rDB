@@ -27,6 +27,12 @@ pub struct ApiError {
     /// sends, so an answer that crossed a link never carries it. Set it with
     /// [`Self::too_large_refusal`].
     pub too_large: Option<TooLarge>,
+    /// Whether the owner's node faulted, so a call can succeed once another node takes the
+    /// partition over (#134). Set by [`Self::owner_fault`] only, and on an answer that crossed a
+    /// link when it is `NotWired` and its detail starts with that constructor's
+    /// `"host fault: "`: the wire carries the detail, not this field. Every other `NotWired`
+    /// refusal, [`Self::host`]'s included, keeps "retrying will not help".
+    pub(crate) owner_fault: bool,
 }
 
 /// Which fixed size limit a `TOO_LARGE` refusal broke (#148).
@@ -58,10 +64,13 @@ pub struct TooLarge {
     pub max: usize,
 }
 
-/// How the detail of a host fault ([`ApiError::host`]) starts. A `NotWired` error whose detail
-/// starts with it is an owner fault, and gets [`owner_fault_step`]; the other `NotWired`
-/// refusals (admin, an undecodable call) keep `step_for`'s (#134).
-const HOST_FAULT: &str = "host fault: ";
+/// How the detail of an owner fault ([`ApiError::owner_fault`]) starts. It is what marks one on
+/// the wire: an answer that crossed a link is an owner fault when it is `NotWired` and its
+/// detail starts with this ([`ApiError::fault_from_wire`], #134).
+pub(crate) const HOST_FAULT: &str = "host fault: ";
+
+/// How the detail of [`ApiError::host`] starts: a node error that no takeover fixes.
+const HOST_ERROR: &str = "host error: ";
 
 /// The tail every "open the folder again" step in `db.rs` ends with ([`super::REOPEN_STEP`] and
 /// the stuck-recovery step). A detail that ends with it already says what to do next.
@@ -108,6 +117,15 @@ pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
 /// The tail of [`crate::admin::PromoteError::OwnerAlive`]: a designed refusal whose text names
 /// the step, which "retrying will not help: report this" would contradict (#79 S3 P2).
 pub(crate) const PROMOTE_ALIVE_STEP: &str = "stop that node first, then promote again";
+
+/// The tails of the other `NotWired` promote refusals that name their own step (#134 audit):
+/// "retrying will not help: report this" contradicted `Unanswered`'s "promote again" and
+/// misdirected the rest. `Unanswered`, `Superseded`, `Unconfigured`, `NoControlStore`.
+pub(crate) const PROMOTE_UNANSWERED_STEP: &str = "it may have written: promote again";
+pub(crate) const PROMOTE_SUPERSEDED_STEP: &str = "run status before promoting again";
+pub(crate) const PROMOTE_UNCONFIGURED_STEP: &str =
+    "promote a node that has not restarted since that node stopped";
+pub(crate) const PROMOTE_NO_STORE_STEP: &str = "open it with Db::open, which connects it to one";
 
 /// The tails of a `RECOVERY_READ_ONLY` refusal whose repair is held on a copy's tail (#79 S4d).
 /// "Writes return when the lost copies are back" is false there: the copy is back, and its tail
@@ -203,6 +221,7 @@ impl ApiError {
             detail: detail.into(),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -216,6 +235,7 @@ impl ApiError {
             detail: error.to_string(),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -257,6 +277,7 @@ impl ApiError {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -278,6 +299,7 @@ impl ApiError {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -300,6 +322,7 @@ impl ApiError {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -326,6 +349,7 @@ impl ApiError {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -347,20 +371,46 @@ impl ApiError {
             ),
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
     }
 
-    /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
+    /// The owner's node faulted (§4.4): it stopped, dropped the call, or could not serve an
+    /// effect, so it serves nothing more this boot. Retrying at it will not help, but another
+    /// node taking its partitions over can serve the call, which [`Self::next_step`] says (#134).
+    #[must_use]
+    pub fn owner_fault(detail: &str) -> Self {
+        Self {
+            owner_fault: true,
+            detail: format!("{HOST_FAULT}{detail}"),
+            ..Self::host_error(String::new())
+        }
+    }
+
+    /// A node error that is not an owner fault: an answer of the wrong shape, a call that
+    /// compiled to nothing, a call the blocking pool did not run. No retry and no takeover fixes
+    /// it, so its step is "retrying will not help: report this" (#134).
     #[must_use]
     pub fn host(detail: &str) -> Self {
+        Self::host_error(format!("{HOST_ERROR}{detail}"))
+    }
+
+    const fn host_error(detail: String) -> Self {
         Self {
             kind: ErrorKind::Unavailable,
             retry: RetryRule::NotWired,
             no_mutation: false,
-            detail: format!("{HOST_FAULT}{detail}"),
+            detail,
             retry_after: None,
             too_large: None,
+            owner_fault: false,
         }
+    }
+
+    /// Whether an answer that crossed a link with this rule and detail is an owner fault: the
+    /// wire carries [`Self::owner_fault`]'s detail prefix, not its field (#134).
+    pub(crate) fn fault_from_wire(retry: RetryRule, detail: &str) -> bool {
+        retry == RetryRule::NotWired && detail.starts_with(HOST_FAULT)
     }
 
     /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
@@ -416,6 +466,10 @@ impl ApiError {
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
+            || self.detail.ends_with(PROMOTE_UNANSWERED_STEP)
+            || self.detail.ends_with(PROMOTE_SUPERSEDED_STEP)
+            || self.detail.ends_with(PROMOTE_UNCONFIGURED_STEP)
+            || self.detail.ends_with(PROMOTE_NO_STORE_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)
             || self.detail.ends_with(TAIL_HELD_RESEND)
             || self.detail.ends_with(TAIL_ADOPTABLE_NEW_WRITE)
@@ -423,7 +477,7 @@ impl ApiError {
         {
             return None;
         }
-        if self.retry == RetryRule::NotWired && self.detail.starts_with(HOST_FAULT) {
+        if self.retry == RetryRule::NotWired && self.owner_fault {
             return Some(owner_fault_step(self.no_mutation));
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))
@@ -1112,7 +1166,7 @@ mod tests {
             "{explained}"
         );
 
-        let host = ApiError::host("the owner's node thread has stopped").for_barrier();
+        let host = ApiError::owner_fault("the owner's node thread has stopped").for_barrier();
         let explained = host.explain();
         assert!(explained.contains(BARRIER_NOTE), "{explained}");
         assert_eq!(
@@ -1149,7 +1203,7 @@ mod tests {
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {
         for no_mutation in [false, true] {
-            let mut error = ApiError::host("storage read fault");
+            let mut error = ApiError::owner_fault("storage read fault");
             error.no_mutation = no_mutation;
             let text = error.explain();
             let case = format!("no_mutation={no_mutation}: {text}");
@@ -1191,7 +1245,7 @@ mod tests {
     /// true: red.
     #[test]
     fn an_unsent_host_fault_says_a_read_reads_again() {
-        let mut error = ApiError::host("storage read fault");
+        let mut error = ApiError::owner_fault("storage read fault");
         error.no_mutation = true;
         let step = error.next_step().expect("a host fault has a step");
         assert!(
@@ -1205,7 +1259,7 @@ mod tests {
     /// names or "not with `Db::resend`" from `owner_fault_step` true: red.
     #[test]
     fn an_unsent_host_fault_sends_a_write_as_new_never_resend() {
-        let mut error = ApiError::host("storage read fault");
+        let mut error = ApiError::owner_fault("storage read fault");
         error.no_mutation = true;
         let step = error.next_step().expect("a host fault has a step");
         assert!(
@@ -1215,6 +1269,58 @@ mod tests {
             ),
             "{step}"
         );
+    }
+
+    /// #134: only a true owner fault gets the takeover step. An owner fault from a real site
+    /// (`unanswered`, a local owner that dropped the call) gets it on both `no_mutation`
+    /// branches; a host error that is not an owner fault (`written` of nothing, an answer of the
+    /// wrong shape) keeps "retrying will not help". Cut: `next_step` testing
+    /// `detail.contains("host ")` instead of the marker, or `host` setting the marker: red on
+    /// the non-fault half.
+    #[test]
+    fn only_an_owner_fault_gets_the_takeover_step() {
+        const PLAIN: &str = "retrying will not help: keep this Db's log and report this message";
+        let fault = super::super::unanswered(true, NodeId(1), super::super::Carries::Nothing);
+        for no_mutation in [false, true] {
+            let mut fault = fault.clone();
+            fault.no_mutation = no_mutation;
+            assert_eq!(
+                fault.next_step(),
+                Some(owner_fault_step(no_mutation)),
+                "no_mutation={no_mutation}: {fault}"
+            );
+            assert!(
+                fault
+                    .explain()
+                    .contains("once another node takes over (an operator promote does that)"),
+                "{fault}"
+            );
+        }
+        let nothing = super::super::written(None).expect_err("nothing was written");
+        let shape = ApiError::host("a write was answered with Unchanged");
+        for error in [nothing.error, shape] {
+            assert!(!error.owner_fault, "{error}");
+            assert!(error.detail.starts_with(HOST_ERROR), "{error}");
+            assert_eq!(error.next_step(), Some(PLAIN), "{error}");
+            assert!(!error.explain().contains("takes over"), "{error}");
+        }
+    }
+
+    /// #134: the wire carries no marker, so an answer that crossed a link is an owner fault by
+    /// its detail's prefix: an owner fault keeps the takeover step and a host error keeps its
+    /// plain step after a round trip. Cut: `From<WireApiError>` setting `owner_fault: false`:
+    /// red on the fault.
+    #[test]
+    fn the_owner_fault_marker_survives_the_wire() {
+        use crate::net::wire::WireApiError;
+        for error in [
+            ApiError::owner_fault("the owner's node thread has stopped"),
+            ApiError::host("a read was answered with Unchanged"),
+        ] {
+            let landed = ApiError::from(WireApiError::from(&error));
+            assert_eq!(landed, error);
+            assert_eq!(landed.next_step(), error.next_step(), "{error}");
+        }
     }
 
     /// When `db.rs` already ended the detail with "open the folder again", no second step is

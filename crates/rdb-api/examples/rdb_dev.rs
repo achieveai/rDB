@@ -7319,13 +7319,14 @@ mod tests {
     /// Unit.
     #[test]
     fn an_admin_error_says_whether_running_it_again_can_help() {
-        let error = |retry, no_mutation| ApiError {
-            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
-            retry,
-            no_mutation,
-            detail: "control store: list partitions/: x; nothing deleted".to_owned(),
-            retry_after: None,
-            too_large: None,
+        let error = |retry, no_mutation| {
+            let mut error = ApiError::new(
+                rdb_core::contracts::errors::ErrorKind::Unavailable,
+                "control store: list partitions/: x; nothing deleted",
+            );
+            error.retry = retry;
+            error.no_mutation = no_mutation;
+            error
         };
         assert_eq!(
             admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
@@ -7354,15 +7355,15 @@ mod tests {
     /// shows whether the delete applied; only a record still there fails the same way. Unit.
     #[test]
     fn an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did() {
-        let error = |retry| ApiError {
-            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
-            retry,
-            no_mutation: false,
-            detail: "control store: delete grants/1 at revision 5: permission denied; the \
-                     delete may have applied; run it again to read where it stands"
-                .to_owned(),
-            retry_after: None,
-            too_large: None,
+        let error = |retry| {
+            let mut error = ApiError::new(
+                rdb_core::contracts::errors::ErrorKind::Unavailable,
+                "control store: delete grants/1 at revision 5: permission denied; the delete \
+                 may have applied; run it again to read where it stands",
+            );
+            error.retry = retry;
+            error.no_mutation = false;
+            error
         };
         let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
         assert_eq!(

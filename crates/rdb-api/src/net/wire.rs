@@ -1526,6 +1526,7 @@ impl From<WireApiError> for ApiError {
             kind: error.kind,
             retry: error.retry,
             no_mutation: error.no_mutation,
+            owner_fault: ApiError::fault_from_wire(error.retry, &error.detail),
             detail: error.detail,
             retry_after: error.retry_after_millis.map(Duration::from_millis),
             // Set only on a refusal the `Db` raises before it sends (#148), so never on the wire.
