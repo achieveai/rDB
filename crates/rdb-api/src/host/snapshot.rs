@@ -120,9 +120,6 @@ pub struct SnapshotOffer {
     pub root: (Seq, Digest),
     /// The canonical record at `S`.
     pub barrier: Bytes,
-    /// The highest seq an accepted `admin forget-tail` gave up on this copy (rev 5b): the
-    /// target accepts a held tail through it. Filled from commit A8b on; `None` before.
-    pub released_through: Option<Seq>,
 }
 
 /// The target's request for the next page after `after` (design section 2, steps 3 and 4).
@@ -183,6 +180,53 @@ pub struct SnapshotOfferRefused {
     /// For [`SnapshotRefusal::TailHeld`], the held tail's head: the `--through` an operator
     /// passes to `admin forget-tail`. `None` otherwise.
     pub through: Option<Seq>,
+}
+
+/// The command that gives up a held tail through `through` on `partition` (design rev 5a): the
+/// one text the warn, `NodeStatus::needs_operator` and `PartitionReady::degraded` all name.
+#[must_use]
+pub fn forget_tail_command(partition: PartitionId, through: Seq) -> String {
+    format!(
+        "admin forget-tail --partition {} --through {} --give-up-live-copy",
+        partition.0, through.0
+    )
+}
+
+/// `NodeStatus::needs_operator`'s text for `copy` on `node` holding a tail through `head` past
+/// the history floor (design rev 5 M1, with rev 5a's command).
+#[must_use]
+pub fn needs_forget_tail(partition: PartitionId, copy: CopyId, node: NodeId, head: Seq) -> String {
+    format!(
+        "copy {} on node {} holds a tail through {} past the history floor; run {} (this can lose \
+         acknowledged writes; see embed.md)",
+        copy.0,
+        node.0,
+        head.0,
+        forget_tail_command(partition, head)
+    )
+}
+
+/// Why an offer is refused, with the held tail for [`SnapshotRefusal::TailHeld`].
+type OfferRefusal = (SnapshotRefusal, Option<super::TailHit>);
+
+/// A copy's `tail_held` refusal of this primary's offer, as the owner keeps it (design rev 5b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OfferHold {
+    /// The copy's node.
+    pub(crate) node: NodeId,
+    /// The held tail's head: the `--through` that gives it up.
+    pub(crate) head: Seq,
+}
+
+/// The tail this copy refused an offer for (design rev 5 M1), warned once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OfferTailHeld {
+    /// The copy the refused offer was for.
+    pub(crate) copy: CopyId,
+    /// The lineage holding the tail.
+    pub(crate) from: Generation,
+    /// The tail's head.
+    pub(crate) head: Seq,
 }
 
 /// Lead ruling 1 (issue #61 A8a): `ladder` holds a rung at every seq from `floor` (the engine's
@@ -367,11 +411,13 @@ impl Host {
         }
         // Only a transfer is deduped: a refill leaves the ladder dense, so R1's next ask for the
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
-        // can repeat).
-        if self.snapshots_served.get(&(partition, copy)) == Some(&barrier) {
+        // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
+        // not hold back the offer a later commit makes at the same `S`.
+        if self.snapshots_served.get(&(partition, copy)) == Some(&(generation, barrier)) {
             return;
         }
-        self.snapshots_served.insert((partition, copy), barrier);
+        self.snapshots_served
+            .insert((partition, copy), (generation, barrier));
         let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
             return unserved("copy_not_in_config");
         };
@@ -425,7 +471,6 @@ impl Host {
             at,
             root,
             barrier: barrier_record,
-            released_through: None,
         };
         let replaced = self
             .transfers
@@ -737,25 +782,100 @@ impl Host {
                 "snapshot_transfer_released",
             );
         }
+        // Rev 5b: a held tail is recorded, so `admin forget-tail` counts it and the owner's
+        // status names the command.
+        if let (SnapshotRefusal::TailHeld, Some(through)) = (refused.reason, refused.through) {
+            self.offer_holds
+                .entry(refused.partition)
+                .or_default()
+                .insert(
+                    refused.copy,
+                    OfferHold {
+                        node: refused.node,
+                        head: through,
+                    },
+                );
+            tracing::warn!(
+                node = self.node.0,
+                partition = refused.partition.0,
+                copy = refused.copy.0,
+                holder = refused.node.0,
+                head = through.0,
+                "offer_hold_recorded"
+            );
+        }
+    }
+
+    /// An accepted `admin forget-tail --through through` (rev 5b, lead ruling R18): every copy
+    /// whose offer was refused for a tail at or below `through` is no longer held. No offer is
+    /// sent for it here: the forget-tail's re-plan commits writable, which supersedes the tail,
+    /// and the next ordinary catch-up offer under that commit goes through. Answers `(copy,
+    /// node, head)` of each released copy.
+    pub(super) fn offer_holds_released(
+        &mut self,
+        partition: PartitionId,
+        through: Seq,
+    ) -> Vec<(CopyId, NodeId, Seq)> {
+        let holds = self.offer_holds.entry(partition).or_default();
+        let released: Vec<_> = holds
+            .iter()
+            .filter(|(_, hold)| hold.head <= through)
+            .map(|(copy, hold)| (*copy, hold.node, hold.head))
+            .collect();
+        holds.retain(|_, hold| hold.head > through);
+        for (copy, node, head) in &released {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = copy.0,
+                holder = node.0,
+                head = head.0,
+                through = through.0,
+                "offer_hold_released"
+            );
+        }
+        released
+    }
+
+    /// `NodeStatus::needs_operator` for `partition` (rev 5 M1): this copy's own held refusal,
+    /// else the first held copy the owner heard of that no forget-tail has released yet.
+    pub(super) fn needs_operator(&self, partition: PartitionId) -> Option<String> {
+        if let Some(held) = self.offer_tail_held.get(&partition) {
+            return Some(needs_forget_tail(
+                partition, held.copy, self.node, held.head,
+            ));
+        }
+        self.offer_holds
+            .get(&partition)?
+            .iter()
+            .next()
+            .map(|(copy, hold)| needs_forget_tail(partition, *copy, hold.node, hold.head))
     }
 
     /// An offer reached this target (module docs, "Target").
     pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) {
         let partition = offer.lineage.partition;
-        if let Err((reason, through)) = self.offer_check(&offer) {
-            tracing::warn!(
-                node = self.node.0,
-                partition = partition.0,
-                copy = offer.copy.0,
-                from = offer.from.0,
-                generation = offer.lineage.generation.0,
-                epoch = offer.lineage.owner_epoch.0,
-                at = offer.at.0,
-                reason = reason.reason(),
-                "snapshot_offer_refused"
-            );
-            self.refuse_offer(&offer, reason, through);
-            return;
+        match self.offer_check(&offer) {
+            Ok(()) => {}
+            Err((reason, held)) => {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = offer.copy.0,
+                    from = offer.from.0,
+                    generation = offer.lineage.generation.0,
+                    epoch = offer.lineage.owner_epoch.0,
+                    at = offer.at.0,
+                    reason = reason.reason(),
+                    through = ?held.map(|hit| hit.head.0),
+                    "snapshot_offer_refused"
+                );
+                if let Some(hit) = held {
+                    self.copy_needs_forget_tail(&offer, hit);
+                }
+                self.refuse_offer(&offer, reason, held.map(|hit| hit.head));
+                return;
+            }
         }
         if let Some(held) = self.installs.get(&partition) {
             tracing::info!(
@@ -792,7 +912,10 @@ impl Host {
     }
 
     /// Design section 2 step 2: the offer's authority and freshness, or why not.
-    fn offer_check(&self, offer: &SnapshotOffer) -> Result<(), (SnapshotRefusal, Option<Seq>)> {
+    ///
+    /// Last, the held-tail check ([`Self::offer_tail`]): a held tail is refused `tail_held`,
+    /// with the hit.
+    fn offer_check(&self, offer: &SnapshotOffer) -> Result<(), OfferRefusal> {
         let partition = offer.lineage.partition;
         let Some(receiver) = self
             .replication
@@ -822,7 +945,81 @@ impl Host {
         {
             return Err((SnapshotRefusal::BadBarrier, None));
         }
-        Ok(())
+        match self.offer_tail(offer)? {
+            None => Ok(()),
+            Some(hit) => Err((SnapshotRefusal::TailHeld, Some(hit))),
+        }
+    }
+
+    /// Issue #61 (design rev 4 N2, rev 5 M1 and 5b): the #105 tail this copy holds under the
+    /// offer's lineage, if any.
+    ///
+    /// No release mark is read (lead ruling R19): a forget-tail's run commits writable, which
+    /// supersedes the tail before any later offer, and a run that does not commit leaves the
+    /// next run to report the tail held again, so a mark could never spare the operator a
+    /// second command.
+    ///
+    /// **L comes from the landed commit (lead ruling R15)**, as [`Host::landing_scan`] takes it.
+    /// A writable commit at generation L was formed through a barrier that already carries every
+    /// acknowledged record of older generations, so an older tail above the base holds only
+    /// unacknowledged records, and a forget-tail alarm over it would be false. That is why a
+    /// copy left out of a writable commit (a dropped copy, re-added as a shadow) never hits
+    /// here: the commit's L is its own generation, every older tail is stamped below it, and the
+    /// install discards those records as the superseded ones they are
+    /// (`t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_install`).
+    /// A hit needs a commit that supersedes nothing older: L unknown (`None`), which on this
+    /// build is a partition whose record an older build wrote and that has committed no
+    /// writable generation since (an upgrade, lead ruling R18). The first writable commit ends
+    /// it, as the forget-tail's re-plan does.
+    ///
+    /// The landed commit anchors the scan; with none at the offer's lineage nothing proves the
+    /// tail superseded, so the offer is refused `not_adopted`.
+    fn offer_tail(&self, offer: &SnapshotOffer) -> Result<Option<super::TailHit>, OfferRefusal> {
+        let partition = offer.lineage.partition;
+        let Some(committed) = self
+            .committed
+            .get(&partition)
+            .filter(|committed| committed.selected.root == offer.lineage)
+        else {
+            return Err((SnapshotRefusal::NotAdopted, None));
+        };
+        let anchor = rdb_core::contracts::recovery::LineageAnchor {
+            lineage: committed.selected.root,
+            base_seq: committed.selected.cutoff_seq,
+            base_digest: committed.selected.cutoff_digest,
+        };
+        Ok(self.tail_scan(partition, anchor, committed.ledger.last_writable))
+    }
+
+    /// Warn `copy_needs_forget_tail` for `hit` once per `(partition, copy)` (rev 5 M1), with the
+    /// full command (lead binding), and keep it for `NodeStatus::needs_operator`.
+    fn copy_needs_forget_tail(&mut self, offer: &SnapshotOffer, hit: super::TailHit) {
+        let partition = offer.lineage.partition;
+        if self
+            .offer_tail_held
+            .get(&partition)
+            .is_some_and(|held| held.copy == offer.copy)
+        {
+            return;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = offer.copy.0,
+            from = hit.from.0,
+            head = hit.head.0,
+            through = hit.head.0,
+            command = %forget_tail_command(partition, hit.head),
+            "copy_needs_forget_tail"
+        );
+        self.offer_tail_held.insert(
+            partition,
+            OfferTailHeld {
+                copy: offer.copy,
+                from: hit.from,
+                head: hit.head,
+            },
+        );
     }
 
     /// Tell the offerer why, so it drops its transfer and pin at once (rev 5 M1).
@@ -903,6 +1100,7 @@ impl Host {
                 return Ok(());
             }
             install.begun = true;
+            self.offer_tail_held.remove(&partition);
             self.dormant_ladders.remove(&partition);
             self.inventory_ladders.remove(&partition);
             self.ladders.remove(&partition);

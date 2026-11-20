@@ -1956,6 +1956,18 @@ fn restart(trio: &mut Trio, dir: &std::path::Path, n: u32) -> BootId {
 /// [`restart`], with node `n`'s data folder removed first when `wipe`: a new process on an
 /// empty disk, as `lr start N --wipe`.
 fn restart_as(trio: &mut Trio, dir: &std::path::Path, n: u32, wipe: bool) -> BootId {
+    restart_over(trio, dir, n, wipe, |_| {})
+}
+
+/// [`restart_as`], with `plant` run on node `n`'s engine while no host holds it: a row's
+/// records written into the stopped node's disk.
+fn restart_over(
+    trio: &mut Trio,
+    dir: &std::path::Path,
+    n: u32,
+    wipe: bool,
+    plant: impl FnOnce(&mut RocksEngine),
+) -> BootId {
     let at = trio
         .nodes
         .iter()
@@ -1968,7 +1980,8 @@ fn restart_as(trio: &mut Trio, dir: &std::path::Path, n: u32, wipe: bool) -> Boo
     if wipe {
         std::fs::remove_dir_all(dir.join(n.to_string())).expect("wipe the node's folder");
     }
-    let engine = RocksEngine::open(dir.join(n.to_string())).expect("reopen engine");
+    let mut engine = RocksEngine::open(dir.join(n.to_string())).expect("reopen engine");
+    plant(&mut engine);
     let (tx, rx) = mpsc::channel();
     trio.links.register(NodeId(n), tx.clone(), boot);
     let mut host = Host::new(
@@ -6220,7 +6233,7 @@ fn pr110_forget_tail_over_a_not_ready_tail_a_repair_probe_found_needs_consent() 
 /// status reports as `interrupted_copy`, `Unchecked`. Node 1 learns it through its repair probe;
 /// no status is planted. A bare `forget-tail --through` over it is refused naming node 2 and
 /// saying it was not checked.
-/// Cut: `TailAdoption::could_return` false for `Unchecked`, red (the bare ask is accepted).
+/// Cut: `TailAdoption::needs_give_up_flag` false for `Unchecked`, red (the bare ask is accepted).
 /// Integration (~4 s): b1's pause and drop, then the repair probe.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
@@ -9202,4 +9215,315 @@ fn s1_r10_iii_a_target_restarted_right_after_its_install_serves() {
             .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
             .then_some(())
     });
+}
+
+/// Issue #61 A8b (lead ruling R15): node 3 is dropped (a writable `DegradedRf2` commit without
+/// it), the survivors write on and trim to their head, and node 3's disk gets an older tail
+/// planted on its last lineage, past every base and creating keys no other copy holds. On
+/// restart it is re-added as a shadow. That commit is writable, so its ledger's L is its own
+/// generation and node 3's older tail is superseded: the landing's `tail_scan` finds no hit, the
+/// offer is accepted with no `tail_held` and no `copy_needs_forget_tail`, and the install
+/// discards the planted records; node 3 catches up. A forget-tail alarm here would be false:
+/// the barrier that formed the writable commit already carries every acknowledged record.
+/// Cut: `Host::offer_tail` scans with L unknown (`None`, rejected option B), red (`tail_held`).
+/// Integration (~8 s): the drop, the restart's re-plan and the transfer.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_install() {
+    const METHOD: &str =
+        "t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_install";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.snapshot_page_keys = 4;
+    });
+    for request in 1..=20 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    kill(&trio, 3, &[1, 2]);
+    let (mut request, _) = put_until_paused(&mut trio, 21);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    for _ in 0..5 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} on two: {other:?}"),
+        }
+        request += 1;
+    }
+    let head = trio.head().expect("a head");
+    trio.until("node 2 applied the head", |trio| {
+        let host = &trio.nodes[1].0;
+        host.replication
+            .receiver(host.node, p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    for at in 0..2 {
+        assert_eq!(super::trio::trim(&mut trio, at, head), Ok(Seq(head)));
+    }
+    trio.links.heal_all();
+    // The planted tail's last record creates key `head + 2`, held by no other copy.
+    let planted = (head + 2).to_be_bytes();
+    restart_over(&mut trio, dir.path(), 3, false, |engine| {
+        let own = engine.buffered_applied(p, before).0;
+        let record = engine
+            .history_at(p, before, Seq(own))
+            .expect("read")
+            .expect("node 3's head record")
+            .0;
+        let mut digests = vec![Digest::ROOT; usize::try_from(own).expect("a small head")];
+        if let Some(last) = digests.last_mut() {
+            *last = ReplicationEnvelope::decode(&record)
+                .expect("decode")
+                .record_digest;
+        }
+        super::trio::write_chain_after(engine, before, digests, head + 2 - own);
+        assert!(
+            engine
+                .get(p, before, Namespace::User, &planted)
+                .expect("read")
+                .is_some(),
+            "the planted key is on node 3"
+        );
+    });
+    trio.until("node 3 caught up", |_| {
+        logged!(METHOD, "copy_caught_up")
+            .iter()
+            .any(|line| line["copy"] == 2)
+            .then_some(())
+    });
+    let scans: Vec<_> = logged!(METHOD, "tail_scan")
+        .into_iter()
+        .filter(|line| line["node"] == 3 && line["read"] == 1)
+        .collect();
+    assert!(!scans.is_empty(), "node 3 read its older tail");
+    for scan in &scans {
+        assert_eq!(scan["hit"], false, "{scan}");
+        assert_eq!(scan["last_writable"], scan["generation"], "{scan}");
+    }
+    assert!(!logged!(METHOD, "snapshot_offer_accepted").is_empty());
+    for refused in ["snapshot_offer_refused", "copy_needs_forget_tail"] {
+        assert!(logged!(METHOD, refused).is_empty(), "{refused} logged");
+    }
+    assert!(!logged!(METHOD, "snapshot_transfer_installed").is_empty());
+    let three = &trio.nodes[2].0;
+    let newest = three
+        .engine
+        .newest_generation(p)
+        .expect("node 3 holds a lineage");
+    assert_eq!(
+        three
+            .engine
+            .get(p, newest, Namespace::User, &planted)
+            .expect("read"),
+        None,
+        "the install discarded the planted key"
+    );
+    assert_eq!(trio.status(2).needs_operator, None);
+}
+
+/// Issue #61 A8b (lead rulings R15 and R18; replaces S2-R7): the operator's way out of an
+/// offer refused for a held tail, end to end, on a copy whose landed commit does not know L
+/// (`TailLedger::last_writable` `None`). That is the state of every partition on a node
+/// upgraded from a build before the ledger (a layout-5 record reads as `TailLedger::unknown`),
+/// until its first writable commit.
+///
+/// **Why L is set in memory.** The store state cannot be reached here: the trio plans its prior
+/// from each host's landed commit, never from `partitions/1` (which it writes without a root),
+/// and every `Active` or `DegradedRf2` commit writes its own generation as L (recovery's
+/// `ledger_for`), so the re-add commit node 3 lands already supersedes an older tail (probe R18,
+/// `host/runs/r18-probe.log`; the writable world is
+/// `t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_install`). Every
+/// step after the one in-memory change is real.
+///
+/// Flow: node 3 refuses node 1's offer `tail_held` and warns `copy_needs_forget_tail` with the
+/// full command; offered again at the same `S`, it refuses again and does not warn again; both
+/// nodes' `NodeStatus::needs_operator` name `H` (the owner's is what
+/// `Db::readiness` reports as `PartitionReady::degraded`); a bare `--through H` is refused,
+/// unchecked, and with `--give-up-live-copy` accepted, naming the copy; its re-plan commits
+/// writable, the next ordinary catch-up offer (no re-offer) is accepted, the install discards
+/// the planted records, node 3 catches up, and nobody needs the operator.
+/// Cuts: `snapshots_served` keyed by barrier alone (as before R18), red (no second offer: the
+/// one refused at the same `S` holds it back); `offer_holds` not counted in `forget_tail_asked`,
+/// red (the ask is refused, nothing to give up); `copy_needs_forget_tail` without its once
+/// check, red (two warns).
+/// Integration (~10 s): the drop, the restart's re-plan, the forget-tail's re-plan, a transfer.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_the_copy() {
+    const METHOD: &str =
+        "t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_the_copy";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), |host| {
+        tuned(host);
+        host.snapshot_page_keys = 4;
+    });
+    for request in 1..=20 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    kill(&trio, 3, &[1, 2]);
+    let (mut request, _) = put_until_paused(&mut trio, 21);
+    dropped_three(&mut trio, before);
+    trio.ready();
+    for _ in 0..5 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} on two: {other:?}"),
+        }
+        request += 1;
+    }
+    let head = trio.head().expect("a head");
+    trio.until("node 2 applied the head", |trio| {
+        let host = &trio.nodes[1].0;
+        host.replication
+            .receiver(host.node, p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    for at in 0..2 {
+        assert_eq!(super::trio::trim(&mut trio, at, head), Ok(Seq(head)));
+    }
+    trio.links.heal_all();
+    trio.nodes[0].0.snapshot_offer_held = true;
+    // The planted tail's last record creates key `head + 2`, held by no other copy.
+    let planted = (head + 2).to_be_bytes();
+    restart_over(&mut trio, dir.path(), 3, false, |engine| {
+        let own = engine.buffered_applied(p, before).0;
+        let record = engine
+            .history_at(p, before, Seq(own))
+            .expect("read")
+            .expect("node 3's head record")
+            .0;
+        let mut digests = vec![Digest::ROOT; usize::try_from(own).expect("a small head")];
+        if let Some(last) = digests.last_mut() {
+            *last = ReplicationEnvelope::decode(&record)
+                .expect("decode")
+                .record_digest;
+        }
+        super::trio::write_chain_after(engine, before, digests, head + 2 - own);
+        assert!(
+            engine
+                .get(p, before, Namespace::User, &planted)
+                .expect("read")
+                .is_some(),
+            "the planted key is on node 3"
+        );
+    });
+    trio.until(
+        "node 3 landed its re-add and node 1 opened a transfer",
+        |trio| {
+            (trio.nodes[2]
+                .0
+                .committed
+                .get(&p)
+                .is_some_and(|landed| landed.new_generation > before)
+                && trio.nodes[0].0.transfers.keys().any(|(at, _)| *at == p))
+            .then_some(())
+        },
+    );
+    let landed = trio.nodes[2].0.committed.get_mut(&p).expect("landed");
+    let readded = landed.new_generation;
+    landed.ledger.last_writable = None;
+    trio.nodes[0].0.snapshot_offer_held = false;
+    let warned = trio.until("node 3 refused the offer", |_| {
+        let warned = logged!(METHOD, "copy_needs_forget_tail");
+        (!warned.is_empty()).then_some(warned)
+    });
+    let refused = logged!(METHOD, "snapshot_offer_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["reason"], "tail_held");
+    // Lead ruling R19: the same held tail offered twice warns once.
+    let at = Seq(refused[0]["at"].as_u64().expect("the offer's S"));
+    let owner = &mut trio.nodes[0].0;
+    owner.snapshots_served.remove(&(p, CopyId(2)));
+    owner.snapshot_catchup(p, CopyId(2), at);
+    trio.until("node 3 refused the second offer", |_| {
+        (logged!(METHOD, "snapshot_offer_refused").len() == 2).then_some(())
+    });
+    for refused in logged!(METHOD, "snapshot_offer_refused") {
+        assert_eq!(refused["reason"], "tail_held", "{refused}");
+    }
+    assert_eq!(
+        logged!(METHOD, "copy_needs_forget_tail").len(),
+        1,
+        "warned once"
+    );
+    let h = warned[0]["head"].as_u64().expect("a head");
+    let command = format!("admin forget-tail --partition 1 --through {h} --give-up-live-copy");
+    assert_eq!(warned[0]["command"], command.as_str());
+    assert_eq!(warned[0]["copy"], 2);
+    let needs = crate::host::snapshot::needs_forget_tail(p, CopyId(2), NodeId(3), Seq(h));
+    trio.until("node 1 heard the refusal", |trio| {
+        (trio.status(0).needs_operator.as_deref() == Some(needs.as_str())).then_some(())
+    });
+    assert_eq!(
+        trio.status(2).needs_operator.as_deref(),
+        Some(needs.as_str())
+    );
+    let release = TailRelease {
+        through: Some(Seq(h)),
+        no_intact_copy: false,
+    };
+    let bare = trio.nodes[0]
+        .0
+        .forget_tail_asked(p, release, false)
+        .expect_err("a bare --through");
+    assert!(bare.no_mutation, "{bare:?}");
+    assert!(
+        bare.detail.starts_with("node 3 holds seqs ")
+            && bare
+                .detail
+                .contains(&format!(" to {h} of partition 1; it has not been checked")),
+        "{bare:?}"
+    );
+    let line = trio.nodes[0]
+        .0
+        .forget_tail_asked(p, release, true)
+        .expect("accepted with the flag");
+    assert!(
+        line.contains("copy 2 on node 3: seqs ")
+            && line.ends_with(&format!("..={h} given up for good")),
+        "{line}"
+    );
+    trio.until("node 3 caught up", |_| {
+        logged!(METHOD, "copy_caught_up")
+            .iter()
+            .any(|line| line["copy"] == 2)
+            .then_some(())
+    });
+    let accepted = logged!(METHOD, "snapshot_offer_accepted");
+    assert_eq!(accepted.len(), 1, "{accepted:?}");
+    assert!(
+        accepted[0]["generation"].as_u64() > Some(readded.0),
+        "the offer of the forget-tail's commit: {accepted:?}"
+    );
+    assert_eq!(
+        logged!(METHOD, "copy_needs_forget_tail").len(),
+        1,
+        "warned once"
+    );
+    let three = &trio.nodes[2].0;
+    let newest = three
+        .engine
+        .newest_generation(p)
+        .expect("node 3 holds a lineage");
+    assert_eq!(
+        three
+            .engine
+            .get(p, newest, Namespace::User, &planted)
+            .expect("read"),
+        None,
+        "the install discarded the planted key"
+    );
+    assert_eq!(trio.status(0).needs_operator, None);
+    assert_eq!(trio.status(2).needs_operator, None);
 }
