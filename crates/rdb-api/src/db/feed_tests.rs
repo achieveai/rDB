@@ -1290,3 +1290,116 @@ fn f87_2_damaged_history_answers_every_feed_caller_corrupt_history() {
         .expect_err("damaged");
     typed("node 1", &error);
 }
+
+/// One feed call to `node` from `START`, refused "call again" because its control read did not
+/// land within the wait (`FEED_READ_WAIT_MILLIS`), not by the caller's own timeout.
+fn refused_call_again(who: &str, answer: Result<FeedPage, ApiError>, took: Duration) {
+    let error = answer.expect_err(who);
+    assert_eq!(error.kind, ErrorKind::Unavailable, "{who}: {error:?}");
+    assert!(error.no_mutation, "{who}: {error:?}");
+    assert!(
+        error.detail.contains("call again"),
+        "{who} after {took:?}: {error:?}"
+    );
+}
+
+/// Review r1: a secondary's control read of `partitions/1` held past the 500 ms wait, through
+/// the real feed path.
+/// (a) Two callers that arrive while it is held share one read and are each refused "call
+/// again" when the wait ends, while the owner goes on writing.
+/// (b) The callers abandoned the read; a later call starts no second one and is refused the same.
+/// (c) Released, the abandoned read lands and the next call is served from it.
+/// (d) After node 2 restarts, a read stamped with its old boot that lands late is dropped
+/// (`control_stale_boot_dropped`, `feed_read`), so a call parked on the new boot's held read is
+/// still refused, not served from the old process's answer.
+/// Cuts: no `until` on parked calls (`Host::feed_duty` never due), red ((a): "no feed answer in
+/// 1s"); `Host::feed_fresh` without `!entry.in_flight`, red ((a): 4 reads held); `Msg::FeedRead`
+/// taken whatever its boot, red ((d): served from the old boot's read).
+/// Integration (~10 s): a restart and its rejoin.
+#[config_log::retcd_test]
+fn f87_2_a_held_control_read_refuses_within_the_wait_shared_and_fenced_by_boot() {
+    const METHOD: &str =
+        "f87_2_a_held_control_read_refuses_within_the_wait_shared_and_fenced_by_boot";
+    let rt = runtime();
+    let gated = GatedStore::new();
+    let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let dir = config_testkit::fs::temp_dir();
+    let budgets = short_grant();
+    let db = Arc::new(opened_with(&rt, dir.path(), &store, budgets));
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+
+    gated.close();
+    let callers = calls_together(&db, NodeId(2), 2);
+    until_held(&gated, 1);
+    let k2 = db
+        .put(b"k2", b"two", None)
+        .expect("the owner writes while the read is held");
+    for (index, caller) in callers.into_iter().enumerate() {
+        let (answer, took) = caller.join().expect("the caller");
+        refused_call_again(&format!("(a) caller {index}"), answer, took);
+    }
+    assert_eq!(gated.held(), 1, "(a) one shared read");
+
+    let (answer, took) = calls_together(&db, NodeId(2), 1)
+        .pop()
+        .expect("one caller")
+        .join()
+        .expect("the caller");
+    refused_call_again("(b) a later call", answer, took);
+    assert_eq!(
+        gated.held(),
+        1,
+        "(b) no second read while the first is held"
+    );
+
+    gated.open();
+    let (records, _) = tail(&db, FeedCursor::START, Source::Node(NodeId(2)), k2.seq);
+    assert_eq!(seqs(&records), vec![k1.seq.0, k2.seq.0], "(c)");
+
+    let old = db.boot_of(NodeId(2)).expect("node 2's boot");
+    db.restart_node(NodeId(2)).expect("node 2 restarts");
+    tail(&db, FeedCursor::START, Source::Node(NodeId(2)), k2.seq);
+    let landed = db
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == NodeId(2))
+        .and_then(|status| status.holds)
+        .expect("node 2 holds a generation")
+        .generation;
+    // Past the grant, so the next call needs a new read.
+    std::thread::sleep(Duration::from_millis(budgets.grant_millis + 200));
+    gated.close();
+    let caller = calls_together(&db, NodeId(2), 1).pop().expect("one caller");
+    until_held(&gated, 2);
+    let late = Msg::FeedRead {
+        boot: old,
+        partition: PARTITION,
+        started: rdb_core::contracts::time::Tick(u64::MAX / 2),
+        read: Ok(crate::host::FeedControlRead {
+            generation: landed,
+            owner: NodeId(1),
+            members: None,
+        }),
+    };
+    lock(&db.nodes)
+        .iter()
+        .find(|handle| handle.node == NodeId(2))
+        .expect("node 2")
+        .send(late)
+        .expect("node 2's mailbox");
+    let (answer, took) = caller.join().expect("the caller");
+    refused_call_again("(d) parked on the new boot's read", answer, took);
+    gated.open();
+    let dropped: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "control_stale_boot_dropped" && line["what"] == "feed_read")
+        .collect();
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["from_boot"], old.0, "{dropped:?}");
+}
