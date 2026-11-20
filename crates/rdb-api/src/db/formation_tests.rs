@@ -1611,19 +1611,39 @@ fn s1a_an_unreachable_store_at_the_formation_read_says_what_to_do() {
     );
 }
 
-/// #137: declare `partitions` over nodes 1 to 3 and open them, `wiped`'s commit hook faulting it
-/// right after its first root commits, before that generation is linked or activated, so no
-/// write is ever admitted; wait until one of its partitions is rooted, then end every process
-/// and lose `wiped`'s whole folder. Every process then reopens: the wiped owner's open rolls
-/// each rooted partition it owns forward onto its own empty copy (no promote, no re-form),
-/// every partition takes a write, and after a restart of all three every write reads back.
-/// Returns the partitions that were rolled forward.
-fn wiped_owner_before_any_write_rolls_forward(
-    method: &str,
+/// The partitions of `partitions` that `wiped` owns and that are rooted in the store: each with
+/// its record's owner and generation.
+fn rooted_of_wiped(
+    rig: &Rig,
     partitions: u32,
     wiped: NodeId,
-) -> Vec<PartitionId> {
-    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+) -> Vec<(PartitionId, NodeId, Generation)> {
+    rig.rt
+        .block_on(partition_states(&rig.store, partitions))
+        .expect("the store answers")
+        .into_iter()
+        .filter_map(|(partition, state)| match state {
+            PartitionState::Rooted(record, _)
+                if admin::owner_in(&ALL_NODES, partition) == wiped =>
+            {
+                Some((partition, record.owner, record.generation))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// #137's state: declare `partitions` over nodes 1 to 3 in `store` and open them, `wiped`'s
+/// commit hook faulting it right after its first root commits, before that generation is linked
+/// or activated, so no write is ever admitted; wait until one of its partitions is rooted, then
+/// end every process and lose `wiped`'s whole folder. Answers the rig, every process ended, and
+/// the partitions of `wiped` that were rooted.
+fn wiped_before_any_write(
+    store: Arc<dyn ConfigStore>,
+    partitions: u32,
+    wiped: NodeId,
+) -> (Rig, Vec<(PartitionId, NodeId, Generation)>) {
+    let mut rig = bare_rig(store);
     match rig
         .rt
         .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
@@ -1631,29 +1651,14 @@ fn wiped_owner_before_any_write_rolls_forward(
         Ok(admin::Declared::Created(_)) => {}
         other => panic!("the declaration is written: {other:?}"),
     }
-    let nodes = ALL_NODES;
-    let owner_of = |partition: u32| admin::owner_in(&nodes, PartitionId(partition));
     let dirs = fresh_dirs();
     crate::host::set_after_commit(
         &dirs[wiped.0 as usize - 1].0,
         Some(crate::host::AfterCommit::Fault),
     );
     rig.open_all(dirs);
-    let rooted_of_wiped = |rig: &Rig| -> Vec<(PartitionId, NodeId, Generation)> {
-        rig.rt
-            .block_on(partition_states(&rig.store, partitions))
-            .expect("the store answers")
-            .into_iter()
-            .filter_map(|(partition, state)| match state {
-                PartitionState::Rooted(record, _) if owner_of(partition.0) == wiped => {
-                    Some((partition, record.owner, record.generation))
-                }
-                _ => None,
-            })
-            .collect()
-    };
     let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
-    while rooted_of_wiped(&rig).is_empty() {
+    while rooted_of_wiped(&rig, partitions, wiped).is_empty() {
         assert!(
             Instant::now() < deadline,
             "node {} never rooted a partition",
@@ -1663,13 +1668,28 @@ fn wiped_owner_before_any_write_rolls_forward(
     }
     rig.shutdown_all();
     crate::host::set_after_commit(&rig.procs[wiped.0 as usize - 1].dir, None);
-    let rooted = rooted_of_wiped(&rig);
+    let rooted = rooted_of_wiped(&rig, partitions, wiped);
     rig.wipe(wiped);
+    (rig, rooted)
+}
+
+/// #137: [`wiped_before_any_write`], then every process reopens: the wiped owner's open rolls
+/// each rooted partition it owns forward onto its own empty copy (no promote, no re-form),
+/// every partition takes a write, and after a restart of all three every write reads back.
+/// Returns the partitions that were rolled forward.
+fn wiped_owner_before_any_write_rolls_forward(
+    method: &str,
+    partitions: u32,
+    wiped: NodeId,
+) -> Vec<PartitionId> {
+    let owner_of = |partition: u32| admin::owner_in(&ALL_NODES, PartitionId(partition));
+    let (mut rig, rooted) =
+        wiped_before_any_write(Arc::new(config_testkit::MemStore::new()), partitions, wiped);
     rig.restart_all();
     rig.wait_ready();
     // The roll-forward names the root's generation (below); the reopen's heal may commit a
     // later one, but the owner stays: nothing promoted the partition away.
-    let after = rooted_of_wiped(&rig);
+    let after = rooted_of_wiped(&rig, partitions, wiped);
     for (partition, owner, generation) in &rooted {
         assert!(
             after
@@ -1755,6 +1775,54 @@ fn s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1() {
     assert_eq!(admin::owner_in(&ALL_NODES, PARTITION), NodeId(1));
     let rolled = wiped_owner_before_any_write_rolls_forward(METHOD, 1, NodeId(1));
     assert_eq!(rolled, [PARTITION]);
+}
+
+/// PR #156 review (question): `partitions/1` is read twice by a reopen of the owner's empty
+/// copy, `formed_member`'s `get` (the instance) and `partition_states`' `list` (the record and
+/// root the roll uses). Replacing the control-store namespace while an open runs is not
+/// supported, but a root of another instance on the second read must not be rolled forward
+/// under the first read's instance. #137's state, then the store's `list` answers
+/// `partitions/1` naming another instance: node 1's reopen is refused naming both instances,
+/// binds nothing and writes nothing. Integration (~4 s).
+/// Cut: drop the instance comparison in `Db::check`'s owner-local branch; the reopen rolls the
+/// other instance's root forward and opens, red.
+#[config_log::retcd_test]
+fn pr156_partition_1_read_again_under_another_instance_is_refused() {
+    let swapping =
+        crate::test_store::SwapPartitionOneInstance::new(Arc::new(config_testkit::MemStore::new()));
+    let (rig, rooted) =
+        wiped_before_any_write(Arc::clone(&swapping) as Arc<dyn ConfigStore>, 1, NodeId(1));
+    assert_eq!(rooted.len(), 1, "partition 1 is rooted: {rooted:?}");
+    let Some((_, PartitionState::Rooted(_, root))) = rig
+        .rt
+        .block_on(partition_states(&rig.store, 1))
+        .expect("the store answers")
+        .pop()
+    else {
+        panic!("partition 1 has a root");
+    };
+    let mut other = root.instance;
+    for byte in &mut other {
+        *byte = !*byte;
+    }
+    swapping.arm(&root.instance, &other);
+    let before = snapshot(&rig.rt, &*rig.store);
+    let refused = rig
+        .reopen(NodeId(1))
+        .map(|_| ())
+        .expect_err("a root of another instance is not rolled forward");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Mismatch(_))
+            && text.contains(&format!(
+                "partitions/1 named instance {} and then {} while this open read it",
+                admin::instance_hex(&root.instance),
+                admin::instance_hex(&other)
+            )),
+        "{text}"
+    );
+    assert!(!has_copies(&rig.procs[0].dir), "nothing bound");
+    assert_eq!(snapshot(&rig.rt, &*rig.store), before, "nothing written");
 }
 
 /// PR #138 review: after acknowledged writes, node 1 loses its whole folder. With the

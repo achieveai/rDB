@@ -2078,6 +2078,17 @@ impl Db {
                         forming_step(declared.is_some())
                     )));
                 };
+                // PR #156 review: partitions/1 was read twice, by `formed_member` and here. The
+                // instance comes from the first read and the root from the second, so they must
+                // agree, as `check_others` requires of every later partition.
+                if root.instance != instance {
+                    return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
+                        "partitions/{} named instance {} and then {} while this open read it",
+                        PARTITION.0,
+                        admin::instance_hex(&instance),
+                        admin::instance_hex(&root.instance)
+                    ))));
+                }
                 // #137: the owner's empty copy of a declared partition 1 whose root no host
                 // activated rolls forward onto that copy; anything else is still refused, and a
                 // refused open binds nothing.
