@@ -24,7 +24,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -134,8 +134,19 @@ pub struct JsonlLayer {
 enum WriterMsg {
     /// Append `line` to the file at the path.
     Line(PathBuf, Vec<u8>),
-    /// Every line sent before this one is handled; answer with every open that has failed.
-    Flush(mpsc::SyncSender<Vec<(PathBuf, String)>>),
+    /// Every line sent before this one is handled; answer with every open that has failed and,
+    /// for a named file, its length now (see [`Flushed::len`]).
+    Flush(Option<PathBuf>, mpsc::SyncSender<Flushed>),
+}
+
+/// The writer's answer to a [`WriterMsg::Flush`].
+struct Flushed {
+    /// Every per-test file that has failed to open so far, with the cause.
+    failed: Vec<(PathBuf, String)>,
+    /// The named file's length when the writer answered. The writer is the only writer of a
+    /// per-test file in this process and answers between whole lines, so this length ends on a
+    /// line boundary even while later lines are being appended.
+    len: Option<std::io::Result<u64>>,
 }
 
 /// The per-test writer, started by the first per-test line. One per process, shared by every
@@ -183,8 +194,12 @@ fn run_test_writer(rx: mpsc::Receiver<WriterMsg>) {
                 };
                 let _ = file.write_all(&line);
             }
-            WriterMsg::Flush(done) => {
-                let _ = done.send(failed.clone());
+            WriterMsg::Flush(path, done) => {
+                let len = path.map(|p| std::fs::metadata(p).map(|m| m.len()));
+                let _ = done.send(Flushed {
+                    failed: failed.clone(),
+                    len,
+                });
             }
         }
     }
@@ -248,8 +263,15 @@ fn flush_and_collect_failures() -> Result<Vec<(PathBuf, String)>, TestLogError> 
     let Some(tx) = TEST_WRITER.get() else {
         return Ok(Vec::new());
     };
+    Ok(flush_through(tx, None)?.failed)
+}
+
+fn flush_through(
+    tx: &mpsc::Sender<WriterMsg>,
+    path: Option<PathBuf>,
+) -> Result<Flushed, TestLogError> {
     let (done_tx, done_rx) = mpsc::sync_channel(1);
-    tx.send(WriterMsg::Flush(done_tx))
+    tx.send(WriterMsg::Flush(path, done_tx))
         .map_err(|_| TestLogError::WriterStopped)?;
     done_rx.recv().map_err(|_| TestLogError::WriterStopped)
 }
@@ -335,6 +357,55 @@ pub fn test_file_path(dir: &Path, module: &str, method: &str) -> PathBuf {
         );
     }
     path
+}
+
+/// The per-test JSONL file for `(module, method)` under `dir`, read as it stood once every line
+/// logged before the call was written: the path, and the file's bytes up to that point.
+///
+/// Read this way, not to the file's end, whenever lines may still be logged into the file
+/// while it is read (issue #132). A line logged after the flush can be mid-append during the
+/// read, and on ext4 one `write` becomes visible a page at a time, so a reader that stops at
+/// the end of the file can stop inside that line. The length the writer reports at the flush
+/// ends on a line boundary, and every byte before it is already written.
+///
+/// The `io::Result` is the file's: it fails if the file does not exist (nothing was logged to it
+/// yet) or cannot be read. Panics, as [`test_file_path`] does, if the writer has stopped or this
+/// file could not be opened.
+pub fn read_test_file(
+    dir: &Path,
+    module: &str,
+    method: &str,
+) -> (PathBuf, std::io::Result<Vec<u8>>) {
+    let path = test_file_path_of(dir, module, method);
+    let flushed =
+        flush_through(test_writer(), Some(path.clone())).unwrap_or_else(|e| panic!("{e}"));
+    if let Some((_, err)) = flushed.failed.iter().find(|(p, _)| *p == path) {
+        panic!(
+            "per-test log lines were lost: cannot open test log {}: {err}",
+            path.display()
+        );
+    }
+    let len = flushed
+        .len
+        .expect("the flush named a file, so the writer measured it");
+    let bytes = len.and_then(|len| read_prefix(&path, len));
+    (path, bytes)
+}
+
+/// The first `len` bytes of `path`. The file only grows, so fewer is an error.
+fn read_prefix(path: &Path, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    File::open(path)?.take(len).read_to_end(&mut bytes)?;
+    if (bytes.len() as u64) < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "the file held {len} bytes at the flush and {} now",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn test_file_path_of(dir: &Path, module: &str, method: &str) -> PathBuf {
