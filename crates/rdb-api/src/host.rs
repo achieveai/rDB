@@ -701,7 +701,7 @@ pub enum Msg {
         reply: Sender<Result<Seq, String>>,
     },
     /// **Dev tool only**, debug builds (issue #61, design section 2 A5): trim this node's copy
-    /// of `partition` to `through` ([`Host::trim_history_through`]) and answer the new floor,
+    /// of `partition` to `through` (`Host::trim_history_through`) and answer the new floor,
     /// or why not. Local only, like [`Msg::Damage`]. `rdb_dev admin trim-history` uses it
     /// through [`crate::db::Db::trim_history`].
     #[cfg(debug_assertions)]
@@ -802,7 +802,7 @@ pub enum PeerAsk {
     },
     /// Issue #61 (design rev 4 N4, rev 5e): F1's `ProbeDigestAt` for one copy, under the plan's
     /// anchor. The holder answers in the anchor's generation, the one its inventory reported
-    /// ([`Host::probe`]): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
+    /// (`Host::probe`): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
     /// when it holds no record there (below its trim floor, or above its head), and nothing
     /// when its read fails, so F1's probe deadline drops the copy.
     Probe {
@@ -1348,7 +1348,7 @@ impl TailAdoption {
 
 /// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
 /// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
-/// `base_below_floor` from [`Host::chain`].
+/// `base_below_floor` from `Host::chain`.
 pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
 
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
@@ -2993,7 +2993,8 @@ struct Host {
     /// Cleared on that copy's `CopyCaughtUp` or when a commit pins it as a member again.
     offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
     /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
-    /// warned `copy_needs_forget_tail` once. Cleared by an install or a release mark.
+    /// warned `copy_needs_forget_tail` once. Cleared by an install, or when an inventory ask
+    /// gives the tail up (`Host::tail_released`).
     offer_tail_held: BTreeMap<PartitionId, snapshot::OfferTailHeld>,
     /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
     /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back

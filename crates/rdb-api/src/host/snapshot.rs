@@ -2,10 +2,10 @@
 //! rebuilt from a state snapshot, started by the target.
 //!
 //! **Source (the primary).** R1's `SnapshotCatchupRequired{copy, barrier}` reaches
-//! [`Host::snapshot_catchup`]. When the primary's own R1 ladder is not dense from the engine's
+//! `Host::snapshot_catchup`. When the primary's own R1 ladder is not dense from the engine's
 //! trim floor to its head (lead ruling, A8: "ladder floor > engine floor"), the ladder is refilled
 //! from the engine and the copy's next `NeedPrefix` walks it: `snapshot_catchup_served{how =
-//! "ladder"}`. Otherwise the engine cannot serve the record either, and a [`Transfer`] opens: a
+//! "ladder"}`. Otherwise the engine cannot serve the record either, and a `Transfer` opens: a
 //! view pinned at `S` = the lineage's applied seq, and a pin that stops a trim past `S`. The offer
 //! ([`SnapshotOffer`]) goes out once the engine's `durable` has reached `S`, so a target never
 //! installs a record its source could still lose in a crash. The source answers each
@@ -13,9 +13,9 @@
 //! `COPY_BATCH_KEYS` unless a row lowers it) and
 //! keeps no chain state: the pull carries the target's running chain. A transfer ends on the
 //! copy's `CopyCaughtUp` (`snapshot_transfer_released`), on the target's refusal, on its node's
-//! `PeerBooted`, or after [`SNAPSHOT_IDLE_MILLIS`] with no pull (`snapshot_transfer_abandoned`).
+//! `PeerBooted`, or after `SNAPSHOT_IDLE_MILLIS` with no pull (`snapshot_transfer_abandoned`).
 //!
-//! **Target.** [`Host::snapshot_offer`] accepts an offer only when its receiver of the partition
+//! **Target.** `Host::snapshot_offer` accepts an offer only when its receiver of the partition
 //! adopted the offer's lineage `(p, g, owner_epoch)`, the offerer is that config's primary node
 //! and boot, `S` is above the receiver's applied head, and the barrier record decodes, names `S`
 //! and recomputes its digest. Otherwise it answers [`SnapshotOfferRefused`] and logs
@@ -964,10 +964,9 @@ impl Host {
     /// Issue #61 (design rev 4 N2, rev 5 M1 and 5b): the #105 tail this copy holds under the
     /// offer's lineage, if any.
     ///
-    /// No release mark is read (lead ruling R19): a forget-tail's run commits writable, which
-    /// supersedes the tail before any later offer, and a run that does not commit leaves the
-    /// next run to report the tail held again, so a mark could never spare the operator a
-    /// second command.
+    /// Nothing else lets the offer pass (lead ruling R19): a forget-tail's run commits
+    /// writable, which supersedes the tail before any later offer, and a run that does not
+    /// commit leaves the next run to report the tail held again.
     ///
     /// **L comes from the landed commit (lead ruling R15)**, as [`Host::landing_scan`] takes it.
     /// A writable commit at generation L was formed through a barrier that already carries every
