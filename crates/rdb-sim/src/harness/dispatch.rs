@@ -6202,12 +6202,11 @@ mod dormant_twin_tests {
     /// straight into the hosted F1, so its phase leaves `Idle`.
     fn fence_owner(dispatcher: &mut Dispatcher, seed: &DormantSeed) {
         use rdb_core::contracts::authority::{AuthorityView, DenyReason, FencingProof, Revocation};
-        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module, StepCtx};
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module};
         use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
         use rdb_core::contracts::recovery::{
             Candidate, LineageAnchor, PriorRecord, RecoveryEvent, RecoveryPlan, TailRelease,
         };
-        use rdb_core::contracts::time::ControlTime;
 
         use crate::storage::snapshot::EmptySnapshot;
 
@@ -6260,23 +6259,7 @@ mod dormant_twin_tests {
         };
         let snapshot = EmptySnapshot::new();
         let budgets = Budgets::SPEC_DEFAULTS;
-        let ctx = StepCtx {
-            now: Tick(1),
-            control_time: ControlTime {
-                estimate: Tick(1),
-                error_millis: 10,
-                bound_established: true,
-                sampled_at: Tick(1),
-            },
-            node: OWNER,
-            boot: BootId(1),
-            partition: P,
-            generation: seed.lineage.generation,
-            owner_epoch: seed.lineage.owner_epoch,
-            config_version: ConfigVersion(1),
-            snapshot: &snapshot,
-            budgets: &budgets,
-        };
+        let ctx = owner_ctx(&snapshot, &budgets, seed.lineage);
         for (id, event) in [
             RecoveryEvent::Plan(Box::new(plan)),
             RecoveryEvent::FenceProven(Box::new(proof)),
@@ -6373,6 +6356,216 @@ mod dormant_twin_tests {
         assert_eq!(
             dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
             Ok(floor_at(10))
+        );
+    }
+
+    /// A step context on node 1 for `P` under `lineage`, at tick 1.
+    fn owner_ctx<'a>(
+        snapshot: &'a crate::storage::snapshot::EmptySnapshot,
+        budgets: &'a rdb_core::contracts::event::Budgets,
+        lineage: Lineage,
+    ) -> rdb_core::contracts::event::StepCtx<'a> {
+        use rdb_core::contracts::time::ControlTime;
+
+        rdb_core::contracts::event::StepCtx {
+            now: Tick(1),
+            control_time: ControlTime {
+                estimate: Tick(1),
+                error_millis: 10,
+                bound_established: true,
+                sampled_at: Tick(1),
+            },
+            node: OWNER,
+            boot: BootId(1),
+            partition: P,
+            generation: lineage.generation,
+            owner_epoch: lineage.owner_epoch,
+            config_version: ConfigVersion(1),
+            snapshot,
+            budgets,
+        }
+    }
+
+    /// Node 1, primary of `lineage`, applies records `from..=to`: each committed to its engine
+    /// and stepped into its R1 as `LocalApplied`, so the tracker's ladder holds it; then the
+    /// engine is synced through `to`.
+    fn owner_applies(dispatcher: &mut Dispatcher, lineage: Lineage, from: u64, to: u64) {
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module};
+        use rdb_core::contracts::ids::{CorrelationId, EventId};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let history = canonical_history(lineage, ConfigVersion(1), to).expect("history");
+        let snapshot = EmptySnapshot::new();
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let ctx = owner_ctx(&snapshot, &budgets, lineage);
+        for seq in from..=to {
+            let batch = history
+                .batches
+                .iter()
+                .find(|batch| batch.seq == Seq(seq))
+                .cloned()
+                .expect("the batch at seq");
+            dispatcher
+                .engines
+                .get_mut(&OWNER)
+                .expect("node 1's engine")
+                .commit(batch)
+                .expect("commit");
+            let event = Event {
+                id: EventId(seq),
+                at: Tick(1),
+                node: OWNER,
+                boot: BootId(1),
+                partition: P,
+                correlation: CorrelationId(seq),
+                kind: EventKind::Kernel(KernelEvent::LocalApplied {
+                    seq: Seq(seq),
+                    bytes: 0,
+                    record_digest: history.digest(seq),
+                }),
+            };
+            dispatcher
+                .replication
+                .step(&ctx, &event)
+                .expect("R1 answers its own event");
+        }
+        sync_owner(dispatcher, to);
+    }
+
+    /// Issue #61 S3-R4, part (a), as the lead settled it (2026-11-20): a transfer the cap
+    /// overruns ends and is re-offered, and the re-offer completes.
+    ///
+    /// **The world.** Node 1 serves generation 1 through [`HEAD`]; node 3, copy 2, is empty
+    /// with a live receiver. Pages hold one key and node 3's pull is held at page 2, so node
+    /// 1's transfer stays open, pinned at `S` = [`HEAD`]. Node 1 then applies three records
+    /// more, and a duty round with a budget that holds only the last three passes the pin.
+    ///
+    /// **Asserted.** The round answers `F` = 4, naming the overran pin 3. It warns
+    /// `history_budget_overran_pin` once and ends the transfer `budget_overran`, and only then
+    /// trims ladder and engine to 4. Node 3's next ask opens a new transfer at the head, 6,
+    /// whose offer replaces the held install and completes: node 3 holds 6, re-seeded at node
+    /// 1's head, no install is left open, and its ACK is queued for node 1.
+    ///
+    /// **Differs.** As in
+    /// [`t61_sim_s2_r4_a_source_lost_mid_transfer_is_replaced_by_the_new_primary`], the release
+    /// on `CopyCaughtUp` needs the ACK stepped through node 1's R1, and is pinned by m10's
+    /// `t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head`.
+    /// What repeated overruns do is part (b), which waits for the owner's ruling.
+    ///
+    /// Cuts: the overrun silent (no warn), red; the transfer kept, red (the trim is refused
+    /// `transfer_pinned`); the transfer ended `refused`, which keeps its barrier, red (the `why`).
+    /// Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes() {
+        const METHOD: &str = "t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes";
+        let (mut dispatcher, seed) = serving_owner();
+        let mut scheduler = Scheduler::new();
+        let three = NodeId(3);
+        dispatcher.register_node(three, BootId(1));
+        dispatcher.engines.insert(three, MemoryEngine::new(three));
+        dispatcher.replication.install_receiver(
+            rdb_core::replication::append::AppendReceiver::new(
+                rdb_core::replication::append::ReceiverInit {
+                    config: seed.config.clone(),
+                    own: CopyId(2),
+                    lineage: seed.lineage,
+                    head: rdb_core::replication::append::Head {
+                        seq: Seq::ZERO,
+                        digest: Digest::ROOT,
+                    },
+                    durable: DurableSeq(0),
+                },
+            )
+            .expect("node 3's receiver"),
+        );
+        sync_owner(&mut dispatcher, HEAD);
+        dispatcher.snapshot_hooks.page_keys = Some(1);
+        dispatcher.snapshot_hooks.pages_held_from = Some(2);
+        // A refill, then the transfer at `S` = HEAD, offered at once and held at page 2.
+        for _ in 0..2 {
+            dispatcher
+                .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD), &mut scheduler)
+                .expect("served");
+        }
+        let open = |dispatcher: &Dispatcher| {
+            dispatcher
+                .snapshot_transfers
+                .get(&(OWNER, P, CopyId(2)))
+                .map(|transfer| transfer.at)
+        };
+        assert_eq!(open(&dispatcher), Some(Seq(HEAD)), "pinned at S");
+        assert!(dispatcher.snapshot_installs.contains_key(&(three, P)));
+
+        let head = HEAD + 3;
+        owner_applies(&mut dispatcher, seed.lineage, HEAD + 1, head);
+        let floor = HEAD + 1;
+        let tight = super::RetentionConfig {
+            keep_millis: 3_600_000,
+            budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(floor)),
+        };
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(0), tight),
+            Ok(RetentionDecision::Floor(RetentionFloor {
+                floor: Seq(floor),
+                behind: Vec::new(),
+                overran_pins: vec![Seq(HEAD)],
+            })),
+            "the cap passes the pin"
+        );
+        let overran: Vec<_> = logged(METHOD, "history_budget_overran_pin")
+            .iter()
+            .map(|line| (line["copy"].as_u64(), line["pin"].as_u64()))
+            .collect();
+        assert_eq!(overran, vec![(Some(2), Some(HEAD))], "warned once");
+        let ended: Vec<_> = logged(METHOD, "snapshot_transfer_abandoned")
+            .iter()
+            .map(|line| line["why"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(ended, vec![Some("budget_overran".to_owned())]);
+        assert_eq!(open(&dispatcher), None, "the transfer ended");
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(floor)), Seq(floor)),
+            "then trimmed past the pin"
+        );
+
+        // The re-offer: node 3 asks again, and this time nothing holds its pull.
+        dispatcher.snapshot_hooks.pages_held_from = None;
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD), &mut scheduler)
+            .expect("served");
+        let opened: Vec<_> = logged(METHOD, "snapshot_transfer_opened")
+            .iter()
+            .map(|line| line["at"].as_u64())
+            .collect();
+        assert_eq!(
+            opened,
+            vec![Some(HEAD), Some(head)],
+            "re-offered at the head"
+        );
+        assert_eq!(logged(METHOD, "snapshot_install_replaced").len(), 1);
+        let installed: Vec<_> = logged(METHOD, "snapshot_transfer_installed")
+            .iter()
+            .map(|line| line["at"].as_u64())
+            .collect();
+        assert_eq!(installed, vec![Some(head)], "the re-offer completes");
+        assert_eq!(
+            (
+                dispatcher.engines[&three].buffered_applied(P, Generation(1)),
+                dispatcher
+                    .replication
+                    .receiver(three, P)
+                    .map(|receiver| receiver.applied_head().seq),
+                dispatcher.snapshot_installs.is_empty(),
+            ),
+            (AppliedSeq(head), Some(Seq(head)), true),
+            "node 3 holds node 1's head, re-seeded there"
+        );
+        assert_eq!(
+            scheduler.take_for(OWNER, Tick(u64::MAX)).len(),
+            1,
+            "node 3's ACK at the head is queued for node 1"
         );
     }
 }
