@@ -85,13 +85,31 @@ voters_arg() { local n s=""; for n in $(seq 1 "$VOTERS"); do s="$s${s:+,}$n=$(vo
 run_rm() { docker run --rm --label "$LABEL" --network "$NET" -v "$NAME-init:/init:ro" "$IMAGE" "$@"; }
 
 # absent KIND NAME: 0 when Docker says no KIND (volume, container, network) has that name,
-# 1 when one does. Any other inspection failure (daemon down, permission) ends the run: an
-# unknown answer is never read as "absent".
+# 1 when one does. Any other inspection failure (daemon down, permission, a DOCKER_HOST that
+# does not resolve) ends the run: an unknown answer is never read as "absent". Only Docker's
+# own not-found answer naming this KIND and NAME counts (review r2): a bare "no such" also
+# appears in "lookup <host>: no such host" and "connect: no such file or directory".
 absent() {
     local err
     if err="$(docker "$1" inspect "$2" 2>&1 >/dev/null)"; then return 1; fi
-    echo "$err" | grep -qiE 'no such|not found' && return 0
+    absent_answer "$1" "$2" "$err" && return 0
     die "inspect $1 $2: $err"
+}
+# absent_answer KIND NAME TEXT: 0 when TEXT is Docker's not-found answer for KIND NAME, in the
+# forms Docker 20 to 28 print: `No such container: NAME`, `get NAME: no such volume`,
+# `No such volume: NAME`, `network NAME not found`, `No such network: NAME`.
+absent_answer() {
+    local kind="$1" name="$2" line
+    while IFS= read -r line; do
+        line="${line#Error response from daemon: }"
+        line="${line#Error: }"
+        case "$kind:$(echo "$line" | tr '[:upper:]' '[:lower:]')" in
+            "container:no such container: $name"|"container:no such object: $name") return 0 ;;
+            "volume:get $name: no such volume"|"volume:no such volume: $name") return 0 ;;
+            "network:network $name not found"|"network:no such network: $name") return 0 ;;
+        esac
+    done <<< "$3"
+    return 1
 }
 
 # Every IPv4 subnet a Docker network or a host route uses, one per line. Fails, printing why,
@@ -141,7 +159,13 @@ preflight() {
     ids="$(docker ps -aq --filter "label=$LABEL")" || die "containers: docker ps failed"
     [ -z "$ids" ] || die "containers: $NAME's still exist"
     absent container "$HELPER" || die "container: $HELPER exists"
-    local vol n
+    local vol n c
+    # Each name `up` will give a container, whoever made one by that name: `docker run --name`
+    # would fail half-way, after the network and volumes exist (review r2).
+    for c in $(for n in $(seq 1 "$VOTERS"); do echo "$NAME-v$n"; done) \
+             $(for n in $(seq 1 "$NODES"); do echo "$NAME-d$n"; done); do
+        absent container "$c" || die "container: $c exists; nothing was created"
+    done
     for vol in "$NAME-init" $(for n in $(seq 1 "$VOTERS"); do echo "$NAME-v$n"; done) \
                $(for n in $(seq 1 "$NODES"); do echo "$NAME-d$n"; done); do
         absent volume "$vol" \
@@ -257,8 +281,10 @@ stop_helper() {
 
 # read_check OUT GROUPS NONCE: the session OUT answered the commands made from GROUPS (lines
 # `P G`) in order: per partition one put, then one get. Each put must say `ok p=P`, and the
-# get right after it must say `value=<P's own value>` exactly. A missing, extra, swapped or
-# wrong answer fails, naming the partition. Prints `ok=N` (N partitions read back).
+# get right after it must say `value=<P's own value> version=` exactly. rdb_dev prints the
+# value's raw bytes, so a space does not end it: matching up to the version field is what makes
+# `value=v1 extra version=` fail for `v1`. A missing, extra, swapped or wrong answer fails,
+# naming the partition. Prints `ok=N` (N partitions read back).
 read_check() {
     python3 -I - "$1" "$2" "$3" <<'PY'
 import sys
@@ -275,7 +301,7 @@ if len(answers) != 2 * len(pairs):
 for i, (p, g) in enumerate(pairs):
     put = answers[2 * i] if 2 * i < len(answers) else "<none>"
     get = answers[2 * i + 1] if 2 * i + 1 < len(answers) else "<none>"
-    want = f"value=mh-{nonce}-p{p}-g{g} "
+    want = f"value=mh-{nonce}-p{p}-g{g} version="
     if not put.startswith(f"ok p={p} "):
         bad.append(f"partition {p} put: {put}")
     elif not get.startswith(want):
@@ -301,15 +327,29 @@ dev() { # extra rdb_dev flags...
         --cert-dir /init/certs --app admin --control-tls /init/certs/control "$@"
 }
 
+# check's scratch folder. Global, not local: the EXIT trap runs after check() has returned,
+# when a local would be gone and `set -u` would stop the cleanup half-way.
+CHECK_TMP=""
+check_cleanup() {
+    stop_helper
+    [ -z "$CHECK_TMP" ] || rm -rf "$CHECK_TMP"
+    CHECK_TMP=""
+}
+# check_scratch: makes CHECK_TMP and arranges that it and the throwaway voter go whatever ends
+# the run: normal end, failure or interruption.
+check_scratch() {
+    CHECK_TMP="$(mktemp -d)"
+    trap check_cleanup EXIT
+    trap 'exit 130' INT TERM
+}
+
 check() {
     load
     # Every claim is read from its own exit code; one failing claim must not end the check.
     set +e
     local n out rc tmp
-    tmp="$(mktemp -d)"
-    # The throwaway voter goes whatever ends the check: normal end, failure or interruption.
-    trap 'stop_helper; rm -rf "$tmp"' EXIT
-    trap 'exit 130' INT TERM
+    check_scratch
+    tmp="$CHECK_TMP"
 
     # SC8 (a): every voter's own configuration reports mutual TLS.
     for n in $(seq 1 "$VOTERS"); do
@@ -470,6 +510,8 @@ selftest_read_check() {
     [ "$(case_rc)" = 1 ]; st "read check fails swapped values" $?
     printf '%s\n' "$good_put1" "value=mh-n-p1-g7x version=1 gen=1 at=1" "$good_put10" "$v10" > "$t/out"
     [ "$(case_rc)" = 1 ]; st "read check fails a wrong value with the right prefix" $?
+    printf '%s\n' "$good_put1" "value=mh-n-p1-g7 extra version=1 gen=1 at=1" "$good_put10" "$v10" > "$t/out"
+    [ "$(case_rc)" = 1 ]; st "read check fails the value followed by a space and more text" $?
     printf '%s\n' "$good_put1" "$v1" "$v1" "$good_put10" "$v10" > "$t/out"
     [ "$(case_rc)" = 1 ]; st "read check fails a duplicate answer" $?
     : > "$t/out"
@@ -479,19 +521,54 @@ selftest_read_check() {
     rm -rf "$t"
 }
 
+# absent() counts only Docker's own not-found answer for the object it asked about.
+selftest_absent_answer() {
+    local yes no rc
+    for yes in "container|Error response from daemon: No such container: rdbst-x" \
+               "volume|Error response from daemon: get rdbst-x: no such volume" \
+               "volume|Error: No such volume: rdbst-x" \
+               "network|Error response from daemon: network rdbst-x not found"; do
+        absent_answer "${yes%%|*}" rdbst-x "${yes#*|}"
+        st "absent reads Docker's not-found answer: ${yes#*|}" $?
+    done
+    for no in "volume|error during connect: Get \"http://h:2375/v1.51/volumes/rdbst-x\": dial tcp: lookup h: no such host" \
+              "volume|error during connect: dial unix /run/docker.sock: connect: no such file or directory" \
+              "container|Cannot connect to the Docker daemon at unix:///x.sock. Is the docker daemon running?" \
+              "network|Error response from daemon: network rdbst-other not found" \
+              "container|Error response from daemon: No such container: rdbst-x2" \
+              "volume|Error response from daemon: No such container: rdbst-x"; do
+        if absent_answer "${no%%|*}" rdbst-x "${no#*|}"; then rc=1; else rc=0; fi
+        st "absent does not read as not-found: ${no#*|}" "$rc"
+    done
+}
+
+# check's cleanup runs after check() has returned, under set -u: it must remove the scratch
+# folder and print nothing.
+selftest_check_cleanup() {
+    local t err dir; t="$(mktemp -d)"
+    err="$( ( set -euo pipefail; f() { check_scratch; echo "$CHECK_TMP" > "$1"; }
+              f "$t/scratch"; exit 0 ) 2>&1 >/dev/null )"
+    dir="$(cat "$t/scratch" 2>/dev/null)"
+    [ -z "$err" ] && [ -n "$dir" ] && [ ! -e "$dir" ]
+    st "check's exit cleanup removes its scratch folder after check returns" $?
+    [ -z "$err" ] || echo "  $err"
+    rm -rf "$t"
+}
+
 # The subnet preflight with stub producers, no Docker: each failure aborts before creation.
 selftest_subnet() {
     local t; t="$(mktemp -d)"
     printf '#!/bin/sh\necho "10.1.0.0/16 dev eth0"\n' > "$t/ip-ok"
     printf '#!/bin/sh\nexit 3\n' > "$t/ip-fail"
     chmod +x "$t/ip-ok" "$t/ip-fail"
-    # A stub docker: two networks listed; inspect answers for both, or (partial) for one, or fails.
+    # A stub docker: two networks listed (or the listing fails); inspect answers for both, or
+    # (partial) for one, or fails.
     run_preflight() { # docker mode, ip command
         (
             DOCKER_MODE="$1" IP_CMD="$2" SUBNET=10.180.99.0/24
             docker() {
                 case "$1 $2" in
-                    "network ls") printf 'aaa\nbbb\n' ;;
+                    "network ls") [ "$DOCKER_MODE" != lsfail ] || return 1; printf 'aaa\nbbb\n' ;;
                     "network inspect")
                         case "$DOCKER_MODE" in
                             whole) printf 'aaa 172.17.0.0/16 \nbbb 10.180.98.0/24 \n' ;;
@@ -511,7 +588,7 @@ selftest_subnet() {
     export CREATED
     run_preflight whole "$t/ip-ok"; st "subnet preflight passes a free subnet" $?
     local mode
-    for mode in "partial $t/ip-ok" "short $t/ip-ok" "fail $t/ip-ok" "whole $t/ip-fail" "whole $t/missing-ip"; do
+    for mode in "lsfail $t/ip-ok" "partial $t/ip-ok" "short $t/ip-ok" "fail $t/ip-ok" "whole $t/ip-fail" "whole $t/missing-ip"; do
         : > "$t/created"
         # shellcheck disable=SC2086 # mode is two words
         run_preflight $mode
@@ -551,6 +628,23 @@ selftest_docker() {
             && docker volume rm "$target" >/dev/null
     done
 
+    # A foreign, unlabelled container with a name up would give a node: refused before up
+    # creates anything, and left alone.
+    local fc="$NAME-d2" fid
+    if absent container "$fc"; then
+        fid="$(docker create --name "$fc" --label "$mark" --entrypoint true "$IMAGE")"
+        out="$("$0" up --no-build --name "$NAME" --image "$IMAGE" --subnet 10.180.97.0/24 2>&1)"; rc=$?
+        absent network "$NAME-net"; net=$?
+        vols="$(docker volume ls -q --filter "label=org.rdb.multihost=$NAME")"
+        [ "$rc" = 1 ] && echo "$out" | grep -q "FAILED at container: $fc exists" \
+            && [ "$net" = 0 ] && [ -z "$vols" ] \
+            && [ "$(docker inspect -f '{{.Id}}' "$fc" 2>/dev/null)" = "$fid" ]
+        st "up refuses an existing container $fc before creating anything (exit $rc)" $?
+        docker rm -f -v "$fid" >/dev/null
+    else
+        st "$fc is free before the container case" 1
+    fi
+
     # A foreign container named <name>-x is refused and left alone.
     absent container "$HELPER" || { st "$HELPER is free before the collision case" 1; return; }
     local foreign
@@ -586,6 +680,8 @@ selftest() {
     # Each case reads its own exit code; one failing case must not end the selftest.
     set +e
     selftest_read_check
+    selftest_check_cleanup
+    selftest_absent_answer
     selftest_subnet
     selftest_docker
     if [ "$ST_FAILS" = 0 ]; then say "selftest: all passed"; else say "selftest: $ST_FAILS failed"; fi
