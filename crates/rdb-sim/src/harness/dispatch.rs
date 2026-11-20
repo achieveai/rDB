@@ -3518,7 +3518,7 @@ impl Dispatcher {
                     node = node.0,
                     partition = partition.0,
                     copy = copy.0,
-                    floor = prev.0,
+                    floor = floor.floor.0,
                     "{HISTORY_COPY_BEHIND_FLOOR}"
                 );
             }
