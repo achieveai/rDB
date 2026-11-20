@@ -649,7 +649,9 @@ impl Default for Opened {
     }
 }
 
-/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299).
+/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299). It bounds
+/// every trigger alike: a `NOT_PRIMARY` or `LEASE_EXPIRED` answer, a send the owner cannot take,
+/// and a call the owner does not answer in time (#80 S3).
 const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
 
 /// How long past a barrier's own timeout a `Db` waits for the owner to say so (#90).
@@ -660,8 +662,8 @@ const BARRIER_ANSWER_MARGIN: Duration = Duration::from_secs(1);
 struct Route {
     /// The node calls go to, per partition: index `p - 1`, one entry at N=1.
     owners: Vec<std::sync::atomic::AtomicU32>,
-    /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
-    /// with. `None`: the owner is fixed.
+    /// What a `NOT_PRIMARY` answer, an owner that cannot be reached, or one that does not answer
+    /// in time re-reads `partitions/1` with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
     /// When `refresh` last read each partition's record, by partition number. A read within
     /// [`OWNER_REREAD_GAP`] of it is not made: the call goes on with the owner that read named
@@ -755,13 +757,6 @@ fn not_ready(status: &NodeStatus) -> Option<NotReady> {
                 .unwrap_or_else(|| NO_RECOVERY.to_owned()),
         )
     })
-}
-
-/// Whether a partition reported as `reason` may have moved to another owner by a promote this
-/// `Db` did not hear of: its owner cannot be reached, or answered without admitting. An owner
-/// that gave no answer at all is not one this tells anything about.
-const fn may_have_moved(reason: &NotReady) -> bool {
-    !matches!(reason, NotReady::NoAnswer)
 }
 
 /// The kind a node refused a call with, for a put's or a status look's error and a read's
@@ -1619,7 +1614,8 @@ impl Db {
     /// process runs no node, claims no folder, bootstraps and heals nothing. It reads the owner
     /// from `partitions/1`, counts one open on the instance that record names so its own request
     /// ids start above every earlier open's, and sends every call over `DbConfig::links`. A
-    /// `NOT_PRIMARY` answer makes it read the owner again. It keeps the store and `budgets`,
+    /// `NOT_PRIMARY` or `LEASE_EXPIRED` answer, an owner it cannot reach, or one that does not
+    /// answer in time makes it read the owner again. It keeps the store and `budgets`,
     /// the ones [`Self::open`] gives every open, so it can run [`Self::promote`] (A-R261).
     async fn open_app(
         config: DbConfig,
@@ -2699,6 +2695,13 @@ impl Db {
                 // owner `partitions/1` names now.
                 self.refresh_owner(partition);
             }
+            if looked == Err(Unlooked::NoAnswer) {
+                // A silent owner (paused, hung, or cut with its sockets open) keeps its link up
+                // and answers nothing, so it gives neither signal around this one. Read the
+                // owner again, within `OWNER_REREAD_GAP`, so a promote that moved the partition
+                // away from it is followed (#80 S3).
+                self.refresh_owner(partition);
+            }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
                     if let Some(next) = waiting.next() {
@@ -2783,17 +2786,19 @@ impl Db {
     }
 
     /// Every partition's state now, one entry each in partition order (issue #79 S3). An owner
-    /// with no link is `NoLink` at once; the rest share one read timeout. A partition with no
-    /// link, or whose owner answers without admitting, has its record read once more, at most
-    /// once per [`OWNER_REREAD_GAP`], so one moved by another process is asked at its new owner
-    /// rather than reported lost or fenced. An owner that does not answer is left as it is.
+    /// with no link is `NoLink` at once; the rest share one read timeout. Every partition that is
+    /// not ready has its record read once more, at most once per [`OWNER_REREAD_GAP`], so one
+    /// moved by another process is asked at its new owner rather than reported lost, fenced or
+    /// unanswered: an owner with no link, one that answers without admitting, and one that does
+    /// not answer at all (a silent owner, paused or hung with its sockets open, #80 S3) may each
+    /// have been promoted away by a process this `Db` did not hear from.
     #[must_use]
     pub fn readiness(&self) -> Vec<PartitionReady> {
         let all: Vec<PartitionId> = (1..=self.route.partitions()).map(PartitionId).collect();
         let mut seen = self.look_at(&all);
         let unadmitted: Vec<PartitionId> = seen
             .iter()
-            .filter(|ready| ready.reason.as_ref().is_some_and(may_have_moved))
+            .filter(|ready| !ready.ready)
             .map(|ready| ready.partition)
             .collect();
         self.refresh_owners(&unadmitted);
@@ -3044,7 +3049,15 @@ impl Db {
                 }
                 Some(answer)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            // A silent owner (paused, hung, or cut with its sockets open) gives no send error
+            // and no refusal: the call waits on a link that is still up. A timeout is the only
+            // signal, so it re-reads the owner too, and the caller's retry goes to the owner the
+            // record names now (#80 S3 R1s). It moves the route only: the answer is still
+            // `None`, so each caller reports its own timeout outcome as before.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.refresh_owner(partition);
+                None
+            }
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
@@ -3058,7 +3071,8 @@ impl Db {
         }
     }
 
-    /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
+    /// After a `NOT_PRIMARY` or `LEASE_EXPIRED` answer, a send the owner could not take (A-R287
+    /// P1), or a call the owner did not answer in time (a silent owner, #80 S3), read the
     /// owner `partition`'s record names now, so the next call, or the caller's retry that
     /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout.
     fn refresh_owner(&self, partition: PartitionId) {
@@ -3212,7 +3226,8 @@ impl Db {
     /// rEtcd's partition record (A-R399), which needs a link to rEtcd. An owner cut off from rEtcd
     /// cannot learn it, gives no `Ok` once its grant stops admitting, and ends at the timeout.
     /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now. On
-    /// either, this `Db` tries to re-read the owner from rEtcd, best effort: at most once per
+    /// either, and when the owner does not answer by `timeout` plus a second, this `Db` tries to
+    /// re-read the owner from rEtcd, best effort: at most once per
     /// partition every 250 ms and within the read timeout. A re-read inside that gap is skipped,
     /// one can fail or time out, and a `Db` whose route is fixed (one running every node itself)
     /// never re-reads. The route changes only after a re-read that succeeds, so only then does a
@@ -11557,6 +11572,194 @@ mod tests {
         );
         app.shutdown();
         nodes.shutdown();
+    }
+
+    /// #80 S3: nodes 1-3 in this process and an app-only `Db` beside them, then node 1 goes
+    /// silent and another process moves partition 1 to node 2 without telling the app. Silent
+    /// is a paused or hung host: node 1's mailbox is swapped for one that holds every message
+    /// unanswered, so the link stays up and nothing is refused. `partitions/1` is rewritten to
+    /// name node 2, as a promote by another process would. The app's put and read timeouts are
+    /// 300 ms, and it has waited out [`OWNER_REREAD_GAP`], so the first re-read is not skipped.
+    struct SilentOwner {
+        nodes: Db,
+        app: Db,
+        /// Node 1's swapped mailbox: held, so a message to it is taken and never answered.
+        held: mpsc::Receiver<Msg>,
+        /// The nodes' and the app's folders, kept until the row ends.
+        _dirs: [Box<dyn std::any::Any>; 2],
+        rt: tokio::runtime::Runtime,
+    }
+
+    impl SilentOwner {
+        fn new() -> Self {
+            let rt = runtime();
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            let nodes = rt
+                .block_on(Db::open_with(
+                    config(dir.path()),
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                    fast(),
+                ))
+                .expect("the nodes' open");
+            admits(&nodes, "after the nodes' open");
+            let app_dir = config_testkit::fs::temp_dir();
+            let app = rt
+                .block_on(Db::open(
+                    DbConfig {
+                        local: Vec::new(),
+                        links: Some(Arc::clone(nodes.links())),
+                        client: ClientId(2),
+                        timeouts: Timeouts {
+                            put: Duration::from_millis(300),
+                            read: Duration::from_millis(300),
+                            ..Timeouts::default()
+                        },
+                        ..config(app_dir.path())
+                    },
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                ))
+                .expect("the app-only open");
+            app.put(b"a", b"1", None)
+                .expect("app A's put while node 1 answers");
+
+            let (silent, held) = mpsc::channel();
+            let boot = nodes.links().boot_of(OWNER).expect("node 1's boot");
+            nodes.links().register(OWNER, silent, boot);
+            let key = ControlKey::Partition(PartitionId(1)).encode();
+            let found = rt
+                .block_on(store.get(config_core::GetRequest {
+                    key: Bytes::from(key.clone()),
+                }))
+                .expect("get partitions/1")
+                .record
+                .expect("partitions/1");
+            let record = PartitionRecord::decode(&found.value).expect("a partition record");
+            let root = PartitionRoot::decode(&found.value).expect("a rooted record");
+            rt.block_on(
+                store.put(config_core::PutRequest {
+                    key: Bytes::from(key),
+                    value: PartitionRecord {
+                        owner: NodeId(2),
+                        ..record
+                    }
+                    .encode_with(&root),
+                    expected_mod_revision: Some(found.mod_revision),
+                    dedup: None,
+                }),
+            )
+            .expect("put partitions/1 naming node 2");
+            assert_eq!(app.route.owner(), OWNER, "nobody told app A");
+            std::thread::sleep(OWNER_REREAD_GAP + Duration::from_millis(50));
+            Self {
+                nodes,
+                app,
+                held,
+                _dirs: [Box::new(dir), Box::new(app_dir)],
+                rt,
+            }
+        }
+
+        fn finish(self) {
+            let Self {
+                mut nodes,
+                mut app,
+                held,
+                _dirs,
+                rt,
+            } = self;
+            drop(held);
+            app.shutdown();
+            nodes.shutdown();
+            drop(rt);
+        }
+    }
+
+    /// #80 S3 (R1s found it): an app whose owner goes silent re-reads the owner after one
+    /// timed-out call, so its retry goes to the owner the record names now ([`SilentOwner`]).
+    /// A silent owner gives no send error and no refusal, so before this the route stayed on it
+    /// for as long as it was silent. The re-read moves the route only: the put still answers the
+    /// compile's own `UNAVAILABLE`, nothing sent.
+    /// Cut: `Db::call`'s timeout arm does not re-read; the route still names node 1, red,
+    /// observed 2026-11-20 (the other two `s80s3_` rows here stayed green).
+    /// Unit (~5 s: three node threads opened, then one 300 ms put timeout).
+    #[config_log::retcd_test]
+    fn s80s3_an_app_whose_owner_goes_silent_rereads_the_owner_after_one_timeout() {
+        let rig = SilentOwner::new();
+        let refused = rig
+            .app
+            .put(b"a", b"2", None)
+            .expect_err("node 1 answers nothing")
+            .error;
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "a compile that timed out sent nothing: {refused:?}"
+        );
+        assert!(
+            refused.detail.contains("nothing was sent"),
+            "the compile's own timeout text: {refused:?}"
+        );
+        assert_eq!(
+            rig.app.route.owner(),
+            NodeId(2),
+            "one timed-out call re-read the owner"
+        );
+        rig.finish();
+    }
+
+    /// #80 S3: `wait_ready` against a silent owner ([`SilentOwner`]) re-reads the owner after a
+    /// look nothing answered, so it goes on to look at the owner the record names now instead
+    /// of waiting on the silent one until `within` runs out. Node 2 is named but was never
+    /// recovered as owner, so the call may still time out; the row pins where it looks.
+    /// Cut: the wait-ready loop does not re-read on `Unlooked::NoAnswer`; the route still names
+    /// node 1 and the time-out names owner 1, phase "unknown", red, observed 2026-11-20.
+    /// Unit (~5 s: three node threads opened, then 1 s of looks).
+    #[config_log::retcd_test]
+    fn s80s3_wait_ready_on_a_silent_owner_rereads_the_owner() {
+        let rig = SilentOwner::new();
+        let waited = rig.app.wait_ready(Duration::from_secs(1));
+        tracing::info!(?waited, "s80s3_wait_ready_silent");
+        assert_eq!(
+            rig.app.route.owner(),
+            NodeId(2),
+            "a look nothing answered re-read the owner: {waited:?}"
+        );
+        if let Err(ReadyError::TimedOut { owner, .. }) = &waited {
+            assert_eq!(
+                *owner,
+                NodeId(2),
+                "the time-out names the owner looked at last"
+            );
+        }
+        rig.finish();
+    }
+
+    /// #80 S3: `readiness` with a silent owner ([`SilentOwner`]) reads the owner of a partition
+    /// nothing answered for, and reports the partition at the owner the record names now, not
+    /// `NoAnswer` at the silent one.
+    /// Cut: `readiness` leaves `NotReady::NoAnswer` out of the re-read; partition 1 is reported
+    /// `NoAnswer` at node 1, red, observed 2026-11-20.
+    /// Unit (~5 s: three node threads opened, then two 300 ms looks).
+    #[config_log::retcd_test]
+    fn s80s3_readiness_with_a_silent_owner_reports_the_owner_the_record_names() {
+        let rig = SilentOwner::new();
+        let seen = rig.app.readiness();
+        tracing::info!(?seen, "s80s3_readiness_silent");
+        assert_eq!(seen[0].partition, PartitionId(1), "{seen:?}");
+        assert_eq!(
+            seen[0].owner,
+            NodeId(2),
+            "partition 1 is looked at again: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].reason,
+            Some(NotReady::NoAnswer),
+            "node 2 answers: {seen:?}"
+        );
+        rig.finish();
     }
 
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
