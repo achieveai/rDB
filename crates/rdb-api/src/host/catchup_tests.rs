@@ -4654,3 +4654,52 @@ fn floor_read_failures(method: &str) -> Vec<(serde_json::Value, serde_json::Valu
         })
         .collect()
 }
+
+/// PR #156 review, #121 check B at adoption, the read-error arm. Generation 1 holds seqs 1 to
+/// 3; its base (seq 2) and head (seq 3) read and seq 1 does not ([`floor_unreadable`]). An ask
+/// at anchor 2, base 2, with L = 1 passes every proof above the base, then check B's seq 1 read
+/// faults: the inventory answers `TailHeld`, the tail held `Unchecked`, `tail_not_adoptable`
+/// names `tail_history_read_failed`, `adopt_floor_read_failed` logs the fault at error, and
+/// nothing is written: lineages, generation 2's link and the cached view are unchanged.
+/// Cut: swallow the read error in `Host::adoption`'s check B (`Err(_) => {}`); red, the ask
+/// links generation 2 and reports.
+/// Unit.
+#[config_log::retcd_test]
+fn pr156_an_adoption_whose_floor_read_fails_holds_the_tail_unchecked() {
+    const METHOD: &str = "pr156_an_adoption_whose_floor_read_fails_holds_the_tail_unchecked";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = floor_unreadable(&path);
+    let mut host = host_over(&path, &rt);
+    host.refresh_view(p, Generation(1)).expect("a step view");
+    let before = untouched(&host);
+    assert!(before.view.is_some(), "a cached view");
+    let answer = host.inventory(
+        p,
+        CopyId(1),
+        anchor_at(2, 2, digests[1]),
+        Some(Generation(1)),
+        None,
+    );
+    assert!(
+        matches!(answer, RecoveryEvent::TailHeld { .. }),
+        "a tail whose floor cannot be read is held: {answer:?}"
+    );
+    assert_eq!(untouched(&host), before, "the refusal wrote nothing");
+    assert!(adoptions(METHOD).is_empty(), "{:?}", adoptions(METHOD));
+    let refused: Vec<_> = logged!(METHOD, "tail_not_adoptable")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        refused,
+        [serde_json::Value::from("tail_history_read_failed")]
+    );
+    assert_eq!(floor_read_failures(METHOD), [(1.into(), 1.into(), true)]);
+    assert_eq!(
+        host.tail_refused.get(&p).map(|refused| refused.adoption),
+        Some(TailAdoption::Unchecked)
+    );
+}
