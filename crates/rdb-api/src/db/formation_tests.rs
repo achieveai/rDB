@@ -3622,3 +3622,84 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
     );
     assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
 }
+
+/// The info-level bytes a write costs, summed over every node's lines (#158 ruling 3): `rdb_node`
+/// logs at info in production, and at ~4.8 KB a write a node at 500 writes/s filled ~210 GB a day.
+const INFO_BYTES_PER_WRITE: usize = 300;
+
+/// The writes the burst makes, after the warm-up, one at a time: each is its own batch, the
+/// worst case for per-batch lines.
+const BURST: usize = 200;
+
+/// A log line's size as the production file holds it: the per-test layer adds `testModule`,
+/// `testMethod` and `testRun`, which `rdb_node`'s file never carries.
+fn production_line_bytes(line: &serde_json::Value) -> usize {
+    let mut line = line.clone();
+    if let Some(fields) = line.as_object_mut() {
+        for test_field in ["testModule", "testMethod", "testRun"] {
+            fields.remove(test_field);
+        }
+    }
+    serde_json::to_string(&line).expect("a JSON line").len() + 1
+}
+
+/// Whether a line is at Information or above. Read from `@l`, not from what the test filter let
+/// through: the per-test layer records rdb's debug lines too.
+fn at_info_or_above(line: &serde_json::Value) -> bool {
+    matches!(
+        line["@l"].as_str(),
+        Some("Information" | "Warning" | "Error" | "Fatal")
+    )
+}
+
+/// #158: a steady stream of writes to a 3-node database costs under [`INFO_BYTES_PER_WRITE`]
+/// bytes of info-level log per write, all three nodes' lines counted. Per-write and per-batch
+/// lines are debug; info carries state changes and faults. Integration (~5 s): a formation, then
+/// [`BURST`] writes to one owner's partition.
+/// Cut: any per-write event moved back to info (for example `net_client_request`,
+/// `publication_fact`, `reply` or `batch_commit`) puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let db = rig.of(owner);
+    let group = group_of(db, partition);
+    // Warm-up: the first writes land while the partition finishes recovering, which logs state
+    // changes that are not the per-write cost.
+    for i in 0..5 {
+        put_lands(db, group, format!("warm{i}").as_bytes(), b"v");
+    }
+
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    for i in 0..BURST {
+        put_lands(db, group, format!("k{i}").as_bytes(), b"v");
+    }
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+
+    let mut by_event: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut total = 0;
+    for line in lines[before..].iter().filter(|line| at_info_or_above(line)) {
+        let bytes = production_line_bytes(line);
+        total += bytes;
+        let event = line["@m"].as_str().unwrap_or("?").to_owned();
+        let entry = by_event.entry(event).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+    let per_write = total / BURST;
+    let mut top: Vec<(String, (usize, usize))> = by_event.into_iter().collect();
+    top.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    top.truncate(12);
+    // Printed whether or not it passes, so a run records the measured cost.
+    eprintln!(
+        "r158: {per_write} info bytes per write over {BURST} writes ({total} in all); {top:?}"
+    );
+    assert!(
+        per_write < INFO_BYTES_PER_WRITE,
+        "{per_write} info bytes per write over {BURST} writes ({total} in all, 3 nodes); \
+         bound {INFO_BYTES_PER_WRITE}. Top events (lines, bytes): {top:?}"
+    );
+}
