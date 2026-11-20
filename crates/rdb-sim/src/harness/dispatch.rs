@@ -328,11 +328,12 @@ pub struct Dispatcher {
     /// inventory it reports. While held the retention duty trims nothing (`InventoryPinned`).
     /// Process memory.
     inventory_pins: BTreeMap<(NodeId, PartitionId), InventoryPin>,
-    /// When each primary a `Recovered` built began its grace (issue #61, design 3.1 m2; lead
-    /// ruling R23): until every other copy its tracker names has an admitted ack, or
-    /// `max(history_keep, inventory_pin_millis)` has passed, the retention duty's window moves
-    /// nothing (`Grace`), though the cap still can. Process memory.
-    grace: BTreeMap<(NodeId, PartitionId), Tick>,
+    /// The generation and start of each primary's grace (issue #61, design 3.1 m2; lead rulings
+    /// R23 and R24): until every other copy its tracker names has an admitted ack, or
+    /// `max(history_keep, inventory_pin_millis)` has passed since the first `Recovered` of that
+    /// generation, the retention duty's window moves nothing (`Grace`), though the cap still
+    /// can. Process memory.
+    grace: BTreeMap<(NodeId, PartitionId), (Generation, Tick)>,
     /// The host's debug-only snapshot hooks, for unit rows only.
     #[cfg(test)]
     snapshot_hooks: SnapshotHooks,
@@ -1344,13 +1345,26 @@ impl Dispatcher {
         if let EventKind::Kernel(KernelEvent::Recovered(result)) = &event.kind {
             self.align_ladders(node, partition, result.new_generation);
             // A primary this `Recovered` left in place has heard no copy since it (design 3.1
-            // m2): its window waits for their acks.
-            if self.replication.primary(node, partition).is_some() {
-                self.grace.insert((node, partition), ctx.now);
+            // m2): its window waits for their acks. One grace per generation (lead ruling R24):
+            // a repeat in the open grace's generation keeps its start, so flapping cannot hold
+            // History open; a new generation ends it `superseded` and waits afresh.
+            let generation = result.new_generation;
+            let open = self.grace.get(&(node, partition)).map(|(held, _)| *held);
+            if open != Some(generation) && self.replication.primary(node, partition).is_some() {
+                if let Some(held) = open {
+                    tracing::info!(
+                        node = node.0,
+                        partition = partition.0,
+                        generation = held.0,
+                        why = "superseded",
+                        "history_grace_ended"
+                    );
+                }
+                self.grace.insert((node, partition), (generation, ctx.now));
                 tracing::info!(
                     node = node.0,
                     partition = partition.0,
-                    generation = result.new_generation.0,
+                    generation = generation.0,
                     "history_grace_begun"
                 );
             }
@@ -3599,9 +3613,10 @@ impl Dispatcher {
     /// End `node`'s grace on `partition` when it no longer holds at `now` (design 3.1 m2; lead
     /// ruling R23), logged `history_grace_ended{why}`: `acked` once every other copy its
     /// tracker names has an admitted ack (its last admitted ACK's `received` above 0),
-    /// `expired` after `wait_millis`, `no_primary` when the node no longer holds one.
+    /// `expired` after `wait_millis`, `no_primary` when the node no longer holds one. A new
+    /// generation's `Recovered` ends it `superseded` where it lands ([`Self::step`]).
     fn release_grace(&mut self, node: NodeId, partition: PartitionId, now: Tick, wait_millis: u64) {
-        let Some(since) = self.grace.get(&(node, partition)).copied() else {
+        let Some((_, since)) = self.grace.get(&(node, partition)).copied() else {
             return;
         };
         let why = match self.replication.primary(node, partition) {
@@ -6926,13 +6941,13 @@ mod dormant_twin_tests {
                 },
             )
             .expect("a trim");
-        step_recovered(&mut dispatcher, &seed);
+        step_recovered(&mut dispatcher, &seed, Tick(0));
         (dispatcher, seed)
     }
 
-    /// Step [`recovered_result`] into node 1's R1 through [`Dispatcher::step`] at tick 0, so the
+    /// Step [`recovered_result`] into node 1's R1 through [`Dispatcher::step`] at `now`, so the
     /// harness's ladder alignment and grace run, and assert a primary stands after it.
-    fn step_recovered(dispatcher: &mut Dispatcher, seed: &DormantSeed) {
+    fn step_recovered(dispatcher: &mut Dispatcher, seed: &DormantSeed, now: Tick) {
         use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, ModuleName};
         use rdb_core::contracts::ids::{CorrelationId, EventId};
 
@@ -6941,7 +6956,7 @@ mod dormant_twin_tests {
         let snapshot = EmptySnapshot::new();
         let budgets = Budgets::SPEC_DEFAULTS;
         let ctx = rdb_core::contracts::event::StepCtx {
-            now: Tick(0),
+            now,
             ..owner_ctx(&snapshot, &budgets, seed.lineage)
         };
         Dispatcher::step(
@@ -6950,7 +6965,7 @@ mod dormant_twin_tests {
             &ctx,
             &Event {
                 id: EventId(1),
-                at: Tick(0),
+                at: now,
                 node: OWNER,
                 boot: BootId(1),
                 partition: P,
@@ -7206,7 +7221,7 @@ mod dormant_twin_tests {
                 boot_floor,
                 "{fault:?}: the engine reopens at its surviving mark"
             );
-            step_recovered(&mut dispatcher, &seed);
+            step_recovered(&mut dispatcher, &seed, Tick(0));
             assert_eq!(
                 floors(&dispatcher),
                 (Some(boot_floor), boot_floor),
@@ -7218,5 +7233,42 @@ mod dormant_twin_tests {
                 "{fault:?}: the restarted holder is pinned"
             );
         }
+    }
+
+    /// Issue #61, lead ruling R24: a repeated `Recovered` in the same generation does not
+    /// restart grace. [`failed_over_owner`] begins it at tick 0; the same `Recovered` again at
+    /// 300 000 logs no second `history_grace_begun`, and the grace still expires 600 000 after
+    /// the first, not the second.
+    ///
+    /// Not covered by a row: a `Recovered` landing a new generation ending the old grace
+    /// `superseded` and beginning a fresh one (no unit fixture here builds a second generation's
+    /// result for a standing primary).
+    ///
+    /// Cut: the reset kept (each `Recovered` overwrites `since`), red (two begun, and the round
+    /// at 600 000 still holds). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_a_repeated_recovered_in_one_generation_keeps_the_first_grace() {
+        const METHOD: &str = "t61_sim_a_repeated_recovered_in_one_generation_keeps_the_first_grace";
+        let (mut dispatcher, seed) = failed_over_owner();
+        step_recovered(&mut dispatcher, &seed, Tick(300_000));
+        assert_eq!(
+            logged(METHOD, "history_grace_begun").len(),
+            1,
+            "one grace for one generation"
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(599_999), NO_KEEP),
+            Ok(RetentionDecision::Held(RetentionHold::Grace))
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(600_000), NO_KEEP),
+            Ok(RetentionDecision::Floor(RetentionFloor {
+                floor: Seq(HEAD),
+                behind: vec![CopyId(1), CopyId(2)],
+                overran_pins: Vec::new(),
+            })),
+            "expired from the first"
+        );
+        assert_eq!(grace_ends(METHOD), vec![Some("expired".to_owned())]);
     }
 }
