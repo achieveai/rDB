@@ -145,6 +145,10 @@ const CONNECT: Duration = Duration::from_secs(2);
 /// Frames kept for a node whose link is not up yet, before the oldest is dropped.
 const QUEUE_CAP: usize = 10_000;
 
+/// The target of `net_client_request`, one debug line per client call (#158). Fault discovery
+/// turns it on alone with `RUST_LOG=info,rdb_api::net::request=debug` ([`faults`]).
+pub const REQUEST_LOG_TARGET: &str = "rdb_api::net::request";
+
 /// Generated stubs for `proto/rdb_net.proto`.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]
 pub mod pb {
@@ -1166,7 +1170,10 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
         WireMsg::Client { call, .. } => {
             let n = shared.faults.next_client_request();
             let identity = call.identity();
-            tracing::info!(
+            // One per client call, so debug (#158), under a target of its own so fault
+            // discovery turns on this line alone: `RUST_LOG=info,rdb_api::net::request=debug`.
+            tracing::debug!(
+                target: REQUEST_LOG_TARGET,
                 n,
                 client = identity.map(|identity| identity.client.0),
                 request = identity.map(|identity| identity.request.0),

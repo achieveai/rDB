@@ -5853,19 +5853,41 @@ impl Host {
     fn report_view(&mut self, view: &AuthorityView, fenced: bool) {
         let at = self.stepped_at;
         let margin_ms = margin_ms(view.valid_through_tick, at);
-        tracing::info!(
-            node = self.node.0,
-            partition = view.lineage.partition.0,
-            seq = view.authority_seq,
-            grant = view.grant_id.0,
-            renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
-            valid_through = view.valid_through_tick.0,
-            past_horizon = margin_ms < 0,
-            would_fence_as = ?view.past_horizon,
-            margin_ms,
-            at = at.0,
-            "authority_view"
-        );
+        // Info only for a change of state (#158): the partition's first view, a new grant or
+        // authority seq, a fence, or a view past its horizon. A renewal that moves only the
+        // horizon is debug: each one was a line at info, about 40% of the bytes a write cost.
+        let changed = fenced
+            || margin_ms < 0
+            || self
+                .authority_views
+                .get(&view.lineage.partition)
+                .is_none_or(|previous| {
+                    previous.grant_id != view.grant_id
+                        || previous.authority_seq != view.authority_seq
+                });
+        macro_rules! authority_view {
+            ($level:expr) => {
+                tracing::event!(
+                    $level,
+                    node = self.node.0,
+                    partition = view.lineage.partition.0,
+                    seq = view.authority_seq,
+                    grant = view.grant_id.0,
+                    renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
+                    valid_through = view.valid_through_tick.0,
+                    past_horizon = margin_ms < 0,
+                    would_fence_as = ?view.past_horizon,
+                    margin_ms,
+                    at = at.0,
+                    "authority_view"
+                )
+            };
+        }
+        if changed {
+            authority_view!(tracing::Level::INFO);
+        } else {
+            authority_view!(tracing::Level::DEBUG);
+        }
         self.authority_views.insert(view.lineage.partition, *view);
         if fenced || view.valid_through_tick < at {
             self.dead_views.insert(view.lineage.partition);
@@ -5926,7 +5948,7 @@ impl Host {
             return;
         }
         let view = self.authority_views.get(&batch.partition);
-        tracing::info!(
+        tracing::debug!(
             node = self.node.0,
             partition = batch.partition.0,
             request = admitted.req.identity.request.0,
@@ -6203,7 +6225,7 @@ impl Host {
             .map_err(|fault| {
                 format!("step view of p{} g{}: {fault:?}", partition.0, generation.0)
             })?;
-        tracing::info!(
+        tracing::debug!(
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
@@ -6530,9 +6552,13 @@ impl Host {
                     PublicationEffect::Snapshot { identity, handle } => {
                         self.previous_answer(site.partition, *identity, *handle)
                     }
-                    PublicationEffect::Status(_)
-                    | PublicationEffect::Mode { .. }
-                    | PublicationEffect::Quarantined { .. } => {
+                    // A status is published every step (#158): debug. A mode change or a
+                    // quarantine is a change of state: info.
+                    PublicationEffect::Status(_) => {
+                        tracing::debug!(node, ?effect, "publication_fact");
+                        Ok(())
+                    }
+                    PublicationEffect::Mode { .. } | PublicationEffect::Quarantined { .. } => {
                         tracing::info!(node, ?effect, "publication_fact");
                         Ok(())
                     }
@@ -14309,20 +14335,31 @@ impl Host {
                         request: None,
                     },
                 };
-                tracing::info!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    client = identity.client.0,
-                    request = identity.request.0,
-                    puts = puts.len(),
-                    change = puts.first().map_or("none", |put| put.change.name()),
-                    compiled = matches!(answer, Answer::Compiled(_)),
-                    unchanged = matches!(answer, Answer::Unchanged),
-                    // The kind only: a refusal's detail can name a map key or a path segment
-                    // as text, and a log never carries a key's text (ADR-0013, A-R154).
-                    kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
-                    "client_compile"
-                );
+                // A refusal is info; a compile that worked is one per write, debug (#158).
+                macro_rules! client_compile {
+                    ($level:expr) => {
+                        tracing::event!(
+                            $level,
+                            node = self.node.0,
+                            partition = partition.0,
+                            client = identity.client.0,
+                            request = identity.request.0,
+                            puts = puts.len(),
+                            change = puts.first().map_or("none", |put| put.change.name()),
+                            compiled = matches!(answer, Answer::Compiled(_)),
+                            unchanged = matches!(answer, Answer::Unchanged),
+                            // The kind only: a refusal's detail can name a map key or a path segment
+                            // as text, and a log never carries a key's text (ADR-0013, A-R154).
+                            kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
+                            "client_compile"
+                        )
+                    };
+                }
+                if matches!(answer, Answer::Error { .. }) {
+                    client_compile!(tracing::Level::INFO);
+                } else {
+                    client_compile!(tracing::Level::DEBUG);
+                }
                 let _ = reply.send(self.redirect(partition, answer));
                 return Ok(());
             }
@@ -14450,7 +14487,7 @@ impl Host {
             }
             _ => None,
         };
-        tracing::info!(
+        tracing::debug!(
             node = self.node.0,
             partition = partition.0,
             client = identity.client.0,
@@ -14810,7 +14847,12 @@ impl Host {
             | ReplyEffect::Failed { identity, .. }
             | ReplyEffect::Read { identity, .. } => *identity,
         };
-        tracing::info!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        // A failure is info; every other reply is one per request, debug (#158).
+        if matches!(reply, ReplyEffect::Failed { .. }) {
+            tracing::info!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        } else {
+            tracing::debug!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        }
         // A status query's answer, or its refusal, goes to the query being stepped, never to a
         // write waiting under the same identity (F-014).
         let for_status = matches!(

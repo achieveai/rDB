@@ -1396,7 +1396,9 @@ impl RocksEngine {
             );
             self.format = FORMAT_VERSION;
         }
-        tracing::info!(
+        // One per batch, so debug (#158). A batch that fails is `batch_commit_failed` at error;
+        // a slow WAL sync is the host's `wal_sync_slow` at warn.
+        tracing::debug!(
             target: LOG_TARGET,
             partition = batch.partition.0,
             generation = batch.generation.0,
