@@ -1,7 +1,9 @@
 //! The lineage check S0's `verify` runs: is the stored history a whole, chained prefix?
 //!
-//! Per record `1..=applied`: it exists, decodes as an envelope, claims its own sequence, carries
-//! a digest that recomputes, and its `prev_digest` is the digest of the record before it, from
+//! Per record `1..=applied` (`floor..=applied` on a trimmed lineage, issue #61, whose record at
+//! the floor starts the chain in place of [`Digest::ROOT`]; none on a level a child's trim
+//! emptied, floor `applied + 1`, whose head digest its `Progress` alone names): it exists,
+//! decodes as an envelope, claims its own sequence, carries a digest that recomputes, and its `prev_digest` is the digest of the record before it, from
 //! [`Digest::ROOT`] at sequence 0. Then: no `History` record exists above `applied`, and the
 //! lineage's `Progress` value names the head — `seq` u64 LE, then the head digest
 //! (`rdb_core::replication::append::PROGRESS_KEY`'s documented format).
@@ -19,7 +21,8 @@
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::envelope::ReplicationEnvelope;
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, PartitionId, Seq};
-use rdb_core::contracts::storage::StorageFault;
+use rdb_core::contracts::storage::{Namespace, StorageFault};
+use rdb_core::replication::append::PROGRESS_KEY;
 
 use crate::engine::{RocksEngine, LOG_TARGET};
 
@@ -30,7 +33,8 @@ pub struct VerifiedLineage {
     pub partition: PartitionId,
     /// The generation.
     pub generation: Generation,
-    /// The applied watermark; every record `1..=applied` was checked.
+    /// The applied watermark; every record `1..=applied` was checked, or `floor..=applied` on a
+    /// trimmed lineage ([`RocksEngine::floor_seq`]).
     pub applied: AppliedSeq,
     /// The durable watermark, as the engine holds it. `open` already refused `durable > applied`.
     pub durable: DurableSeq,
@@ -95,6 +99,7 @@ pub fn verify_lineage(
             generation = generation.0,
             applied = applied.0,
             durable = verified.durable.0,
+            floor = engine.floor_seq(partition, generation).0,
             "lineage_verified"
         ),
         Err(fault) => tracing::error!(
@@ -118,25 +123,37 @@ fn check(
     if engine.staging(partition, generation).is_some() {
         return Err(LineageFault::CopyIncomplete);
     }
+    // A trimmed lineage holds `floor..=applied` (issue #61): the record at the floor is checked
+    // on its own, and its digest starts the chain the records above it must follow.
+    let floor = engine.floor_seq(partition, generation);
     let mut prev = Digest::ROOT;
     let mut head_progress = None;
-    for seq in (1..=applied.0).map(Seq) {
-        let (record, progress) = engine
-            .history_at(partition, generation, seq)
+    let first = if floor.0 > 0 && floor.0 == applied.0 + 1 {
+        // A level a child's trim emptied (design rev 5c): no History is left to walk, and the
+        // head `Progress` alone names its head digest, checked below like any other.
+        let progress = engine
+            .get(partition, generation, Namespace::Progress, PROGRESS_KEY)
             .map_err(LineageFault::Read)?
-            .ok_or(LineageFault::Missing(seq))?;
-        let envelope =
-            ReplicationEnvelope::decode(&record).map_err(|_| LineageFault::Undecodable(seq))?;
-        if envelope.header.seq != seq {
-            return Err(LineageFault::WrongSeq {
-                at: seq,
-                claims: envelope.header.seq,
-            });
+            .map(|(_, _, value)| value);
+        if let Some(digest) = progress
+            .as_deref()
+            .and_then(|value| value.get(8..))
+            .and_then(|digest| <[u8; 32]>::try_from(digest).ok())
+        {
+            prev = Digest(digest);
         }
-        match envelope.compute_record_digest() {
-            Ok(digest) if digest == envelope.record_digest => {}
-            _ => return Err(LineageFault::DigestMismatch(seq)),
-        }
+        head_progress = progress;
+        floor.0
+    } else if floor.0 > 0 {
+        let (envelope, progress) = record_at(engine, partition, generation, floor)?;
+        prev = envelope.record_digest;
+        head_progress = progress;
+        floor.0 + 1
+    } else {
+        1
+    };
+    for seq in (first..=applied.0).map(Seq) {
+        let (envelope, progress) = record_at(engine, partition, generation, seq)?;
         if envelope.prev_digest != prev {
             return Err(LineageFault::BrokenChain(seq));
         }
@@ -165,4 +182,30 @@ fn check(
         durable: engine.durable(partition, generation),
         head_digest: prev,
     })
+}
+
+/// The record at `seq`, checked on its own: it exists, decodes, claims `seq`, and carries a
+/// digest that recomputes. With it, the head `Progress` value [`RocksEngine::history_at`] reads.
+fn record_at(
+    engine: &RocksEngine,
+    partition: PartitionId,
+    generation: Generation,
+    seq: Seq,
+) -> Result<(ReplicationEnvelope, Option<bytes::Bytes>), LineageFault> {
+    let (record, progress) = engine
+        .history_at(partition, generation, seq)
+        .map_err(LineageFault::Read)?
+        .ok_or(LineageFault::Missing(seq))?;
+    let envelope =
+        ReplicationEnvelope::decode(&record).map_err(|_| LineageFault::Undecodable(seq))?;
+    if envelope.header.seq != seq {
+        return Err(LineageFault::WrongSeq {
+            at: seq,
+            claims: envelope.header.seq,
+        });
+    }
+    match envelope.compute_record_digest() {
+        Ok(digest) if digest == envelope.record_digest => Ok((envelope, progress)),
+        _ => Err(LineageFault::DigestMismatch(seq)),
+    }
 }

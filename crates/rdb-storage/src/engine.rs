@@ -46,9 +46,9 @@ use crate::keys::{
     self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
     decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
     ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
-    Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
-    FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY,
-    PRIVATE_NS, SEALED_KEY,
+    Link, PublishMark, TrimFloor, APPLIED_KEY, CF_HISTORY, CF_METADATA, COLUMN_FAMILIES,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN,
+    OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TRIM_FLOOR_KEY, TRIM_FLOOR_LEN,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -272,6 +272,59 @@ pub enum BindError {
     },
 }
 
+/// Why [`RocksEngine::stage_trim_history`] refused (issue #61). Nothing was written in any
+/// case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TrimRefused {
+    /// The engine holds no such lineage.
+    #[error("no such lineage")]
+    UnknownLineage,
+    /// A full copy is staged into the lineage and was never switched: its keys are partial.
+    #[error("a full copy is staged in this lineage")]
+    Staging,
+    /// A child inherited the lineage. Its History is trimmed through the child's walk, which
+    /// keeps the part the child does not read.
+    #[error("sealed by child generation {}", child.0)]
+    Sealed {
+        /// The child generation.
+        child: Generation,
+    },
+    /// The floor is above the lineage's applied watermark: the record at it does not exist.
+    #[error("floor {} is above applied {}", floor.0, applied.0)]
+    AboveApplied {
+        /// The floor asked for.
+        floor: Seq,
+        /// The lineage's applied watermark.
+        applied: AppliedSeq,
+    },
+    /// The floor is below the one the lineage already reads under: a floor never moves down.
+    #[error("floor {} is below the current floor {}", floor.0, current.0)]
+    BelowFloor {
+        /// The floor asked for.
+        floor: Seq,
+        /// [`RocksEngine::floor_seq`] now.
+        current: Seq,
+    },
+    /// RocksDB refused the write.
+    #[error("the trim write failed")]
+    WriteFailed,
+}
+
+impl TrimRefused {
+    /// The `reason` field `history_trim_refused` carries.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownLineage => "unknown_lineage",
+            Self::Staging => "staging",
+            Self::Sealed { .. } => "sealed",
+            Self::AboveApplied { .. } => "above_applied",
+            Self::BelowFloor { .. } => "below_floor",
+            Self::WriteFailed => "write_failed",
+        }
+    }
+}
+
 /// One lineage's engine-private records as the engine holds them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -283,6 +336,10 @@ pub(crate) struct Marks {
     pub(crate) sealed_by: Option<Generation>,
     /// Set on a child mid full copy: the `(parent, base)` of its `copying` record.
     pub(crate) staging: Option<(Generation, Seq)>,
+    /// Set on a trimmed level: its own `trim_floor` record (issue #61), written by a trim of it
+    /// or of a child that cut it (design rev 5c). [`RocksEngine::floor`] takes the highest mark
+    /// that cuts what a lineage reads.
+    pub(crate) floor: Option<TrimFloor>,
 }
 
 /// One core set's data engine on RocksDB.
@@ -699,6 +756,7 @@ impl RocksEngine {
                 link = ?marks.link,
                 sealed_by = ?marks.sealed_by.map(|child| child.0),
                 staging = ?marks.staging,
+                floor = marks.floor.map(|floor| floor.seq.0),
                 "lineage_restored"
             );
         }
@@ -1798,6 +1856,183 @@ impl RocksEngine {
         Ok(deleted)
     }
 
+    /// The trim mark lineage `(partition, generation)` reads under (issue #61, design rev 5c),
+    /// with the generation whose level holds it: the **highest** mark that cuts what the
+    /// lineage reads. The walk follows every link, `copied` ones included, since History falls
+    /// through all of them. A level's mark counts only while it is at most one past the last seq
+    /// the lineage reads there: `applied + 1` on its own level (a cut level whose History is
+    /// all gone is marked `head + 1`, "empty"), `base + 1` through a link, the smallest along
+    /// the path. A sealed sibling sharing a parent so sees the cut another child's trim made.
+    /// A caller that needs the lineage's own mark (its root is that lineage's root) checks the
+    /// generation. `None` when no level holds one: History is whole from seq 1.
+    #[must_use]
+    pub fn floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, TrimFloor)> {
+        let mut best: Option<(Generation, TrimFloor)> = None;
+        let mut level = generation;
+        let mut top = self
+            .buffered_applied(partition, generation)
+            .0
+            .saturating_add(1);
+        loop {
+            let Some(marks) = self.lineages.get(&(partition, level)) else {
+                return best;
+            };
+            if let Some(floor) = marks.floor.filter(|floor| floor.seq.0 <= top) {
+                if best.is_none_or(|(_, held)| floor.seq > held.seq) {
+                    best = Some((level, floor));
+                }
+            }
+            let Some(link) = marks.link else {
+                return best;
+            };
+            top = top.min(link.base.0.saturating_add(1));
+            level = link.parent;
+        }
+    }
+
+    /// The lowest seq whose History record lineage `(partition, generation)` keeps:
+    /// [`Self::floor`]'s seq, or [`Seq::ZERO`] when the lineage was never trimmed. The record
+    /// **at** the floor is kept, so a floored lineage still reads its floor record.
+    #[must_use]
+    pub fn floor_seq(&self, partition: PartitionId, generation: Generation) -> Seq {
+        self.floor(partition, generation)
+            .map_or(Seq::ZERO, |(_, floor)| floor.seq)
+    }
+
+    /// Delete lineage `(partition, generation)`'s History below `floor.seq` and write `floor`
+    /// as its trim mark, in one atomic `WriteBatch`, staged unsynced (issue #61, A-R317): the
+    /// trim is durable only after the next WAL sync that begins after this returns, so a node's
+    /// thread never waits on an fsync for it. A crash before that sync reopens with the older
+    /// floor and its rows back, which is the safe direction: the caller rebuilds its ladders
+    /// from [`Self::floor_seq`] at open.
+    ///
+    /// The walk follows History's own chain, every link included (`copied` ones too, since
+    /// History falls through them): the lineage's own level loses `[0, floor)`, and a level
+    /// reached through links whose bases are `b1, b2, ..` loses `[0, min(floor, b1+1, b2+1, ..))`,
+    /// exactly the part of it this lineage reads. A parent's records above the base (a tail
+    /// issue #105 keeps) are never touched. The record at `floor.seq` always stays.
+    ///
+    /// Each level cut is marked at its own cut, `min(floor, b1+1, ..)`, in the same batch, with
+    /// `floor`'s root, unless it already holds a higher mark: a mark never goes down (design
+    /// rev 5c). A parent with no records above its base is so marked `head + 1`, empty: its
+    /// head record is gone too, which no reader of it needs once the child is past its base.
+    ///
+    /// Returns how many levels the walk visited. Local cleanup, not a replicated write: no
+    /// `applied` mark moves. Logs `history_trimmed{levels, from, to}`, or
+    /// `history_trim_refused{reason}`.
+    ///
+    /// # Errors
+    ///
+    /// A [`TrimRefused`] naming why; nothing is written in any case.
+    pub fn stage_trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) -> Result<usize, TrimRefused> {
+        let current = self.floor_seq(partition, generation);
+        let result = self.trim_history(partition, generation, floor, current);
+        let (p, g, to) = (partition.0, generation.0, floor.seq.0);
+        match &result {
+            Ok(levels) => tracing::info!(
+                target: LOG_TARGET, partition = p, generation = g, levels, from = current.0, to,
+                "history_trimmed"
+            ),
+            Err(refused) => tracing::warn!(
+                target: LOG_TARGET, partition = p, generation = g, from = current.0, to,
+                reason = refused.reason(), detail = %refused, "history_trim_refused"
+            ),
+        }
+        result
+    }
+
+    fn trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+        current: Seq,
+    ) -> Result<usize, TrimRefused> {
+        let Some(marks) = self.lineages.get(&(partition, generation)).copied() else {
+            return Err(TrimRefused::UnknownLineage);
+        };
+        if marks.staging.is_some() {
+            return Err(TrimRefused::Staging);
+        }
+        if let Some(child) = marks.sealed_by {
+            return Err(TrimRefused::Sealed { child });
+        }
+        if floor.seq.0 > marks.applied.0 {
+            return Err(TrimRefused::AboveApplied {
+                floor: floor.seq,
+                applied: marks.applied,
+            });
+        }
+        if floor.seq < current {
+            return Err(TrimRefused::BelowFloor {
+                floor: floor.seq,
+                current,
+            });
+        }
+        let cf = self.cf(CF_HISTORY);
+        let mut write = WriteBatch::default();
+        // Every level cut gets its own mark at its cut, in this batch (design rev 5c), so a
+        // reader of that level alone (a sealed sibling, an older generation) knows its History
+        // starts there. A mark never goes down, and its root is the child's.
+        let mut marked: Vec<(Generation, TrimFloor)> = Vec::new();
+        let (mut level, mut end, mut levels) = (generation, floor.seq.0, 0_usize);
+        loop {
+            levels += 1;
+            write.delete_range_cf(
+                cf,
+                encode_key(partition, level, Namespace::History, &[]),
+                encode_key(partition, level, Namespace::History, &end.to_be_bytes()),
+            );
+            let held = self
+                .lineages
+                .get(&(partition, level))
+                .and_then(|marks| marks.floor);
+            if held.is_none_or(|held| held.seq.0 < end) {
+                let mark = TrimFloor {
+                    seq: Seq(end),
+                    ..floor
+                };
+                write.put_cf(
+                    self.cf(CF_METADATA),
+                    private_key(partition, level, TRIM_FLOOR_KEY),
+                    mark.encode(),
+                );
+                marked.push((level, mark));
+            }
+            let Some(link) = self.link(partition, level) else {
+                break;
+            };
+            end = end.min(link.base.0.saturating_add(1));
+            level = link.parent;
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(false);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "history_trim_write_failed"
+            );
+            return Err(TrimRefused::WriteFailed);
+        }
+        for (level, mark) in marked {
+            self.lineages.entry((partition, level)).or_default().floor = Some(mark);
+        }
+        Ok(levels)
+    }
+
     /// The highest sequence applied to state, not necessarily synced.
     #[must_use]
     pub fn buffered_applied(&self, partition: PartitionId, generation: Generation) -> AppliedSeq {
@@ -2032,6 +2267,15 @@ impl std::fmt::Display for RawRecord {
                     format!(
                         "parent:{} base:{} copied:{}",
                         link.parent.0, link.base.0, link.copied
+                    )
+                })
+            } else if key == TRIM_FLOOR_KEY {
+                TrimFloor::decode(&self.value).map_or_else(undecodable, |floor| {
+                    format!(
+                        "seq:{} root_base:{} root_digest:{}",
+                        floor.seq.0,
+                        floor.root_base.0,
+                        hex(&floor.root_digest.0)
                     )
                 })
             } else if key == COPYING_KEY {
@@ -2479,11 +2723,40 @@ fn restore_lineages(
                 }
                 marks.sealed_by = Some(child);
             }
+            TRIM_FLOOR_KEY => {
+                sized("trim_floor", TRIM_FLOOR_LEN)?;
+                marks.floor = Some(
+                    TrimFloor::decode(&value)
+                        .ok_or_else(|| corrupt("trim_floor record did not decode"))?,
+                );
+            }
             _ => return Err(corrupt("an engine record name format 1 does not define")),
         }
     }
     // The switch batch writes `applied = base` with the link, and applied only rises after.
+    // A trim refuses a floor above applied, and applied only rises after (issue #61). The one
+    // exception is a parent level a child's trim emptied: it is marked `applied + 1` (design
+    // rev 5c), and only a level some lineage links to can be.
+    let parents: BTreeSet<(PartitionId, Generation)> = lineages
+        .iter()
+        .filter_map(|(&(partition, _), marks)| marks.link.map(|link| (partition, link.parent)))
+        .collect();
     for (&(partition, generation), marks) in &lineages {
+        let limit = if parents.contains(&(partition, generation)) {
+            marks.applied.0.saturating_add(1)
+        } else {
+            marks.applied.0
+        };
+        if let Some(floor) = marks.floor.filter(|floor| floor.seq.0 > limit) {
+            return Err(OpenError::CorruptRecord {
+                path: path.to_path_buf(),
+                key_hex: hex(&private_key(partition, generation, TRIM_FLOOR_KEY)),
+                problem: format!(
+                    "inconsistent lineage records: trim floor {} above applied {}",
+                    floor.seq.0, marks.applied.0
+                ),
+            });
+        }
         if let Some(link) = marks.link.filter(|link| marks.applied.0 < link.base.0) {
             return Err(OpenError::CorruptRecord {
                 path: path.to_path_buf(),

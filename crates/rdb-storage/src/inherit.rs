@@ -526,6 +526,7 @@ impl RocksEngine {
                 link: Some(link),
                 sealed_by: None,
                 staging: None,
+                floor: None,
             },
         );
         self.lineages

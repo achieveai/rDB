@@ -17,7 +17,8 @@
 //! - **Engine-private records** live in `metadata` under ns byte `0xFF`: per lineage `applied`
 //!   and `durable` (u64 BE, no frame); on an inherited lineage, `parent` ([`Link`], 17 bytes);
 //!   on a parent, `sealed` (the child generation, u64 BE); on a child mid full copy, `copying`
-//!   (parent and base, 16 bytes). A lineage with no parent has no
+//!   (parent and base, 16 bytes); on a trimmed lineage, `trim_floor` ([`TrimFloor`], 48 bytes,
+//!   issue #61). A lineage with no parent has no
 //!   `parent` record, never "parent 0": generation 0 is legal (ADR-rdb-0010 decision 11). The
 //!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
 //!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
@@ -32,6 +33,7 @@
 
 use std::collections::BTreeSet;
 
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{Generation, OwnerEpoch, PartitionId, Seq};
 use rdb_core::contracts::storage::Namespace;
 use rdb_core::contracts::time::Tick;
@@ -82,6 +84,54 @@ pub(crate) const SEALED_KEY: &[u8] = b"sealed";
 /// Engine-private record: on a child mid full copy, `parent u64 BE | base u64 BE` (16 bytes).
 /// Written by the copy's first batch, deleted by its switch batch.
 pub(crate) const COPYING_KEY: &[u8] = b"copying";
+
+/// Engine-private record: the lineage's [`TrimFloor`] (issue #61), 48 bytes. Written by the
+/// trim walk ([`crate::RocksEngine::stage_trim_history`]). A build from before it refuses the
+/// name at open, as it refuses any private record it does not define, so it can never read a
+/// trimmed History as whole; that is why no format bump was needed.
+pub(crate) const TRIM_FLOOR_KEY: &[u8] = b"trim_floor";
+
+/// A lineage's trim floor (issue #61): its History holds `seq..=applied`, the record **at**
+/// `seq` included, and nothing below. Before it deleted anything below, the copy checked that it
+/// descends from `(root_base, root_digest)`; the engine stores that root as given and never
+/// reads it.
+///
+/// Stored as `seq u64 BE | root_base u64 BE | root_digest 32 bytes` (48 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimFloor {
+    /// The lowest seq whose History record this lineage keeps.
+    pub seq: Seq,
+    /// The base of the root this copy proved it descends from.
+    pub root_base: Seq,
+    /// The record digest at [`Self::root_base`] ([`Digest::ROOT`] at 0).
+    pub root_digest: Digest,
+}
+
+/// Length of an encoded [`TrimFloor`].
+pub(crate) const TRIM_FLOOR_LEN: usize = 8 + 8 + 32;
+
+impl TrimFloor {
+    /// The stored bytes.
+    pub(crate) fn encode(self) -> [u8; TRIM_FLOOR_LEN] {
+        let mut out = [0; TRIM_FLOOR_LEN];
+        out[0..8].copy_from_slice(&self.seq.0.to_be_bytes());
+        out[8..16].copy_from_slice(&self.root_base.0.to_be_bytes());
+        out[16..48].copy_from_slice(&self.root_digest.0);
+        out
+    }
+
+    /// `None` when `raw` is not exactly [`TRIM_FLOOR_LEN`] bytes.
+    pub(crate) fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() != TRIM_FLOOR_LEN {
+            return None;
+        }
+        Some(Self {
+            seq: Seq(decode_mark(&raw[0..8])?),
+            root_base: Seq(decode_mark(&raw[8..16])?),
+            root_digest: Digest(raw[16..48].try_into().ok()?),
+        })
+    }
+}
 
 /// Encode a `copying` record.
 pub(crate) fn encode_copying(parent: Generation, base: Seq) -> [u8; 16] {
