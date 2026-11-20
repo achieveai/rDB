@@ -1374,6 +1374,7 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        unmuted(&shared, node).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);
@@ -1395,6 +1396,18 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Wait while this node is muted: a stopped process dials nobody, so its links stay down for
+/// as long as the fault lasts (#107 slice 2b manual walk).
+async fn unmuted(shared: &Shared, node: NodeId) {
+    if !shared.faults.muted() {
+        return;
+    }
+    tracing::info!(peer = node.0, "net_dial_muted");
+    while shared.faults.muted() {
+        tokio::time::sleep(faults::POLL).await;
     }
 }
 
@@ -1632,6 +1645,12 @@ impl RdbNet for Service {
                     return;
                 }
             };
+            // Mute: a stopped process answers no handshake, so the dialler's link stays down.
+            if shared.faults.muted() {
+                // Debug: the dialler retries about once a second for as long as the mute lasts.
+                tracing::debug!(peer = %label, "net_handshake_muted");
+                return;
+            }
             if let Some(reason) = refusal(&shared, &label, &hello) {
                 tracing::warn!(peer = %label, %reason, "net_handshake_refused");
                 let _ = tx.send(envelope(&Frame::Refused { reason }));

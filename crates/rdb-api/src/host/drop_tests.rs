@@ -8060,11 +8060,15 @@ fn issue107_r_a_link_down_near_the_end_of_the_hold_discards_its_uptime() {
 }
 
 /// Review: the hold at its default, `LIVE_READD_HOLD_MILLIS` (the other rows run 300 ms): no
-/// `Inspect` at 4,999 ms of link, one at 5,000 ms.
-/// Cut: `linked_ms >= hold` as `>`, red (no probe at 5,000 ms).
+/// `Inspect` at 4,999 ms of link, one at 5,000 ms. #107 slice 2b manual walk: the probe is
+/// logged `live_readd_probed` at info, so the step between the hold and the plan shows at the
+/// default level.
+/// Cuts: `linked_ms >= hold` as `>`, red (no probe at 5,000 ms); `live_readd_probed` at debug,
+/// red (the level).
 /// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
 #[config_log::retcd_test]
 fn issue107_r_the_default_hold_probes_at_5000_ms_and_not_before() {
+    const METHOD: &str = "issue107_r_the_default_hold_probes_at_5000_ms_and_not_before";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, t0) = due_return(dir.path(), |host| {
         host.live_readd.hold_millis = LIVE_READD_HOLD_MILLIS;
@@ -8077,6 +8081,15 @@ fn issue107_r_the_default_hold_probes_at_5000_ms_and_not_before() {
     trio.nodes[0].0.live_readd_duty(t0.plus_millis(5_000));
     assert_eq!(probed(&trio), Some(P1), "5,000 ms");
     assert_eq!(inspects_on_three(&trio).len(), 1);
+    let probes: Vec<_> = logged!(METHOD, "live_readd_probed")
+        .into_iter()
+        .map(|line| (line["@l"].clone(), line["probed"].clone()))
+        .collect();
+    assert_eq!(
+        probes,
+        [("Information".into(), 3.into())],
+        "one probe, at info"
+    );
 }
 
 /// Review: a copy whose `Inspect` answers a fault is refused (`live_readd_refused{faulted}`, with

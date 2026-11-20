@@ -7679,7 +7679,7 @@ impl Host {
                 self.live_readd_unanswered(partition, node, now, "send_failed");
                 return;
             }
-            tracing::debug!(
+            tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 probed = node.0,

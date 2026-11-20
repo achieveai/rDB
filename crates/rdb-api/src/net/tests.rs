@@ -2753,6 +2753,63 @@ async fn row_13f_a_link_held_on_both_ends_outlives_the_silence_limit() {
     assert!(closed.is_empty(), "a hold is a delay: {closed:?}");
 }
 
+/// #107 slice 2b manual walk: `mute` holds a link down, as a stopped process does. Node 2 dials
+/// node 1. Once node `muted` goes mute, the link closes on silence (`PROBE_SILENCE`), and it
+/// then stays down for longer than the shortest `unreachable_drop_after` a node accepts
+/// ([`crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]), so the owner's unreachable clock can
+/// fire. Both ends: a muted dialler (2) dials nobody, and a muted listener (1) answers no
+/// handshake. Before the fix the handshake ran while muted and the link was back in ~100 ms.
+/// Cuts: drop the dial loop's `unmuted` wait, red (case 2); answer a hello while muted, red
+/// (case 1).
+/// Integration (~9 s): the silence limit, then the watch; the two cases run at once.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_muted_node_keeps_its_link_down_past_the_drop_clock() {
+    async fn case(muted: u32) {
+        let dir = config_testkit::fs::temp_dir();
+        certs_for(dir.path(), &[1, 2]);
+        let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+        let addr = one.net.addr().expect("listening");
+        let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+        one.net
+            .wait_up(&[NodeId(2)], PATIENCE)
+            .await
+            .expect("the link comes up");
+        // The side that is not muted watches the link, as the owner's drop clock does.
+        let (silent, watcher, peer) = if muted == 1 {
+            (&one, &two, NodeId(1))
+        } else {
+            (&two, &one, NodeId(2))
+        };
+        silent.faults.apply("mute\n");
+        let up = |side: &Side| matches!(side.net.states().get(&peer), Some(LinkState::Up(_)));
+        let patience = crate::host::test_patience(super::PROBE_SILENCE + PATIENCE);
+        let deadline = tokio::time::Instant::now() + patience;
+        while up(watcher) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {muted} muted: the link never closed within {patience:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let hold = Duration::from_millis(crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS + 500);
+        let until = tokio::time::Instant::now() + hold;
+        while tokio::time::Instant::now() < until {
+            assert!(
+                !up(watcher),
+                "node {muted} muted: the link came back up while muted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        silent.faults.apply("");
+        watcher
+            .net
+            .wait_up(&[peer], crate::host::test_patience(PATIENCE))
+            .await
+            .expect("the link comes back once the mute lifts");
+    }
+    tokio::join!(case(1), case(2));
+}
+
 /// PR #103 review: a hold on one end only, longer than `PROBE_SILENCE`, is still a delay. Node
 /// 1 holds node 2; node 2 holds nothing, so its silence timer runs. An `Inspect` node 2 sends
 /// waits in node 1's hold past the silence limit, is delivered when the hold lifts, and is

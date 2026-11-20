@@ -909,7 +909,7 @@ What is given up is gone for good. Being accepted does not mean writable: the re
 
 #### 8.5.10 Upgrade, release and limits
 
-**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 9. An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
+**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 10 (9 when this was decided; issue #107 slice 2b moved it to 10, and that upgrade is also stop every node, upgrade, start every node). An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
 
 **Owner decision (2026-11-09): units 1 and 2 release together.** Unit 1 alone can only give a live copy's tail up.
 
