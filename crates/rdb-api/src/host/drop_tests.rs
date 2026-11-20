@@ -5468,17 +5468,19 @@ fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_ab
     );
 }
 
-/// S4c: a put P1 can no longer publish, stranded by the rejoin that ends its generation, answers
-/// `UNKNOWN_OUTCOME` when the new lineage arrives, through the `Failed` reply. Before, nothing
-/// answered it and the client waited out its whole 5 s. The Publication check is denied to put
-/// the write in that state on demand, as a revocation staged after its dispatch does. Timed on
-/// the trio's own clock, the one the post-apply deadline runs on, so the answer cannot be that
-/// deadline's. Status then says the write is applied.
-/// Cut: remove the emit in `PubKernel::recovery_replies`, red (answered after 5,500 ms,
-/// the host's waiter expiry: the recovery has also dropped the candidate's deadline).
+/// S4c: a put P1 can no longer publish, stranded by the rejoin that ends its generation, is
+/// answered when the new lineage arrives. Before, nothing answered it and the client waited out
+/// its whole 5 s. The Publication check is denied to put the write in that state on demand, as
+/// a revocation staged after its dispatch does. Timed on the trio's own clock, the one the
+/// post-apply deadline runs on, so the answer cannot be that deadline's. The new lineage's
+/// cutoff keeps the write, so since #111 the answer is `RecoveredApplied`, the same result its
+/// status query gives (it was `UNKNOWN_OUTCOME` before #111).
+/// Cuts: remove the emit in `PubKernel::recovery_replies`, red (answered after 5,500 ms,
+/// the host's waiter expiry: the recovery has also dropped the candidate's deadline). Answer
+/// `Unknown` for every owed reply (before #111), red at the answer.
 /// Integration (~2 s): bootstrap, the pause age, one rejoin.
 #[config_log::retcd_test]
-fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
+fn s4c_a_put_stranded_by_a_rejoin_answers_recovered_applied_at_the_new_lineage() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), tuned);
     trio.nodes[0].0.deny_next_publication_check = true;
@@ -5493,14 +5495,15 @@ fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
     let answer = trio.until("the stranded put answers", |_| stranded.try_recv().ok());
     let waited = trio.clock.now().0 - sent.0;
     tracing::info!(waited, "s4c_stranded_put_answered");
-    match answer {
-        Answer::Error { error, .. } => assert_eq!(
-            (error.name(), error.retry, error.no_mutation),
-            ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
-            "{error:?}"
-        ),
+    let answered = match answer {
+        Answer::Txn { result, .. } => result,
         other => panic!("the stranded put: {other:?}"),
-    }
+    };
+    assert_eq!(
+        answered.outcome,
+        rdb_core::contracts::txn::Outcome::RecoveredApplied,
+        "{answered:?}"
+    );
     assert!(
         waited < rdb_core::publication::POST_APPLY_DEADLINE_MILLIS,
         "answered after {waited} ms: not by the recovery"
@@ -5526,6 +5529,7 @@ fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
         rdb_core::contracts::txn::Outcome::RecoveredApplied,
         "{status:?}"
     );
+    assert_eq!(status, answered, "the reply and the status agree (#111)");
 }
 
 // S4a (#93, D1): an idle partition drops a copy out of reach, and a left-out copy comes back
