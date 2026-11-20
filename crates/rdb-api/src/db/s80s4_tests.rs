@@ -414,7 +414,10 @@ fn s80s4_a_node_added_at_runtime_links_and_takes_a_copy_without_restarting_the_o
 /// #80 S4 M7b (S-6): after M7, partition p's owner (never node 1) is stopped, as an operator
 /// stops a node before a promote of one of its partitions, and p is promoted to node 6. Node 1's
 /// own embedded `Db`, opened before node 6 existed and never restarted, then writes to p and the
-/// put lands, and `route` names node 6 as p's owner. Integration.
+/// put lands, and `route` names node 6 as p's owner. Integration. Stopping the owner is the
+/// row's scope, not a gap: it proves an embedded `Db` writes to a node added at runtime with no
+/// restart. A handoff that keeps the owner running is T12's drain (M10). Not asserted here:
+/// node 6's app address in the route (`RouteInfo` has none; gated on t2's #83 B2).
 /// Cut: no `nodes/` watcher in `Db::open` (`start_members` not called): no node admits node 6,
 /// so the row stops at M7's admission step ("not within 10s: node 1 admits node 6") before the
 /// promote, red, observed 2026-11-20.

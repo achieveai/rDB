@@ -7,7 +7,11 @@
 #   scripts/docker-multihost.sh check    [--name rdbmh]
 #   scripts/docker-multihost.sh down     [--name rdbmh]
 #   scripts/docker-multihost.sh clean    [--name rdbmh]
-#   scripts/docker-multihost.sh selftest [--name rdbst] [--image rdb-bf-node:dev]
+#   scripts/docker-multihost.sh selftest [--name rdbst] [--image rdb-bf-node:dev] [--no-docker]
+#   scripts/docker-multihost.sh failover N [--with-voter-leader] [--rejoin-s 120] [--name rdbmh]
+#   scripts/docker-multihost.sh kill N | restart N | restart-voter V   [--name rdbmh]
+#   scripts/docker-multihost.sh d1       [--name rdbd1] [--subnet 10.180.81.0/24] [--image ..]
+#                                        [--no-build]
 #
 # `up` builds the image (unless --no-build), checks that nothing it would create exists yet
 # (the network <name>-net, the volumes <name>-init, <name>-vN and <name>-dN, any container
@@ -32,12 +36,36 @@
 # label org.rdb.multihost=<name> that `up` puts on each, and touch nothing else.
 #
 # `selftest` checks this script's own guards: the read check and the subnet preflight with
-# stub producers (no Docker), then, with Docker and --image, that `up` refuses an existing
+# stub producers (no Docker), G1 through the entrypoint, the S3 claims over hand-made outputs,
+# the argument refusals and d1's teardown guard (all with stubs, no Docker), then, unless
+# --no-docker, with Docker and --image, that `up` refuses an existing
 # init, voter or data volume before writing anything, and the throwaway voter's collision and
 # failed-start handling. It removes only what it created.
 #
-# Not supported: `docker restart <name>-vN` or `<name>-dN`. Voter 1 was started with
-# `--form`, and restarting hosts is #80 S3's subject. Use down, clean and up instead.
+# #80 S3. The data nodes run with --failover, and print the write-outage bound once
+# (`rdb_node failover bound_ms=B gates=..`). Voter 1 forms the cluster through the entrypoint's
+# G1 (RDB_FORM_IF_FRESH=1: --form only on a fresh volume), so any voter can be restarted.
+#   failover N   kill node N's container and measure (PASS or FAIL per claim, exit 0 or 1):
+#                K1 every partition is written after the kill; the classes in `gates` land
+#                   within bound_ms (the max and p50 of each class are printed);
+#                K2 no partition is owned by N; each one N owned has a higher token and an
+#                   owner among its other copies; every other partition keeps its owner;
+#                K3 the untouched partitions never go longer than the put timeout unwritten;
+#                K4 every planner_promoted after the kill names a partition N owned;
+#                K5 the last acknowledged probe value of every partition reads back.
+#                Then N is started again: J1 ready within 60 s; J2 within --rejoin-s it is
+#                pinned regular again wherever it was, three copies each; J3 the K5 values
+#                still read back and a 5 s probe writes every partition; J4 (printed) what N
+#                owns. --with-voter-leader also kills the rEtcd leader at the same instant
+#                and starts it again with N (D1c).
+#   kill N, restart N   kill node N's container; start it again and wait for it to be ready.
+#   restart-voter V     `docker restart` voter V during a 30 s probe: no partition goes over
+#                       15 s unwritten, and the voter is ready within 60 s.
+#   d1           the whole D1 run on its own --name and --subnet: up, check, failover 3, 1 and
+#                5, restart-voter 1 twice, failover 3 --with-voter-leader. down and clean run
+#                when it exits, whatever ends it, but only once its own preflight has passed,
+#                so it never removes a rig it did not create.
+# Every probe runs in an rdb_dev with --put-timeout-ms 1000, the put timeout the bound assumes.
 #
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
 # --subnet must be a /24 that overlaps no Docker network and no host route; `up` checks.
@@ -47,7 +75,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 NODES=5 VOTERS=3 PARTITIONS=16 SUBNET=10.180.80.0/24 NAME=rdbmh IMAGE=rdb-bf-node:dev BUILD=1
+WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET=""
 [ "$CMD" = selftest ] && NAME=rdbst
+[ "$CMD" = d1 ] && NAME=rdbd1 SUBNET=10.180.81.0/24
+case "$CMD" in
+    failover|kill|restart|restart-voter)
+        case "${1:-}" in
+            ''|*[!0-9]*|0*) echo "docker-multihost: $CMD takes a node number from 1, not '${1:-}'" >&2; exit 2 ;;
+        esac
+        TARGET="$1"; shift ;;
+esac
 while [ $# -gt 0 ]; do
     case "$1" in
         --nodes) NODES="$2"; shift 2 ;;
@@ -57,9 +94,20 @@ while [ $# -gt 0 ]; do
         --name) NAME="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
         --no-build) BUILD=0; shift ;;
+        --with-voter-leader) WITH_VOTER_LEADER=1; shift ;;
+        --rejoin-s)
+            case "${2:-}" in ''|*[!0-9]*) echo "docker-multihost: --rejoin-s takes whole seconds" >&2; exit 2 ;; esac
+            REJOIN_S="$2"; shift 2 ;;
+        --no-docker) NO_DOCKER=1; shift ;;
         *) echo "docker-multihost: unknown argument $1" >&2; exit 2 ;;
     esac
 done
+[ "$WITH_VOTER_LEADER" = 0 ] || [ "$CMD" = failover ] \
+    || { echo "docker-multihost: --with-voter-leader is read only by failover" >&2; exit 2; }
+[ "$REJOIN_S" = 120 ] || [ "$CMD" = failover ] \
+    || { echo "docker-multihost: --rejoin-s is read only by failover" >&2; exit 2; }
+[ "$NO_DOCKER" = 0 ] || [ "$CMD" = selftest ] \
+    || { echo "docker-multihost: --no-docker is read only by selftest" >&2; exit 2; }
 LABEL="org.rdb.multihost=$NAME"
 NET="$NAME-net"
 HELPER="$NAME-x"
@@ -222,13 +270,15 @@ up() {
     local n order
     order="$(seq 2 "$VOTERS") 1"
     for n in $order; do
-        local form=()
-        [ "$n" = 1 ] && form=(--form)
+        # G1: voter 1 forms the cluster on a fresh volume only, so a restart of it serves.
+        local form=0
+        [ "$n" = 1 ] && form=1
         own_volume "$NAME-v$n"
         docker run -d --name "$NAME-v$n" --label "$LABEL" --network "$NET" --ip "$(voter_ip "$n")" \
+            -e RDB_FORM_IF_FRESH="$form" \
             -v "$NAME-v$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" voter \
             --config "/init/voters/voter-$n/config.toml" --log-dir /data/logs \
-            --shutdown-file /data/stop --health-listen 127.0.0.1:7004 "${form[@]}" >/dev/null \
+            --shutdown-file /data/stop --health-listen 127.0.0.1:7004 >/dev/null \
             || die "voter $n start"
         say "voter $n at $(voter_ip "$n")"
     done
@@ -248,7 +298,7 @@ up() {
             -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
             --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers)" --control "$(control)" \
             --control-tls /init/certs/control --cert-dir /init/certs --admin-apps admin \
-            --log-dir /data/logs >/dev/null || die "node $n start"
+            --failover --log-dir /data/logs >/dev/null || die "node $n start"
         say "node $n at $(node_ip "$n")"
     done
     for n in $(seq 1 "$NODES"); do
@@ -490,6 +540,557 @@ clean() {
         docker network rm "$NET" >/dev/null
     fi
     say "clean: removed $(echo "$vols" | grep -c . || true) volumes and network $NET"
+}
+
+# --- #80 S3: failover, kill, restart, restart-voter, d1 ---------------------------------------
+
+# The claims, read from the sessions' outputs (no Docker): `analyze MODE ARGS..`. Every mode
+# that judges prints `PASS <claim>` or `FAIL <claim>` lines, with detail lines indented, and
+# exits 0; a line it cannot read ends it with exit 2 and the line, never a guess.
+#   failover N PARTITIONS T0 PUT_MS BOUND_LINE PRE RUN POST PROMOTED READS   K1-K5
+#   reads PRE RUN              the get commands K5 and J3 read back, in the order they judge
+#   rejoin N PARTITIONS PRE STATUS        exit 0 when J2 holds, 1 when not yet; one line why
+#   j3 PARTITIONS PRE RUN READS AFTER     J3
+#   owned N STATUS             J4: the partitions N owns, as a line
+#   voter PARTITIONS PROBE     restart-voter's claim
+#   leader HEALTH..            the voter every answering voter names as leader, or exit 1
+analyze() {
+    python3 -I - "$@" <<'PY'
+import calendar, json, re, statistics, sys
+
+def die(why):
+    print(f"analyze: {why}", file=sys.stderr)
+    sys.exit(2)
+
+def lines(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [line.rstrip("\n") for line in f]
+
+def status(path):
+    """{p: (owner, (generation, epoch), [(node, role)])} from `admin status`; the last line wins."""
+    out = {}
+    for line in lines(path):
+        m = re.match(r"partitions/(\d+) rev=\d+ ", line)
+        if not m:
+            continue
+        owner = re.search(r"\bowner: NodeId\((\d+)\)", line)
+        gen = re.search(r"\bgeneration: Generation\((\d+)\)", line)
+        epoch = re.search(r"\bowner_epoch: OwnerEpoch\((\d+)\)", line)
+        members = re.search(r" members=(\S+)$", line)
+        if not (owner and gen and epoch and members):
+            die(f"cannot read a partition line: {line}")
+        listed = []
+        if members.group(1) != "-":
+            for item in members.group(1).strip("[]").split(","):
+                node, _, role = item.partition(":")
+                if not node.isdigit() or role not in ("owner", "regular", "shadow"):
+                    die(f"cannot read members {members.group(1)}: {line}")
+                listed.append((int(node), role))
+        out[int(m.group(1))] = (int(owner.group(1)), (int(gen.group(1)), int(epoch.group(1))), listed)
+    return out
+
+PROBE = re.compile(
+    r"probe partition=(\d+) group=(\d+) ok=(\d+) err=(\d+) max_gap_ms=(\d+) "
+    r"first_err_at_ms=(\d+|-) first_ok_after_err_at_ms=(\d+|-) last_ok_i=(\d+) "
+    r"owner=(\S+) token=(\S+) errs=(\S+)$")
+
+def probe(path):
+    """{p: tally} from a probe-all's lines; a partition with no group is absent."""
+    out = {}
+    for line in lines(path):
+        if not line.startswith("probe partition="):
+            continue
+        m = PROBE.match(line)
+        if not m:
+            if " err: no group maps to it" in line:
+                continue
+            die(f"cannot read a probe line: {line}")
+        num = lambda s: None if s == "-" else int(s)
+        out[int(m.group(1))] = {
+            "group": int(m.group(2)), "ok": int(m.group(3)), "err": int(m.group(4)),
+            "gap": int(m.group(5)), "first_err": num(m.group(6)), "first_ok_after": num(m.group(7)),
+            "last_ok_i": int(m.group(8)), "owner": m.group(9), "errs": m.group(11),
+        }
+    return out
+
+def verdict(ok, claim, details=()):
+    print(("PASS " if ok else "FAIL ") + claim)
+    for detail in list(details)[:8]:
+        print("  " + detail)
+
+def reads(pre, run):
+    """(command, partition, object, last_ok_i) in the order the read-back judges them."""
+    out = []
+    for p in sorted(set(pre) | set(run)):
+        for name, tallies in (("s3-pre", pre), ("s3-run", run)):
+            if p in tallies:
+                t = tallies[p]
+                out.append((f"get --group {t['group']} {name}", p, name, t["last_ok_i"]))
+    return out
+
+def readback(want, path):
+    """Problems with the answers in PATH to the commands in WANT, in order."""
+    answers = [l for l in lines(path) if l.startswith(("value=", "absent", "err ", "doc="))]
+    bad = []
+    if len(answers) != len(want):
+        bad.append(f"{len(answers)} answers to {len(want)} reads")
+    for (_, p, name, last), answer in zip(want, answers):
+        m = re.match(r"value=(\d+) version=", answer)
+        if m and int(m.group(1)) >= last:
+            continue
+        if answer.startswith("absent") and last == 0:
+            continue
+        bad.append(f"partition {p} {name}: wanted at least {last}, read {answer}")
+    return bad
+
+def millis(stamp):
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(?:Z|\+00:00)$", stamp or "")
+    if not m:
+        die(f"cannot read a log time {stamp!r}")
+    whole = calendar.timegm(__import__("time").strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    return whole * 1000 + int((m.group(2) or "0")[:3].ljust(3, "0"))
+
+def classes(n, partitions, pre):
+    out = {}
+    for p in range(1, partitions + 1):
+        if p not in pre:
+            die(f"the status before names no partitions/{p}")
+        owner, _, members = pre[p]
+        if owner == n:
+            out[p] = "owner"
+        elif any(node == n for node, _ in members):
+            out[p] = "secondary_kill"
+        else:
+            out[p] = "untouched"
+    return out
+
+def failover(n, partitions, t0, put_ms, bound_line, pre_path, run_path, post_path, promoted_path, reads_path):
+    m = re.match(r"rdb_node failover bound_ms=(\d+) gates=(\S+) ", bound_line + " ")
+    if not m:
+        die(f"cannot read the bound line {bound_line!r}")
+    bound, gates = int(m.group(1)), m.group(2).split(",")
+    pre, pre_probe = status(pre_path), probe(pre_path)
+    run, post = probe(run_path), status(post_path)
+    cls = classes(n, partitions, pre)
+
+    # K1: written after T0, and each gated class within the bound.
+    times = {"owner": [], "secondary_kill": [], "untouched": []}
+    bad = []
+    for p in range(1, partitions + 1):
+        t = run.get(p)
+        if t is None:
+            bad.append(f"partition {p}: no probe line")
+            continue
+        if t["ok"] == 0 or (t["first_err"] is not None and t["first_ok_after"] is None):
+            bad.append(f"partition {p} ({cls[p]}): not written after the kill (ok={t['ok']} errs={t['errs']})")
+            continue
+        times[cls[p]].append(0 if t["first_err"] is None else max(0, t["first_ok_after"] - t0))
+    for name, got in times.items():
+        gated = name in gates
+        worst = max(got) if got else 0
+        print(f"  K1 class={name} partitions={len(got)} max_ms={worst} "
+              f"p50_ms={int(statistics.median(got)) if got else 0} bound_ms={bound} "
+              f"{'gated' if gated else 'reported'}")
+        if gated and worst > bound:
+            bad.append(f"class {name}: {worst} ms > bound_ms={bound}")
+    verdict(not bad, f"K1 every partition written after the kill; {','.join(gates)} within {bound} ms", bad)
+
+    # K2: owners.
+    bad = []
+    for p in range(1, partitions + 1):
+        if p not in post:
+            bad.append(f"partition {p}: no record after")
+            continue
+        owner, token, members = pre[p]
+        now_owner, now_token, _ = post[p]
+        if now_owner == n:
+            bad.append(f"partition {p}: still owned by node {n}")
+        elif owner == n:
+            survivors = {node for node, _ in members if node != n}
+            if now_token <= token:
+                bad.append(f"partition {p}: token {now_token} not above {token}")
+            if now_owner not in survivors:
+                bad.append(f"partition {p}: owner {now_owner} is not one of its copies {sorted(survivors)}")
+        elif now_owner != owner:
+            bad.append(f"partition {p}: owner moved {owner} -> {now_owner}, and node {n} did not own it")
+    verdict(not bad, f"K2 node {n} owns no partition; its partitions moved to a copy with a higher token; the rest kept their owner", bad)
+
+    # K3: untouched partitions never wait longer than the put timeout.
+    bad = [f"partition {p}: max_gap_ms={run[p]['gap']}" for p in sorted(run)
+           if cls.get(p) == "untouched" and run[p]["gap"] > put_ms]
+    verdict(not bad, f"K3 untouched partitions: max_gap_ms <= {put_ms}", bad)
+
+    # K4: no spurious promote.
+    bad, seen = [], 0
+    for line in lines(promoted_path):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            die(f"cannot read a promoted log line: {line}")
+        if event.get("@m") != "planner_promoted" or millis(event.get("@t")) < t0:
+            continue
+        seen += 1
+        p = event.get("partition")
+        if not isinstance(p, int):
+            die(f"a planner_promoted line names no partition: {line}")
+        if cls.get(p) != "owner":
+            bad.append(f"partition {p} ({cls.get(p)}) promoted {event.get('prior')} -> {event.get('owner')}")
+    verdict(not bad, f"K4 every planner_promoted after the kill ({seen}) names a partition node {n} owned", bad)
+
+    # K5: no lost write.
+    bad = readback(reads(pre_probe, run), reads_path)
+    verdict(not bad, "K5 every partition's last acknowledged s3-pre and s3-run value reads back", bad)
+
+def rejoin(n, partitions, pre_path, status_path):
+    pre, now = status(pre_path), status(status_path)
+    bad = []
+    for p in range(1, partitions + 1):
+        if p not in now:
+            bad.append(f"partition {p}: no record")
+            continue
+        members = now[p][2]
+        if any(node == n for node, _ in pre[p][2]) and (n, "regular") not in members and (n, "owner") not in members:
+            bad.append(f"partition {p}: node {n} not pinned regular: {members}")
+        serving = [node for node, role in members if role in ("owner", "regular")]
+        if len(serving) != 3:
+            bad.append(f"partition {p}: {len(serving)} copies, not 3: {members}")
+    print(f"  J2 {'held' if not bad else 'not yet'}: " + ("; ".join(bad[:3]) if bad else f"node {n} pinned again, 3 copies each"))
+    sys.exit(1 if bad else 0)
+
+def j3(partitions, pre_path, run_path, reads_path, after_path):
+    bad = readback(reads(probe(pre_path), probe(run_path)), reads_path)
+    after = probe(after_path)
+    bad += [f"partition {p}: s3-after not written" for p in range(1, partitions + 1)
+            if after.get(p, {}).get("ok", 0) == 0]
+    verdict(not bad, "J3 the K5 values still read back, and a 5 s probe writes every partition", bad)
+
+mode, args = sys.argv[1], sys.argv[2:]
+if mode == "failover":
+    n, partitions, t0, put_ms = (int(a) for a in args[:4])
+    failover(n, partitions, t0, put_ms, *args[4:])
+elif mode == "reads":
+    for command, *_ in reads(probe(args[0]), probe(args[1])):
+        print(command)
+elif mode == "rejoin":
+    rejoin(int(args[0]), int(args[1]), args[2], args[3])
+elif mode == "j3":
+    j3(int(args[0]), *args[1:])
+elif mode == "owned":
+    owned = sorted(p for p, (owner, _, _) in status(args[1]).items() if owner == int(args[0]))
+    print(f"J4 node {args[0]} owns {len(owned)} partitions: {owned or '-'}")
+elif mode == "voter":
+    tallies, partitions = probe(args[1]), int(args[0])
+    bad = []
+    for p in range(1, partitions + 1):
+        t = tallies.get(p)
+        if t is None or t["ok"] == 0:
+            bad.append(f"partition {p}: not written")
+        elif t["gap"] > 15000:
+            bad.append(f"partition {p}: max_gap_ms={t['gap']}")
+    verdict(not bad, "R-V every partition written, none over 15000 ms unwritten, while the voter restarted", bad)
+elif mode == "leader":
+    named = set()
+    for path in args:
+        text = open(path, encoding="utf-8", errors="replace").read().strip()
+        if not text:
+            continue
+        try:
+            leader = json.loads(text).get("current_leader")
+        except ValueError:
+            die(f"cannot read a voter's health: {text[:200]}")
+        if leader is not None:
+            named.add(leader)
+    if len(named) != 1:
+        print(f"analyze: the voters name {sorted(named) or 'no'} leader", file=sys.stderr)
+        sys.exit(1)
+    print(named.pop())
+else:
+    die(f"unknown mode {mode}")
+PY
+}
+
+# A target the run has: a data node 1..NODES or a voter 1..VOTERS.
+target_in() { # kind, count
+    [ "$TARGET" -le "$2" ] || { echo "docker-multihost: $CMD $TARGET: the run has $1 1..$2" >&2; exit 2; }
+}
+
+# The run's scratch folder and its live session, removed and closed whatever ends the run; a
+# container this run killed and has not started yet is started again, so an interrupted run
+# does not leave the rig short of a host.
+SESSION_PID="" KILLED=""
+run_cleanup() {
+    session_close
+    local c
+    for c in $KILLED; do
+        echo "multihost: starting $c again, which this run killed" >&2
+        docker start "$c" >/dev/null 2>&1 || echo "multihost: could not start $c" >&2
+    done
+    KILLED=""
+    check_cleanup
+}
+run_scratch() {
+    CHECK_TMP="$(mktemp -d)"
+    trap run_cleanup EXIT
+    trap 'exit 130' INT TERM
+}
+
+# A live rdb_dev session reading the fifo SESSION_IN, writing OUT: session_open OUT.
+session_open() {
+    local in="$CHECK_TMP/session.in"
+    rm -f "$in"; mkfifo "$in"
+    dev --put-timeout-ms 1000 < "$in" > "$1" 2>&1 &
+    SESSION_PID=$!
+    exec 3> "$in"
+}
+session_send() { echo "$*" >&3; }
+session_close() { # waits for the session; its exit code
+    [ -n "$SESSION_PID" ] || return 0
+    echo quit >&3 2>/dev/null || true
+    exec 3>&-
+    local rc=0
+    wait "$SESSION_PID" || rc=$?
+    SESSION_PID=""
+    return "$rc"
+}
+# session_ready OUT: the session's `wait ready` answered `reached ready`, and every node's link
+# is up in its latest `admin status`. Fails, with the session's last lines, when not in time.
+session_ready() {
+    local out="$1" i asked=0
+    session_send "wait ready 60"
+    for i in $(seq 1 90); do
+        grep -q '^reached ready' "$out" && break
+        if grep -qE '^(not ready|err )' "$out" || [ "$i" = 90 ]; then
+            tail -n 5 "$out" | sed 's/^/  session: /' >&2
+            return 1
+        fi
+        sleep 1
+    done
+    for i in $(seq 1 30); do
+        session_send "admin status"; asked=$((asked + 1))
+        local _
+        for _ in $(seq 1 20); do
+            [ "$(grep -cE '^link node=' "$out")" -ge $((asked * NODES)) ] && break
+            sleep 0.25
+        done
+        [ "$(grep -E '^link node=' "$out" | tail -n "$NODES" | grep -cE '^link node=[0-9]+ up ')" = "$NODES" ] \
+            && return 0
+        sleep 1
+    done
+    grep -E '^link node=' "$out" | tail -n "$NODES" | sed 's/^/  session: /' >&2
+    return 1
+}
+# One whole session: its commands on stdin, through the same rdb_dev flags.
+session_run() { # out, commands...
+    local out="$1"; shift
+    { echo "wait ready 60"; printf '%s\n' "$@"; echo quit; } | dev --put-timeout-ms 1000 > "$out" 2>&1
+}
+
+# The write-outage bound a running data node printed, other than node SKIP.
+bound_line() { # skip
+    local n line
+    for n in $(seq 1 "$NODES"); do
+        [ "$n" = "$1" ] && continue
+        line="$(docker logs "$NAME-d$n" 2>/dev/null | grep '^rdb_node failover bound_ms=' | tail -n 1)"
+        [ -n "$line" ] && { echo "$line"; return 0; }
+    done
+    return 1
+}
+
+# The rEtcd leader every answering voter names.
+voter_leader() {
+    local n
+    for n in $(seq 1 "$VOTERS"); do
+        docker exec "$NAME-v$n" curl -sf http://127.0.0.1:7004/health > "$CHECK_TMP/health-$n" 2>/dev/null \
+            || : > "$CHECK_TMP/health-$n"
+    done
+    analyze leader "$CHECK_TMP"/health-*
+}
+
+voter_ready() { # voter, seconds
+    local i
+    for i in $(seq 1 "$2"); do
+        docker exec "$NAME-v$1" curl -sf http://127.0.0.1:7004/health 2>/dev/null | grep -q '"ready":true' \
+            && return 0
+        sleep 1
+    done
+    return 1
+}
+
+node_ready_since() { # node, since (Unix seconds, for docker logs --since), seconds
+    local i
+    for i in $(seq 1 "$3"); do
+        docker logs --since "$2" "$NAME-d$1" 2>&1 | grep -qE "^rdb_node ready node=$1( |\$)" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# planner_promoted lines from every running data node's log folder, into OUT. Fails when a
+# running node's logs cannot be read: grep's "no match" is not a failure, its errors are.
+promoted_lines() { # out, skip
+    local n
+    : > "$1"
+    for n in $(seq 1 "$NODES"); do
+        [ "$n" = "$2" ] && continue
+        docker exec "$NAME-d$n" sh -c 'grep -rh planner_promoted /data/logs; [ $? -le 1 ]' >> "$1" \
+            || { echo "multihost: could not read node $n's logs" >&2; return 1; }
+    done
+}
+
+# Record a claim line from analyze into FAILS.
+claims() { local line; while IFS= read -r line; do echo "$line"; case "$line" in FAIL*) FAILS=$((FAILS + 1)) ;; esac; done; }
+
+failover() {
+    load
+    target_in "data nodes" "$NODES"
+    local n="$TARGET" tmp leader="" bound
+    set +e
+    run_scratch
+    tmp="$CHECK_TMP"
+    bound="$(bound_line "$n")" || die "failover: no node printed 'rdb_node failover bound_ms='; was up run with --failover (T6a)?"
+    say "failover $n: $bound"
+
+    # Before: owners, tokens, members, and a baseline probe.
+    session_run "$tmp/pre.out" "admin status" "probe-all 3000 200 s3-pre" \
+        || { tail -n 5 "$tmp/pre.out" | sed 's/^/  /'; die "failover: the baseline session failed"; }
+    if [ "$WITH_VOTER_LEADER" = 1 ]; then
+        leader="$(voter_leader)" || die "failover: the voters do not agree on a leader"
+        say "failover $n: the rEtcd leader is voter $leader"
+    fi
+
+    # Kill at T0, with a probe session already linked.
+    session_open "$tmp/run.out"
+    session_ready "$tmp/run.out" || die "failover: the probe session did not become ready with every link up"
+    local t0 victims="$NAME-d$n"
+    [ -z "$leader" ] || victims="$victims $NAME-v$leader"
+    t0="$(date +%s%3N)"
+    # shellcheck disable=SC2086 # one argument per container
+    docker kill $victims >/dev/null || die "failover: docker kill $victims"
+    KILLED="$victims"
+    say "failover $n: killed $victims at T0=$t0"
+    session_send "probe-all 45000 200 s3-run"
+    session_close; local probe_rc=$?
+    grep -E '^probe' "$tmp/run.out" | tail -n 3 | sed 's/^/  /'
+    say "failover $n: probe session exit $probe_rc"
+
+    # After: records, logs, and the read-back.
+    session_run "$tmp/post.out" "admin status"
+    promoted_lines "$tmp/promoted.jsonl" "$n" || : > "$tmp/promoted.jsonl"
+    local reads
+    mapfile -t reads < <(analyze reads "$tmp/pre.out" "$tmp/run.out")
+    session_run "$tmp/reads.out" "${reads[@]}"
+    analyze failover "$n" "$PARTITIONS" "$t0" 1000 "$bound" "$tmp/pre.out" "$tmp/run.out" \
+        "$tmp/post.out" "$tmp/promoted.jsonl" "$tmp/reads.out" > "$tmp/k.txt" \
+        || die "failover: the claims could not be read"
+    claims < "$tmp/k.txt"
+
+    # Restart: J1 ready, J2 pinned again, J3 still readable, J4 printed.
+    local since c
+    since="$(date +%s)"
+    for c in $victims; do docker start "$c" >/dev/null || die "failover: docker start $c"; done
+    KILLED=""
+    local rc=0
+    node_ready_since "$n" "$since" 60 || rc=1
+    [ -z "$leader" ] || voter_ready "$leader" 60 || rc=1
+    verdict "J1 node $n${leader:+ and voter $leader} ready within 60 s of the start" "$rc"
+    local deadline=$((SECONDS + REJOIN_S))
+    rc=1
+    while :; do
+        session_run "$tmp/rejoin.out" "admin status"
+        analyze rejoin "$n" "$PARTITIONS" "$tmp/pre.out" "$tmp/rejoin.out" > "$tmp/j2.txt"; rc=$?
+        [ "$rc" = 2 ] && die "failover: the rejoin status could not be read"
+        [ "$rc" = 0 ] || [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 5
+    done
+    cat "$tmp/j2.txt"
+    verdict "J2 within ${REJOIN_S} s node $n is pinned regular again wherever it was, 3 copies each" "$rc"
+    session_run "$tmp/reads2.out" "${reads[@]}"
+    session_run "$tmp/after.out" "probe-all 5000 200 s3-after"; local after_rc=$?
+    analyze j3 "$PARTITIONS" "$tmp/pre.out" "$tmp/run.out" "$tmp/reads2.out" "$tmp/after.out" > "$tmp/j3.txt" \
+        || die "failover: J3 could not be read"
+    [ "$after_rc" = 0 ] || echo "FAIL J3 the s3-after probe session exited $after_rc" >> "$tmp/j3.txt"
+    claims < "$tmp/j3.txt"
+    analyze owned "$n" "$tmp/rejoin.out"
+    if [ "$FAILS" = 0 ]; then say "failover $n: all passed"; else say "failover $n: $FAILS failed"; fi
+    [ "$FAILS" = 0 ]
+}
+
+kill_node() {
+    load
+    target_in "data nodes" "$NODES"
+    docker kill "$NAME-d$TARGET" >/dev/null || die "kill: docker kill $NAME-d$TARGET"
+    say "kill: $NAME-d$TARGET killed at $(date +%s%3N)"
+}
+
+restart_node() {
+    load
+    target_in "data nodes" "$NODES"
+    local since
+    since="$(date +%s)"
+    docker start "$NAME-d$TARGET" >/dev/null || die "restart: docker start $NAME-d$TARGET"
+    node_ready_since "$TARGET" "$since" 60 || die "restart: node $TARGET not ready within 60 s"
+    say "restart: node $TARGET ready"
+}
+
+restart_voter() {
+    load
+    target_in voters "$VOTERS"
+    local v="$TARGET" tmp
+    set +e
+    run_scratch
+    tmp="$CHECK_TMP"
+    session_open "$tmp/voter.out"
+    session_ready "$tmp/voter.out" || die "restart-voter: the probe session did not become ready"
+    session_send "probe-all 30000 200 s3-voter"
+    sleep 2
+    say "restart-voter $v: docker restart $NAME-v$v at $(date +%s%3N)"
+    docker restart "$NAME-v$v" >/dev/null || die "restart-voter: docker restart $NAME-v$v"
+    local rc=0
+    voter_ready "$v" 60 || rc=1
+    verdict "R-V voter $v ready within 60 s of its restart" "$rc"
+    session_close; local probe_rc=$?
+    analyze voter "$PARTITIONS" "$tmp/voter.out" > "$tmp/v.txt" || die "restart-voter: the probe could not be read"
+    [ "$probe_rc" = 0 ] || echo "FAIL R-V the probe session exited $probe_rc" >> "$tmp/v.txt"
+    claims < "$tmp/v.txt"
+    if [ "$FAILS" = 0 ]; then say "restart-voter $v: all passed"; else say "restart-voter $v: $FAILS failed"; fi
+    [ "$FAILS" = 0 ]
+}
+
+# The whole D1 run on this --name and --subnet. Teardown is armed only after this run's own
+# preflight has passed: a name another run holds is refused, and nothing of it is removed.
+D1_ARMED=0
+d1_teardown() {
+    [ "$D1_ARMED" = 1 ] || return 0
+    say "d1: down and clean of $NAME"
+    "$0" down --name "$NAME" || true
+    "$0" clean --name "$NAME" || true
+}
+d1() {
+    if [ "$BUILD" = 1 ]; then
+        say "building $IMAGE"
+        (cd "$REPO" && docker build -f docker/Dockerfile -t "$IMAGE" .) || die "build"
+    fi
+    preflight
+    D1_ARMED=1
+    trap d1_teardown EXIT
+    trap 'exit 130' INT TERM
+    local common=(--name "$NAME") step rc failed=0 results=""
+    "$0" up --no-build --name "$NAME" --subnet "$SUBNET" --image "$IMAGE" --nodes "$NODES" \
+        --voters "$VOTERS" --partitions "$PARTITIONS" || die "d1: up"
+    for step in "check" "failover 3" "failover 1" "failover 5" "restart-voter 1" "restart-voter 1" \
+                "failover 3 --with-voter-leader"; do
+        say "d1: === $step"
+        # shellcheck disable=SC2086 # the step's words
+        "$0" $step "${common[@]}"; rc=$?
+        results="$results
+  d1 step '$step' exit $rc"
+        [ "$rc" = 0 ] || failed=$((failed + 1))
+    done
+    echo "multihost: d1 results:$results"
+    if [ "$failed" = 0 ]; then say "d1: all passed"; else say "d1: $failed steps failed"; fi
+    [ "$failed" = 0 ]
 }
 
 # --- selftest -------------------------------------------------------------------------------
@@ -734,6 +1335,189 @@ selftest_docker() {
     st "a throwaway start and stop leaves no container and no volume" $?
 }
 
+# G1 through the real entrypoint, with config-server stubbed to print its arguments (no Docker).
+selftest_g1() {
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin" "$t/held"
+    printf '#!/bin/sh\necho "args: $*"\n' > "$t/bin/config-server"
+    chmod +x "$t/bin/config-server"
+    : > "$t/held/raft.db"
+    g1() { # env value, data folder, extra args...
+        local env="$1" data="$2"; shift 2
+        PATH="$t/bin:$PATH" RDB_FORM_IF_FRESH="$env" RDB_VOTER_DATA="$data" \
+            bash "$REPO/docker/entrypoint.sh" voter --config c.toml "$@" 2>/dev/null
+    }
+    [ "$(g1 1 "$t/absent")" = "args: --config c.toml --form" ]
+    st "G1 forms on an absent data folder" $?
+    mkdir -p "$t/empty"
+    [ "$(g1 1 "$t/empty")" = "args: --config c.toml --form" ]
+    st "G1 forms on an empty data folder" $?
+    [ "$(g1 1 "$t/held")" = "args: --config c.toml" ]
+    st "G1 does not form on a folder that holds a store (a restart)" $?
+    [ "$(g1 0 "$t/absent")" = "args: --config c.toml" ]
+    st "G1 off (RDB_FORM_IF_FRESH=0) never adds --form" $?
+    g1 1 "$t/absent" --form >/dev/null; [ $? = 2 ]
+    st "G1 refuses --form given with RDB_FORM_IF_FRESH=1" $?
+    g1 yes "$t/absent" >/dev/null; [ $? = 2 ]
+    st "G1 refuses an RDB_FORM_IF_FRESH other than 0 or 1" $?
+    rm -rf "$t"
+}
+
+# The failover claims over hand-made outputs, no Docker: node 2 dies at T0=1000000. Partition 1
+# is node 2's (owner class), 2 holds a copy on it (secondary_kill), 3 is untouched. The good
+# case sits on every edge: owner lands at exactly bound_ms, the untouched gap is exactly the put
+# timeout, and a promote before T0 is not counted.
+selftest_failover_claims() {
+    local t; t="$(mktemp -d)"
+    rec() { # p, owner, generation, members
+        echo "partitions/$1 rev=5 PartitionRecord { partition: PartitionId($1), owner: NodeId($2), generation: Generation($3), owner_epoch: OwnerEpoch(0), config_version: ConfigVersion(1), lifecycle: Serving } root=- members=$4"
+    }
+    pr() { # p, group, ok, gap, first_err, first_ok_after, last
+        echo "probe partition=$1 group=$2 ok=$3 err=0 max_gap_ms=$4 first_err_at_ms=$5 first_ok_after_err_at_ms=$6 last_ok_i=$7 owner=1 token=1.0 errs=-"
+    }
+    { echo "reached ready"
+      rec 1 2 1 "[2:owner,1:regular,3:regular]"; rec 2 1 1 "[1:owner,2:regular,4:regular]"
+      rec 3 3 1 "[3:owner,4:regular,5:regular]"
+      pr 1 7 10 210 - - 10; pr 2 8 10 210 - - 10; pr 3 9 10 210 - - 10; } > "$t/pre"
+    write_run() { # owner first_ok_after, copy first_ok_after, untouched gap
+        { pr 1 7 40 15000 1000100 "$1" 50; pr 2 8 50 13450 1000100 "$2" 60; pr 3 9 200 "$3" - - 200
+          echo "probe: 3 partitions, max_gap_ms=15000"; } > "$t/run"
+    }
+    write_post() { # partition 1's owner and generation, partition 3's owner
+        { rec 1 "$1" "$2" "[1:owner,3:regular]"; rec 2 1 1 "[1:owner,4:regular]"
+          rec 3 "$3" 1 "[3:owner,4:regular,5:regular]"; } > "$t/post"
+    }
+    write_promoted() { # a partition promoted after T0
+        { echo '{"@t":"1970-01-01T00:16:30.000000000Z","@m":"planner_promoted","partition":3,"owner":4,"prior":3}'
+          echo "{\"@t\":\"1970-01-01T00:16:50.123456789Z\",\"@m\":\"planner_promoted\",\"partition\":$1,\"owner\":1,\"prior\":2}"; } > "$t/promoted"
+    }
+    write_reads() { # partition 2's s3-run answer
+        printf '%s\n' "reached ready" "value=10 version=1" "value=50 version=2" "value=10 version=1" \
+            "$1" "value=10 version=1" "value=200 version=9" > "$t/reads"
+    }
+    good() { write_run 1015000 1013450 1000; write_post 1 2 3; write_promoted 1; write_reads "value=60 version=3"; }
+    claim() { # what, then the claim's verdict line prefix and a detail it must print
+        analyze failover 2 3 1000000 1000 \
+            "rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 kill_ms=13450" \
+            "$t/pre" "$t/run" "$t/post" "$t/promoted" "$t/reads" > "$t/out" 2>&1
+    }
+    good; claim
+    [ "$(grep -c '^PASS K' "$t/out")" = 5 ] && ! grep -q '^FAIL' "$t/out"
+    st "failover claims pass a run on every edge (bound, put timeout, a promote before T0)" $?
+    grep -v '^PASS' "$t/out" | grep -v '^  K1 class' | sed 's/^/  /'
+    bad() { # name, claim, detail text
+        claim
+        grep -q "^FAIL $2" "$t/out" && grep -qF -- "$3" "$t/out"
+        st "failover claims fail $1" $?
+        good
+    }
+    write_run 1015001 1013450 1000; bad "an owner class 1 ms over bound_ms" K1 "class owner: 15001 ms > bound_ms=15000"
+    write_run 1015000 - 1000; bad "a copy class never written after its error" K1 "partition 2 (secondary_kill): not written"
+    write_post 2 2 3; bad "a partition still owned by the dead node" K2 "partition 1: still owned by node 2"
+    write_post 1 1 3; bad "a moved partition whose token did not rise" K2 "partition 1: token (1, 0) not above (1, 0)"
+    write_post 5 2 3; bad "a moved partition owned by a node that held no copy" K2 "partition 1: owner 5 is not one of its copies"
+    write_post 1 2 4; bad "an untouched partition whose owner moved" K2 "partition 3: owner moved 3 -> 4"
+    write_run 1015000 1013450 1001; bad "an untouched partition 1 ms over the put timeout" K3 "partition 3: max_gap_ms=1001"
+    write_promoted 3; bad "a promote of an untouched partition after T0" K4 "partition 3 (untouched) promoted"
+    write_reads "value=59 version=3"; bad "a read-back below the last acknowledged value" K5 "partition 2 s3-run: wanted at least 60"
+    write_reads "absent gen=1 at=1"; bad "an acknowledged value read back absent" K5 "partition 2 s3-run: wanted at least 60, read absent"
+    sed -i 's/ owner_epoch: OwnerEpoch(0),//' "$t/post"; claim
+    [ $? = 2 ] && grep -q "cannot read a partition line" "$t/out"
+    st "failover claims stop at a partition line they cannot read (exit 2)" $?
+
+    # J2, J3, restart-voter, the leader.
+    { rec 1 1 2 "[1:owner,3:regular,2:regular]"; rec 2 1 1 "[1:owner,2:regular,4:regular]"
+      rec 3 3 1 "[3:owner,4:regular,5:regular]"; } > "$t/rejoin"
+    analyze rejoin 2 3 "$t/pre" "$t/rejoin" >/dev/null; st "J2 holds when node 2 is regular again, 3 copies each" $?
+    sed -i 's/,2:regular\]$/,2:shadow]/' "$t/rejoin"
+    analyze rejoin 2 3 "$t/pre" "$t/rejoin" > "$t/out"; [ $? = 1 ] && grep -qF "partition 1: node 2 not pinned regular" "$t/out"
+    st "J2 does not hold while node 2 is still a shadow" $?
+    rec 3 3 1 "[3:owner,4:regular]" >> "$t/rejoin"; sed -i 's/,2:shadow\]$/,2:regular]/' "$t/rejoin"
+    analyze rejoin 2 3 "$t/pre" "$t/rejoin" > "$t/out"; [ $? = 1 ] && grep -qF "partition 3: 2 copies, not 3" "$t/out"
+    st "J2 does not hold while a partition has 2 copies" $?
+    good
+    { pr 1 7 5 210 - - 5; pr 2 8 5 210 - - 5; pr 3 9 5 210 - - 5; } > "$t/after"
+    analyze j3 3 "$t/pre" "$t/run" "$t/reads" "$t/after" > "$t/out"; grep -q '^PASS J3' "$t/out"
+    st "J3 passes when the values read back and every partition takes a put" $?
+    { pr 1 7 5 210 - - 5; pr 2 8 0 5000 - - 0; pr 3 9 5 210 - - 5; } > "$t/after"
+    analyze j3 3 "$t/pre" "$t/run" "$t/reads" "$t/after" > "$t/out"
+    grep -q '^FAIL J3' "$t/out" && grep -qF "partition 2: s3-after not written" "$t/out"
+    st "J3 fails a partition the after probe could not write" $?
+    { pr 1 7 5 15000 - - 5; pr 2 8 5 210 - - 5; pr 3 9 5 210 - - 5; } > "$t/voter"
+    analyze voter 3 "$t/voter" > "$t/out"; grep -q '^PASS R-V' "$t/out"
+    st "restart-voter passes a 15000 ms gap" $?
+    { pr 1 7 5 15001 - - 5; pr 2 8 5 210 - - 5; } > "$t/voter"
+    analyze voter 3 "$t/voter" > "$t/out"
+    grep -q '^FAIL R-V' "$t/out" && grep -qF "partition 1: max_gap_ms=15001" "$t/out" && grep -qF "partition 3: not written" "$t/out"
+    st "restart-voter fails a 15001 ms gap and a partition never written" $?
+    printf '{"ready":true,"current_leader":2}' > "$t/h1"; : > "$t/h2"; printf '{"current_leader":2,"ready":true}' > "$t/h3"
+    [ "$(analyze leader "$t/h1" "$t/h2" "$t/h3")" = 2 ]; st "the leader is the voter every answering voter names" $?
+    printf '{"current_leader":3}' > "$t/h3"
+    analyze leader "$t/h1" "$t/h2" "$t/h3" >/dev/null 2>&1; [ $? = 1 ]
+    st "voters that name two leaders are refused" $?
+    rm -rf "$t"
+}
+
+# The arguments, through the entry point, with a docker stub that fails every call: a bad one is
+# refused (exit 2) before Docker is asked anything.
+selftest_args() {
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$t/calls" > "$t/bin/docker"
+    chmod +x "$t/bin/docker"
+    local args rc
+    for args in "failover" "failover x" "failover 0" "failover 03" "kill 2 --with-voter-leader" \
+                "restart-voter 1 --rejoin-s 5" "up --no-docker" "failover 2 --rejoin-s soon"; do
+        : > "$t/calls"
+        # shellcheck disable=SC2086 # the case's words
+        PATH="$t/bin:$PATH" "$0" $args > /dev/null 2>&1; rc=$?
+        [ "$rc" = 2 ] && [ ! -s "$t/calls" ]
+        st "'$args' is refused (exit $rc) before Docker is asked" $?
+    done
+    rm -rf "$t"
+}
+
+# d1's teardown, with a docker stub that logs every call: on a name whose network already exists
+# d1 refuses at its preflight and removes nothing; once its preflight passed, a later failure
+# runs down and clean for its own label.
+selftest_d1_teardown() {
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin"
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$1 $2" in
+    "image inspect") exit 0 ;;
+    "network inspect")
+        [ "$NET_EXISTS" = 1 ] && exit 0
+        echo "Error response from daemon: network $3 not found" >&2; exit 1 ;;
+    "volume inspect") echo "Error response from daemon: get $3: no such volume" >&2; exit 1 ;;
+    "container inspect"|"inspect "*) echo "Error response from daemon: No such container: $3" >&2; exit 1 ;;
+    "network ls"|"ps -aq"|"volume ls") exit 0 ;;
+    "network create") exit 1 ;;
+esac
+exit 1
+SH
+    printf '#!/bin/sh\necho "10.1.0.0/16 dev eth0"\n' > "$t/ip"
+    chmod +x "$t/bin/docker" "$t/ip"
+    local rc
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=1 MULTIHOST_IP_CMD="$t/ip" \
+        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at network: rdbst-d1-net exists" "$t/out" \
+        && ! grep -qE '^(ps |rm |volume rm|network rm)' "$t/calls"
+    st "d1 on a name another run holds refuses and removes nothing (exit $rc)" $?
+    grep -E '^(ps |rm |volume rm|network rm)' "$t/calls" | sed 's/^/  called: docker /'
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" \
+        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at network create" "$t/out" \
+        && grep -q "^volume ls -q --filter label=org.rdb.multihost=rdbst-d1\$" "$t/calls" \
+        && grep -q "clean: removed" "$t/out"
+    st "d1 whose up fails after its preflight runs down and clean for its own label (exit $rc)" $?
+    rm -rf "$t"
+}
+
 selftest() {
     # Each case reads its own exit code; one failing case must not end the selftest.
     set +e
@@ -743,7 +1527,11 @@ selftest() {
     selftest_absent_answer
     selftest_absent_caller
     selftest_subnet
-    selftest_docker
+    selftest_g1
+    selftest_failover_claims
+    selftest_args
+    selftest_d1_teardown
+    if [ "$NO_DOCKER" = 1 ]; then echo "SKIP selftest docker part (--no-docker)"; else selftest_docker; fi
     if [ "$ST_FAILS" = 0 ]; then say "selftest: all passed"; else say "selftest: $ST_FAILS failed"; fi
     [ "$ST_FAILS" = 0 ]
 }
@@ -754,5 +1542,10 @@ case "$CMD" in
     down) down ;;
     clean) clean ;;
     selftest) selftest ;;
-    *) sed -n '2,10p' "$0"; exit 2 ;;
+    failover) failover ;;
+    kill) kill_node ;;
+    restart) restart_node ;;
+    restart-voter) restart_voter ;;
+    d1) d1 ;;
+    *) sed -n '2,15p' "$0"; exit 2 ;;
 esac
