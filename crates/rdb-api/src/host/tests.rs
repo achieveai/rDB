@@ -7464,3 +7464,62 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
     }
     assert!(host.fault.is_none(), "{:?}", host.fault);
 }
+
+/// Issue #130 (F-014's identity half): a status query's waiter is taken only by a `Status` or
+/// `Failed` reply under the identity it asked about. A reply of either kind under another
+/// identity leaves the waiter where it is, unanswered: a `Failed` goes on to the pending table
+/// (here empty, so unclaimed), and a `Status` with no query of its own is a fault. The last
+/// step is the control: a `Status` under the asked identity does take and answer it.
+/// Cut: `Host::reply` takes the waiter without comparing the identity, red (the query hears
+/// the other request's refusal).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_status_or_failed_reply_for_another_identity_does_not_take_the_status_waiter() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let (reply, answer) = mpsc::channel();
+    host.answering = Some((identity(1), reply));
+    let asked = |host: &Host| host.answering.as_ref().map(|(asked, _)| *asked);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Failed {
+            identity: identity(2),
+            error: RdbError::UnknownOutcome {
+                partition: PartitionId(1),
+                identity: identity(2),
+            },
+        },
+    )
+    .expect("another request's refusal is unclaimed, not a fault");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Failed");
+    still_waits("the status query, after request 2's refusal", &answer);
+
+    let fault = host
+        .reply(
+            PartitionId(1),
+            &ReplyEffect::Status {
+                identity: identity(2),
+                status: TxnStatus::Unknown,
+            },
+        )
+        .expect_err("a status answer no query asked for");
+    assert!(fault.detail.contains("no status query"), "{fault:?}");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Status");
+    still_waits("the status query, after request 2's status", &answer);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Status {
+            identity: identity(1),
+            status: TxnStatus::Unknown,
+        },
+    )
+    .expect("the asked identity's status");
+    assert_eq!(asked(&host), None, "taken by its own answer");
+    match answer.try_recv() {
+        Ok(Answer::Status(TxnStatus::Unknown)) => {}
+        other => panic!("the status query's own answer: {other:?}"),
+    }
+}
