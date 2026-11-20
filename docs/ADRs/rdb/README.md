@@ -40,6 +40,7 @@ ADR that supersedes.
 | [0022](0022-formation-by-declaration.md) | Formation by declaration — each node forms its own partitions from its own folder (extends 0008) | Proposed |
 | [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 | [0024](0024-tls-to-the-control-store.md) | TLS to the control store — plaintext to rEtcd only when every node is on a loopback IP (extends 0023) | Proposed |
+| [0025](0025-history-trim-floor-and-snapshot-rebuild.md) | History trim floor and snapshot rebuild — History kept from a per-lineage floor; a copy behind it is rebuilt from a state snapshot (extends 0010) | Proposed |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
 enables no Merge family. 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
@@ -55,6 +56,7 @@ reached yet.
 | 0004, 0007, 0008 | kernel-a (transaction, authority, control records) |
 | 0005, 0006, 0009, 0021 | kernel-b (replication, lag protection, recovery) |
 | 0019 | verification (gates, evidence, the release boundary) |
+| 0025 | storage, t5 (history trim floor, snapshot rebuild); it amends kernel-b's 0005, 0009 and 0021 |
 
 ## Naming
 

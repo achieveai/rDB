@@ -226,6 +226,11 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
+/// Issue #61 (design N3): the "not before" poll hint on a write refused read-only while this
+/// owner rebuilds a copy from a snapshot. Fixed, and not an estimate: the source knows how much
+/// it has sent, not how much is left.
+pub const REBUILD_RETRY_HINT: Duration = Duration::from_secs(5);
+
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
 /// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282): the paused
 /// clock of the host's drop duty. A reachable copy's clock starts at the later of the last
@@ -696,7 +701,7 @@ pub enum Msg {
         reply: Sender<Result<Seq, String>>,
     },
     /// **Dev tool only**, debug builds (issue #61, design section 2 A5): trim this node's copy
-    /// of `partition` to `through` ([`Host::trim_history_through`]) and answer the new floor,
+    /// of `partition` to `through` (`Host::trim_history_through`) and answer the new floor,
     /// or why not. Local only, like [`Msg::Damage`]. `rdb_dev admin trim-history` uses it
     /// through [`crate::db::Db::trim_history`].
     #[cfg(debug_assertions)]
@@ -797,7 +802,7 @@ pub enum PeerAsk {
     },
     /// Issue #61 (design rev 4 N4, rev 5e): F1's `ProbeDigestAt` for one copy, under the plan's
     /// anchor. The holder answers in the anchor's generation, the one its inventory reported
-    /// ([`Host::probe`]): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
+    /// (`Host::probe`): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
     /// when it holds no record there (below its trim floor, or above its head), and nothing
     /// when its read fails, so F1's probe deadline drops the copy.
     Probe {
@@ -1343,7 +1348,7 @@ impl TailAdoption {
 
 /// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
 /// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
-/// `base_below_floor` from [`Host::chain`].
+/// `base_below_floor` from `Host::chain`.
 pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
 
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
@@ -1844,6 +1849,9 @@ struct CatchUp {
     low: u64,
     /// What the shadow had acknowledged at the last duty.
     acked: u64,
+    /// Issue #61 (design M5): entries this owner's snapshot transfer to the shadow had served
+    /// at the last duty, 0 with none. The owner is the source, so the copy advancing counts.
+    pulled: u64,
 }
 
 /// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
@@ -2980,12 +2988,13 @@ struct Host {
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
     /// Issue #61 (design rev 5b): per partition and copy, a `tail_held` refusal of this
-    /// primary's offer, and the `--through` an accepted forget-tail released it with. In
-    /// memory: an owner restart loses it, and the next refused offer records it again.
-    /// Cleared on that copy's `CopyCaughtUp` or when a commit pins it as a member again.
+    /// primary's offer, with the tail's head. In memory: an owner restart loses it, and the
+    /// next refused offer records it again. Dropped by an accepted forget-tail whose `--through`
+    /// covers it, on that copy's `CopyCaughtUp`, or when a commit pins it as a member again.
     offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
     /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
-    /// warned `copy_needs_forget_tail` once. Cleared by an install or a release mark.
+    /// warned `copy_needs_forget_tail` once. Cleared by an install, or when an inventory ask
+    /// gives the tail up (`Host::tail_released`).
     offer_tail_held: BTreeMap<PartitionId, snapshot::OfferTailHeld>,
     /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
     /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
@@ -5553,10 +5562,13 @@ impl Host {
     }
 
     /// A read-only refusal's detail, with the copies a held repair names and the step this owner
-    /// can actually give (#79 S4d), when that is why it stays read-only. Unchanged otherwise.
+    /// can actually give (#79 S4d), when that is why it stays read-only. Issue #61 (design N3):
+    /// else, while this owner rebuilds a copy from a snapshot, the copy and the transfer's
+    /// progress, [`crate::db::error::REBUILDING_STEP`], and a "not before" poll hint of
+    /// [`REBUILD_RETRY_HINT`], which is not an estimate. Unchanged otherwise.
     fn named_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
         let Some(holds) = self.tail_holds.get(&partition) else {
-            return refused;
+            return self.rebuilding_read_only(partition, refused);
         };
         let named = holds
             .iter()
@@ -5590,6 +5602,33 @@ impl Host {
             (false, false) => crate::db::error::TAIL_HELD_RESEND,
         };
         refused.detail = format!("{}: {named}; {step}", refused.detail);
+        refused
+    }
+
+    /// [`Self::named_read_only`]'s rebuild arm (issue #61, design N3): the first transfer this
+    /// node serves for `partition`, by copy, named with its progress. Unchanged with none.
+    fn rebuilding_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let Some(((_, copy), transfer)) = self
+            .transfers
+            .range((partition, CopyId(0))..)
+            .find(|((at, _), _)| *at == partition)
+        else {
+            return refused;
+        };
+        let millis = transfer.opened.millis_until(self.clock.now());
+        refused.detail = format!(
+            "{}: copy {} on node {} is being rebuilt from a snapshot: {} entries ({:.1} MiB) sent \
+             in {}.{} s; writes resume when it is caught up",
+            refused.detail,
+            copy.0,
+            transfer.node.0,
+            transfer.pulled,
+            transfer.bytes as f64 / f64::from(1u32 << 20),
+            millis / 1000,
+            (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
         refused
     }
 
@@ -9507,11 +9546,19 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
+                let pulled = Self::transfer_pulled(
+                    self.transfers
+                        .iter()
+                        .map(|(key, transfer)| (*key, transfer.node, transfer.pulled)),
+                    (partition, shadow.copy),
+                    shadow.node,
+                );
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
                     low: behind,
                     acked,
+                    pulled,
                 };
                 self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
             }
@@ -9540,11 +9587,26 @@ impl Host {
         self.start_revoke(partition, epoch, replan);
     }
 
+    /// Issue #61 (design M5): the entries this owner's snapshot transfer to copy `at` on `node`
+    /// has served, 0 with no such transfer or one to another node. Over `(key, node, pulled)`
+    /// projections of the transfers, so a unit row needs no snapshot.
+    fn transfer_pulled(
+        transfers: impl IntoIterator<Item = ((PartitionId, CopyId), NodeId, u64)>,
+        at: (PartitionId, CopyId),
+        node: NodeId,
+    ) -> u64 {
+        transfers
+            .into_iter()
+            .find(|(key, to, _)| *key == at && *to == node)
+            .map_or(0, |(_, _, pulled)| pulled)
+    }
+
     /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records
     /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
     /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
     /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
-    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// advancing (`lagging` is the entry this duty took), or this owner's snapshot transfer to
+    /// the shadow serving more entries (issue #61, M5). Any of them starts it again. Past
     /// `move_catch_up_millis` with no progress the move is given up as
     /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
     /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
@@ -9560,8 +9622,9 @@ impl Host {
         let (to, behind, now) = (seen.to, seen.low, seen.since);
         let clock = match lagging {
             Some(last) if last.to == to => {
-                let progress =
-                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                let progress = behind < last.low
+                    || (last.acked < cutoff && seen.acked > last.acked)
+                    || seen.pulled > last.pulled;
                 CatchUp {
                     since: if progress { now } else { last.since },
                     low: last.low.min(behind),

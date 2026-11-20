@@ -1031,6 +1031,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Writes return once the copy has caught up. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -1117,10 +1118,11 @@ above comes back by itself once its link is back:
   and the partition can then stay read-only until that copy's node restarts. A build older than
   check B can also be left holding a lineage with a hole in it, which nothing refuses
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
-  them apart. Turning it on by default first needs the protocol version raised to 10, or a
-  capability bit that gates the re-add, so a node without these guards is refused or never
-  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
+- **Before it can be on by default.** Builds with and without these guards can speak the same
+  protocol version, so a node cannot tell them apart. Turning it on by default first needs a
+  protocol version raised for it, or a capability bit that gates the re-add, so a node without
+  these guards is refused or never re-added live (ADR-rdb-0009 section 7). Until then it stays
+  off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1206,6 +1208,13 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
 ### Known limits in this release
 
+- **Writes pause while a copy is rebuilt after the owner dies.** This happens when history was
+  trimmed, a copy was down for longer than the trimmed history covers, and then the owner died.
+  The one copy left owns the partition read-only until the other copy has a snapshot and has
+  caught up. Until then writes are refused `RECOVERY_READ_ONLY`, naming the copy being rebuilt
+  ("When writes pause"). How long that takes grows with the partition's size. `retry_after` is
+  a fixed 5 s poll hint, not an estimate: rDB cannot yet count a partition's bytes cheaply
+  enough to give one.
 - **A move whose new copy makes no progress for 90 s is given up.** A move's new copy catches
   up one record per round trip. Copying a long history is progress, however long it takes.
   The clock counts only time in which the copy gets no closer to the head. That happens when
@@ -1342,6 +1351,27 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
+  - `Trimmed` (issue #61): the history needed to adopt the tail is trimmed, so it cannot come
+    back. Giving it up still needs `--give-up-live-copy`, and forget-tail's refusal names the
+    whole command.
+- **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
+  `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
+  set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,
+  command}` on that copy's node. The partition still takes writes on its other copies. The named
+  copy cannot be rebuilt, because it holds records no other copy has, and history needed to
+  bring them back has been trimmed. It happens only on a partition whose record an older build
+  wrote and that has committed no writable generation since.
+  - To let it rejoin, run on the owner:
+    `admin forget-tail --partition P --through H --give-up-live-copy`, with the H the warn
+    names. The copy is then rebuilt from a snapshot and returns by itself.
+  - **THIS CAN LOSE ACKNOWLEDGED WRITES.** Seqs above the partition's cutoff, up to H, on that
+    copy are deleted for good. Some of them may be writes your app was told succeeded (`Ok`
+    without `wait_durable`). Before running it, read what that copy holds, if you need it
+    (`rdb_storage::dump` on a stopped node, or a backup). Do not wipe or rebuild the node first:
+    that loses the same records without the check.
+  - If `degraded` still names the copy after the command was accepted, run the same command
+    again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
+    copies.
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
   the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
   lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
@@ -1388,7 +1418,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  as undecodable. Its nodes speak `rdb_api::net::PROTOCOL_VERSION`, and the handshake refuses
+  any other version.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
