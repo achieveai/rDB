@@ -4,9 +4,9 @@
 //! The target runs three steps, each one `WriteBatch`:
 //!
 //! 1. [`RocksEngine::install_begin`] wipes every lineage the partition holds, its engine
-//!    records included (`tail_release` among them), and writes the `installing` record on the
-//!    new lineage, all in one batch (design rev 5b). It refuses when the copy holds a
-//!    generation newer than the one being installed. Unsynced.
+//!    records included, and writes the `installing` record on the new lineage, all in one batch
+//!    (design rev 5b). It refuses when the copy holds a generation newer than the one being
+//!    installed. Unsynced.
 //! 2. [`RocksEngine::install_chunk`] writes one page of the source's view
 //!    ([`crate::RocksSnapshot::entries_after`]) into the lineage's own key range. Unsynced.
 //! 3. [`RocksEngine::install_finish`] writes the barrier's History record, the head `Progress`,

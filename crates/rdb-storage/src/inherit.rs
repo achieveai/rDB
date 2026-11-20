@@ -562,7 +562,6 @@ impl RocksEngine {
                 staging: None,
                 floor: None,
                 installing: None,
-                tail_release: None,
             },
         );
         self.lineages

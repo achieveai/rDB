@@ -22,8 +22,7 @@
 //! Snapshot installs (issue #61 S2) follow the host's sync points. An unfinished install comes
 //! back as it was and [`CrashImage::reopen`] clears it, as the host's open does. A finished one
 //! survives a host crash with `applied` at its barrier and `durable` untouched, because
-//! `install_finish` is a synced write that moves no durable mark. A tail release is synced, so
-//! every crash keeps it.
+//! `install_finish` is a synced write that moves no durable mark.
 //!
 //! A begin is one unsynced batch on the host, so a host crash before any sync covers it loses
 //! the begin **with its wipe**: the image then holds the partition's lineages as they were before
@@ -73,8 +72,8 @@ pub struct CrashImage {
     /// only the one a sync covered after a host crash, as the host's unsynced trim batch is
     /// lost with the WAL tail.
     floors: Vec<(PartitionId, Generation, TrimFloor)>,
-    /// Each lineage's install, finished or not, and its tail release (issue #61).
-    installs: Vec<(PartitionId, Generation, Option<Install>, Option<Seq>)>,
+    /// Each lineage's install, finished or not (issue #61).
+    installs: Vec<(PartitionId, Generation, Option<Install>)>,
 }
 
 impl CrashImage {
@@ -140,13 +139,8 @@ impl CrashImage {
             if let Some(floor) = floor {
                 floors.push((*partition, *generation, floor));
             }
-            if lineage.install.is_some() || lineage.tail_release.is_some() {
-                installs.push((
-                    *partition,
-                    *generation,
-                    lineage.install.clone(),
-                    lineage.tail_release,
-                ));
+            if lineage.install.is_some() {
+                installs.push((*partition, *generation, lineage.install.clone()));
             }
             surviving.push(SurvivingPrefix {
                 partition: *partition,
@@ -180,8 +174,8 @@ impl CrashImage {
     #[must_use]
     pub fn reopen(&self, node: NodeId) -> MemoryEngine {
         let mut engine = MemoryEngine::new(node);
-        for (partition, generation, install, tail_release) in &self.installs {
-            engine.restore_install(*partition, *generation, install.as_ref(), *tail_release);
+        for (partition, generation, install) in &self.installs {
+            engine.restore_install(*partition, *generation, install.as_ref());
         }
         for batch in &self.batches {
             // Replaying a batch that committed before the crash cannot fail: no fault is

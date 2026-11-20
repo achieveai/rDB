@@ -62,9 +62,6 @@ pub(crate) struct Lineage {
     /// until [`MemoryEngine::install_finish`], and the base every read of the lineage starts
     /// from once finished.
     pub(crate) install: Option<Install>,
-    /// The highest seq the host released this lineage's tail through, the twin of
-    /// `rdb-storage`'s `tail_release` record. Synced when written, so every crash keeps it.
-    pub(crate) tail_release: Option<Seq>,
 }
 
 /// One page entry of a snapshot install, the twin of `rdb_storage::SnapshotEntry` without the
@@ -572,10 +569,24 @@ impl MemoryEngine {
         generation: Generation,
         handle: SnapshotHandle,
     ) -> MemorySnapshot {
+        MemorySnapshot::new(
+            handle,
+            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
+            generation,
+            self.view(partition, generation),
+        )
+    }
+
+    /// Every record lineage `(partition, generation)` shows, as [`Self::snapshot`] describes.
+    fn view(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> BTreeMap<(Namespace, Bytes), (Bytes, Version)> {
         let inherited = self
             .lineage(partition, generation)
             .is_some_and(|lineage| lineage.parent.is_some());
-        let records = if inherited {
+        if inherited {
             let mut records = BTreeMap::new();
             self.replay_into(partition, generation, None, &mut records);
             records
@@ -587,13 +598,35 @@ impl MemoryEngine {
                     ((*ns, key.clone()), (value.clone(), *version))
                 })
                 .collect()
-        };
-        MemorySnapshot::new(
-            handle,
-            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
-            generation,
-            records,
-        )
+        }
+    }
+
+    /// One page of lineage `(partition, generation)`'s view after the exclusive cursor `after`,
+    /// at most `limit` entries in `(namespace, key)` order (issue #61 S2): the twin of
+    /// `RocksSnapshot::entries_after`, which the host's source pages with. History and the head
+    /// `Progress` are left out: the barrier carries History and `install_finish` writes the
+    /// head. Meta is left out too; the host's export lists it, but format 1 stores no Meta
+    /// record under a lineage (commit and open refuse one, m8s_25a and m8s_25b), so neither
+    /// list ever yields one, and an install refuses all three ([`InstallError::ForeignEntry`]),
+    /// as the host's does. Each entry carries the version its record was written at.
+    #[must_use]
+    pub fn entries_after(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        after: Option<&(Namespace, Bytes)>,
+        limit: usize,
+    ) -> Vec<InstallEntry> {
+        self.view(partition, generation)
+            .into_iter()
+            .filter(|((ns, key), _)| {
+                !matches!(ns, Namespace::History | Namespace::Meta)
+                    && !(*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
+            })
+            .filter(|(cursor, _)| after.is_none_or(|after| cursor > after))
+            .take(limit)
+            .map(|((ns, key), (value, version))| (ns, key, value, version))
+            .collect()
     }
 
     /// Apply `generation`'s history to `records`: its predecessor's through the base it was cut
@@ -709,7 +742,7 @@ impl MemoryEngine {
 
     /// Trim lineage `(partition, generation)`'s History below `floor.seq`, the twin of
     /// `RocksEngine::stage_trim_history` (issue #61). Staged unsynced: a host crash before the
-    /// next sync loses it ([`Lineage::floor_synced`]).
+    /// next sync loses it (`Lineage::floor_synced`).
     ///
     /// The walk follows the chain: the own level is cut at `floor.seq`, a level reached through
     /// links at bases `b1, b2, ..` at `min(floor, b1+1, b2+1, ..)`, and each level cut is marked
@@ -1073,55 +1106,8 @@ impl MemoryEngine {
         lineage.durable = durable;
     }
 
-    /// Record that the host released lineage `(partition, generation)`'s tail through
-    /// `through`, the twin of `RocksEngine::put_tail_release` (synced there, so kept by every
-    /// crash image here).
-    ///
-    /// # Errors
-    ///
-    /// [`StorageFault::WriteFailed`] when the engine holds no such lineage; nothing is written.
-    pub fn put_tail_release(
-        &mut self,
-        partition: PartitionId,
-        generation: Generation,
-        through: Seq,
-    ) -> Result<(), StorageFault> {
-        let (node, p, g) = (self.node.0, partition.0, generation.0);
-        let Some(lineage) = self.lineages.get_mut(&(partition, generation)) else {
-            tracing::error!(
-                node,
-                partition = p,
-                generation = g,
-                through = through.0,
-                "tail_release_unknown_lineage"
-            );
-            return Err(StorageFault::WriteFailed);
-        };
-        lineage.tail_release = Some(through);
-        tracing::info!(
-            node,
-            partition = p,
-            generation = g,
-            through = through.0,
-            "tail_release_written"
-        );
-        Ok(())
-    }
-
-    /// The newest generation of `partition` holding a tail release, and its `through`.
-    #[must_use]
-    pub fn tail_release(&self, partition: PartitionId) -> Option<(Generation, Seq)> {
-        self.lineages
-            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
-            .rev()
-            .find_map(|(&(_, generation), lineage)| {
-                lineage.tail_release.map(|through| (generation, through))
-            })
-    }
-
     /// Step 1 of a snapshot install (issue #61 S2), the twin of `RocksEngine::install_begin`:
-    /// wipe every lineage `partition` holds — its records, batches, links, marks and tail
-    /// release — and start lineage `(partition, generation)` installing at barrier `at`, as one
+    /// wipe every lineage `partition` holds — its records, batches, links and marks — and start lineage `(partition, generation)` installing at barrier `at`, as one
     /// step (the host's one `WriteBatch`, rev 5b). A begin while already installing starts over.
     /// Logs `snapshot_install_begun{wiped}` or `snapshot_install_refused{step: "begin"}`.
     ///
@@ -1379,14 +1365,13 @@ impl MemoryEngine {
         );
     }
 
-    /// Restore a lineage's install and tail release from a crash image, before its batches
-    /// replay: an install's entries are the base its batches write over.
+    /// Restore a lineage's install from a crash image, before its batches replay: an install's
+    /// entries are the base its batches write over.
     pub(crate) fn restore_install(
         &mut self,
         partition: PartitionId,
         generation: Generation,
         install: Option<&Install>,
-        tail_release: Option<Seq>,
     ) {
         if let Some(install) = install {
             for (ns, key, value, version) in &install.entries {
@@ -1396,7 +1381,6 @@ impl MemoryEngine {
         }
         let lineage = self.lineages.entry((partition, generation)).or_default();
         lineage.install = install.cloned();
-        lineage.tail_release = tail_release;
     }
 
     /// Clear every lineage still installing, the twin of the host's `clear_installs` at a

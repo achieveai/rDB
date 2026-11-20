@@ -2569,6 +2569,88 @@ fn provider_a_survivor_that_adopted_a_newer_generation_answers_from_it() {
     );
 }
 
+/// Issue #61 A9d (design 3.5, B3; the twin of the host's `t61_survivor_refuses_a_parent_mark`
+/// own-mark case): a survivor that adopted generation 2 at cutoff 2, wrote 3-5 and then trimmed
+/// to 4 has no record at its base. Its inventory is anchored at the committed root as before;
+/// the base is proved by generation 2's own mark rooted at `(2, d2)`, and the ladder is that
+/// root rung, then the kept records 4 and 5. A committed digest the mark does not name is
+/// still `survivor_base`. Cuts: the base proved by its record only (as before A9d), red
+/// (`survivor_base`); the root rung left out, red (the ladder starts at 4).
+#[retcd_test]
+fn t61_sim_a_trimmed_survivor_answers_from_its_floor_with_the_root_rung() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    support::preamble();
+    let prior = send_history(3);
+    let after = send_history_after(2, &prior, 2, 5);
+    let query = || {
+        effect_from(
+            ModuleName::Recovery,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::QueryInventory {
+                copies: vec![CopyId(1)],
+            })),
+        )
+    };
+    let trimmed = |cutoff_digest: Digest| {
+        let mut dispatcher = survivor_that_moved_on(cutoff_digest);
+        for batch in after.batches.iter().filter(|batch| batch.seq.0 > 3) {
+            dispatcher
+                .preload(PEER, batch.clone())
+                .expect("a write of the new lineage");
+        }
+        dispatcher
+            .trim_history(PEER, PartitionId(1), Seq(4))
+            .expect("a trim above the cutoff");
+        let engine = dispatcher.engine(PEER).expect("PEER's engine");
+        assert_eq!(
+            engine.history_at(PartitionId(1), Generation(2), Seq(2)),
+            None,
+            "control: the base's record is gone"
+        );
+        dispatcher
+    };
+
+    let mut dispatcher = trimmed(prior.digest(2));
+    let mut scheduler = Scheduler::new();
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, query()).expect("a query");
+    let current = SurvivorInventory {
+        copy: CopyId(1),
+        anchor_seen: LineageAnchor {
+            lineage: rdb_core::contracts::authority::Lineage {
+                generation: Generation(2),
+                ..send_lineage()
+            },
+            base_seq: Seq(2),
+            base_digest: prior.digest(2),
+        },
+        head: (Seq(5), after.digest(5)),
+        ladder: vec![
+            (Seq(2), prior.digest(2)),
+            (Seq(4), after.digest(4)),
+            (Seq(5), after.digest(5)),
+        ],
+        quarantined: None,
+        holds_last_writable: false,
+    };
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        Some(EventKind::Kernel(KernelEvent::Recovery(
+            RecoveryEvent::InventoryReported(Box::new(current))
+        ))),
+        "the root rung from the mark, then dense from the floor to the head"
+    );
+
+    let mut dispatcher = trimmed(digest(9));
+    let mut scheduler = Scheduler::new();
+    assert_eq!(
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, query()),
+        Err(SimError::Config {
+            field: "survivor_base"
+        }),
+        "a committed digest the mark does not name is refused"
+    );
+}
+
 /// q1's second-recovery scenario (L-R182z, team i1): a placed survivor whose holder is a
 /// **secondary** of a recovery took no adoption, only a landing. When it is in that recovery's
 /// barrier its first landing inherits the committed prefix (B-R58c), so it descends from the
