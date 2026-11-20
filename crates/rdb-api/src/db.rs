@@ -15363,6 +15363,154 @@ mod tests {
         db.shutdown();
     }
 
+    /// #158 option B: an owner refusing writes for several windows logs, at info, one
+    /// `refusal_first` for the key and one `refusal_summary` per window, not one line per
+    /// refusal. Debug keeps every refusal's `reply` line, and the summaries' counts add up to
+    /// them. The window is 100 ms here, so three windows close in well under a second.
+    /// Cut: no `refusal_summary` line is written: the counts never reach the refusals, red.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn r158_refusals_log_one_first_and_one_summary_per_window_at_info() {
+        const METHOD: &str = "r158_refusals_log_one_first_and_one_summary_per_window_at_info";
+        const WINDOW: Duration = Duration::from_millis(100);
+        let dir = config_testkit::fs::temp_dir();
+        crate::host::set_refusal_window(dir.path(), 100);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+
+        // Overload: refused puts, back to back, until three windows have passed.
+        let started = Instant::now();
+        let mut refused = 0_u64;
+        while started.elapsed() < 3 * WINDOW || refused < 20 {
+            let paused = db
+                .put(b"c", &refused.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+            refused += 1;
+        }
+        let elapsed = started.elapsed();
+        db.links().heal_all();
+
+        // The last window closes one window after its last refusal: wait for its summary.
+        let paused_in = |line: &serde_json::Value| -> u64 {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                    .expect("top is JSON");
+            top.as_array()
+                .expect("top is an array")
+                .iter()
+                .filter(|key| key["reason"] == "ProtectionPaused")
+                .map(|key| key["count"].as_u64().expect("a count"))
+                .sum()
+        };
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        let lines = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let summarised: u64 = lines
+                .iter()
+                .filter(|line| line["@m"] == "refusal_summary")
+                .map(paused_in)
+                .sum();
+            if summarised >= refused {
+                break lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "summaries count {summarised} of {refused} refusals"
+            );
+            std::thread::yield_now();
+        };
+        db.shutdown();
+
+        let with = |message: &'static str| {
+            lines
+                .iter()
+                .filter(move |line| line["@m"] == message)
+                .collect::<Vec<_>>()
+        };
+        // Debug: every refusal, one `reply` line each.
+        let paused_replies: Vec<u64> = with("reply")
+            .into_iter()
+            .filter(|line| {
+                line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .inspect(|line| assert_eq!(line["@l"], "Debug", "{line}"))
+            .map(|line| line["request"].as_u64().expect("a request id"))
+            .collect();
+        assert_eq!(
+            paused_replies.len() as u64,
+            refused,
+            "a debug reply per refusal"
+        );
+        // Info: one first, and at most one summary per window the overload spanned (plus the
+        // window it ended in).
+        let firsts: Vec<_> = with("refusal_first")
+            .into_iter()
+            .filter(|line| line["reason"] == "ProtectionPaused")
+            .collect();
+        assert_eq!(firsts.len(), 1, "one first for the key: {firsts:?}");
+        let summaries: Vec<_> = with("refusal_summary")
+            .into_iter()
+            .filter(|line| paused_in(line) > 0)
+            .collect();
+        let windows = elapsed.as_millis().div_ceil(WINDOW.as_millis()) + 1;
+        assert!(
+            (summaries.len() as u128) <= windows,
+            "{} summaries for {elapsed:?} of refusals: {summaries:?}",
+            summaries.len()
+        );
+        assert!(summaries.len() >= 3, "a summary per window: {summaries:?}");
+        for line in firsts.iter().chain(&summaries) {
+            assert_eq!(line["@l"], "Information", "{line}");
+        }
+        // The summaries' counts are the debug lines, and name requests among them.
+        let summarised: u64 = summaries.iter().map(|line| paused_in(line)).sum();
+        assert_eq!(summarised, refused, "summaries count every refusal once");
+        for line in &summaries {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top")).expect("json");
+            for key in top.as_array().expect("array") {
+                for end in ["first", "last"] {
+                    let id = key[end].as_u64().expect("an id");
+                    assert!(
+                        paused_replies.contains(&id),
+                        "{end} {id} is a refused request"
+                    );
+                }
+            }
+        }
+        // No refusal is an info `reply` line any more.
+        assert!(
+            with("reply").iter().all(|line| line["@l"] == "Debug"),
+            "replies stay at debug"
+        );
+    }
+
     /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's
     /// last put is still answered after the reopen has written past it: its status is its
     /// outcome, never `Expired`, and never `Unknown` for want of its row.
