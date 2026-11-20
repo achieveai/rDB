@@ -2233,12 +2233,27 @@ mod tests {
 
             // The supervisor's part: start node 1 again on its folder, at a new boot. The ended
             // serve ran `Net::shutdown`, so nothing answers the peers at the old boot (#81).
+            // Its listener closes as its tasks wind down, so the address is bound again with a
+            // bounded retry, as `Rig::restart` does, and handed to the new serve.
+            let rebound = rt.block_on(async {
+                let deadline = Instant::now() + Duration::from_secs(5) * scale;
+                loop {
+                    match tokio::net::TcpListener::bind(&addrs[0]).await {
+                        Ok(listener) => break listener,
+                        Err(e) if Instant::now() < deadline => {
+                            tracing::debug!(error = %e, "own81_restart_bind_retry");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => panic!("node 1's address again: {e}"),
+                    }
+                }
+            });
             let again = {
                 let args = args_of(1);
                 let store = Arc::clone(&store);
                 let (rt, on_ready, span) = (&rt, &on_ready, &span);
                 scope.spawn(move || {
-                    span.in_scope(|| serve_on_ready(&args, rt, store, None, on_ready))
+                    span.in_scope(|| serve_on_ready(&args, rt, store, Some(rebound), on_ready))
                 })
             };
             wait(
