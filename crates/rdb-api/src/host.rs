@@ -2599,7 +2599,8 @@ enum PendingKind {
 }
 
 /// Why a node faulted, typed (A-R178): every waiter is refused with [`Fault::error`], and every
-/// call after with [`Fault::refusal`]. A view that read stored damage refuses as
+/// call after with [`Fault::refusal`], except a status query, which gets [`Fault::error`] (#136).
+/// A view that read stored damage refuses as
 /// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
 /// fault is [`ApiError::host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
