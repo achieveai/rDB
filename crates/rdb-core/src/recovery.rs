@@ -845,7 +845,8 @@ impl Recovery {
             SelectionOutcome::Empty => block(BlockReason::NoEligibleRegular, emit),
             SelectionOutcome::Divergence(evidence) => quarantine(evidence, emit),
             SelectionOutcome::NeedProbes(needed) => {
-                run.collect.start_probing(&needed, deadline, emit);
+                run.collect
+                    .start_probing(&needed, run.plan.anchor.base_seq, deadline, emit);
                 self.arm(deadline, emit);
                 Phase::Collecting(run)
             }

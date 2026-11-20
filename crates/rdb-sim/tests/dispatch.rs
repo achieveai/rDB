@@ -2105,43 +2105,59 @@ fn provider_no_recovery_request_is_recorded_as_a_fact() {
     }
 }
 
-/// The probe scenario's other answer (team i1, 2026-10-02): a copy that cannot answer — never
-/// placed, or placed on a node that has since crashed — answers `ProbeUnavailable`, routed back
-/// to the asker, and never a digest the harness made up.
+/// The probe scenario's other answer (team i1, 2026-10-02; issue #61 A4): a copy that cannot
+/// answer — never placed, or placed on a node that has since crashed — gives no event at all, and
+/// never a digest the harness made up. `ProbeUnavailable` now means the holder is alive and the
+/// seq is below its floor, so a down holder must not send it; F1's probe deadline drops the copy
+/// (`rdb-core` `recovery_f1.rs` `an_unanswered_probe_drops_the_source`).
 #[retcd_test]
-fn provider_a_probe_no_holder_can_answer_is_unavailable() {
+fn provider_a_probe_no_holder_can_answer_gets_no_answer() {
     use rdb_core::contracts::event::KernelEvent;
     use rdb_core::contracts::recovery::RecoveryEvent;
     support::preamble();
-    let probe = |copy: CopyId| {
+    let probe_at = |copy: CopyId, seq: u64| {
         effect_from(
             ModuleName::Recovery,
             EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt {
                 copy,
-                seq: Seq(1),
+                seq: Seq(seq),
             })),
         )
     };
-    let unavailable = |copy: CopyId| {
-        Some(EventKind::Kernel(KernelEvent::Recovery(
-            RecoveryEvent::ProbeUnavailable { copy, seq: Seq(1) },
-        )))
-    };
+    let probe = |copy: CopyId| probe_at(copy, 1);
     let mut dispatcher = with_survivor();
     let mut scheduler = Scheduler::new();
 
-    deliver_on(&mut dispatcher, &mut scheduler, NODE, probe(CopyId(2))).expect("a probe");
-    let answer = scheduler.pop().expect("an answer");
+    // Control: the placed, live holder does answer (at seq 0, the root every lineage starts
+    // at), so the silences below come from the holder, not from the probe path.
+    deliver_on(
+        &mut dispatcher,
+        &mut scheduler,
+        NODE,
+        probe_at(CopyId(1), 0),
+    )
+    .expect("a probe");
+    let answer = scheduler.pop().expect("the placed holder answers");
     assert_eq!(
         (answer.node, answer.partition),
         (NODE, PartitionId(1)),
         "to the asker"
     );
     assert!(dispatcher.take_routed(answer.id), "held to F1's answer");
+    assert!(
+        matches!(
+            answer.kind,
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::ProbeAnswered { .. }))
+        ),
+        "copy 1 is placed and up: {:?}",
+        answer.kind
+    );
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, probe(CopyId(2))).expect("a probe");
     assert_eq!(
-        Some(answer.kind),
-        unavailable(CopyId(2)),
-        "copy 2 was never placed"
+        scheduler.pop().map(|event| event.kind),
+        None,
+        "copy 2 was never placed: no answer, not ProbeUnavailable"
     );
 
     dispatcher
@@ -2155,8 +2171,8 @@ fn provider_a_probe_no_holder_can_answer_is_unavailable() {
     deliver_on(&mut dispatcher, &mut scheduler, NODE, probe(CopyId(1))).expect("a probe");
     assert_eq!(
         scheduler.pop().map(|event| event.kind),
-        unavailable(CopyId(1)),
-        "copy 1's holder is down"
+        None,
+        "copy 1's holder is down: no answer, not ProbeUnavailable"
     );
 }
 

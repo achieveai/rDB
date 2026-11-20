@@ -2314,9 +2314,12 @@ impl Dispatcher {
     ///
     /// Answered from the engine of the node the scenario placed `copy` on, under the generation
     /// that copy reports today ([`Self::current_inventory`]), with the digest the engine stores
-    /// ([`stored_digest`]). Never a digest the harness made up: a copy that was not placed, whose
-    /// node is down or unregistered, or whose engine stores no record there answers
-    /// [`RecoveryEvent::ProbeUnavailable`], and F1 records that source as lost.
+    /// ([`stored_digest`]). Never a digest the harness made up. A copy that was not placed, or
+    /// whose node is down or unregistered, gives **no answer** (issue #61 A4): a real holder that
+    /// is down cannot reply, and F1's probe deadline drops it. A placed holder that can report but
+    /// whose engine stores no record there in the probed generation answers
+    /// [`RecoveryEvent::ProbeUnavailable`]: until the sim has a floor (#61 A6), that is a seq above
+    /// the holder's head.
     ///
     /// # Errors
     ///
@@ -2338,7 +2341,16 @@ impl Dispatcher {
                     .get(&holder)
                     .and_then(|engine| stored_digest(engine, lineage, seq))
             }
-            _ => None,
+            _ => {
+                tracing::info!(
+                    node = site.0 .0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    seq = seq.0,
+                    "probe unanswered: the holder was not placed or cannot report"
+                );
+                return Ok(());
+            }
         };
         tracing::info!(
             node = site.0 .0,
