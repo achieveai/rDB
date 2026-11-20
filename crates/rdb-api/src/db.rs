@@ -6469,7 +6469,7 @@ fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
 
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
 /// dispatch margin, and 10 s of slack for the store.
-fn heal_within(budgets: &Budgets) -> Duration {
+pub(crate) fn heal_within(budgets: &Budgets) -> Duration {
     Duration::from_millis(
         budgets
             .grant_millis
