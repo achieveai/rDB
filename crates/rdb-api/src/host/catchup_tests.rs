@@ -4496,3 +4496,161 @@ fn issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing() {
         .collect();
     assert_eq!(logged, [(1.into(), 1.into(), true)]);
 }
+
+/// What a tail held `Unchecked` by check B must still be, whichever path held it (PR #156
+/// review, #153 rule). Its status crosses the wire: a peer's look decodes it, so the link
+/// stays up. A bare `forget-tail --through` over it, on the pinned owner in this process,
+/// still needs `--give-up-live-copy`. And the state is `Unchecked`. Checked in that order, so
+/// a `Refused` state fails on the wire first.
+fn held_unchecked(host: &Host) {
+    use crate::net::wire::{decode, encode, Frame, WireNodeStatus, WireReply};
+    let p = PartitionId(1);
+    let status = host.status(p);
+    let held = status.tail_refused.expect("the status names the held tail");
+    let bytes = encode(&Frame::Reply {
+        correlation: 1,
+        reply: WireReply::Status(Box::new(WireNodeStatus::from(&status))),
+    });
+    let Ok(Frame::Reply {
+        reply: WireReply::Status(back),
+        ..
+    }) = decode(&bytes)
+    else {
+        panic!("not a status reply");
+    };
+    let back = NodeStatus::try_from(*back).unwrap_or_else(|error| {
+        panic!("a peer cannot decode the status, so the link closes: {error}")
+    });
+    assert_eq!(
+        back.tail_refused.map(|tail| tail.adoption),
+        Some(held.adoption)
+    );
+    needs_live_copy_consent(held.adoption);
+    assert_eq!(held.adoption, TailAdoption::Unchecked, "{held:?}");
+}
+
+/// A pinned owner, in this process, holding a tail in `adoption` above its cutoff as its own:
+/// a bare `forget-tail --through` over it is refused, naming `--give-up-live-copy` and saying
+/// the tail was not checked.
+fn needs_live_copy_consent(adoption: TailAdoption) {
+    use rdb_core::contracts::errors::ErrorKind;
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (generation, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let owner = &mut trio.nodes[0].0;
+    owner.tail_refused.insert(
+        p,
+        TailRefused {
+            generation,
+            head: Seq(cutoff.0 + 3),
+            base: cutoff,
+            reason: "tail_on_older_lineage",
+            adoption,
+        },
+    );
+    let through = TailRelease {
+        through: Some(Seq(cutoff.0 + 5)),
+        no_intact_copy: false,
+    };
+    let error = owner
+        .forget_tail_asked(p, through, false)
+        .expect_err("a bare forget-tail over the held tail needs --give-up-live-copy");
+    assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains("add --give-up-live-copy")
+            && error.detail.contains("not been checked"),
+        "{error:?}"
+    );
+}
+
+/// PR #156 review, #153 rule, check B at a landing's scan, the missing floor: generation 2
+/// holds a tail at seqs 2 and 3 with no seq 1 (as in
+/// [`i121_adoption_refuses_a_tail_holed_below_its_base`]). Generation 3's landing at cutoff 2,
+/// with L = 2, scans the tail and its adoption answers `tail_has_no_floor`, a reason outside
+/// the wire vocabulary. The landing holds the tail `Unchecked`, as the inventory does: the
+/// status decodes on a peer and a bare `forget-tail` needs `--give-up-live-copy`.
+/// Cut: `TailAdoption::of` answers `Refused` for every reason past the not-ready ones (the
+/// classification before this row); red, the status does not decode.
+/// Unit.
+#[config_log::retcd_test]
+fn pr156_a_landing_holds_a_tail_with_no_floor_unchecked() {
+    const METHOD: &str = "pr156_a_landing_holds_a_tail_with_no_floor_unchecked";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = write_chain_after(
+        &mut RocksEngine::open(&path).expect("open engine"),
+        Generation(2),
+        vec![Digest::ROOT],
+        2,
+    );
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let mut landing = landing_at(2, digests[1]);
+    landing.new_generation = Generation(3);
+    landing.selected.root.generation = Generation(3);
+    landing.ledger.last_writable = Some(Generation(2));
+    host.landing_scan(p, &landing);
+    let said: Vec<_> = logged!(METHOD, "land_tail_not_adoptable")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(said, [serde_json::Value::from("tail_has_no_floor")]);
+    held_unchecked(&host);
+}
+
+/// PR #156 review, #153 rule, check B at a landing's scan, the unreadable floor: generation 1
+/// holds seqs 1 to 3, its base (seq 2) and head (seq 3) read and seq 1 does not
+/// ([`floor_unreadable`]). Generation 2's landing at cutoff 2, with L = 1, scans the tail; its
+/// adoption logs `adopt_floor_read_failed` with the fault and answers
+/// `tail_history_read_failed`, a reason outside the wire vocabulary. The landing holds the tail
+/// `Unchecked`: the status decodes on a peer and a bare `forget-tail` needs
+/// `--give-up-live-copy`.
+/// Cut: as [`pr156_a_landing_holds_a_tail_with_no_floor_unchecked`]'s; red, the status does not
+/// decode.
+/// Unit.
+#[config_log::retcd_test]
+fn pr156_a_landing_holds_a_tail_whose_floor_read_fails_unchecked() {
+    const METHOD: &str = "pr156_a_landing_holds_a_tail_whose_floor_read_fails_unchecked";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = floor_unreadable(&path);
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let p = PartitionId(1);
+    let mut landing = landing_at(2, digests[1]);
+    landing.ledger.last_writable = Some(Generation(1));
+    host.landing_scan(p, &landing);
+    let said: Vec<_> = logged!(METHOD, "land_tail_not_adoptable")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(said, [serde_json::Value::from("tail_history_read_failed")]);
+    assert_eq!(floor_read_failures(METHOD), [(1.into(), 1.into(), true)]);
+    held_unchecked(&host);
+}
+
+/// `adopt_floor_read_failed` lines: partition, the tail's generation, and whether the fault
+/// names `Corrupt`. Each must be an error.
+fn floor_read_failures(method: &str) -> Vec<(serde_json::Value, serde_json::Value, bool)> {
+    logged!(method, "adopt_floor_read_failed")
+        .into_iter()
+        .map(|line| {
+            assert_eq!(line["@l"], "Error", "{line}");
+            (
+                line["partition"].clone(),
+                line["from"].clone(),
+                line["fault"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("Corrupt")),
+            )
+        })
+        .collect()
+}

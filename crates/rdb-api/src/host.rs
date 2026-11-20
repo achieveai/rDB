@@ -1254,19 +1254,25 @@ pub enum TailAdoption {
     /// A proof failed, named by one of [`ADOPTION_REFUSALS`]. The tail cannot come back.
     Refused(&'static str),
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
-    /// survivor's own check). The next landing scan replaces it.
+    /// survivor's own check), or by one whose reason is not in [`ADOPTION_REFUSALS`]: check B's
+    /// `tail_has_no_floor` and `tail_history_read_failed` (#121), or a write that failed after
+    /// the proofs held. The next landing scan replaces it.
     Unchecked,
 }
 
 impl TailAdoption {
-    /// The state [`Host::adoption`]'s answer names.
+    /// The state [`Host::adoption`]'s answer names. A reason outside [`ADOPTION_REFUSALS`], the
+    /// wire vocabulary, is `Unchecked`, at adoption and at landing alike (#153 lead ruling): as
+    /// `Refused` it would not decode on a peer, so a status naming it would close the link, and
+    /// a bare `forget-tail` over it would need no `--give-up-live-copy`.
     pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
             Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
                 Self::NotReady(reason)
             }
-            Err(reason) => Self::Refused(reason),
+            Err(reason) if ADOPTION_REFUSALS.contains(reason) => Self::Refused(reason),
+            Err(_) => Self::Unchecked,
         }
     }
 
@@ -12908,13 +12914,10 @@ impl Host {
                                 reason = refusal,
                                 "tail_not_adoptable"
                             );
-                            // A write that failed after the proofs held proves nothing
-                            // about the tail: it stays `Unchecked`.
-                            let adoption = if ADOPTION_REFUSALS.contains(&refusal) {
-                                TailAdoption::of::<()>(&Err(refusal))
-                            } else {
-                                TailAdoption::Unchecked
-                            };
+                            // A write that failed after the proofs held, or check B's
+                            // refusal, proves nothing the wire can name: `of` holds it
+                            // `Unchecked`.
+                            let adoption = TailAdoption::of::<()>(&Err(refusal));
                             return self.tail_held(partition, copy, anchor, hit, adoption);
                         }
                     },
@@ -13476,7 +13479,8 @@ impl Host {
             // Check B at adoption (#121, ADR-rdb-0021 amendment): a link or a resume puts the
             // anchor's generation onto the tail's lineage, so that lineage must reach seq 1, as
             // landing and the inventory link require. Neither reason is in
-            // `ADOPTION_REFUSALS`, a wire vocabulary: each holds the tail `Unchecked`.
+            // `ADOPTION_REFUSALS`, a wire vocabulary: `TailAdoption::of` holds the tail
+            // `Unchecked`, at adoption and at a landing's scan alike.
             match self.has_floor(partition, hit.from) {
                 Ok(true) => {}
                 Ok(false) => return Err("tail_has_no_floor"),
