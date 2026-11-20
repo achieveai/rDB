@@ -154,8 +154,8 @@ fn f87_1_resume_cursor_into_an_adopted_tail_matches_by_digest() {
 }
 
 /// Review r1 (PR #170): a copy linked generation 2 at seq 1, then caught up the kept seq 2 with
-/// its old stamp 1 onto its generation-2 level. A consumer reading one record per call (`max`
-/// 1) from `START` keeps the cursor `(1, 2)`, which passes generation 1's exit (1). Its exact
+/// its old stamp 1 onto its generation-2 level. A consumer reading one record per call
+/// (`max = 1`) from `START` keeps the cursor `(1, 2)`, past generation 1's exit (1). Its exact
 /// stamp and digest are visible at seq 2 within the cap, so the cursor is kept and the walk
 /// reaches the cap with every record once. A consumer reopened with the saved cursor is served
 /// too. Guards kept: the same seq holding another record (a real cut) is `Rewound`, and a cursor
@@ -356,7 +356,7 @@ fn f87_1_skipped_bytes_count_toward_the_scan_cap() {
     let huge = |seq| scanned(seq, FEED_SCAN_BYTES + 1, false);
     assert_eq!(count(5_000, 10, &huge), ((Vec::new(), 1, true), 1));
     // Every other record returned: 3 returned (3 MiB) and 5 skipped by the 8th read.
-    let mixed = |seq: u64| scanned(seq, mib, seq % 2 == 0 && seq <= 6);
+    let mixed = |seq: u64| scanned(seq, mib, seq.is_multiple_of(2) && seq <= 6);
     assert_eq!(count(5_000, 10, &mixed), ((vec![2, 4, 6], 8, true), 8));
     // Under the scan cap nothing changes: the page ends at the cap with `more` unset.
     assert_eq!(count(5, 10, &skipped), ((Vec::new(), 5, false), 5));
