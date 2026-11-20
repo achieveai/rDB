@@ -1115,10 +1115,18 @@ const REPAIR_PROFILE: config_storage::SnapshotConfig = config_storage::SnapshotC
 /// no exclusion argument.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m5_17_startup_rebuilds_the_snapshot_a_purged_store_lost() {
+    // The 40 seed puts run while REPAIR_PROFILE builds a snapshot every 8 entries, and a synced
+    // log write waits for the store's checkpoint (A-R286; see `MAX_BACKGROUND_JOBS` in
+    // config-storage). On a loaded host one put's log flush took 1.95 s behind a running
+    // checkpoint and the put missed the testkit's 2 s unscaled `write_timeout` (issue #77, load
+    // ~150 on 32 cores). The row asserts the startup rebuild, not write latency, so its budget
+    // is a scaled deadline, as in `a_follower_behind_the_purge_point_rejoins_over_a_slow_link`.
+    let write_budget = TestTimers::DEFAULT.multiple(2);
     let cluster = Cluster::builder()
         .nodes(1)
         .storage(StorageKind::ROCKS)
         .snapshot(REPAIR_PROFILE)
+        .timeouts(write_budget, write_budget)
         .start()
         .await;
     cluster
