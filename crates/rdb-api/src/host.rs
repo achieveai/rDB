@@ -100,6 +100,9 @@ use crate::ownership::{
 };
 use crate::transport::Links;
 
+mod dedup_fill;
+use dedup_fill::{Crossed, Fill};
+
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
 /// (`rdb_sim` tests, `support::scenarios::run::BOOT`). `Db::restart_node` starts a node again
 /// at its previous boot plus one (M9 S2b).
@@ -1427,6 +1430,9 @@ pub struct IndexLengths {
     pub ladder: usize,
     /// The host's `published_at` publish marks.
     pub published_at: usize,
+    /// T1's dedup cap (`Limits::dedup_cap`, `DbConfig::dedup_cap`): `dedup` at this many
+    /// answers `OVERLOADED` to a new write (issue #98). 0 where the node holds no T1 index.
+    pub dedup_cap: usize,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -2718,6 +2724,9 @@ struct Host {
     /// How many trims the duty sent and how many durable deletes ran, for the rows.
     trims_sent: u64,
     trim_deletes: u64,
+    /// Issue #98: per partition, which of `dedup_cap_high` and `dedup_cap_full` were logged and
+    /// not yet re-armed ([`Host::watch_dedup_fill`]).
+    dedup_fill: BTreeMap<PartitionId, Fill>,
     /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
     /// rows of every older generation it holds retire: one retention after the landing.
     retire_due: BTreeMap<(PartitionId, Generation), Tick>,
@@ -3034,6 +3043,7 @@ impl Host {
             trim_deleted_at: BTreeMap::new(),
             trims_sent: 0,
             trim_deletes: 0,
+            dedup_fill: BTreeMap::new(),
             retire_due: BTreeMap::new(),
             marks_restored: BTreeSet::new(),
             marks_written: BTreeMap::new(),
@@ -5490,6 +5500,53 @@ impl Host {
         Some(Duration::from_millis(runs.0.saturating_sub(now.0)))
     }
 
+    /// Issue #98: after each step, warn once when `partition`'s dedup index reaches 80% of its
+    /// cap (`dedup_cap_high`) and once when it reaches the cap (`dedup_cap_full`), each re-armed
+    /// only once the index falls well below its mark ([`dedup_fill`]). Every change to the index
+    /// is a T1 step, so watching here sees each one. A node with no T1 instance for the
+    /// partition holds no index, and its marks are re-armed. Fields: the fill and the cap, the
+    /// retention, and when the trim duty can first free an entry (`frees_in_ms`, absent when no
+    /// time is known: the same "not before" an `OVERLOADED` carries).
+    fn watch_dedup_fill(&mut self, partition: PartitionId) {
+        let Some(kernel) = self.transaction.kernel(self.node, partition) else {
+            self.dedup_fill.remove(&partition);
+            return;
+        };
+        let (len, cap) = (kernel.dedup().len(), kernel.limits().dedup_cap);
+        let crossed = self
+            .dedup_fill
+            .entry(partition)
+            .or_default()
+            .observe(len, cap);
+        for mark in crossed {
+            let frees_in_ms = self
+                .cap_frees_in(partition, self.clock.now())
+                .map(|after| u64::try_from(after.as_millis()).unwrap_or(u64::MAX));
+            let retention_ms = self.budgets.dedup_retention_millis;
+            match mark {
+                Crossed::High => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    len,
+                    cap,
+                    high_mark = dedup_fill::high_mark(cap),
+                    retention_ms,
+                    frees_in_ms,
+                    "dedup_cap_high"
+                ),
+                Crossed::Full => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    len,
+                    cap,
+                    retention_ms,
+                    frees_in_ms,
+                    "dedup_cap_full"
+                ),
+            }
+        }
+    }
+
     /// A-R187: whether the retire due for `(partition, serving)` would free an entry T1 holds.
     /// A disk scan that fails names no free; the retire duty itself faults the node on it.
     fn retire_frees(
@@ -6067,6 +6124,7 @@ impl Host {
             );
             stepped?;
         }
+        self.watch_dedup_fill(event.partition);
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
             return Err(fail_waiter(
@@ -15200,6 +15258,10 @@ impl Host {
                     None => receiver.map_or(0, |receiver| receiver.history().len()),
                 },
                 published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
+                dedup_cap: self
+                    .transaction
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.limits().dedup_cap),
             }),
             pinned: self
                 .committed

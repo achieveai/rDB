@@ -187,6 +187,14 @@ pub struct DbConfig {
     /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
     /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
     /// memory (measured on a debug build).
+    ///
+    /// Before and at the cap, the owner warns (issue #98): `dedup_cap_high` once when a
+    /// partition's index reaches 80% of the cap, and `dedup_cap_full` once when it reaches the
+    /// cap. Each names `node`, `partition`, `len`, `cap`, `retention_ms` and, when known,
+    /// `frees_in_ms` (the earliest an entry frees). Each is logged again only after the index has
+    /// fallen 5% of the cap (at least one entry) below its mark, so a fill hovering on a mark
+    /// does not log per write. [`Db::node_status`] reports the fill and the cap side by side, as
+    /// `lengths.dedup` and `lengths.dedup_cap`.
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
@@ -6919,6 +6927,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod dedup_cap_tests;
 
 #[cfg(test)]
 mod tests {
