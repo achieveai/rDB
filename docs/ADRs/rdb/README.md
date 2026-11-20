@@ -56,6 +56,7 @@ reached yet.
 | 0004, 0007, 0008 | kernel-a (transaction, authority, control records) |
 | 0005, 0006, 0009, 0021 | kernel-b (replication, lag protection, recovery) |
 | 0019 | verification (gates, evidence, the release boundary) |
+| 0025 | storage, t5 (history trim floor, snapshot rebuild); it amends kernel-b's 0005, 0009 and 0021 |
 
 ## Naming
 
