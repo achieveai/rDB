@@ -871,8 +871,10 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 **Delete.** `write(workspace, id, Change::Delete, expect)` deletes any kind of object.
 
 - A document is one call. A larger map, set, list or blob is deleted in batches of up to 254
-  records: call again until `Ok(None)`. The root goes last, so a reader may see a map with
-  fewer entries, but a new object at that id never inherits old entries.
+  records: call again until `Ok(None)`. Between batches the object reads as valid or absent,
+  never as damage: a map, set or list reads with fewer entries, and a blob reads as absent
+  (its root goes first; the chunks left go in the next calls). A new object at that id never
+  inherits old entries.
 - `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
   `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
 - `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload

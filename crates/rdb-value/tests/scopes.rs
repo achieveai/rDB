@@ -2,7 +2,7 @@
 //!
 //! Scenario: a gateway stores each (app, sub-tenant) scope's objects under a header no other
 //! scope's header can start or end inside, lists one workspace's objects by id, and deletes
-//! any object of any kind, root last.
+//! any object of any kind, each batch leaving a valid object or nothing a read refuses.
 
 mod common;
 
@@ -386,4 +386,107 @@ fn delete_empties_any_kind_root_last_and_checks_its_version() {
     );
     k.commit_any_order(&batch);
     assert_eq!(delete_object(&k.snapshot(), &orphan, None).unwrap(), None);
+}
+
+/// Delete `root` to the end, batch by batch, and check that nothing is stored under it.
+fn finish_delete(k: &mut Kernel, root: &RootKey) {
+    let mut batches = 0;
+    while let Some(batch) = delete_object(&k.snapshot(), root, None).unwrap() {
+        batches += 1;
+        assert!(batches < 20, "the delete ends");
+        k.commit_any_order(&batch);
+    }
+    let left = k
+        .records
+        .keys()
+        .filter(|key| key.starts_with(root.object_prefix()))
+        .count();
+    assert_eq!(left, 0, "{left} records left after {batches} more batches");
+}
+
+/// PR #178 review r1 T4: a map of 255 entries is one record more than a request deletes. After
+/// one batch it reads as a smaller map, never `CountMismatch`; then the delete finishes. Cut:
+/// `partial_delete` answers `None` for a map (the raw batch, root kept at its count): red.
+#[test]
+fn a_map_part_deleted_reads_as_a_smaller_map() {
+    use rdb_value::collection::members;
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"map");
+    map(&mut k, &root, 255);
+    let batch = delete_object(&k.snapshot(), &root, None).unwrap().unwrap();
+    k.commit_any_order(&batch);
+    let read = members(&k.snapshot(), &root, None, 1_000);
+    let page = read.unwrap_or_else(|e| panic!("after one batch the map reads back: {e:?}"));
+    assert!(page.members.len() < 255, "the batch removed members");
+    assert_eq!(page.collection.count, page.members.len() as u64);
+    finish_delete(&mut k, &root);
+}
+
+/// PR #178 review r1 T5: a list of 255 items with their own records. After one batch it reads
+/// as a shorter list, never `ItemMissing`; then the delete finishes. Cut: `partial_delete`
+/// answers `None` for a list: red.
+#[test]
+fn a_list_part_deleted_reads_as_a_shorter_list() {
+    use rdb_value::list::{compile_list, items, Start};
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"list");
+    let push = |from: i128, to: i128| (from..to).map(|i| ListOp::Push(int(i))).collect::<Vec<_>>();
+    let made = create_list(&k.snapshot(), &root, true, DEFAULT_BLOCK_MAX, &push(0, 50)).unwrap();
+    k.commit(made.compiled());
+    for at in (50..255).step_by(50) {
+        let s = k.snapshot();
+        let version = s.version(Namespace::User, root.as_bytes()).unwrap();
+        let ops = push(at, (at + 50).min(255));
+        let made =
+            compile_list(&s, &root, Expected::Version(version), DEFAULT_BLOCK_MAX, &ops).unwrap();
+        k.commit(made.compiled());
+    }
+    let full = items(&k.snapshot(), &root, Start::Position(0), 1_000).unwrap();
+    assert_eq!(full.items.len(), 255, "control: 255 items");
+    let batch = delete_object(&k.snapshot(), &root, None).unwrap().unwrap();
+    k.commit_any_order(&batch);
+    let read = items(&k.snapshot(), &root, Start::Position(0), 1_000);
+    let page = read.unwrap_or_else(|e| panic!("after one batch the list reads back: {e:?}"));
+    assert!(page.items.len() < 255, "the batch removed items");
+    assert_eq!(page.list.count, page.items.len() as u64);
+    finish_delete(&mut k, &root);
+}
+
+/// PR #178 review r1 T6: a blob published from 255 one-byte chunks. After one batch it reads as
+/// absent, never `ChunkMissing`; then the delete finishes. Cut: `partial_delete` answers `None`
+/// for a blob (chunks first, root last): red.
+#[test]
+fn a_blob_part_deleted_reads_as_absent() {
+    use rdb_value::blob::{read_blob, read_range};
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"blob");
+    let bytes: Vec<u8> = (0..255_u8).collect();
+    for (index, piece) in (0..).zip(bytes.chunks(1)) {
+        k.commit(&put_chunk(&k.snapshot(), &root, &[9; 16], index, piece).unwrap());
+    }
+    let sha: [u8; 32] = Sha256::digest(&bytes).into();
+    let made = publish(
+        &k.snapshot(),
+        &root,
+        Expected::Absent,
+        &[9; 16],
+        255,
+        1,
+        &sha,
+        Generation(k.generation),
+    )
+    .unwrap();
+    k.commit(&made);
+    assert_eq!(read_range(&k.snapshot(), &root, 0, 255).unwrap(), bytes, "control");
+    let version = k.snapshot().version(Namespace::User, root.as_bytes()).unwrap();
+    let batch = delete_object(&k.snapshot(), &root, Some(version)).unwrap().unwrap();
+    k.commit_any_order(&batch);
+    let read = read_blob(&k.snapshot(), &root)
+        .and_then(|found| found.map(|blob| read_range(&k.snapshot(), &root, 0, blob.manifest.size)).transpose());
+    let read = read.unwrap_or_else(|e| panic!("after one batch the blob reads back: {e:?}"));
+    assert_eq!(read, None, "absent after its root went first");
+    // The chunks left go on under `expect`, since the blob it named is deleted.
+    let rest = delete_object(&k.snapshot(), &root, Some(version)).unwrap().unwrap();
+    assert!(!rest.mutations.is_empty());
+    finish_delete(&mut k, &root);
 }

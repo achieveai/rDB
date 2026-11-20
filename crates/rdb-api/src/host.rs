@@ -999,13 +999,14 @@ pub enum Change {
     /// Nothing stored compiles to nothing ([`Answer::Unchanged`]) once the view is published;
     /// `UNKNOWN_OUTCOME`, never sent, while it is applied and not yet published.
     Clear,
-    /// Delete the object, whatever its kind, in batches (#147): up to 254 records other than the
-    /// root, each at the version read, guarded by the root at the version read; the root goes in
-    /// the batch that leaves nothing else. Write it again until it answers
-    /// [`Answer::Unchanged`]: nothing is stored under the object, once the view is published.
-    /// `expect` `Version(v)` makes every batch a CAS on the root; `Absent` is refused. A reader
-    /// may see a collection with fewer entries mid-delete, never a re-created object that kept
-    /// old ones, since the root goes last.
+    /// Delete the object, whatever its kind, in batches (#147, `rdb_value::repair::delete_object`).
+    /// Write it again until it answers [`Answer::Unchanged`]: nothing is stored under the object,
+    /// once the view is published. Between batches the object reads as valid or absent, never as
+    /// damage (PR #178 review r1): a map, set or list loses entries through its own compile, so
+    /// its count and links stay true; a blob's root goes first, leaving chunks with no root,
+    /// which read as absent; any other object keeps its root to the last batch. `expect`
+    /// `Version(v)` makes every batch a CAS on the root, and the chunks a deleted blob leaves go
+    /// on under it; `Absent` is refused. A re-created object never inherits old records.
     Delete,
 }
 

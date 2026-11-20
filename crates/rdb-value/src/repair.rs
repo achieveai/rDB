@@ -28,13 +28,19 @@ use rdb_core::{Condition, Generation, Mutation, Namespace, Seq, SnapshotHandle, 
 
 use crate::blob::{check_chunk, read_blob, verify_chunks, Manifest};
 use crate::collection::{
-    check_count, check_element, collection, drop_collection, members, Collection, CollectionKind,
+    check_count, check_element, collection, compile_collection, drop_collection, members,
+    Collection, CollectionKind, ElemOp,
 };
-use crate::compile::{read, record, BlockFault, Compiled, Corrupt, SlotFault, ValueError};
+use crate::compile::{
+    read, record, BlockFault, Compiled, Corrupt, Expected, SlotFault, ValueError,
+};
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{newer_build, open, Kind};
 use crate::keys::{block_key, chunk_key, item_key, parse, slot_key, KeyError, RootKey, Sub};
-use crate::list::{check_base, check_item, check_slot, drop_list, items, list, slot_of, Start};
+use crate::list::{
+    check_base, check_item, check_slot, compile_list, drop_list, items, list, slot_of, ListOp,
+    Start, DEFAULT_BLOCK_MAX,
+};
 
 /// The most deletes of records other than the root in one batch: one less than a request
 /// carries, so the batch that empties the object still has room for the root.
@@ -614,21 +620,34 @@ fn batch(
     ))
 }
 
-/// One batch of an ordinary delete of the object at `root`, of any kind (#147): no damage proof,
-/// and Clear's order, root last.
+/// One batch of an ordinary delete of the object at `root`, of any kind (#147): no damage proof.
+/// Every state between two batches reads as a valid object or as absent, never as damage, so a
+/// crash or a stop between batches leaves nothing a read refuses (PR #178 review r1, T4-T6).
 ///
-/// - Up to [`MAX_CLEAR_DELETES`] records other than the root, in key order, each at the version
-///   read, and each batch guarded by the root at the version read, or by its absence for an
-///   object with no root (the chunks of an upload never published).
-/// - The batch that leaves nothing else deletes the root, at its version.
+/// - Everything fits one request: the records other than the root, then the root, each at the
+///   version read. This is the last batch.
+/// - A map or set that does not fit: up to [`MAX_CLEAR_DELETES`] of its elements removed by
+///   [`compile_collection`], which rewrites the root's count. A smaller map.
+/// - A list that does not fit: its first items removed by [`compile_list`], which relinks its
+///   blocks and rewrites the root. A shorter list.
+/// - A blob that does not fit: its root first, with chunks up to the limit. What is left is
+///   chunks with no root, which reads as absent and is what an upload never published leaves.
+/// - Any other object (a document with upload chunks, or a root that does not open): up to
+///   [`MAX_CLEAR_DELETES`] records other than the root, in key order, root last, as Clear does.
+///   A document's read never looks at chunks, so it reads back unchanged; a root that does not
+///   open is damage already.
+/// - With no root, up to [`MAX_CLEAR_DELETES`] records, guarded by the root's absence.
 /// - `Ok(None)`: nothing is stored under the object. Call again until then.
 ///
-/// With `expect`, the root must be at that version: every batch is a CAS.
+/// With `expect`, the root must be at that version: every batch is a CAS. Once a blob's root has
+/// gone, the chunks left behind go on under the root's absence with `expect` still given, since
+/// the object it named is deleted.
 ///
 /// # Errors
 /// [`ApplyError::VersionConflict`] when the root is at another version than `expect`, and
-/// [`ApplyError::ObjectAbsent`] when `expect` names a version and there is no root but other
-/// records are stored. [`Corrupt::VersionWithoutValue`] for a record with no version.
+/// [`ApplyError::ObjectAbsent`] when `expect` names a version and there is no root but records
+/// other than chunks are stored. [`Corrupt::VersionWithoutValue`] for a record with no version.
+/// A map's, set's or list's own compile errors for a damaged element, item or block.
 pub fn delete_object(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -679,11 +698,13 @@ pub fn delete_object(
         (Some(expected), Some(found)) if expected != found => {
             return Err(ApplyError::VersionConflict { expected, found }.into());
         }
-        (Some(_), None) => return Err(ApplyError::ObjectAbsent.into()),
+        (Some(_), None) if !only_chunks(&mutations) => {
+            return Err(ApplyError::ObjectAbsent.into())
+        }
         _ => {}
     }
-    if !more {
-        if let Some(version) = root_version {
+    if let Some(version) = root_version {
+        if !more {
             mutations.push(Mutation::Delete {
                 key: root.to_bytes(),
                 expected_version: Some(version),
@@ -695,6 +716,9 @@ pub fn delete_object(
                 }));
             }
             mutations.pop();
+        }
+        if let Some(partial) = partial_delete(snapshot, root, version, &mut mutations)? {
+            return Ok(Some(partial));
         }
     }
     let guard = match root_version {
@@ -710,4 +734,89 @@ pub fn delete_object(
         mutations,
         conditions: vec![guard],
     }))
+}
+
+/// Whether every record in `mutations` is a blob chunk (its key parses as [`Sub::Chunk`]).
+fn only_chunks(mutations: &[Mutation]) -> bool {
+    mutations.iter().all(|mutation| match mutation {
+        Mutation::Delete { key, .. } | Mutation::Put { key, .. } => {
+            matches!(parse(key).map(|parsed| parsed.sub), Ok(Sub::Chunk))
+        }
+    })
+}
+
+/// A batch of [`delete_object`] for an object at root version `version` that does not fit one
+/// request, which leaves a valid object behind; `scanned` holds the raw deletes of its first
+/// records. `None`: the kind has no such batch, so the raw one is valid (see
+/// [`delete_object`]).
+fn partial_delete(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    version: u64,
+    scanned: &mut Vec<Mutation>,
+) -> Result<Option<Compiled>, ValueError> {
+    let Some((_, bytes)) = record(snapshot, root.as_bytes())? else {
+        return Ok(None);
+    };
+    let Ok(opened) = open(&bytes) else {
+        return Ok(None);
+    };
+    let fits = |compiled: &Compiled| {
+        compiled.mutations.len() <= MAX_REQUEST_MUTATIONS
+            && record_len(0, &compiled.mutations) <= MAX_ENVELOPE_BYTES
+    };
+    match opened.kind {
+        Kind::Map | Kind::Set => {
+            let kind = if opened.kind == Kind::Map {
+                CollectionKind::Map
+            } else {
+                CollectionKind::Set
+            };
+            let page = members(snapshot, root, None, MAX_CLEAR_DELETES)?;
+            let ops: Vec<_> = page
+                .members
+                .into_iter()
+                .map(|member| ElemOp::Remove(member.key))
+                .collect();
+            let mut take = ops.len();
+            while take > 0 {
+                match compile_collection(snapshot, root, kind, Expected::Version(version), &ops[..take]) {
+                    Ok(compiled) if fits(&compiled) => return Ok(Some(compiled)),
+                    Ok(_) | Err(ValueError::Apply(ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. })) => take /= 2,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(None)
+        }
+        Kind::List => {
+            let count = list(snapshot, root)?.map_or(0, |found| found.count);
+            let mut take = count.min(MAX_CLEAR_DELETES as u64);
+            while take > 0 {
+                let ops = vec![ListOp::Remove { at: 0 }; usize::try_from(take).unwrap_or(usize::MAX)];
+                match compile_list(snapshot, root, Expected::Version(version), DEFAULT_BLOCK_MAX, &ops) {
+                    Ok(compiled) if fits(compiled.compiled()) => {
+                        return Ok(Some(compiled.compiled().clone()))
+                    }
+                    Ok(_) | Err(ValueError::Apply(ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. })) => take /= 2,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(None)
+        }
+        Kind::Blob => {
+            let mut mutations = vec![Mutation::Delete {
+                key: root.to_bytes(),
+                expected_version: Some(version),
+            }];
+            mutations.extend(scanned.drain(..).take(MAX_CLEAR_DELETES));
+            while record_len(0, &mutations) > MAX_ENVELOPE_BYTES {
+                mutations.pop();
+            }
+            Ok(Some(Compiled {
+                mutations,
+                conditions: Vec::new(),
+            }))
+        }
+        Kind::Document | Kind::Chunk | Kind::ListBlock | Kind::ListSlot => Ok(None),
+    }
 }
