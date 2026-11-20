@@ -113,6 +113,8 @@ NET="$NAME-net"
 HELPER="$NAME-x"
 # The host-route producer; selftest points it at a missing or failing command.
 IP_CMD="${MULTIHOST_IP_CMD:-ip}"
+# The command d1 runs its up and its steps with: this script, or a stub in the selftest.
+D1_SELF="${MULTIHOST_D1_SELF:-$0}"
 
 say() { echo "multihost: $*"; }
 die() { echo "multihost: FAILED at $*" >&2; exit 1; }
@@ -985,6 +987,7 @@ failover() {
         "$tmp/post.out" "$tmp/promoted.jsonl" "$tmp/reads.out" > "$tmp/k.txt" \
         || die "failover: the claims could not be read"
     claims < "$tmp/k.txt"
+    failover_capture "failover$n-$t0-mid" "$tmp"
 
     # Restart: J1 ready, J2 pinned again, J3 still readable, J4 printed.
     local since c
@@ -1061,8 +1064,41 @@ restart_voter() {
 # The whole D1 run on this --name and --subnet. Teardown is armed only after this run's own
 # preflight has passed: a name another run holds is refused, and nothing of it is removed.
 D1_ARMED=0
+# Copy each container's /data/logs and its `docker logs` into $D1_LOG_OUT/logs-<slug>/, so a
+# step's evidence outlives `clean`. Unset D1_LOG_OUT: nothing is kept, and d1 says so.
+d1_capture() { # slug
+    [ -n "${D1_LOG_OUT:-}" ] || { say "d1: D1_LOG_OUT unset; logs of $1 not kept"; return 0; }
+    local dir="$D1_LOG_OUT/logs-$1" c
+    mkdir -p "$dir" || { say "d1: cannot make $dir"; return 0; }
+    for c in $(docker ps -a --filter "label=$LABEL" --format '{{.Names}}'); do
+        docker cp "$c:/data/logs" "$dir/$c" >/dev/null 2>&1 || say "d1: no /data/logs from $c"
+        docker logs "$c" > "$dir/$c.stdout" 2>&1 || say "d1: no docker logs from $c"
+    done
+    say "d1: logs of $1 in $dir"
+}
+# After a failover's probe, before the restart: every container's logs, the admin status
+# before and after the kill (partitions/, grants/, nodes/), the probe output, the promoted
+# lines, and each container's command line as Docker and its pid 1 see it.
+failover_capture() { # slug, scratch
+    [ -n "${D1_LOG_OUT:-}" ] || return 0
+    local dir="$D1_LOG_OUT/logs-$1" c f
+    d1_capture "$1"
+    for f in pre.out run.out post.out promoted.jsonl k.txt; do
+        [ -f "$2/$f" ] && cp "$2/$f" "$dir/$f"
+    done
+    { echo "# admin status before the kill (pre) and after the probe (post)"
+      grep -hE '^(partitions|grants|nodes)/' "$2/pre.out" | sed 's/^/pre  /'
+      grep -hE '^(partitions|grants|nodes)/' "$2/post.out" | sed 's/^/post /'
+    } > "$dir/control.txt" 2>&1
+    for c in $(docker ps -a --filter "label=$LABEL" --format '{{.Names}}'); do
+        echo "$c state=$(docker inspect --format '{{.State.Status}}' "$c") cmd=$(docker inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}} {{json .Args}}' "$c")"
+        docker exec "$c" sh -c 'tr "\\0" " " < /proc/1/cmdline; echo' 2>/dev/null | sed 's/^/  pid1: /'
+    done > "$dir/cmdline.txt" 2>&1
+    say "failover: capture in $dir"
+}
 d1_teardown() {
     [ "$D1_ARMED" = 1 ] || return 0
+    d1_capture teardown
     say "d1: down and clean of $NAME"
     "$0" down --name "$NAME" || true
     "$0" clean --name "$NAME" || true
@@ -1076,14 +1112,17 @@ d1() {
     D1_ARMED=1
     trap d1_teardown EXIT
     trap 'exit 130' INT TERM
-    local common=(--name "$NAME") step rc failed=0 results=""
-    "$0" up --no-build --name "$NAME" --subnet "$SUBNET" --image "$IMAGE" --nodes "$NODES" \
+    local common=(--name "$NAME") step rc failed=0 results="" i=0
+    "$D1_SELF" up --no-build --name "$NAME" --subnet "$SUBNET" --image "$IMAGE" --nodes "$NODES" \
         --voters "$VOTERS" --partitions "$PARTITIONS" || die "d1: up"
     for step in "check" "failover 3" "failover 1" "failover 5" "restart-voter 1" "restart-voter 1" \
                 "failover 3 --with-voter-leader"; do
         say "d1: === $step"
+        # Not `cmd; rc=$?`: under `set -e` a failing step would end d1 there (d1 run 1, #176).
+        rc=0
         # shellcheck disable=SC2086 # the step's words
-        "$0" $step "${common[@]}"; rc=$?
+        "$D1_SELF" $step "${common[@]}" || rc=$?
+        i=$((i + 1)); d1_capture "$i-${step// /_}"
         results="$results
   d1 step '$step' exit $rc"
         [ "$rc" = 0 ] || failed=$((failed + 1))
@@ -1515,6 +1554,23 @@ SH
         && grep -q "^volume ls -q --filter label=org.rdb.multihost=rdbst-d1\$" "$t/calls" \
         && grep -q "clean: removed" "$t/out"
     st "d1 whose up fails after its preflight runs down and clean for its own label (exit $rc)" $?
+    # A failing step does not end d1: every step runs, each one's logs are kept, and d1 exits 1.
+    # Cut: d1's step line back to `"$D1_SELF" $step ..; rc=$?` (as in d1 run 1, #176): red,
+    # observed 2026-11-20: set -e ends d1 at failover 1 and the later steps never run.
+    # shellcheck disable=SC2016 # the stub's own $*, expanded when it runs
+    printf '#!/bin/sh\necho "$*" >> "$STEPS"\ncase "$*" in "failover 1 "*) exit 1 ;; esac\nexit 0\n' \
+        > "$t/self"
+    chmod +x "$t/self"
+    : > "$t/calls"; : > "$t/steps"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs" \
+        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 7 ] \
+        && grep -q "^failover 3 --with-voter-leader --name rdbst-d1\$" "$t/steps" \
+        && grep -q "d1 step 'failover 1' exit 1" "$t/out" && grep -q "d1: 1 steps failed" "$t/out" \
+        && [ -d "$t/logs/logs-3-failover_1" ] && [ -d "$t/logs/logs-7-failover_3_--with-voter-leader" ] \
+        && [ -d "$t/logs/logs-teardown" ]
+    st "d1 runs every step past a failing one, keeps each step's logs, and exits 1 (exit $rc)" $?
     rm -rf "$t"
 }
 
