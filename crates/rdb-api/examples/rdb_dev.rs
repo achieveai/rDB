@@ -121,7 +121,9 @@
 //!                                         `next=G:S:HEX more=`; or one `behind`, `trimmed`
 //!                                         or `rewound to=G:S:HEX` line. In process or against
 //!                                         a running cluster (`lr do`); `--at N` reaches any
-//!                                         node, in this process or over the links
+//!                                         node, in this process or over the links. Over
+//!                                         the links only an admin app may read it (#151);
+//!                                         `lr` runs as `admin`
 //! put --as <n> <object> <value> [--if-version N]
 //!                                         the same put under request id app_request_id(n),
 //!                                         your own number n below 2^63, used once; recorded

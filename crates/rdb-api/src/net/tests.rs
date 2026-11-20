@@ -14,7 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
-    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity, Seq,
+    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::recovery::{CommittedRoot, DurableProof, RecoveryBarrier, RecoveryResult};
@@ -1830,6 +1830,54 @@ fn pr74_r3_the_admin_list_names_who_may_move_not_the_name_admin() {
     }
 }
 
+/// #170 review (owner ruling 2026-11-20, fail closed): a change feed call passes only from an
+/// app on the admin list, or from a node, whatever tenant it names; any other app is refused
+/// with the reason naming #151, for its own tenant and for another. Other calls from that app
+/// are untouched.
+/// Cut: no `Changes` arm in `sender_refused`, red (app `gw` passes).
+/// Unit.
+#[test]
+fn f87_2_r2_only_an_admin_app_may_read_the_change_feed() {
+    let changes = |tenant: u32| WireMsg::Client {
+        to: NodeId(2),
+        partition: PartitionId(1),
+        call: wire::WireCall::Changes {
+            identity: RequestIdentity {
+                tenant: TenantId(tenant),
+                ..identity(1, 1)
+            },
+            from: crate::feed::FeedCursor::START.into(),
+            max: 10,
+        },
+        reply: 1,
+    };
+    let admin = Label::App("admin".to_owned());
+    let gw = Label::App("gw".to_owned());
+    let node1 = Label::Node(NodeId(1));
+    for tenant in [1, 2] {
+        let msg = changes(tenant);
+        assert_eq!(super::sender_refused(&admin, &msg, &admin_apps()), None);
+        assert_eq!(super::sender_refused(&node1, &msg, &BTreeSet::new()), None);
+        let reason = super::sender_refused(&gw, &msg, &admin_apps()).expect("gw refused");
+        assert!(
+            reason.contains("app gw may not read the change feed on node 2")
+                && reason.contains("needs the admin certificate")
+                && reason.contains("(#151)"),
+            "{reason}"
+        );
+    }
+    let status = WireMsg::Client {
+        to: NodeId(2),
+        partition: PartitionId(1),
+        call: wire::WireCall::Status {
+            identity: identity(1, 1),
+            generation: None,
+        },
+        reply: 1,
+    };
+    assert_eq!(super::sender_refused(&gw, &status, &admin_apps()), None);
+}
+
 /// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is
 /// refused or up, within 3 s scaled by `RETCD_TEST_DEADLINE_SCALE`: under load the handshake
 /// alone took longer than a fixed 3 s (A-R257), and the row read `Waiting(None)` as a fault.
@@ -3225,12 +3273,16 @@ async fn an_accepted_socket_has_nodelay_set() {
 }
 
 /// Issue #87 slice 2, design S-D from any host: an app that holds no copy, linked over mutual
-/// TLS as `gw` (not an admin app), reads node 2's feed through `Db::changes` with
+/// TLS as `admin` (on the nodes' admin apps), reads node 2's feed through `Db::changes` with
 /// `Source::Node(2)`. Node 2 is a secondary in another process. It answers the owner's puts in
 /// order, with their object ids and request ids; a refusal is `UNAVAILABLE` claiming no
 /// mutation. Node 4, a spare process that holds no copy, answers `UNAVAILABLE` with rule
 /// `Definitive` and the step to read another copy, claiming no mutation.
-/// Cut: `sender_refused` treats `Changes` as admin-only, red (`gw` is refused).
+/// #170 review (owner ruling 2026-11-20, fail closed): `admin` is served for tenant 2 as well
+/// (empty pages past every record: tenant 2 wrote nothing). App `gw`, linked the same way but
+/// not on the admin apps, is refused `INVALID_ARGUMENT` with no mutation and the reason naming
+/// #151, for tenant 1 and tenant 2, from node 2 and from the owner.
+/// Cut: no `Changes` arm in `sender_refused`, red (`gw` is served).
 /// Integration (~10 s): a formation, four node opens, the app's open, real TLS on loopback.
 #[config_log::retcd_test]
 fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
@@ -3241,9 +3293,11 @@ fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
         .expect("runtime");
     let dir = config_testkit::fs::temp_dir();
     let certs_dir = dir.path().join("certs");
-    let app_label = Label::App("gw".to_owned());
+    let app_label = Label::App("admin".to_owned());
+    let gw_label = Label::App("gw".to_owned());
     let mut labels: Vec<Label> = (1..=4).map(|n| Label::Node(NodeId(n))).collect();
     labels.push(app_label.clone());
+    labels.push(gw_label.clone());
     certs::generate(&certs_dir, &labels).expect("certs generate");
     let data = dir.path().join("db");
     let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -3284,41 +3338,49 @@ fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
         .collect();
     let last = puts.last().expect("three puts").seq;
 
-    let app_links = Links::new();
-    let app_net = {
-        let _entered = rt.enter();
-        Net::start(
-            NetConfig {
-                label: app_label.clone(),
-                boot: BootId(0),
-                tls: certs::load(&certs_dir, &app_label).expect("app certs"),
-                peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
-                dial: addrs.clone(),
-                protocol_version: PROTOCOL_VERSION,
-                faults: Faults::new(),
-                admin_apps: BTreeSet::new(),
-            },
-            &app_links,
-            None,
-        )
-        .expect("the app's net starts")
+    let app_dirs = [
+        config_testkit::fs::temp_dir(),
+        config_testkit::fs::temp_dir(),
+    ];
+    let open_app = |label: &Label, client: u32, app_dir: &std::path::Path| {
+        let app_links = Links::new();
+        let app_net = {
+            let _entered = rt.enter();
+            Net::start(
+                NetConfig {
+                    label: label.clone(),
+                    boot: BootId(0),
+                    tls: certs::load(&certs_dir, label).expect("app certs"),
+                    peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
+                    dial: addrs.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    faults: Faults::new(),
+                    admin_apps: BTreeSet::new(),
+                },
+                &app_links,
+                None,
+            )
+            .expect("the app's net starts")
+        };
+        let up: Vec<NodeId> = PEERS.map(NodeId).to_vec();
+        rt.block_on(app_net.wait_up(&up, patience))
+            .expect("the app links every node");
+        let app = rt
+            .block_on(crate::db::Db::open(
+                crate::db::DbConfig {
+                    local: Vec::new(),
+                    links: Some(app_links),
+                    client: ClientId(client),
+                    ..db_config(app_dir)
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("the app-only open");
+        (app_net, app)
     };
-    let up: Vec<NodeId> = PEERS.map(NodeId).to_vec();
-    rt.block_on(app_net.wait_up(&up, patience))
-        .expect("the app links every node");
-    let app_dir = config_testkit::fs::temp_dir();
-    let mut app = rt
-        .block_on(crate::db::Db::open(
-            crate::db::DbConfig {
-                local: Vec::new(),
-                links: Some(app_links),
-                client: ClientId(9),
-                ..db_config(app_dir.path())
-            },
-            Arc::clone(&store),
-            rt.handle().clone(),
-        ))
-        .expect("the app-only open");
+    let (app_net, mut app) = open_app(&app_label, 9, app_dirs[0].path());
+    let (gw_net, mut gw) = open_app(&gw_label, 10, app_dirs[1].path());
 
     let (mut records, mut at) = (Vec::new(), crate::feed::FeedCursor::START);
     let (mut refused, deadline) = (0, std::time::Instant::now() + patience);
@@ -3357,6 +3419,57 @@ fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
         .collect();
     assert_eq!(objects, [b"x".as_slice(), b"y", b"z"]);
 
+    // #170 review: the admin app is served for another tenant too; tenant 2 wrote nothing.
+    let deadline = std::time::Instant::now() + patience;
+    let mut at = crate::feed::FeedCursor::START;
+    while at.seq < last {
+        assert!(std::time::Instant::now() < deadline, "tenant 2 at {at:?}");
+        match app.changes_as(
+            TenantId(2),
+            PartitionId(1),
+            at,
+            256,
+            crate::db::Source::Node(NodeId(2)),
+        ) {
+            Ok(crate::feed::FeedPage::Records { records, next, .. }) => {
+                assert!(records.is_empty(), "tenant 2 sees {records:?}");
+                at = next;
+            }
+            Ok(other) => panic!("node 2 answered admin for tenant 2: {other:?}"),
+            Err(error) if error.kind == rdb_core::contracts::errors::ErrorKind::Unavailable => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("node 2 refused admin for tenant 2: {error:?}"),
+        }
+    }
+    // An app not on the admin apps is refused, for its own tenant and another, whichever copy.
+    for tenant in [1, 2] {
+        for source in [crate::db::Source::Node(NodeId(2)), crate::db::Source::Owner] {
+            let error = gw
+                .changes_as(
+                    TenantId(tenant),
+                    PartitionId(1),
+                    crate::feed::FeedCursor::START,
+                    256,
+                    source,
+                )
+                .expect_err("gw is not an admin app");
+            assert_eq!(
+                (error.kind, error.no_mutation),
+                (
+                    rdb_core::contracts::errors::ErrorKind::InvalidArgument,
+                    true
+                ),
+                "tenant {tenant} from {source:?}: {error:?}"
+            );
+            assert!(
+                error.detail.contains("app gw may not read the change feed")
+                    && error.detail.contains("(#151)"),
+                "{error:?}"
+            );
+        }
+    }
+
     let error = app
         .changes(
             PartitionId(1),
@@ -3386,7 +3499,9 @@ fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
     );
 
     app.shutdown();
+    gw.shutdown();
     drop(app_net);
+    drop(gw_net);
     four.db.shutdown();
     three.db.shutdown();
     two.db.shutdown();

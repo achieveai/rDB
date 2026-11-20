@@ -2,7 +2,7 @@
 
 **Status:** Accepted, option A (issue #87, 2026-11-19). Built: slice 1 (in process) and slice 2
 (the wire, protocol 10). **The current contract is the dated amendments below, newest last**
-(2026-11-20, #170 review r1). Deferred: retention (`History` is not trimmed yet, #61) and
+(2026-11-20, #170 review r1 and r2). Deferred: retention (`History` is not trimmed yet, #61) and
 long-poll (slice 4). The prefix filter (slice 3) is dropped from #87: shared config stays in
 rEtcd (lead, 2026-11-19). The Decision, Consequences and Verification sections below are
 historical: they were written on 2026-10-23, while this ADR was Proposed.
@@ -102,6 +102,20 @@ holds at the same stamp and digest is served, even when a later generation linke
 max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
 envelope that does not decode) is `CORRUPT_HISTORY` with the feed's step, for every caller waiting
 on that copy. `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
+
+**Amended 2026-11-20 (#170 review r2): the feed fails closed for apps.** The owner ruled on
+2026-11-20 to fail closed until a certificate binds an app to its tenants (#151). Over the links a
+node serves `Changes` only to a node (`Label::Node`) or to an app on its `admin_apps`
+(`rdb_node --admin-apps`, `NetConfig::admin_apps`), which the operator trusts with every tenant,
+whatever tenant the call names. Any other app is refused `INVALID_ARGUMENT` with `no_mutation`,
+the reason "the change feed needs the admin certificate until tenants are bound to certificates
+(#151)". That is the refusal kind `sender_refused` already gives the admin-only calls: rdb has no
+`PERMISSION_DENIED`, and adding one changes the contracts surface; a dedicated kind can come with
+#151. A `Db` in the process that runs the nodes is trusted, as for every other call. The rule
+also covers what the tenant filter alone leaves visible in a shared partition: a page's `next`
+and a cursor's digest name positions and digests of records written by other tenants, so a
+plain app could map their write boundaries. Per-app tenant binding, and with it feed access for
+plain apps, comes with #151. This replaces slice 2's "any authenticated app may call it".
 
 ## Decision
 

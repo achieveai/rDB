@@ -134,8 +134,9 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,
 /// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
 /// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
-/// `INCOMPATIBLE_VERSION` by name rather than misread. Any app may call it, not only an admin
-/// app. Split from #107's bump, it would take `11`.
+/// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
+/// until tenants are bound to certificates (#151; [`sender_refused`]). Split from #107's bump,
+/// it would take `11`.
 pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
@@ -1091,6 +1092,8 @@ const DEFAULT_LR_ADMIN: &str = "admin";
 /// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
 ///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
 ///   reason is the whole refusal, which [`receive`] answers the call with;
+/// - a change feed call (`Changes`) names a tenant no certificate binds yet (#151), so only an
+///   app on `admin_apps` may send one (owner ruling 2026-11-20, fail closed);
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
 fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
@@ -1125,6 +1128,25 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                  rebuild a copy or forget a tail, and the node's operator names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",
+                to.0
+            ));
+        }
+        // #170 review (owner ruling 2026-11-20, fail closed): a feed call names its tenant but
+        // no certificate binds an app to one yet (#151), so only an app on `admin_apps`, whom
+        // the operator trusts with every tenant, may read the feed. Nodes are trusted (below).
+        (
+            Label::App(app),
+            WireMsg::Client {
+                call: wire::WireCall::Changes { .. },
+                to,
+                ..
+            },
+        ) if !admin_apps.contains(app) => {
+            return Some(format!(
+                "app {app} may not read the change feed on node {}: the change feed needs the \
+                 admin certificate until tenants are bound to certificates (#151); add {app} to \
+                 the node's admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) only if \
+                 it may read every tenant",
                 to.0
             ));
         }

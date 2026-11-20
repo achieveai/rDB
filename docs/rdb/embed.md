@@ -1620,8 +1620,10 @@ docker run --rm rdb-bf-node:dev help
 
 `Db::changes` lets your app read one partition's committed transactions in order. It works from
 any host: a node in your process, or one over the links, from an app that holds no copy as well as
-from a node. Any app may call it; it is not an admin call. Every write of your tenant comes back;
-a key-prefix filter is not offered yet.
+from a node. **Over the links only an admin app may call it** (`rdb_node --admin-apps`,
+`NetConfig::admin_apps`; `lr` runs as `admin`) until tenants are bound to certificates (#151); see
+"Tenants" below. In the process that runs the nodes, any `Db` may. Every write of the call's
+tenant comes back; a key-prefix filter is not offered yet.
 
 Each write is physical: the stored key, with its group and object id parsed out, and the stored
 value bytes. `FeedWrite.value` is `Some(bytes)`, the stored after-image, when the write stored a
@@ -1630,7 +1632,8 @@ there is nothing to decode. A physical delete removes one stored key, not necess
 object, which may keep other keys. Decode a value with `rdb-value`: `envelope::open`, then
 `cbor::decode` the payload. A `Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
 not read that format is answered `INCOMPATIBLE_VERSION` (upgrade the client) rather than misreading
-it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]`.
+it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]` (over the links it
+runs as app `admin` by default).
 
 Two uses it is built for:
 
@@ -1716,7 +1719,13 @@ loop {
   record before uploading it.
 - **One feed per partition.** A feed is one partition's order. Reading several partitions means
   one cursor each, and there is no order between them.
-- **Tenants (Q3).** The feed returns only your tenant's writes, the tenant of the call's
-  identity, as every other call uses. A record with none of your writes is skipped, and `next`
-  still moves past it. **Over the wire a tenant is asserted by the caller, not proved** (#151
-  tracks binding it to a certificate), so do not rely on it as an access boundary yet.
+- **Tenants (Q3).** The feed returns only the writes of the call's tenant, the tenant of its
+  identity, as every other call uses. A record with none of them is skipped, and `next` still
+  moves past it. **Over the wire a tenant is asserted by the caller, not proved** (#151 tracks
+  binding it to a certificate). So, by the owner's ruling of 2026-11-20, a node fails closed:
+  it serves the feed over the links only to another node or an admin app, which may read every
+  tenant. Any other app is refused `INVALID_ARGUMENT` (no mutation) with "the change feed needs
+  the admin certificate until tenants are bound to certificates (#151)", whatever tenant it
+  names. This also keeps a plain app from mapping other tenants' write positions and digests
+  through `next` and cursors. Do not give an app the admin certificate unless it may read every
+  tenant.

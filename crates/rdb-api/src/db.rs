@@ -3303,6 +3303,35 @@ impl Db {
         max: u32,
         source: Source,
     ) -> Result<FeedPage, ApiError> {
+        self.changes_under(self.identity(), partition, from, max, source)
+    }
+
+    /// [`Self::changes`] under another tenant's identity, as an app over the wire may claim
+    /// one (#170 review: the tenant rows).
+    #[cfg(test)]
+    pub(crate) fn changes_as(
+        &self,
+        tenant: TenantId,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        let identity = RequestIdentity {
+            tenant,
+            ..self.identity()
+        };
+        self.changes_under(identity, partition, from, max, source)
+    }
+
+    fn changes_under(
+        &self,
+        identity: RequestIdentity,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
         if partition.0 == 0 || partition.0 > self.route.partitions() {
             return Err(ApiError::invalid(format!(
                 "partition {} is not one of this database's {}",
@@ -3311,7 +3340,7 @@ impl Db {
             )));
         }
         let call = ClientCall::Changes {
-            identity: self.identity(),
+            identity,
             from,
             max,
         };
