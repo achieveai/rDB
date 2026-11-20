@@ -843,7 +843,9 @@ Never hand-edit a record in a live store.
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
 `admin route G` prints `route group G partition P owner node N token G.E addr ADDRESS`
 (`addr none` when no address is recorded). The address is shown with each control character
-and backslash escaped (`\r`, `\n`, `\u{1b}`, `\\`), so it stays on one line;
+and backslash escaped (`\r`, `\n`, `\u{1b}`, `\\`), and each Unicode line separator and bidi
+control as a visible escape (`\u{2028}`, `\u{202e}`), so it stays on one line in its stored
+order;
 `RouteInfo::app_address` still returns the stored bytes.
 
 ## 5. Reopening your folder

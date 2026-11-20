@@ -3271,18 +3271,39 @@ fn route_line(db: &Db, group: rdb_api::AffinityId) -> String {
 }
 
 /// `text` for one console line (#83 B2, PR #159 review): each control character and each
-/// backslash as its Rust escape (`\r`, `\n`, `\u{1b}`, `\\`), every other character as it is.
-/// So the escape cannot be confused with a stored backslash, and the line stays one line.
+/// backslash as its Rust escape (`\r`, `\n`, `\u{1b}`, `\\`), each Unicode line separator and
+/// bidi format control as a visible `\u{..}` escape ([`console_reorders`]), every other
+/// character as it is. So the escape cannot be confused with a stored backslash, the line
+/// stays one line, and what it shows is in the stored order.
 fn console_safe(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() || c == '\\' {
                 c.escape_debug().to_string()
+            } else if console_reorders(c) {
+                let code = u32::from(c);
+                format!("\\u{{{code:x}}}")
             } else {
                 c.to_string()
             }
         })
         .collect()
+}
+
+/// Characters that are not `is_control()`, yet break a console line or reorder what follows
+/// (PR #159 review r2): the line and paragraph separators U+2028 and U+2029, and the bidi
+/// format controls U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069.
+fn console_reorders(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}'
+            | '\u{2029}'
+            | '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The first `txn` op that names no group, refused above one partition (issue #79).
@@ -9668,11 +9689,49 @@ mod tests {
         (rt, cluster, db)
     }
 
+    /// #83 B2 (PR #159 review r2): `console_safe` shows each Unicode line separator and bidi
+    /// format control as a visible `\u{..}` escape, exactly, beside the control-character and
+    /// backslash escapes, and leaves other text, non-ASCII included, as it is. Cut: the
+    /// `console_reorders` arm removed, red at U+2028 (passed through raw). Unit (<1 ms).
+    #[test]
+    fn console_safe_escapes_line_separators_and_bidi_controls() {
+        for (c, shown) in [
+            ('\u{2028}', r"\u{2028}"),
+            ('\u{2029}', r"\u{2029}"),
+            ('\u{061c}', r"\u{61c}"),
+            ('\u{200e}', r"\u{200e}"),
+            ('\u{200f}', r"\u{200f}"),
+            ('\u{202a}', r"\u{202a}"),
+            ('\u{202b}', r"\u{202b}"),
+            ('\u{202c}', r"\u{202c}"),
+            ('\u{202d}', r"\u{202d}"),
+            ('\u{202e}', r"\u{202e}"),
+            ('\u{2066}', r"\u{2066}"),
+            ('\u{2067}', r"\u{2067}"),
+            ('\u{2068}', r"\u{2068}"),
+            ('\u{2069}', r"\u{2069}"),
+            ('\r', r"\r"),
+            ('\u{1b}', r"\u{1b}"),
+            ('\\', r"\\"),
+        ] {
+            assert_eq!(
+                console_safe(&format!("a{c}b")),
+                format!("a{shown}b"),
+                "{c:?}"
+            );
+        }
+        assert_eq!(
+            console_safe("gw-é.例:8443/ü?x=1"),
+            "gw-é.例:8443/ü?x=1",
+            "other text as it is"
+        );
+    }
+
     /// #83 B2 (PR #159 review): `admin route G` ends `addr none` while the owner's record is
     /// layout 1, and names the owner's app address once its record holds one (layout 2). The
-    /// address is stored with CR, LF, ESC and a backslash: the line stays one physical line,
-    /// with each shown as its escape, while `RouteInfo::app_address` still returns the stored
-    /// bytes exactly. The records are written before the first lookup, and the second after the
+    /// address is stored with CR, LF, ESC, a backslash, U+2028 and two bidi controls: the line
+    /// stays one physical line, with each shown as its escape, while `RouteInfo::app_address`
+    /// still returns the stored bytes exactly. The records are written before the first lookup, and the second after the
     /// one-second address cache, so no cached answer masks either. Cut: `route_line` prints
     /// the raw address, red at "one line". Integration (~5 s): three real rEtcd voters and one
     /// open.
@@ -9707,14 +9766,18 @@ mod tests {
         assert!(line.ends_with(" addr none"), "{line}");
         let owner = db.route(group).expect("a route").owner.0;
 
-        let stored = "gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y";
+        let stored =
+            "gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y\u{2028}\u{202e}z\u{2066}";
         write(owner, Some(stored));
         std::thread::sleep(Duration::from_millis(1_100));
         let line = route_line(&db, group);
-        assert!(!line.contains(['\r', '\n', '\u{1b}']), "one line: {line:?}");
+        assert!(
+            !line.contains(['\r', '\n', '\u{1b}', '\u{2028}', '\u{202e}', '\u{2066}']),
+            "one line: {line:?}"
+        );
         assert!(
             line.ends_with(
-                r" addr gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y"
+                r" addr gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y\u{2028}\u{202e}z\u{2066}"
             ),
             "{line}"
         );
