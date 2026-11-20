@@ -812,24 +812,77 @@ fn f87_1_measure_write_p99_with_tailing_consumers() {
     }
 }
 
-/// Slice 1 keeps the feed off the wire: a `Changes` call does not convert to a `WireCall`, and
-/// the refusal names slice 2, so a remote caller is told why rather than "unreachable".
-/// Cut: convert `Changes` to a `WaitDurable` frame, red.
-#[test]
-fn f87_1_changes_refuses_the_wire_until_slice_2() {
-    let call = ClientCall::Changes {
-        identity: RequestIdentity {
-            tenant: TENANT,
-            client: ClientId(1),
-            request: RequestId(1),
-        },
-        from: FeedCursor::START,
-        max: 10,
-    };
-    match crate::net::wire::WireCall::try_from(&call) {
-        Err(crate::net::wire::WireError::Value(detail)) => {
-            assert!(detail.contains("slice 2"), "{detail}");
-        }
-        other => panic!("{other:?}"),
+/// Warm standby (ADR-rdb-0020, design S-E): a consumer replays node 2's feed from `START`, two
+/// records a page, decodes each after-image with rdb-value (the envelope, then the CBOR
+/// document) and keeps the last value per object. The map it builds equals what the owner
+/// reads for every object, including one written four times across two pages.
+/// Cut: `feed::page` returns its records in reverse order, red (`a` rebuilds as `v3`, not
+/// `v4`).
+/// Integration (~3 s): a fresh open and node 2's first fresh read.
+#[config_log::retcd_test]
+fn f87_2_replay_from_start_rebuilds_user_state() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let written: [(&[u8], &[u8]); 6] = [
+        (b"a", b"v1"),
+        (b"a", b"v2"),
+        (b"a", b"v3"),
+        (b"a", b"v4"),
+        (b"b", b"b1"),
+        (b"c", b"c1"),
+    ];
+    let mut last = Seq(0);
+    for (object, value) in written {
+        last = db.put(object, value, None).expect("a put").seq;
     }
+    let node2 = Source::Node(NodeId(2));
+    // Node 2 has applied every put, so each page below is two records and the pages fall
+    // [a v1, a v2], [a v3, a v4], [b, c].
+    tail(&db, FeedCursor::START, node2, last);
+
+    let mut state: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let (mut at, mut pages) = (FeedCursor::START, 0);
+    let deadline = Instant::now() + patience();
+    while at.seq < last {
+        assert!(Instant::now() < deadline, "replay stuck at {at:?}");
+        let page = match db.changes(PARTITION, at, 2, node2) {
+            Ok(page) => page,
+            Err(error) if error.kind == ErrorKind::Unavailable => {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(error) => panic!("replay from {at:?}: {error:?}"),
+        };
+        let FeedPage::Records { records, next, .. } = page else {
+            panic!("replay from {at:?}: {page:?}");
+        };
+        for write in records.iter().flat_map(|record| &record.writes) {
+            let stored = write.value.as_ref().expect("a put stores a value");
+            let opened = rdb_value::envelope::open(stored).expect("a sealed after-image");
+            assert_eq!(opened.kind, rdb_value::envelope::Kind::Document);
+            let rdb_value::value::Value::Bytes(bytes) =
+                rdb_value::cbor::decode(opened.payload).expect("a CBOR document")
+            else {
+                panic!("a put stores a byte string: {write:?}");
+            };
+            state.insert(write.object.to_vec(), bytes);
+        }
+        at = next;
+        pages += 1;
+    }
+    assert_eq!(pages, 3, "two records a page");
+
+    let mut owner: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for object in [b"a", b"b", b"c"] {
+        let (_, value) = db
+            .get(object)
+            .expect("the owner reads")
+            .value
+            .expect("written");
+        owner.insert(object.to_vec(), value.to_vec());
+    }
+    assert_eq!(state, owner, "the replayed state is the owner's");
+    assert_eq!(state.get(b"a".as_slice()), Some(&b"v4".to_vec()));
 }

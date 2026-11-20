@@ -9,7 +9,7 @@ dropped from #87: shared config stays in rEtcd (lead, 2026-11-19).
 create a log for that change in data … if some external application wants to consume this, and undo
 some of the changes rather than the database itself figuring all that thing out."
 
-**Amended 2026-11-19 (#87 slice 1).** What exists now, in process only:
+**Amended 2026-11-19 (#87 slice 1).** What exists now (slice 1 was in process only):
 
 - `Db::changes(partition, from, max, source)` reads one partition's committed `History` after a
   `FeedCursor` (the record's header stamp, its seq and its `record_digest`), from the owner
@@ -22,8 +22,13 @@ some of the changes rather than the database itself figuring all that thing out.
   its own read of `partitions/{p}` is fresh (the R2 bound: started within `grant_millis`, naming
   its generation and pinning it regular).
 - No key filter. Only `User` writes under the caller's tenant are returned (Q3); a record with
-  none is skipped and `next` moves past it. Over the wire a `Changes` call is
-  refused `INVALID_ARGUMENT` until slice 2.
+  none is skipped and `next` moves past it.
+
+**Amended 2026-11-20 (#87 slice 2).** The feed crosses the wire in protocol 10, the same bump as
+#107: `WireCall::Changes` and `WireAnswer::Changes(WireFeedPage)`, added last. A page carries
+`format` 1, physical writes (Q5a); another format lands as `INCOMPATIBLE_VERSION`. Any
+authenticated app may call it. `Source::Node(n)` reaches node `n` over the links from any host; a
+node with no copy answers `UNAVAILABLE`.
 
 ## Context
 

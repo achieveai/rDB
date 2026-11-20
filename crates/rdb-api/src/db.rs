@@ -3246,8 +3246,8 @@ impl Db {
     /// again at once while `more` is set. A page never passes what the copy may serve: the
     /// owner's published position, or what a regular secondary applied. `Source::Owner` goes to
     /// the owner this `Db` routes to, re-routed as any call is; `Source::Node(n)` goes to node
-    /// `n` alone, so the owner does no work. In process only until slice 2: over the wire it is
-    /// refused `INVALID_ARGUMENT`.
+    /// `n` alone, so the owner does no work. Either works from any host: a node in this process
+    /// or one over the links, from an app that holds no copy as well as from a node.
     ///
     /// The other answers say what to do: [`FeedPage::Behind`] keeps the cursor (wait, or ask
     /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
@@ -3261,7 +3261,9 @@ impl Db {
     /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
     /// nothing in its generation, or (a secondary) has no fresh read of `partitions/{p}` naming
     /// its generation with it pinned. The first call to a secondary starts that read and is
-    /// refused: call again. `UNAVAILABLE` also when no answer came within the read timeout.
+    /// refused: call again. `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// `Source::Node(n)` names a node this process has no link to. `INCOMPATIBLE_VERSION` when
+    /// the node sent records of a format this build does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, answers as a write
     /// would: `LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner.
     /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the

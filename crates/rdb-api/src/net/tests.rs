@@ -293,7 +293,111 @@ fn calls() -> Vec<ClientCall> {
         },
         give_up_live_copy: true,
     });
+    // Issue #87: a feed call, its cursor's three parts and its cap carried.
+    calls.push(ClientCall::Changes {
+        identity: identity(4, 36),
+        from: feed_cursor(7),
+        max: 12,
+    });
     calls
+}
+
+/// A feed cursor with every part set: stamp 3, seq `seq`, a digest of `seq` bytes.
+fn feed_cursor(seq: u64) -> crate::feed::FeedCursor {
+    crate::feed::FeedCursor {
+        generation: Generation(3),
+        seq: Seq(seq),
+        digest: Digest([seq as u8; 32]),
+    }
+}
+
+/// Every [`crate::feed::FeedPage`] kind: records with a write and a delete in two groups, and
+/// each answer that is not records.
+fn feed_pages() -> Vec<crate::feed::FeedPage> {
+    use crate::feed::{FeedPage, FeedRecord, FeedWrite};
+    use rdb_core::contracts::ids::AffinityId;
+    vec![
+        FeedPage::Records {
+            records: vec![
+                FeedRecord {
+                    at: feed_cursor(5),
+                    request: identity(2, 9),
+                    writes: vec![
+                        FeedWrite {
+                            group: AffinityId(1),
+                            object: Bytes::from_static(b"a\0b"),
+                            key: Bytes::from_static(b"key-a"),
+                            value: Some(Bytes::from_static(b"sealed")),
+                        },
+                        FeedWrite {
+                            group: AffinityId(4),
+                            object: Bytes::from_static(b"c"),
+                            key: Bytes::from_static(b"key-c"),
+                            value: None,
+                        },
+                    ],
+                },
+                FeedRecord {
+                    at: feed_cursor(6),
+                    request: identity(2, 10),
+                    writes: Vec::new(),
+                },
+            ],
+            next: feed_cursor(8),
+            more: true,
+        },
+        FeedPage::Records {
+            records: Vec::new(),
+            next: crate::feed::FeedCursor::START,
+            more: false,
+        },
+        FeedPage::Behind { head: Seq(4) },
+        FeedPage::Trimmed { floor: Seq(2) },
+        FeedPage::Rewound { to: feed_cursor(3) },
+    ]
+}
+
+/// Issue #87 slice 2: a feed page names its records' format, and a page of a format this build
+/// does not read lands as `INCOMPATIBLE_VERSION` naming both formats, never as records read in
+/// the wrong shape. Format 1 lands as the page it was.
+/// Cut: `FeedPage::try_from` skips the format check, red (the page lands as records).
+/// Unit (~1 ms): encode and decode only.
+#[test]
+fn f87_2_a_feed_page_of_another_record_format_is_refused_incompatible_version() {
+    for page in feed_pages() {
+        let WireAnswer::Changes(mut wired) = WireAnswer::carry(&Answer::Changes(page.clone()))
+        else {
+            panic!("a feed page is carried as a feed page");
+        };
+        assert_eq!(wired.format, wire::FEED_RECORD_FORMAT);
+        assert_eq!(wired.format, 1, "format 1 is physical writes");
+        let same = WireAnswer::Changes(wired.clone()).land();
+        assert_eq!(format!("{same:?}"), format!("{:?}", Answer::Changes(page)));
+        wired.format = 2;
+        let bytes = wire::encode(&Frame::Reply {
+            correlation: 1,
+            reply: WireReply::Answer(WireAnswer::Changes(wired)),
+        });
+        let Ok(Frame::Reply {
+            reply: WireReply::Answer(back),
+            ..
+        }) = wire::decode(&bytes)
+        else {
+            panic!("a format-2 page still decodes as a reply");
+        };
+        match back.land() {
+            Answer::Error { error, request } => {
+                assert_eq!(
+                    error.kind,
+                    rdb_core::contracts::errors::ErrorKind::IncompatibleVersion
+                );
+                assert!(error.to_string().contains("format 2"), "{error}");
+                assert!(error.to_string().contains("format 1 only"), "{error}");
+                assert_eq!(request, None);
+            }
+            other => panic!("a format-2 page landed as {other:?}"),
+        }
+    }
 }
 
 /// Every answer shape a node sends back: each `Seen`, and an error with a retry hint.
@@ -386,6 +490,9 @@ fn answers() -> Vec<Answer> {
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::TailForgotten("forget-tail: partition 1 re-plans from generation 4".to_owned()),
         Answer::Durable,
+    ]);
+    answers.extend(feed_pages().into_iter().map(Answer::Changes));
+    answers.extend([
         Answer::Moved(MoveAnswer {
             done: true,
             line: "already moved: node 3 to node 4".to_owned(),
@@ -634,6 +741,28 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         request: None,
     });
     assert_eq!(index(&error), 5);
+    // Issue #87: the feed's call and answer went last, after #105's.
+    let forgotten = WireAnswer::carry(&Answer::TailForgotten(String::new()));
+    assert_eq!(index(&forgotten), 9);
+    let page = WireAnswer::carry(&Answer::Changes(crate::feed::FeedPage::Behind {
+        head: Seq(1),
+    }));
+    assert_eq!(index(&page), 10);
+    let call = wire::WireCall::try_from(&ClientCall::Changes {
+        identity: identity(1, 1),
+        from: crate::feed::FeedCursor::START,
+        max: 1,
+    })
+    .expect("a feed call crosses");
+    let forget = wire::WireCall::ForgetTail {
+        identity: identity(1, 2),
+        through: None,
+        no_intact_copy: false,
+        give_up_live_copy: false,
+    };
+    let call_index = |call: &wire::WireCall| postcard::to_stdvec(call).expect("encodes")[0];
+    assert_eq!(call_index(&forget), 9);
+    assert_eq!(call_index(&call), 10);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
@@ -3093,4 +3222,161 @@ async fn an_accepted_socket_has_nodelay_set() {
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
     );
+}
+
+/// Issue #87 slice 2, design S-D from any host: an app that holds no copy, linked over mutual
+/// TLS as `gw` (not an admin app), reads node 2's feed through `Db::changes` with
+/// `Source::Node(2)`. Node 2 is a secondary in another process. It answers the owner's puts in
+/// order, with their object ids and request ids, until node 2's first fresh read it is refused
+/// `UNAVAILABLE` claiming no mutation. Node 4, a spare process that holds no copy, answers
+/// `UNAVAILABLE`, claiming no mutation.
+/// Cut: `sender_refused` treats `Changes` as admin-only, red (`gw` is refused).
+/// Integration (~10 s): a formation, four node opens, the app's open, real TLS on loopback.
+#[config_log::retcd_test]
+fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    let certs_dir = dir.path().join("certs");
+    let app_label = Label::App("gw".to_owned());
+    let mut labels: Vec<Label> = (1..=4).map(|n| Label::Node(NodeId(n))).collect();
+    labels.push(app_label.clone());
+    certs::generate(&certs_dir, &labels).expect("certs generate");
+    let data = dir.path().join("db");
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    {
+        let mut formed = rt
+            .block_on(crate::db::Db::open(
+                db_config(&data),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("formation opens");
+        formed.wait_ready(patience).expect("formation is ready");
+        formed.shutdown();
+    }
+
+    const PEERS: [u32; 4] = [1, 2, 3, 4];
+    let mut listeners: BTreeMap<NodeId, tokio::net::TcpListener> = BTreeMap::new();
+    let mut addrs = BTreeMap::new();
+    for node in PEERS {
+        let (listener, addr) = rt.block_on(config_testkit::ports::ephemeral_listener());
+        listeners.insert(NodeId(node), listener);
+        addrs.insert(NodeId(node), addr.to_string());
+    }
+    let start = |node: u32, listener: tokio::net::TcpListener| {
+        node_process(&rt, &data, &certs_dir, &store, node, listener, &addrs)
+    };
+    let mut four = start(4, listeners.remove(&NodeId(4)).expect("a listener"));
+    let mut three = start(3, listeners.remove(&NodeId(3)).expect("a listener"));
+    let mut two = start(2, listeners.remove(&NodeId(2)).expect("a listener"));
+    let mut one = start(1, listeners.remove(&NodeId(1)).expect("a listener"));
+    one.db
+        .wait_ready(patience)
+        .expect("node 1's process is ready");
+    let puts: Vec<crate::db::PutOk> = [b"x", b"y", b"z"]
+        .iter()
+        .map(|object| one.db.put(*object, b"v", None).expect("a put on node 1"))
+        .collect();
+    let last = puts.last().expect("three puts").seq;
+
+    let app_links = Links::new();
+    let app_net = {
+        let _entered = rt.enter();
+        Net::start(
+            NetConfig {
+                label: app_label.clone(),
+                boot: BootId(0),
+                tls: certs::load(&certs_dir, &app_label).expect("app certs"),
+                peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
+                dial: addrs.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                faults: Faults::new(),
+                admin_apps: BTreeSet::new(),
+            },
+            &app_links,
+            None,
+        )
+        .expect("the app's net starts")
+    };
+    let up: Vec<NodeId> = PEERS.map(NodeId).to_vec();
+    rt.block_on(app_net.wait_up(&up, patience))
+        .expect("the app links every node");
+    let app_dir = config_testkit::fs::temp_dir();
+    let mut app = rt
+        .block_on(crate::db::Db::open(
+            crate::db::DbConfig {
+                local: Vec::new(),
+                links: Some(app_links),
+                client: ClientId(9),
+                ..db_config(app_dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+        ))
+        .expect("the app-only open");
+
+    let (mut records, mut at) = (Vec::new(), crate::feed::FeedCursor::START);
+    let (mut refused, deadline) = (0, std::time::Instant::now() + patience);
+    while at.seq < last {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2's feed never reached {last:?} from the app: at {at:?}, {refused} refused"
+        );
+        match app.changes(PartitionId(1), at, 256, crate::db::Source::Node(NodeId(2))) {
+            Ok(crate::feed::FeedPage::Records {
+                records: page,
+                next,
+                ..
+            }) => {
+                records.extend(page);
+                at = next;
+            }
+            Ok(other) => panic!("node 2 answered the app {other:?}"),
+            Err(error) if error.kind == rdb_core::contracts::errors::ErrorKind::Unavailable => {
+                assert!(error.no_mutation, "{error:?}");
+                refused += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("node 2 refused the app: {error:?}"),
+        }
+    }
+    let seqs: Vec<Seq> = records.iter().map(|record| record.at.seq).collect();
+    assert_eq!(seqs, puts.iter().map(|put| put.seq).collect::<Vec<_>>());
+    for (record, put) in records.iter().zip(&puts) {
+        assert_eq!(record.request.request, put.request, "{record:?}");
+        assert_eq!(record.at.generation, put.generation, "{record:?}");
+    }
+    let objects: Vec<&[u8]> = records
+        .iter()
+        .flat_map(|record| record.writes.iter().map(|write| write.object.as_ref()))
+        .collect();
+    assert_eq!(objects, [b"x".as_slice(), b"y", b"z"]);
+
+    let error = app
+        .changes(
+            PartitionId(1),
+            crate::feed::FeedCursor::START,
+            256,
+            crate::db::Source::Node(NodeId(4)),
+        )
+        .expect_err("node 4 holds no copy");
+    assert_eq!(
+        error.kind,
+        rdb_core::contracts::errors::ErrorKind::Unavailable,
+        "{error:?}"
+    );
+    assert!(error.no_mutation, "{error:?}");
+    assert!(error.to_string().contains("node 4"), "{error}");
+
+    app.shutdown();
+    drop(app_net);
+    four.db.shutdown();
+    three.db.shutdown();
+    two.db.shutdown();
+    one.db.shutdown();
 }

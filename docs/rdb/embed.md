@@ -1561,9 +1561,16 @@ docker run --rm rdb-bf-node:dev help
 
 ## 9. Change feed (read every committed change, in order)
 
-`Db::changes` lets your app read one partition's committed transactions in order. It is in
-process only for now (#87 slice 1): over the wire it is refused `INVALID_ARGUMENT`. Every write of
-your tenant comes back; a key-prefix filter is not offered yet.
+`Db::changes` lets your app read one partition's committed transactions in order. It works from
+any host: a node in your process, or one over the links, from an app that holds no copy as well as
+from a node. Any app may call it; it is not an admin call. Every write of your tenant comes back;
+a key-prefix filter is not offered yet.
+
+Each write is physical: the stored key, with its group and object id parsed out, and the stored
+value bytes. Decode a value with `rdb-value`: `envelope::open`, then `cbor::decode` the payload. A
+`Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
+not read that format is answered `INCOMPATIBLE_VERSION` (upgrade the client) rather than misreading
+it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]`.
 
 Two uses it is built for:
 

@@ -127,6 +127,13 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
 /// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
 /// refused at the handshake. Upgrade: stop every node, upgrade, start every node.
+///
+/// `10` also carries issue #87's change feed, in the same bump: `WireCall::Changes`,
+/// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,
+/// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
+/// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
+/// `INCOMPATIBLE_VERSION` by name rather than misread. Any app may call it, not only an admin
+/// app. Split from #107's bump, it would take `11`.
 pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

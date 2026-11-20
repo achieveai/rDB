@@ -4839,12 +4839,9 @@ fn parse_cursor(text: &str) -> Result<rdb_api::FeedCursor, String> {
 }
 
 /// `changes`: one page of `Db::changes`, printed record by record. `false` when refused.
-fn changes_line(db: &Db, partition: &str, rest: &[&str]) -> Result<bool, String> {
-    let partition = rdb_api::PartitionId(
-        partition
-            .parse()
-            .map_err(|_| format!("{CHANGES_USAGE}: the partition is a number"))?,
-    );
+/// `changes`'s flags after the partition: the cursor (default `START`), the copy to read
+/// (`--at N`, any node; default the owner) and the most records (default a full page).
+fn changes_args(rest: &[&str]) -> Result<(rdb_api::FeedCursor, rdb_api::Source, u32), String> {
     let (mut from, mut source, mut max) = (
         rdb_api::FeedCursor::START,
         rdb_api::Source::Owner,
@@ -4855,11 +4852,21 @@ fn changes_line(db: &Db, partition: &str, rest: &[&str]) -> Result<bool, String>
         let value = words.next().ok_or_else(|| CHANGES_USAGE.to_owned())?;
         match *word {
             "--from" => from = parse_cursor(value)?,
-            "--at" => source = rdb_api::Source::Node(parse_node(value)?),
+            "--at" => source = rdb_api::Source::Node(parse_any_node(value)?),
             "--max" => max = value.parse().map_err(|_| CHANGES_USAGE.to_owned())?,
             _ => return Err(CHANGES_USAGE.to_owned()),
         }
     }
+    Ok((from, source, max))
+}
+
+fn changes_line(db: &Db, partition: &str, rest: &[&str]) -> Result<bool, String> {
+    let partition = rdb_api::PartitionId(
+        partition
+            .parse()
+            .map_err(|_| format!("{CHANGES_USAGE}: the partition is a number"))?,
+    );
+    let (from, source, max) = changes_args(rest)?;
     match db.changes(partition, from, max, source) {
         Ok(rdb_api::FeedPage::Records {
             records,
@@ -9982,5 +9989,30 @@ mod tests {
         };
         let line = put_text(&Ok(ok));
         assert!(line.starts_with("ok p=2 "), "{line}");
+    }
+
+    /// #87 slice 2 (lr walk on a four-node run): `changes --at 4` was refused "a node is 1, 2
+    /// or 3" before any call, so a copy that a move put on node 4 could not be tailed, nor a
+    /// spare asked. `--at` takes any node to `MAX_NODES`; the other flags keep their defaults.
+    /// Cut: `--at` parsed with `parse_node`, red at `--at 4`. Unit.
+    #[test]
+    fn f87_2_changes_at_takes_any_node() {
+        let (from, source, max) = changes_args(&["--at", "4"]).expect("--at 4");
+        assert_eq!(source, rdb_api::Source::Node(NodeId(4)));
+        assert_eq!(from, rdb_api::FeedCursor::START);
+        assert_eq!(max, rdb_api::feed::FEED_PAGE_RECORDS);
+        let max_node = rdb_api::db::MAX_NODES;
+        let at = max_node.to_string();
+        let (_, source, max) = changes_args(&["--max", "2", "--at", &at]).expect("--at max");
+        assert_eq!(source, rdb_api::Source::Node(NodeId(max_node)));
+        assert_eq!(max, 2);
+        let past = (max_node + 1).to_string();
+        for bad in [vec!["--at", "0"], vec!["--at", past.as_str()], vec!["--at"]] {
+            assert!(changes_args(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            changes_args(&[]).expect("no flags").1,
+            rdb_api::Source::Owner
+        );
     }
 }
