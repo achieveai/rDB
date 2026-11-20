@@ -418,6 +418,113 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
 
+**Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
+partitions were all promoted away while it was stopped comes back with a frozen grant, and
+nothing at that boot lifts it. `rdb_node` checks for that about once a second. It exits **75**
+(`EX_TEMPFAIL`) when its own `NodeStatus` has shown `replace_stopped` for 5 s, or its host has
+faulted (`fault` is set), **and** no `partitions/` record in the control store names it owner,
+in any lifecycle. A failed read of the control store keeps it up. Before it exits it prints
+`rdb_node restart-wanted node=N reason=R` (`replace_stopped` or `host_faulted`) and logs
+`rdb_node_restart_wanted`, then shuts down and prints `rdb_node stopped node=N` as usual.
+
+- **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
+  flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
+  other non-zero exit as a failure to report, not a restart to loop on.
+- `lr` supervises nothing. `lr status` shows such a node as `exited 75: restart wanted`, and
+  `lr start N` is the restart.
+- `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
+  embedder asks the same.
+
+**Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
+supervisor, restarts the node in place:
+
+1. Poll `db.restart_wanted()` about once a second. It blocks, as `node_status` does, and
+   keeps the 5 s hold between calls. It returns `Some(RestartReason::ReplaceStopped)` or
+   `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
+   cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
+   a partition, so a frozen node beside an owning one waits until the owner's partitions move.
+   Run one `Db` per node, as the gateway does, so each restarts on its own.
+2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
+   links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
+   than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
+   `Links` included), the old boot keeps answering its peers' probes, they keep their route
+   to it, and they never meet the new boot.
+3. Drop the `Db`, the `Net` and the `Links`.
+4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
+   at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
+   held.
+
+A peer sees every link to the old boot end, and its dials refused while nothing listens. When
+the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
+the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
+restart: the control store, the runtime and your app's own state stay as they are.
+
+### When a host is lost: automatic failover
+
+Start each node process with `rdb_node --failover` (`DbConfig::failover`). Then a lost host
+does not need an operator. The design and the measurements are in ADR-rdb-0025.
+
+**How long writes stop.** A partition stops taking writes for a while. How long depends on
+what the lost host was to it. These are the expected times at the default settings:
+
+| The lost host was the partition's | It ended (crash, `kill`) | It went silent (hang, pause) |
+|---|---|---|
+| owner | about 12 s | about 12 s |
+| copy (secondary) | about 13.5 s | about 17 s |
+| neither | no stop | no stop |
+
+- **A crash: every partition takes writes again within 15 s.** That is the pass/fail bound.
+- **A hang: about 17 s.** A silent host's sockets stay open, so the owner first waits to be
+  sure the copy is gone, not just slow. 25 s is the hard ceiling.
+- A loaded machine runs longer. One test run at load 47 took 13.7 s for a copy.
+- `rdb_node --failover` prints these figures once at open, as `rdb_node failover bound_ms=...`.
+
+**What your app sees during the stop.**
+
+- A write that gets no answer in time is `UNKNOWN_OUTCOME` ("no answer in ..."). It was sent.
+  It may still land. Ask `db.status` with the same request id, or `db.resend` it.
+- `UNAVAILABLE` with "nothing was sent" is different. It comes only when the write could not
+  be compiled in time, or the owner had no link at all. Nothing was written. Send it again as
+  a new write.
+- A read that gets no answer is `UNAVAILABLE`. A read changes nothing, so just retry.
+- Keep retrying with a short pause. After a timeout, the `Db` reads the partition's owner
+  again, so the next try goes to the new owner. You do not need to reopen anything.
+- `db.wait_ready` and `db.readiness` follow the new owner the same way.
+
+**A node that was lost and comes back.**
+
+- **After a crash,** restart it on its own folder. It rejoins as a copy by itself. It does not
+  get its partitions back. It can be made owner again by a later failover.
+- **After a hang,** the node may wake up with its grant frozen. It then runs but can never
+  lead. Restart it. `rdb_node` does this for you: it exits 75 for its supervisor (section 4,
+  "Supervising a node process"). An embedded `Db` polls `db.restart_wanted()` about once a
+  second. On `Some(RestartReason::ReplaceStopped)`, restart the `Db` and its `Net` in-process,
+  as in "Embedded restart" above. Run one `Db` per node.
+
+**Limits in this release.**
+
+- **Two copies of one partition down: that partition stops taking writes.** The one copy
+  left may be missing acknowledged writes, so it is never promoted. Other partitions fail
+  over as usual. When writes return depends on which copy comes back:
+  - The owner is alive and a copy returns: the owner adds it back, and writes return.
+  - The owner is dead and the owner returns: writes stay stopped until its other copy is
+    back too (#169, being fixed).
+  - The owner is dead and a copy that is not the owner returns: it is not added back. The
+    partition stays stopped until the owner returns (#177).
+- **#169:** the second case above.
+- **#177:** the third case above.
+- **A hung node that wakes up stays frozen until it is restarted** (#168). See above.
+- If a host hangs while it is the last reachable copy of a partition, and the partition's
+  other copies are also down, restarting that host does not bring the partition back; it
+  returns when one of its other copies returns. See #168 and #172.
+- **Tested on one machine.** Five node processes, each in its own Docker container, are the
+  closest run so far.
+
+<!-- #176: the Docker d1 result goes here: per-class outage times and the host load. -->
+
+<!-- S4 (membership, dev-s4): adding and removing a node goes here, with its limits: layout 3,
+the start check, the N-3 mixed-version rule, the R8-7 ruling, one change at a time. -->
+
 ### Fencing your own side effects
 
 Your app may do things outside rDB for a partition it leads: start a container, upload a

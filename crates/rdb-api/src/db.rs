@@ -114,6 +114,9 @@ pub const MAX_KEY: usize = 1_024;
 pub const MAX_PAGE: usize = 1_000;
 
 mod ack_floor;
+mod restart;
+
+pub use restart::RestartReason;
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
@@ -578,6 +581,9 @@ pub struct Db {
     /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
     /// be restarted once writes have stopped (M9 S2b, D3).
     ready_seen: AtomicBool,
+    /// When [`Db::restart_wanted`] first saw `replace_stopped` in the run of polls that has
+    /// seen it every time since, for its 5 s hold. `None` while not stopped.
+    restart_hold: Mutex<Option<Instant>>,
     /// The `nodes/` this open claimed, while the open is unfinished. Dropping the `Db` then
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
@@ -1953,6 +1959,7 @@ impl Db {
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened {
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
@@ -2200,6 +2207,7 @@ impl Db {
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind,
             opened: Opened {
                 base_boot: boot,
@@ -4566,6 +4574,71 @@ impl Db {
         statuses
     }
 
+    /// #81 V10: whether this process should restart its nodes, and why. One poll; call it about
+    /// once a second. Blocking, like [`Self::node_status`].
+    ///
+    /// `Some` when, at this poll, a node of this `Db` reports a host fault
+    /// ([`RestartReason::HostFaulted`]), or every poll for the last 5 s has seen
+    /// `replace_stopped` ([`RestartReason::ReplaceStopped`]: a promote froze the grant, and
+    /// nothing at this boot lifts it). And only when no `partitions/` record names one of this
+    /// `Db`'s nodes owner, in any lifecycle: a restart while it still owns a partition would cut
+    /// that partition's writes short of the planner's move. A poll whose status does not answer
+    /// starts the hold again. A control read that fails or does not answer within the read
+    /// timeout gives `None` (`db_restart_check_unread`).
+    ///
+    /// With several nodes in one `Db`, this is `None` while **any** of them owns a partition:
+    /// a frozen node beside an owning one stays frozen until the owner's partitions move. Run
+    /// one `Db` per node, as the gateway does, for each to restart on its own.
+    ///
+    /// On `Some`: [`Self::shutdown`], `Net::shutdown`, drop the `Db`, `Net` and `Links`, then
+    /// open again on the same folder with a fresh `Net` and `Links` on the same address.
+    /// `rdb_node` exits 75 instead, for its supervisor to do the same.
+    #[must_use]
+    pub fn restart_wanted(&self) -> Option<RestartReason> {
+        let statuses = self.node_status();
+        let now = Instant::now();
+        let stopped_since = {
+            let mut hold = lock(&self.restart_hold);
+            *hold = if statuses.is_empty() || !statuses.iter().any(|status| status.replace_stopped)
+            {
+                None
+            } else {
+                Some(hold.unwrap_or(now))
+            };
+            *hold
+        };
+        let faulted = statuses.iter().any(|status| status.fault.is_some());
+        restart::restart_due(stopped_since, faulted, now, || self.owns_no_partition())
+    }
+
+    /// [`Self::restart_wanted`]'s control read: whether no `partitions/` record names one of
+    /// this `Db`'s nodes owner. A failed or late read is `false`.
+    fn owns_no_partition(&self) -> bool {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            tracing::warn!(error = "no control store", "db_restart_check_unread");
+            return false;
+        };
+        let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        let (done, answer) = mpsc::channel();
+        rt.spawn(async move {
+            let _ = done.send(restart::owns_no_partition(&*store, &nodes).await);
+        });
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(Ok(none)) => none,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "db_restart_check_unread");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    error = "partitions/ did not answer within the read timeout",
+                    "db_restart_check_unread"
+                );
+                false
+            }
+        }
+    }
+
     /// Each node's state for `partition`, as [`Self::node_status`] answers for partition 1: in
     /// node order, with a node that does not answer within the read timeout left out.
     /// [`NodeStatus::committed_without`] is per partition, and this is how to read it on any
@@ -5010,6 +5083,7 @@ impl Db {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -5050,6 +5124,7 @@ impl Db {
             ack_floor: hand_tracker(),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -6094,6 +6169,9 @@ impl Db {
     }
 
     /// Stop every node and every control call. The control store stays the caller's.
+    ///
+    /// This does not stop the process links: call [`crate::net::Net::shutdown`] (or drop every
+    /// `Arc<Net>`, which the `Links` holds too) as well, or peers keep a route to this node.
     pub fn shutdown(&mut self) {
         if let Some(task) = self.opened.planner_task.take() {
             task.abort();
@@ -7780,6 +7858,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7994,6 +8073,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -8048,6 +8128,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -8114,6 +8195,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -8197,6 +8279,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -8271,6 +8354,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route {
@@ -8352,6 +8436,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -9865,6 +9950,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),

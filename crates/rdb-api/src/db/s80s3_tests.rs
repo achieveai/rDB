@@ -22,6 +22,7 @@ use super::reopen_tests::fast;
 use super::*;
 use crate::planner::{write_outage_bound, Failover, OutageClass, PROBE_PUT_TIMEOUT};
 use rdb_core::authority::grant::GrantRecord;
+use rdb_core::contracts::ids::ReplicaRole;
 
 /// How often a probe puts.
 const PROBE_GAP: Duration = Duration::from_millis(200);
@@ -172,8 +173,20 @@ fn survivor(lost: &Lost) -> NodeId {
 /// every partition until each class's expected bound has passed and every partition's last
 /// put landed, or until the scaled bound of the slowest class present runs out.
 fn lose_one(loss: Loss, timeouts: Timeouts, failover: Option<Failover>) -> Lost {
-    let mut rig = failover_rig(timeouts, failover);
+    let rig = failover_rig(timeouts, failover);
     let dead = victim(&rig);
+    lose(rig, dead, loss, timeouts, failover)
+}
+
+/// [`lose_one`] on a rig already running: a pre-loss value in every partition, then lose `dead`
+/// by `loss` and probe every partition as [`lose_one`] says.
+fn lose(
+    mut rig: Rig,
+    dead: NodeId,
+    loss: Loss,
+    timeouts: Timeouts,
+    failover: Option<Failover>,
+) -> Lost {
     let prober = (1..=S1B_K)
         .map(NodeId)
         .find(|node| *node != dead)
@@ -515,4 +528,369 @@ fn s80s3_a_silently_stopped_node_of_five_keeps_every_partition_writable() {
         "s80s3_a_silently_stopped_node_of_five_keeps_every_partition_writable",
     );
     reads_back(&lost, survivor(&lost));
+}
+
+/// The roles `partitions/{partition}` pins, by node.
+fn pinned_roles(rig: &Rig, partition: u32) -> BTreeMap<u32, ReplicaRole> {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(partition)).encode()),
+        }))
+        .expect("the store answers");
+    read.record
+        .and_then(|found| RecordMember::decode_all(&found.value))
+        .map(|members| members.iter().map(|m| (m.node.0, m.role)).collect())
+        .unwrap_or_default()
+}
+
+/// #80 S3 R2 (AC4, risk A2): after R1's kill, the dead node restarts on its own folder. Every
+/// partition whose ring seat named it pins it again as a regular copy, three regular copies
+/// each, with no operator action and one restart; it owns no partition (ownership never fails
+/// back); the pre-loss values and the probe's last landed value still read back, and a put lands
+/// in every partition. Integration (~40-70 s).
+/// Green on its first run (2026-11-20): the existing restart re-plan (`Host::peer_booted`, then
+/// `rejoin_if_stale`) re-adds the node, about 0.8 s after it is ready; design risk A2 did not
+/// occur. Cut: `peer_booted` checks no partition; partition 1 stays pinned to nodes 2 and 3
+/// only, red, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_a_killed_node_restarted_on_its_folder_is_pinned_again_everywhere() {
+    const TEST: &str = "s80s3_a_killed_node_restarted_on_its_folder_is_pinned_again_everywhere";
+    let mut lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let dead = lost.dead;
+    lost.rig.restart(dead, probe_timeouts());
+    lost.rig
+        .of(dead)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("node {} is ready again: {e}", dead.0));
+    let rejoined = Instant::now();
+    for p in (1..=S1B_P).filter(|p| ring(S1B_K, *p).copies.contains(&dead.0)) {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+        loop {
+            let roles = pinned_roles(&lost.rig, p);
+            let regular = roles
+                .values()
+                .filter(|role| **role != ReplicaRole::Shadow)
+                .count();
+            if roles
+                .get(&dead.0)
+                .is_some_and(|role| *role != ReplicaRole::Shadow)
+                && regular == 3
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p} never pins node {} regular with three regular copies: {roles:?}",
+                dead.0
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    tracing::info!(
+        node = dead.0,
+        rejoin_ms = ms(rejoined.elapsed()),
+        "s80s3_rejoined"
+    );
+    for p in 1..=S1B_P {
+        assert_ne!(
+            token_of(&lost.rig, p).1,
+            dead,
+            "partition {p} did not fail back"
+        );
+    }
+    reads_back(&lost, dead);
+    for (p, group) in &lost.groups {
+        put_lands(
+            lost.rig.of(dead),
+            *group,
+            b"s3-after",
+            p.to_string().as_bytes(),
+        );
+    }
+}
+
+/// Puts through `db` into `group` until one lands or `patience` runs out: the put, or the last
+/// refusal.
+fn put_within(db: &Db, group: AffinityId, patience: Duration) -> Result<PutOk, String> {
+    let deadline = Instant::now() + patience;
+    loop {
+        match db.put_in(group, b"s3-two", b"1", None) {
+            Ok(put) => return Ok(put),
+            Err(refused) if Instant::now() >= deadline => return Err(format!("{refused:?}")),
+            Err(_) => std::thread::sleep(PROBE_GAP),
+        }
+    }
+}
+
+/// #80 S3 R5 (AC6, #81 Q1 on the ring): five declared nodes, sixteen partitions, the planner on
+/// every node; two ring-adjacent nodes, 2 and 3, have their processes ended. A partition whose
+/// dead owner's only other copies are both down has one answering copy, so the planner refuses
+/// it (`planner_no_eligible_copy`, `lone_survivor`) and writes nothing to its record: the same
+/// owner and token, and no put lands. A partition whose dead owner has two answering copies is
+/// promoted and takes a put. A partition whose owner lives and has its two copies down takes
+/// no put either (it pauses, then is read-only: no copy can acknowledge) and keeps its owner;
+/// its owner's own drop re-plan may raise its token. Every other partition takes a put, and the
+/// writable ones read their pre-loss value back. Integration (~30-40 s).
+/// Two nodes down is beyond S3's promise (one host killed or hung), so the row stops there.
+/// Two restart findings are open (lead ruling, 2026-11-20).
+/// (a) #168: restarting node 3 brings nothing back. The promote of node 3's partitions
+/// froze `grants/3`, and a frozen node is never a promote target (`PromoteError::TargetFrozen`,
+/// #61 critic Y3).
+/// (b) #169: restarting node 2, the refused partitions' owner, with node 3 still down, it
+/// never recovers them (`wait_ready` times out with "recovery phase is partition 2: none"); it
+/// does once node 3 is back too.
+/// Cut: `choose_target` needs one candidate, not two; red, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are() {
+    const TEST: &str = "s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are";
+    let mut rig = failover_rig(probe_timeouts(), Some(Failover::default()));
+    let down = [2_u32, 3];
+    let via = NodeId(4);
+    let groups: BTreeMap<u32, AffinityId> =
+        (1..=S1B_P).map(|p| (p, group_of(rig.of(via), p))).collect();
+    for (p, group) in &groups {
+        put_lands(rig.of(via), *group, b"s3-pre", p.to_string().as_bytes());
+    }
+    for p in 1..=S1B_P {
+        let placed: BTreeSet<u32> = ring(S1B_K, p).copies.into_iter().collect();
+        pins_until(
+            &rig,
+            p,
+            Duration::from_secs(10),
+            "the ring's pins",
+            |pins| *pins == placed,
+        );
+    }
+    let tokens: BTreeMap<u32, ((u64, u64), NodeId)> =
+        (1..=S1B_P).map(|p| (p, token_of(&rig, p))).collect();
+    let both_down = |p: u32| {
+        let pins = pinned_nodes(&rig, p);
+        down.iter().all(|node| pins.contains(node))
+    };
+    let owner_down = |p: u32| down.contains(&tokens[&p].1 .0);
+    let lone: Vec<u32> = (1..=S1B_P)
+        .filter(|p| owner_down(*p) && both_down(*p))
+        .collect();
+    let promoted: Vec<u32> = (1..=S1B_P)
+        .filter(|p| owner_down(*p) && !both_down(*p))
+        .collect();
+    let owner_alone: Vec<u32> = (1..=S1B_P)
+        .filter(|p| !owner_down(*p) && both_down(*p))
+        .collect();
+    let rest: Vec<u32> = (1..=S1B_P)
+        .filter(|p| !lone.contains(p) && !promoted.contains(p) && !owner_alone.contains(p))
+        .collect();
+    tracing::info!(
+        ?lone,
+        ?promoted,
+        ?owner_alone,
+        ?rest,
+        "s80s3_two_down_classes"
+    );
+    assert!(
+        !lone.is_empty() && !promoted.is_empty(),
+        "the ring puts partitions in both"
+    );
+
+    let t0 = Instant::now();
+    for node in down {
+        rig.stop(NodeId(node));
+    }
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let db = rig.of(via);
+    for p in promoted.iter().chain(&rest) {
+        let put = put_within(db, groups[p], patience);
+        tracing::info!(
+            partition = p,
+            at_ms = ms(t0.elapsed()),
+            ok = put.is_ok(),
+            "s80s3_two_down_put"
+        );
+        put.unwrap_or_else(|e| panic!("partition {p} takes a put with two nodes down: {e}"));
+    }
+    for p in &owner_alone {
+        let put = put_within(db, groups[p], Duration::from_secs(5));
+        tracing::info!(
+            partition = p,
+            at_ms = ms(t0.elapsed()),
+            outcome = ?put.as_ref().map(|_| ()),
+            pins = ?pinned_roles(&rig, *p),
+            "s80s3_two_down_owner_alone"
+        );
+        assert!(
+            put.is_err(),
+            "partition {p}: no copy can acknowledge, yet a put landed"
+        );
+        // Its owner's own drop re-plan may raise the token; the owner stays.
+        assert_eq!(
+            token_of(&rig, *p).1,
+            tokens[p].1,
+            "partition {p}: not failed over"
+        );
+    }
+    for p in &lone {
+        let deadline = Instant::now() + patience;
+        loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), TEST);
+            let said = lines.iter().any(|line| {
+                line["@m"] == "planner_no_eligible_copy"
+                    && line["partition"] == *p
+                    && line["reason"] == "lone_survivor"
+            });
+            if said {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p}: no planner_no_eligible_copy lone_survivor"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            token_of(&rig, *p),
+            tokens[p],
+            "partition {p}: nothing written"
+        );
+        let put = db.put_in(groups[p], b"s3-two", b"1", None);
+        assert!(put.is_err(), "partition {p} takes no put: {put:?}");
+    }
+    let promotes: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| line["@m"] == "planner_promoted")
+            .collect();
+    for p in &lone {
+        assert!(
+            !promotes.iter().any(|line| line["partition"] == *p),
+            "partition {p} was not promoted: {promotes:?}"
+        );
+    }
+    for p in &promoted {
+        let (token, owner) = token_of(&rig, *p);
+        assert!(
+            token > tokens[p].0 && !down.contains(&owner.0),
+            "partition {p}: {owner:?}"
+        );
+    }
+
+    for p in promoted.iter().chain(&rest) {
+        let group = &groups[p];
+        let pre = db.get_in(*group, b"s3-pre").expect("a get");
+        assert_eq!(
+            pre.value.as_ref().map(|(_, v)| v.to_vec()),
+            Some(p.to_string().into_bytes()),
+            "partition {p}'s pre-loss value"
+        );
+    }
+}
+
+/// #80 S3 R3 (AC5): R1's kill, then R2's restart of the killed node V on its folder, until every
+/// partition whose ring seat names V pins it regular again with three regular copies and V's
+/// frozen grant is cleared (#81 X2: `planner_frozen_grant_cleared`). Then a second kill: M,
+/// the owner now of the lowest partition V owned before, whose copies are V and one other.
+/// Every partition takes a put again within the bound, as in R1: M's partitions move (that
+/// one with V a candidate beside the other copy), M's copy seats are dropped by the unreachable
+/// clock, the rest see no gap; nothing acknowledged is lost. Integration (~35-60 s).
+/// Cut: `Planner::sweep` skips `clear_frozen`; V's grant stays frozen after its restart, so V
+/// is never a candidate again ("grants/1 is still frozen after its restart"), red, observed
+/// 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_after_a_kill_and_restart_a_second_kill_keeps_every_partition_writable() {
+    const TEST: &str =
+        "s80s3_after_a_kill_and_restart_a_second_kill_keeps_every_partition_writable";
+    let mut lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let first = lost.dead;
+    let moved: Vec<u32> = lost
+        .seats
+        .iter()
+        .filter(|(_, seat)| **seat == Seat::Owner)
+        .map(|(p, _)| *p)
+        .collect();
+    lost.rig.restart(first, probe_timeouts());
+    lost.rig
+        .of(first)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("node {} is ready again: {e}", first.0));
+    for p in (1..=S1B_P).filter(|p| ring(S1B_K, *p).copies.contains(&first.0)) {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+        loop {
+            let roles = pinned_roles(&lost.rig, p);
+            let regular = roles
+                .values()
+                .filter(|role| **role != ReplicaRole::Shadow)
+                .count();
+            if roles
+                .get(&first.0)
+                .is_some_and(|role| *role != ReplicaRole::Shadow)
+                && regular == 3
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p} never pins node {} regular with three regular copies: {roles:?}",
+                first.0
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    // X2 lets the old boot's frozen grant go once the node owns nothing; until then it is no
+    // promote candidate, so the second kill is measured from there.
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    while grant_of(&lost.rig, ControlKey::Grant(first)).is_some_and(|grant| grant.frozen) {
+        assert!(
+            Instant::now() < deadline,
+            "grants/{} is still frozen after its restart",
+            first.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let lowest = *moved.first().expect("the first kill moved a partition");
+    let second = token_of(&lost.rig, lowest).1;
+    assert!(
+        second != first && pinned_nodes(&lost.rig, lowest).contains(&first.0),
+        "partition {lowest}: owner {second:?}, node {} a copy",
+        first.0
+    );
+    tracing::info!(
+        first = first.0,
+        second = second.0,
+        partition = lowest,
+        "s80s3_second_kill"
+    );
+    let lost = lose(
+        lost.rig,
+        second,
+        Loss::Kill,
+        probe_timeouts(),
+        Some(Failover::default()),
+    );
+    after_loss(&lost, TEST);
+    reads_back(&lost, first);
+    // The restarted node was a candidate for that partition (X2), not left out as frozen.
+    let decided: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| {
+                line["@m"] == "planner_promote_decision"
+                    && line["partition"] == lowest
+                    && line["dead"] == second.0
+            })
+            .collect();
+    assert!(
+        decided.iter().any(|line| line["answering"]
+            .as_str()
+            .is_some_and(|nodes| nodes.contains(&first.0.to_string()))),
+        "partition {lowest}: node {} answers as a candidate: {decided:?}",
+        first.0
+    );
+    let (_, owner) = token_of(&lost.rig, lowest);
+    tracing::info!(
+        partition = lowest,
+        owner = owner.0,
+        "s80s3_second_kill_moved"
+    );
 }

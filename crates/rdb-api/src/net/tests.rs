@@ -2568,6 +2568,8 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
     });
     let boot = BootId(22);
     let (first_tx, _first_out) = tokio::sync::mpsc::unbounded_channel();
@@ -2644,6 +2646,8 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
     });
     let net = Arc::new(Net {
         shared: Arc::clone(&shared),
@@ -2873,6 +2877,8 @@ fn a_future_or_duplicate_clock_echo_is_not_a_round() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
     });
     let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
     let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
