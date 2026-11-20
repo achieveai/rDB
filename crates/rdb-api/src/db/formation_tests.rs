@@ -4715,6 +4715,31 @@ fn own83_b2_12_a_marker_that_cannot_be_staged_refuses_until_it_can() {
     late_b_is_refused(&fence, A, r);
 }
 
+/// own83_b2_13 (#83 B2, PR #159 review r3, T48): a lone `app-addr-pending.new`, as a crash
+/// between staging and the rename leaves it, says nothing: the rename never happened, so no
+/// write was sent after it. On a settled folder whose record holds A, with only the staged file
+/// there, an open with A succeeds and writes nothing: the record and its revision as they were,
+/// no `nodes/` put, no final marker, and the staged file left in place. Cut: the staged file
+/// read as a marker (`pending_app_addr` true when it is there), red at "nothing written".
+/// Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_13_a_lone_staged_marker_is_not_a_marker() {
+    const A: &str = "gw-1.a:8443";
+    let fence = Fence::new(A);
+    fence.open(A).expect("settled: a restart with A");
+    let settled = fence.record();
+    let staged = fence.dir.0.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    std::fs::write(&staged, format!("{}\n", settled.1)).expect("a staged file, no rename");
+    let puts = fence.node_puts();
+    fence
+        .open(A)
+        .expect("an open with A beside a lone staged file");
+    assert_eq!(fence.record(), settled, "nothing written");
+    assert_eq!(fence.node_puts(), puts, "no put");
+    assert!(!fence.marked(), "no final marker");
+    assert!(staged.exists(), "the staged file is left in place");
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 
