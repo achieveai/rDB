@@ -435,7 +435,8 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
 - **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
   flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
   other non-zero exit as a failure to report, not a restart to loop on.
-- `lr` supervises nothing. `lr status` shows such a node as `exited 75: restart wanted`, and
+- `lr` supervises nothing. `lr status` shows such a node as `stopped: restart wanted` (it reads
+  the printed `restart-wanted` line, not the exit status), and
   `lr start N` is the restart.
 - `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
   embedder asks the same.
