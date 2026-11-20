@@ -66,8 +66,9 @@ use rdb_core::{
     replication::{
         append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit, UNSOLICITED},
         retention::{
-            cap_seq, retention_floor, RetentionDecision, RetentionHold, RetentionInput,
-            RetentionSamples, HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
+            cap_seq, needs_history_budget, overrun_action, retention_floor, OverrunAction,
+            RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
+            HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
         },
         wire, Replication,
     },
@@ -323,6 +324,15 @@ pub struct Dispatcher {
     /// `history_copy_behind_floor` for, until it is counted again: the alert is logged once.
     /// Process memory.
     behind_floor: BTreeSet<(NodeId, PartitionId, CopyId)>,
+    /// Per `(source, partition, copy)`, the overruns in a row of that copy's transfers (issue
+    /// #61 S3-R4 (b), owner ruling 2026-11-20, option 1): one more each time the cap ends one
+    /// `budget_overran`, reset when a transfer of the copy is released `caught_up`. At
+    /// [`overrun_action`]'s give-up the source offers that copy no more. Process memory.
+    overruns: BTreeMap<(NodeId, PartitionId, CopyId), u32>,
+    /// Per `(source, partition, copy)`, the operator text of a copy the source gave up on
+    /// ([`needs_history_budget`]), the twin of the host's `NodeStatus::needs_operator`; cleared
+    /// with the count. Process memory.
+    needs_operator: BTreeMap<(NodeId, PartitionId, CopyId), String>,
     /// Each node's inventory pin per partition (issue #61, design 3.5; the host's
     /// `inventory_pins`): taken at restart for every partition its engine holds, and on every
     /// inventory it reports. While held the retention duty trims nothing (`InventoryPinned`).
@@ -485,6 +495,8 @@ impl Dispatcher {
             snapshot_installs: BTreeMap::new(),
             retention_samples: BTreeMap::new(),
             behind_floor: BTreeSet::new(),
+            overruns: BTreeMap::new(),
+            needs_operator: BTreeMap::new(),
             inventory_pins: BTreeMap::new(),
             grace: BTreeMap::new(),
             #[cfg(test)]
@@ -2160,6 +2172,21 @@ impl Dispatcher {
             );
             return Ok(());
         }
+        // Owner ruling 2026-11-20, option 1: after the give-up the copy is offered nothing more
+        // until a caught-up release resets its count; `needs_operator` names it meanwhile.
+        if let Some(&attempts) = self.overruns.get(&key) {
+            if overrun_action(attempts) == OverrunAction::GiveUp {
+                tracing::info!(
+                    node = node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    barrier = barrier.0,
+                    attempts,
+                    "snapshot_catchup_given_up"
+                );
+                return Ok(());
+            }
+        }
         // Keyed by generation too (lead ruling R18), as the host's: a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
         if self.snapshots_served.get(&key) == Some(&(generation, barrier)) {
@@ -2279,9 +2306,40 @@ impl Dispatcher {
         self.snapshot_offer(to, &offer, scheduler)
     }
 
+    /// The overruns in a row of `copy`'s transfers from `node` on `partition` (owner ruling
+    /// 2026-11-20, option 1): 0 when none, or since a caught-up release.
+    #[must_use]
+    pub fn overruns(&self, node: NodeId, partition: PartitionId, copy: CopyId) -> u32 {
+        self.overruns
+            .get(&(node, partition, copy))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The operator text for `copy` once `node` gave up offering it on `partition`, the twin of
+    /// the host's `NodeStatus::needs_operator`; `None` before the give-up and after a reset.
+    #[must_use]
+    pub fn needs_operator(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        copy: CopyId,
+    ) -> Option<&str> {
+        self.needs_operator
+            .get(&(node, partition, copy))
+            .map(String::as_str)
+    }
+
     /// End transfer `key` and forget its barrier, unless it ended `refused` (rev 5 M1: no
-    /// re-offer at that `S`), logged `event{why}`: the host's `end_transfer`.
+    /// re-offer at that `S`), logged `event{why}`: the host's `end_transfer`. A `caught_up`
+    /// release also resets the copy's overrun count and its `needs_operator`.
     fn end_transfer(&mut self, key: (NodeId, PartitionId, CopyId), why: &str, event: &'static str) {
+        // A caught-up copy has its history: its overrun count starts again (owner ruling
+        // 2026-11-20, option 1), whether or not a transfer is still open.
+        if why == "caught_up" {
+            self.overruns.remove(&key);
+            self.needs_operator.remove(&key);
+        }
         let Some(transfer) = self.snapshot_transfers.remove(&key) else {
             return;
         };
@@ -3434,8 +3492,11 @@ impl Dispatcher {
     /// * On a primary, the counted copies are every other copy its tracker's active predicates
     ///   name, at [`known`] durable. A secondary passes none.
     /// * Each open snapshot transfer this node serves pins its `S`. A pin the cap overran is
-    ///   logged `history_budget_overran_pin` and its transfer ends (`budget_overran`), so the
-    ///   copy's next ask opens a new one.
+    ///   logged `history_budget_overran_pin{attempts, gave_up}` and its transfer ends
+    ///   (`budget_overran`), so the copy's next ask opens a new one, until [`overrun_action`]
+    ///   gives up on the copy: then `history_budget_gave_up` names it in
+    ///   [`Self::needs_operator`] and it is offered nothing more until a `caught_up` release
+    ///   (owner ruling 2026-11-20, option 1).
     /// * A copy behind the floor is logged `history_copy_behind_floor` once, until it is counted
     ///   again.
     /// * A hold ([`Self::retention_hold`]) trims nothing, logged `history_trim_held{reason}`.
@@ -3538,15 +3599,33 @@ impl Dispatcher {
             }
         }
         for (key, at) in served.iter().filter(|(_, at)| *at < floor.floor) {
+            let attempts = self.overruns.entry(*key).or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            let attempts = *attempts;
+            let gave_up = overrun_action(attempts) == OverrunAction::GiveUp;
             tracing::warn!(
                 node = node.0,
                 partition = partition.0,
                 copy = key.2 .0,
                 pin = at.0,
                 floor = floor.floor.0,
+                attempts,
+                gave_up,
                 "{HISTORY_BUDGET_OVERRAN_PIN}"
             );
             self.end_transfer(*key, "budget_overran", "snapshot_transfer_abandoned");
+            if gave_up {
+                let needs = needs_history_budget(key.2, node, attempts);
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    copy = key.2 .0,
+                    attempts,
+                    needs_operator = %needs,
+                    "history_budget_gave_up"
+                );
+                self.needs_operator.insert(*key, needs);
+            }
         }
         if floor.floor > prev {
             self.trim_history(node, partition, floor.floor)?;
@@ -6610,34 +6689,11 @@ mod dormant_twin_tests {
         sync_owner(dispatcher, to);
     }
 
-    /// Issue #61 S3-R4, part (a), as the lead settled it (2026-11-20): a transfer the cap
-    /// overruns ends and is re-offered, and the re-offer completes.
-    ///
-    /// **The world.** Node 1 serves generation 1 through [`HEAD`]; node 3, copy 2, is empty
-    /// with a live receiver. Pages hold one key and node 3's pull is held at page 2, so node
-    /// 1's transfer stays open, pinned at `S` = [`HEAD`]. Node 1 then applies three records
-    /// more, and a duty round with a budget that holds only the last three passes the pin.
-    ///
-    /// **Asserted.** The round answers `F` = 4, naming the overran pin 3. It warns
-    /// `history_budget_overran_pin` once and ends the transfer `budget_overran`, and only then
-    /// trims ladder and engine to 4. Node 3's next ask opens a new transfer at the head, 6,
-    /// whose offer replaces the held install and completes: node 3 holds 6, re-seeded at node
-    /// 1's head, no install is left open, and its ACK is queued for node 1.
-    ///
-    /// **Differs.** As in
-    /// [`t61_sim_s2_r4_a_source_lost_mid_transfer_is_replaced_by_the_new_primary`], the release
-    /// on `CopyCaughtUp` needs the ACK stepped through node 1's R1, and is pinned by m10's
-    /// `t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head`.
-    /// What repeated overruns do is part (b), which waits for the owner's ruling.
-    ///
-    /// Cuts: the overrun silent (no warn), red; the transfer kept, red (the trim is refused
-    /// `transfer_pinned`); the transfer ended `refused`, which keeps its barrier, red (the `why`).
-    /// Unit, under a second.
-    #[config_log::retcd_test]
-    fn t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes() {
-        const METHOD: &str = "t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes";
+    /// Node 1 serves generation 1 through [`HEAD`]; node 3, copy 2, is empty with a live
+    /// receiver. Pages hold one key and node 3's pull is held at page 2, so a transfer node 1
+    /// opens for copy 2 stays open, pinned at its `S`. Returns node 3.
+    fn held_transfer_world() -> (Dispatcher, DormantSeed, NodeId) {
         let (mut dispatcher, seed) = serving_owner();
-        let mut scheduler = Scheduler::new();
         let three = NodeId(3);
         dispatcher.register_node(three, BootId(1));
         dispatcher.engines.insert(three, MemoryEngine::new(three));
@@ -6659,6 +6715,235 @@ mod dormant_twin_tests {
         sync_owner(&mut dispatcher, HEAD);
         dispatcher.snapshot_hooks.page_keys = Some(1);
         dispatcher.snapshot_hooks.pages_held_from = Some(2);
+        (dispatcher, seed, three)
+    }
+
+    /// Copy 2's transfer from node 1, if one is open: its `S`.
+    fn copy_2_transfer(dispatcher: &Dispatcher) -> Option<Seq> {
+        dispatcher
+            .snapshot_transfers
+            .get(&(OWNER, P, CopyId(2)))
+            .map(|transfer| transfer.at)
+    }
+
+    /// Node 3 asks for copy 2 until node 1 holds a transfer open for it (a refill may answer
+    /// the first ask), at most twice. Returns the transfer's `S`, `None` when none opened.
+    fn copy_2_asks(dispatcher: &mut Dispatcher, scheduler: &mut Scheduler) -> Option<Seq> {
+        for _ in 0..2 {
+            if copy_2_transfer(dispatcher).is_some() {
+                break;
+            }
+            dispatcher
+                .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD), scheduler)
+                .expect("served");
+        }
+        copy_2_transfer(dispatcher)
+    }
+
+    /// One overrun of copy 2's open transfer: node 1 applies three records past its head, and a
+    /// duty round at `now`, whose budget holds only those three, passes the transfer's pin.
+    fn overrun_copy_2(dispatcher: &mut Dispatcher, seed: &DormantSeed, now: Tick) {
+        let pin = copy_2_transfer(dispatcher).expect("a transfer is open");
+        let head = dispatcher.engines[&OWNER]
+            .buffered_applied(P, Generation(1))
+            .0;
+        owner_applies(dispatcher, seed.lineage, head + 1, head + 3);
+        let tight = super::RetentionConfig {
+            keep_millis: 3_600_000,
+            budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(head + 1)),
+            ..RETAIN
+        };
+        let decision = dispatcher
+            .retention_duty(OWNER, P, now, tight)
+            .expect("duty");
+        let RetentionDecision::Floor(floor) = decision else {
+            panic!("held: {decision:?}");
+        };
+        assert_eq!(floor.overran_pins, vec![pin], "the cap passes the pin");
+    }
+
+    /// `history_budget_overran_pin`'s `(attempts, gave_up)` for copy 2, in order.
+    fn overran_attempts(method: &str) -> Vec<(Option<u64>, Option<bool>)> {
+        logged(method, "history_budget_overran_pin")
+            .iter()
+            .map(|line| (line["attempts"].as_u64(), line["gave_up"].as_bool()))
+            .collect()
+    }
+
+    /// Issue #61 S3-R4 part (b), owner ruling 2026-11-20, option 1: after three overruns in a
+    /// row of one copy's transfer, the source stops re-offering it, warns once with
+    /// `gave_up = true`, and names the copy and the remedy in `needs_operator`.
+    ///
+    /// **The world.** [`held_transfer_world`]: node 3's pull is held, so each transfer node 1
+    /// opens for copy 2 stays open until the cap passes it ([`overrun_copy_2`]).
+    ///
+    /// **Asserted.** Three rounds of ask, then overrun, warn `history_budget_overran_pin` with
+    /// `attempts` 1, 2, 3 and `gave_up` false, false, true. `needs_operator` is empty until the
+    /// third and then reads [`needs_history_budget`] (copy 2, node 1, 3 attempts), logged once as
+    /// `history_budget_gave_up`. A fourth ask opens nothing (`snapshot_catchup_given_up`), so
+    /// three transfers opened in all, and a further duty round warns nothing more.
+    ///
+    /// Cuts: no give-up ([`overrun_action`] never answers `GiveUp`), red (the third warn's
+    /// `gave_up`); the give-up at 1, red (the first warn's). Unit, under a second.
+    ///
+    /// [`needs_history_budget`]: rdb_core::replication::retention::needs_history_budget
+    /// [`overrun_action`]: rdb_core::replication::retention::overrun_action
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_three_overruns_in_a_row_give_up_the_copy() {
+        use rdb_core::replication::retention::needs_history_budget;
+
+        const METHOD: &str = "t61_sim_s3_r4b_three_overruns_in_a_row_give_up_the_copy";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        for round in 1..=3_u32 {
+            assert_eq!(
+                dispatcher.needs_operator(OWNER, P, CopyId(2)),
+                None,
+                "round {round}"
+            );
+            assert!(
+                copy_2_asks(&mut dispatcher, &mut scheduler).is_some(),
+                "round {round} re-offers"
+            );
+            overrun_copy_2(&mut dispatcher, &seed, Tick(u64::from(round)));
+            assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), round);
+        }
+        assert_eq!(
+            overran_attempts(METHOD),
+            vec![
+                (Some(1), Some(false)),
+                (Some(2), Some(false)),
+                (Some(3), Some(true))
+            ]
+        );
+        let needs = needs_history_budget(CopyId(2), OWNER, 3);
+        assert!(needs.contains("raise history budget or reduce writes"));
+        assert_eq!(
+            dispatcher.needs_operator(OWNER, P, CopyId(2)),
+            Some(needs.as_str())
+        );
+        let gave_up: Vec<_> = logged(METHOD, "history_budget_gave_up")
+            .iter()
+            .map(|line| {
+                (
+                    line["copy"].as_u64(),
+                    line["needs_operator"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(gave_up, vec![(Some(2), Some(needs.clone()))], "once");
+
+        assert_eq!(
+            copy_2_asks(&mut dispatcher, &mut scheduler),
+            None,
+            "no fourth offer"
+        );
+        assert_eq!(logged(METHOD, "snapshot_transfer_opened").len(), 3);
+        assert!(!logged(METHOD, "snapshot_catchup_given_up").is_empty());
+        let head = dispatcher.engines[&OWNER]
+            .buffered_applied(P, Generation(1))
+            .0;
+        owner_applies(&mut dispatcher, seed.lineage, head + 1, head + 3);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(4), RETAIN)
+            .expect("duty");
+        assert_eq!(overran_attempts(METHOD).len(), 3, "no further warn");
+        assert_eq!(logged(METHOD, "history_budget_gave_up").len(), 1);
+    }
+
+    /// Issue #61 S3-R4 part (b), owner ruling 2026-11-20, option 1: the count is of overruns
+    /// **in a row**, so a caught-up release resets it.
+    ///
+    /// **Asserted.** Two overruns of copy 2's transfers, warned `attempts` 1 and 2. Node 1 then
+    /// opens a third transfer and R1's `CopyCaughtUp` for copy 2 reaches the dispatcher's own
+    /// arm, which releases it `caught_up`: the count is 0 again. The next transfer's overrun
+    /// warns `attempts` 1, `gave_up` false, and nobody needs the operator.
+    ///
+    /// **Differs.** The `CopyCaughtUp` effect is handed to [`Dispatcher::kernel`] directly
+    /// rather than stepped out of R1 from node 3's ACK, which
+    /// [`t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes`] notes needs R1's
+    /// own stepping; the arm it reaches is the one the run loop calls.
+    ///
+    /// Cut: no reset, red (the count stays 2, and the third overrun gives up). Unit, under a
+    /// second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_caught_up_release_resets_the_overrun_count() {
+        use rdb_core::contracts::event::{KernelEffect, ModuleName};
+        use rdb_core::contracts::ids::CorrelationId;
+
+        const METHOD: &str = "t61_sim_s3_r4b_a_caught_up_release_resets_the_overrun_count";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        for round in 1..=2 {
+            copy_2_asks(&mut dispatcher, &mut scheduler).expect("re-offered");
+            overrun_copy_2(&mut dispatcher, &seed, Tick(round));
+        }
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 2);
+
+        let at = copy_2_asks(&mut dispatcher, &mut scheduler).expect("a third transfer");
+        dispatcher
+            .kernel(
+                OWNER,
+                ModuleName::Replication,
+                &KernelEffect::CopyCaughtUp {
+                    copy: CopyId(2),
+                    head: at,
+                    digest: Digest::ROOT,
+                },
+                (OWNER, P, CorrelationId(0)),
+                &[],
+                &mut scheduler,
+            )
+            .expect("caught up");
+        let released: Vec<_> = logged(METHOD, "snapshot_transfer_released")
+            .iter()
+            .map(|line| line["why"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(released, vec![Some("caught_up".to_owned())]);
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 0, "reset");
+
+        copy_2_asks(&mut dispatcher, &mut scheduler).expect("offered again");
+        overrun_copy_2(&mut dispatcher, &seed, Tick(3));
+        assert_eq!(
+            overran_attempts(METHOD),
+            vec![
+                (Some(1), Some(false)),
+                (Some(2), Some(false)),
+                (Some(1), Some(false))
+            ]
+        );
+        assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
+    }
+
+    /// Issue #61 S3-R4, part (a), as the lead settled it (2026-11-20): a transfer the cap
+    /// overruns ends and is re-offered, and the re-offer completes.
+    ///
+    /// **The world.** Node 1 serves generation 1 through [`HEAD`]; node 3, copy 2, is empty
+    /// with a live receiver. Pages hold one key and node 3's pull is held at page 2, so node
+    /// 1's transfer stays open, pinned at `S` = [`HEAD`]. Node 1 then applies three records
+    /// more, and a duty round with a budget that holds only the last three passes the pin.
+    ///
+    /// **Asserted.** The round answers `F` = 4, naming the overran pin 3. It warns
+    /// `history_budget_overran_pin` once and ends the transfer `budget_overran`, and only then
+    /// trims ladder and engine to 4. Node 3's next ask opens a new transfer at the head, 6,
+    /// whose offer replaces the held install and completes: node 3 holds 6, re-seeded at node
+    /// 1's head, no install is left open, and its ACK is queued for node 1.
+    ///
+    /// **Differs.** As in
+    /// [`t61_sim_s2_r4_a_source_lost_mid_transfer_is_replaced_by_the_new_primary`], the release
+    /// on `CopyCaughtUp` needs the ACK stepped through node 1's R1, and is pinned by m10's
+    /// `t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head`.
+    /// What repeated overruns do is part (b):
+    /// [`t61_sim_s3_r4b_three_overruns_in_a_row_give_up_the_copy`].
+    ///
+    /// Cuts: the overrun silent (no warn), red; the transfer kept, red (the trim is refused
+    /// `transfer_pinned`); the transfer ended `refused`, which keeps its barrier, red (the `why`).
+    /// Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes() {
+        const METHOD: &str = "t61_sim_s3_r4_an_overran_transfer_ends_and_its_re_offer_completes";
+        let (mut dispatcher, seed, three) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
         // A refill, then the transfer at `S` = HEAD, offered at once and held at page 2.
         for _ in 0..2 {
             dispatcher
