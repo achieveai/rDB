@@ -7803,6 +7803,83 @@ fn issue107_m3_an_unpromoted_re_added_shadow_is_given_up_on_the_clock() {
     given_up_stays_out(&mut trio, METHOD, boot);
 }
 
+/// #107 M3 exit, review r1: the give-up budget belongs to the process the live re-add pinned.
+/// Node 3 is re-added far behind and held (as in the clock row). A commit that pins it at the
+/// same boot keeps its clock and blocks. Then node 3 restarts mid-catch-up: once node 1 pins
+/// its newer boot, the old tracking is gone, so the restarted copy is never given up on the old
+/// process's clock or blocks; it is promoted regular at the new boot, still with no tracking.
+/// Cut: `Host::rejoin_committed` retaining a held shadow by node and role only (no boot), red
+/// (the old boot's tracking held after the new boot is pinned).
+/// Integration (~10 s): the drop, 100 puts, the re-add, the restart's rejoin and promote.
+#[config_log::retcd_test]
+fn issue107_m3_a_restarted_re_added_shadow_starts_with_no_give_up_budget() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, false);
+    trio.ready();
+    for _ in 0..100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    trio.links.heal_all();
+    let held = trio.until(
+        "node 1 holds node 3's re-added shadow, between re-plans",
+        |trio| {
+            let owner = &trio.nodes[0].0;
+            let held = owner.live_readd.shadows.get(&(P1, NodeId(3))).copied()?;
+            (!owner.rejoins.contains_key(&P1)).then_some(held)
+        },
+    );
+    assert_eq!(held.boot, boot, "pinned at the boot it runs");
+
+    // The same boot pinned again: the budget it has spent is kept.
+    let owner = &mut trio.nodes[0].0;
+    owner
+        .live_readd
+        .shadows
+        .get_mut(&(P1, NodeId(3)))
+        .expect("held")
+        .blocks = 2;
+    let generation = owner.committed[&P1].new_generation;
+    owner.rejoin_committed(P1, generation);
+    let kept = owner.live_readd.shadows.get(&(P1, NodeId(3))).copied();
+    assert_eq!(
+        kept.map(|kept| (kept.since, kept.blocks, kept.boot)),
+        Some((held.since, 2, boot)),
+        "same boot: clock and blocks kept"
+    );
+
+    // Node 3 restarts mid-catch-up.
+    kill(&trio, 3, &[1, 2]);
+    let three = trio.nodes.remove(2);
+    restart_dead(&mut trio, (three, 3));
+    let reboot = trio.links.boot_of(NodeId(3)).expect("registered");
+    assert_ne!(reboot, boot);
+    let tracked = until_through_blocks(&mut trio, "node 1 pins node 3's new boot", |trio| {
+        let owner = &trio.nodes[0].0;
+        let committed = owner.committed.get(&P1)?;
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == NodeId(3) && member.boot == reboot)
+            .then(|| owner.live_readd.shadows.get(&(P1, NodeId(3))).copied())
+    });
+    assert_eq!(tracked, None, "the old boot's clock and blocks are cleared");
+    until_through_blocks(&mut trio, "node 3 regular at its new boot", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary)).then_some(())
+    });
+    assert!(
+        trio.nodes[0].0.live_readd.shadows.is_empty(),
+        "promoted: nothing held"
+    );
+}
+
 /// #107 M3 exit, the blocks: a promote re-plan for a re-added shadow that ends without
 /// committing counts one block, whatever ended it, and the third gives the shadow up. Here two
 /// end at a revocation A1 never answers (two `DrainProof`s lost, so `retry_blocked_rejoin`

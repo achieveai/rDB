@@ -1778,6 +1778,9 @@ struct ReaddShadow {
     since: Tick,
     /// Promote re-plans for it that ended without committing the promote.
     blocks: u32,
+    /// The boot the commit pinned it at. Its clock and blocks belong to that process: once a
+    /// newer boot of the node is pinned (it restarted), the tracking is cleared (review r1).
+    boot: BootId,
 }
 
 impl LiveReadd {
@@ -7647,14 +7650,17 @@ impl Host {
                         .any(|pin| pin.node == *node && pin.role == ReplicaRole::RegularSecondary)
             });
         }
-        // M3 exit: a re-added shadow promoted or left out is no longer held.
+        // M3 exit: a re-added shadow promoted, left out or restarted (a newer boot pinned) is
+        // no longer held; its clock and blocks belonged to the process the re-add pinned.
         if let Some(committed) = self.committed.get(&partition) {
             let pinned = &committed.committed.pinned_config.members;
-            self.live_readd.shadows.retain(|(at, node), _| {
+            self.live_readd.shadows.retain(|(at, node), held| {
                 *at != partition
-                    || pinned
-                        .iter()
-                        .any(|pin| pin.node == *node && pin.role == ReplicaRole::Shadow)
+                    || pinned.iter().any(|pin| {
+                        pin.node == *node
+                            && pin.role == ReplicaRole::Shadow
+                            && pin.boot == held.boot
+                    })
             });
         }
         let Some(Rejoin::Planned {
@@ -9347,6 +9353,7 @@ impl Host {
                     generation,
                     since,
                     blocks: 0,
+                    boot,
                 },
             );
         }
