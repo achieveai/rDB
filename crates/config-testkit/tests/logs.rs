@@ -202,7 +202,7 @@ fn lines_for_current_test_never_reads_a_line_still_being_written() {
 #[config_log::retcd_test]
 #[ignore = "run in a child process by lines_for_current_test_never_reads_a_line_still_being_written"]
 fn child_reads_its_log_while_long_lines_are_written() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     const METHOD: &str = "child_reads_its_log_while_long_lines_are_written";
     const ROUNDS: usize = 12;
@@ -211,17 +211,26 @@ fn child_reads_its_log_while_long_lines_are_written() {
     const LONG: &str = "concurrent long line";
     let twin = |round: usize| format!("{METHOD}_r{round}");
 
-    // The writer logs round `r`'s long line once every reader has started round `r`.
-    let started = AtomicUsize::new(0);
+    // Readers started so far, over all rounds. The writer logs round `r`'s long line once
+    // every reader has started round `r`.
+    let started = (Mutex::new(0usize), Condvar::new());
+    let start = |n: usize| {
+        *started.0.lock().unwrap_or_else(|e| e.into_inner()) += n;
+        started.1.notify_all();
+    };
     let span = tracing::Span::current();
     let failure = std::thread::scope(|scope| {
         scope.spawn(|| {
             let _entered = span.enter();
             let pad = "x".repeat(PAD);
             for round in 0..ROUNDS {
-                while started.load(Ordering::Acquire) < (round + 1) * READERS {
-                    std::thread::yield_now();
-                }
+                let count = started.0.lock().unwrap_or_else(|e| e.into_inner());
+                drop(
+                    started
+                        .1
+                        .wait_while(count, |n| *n < (round + 1) * READERS)
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
                 let method = twin(round);
                 tracing::info_span!("twin", testMethod = method.as_str()).in_scope(|| {
                     tracing::info!(round, pad = pad.as_str(), "concurrent long line");
@@ -230,7 +239,7 @@ fn child_reads_its_log_while_long_lines_are_written() {
         });
         let readers: Vec<_> = (0..READERS)
             .map(|reader| {
-                let (span, started) = (span.clone(), &started);
+                let (span, start) = (span.clone(), &start);
                 scope.spawn(move || {
                     let _entered = span.enter();
                     let rounds = std::panic::catch_unwind(|| {
@@ -238,7 +247,7 @@ fn child_reads_its_log_while_long_lines_are_written() {
                         for round in 0..ROUNDS {
                             let method = twin(round);
                             let in_twin = tracing::info_span!("twin", testMethod = method.as_str());
-                            started.fetch_add(1, Ordering::AcqRel);
+                            start(1);
                             loop {
                                 in_twin.in_scope(|| tracing::info!(reader, reads, "read marker"));
                                 let lines = config_testkit::logs::lines_for_current_test(
@@ -262,7 +271,7 @@ fn child_reads_its_log_while_long_lines_are_written() {
                     // A failed reader stops early; count its rounds started so the writer
                     // and the other readers can finish.
                     if rounds.is_err() {
-                        started.fetch_add(ROUNDS * READERS, Ordering::AcqRel);
+                        start(ROUNDS * READERS);
                     }
                     rounds
                 })
