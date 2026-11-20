@@ -1,4 +1,4 @@
-# rDB node image: one image, two roles (issue #85).
+# rDB node image: one image, three executables (issue #85, #80 S2).
 #   voter  -> config-server, the rEtcd voter (control plane)
 #   data   -> rdb_node, one rDB data node (example of rdb-api)
 #   dev    -> rdb_dev, an rDB app for admin and data lines (#80 S2)

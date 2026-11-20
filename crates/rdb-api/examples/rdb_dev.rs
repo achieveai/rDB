@@ -716,6 +716,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
+    // Review r1: without --control the run starts its own plaintext voters, so a TLS folder
+    // would be read by nothing.
+    if parsed.control_tls.is_some() && parsed.control.is_none() {
+        return Err("--control-tls needs --control: the rEtcd it dials over TLS".to_owned());
+    }
     app_only_check(&parsed)?;
     Ok(parsed)
 }
@@ -751,7 +756,6 @@ fn app_only_check(args: &Args) -> Result<(), String> {
     }
 }
 
-/// Whether `text` is `host:port`: a host, a colon, and a port number from 1 to 65535.
 /// The rEtcd client for `--control E`: plaintext, or mutual TLS under `--control-tls T` with
 /// the cluster id from the client certificate (#80 S2, ADR-rdb-0024).
 fn connect_control(
@@ -779,6 +783,7 @@ fn connect_control(
     Ok(client)
 }
 
+/// Whether `text` is `host:port`: a host, a colon, and a port number from 1 to 65535.
 fn is_host_port(text: &str) -> bool {
     text.rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
@@ -9913,5 +9918,121 @@ mod tests {
         };
         let line = put_text(&Ok(ok));
         assert!(line.starts_with("ok p=2 "), "{line}");
+    }
+
+    /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
+    /// `--control-tls` folder of its fixture's client certificate, and its client endpoints
+    /// followers first, so a client that cannot follow a leader hint fails (#80 S2 review r1).
+    fn tls_control(
+        rt: &tokio::runtime::Runtime,
+        cluster: config_core::ClusterId,
+        seed: u64,
+    ) -> (
+        config_testkit::Cluster,
+        Vec<String>,
+        std::path::PathBuf,
+        Box<dyn std::any::Any>,
+    ) {
+        let voters = rt.block_on(
+            config_testkit::Cluster::builder()
+                .nodes(3)
+                .cluster_id(cluster)
+                .storage(config_testkit::cluster::StorageKind::Ephemeral)
+                .mutual_tls(seed)
+                .authz(config_testkit::cluster::AuthzKind::Static(
+                    "[[grant]]\nprincipal = \"rdb\"\nprefix = \"\"\naccess = [\"read\", \"write\"]\n"
+                        .to_owned(),
+                ))
+                .start(),
+        );
+        let leader = rt.block_on(voters.leader());
+        let dir = config_testkit::fs::temp_dir();
+        let pair = voters
+            .fixture()
+            .issue(config_testkit::CertProfile::client("rdb"));
+        for (name, text) in [
+            ("ca.pem", &pair.ca_pem),
+            ("client.pem", &pair.cert_pem),
+            ("client.key", &pair.key_pem),
+        ] {
+            std::fs::write(dir.path().join(name), text).expect("a control file");
+        }
+        let mut endpoints: Vec<String> = voters
+            .followers()
+            .into_iter()
+            .map(|id| voters.client_endpoint(id))
+            .collect();
+        endpoints.push(voters.client_endpoint(leader));
+        let path = dir.path().to_path_buf();
+        (voters, endpoints, path, Box::new(dir))
+    }
+
+    /// A create-only put of `key` through `store`, and its exact read back (#80 S2 review r1).
+    fn sentinel(
+        rt: &tokio::runtime::Runtime,
+        store: &dyn config_core::ConfigStore,
+        key: &'static [u8],
+    ) {
+        let key = bytes::Bytes::from_static(key);
+        let value = bytes::Bytes::from_static(b"over tls from a follower");
+        rt.block_on(store.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            ..config_core::PutRequest::default()
+        }))
+        .expect("a create-only put over TLS");
+        let read = rt
+            .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+            .expect("the read back");
+        assert_eq!(
+            read.record.map(|record| (record.key, record.value)),
+            Some((key, value))
+        );
+    }
+
+    /// #80 S2 review r1: `connect_control` under `--control-tls` reaches a mutual-TLS rEtcd
+    /// whose cluster is not the default, starting at a follower: a create-only put and its
+    /// exact read back succeed. Cluster row (~3 s): a 3-voter TLS rEtcd, the only way to prove
+    /// the constructor's TLS and cluster wiring.
+    /// Cut 1: `connect_control` uses `GrpcClientOptions::default()` under a TLS folder: the
+    /// TLS voters refuse plaintext, red. Cut 2: it drops `.with_cluster_id`: the follower's
+    /// hint is not followed, red.
+    #[config_log::retcd_test]
+    fn s2_connect_control_puts_and_reads_back_over_tls_from_a_follower() {
+        use config_core::ConfigStore as _;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = config_core::ClusterId::from_bytes([0x82; 16]);
+        let (voters, endpoints, path, _dir) = tls_control(&rt, cluster, 812);
+        let client = {
+            let _entered = rt.enter();
+            super::connect_control(&endpoints, Some(&path)).expect("the control client")
+        };
+        assert_eq!(
+            client.capabilities().transport_security,
+            config_core::TransportSecurity::MutualTls
+        );
+        sentinel(&rt, &client, b"s2-sentinel/rdb_dev-connect_control");
+        drop(client);
+        rt.block_on(voters.shutdown());
+    }
+
+    /// #80 S2 review r1: `--control-tls` without `--control` is refused (the run would start
+    /// its own plaintext voters and read the folder never); with `--control` it parses, and
+    /// `--control` alone still parses plaintext. Unit.
+    #[test]
+    fn s2_control_tls_needs_control() {
+        let with = |words: &[&str]| super::parse(words.iter().map(|w| (*w).to_owned()));
+        assert_eq!(
+            with(&["--control-tls", "t"]).map(|_| ()),
+            Err("--control-tls needs --control: the rEtcd it dials over TLS".to_owned())
+        );
+        let paired = with(&["--control", "10.0.0.2:7002", "--control-tls", "t"]).expect("parses");
+        assert_eq!(paired.control_tls, Some(std::path::PathBuf::from("t")));
+        let plain = with(&["--control", "127.0.0.1:2379"]).expect("parses");
+        assert_eq!(plain.control_tls, None);
     }
 }

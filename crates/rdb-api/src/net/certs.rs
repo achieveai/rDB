@@ -118,8 +118,10 @@ pub fn load(dir: &Path, label: &Label) -> Result<config_grpc::MtlsConfig, String
 /// The folder under a `--cert-dir` that [`generate_control`] writes the rEtcd material into.
 pub const CONTROL_DIR: &str = "control";
 
-/// The rEtcd client name every rDB process presents on the control link (#80 S2 ruling 2: one
-/// shared identity until the certificate join of S4 mints one per node).
+/// The rEtcd client name `generate_control` mints for the control link (#80 S2 ruling 2: one
+/// shared identity until the certificate join of S4 mints one per node). [`load_control`]
+/// does not require it: a production `client.pem` may name any client principal the rEtcd
+/// policy authorises (owner answer 2, review r1).
 pub const CONTROL_CLIENT: &str = "rdb";
 
 /// What [`load_control`] read: the mutual-TLS material for the control link, and the rEtcd
@@ -148,7 +150,9 @@ fn control_step(dir: &Path) -> String {
 
 /// Load the control link's mutual-TLS material from `dir` (#80 S2, ADR-rdb-0024): `ca.pem`,
 /// `client.pem` and `client.key`. The rEtcd cluster and client name are read from the client
-/// certificate, which must name exactly one rEtcd identity, a client one.
+/// certificate, which must name exactly one rEtcd identity, a client one. Any client name is
+/// taken, not only [`CONTROL_CLIENT`]: rEtcd's policy decides what it may do. The name found
+/// is logged (`control_tls_loaded`).
 ///
 /// # Errors
 ///
@@ -166,6 +170,12 @@ pub fn load_control(dir: &Path) -> Result<ControlTls, String> {
     let key = read("client.key")?;
     let (cluster, principal) = control_identity(&cert)
         .map_err(|why| format!("{}: {why}", dir.join("client.pem").display()))?;
+    tracing::info!(
+        dir = %dir.display(),
+        %cluster,
+        %principal,
+        "control_tls_loaded"
+    );
     Ok(ControlTls {
         mtls: config_grpc::MtlsConfig::new(ca, cert, key),
         cluster,
@@ -217,13 +227,11 @@ fn ia5(text: &str) -> Result<Ia5String, String> {
 ///
 /// The step that failed, with the path.
 pub fn generate(dir: &Path, labels: &[Label]) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    private_dir(dir)?;
     let rcgen = |error: rcgen::Error| error.to_string();
     let ca_key = KeyPair::generate().map_err(rcgen)?;
     let ca_cert = dev_ca().self_signed(&ca_key).map_err(rcgen)?;
-    let write = |path: PathBuf, text: String| {
-        std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))
-    };
+    let write = |path: PathBuf, text: String| write_file(&path, &text);
     write(dir.join("ca.pem"), ca_cert.pem())?;
     write(dir.join("ca.key"), ca_key.serialize_pem())?;
     for label in labels {
@@ -259,6 +267,49 @@ pub fn generate(dir: &Path, labels: &[Label]) -> Result<(), String> {
         "net_certs_generated"
     );
     Ok(())
+}
+
+/// Create `dir` if it is missing and make it `0700` (owner only) on Unix, whatever the umask
+/// or its earlier mode (#80 S2 review r1): it holds the development CA's signing key and every
+/// private key. Elsewhere the folder keeps the platform's default ACL.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("{}: chmod 0700: {error}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Write `text` to `path`: a `.key` file is `0600` on Unix, any other `0644`, set on the open
+/// file before a byte is written, so neither the umask nor an earlier mode of a file being
+/// replaced leaves a key readable by another user.
+fn write_file(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let secret = path.extension().is_some_and(|ext| ext == "key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if secret { 0o600 } else { 0o644 });
+    }
+    let mut file = options.open(path).map_err(failed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(if secret {
+            0o600
+        } else {
+            0o644
+        }))
+        .map_err(failed)?;
+    }
+    file.write_all(text.as_bytes()).map_err(failed)
 }
 
 /// The development CA's parameters. [`generate_control`] makes them again over `ca.key` to
@@ -309,14 +360,16 @@ pub fn generate_control(
         })
     };
     let ca_pem = read("ca.pem")?;
-    let ca_key = KeyPair::from_pem(&read("ca.key")?).map_err(rcgen)?;
+    let ca_key_pem = read("ca.key")?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem).map_err(rcgen)?;
     let ca_cert = dev_ca().self_signed(&ca_key).map_err(rcgen)?;
+    // The whole generation folder, the CA's signing key in it too, is owner-only before a new
+    // key is written (review r1).
+    private_dir(dir)?;
+    write_file(&dir.join("ca.key"), &ca_key_pem)?;
     let out = dir.join(CONTROL_DIR);
-    std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
-    let write = |name: String, text: String| {
-        let path = out.join(name);
-        std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))
-    };
+    private_dir(&out)?;
+    let write = |name: String, text: String| write_file(&out.join(name), &text);
     write("ca.pem".to_owned(), ca_pem)?;
     let issue = |cn: String, sans: Vec<SanType>, server: bool| {
         let key = KeyPair::generate().map_err(rcgen)?;
@@ -430,6 +483,18 @@ mod tests {
         let loaded = load_control(&good).expect("a client certificate loads");
         assert_eq!(loaded.cluster, cluster);
         assert_eq!(loaded.principal, "rdb");
+
+        // Owner answer 2 (review r1): any client principal the policy authorises loads.
+        let other = root.path().join("other-client");
+        write_control(
+            &other,
+            &fixture.issue(config_testkit::CertProfile::client("billing-svc")),
+        );
+        let loaded = load_control(&other).expect("another client name loads");
+        assert_eq!(
+            (loaded.cluster, loaded.principal.as_str()),
+            (cluster, "billing-svc")
+        );
 
         let missing = root.path().join("missing");
         write_control(
@@ -559,5 +624,66 @@ mod tests {
             );
             assert!(sans.contains(host), "voter {n}'s host SAN: {sans:?}");
         }
+    }
+
+    /// #80 S2 review r1: `generate` and `generate_control` leave the generation folder and
+    /// `control/` at `0700` and every `.key` at `0600`, on a fresh folder and on a second run
+    /// over a folder and files made world-readable beforehand (what a permissive umask or an
+    /// older build leaves). Unit, Unix only.
+    /// Cut: `write_file` drops its `set_permissions`: the replaced `0666` key keeps its mode,
+    /// red.
+    #[cfg(unix)]
+    #[config_log::retcd_test]
+    fn s2_generated_folders_and_keys_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let cluster = ClusterId::from_bytes([0x24; 16]);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        let voters = [(1, "10.0.0.2".to_owned())];
+        let check = |when: &str| {
+            for folder in [dir.clone(), dir.join(CONTROL_DIR)] {
+                assert_eq!(mode(&folder), 0o700, "{when}: {}", folder.display());
+            }
+            for key in [
+                dir.join("ca.key"),
+                dir.join("node-1.key"),
+                dir.join(CONTROL_DIR).join("client.key"),
+                dir.join(CONTROL_DIR).join("voter-1.key"),
+            ] {
+                assert_eq!(mode(&key), 0o600, "{when}: {}", key.display());
+            }
+            assert_eq!(mode(&dir.join("ca.pem")), 0o644, "{when}: ca.pem");
+        };
+        generate(&dir, &[Label::Node(NodeId(1))]).expect("certs");
+        generate_control(&dir, cluster, &voters).expect("control certs");
+        check("fresh");
+
+        let open = |path: &Path, bits: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        };
+        open(&dir, 0o777);
+        open(&dir.join(CONTROL_DIR), 0o777);
+        for key in ["ca.key", "node-1.key"] {
+            open(&dir.join(key), 0o666);
+        }
+        for key in ["client.key", "voter-1.key"] {
+            open(&dir.join(CONTROL_DIR).join(key), 0o666);
+        }
+        // generate_control alone first: the CA key it signs with is protected too.
+        generate_control(&dir, cluster, &voters).expect("control certs again");
+        assert_eq!(mode(&dir), 0o700, "generate_control protects the folder");
+        assert_eq!(mode(&dir.join("ca.key")), 0o600, "and the CA key");
+        open(&dir.join("node-1.key"), 0o666);
+        generate(&dir, &[Label::Node(NodeId(1))]).expect("certs again");
+        generate_control(&dir, cluster, &voters).expect("control certs again");
+        check("over world-readable files");
     }
 }

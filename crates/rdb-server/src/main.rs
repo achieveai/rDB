@@ -8,8 +8,9 @@
 //!
 //! `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
 //! `T/client.key`, the cluster id read from the client certificate (#80 S2, ADR-rdb-0024).
-//! Without it the link is plaintext; rdb-server refuses no plaintext link itself, and an open
-//! of a database whose nodes are not all on loopback IPs refuses it.
+//! Without it the link is plaintext. rdb-server has no start check of its own; its app open
+//! (`local = []`) refuses a plaintext link, with nothing written, when the database is
+//! declared and any `nodes/` record is not on a loopback IP (owner answer 1 on PR #145).
 //!
 //! It checks `--listen` first (loopback only, `rdb_server::check_listen`), then opens its `Db`
 //! as an app (`local = []`, links to every node in `--nodes` as app `NAME`, default `pilot-b`,
@@ -415,5 +416,122 @@ fn one_separator(path: &std::path::Path) -> String {
         shown.replace('\\', "/")
     } else {
         shown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
+    /// `--control-tls` folder of its fixture's client certificate, and its client endpoints
+    /// followers first, so a client that cannot follow a leader hint fails (#80 S2 review r1).
+    fn tls_control(
+        rt: &tokio::runtime::Runtime,
+        cluster: config_core::ClusterId,
+        seed: u64,
+    ) -> (
+        config_testkit::Cluster,
+        Vec<String>,
+        std::path::PathBuf,
+        Box<dyn std::any::Any>,
+    ) {
+        let voters = rt.block_on(
+            config_testkit::Cluster::builder()
+                .nodes(3)
+                .cluster_id(cluster)
+                .storage(config_testkit::cluster::StorageKind::Ephemeral)
+                .mutual_tls(seed)
+                .authz(config_testkit::cluster::AuthzKind::Static(
+                    "[[grant]]\nprincipal = \"rdb\"\nprefix = \"\"\naccess = [\"read\", \"write\"]\n"
+                        .to_owned(),
+                ))
+                .start(),
+        );
+        let leader = rt.block_on(voters.leader());
+        let dir = config_testkit::fs::temp_dir();
+        let pair = voters
+            .fixture()
+            .issue(config_testkit::CertProfile::client("rdb"));
+        for (name, text) in [
+            ("ca.pem", &pair.ca_pem),
+            ("client.pem", &pair.cert_pem),
+            ("client.key", &pair.key_pem),
+        ] {
+            std::fs::write(dir.path().join(name), text).expect("a control file");
+        }
+        let mut endpoints: Vec<String> = voters
+            .followers()
+            .into_iter()
+            .map(|id| voters.client_endpoint(id))
+            .collect();
+        endpoints.push(voters.client_endpoint(leader));
+        let path = dir.path().to_path_buf();
+        (voters, endpoints, path, Box::new(dir))
+    }
+
+    /// A create-only put of `key` through `store`, and its exact read back (#80 S2 review r1).
+    fn sentinel(
+        rt: &tokio::runtime::Runtime,
+        store: &dyn config_core::ConfigStore,
+        key: &'static [u8],
+    ) {
+        let key = bytes::Bytes::from_static(key);
+        let value = bytes::Bytes::from_static(b"over tls from a follower");
+        rt.block_on(store.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            ..config_core::PutRequest::default()
+        }))
+        .expect("a create-only put over TLS");
+        let read = rt
+            .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+            .expect("the read back");
+        assert_eq!(
+            read.record.map(|record| (record.key, record.value)),
+            Some((key, value))
+        );
+    }
+
+    /// #80 S2 review r1: rdb-server's `connect_control` under `--control-tls` reaches a
+    /// mutual-TLS rEtcd whose cluster is not the default, starting at a follower: a
+    /// create-only put and its exact read back succeed. Cluster row (~3 s): a 3-voter TLS
+    /// rEtcd, the only way to prove the constructor's TLS and cluster wiring.
+    /// Cut 1: `connect_control` uses `GrpcClientOptions::default()` under a TLS folder: the
+    /// TLS voters refuse plaintext, red. Cut 2: it drops `.with_cluster_id`: the follower's
+    /// hint is not followed, red.
+    #[config_log::retcd_test]
+    fn s2_connect_control_puts_and_reads_back_over_tls_from_a_follower() {
+        use config_core::ConfigStore as _;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = config_core::ClusterId::from_bytes([0x83; 16]);
+        let (voters, endpoints, path, _dir) = tls_control(&rt, cluster, 813);
+        let mut argv = vec![
+            "--control".to_owned(),
+            endpoints.join(","),
+            "--nodes".to_owned(),
+            "1=127.0.0.1:1".to_owned(),
+            "--cert-dir".to_owned(),
+            "c".to_owned(),
+            "--listen".to_owned(),
+            "127.0.0.1:1".to_owned(),
+            "--control-tls".to_owned(),
+        ];
+        argv.push(path.display().to_string());
+        let args = super::parse(argv.into_iter()).expect("parses");
+        let client = {
+            let _entered = rt.enter();
+            super::connect_control(&args).expect("the control client")
+        };
+        assert_eq!(
+            client.capabilities().transport_security,
+            config_core::TransportSecurity::MutualTls
+        );
+        sentinel(&rt, &client, b"s2-sentinel/rdb-server-connect_control");
+        drop(client);
+        rt.block_on(voters.shutdown());
     }
 }

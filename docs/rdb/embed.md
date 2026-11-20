@@ -102,7 +102,8 @@ It runs without TLS and with every caller allowed. That is for one machine, neve
 ### TLS to rEtcd: nodes on other machines
 
 **Plaintext to rEtcd is refused unless every node is on a loopback IP** (ADR-rdb-0024). A
-declaration, an open and an `rdb_node` start are each refused, with nothing written, when the
+declaration, an open (a node process's or an app's, `DbConfig::local` empty) and an
+`rdb_node` start are each refused, with nothing written, when the
 store is plaintext and any `nodes/` record names a host that is not `127.x.x.x` or `::1`. A
 host name counts as another machine, `localhost` too. The refusal names the node and its
 address, and says to pass `--control-tls`.
@@ -124,13 +125,17 @@ let store: Arc<dyn ConfigStore> = Arc::new(client);
 ```
 
 - The folder holds `ca.pem` (the CA rEtcd's voters are signed by), `client.pem` and
-  `client.key`. The client certificate names `retcd://<cluster>/client/rdb`; every rDB process
-  shares that one identity, and rEtcd's `[authz] policy` grants it read and write on `""`.
+  `client.key`. Every rDB process shares that one client certificate. The `--gen-certs` one
+  names `retcd://<cluster>/client/rdb`; a production one may name any client principal
+  rEtcd's `[authz] policy` grants read and write on `""`. The loader takes any client name
+  and logs it (`control_tls_loaded`, field `principal`).
 - For development, `rdb_node --gen-certs --cert-dir C --control-cluster <32 hex>
   --control-voters 1=HOST,2=HOST,3=HOST` writes `C/control/` with those three files and one
   `voter-N.pem`/`.key` per voter. Production brings its own files in that layout.
 - `rdb_node`, `rdb_dev` and `rdb-server` take `--control-tls C/control`. Only `rdb_node`
-  refuses plaintext at its own start; the others meet the open's refusal.
+  refuses plaintext at its own start; the others meet the open's refusal, an app open
+  included. `rdb_dev --control-tls` needs `--control`.
+- `--gen-certs` makes its folder and `control/` `0700` and every key `0600` on Unix.
 - `scripts/docker-multihost.sh` runs the whole path on separate container IPs; see
   `docker/README.md`.
 
@@ -1274,8 +1279,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
   This can be run with up to eight processes on 127.0.0.1 to .8 of one host: each loopback
   address counts as its own machine. The tests run five to eight nodes this way in one
-  process, and four `rdb_node` start paths; five separate processes have not been run at
-  this commit. It has not been run on separate machines. A machine
+  process, and four `rdb_node` start paths. Five separate `rdb_node` processes have run in
+  `scripts/docker-multihost.sh`'s Docker proof (#80 S2), each container on its own IP, all on
+  one physical host. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
   Copies are uneven by up to 3 per node when K does not divide P. Still missing: adding or
   removing a node. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node process started
@@ -1578,7 +1584,8 @@ Source: `crates/rdb-storage/README.md`, "Chain-depth ceiling".
 
 ## 8. Container image (voter and data node)
 
-`docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with both processes:
+`docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with three executables:
+`config-server` (the voter), `rdb_node` (the data node) and `rdb_dev` (the app):
 
 ```bash
 docker build -f docker/Dockerfile -t rdb-bf-node:dev .      # from the repository root

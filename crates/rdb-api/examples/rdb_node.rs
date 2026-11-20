@@ -2116,4 +2116,176 @@ mod tests {
         }
         assert!(dir.join("node-5.pem").exists() && dir.join("app-admin.pem").exists());
     }
+
+    /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
+    /// `--control-tls` folder of its fixture's client certificate, and its client endpoints
+    /// followers first, so a client that cannot follow a leader hint fails (#80 S2 review r1).
+    fn tls_control(
+        rt: &tokio::runtime::Runtime,
+        cluster: config_core::ClusterId,
+        seed: u64,
+    ) -> (
+        config_testkit::Cluster,
+        Vec<String>,
+        std::path::PathBuf,
+        Box<dyn std::any::Any>,
+    ) {
+        let voters = rt.block_on(
+            config_testkit::Cluster::builder()
+                .nodes(3)
+                .cluster_id(cluster)
+                .storage(config_testkit::cluster::StorageKind::Ephemeral)
+                .mutual_tls(seed)
+                .authz(config_testkit::cluster::AuthzKind::Static(
+                    "[[grant]]\nprincipal = \"rdb\"\nprefix = \"\"\naccess = [\"read\", \"write\"]\n"
+                        .to_owned(),
+                ))
+                .start(),
+        );
+        let leader = rt.block_on(voters.leader());
+        let dir = config_testkit::fs::temp_dir();
+        let pair = voters
+            .fixture()
+            .issue(config_testkit::CertProfile::client("rdb"));
+        for (name, text) in [
+            ("ca.pem", &pair.ca_pem),
+            ("client.pem", &pair.cert_pem),
+            ("client.key", &pair.key_pem),
+        ] {
+            std::fs::write(dir.path().join(name), text).expect("a control file");
+        }
+        let mut endpoints: Vec<String> = voters
+            .followers()
+            .into_iter()
+            .map(|id| voters.client_endpoint(id))
+            .collect();
+        endpoints.push(voters.client_endpoint(leader));
+        let path = dir.path().to_path_buf();
+        (voters, endpoints, path, Box::new(dir))
+    }
+
+    /// #80 S2 review r1: `control(args)` under `--control-tls` reaches a mutual-TLS rEtcd
+    /// whose cluster is not the default, starting at a follower: a create-only put and its
+    /// exact read back succeed, and the store reports mutual TLS. Cluster row (~3 s): a
+    /// 3-voter TLS rEtcd, the only way to prove the constructor's TLS and cluster wiring.
+    /// Cut 1: `control` builds `GrpcClientOptions::default()` under `--control-tls`: the TLS
+    /// voters refuse plaintext, red. Cut 2: `control` drops `.with_cluster_id`: the follower's
+    /// hint is not followed, red.
+    #[config_log::retcd_test]
+    fn s2_control_constructor_puts_and_reads_back_over_tls_from_a_follower() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = config_core::ClusterId::from_bytes([0x81; 16]);
+        let (voters, endpoints, path, _dir) = tls_control(&rt, cluster, 811);
+        let tls = path.display().to_string();
+        let args = parsed(&[
+            "--declare",
+            "--peers",
+            PEERS,
+            "--control",
+            &endpoints.join(","),
+            "--control-tls",
+            &tls,
+        ])
+        .expect("parses");
+        let store = {
+            let _entered = rt.enter();
+            super::control(&args).expect("the control client")
+        };
+        assert_eq!(
+            store.capabilities().transport_security,
+            config_core::TransportSecurity::MutualTls
+        );
+        let key = bytes::Bytes::from_static(b"s2-sentinel/rdb_node-control");
+        let value = bytes::Bytes::from_static(b"over tls from a follower");
+        rt.block_on(store.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            ..config_core::PutRequest::default()
+        }))
+        .expect("a create-only put over TLS");
+        let read = rt
+            .block_on(store.get(config_core::GetRequest { key: key.clone() }))
+            .expect("the read back");
+        assert_eq!(
+            read.record.map(|record| (record.key, record.value)),
+            Some((key, value))
+        );
+        drop(store);
+        rt.block_on(voters.shutdown());
+    }
+
+    /// #80 S2 review r1: the node process's own start, `serve_on`, refuses a plaintext store
+    /// for a database declared on other machines before it writes its boot or binds. The
+    /// bind is observed on its own: `--listen` is the wildcard on a port this row already
+    /// holds, so a start that bound first would fail with the bind error, not the TLS one.
+    /// Over a TLS store the same start passes the check, writes its boot, and then meets the
+    /// held port: the order is check, boot, bind. Unit (an in-memory store, one held port).
+    /// Cut: `start_check_on` skips `control_tls_refusal`: the plaintext start writes its boot
+    /// and fails at the bind instead, red.
+    #[config_log::retcd_test]
+    fn s2_serve_refuses_plaintext_control_before_boot_or_bind() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let held = std::net::TcpListener::bind("0.0.0.0:0").expect("a free port");
+        let port = held.local_addr().expect("bound").port();
+        let peers = format!("1=10.9.9.1:{port},2=10.9.9.2:{port},3=10.9.9.3:{port}");
+        let memory: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let tls: Arc<dyn ConfigStore> = Arc::new(TlsReported(Arc::clone(&memory)));
+        let declare = parsed(&["--declare", "--peers", &peers]).expect("parses");
+        declare_on(&declare, &tls, &rt).expect("declared over TLS");
+        let root = config_testkit::fs::temp_dir();
+        let certs_dir = root.path().join("certs");
+        rdb_api::net::certs::generate(
+            &certs_dir,
+            &(1..=3)
+                .map(|n| rdb_api::net::wire::Label::Node(rdb_api::NodeId(n)))
+                .collect::<Vec<_>>(),
+        )
+        .expect("certs");
+        let path = |p: &std::path::Path| p.display().to_string();
+        let start = |dir: &std::path::Path, store: &Arc<dyn ConfigStore>| {
+            let args = parsed(&[
+                "--node",
+                "1",
+                "--dir",
+                &path(dir),
+                "--listen",
+                &format!("0.0.0.0:{port}"),
+                "--peers",
+                &peers,
+                "--control",
+                "127.0.0.1:1",
+                "--cert-dir",
+                &path(&certs_dir),
+            ])
+            .expect("parses");
+            super::serve_on(&args, &rt, Arc::clone(store))
+        };
+        let plain_dir = root.path().join("plain");
+        let refused = start(&plain_dir, &memory);
+        assert!(
+            matches!(&refused, Err(text) if text.contains("node 1's address 10.9.9.1")
+                && text.contains("not TLS") && text.contains("nothing was started")),
+            "{refused:?}"
+        );
+        assert!(!plain_dir.exists(), "no boot was written");
+        let tls_dir = root.path().join("tls");
+        let bind = start(&tls_dir, &tls);
+        assert!(
+            matches!(&bind, Err(text) if text.starts_with(&format!("--listen 0.0.0.0:{port}"))
+                && !text.contains("not TLS")),
+            "over TLS the start reaches the held port: {bind:?}"
+        );
+        assert!(
+            tls_dir.exists(),
+            "over TLS the boot is written before the bind"
+        );
+        drop(held);
+    }
 }

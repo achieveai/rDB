@@ -154,7 +154,8 @@ C
       --allow-insecure-dev --dev-allow-all "${form[@]}" "$@"
     ;;
   help|-h|--help)
-    sed -n '2,23p' "$0"; exit 0 ;;
+    # The leading comment block only: from line 2 to the first line that is not a comment.
+    sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
   *) echo "rdb-entrypoint: unknown role '$role' (voter|dev-voter|data|dev|voter-init|help)" >&2
      exit 2 ;;
 esac
