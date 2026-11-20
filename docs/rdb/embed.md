@@ -358,6 +358,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
   for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
   for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
+  With `DbConfig::failover` set, the planner does the same by itself: once a faulted owner's
+  grant has run out it moves every partition of that owner, logging `planner_node_silent` with
+  reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
+  owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every

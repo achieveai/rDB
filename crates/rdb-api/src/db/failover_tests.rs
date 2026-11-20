@@ -708,34 +708,141 @@ fn own81_v4_an_owner_cut_from_retcd_but_answering_is_not_failed_over() {
     );
 }
 
-/// V5: node 1's host faults (`Msg::Fault`, as a failed control effect does), so A1 renews no
-/// more. Its net tasks still answer. Integration (~13 s).
-/// Cut: as V4; the `heard_on_link` evidence assertion goes red.
-#[config_log::retcd_test]
-fn own81_v5_a_faulted_owner_still_answering_is_not_failed_over() {
-    alive_owner_is_not_failed_over(
-        "own81_v5_a_faulted_owner_still_answering_is_not_failed_over",
-        true,
-        |rig| {
-            let db = &rig.procs[0].db;
-            let boot = db.boot_of(NodeId(1)).expect("this process runs node 1");
-            db.send_to(
-                NodeId(1),
-                Msg::Fault {
-                    boot,
-                    kind: "own81_v5",
-                    detail: "injected".to_owned(),
-                },
-            )
-            .expect("node 1 takes the fault");
-            until("node 1 faults", Duration::from_secs(10), || {
-                rig.procs[0]
-                    .db
-                    .node_status()
-                    .pop()
-                    .is_some_and(|status| status.fault.is_some())
-            });
+/// Fault node 1's host (`Msg::Fault`, as a failed control effect or a stuck WAL sync does) and
+/// wait until it answers looks with the fault. Its net tasks still answer.
+fn fault_node_1(rig: &Rig, kind: &'static str) {
+    let db = &rig.procs[0].db;
+    let boot = db.boot_of(NodeId(1)).expect("this process runs node 1");
+    db.send_to(
+        NodeId(1),
+        Msg::Fault {
+            boot,
+            kind,
+            detail: "injected".to_owned(),
         },
+    )
+    .expect("node 1 takes the fault");
+    until("node 1 faults", Duration::from_secs(10), || {
+        rig.procs[0]
+            .db
+            .node_status()
+            .pop()
+            .is_some_and(|status| status.fault.is_some())
+    });
+}
+
+/// V5, as narrowed by the owner's answer to Q13 on #81 (issue #122 half B): node 1 owns
+/// several of 6 partitions and its host faults, so A1 renews no more while its links still
+/// answer. A host fault lasts the boot, so the planner fails every partition of node 1 over
+/// with no operator: `planner_node_silent` with reason `owner_faulted`, no
+/// `planner_owner_alive_not_serving`, a put lands on each moved partition through the two that
+/// run, and node 1 publishes nothing after the fault and answers a write sent to it straight
+/// with its fault. Only nodes 2 and 3 run a planner, as in `alive_owner_is_not_failed_over`.
+/// Integration (~10 s): waits out a 3 s grant, its margins, the looks and the promotes.
+/// Cuts: `judge` ignores a look's fault (the old rule): node 1 is heard, alerted and never
+/// moved, red at the first wait. `judge` reads every answered look as faulted: the moves still
+/// happen, but V4 (`answered` owner cut from rEtcd) goes red.
+#[config_log::retcd_test]
+fn own81_v5_i122_b_a_faulted_owner_has_every_partition_failed_over() {
+    const METHOD: &str = "own81_v5_i122_b_a_faulted_owner_has_every_partition_failed_over";
+    let rig = rig_with(6, [None, Some(failover()), Some(failover())]);
+    let faulted = NodeId(1);
+    let moving = rig.owned_by(faulted);
+    assert!(
+        moving.len() >= 2,
+        "node 1 owns above one partition: {moving:?}"
+    );
+    let staying: Vec<(u32, NodeId)> = (1..=6)
+        .filter(|p| !moving.contains(p))
+        .map(|p| (p, rig.owner(p)))
+        .collect();
+    until("a planner holds its grant", Duration::from_secs(20), || {
+        rig.planner_grant().is_some()
+    });
+    let setup_alerts = logged(METHOD, "planner_owner_alive_not_serving").len();
+
+    let at_fault = Instant::now();
+    fault_node_1(&rig, "i122_b");
+    let published_at_fault: Vec<_> = moving
+        .iter()
+        .map(|p| {
+            rig.procs[0]
+                .db
+                .look_in(PartitionId(*p), faulted)
+                .expect("node 1 answers a look")
+                .published
+        })
+        .collect();
+    until(
+        "every partition of node 1 moves",
+        Duration::from_secs(60),
+        || moving.iter().all(|p| rig.owner(*p) != faulted),
+    );
+    let took = at_fault.elapsed();
+
+    for p in &moving {
+        assert!(
+            matches!(rig.record(*p).owner, NodeId(2 | 3)),
+            "partition {p} moved to a running node"
+        );
+    }
+    for (p, owner) in &staying {
+        assert_eq!(rig.owner(*p), *owner, "partition {p} did not move");
+    }
+    assert!(rig.grants()[&faulted].frozen, "the promotes froze grants/1");
+    let silent = logged(METHOD, "planner_node_silent");
+    assert!(
+        silent
+            .iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "owner_faulted"),
+        "{silent:?}"
+    );
+    let alerts = logged(METHOD, "planner_owner_alive_not_serving");
+    assert_eq!(
+        alerts.len(),
+        setup_alerts,
+        "a faulted owner is moved, not alerted: {alerts:?}"
+    );
+
+    let (app, _net, _links) = rig.app(&[NodeId(2), NodeId(3)]);
+    for p in &moving {
+        put_lands(&app, group_of(&app, *p), Duration::from_secs(30));
+    }
+
+    // Node 1 took no write after the fault: nothing it owned published past where it stood, and
+    // a put sent to it straight answers the fault.
+    let node_1 = &rig.procs[0].db;
+    let published_after: Vec<_> = moving
+        .iter()
+        .map(|p| {
+            node_1
+                .look_in(PartitionId(*p), faulted)
+                .expect("node 1 answers a look")
+                .published
+        })
+        .collect();
+    assert_eq!(
+        published_after, published_at_fault,
+        "node 1 published nothing"
+    );
+    let partition = PartitionId(moving[0]);
+    let answer = node_1
+        .send_call(
+            faulted,
+            partition,
+            super::partition_tests::compile(1221, group_of(&app, moving[0])),
+        )
+        .expect("node 1 runs")
+        .recv_timeout(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("node 1 answers");
+    let Answer::Error { error, .. } = &answer else {
+        panic!("node 1 answers a put with its fault: {answer:?}");
+    };
+    assert!(error.detail.contains("i122_b: injected"), "{error:?}");
+    tracing::info!(
+        moved = moving.len(),
+        took_ms = took.as_millis(),
+        "i122_b_time_from_fault_to_new_primary"
     );
 }
 
@@ -1136,11 +1243,9 @@ fn own81_an_owner_with_no_grant_of_its_own_past_the_grace_is_alerted_once_not_mo
 /// Lead ruling 1 on PR #119: the planner on node 1 holds `planner/grant`; node 1's host
 /// faults, and its process stays up, on its links and on its rEtcd. The planner gives the grant
 /// up (`planner_grant_released_host_faulted`, once), node 2's planner takes it once it lapses,
-/// and node 2 is the one that judges node 1: still answering, so the Q2 alert and no move.
-/// Then node 1 goes silent on its links and node 2 fails its partition over.
-/// The first half is what the ruling changes. Once node 1 is muted its clock has no samples,
-/// so its planner stops on `planner_clock_unbounded` with or without the ruling.
-/// Integration (~20 s): a grant lapse, the alert, then a failover.
+/// and node 2 is the one that judges node 1. Node 1 answers its looks with the fault, so node 2
+/// fails its partition over with no mute and no alert (#122 half B; before it, the Q2 alert).
+/// Integration (~15 s): a grant lapse, then a failover.
 /// Cut: skip the own-host check in `hold`; node 1 keeps renewing, nobody judges node 1 (a
 /// planner does not judge its own node while its grant stands), and node 2 never holds the
 /// grant, red.
@@ -1179,21 +1284,18 @@ fn own81_a_planner_on_a_faulted_host_gives_up_its_grant_and_another_fails_over()
                 .is_some_and(|grant| grant.node == NodeId(2))
         },
     );
-    let alert = logged_at_least(METHOD, "planner_owner_alive_not_serving", 1);
-    assert_eq!(alert.len(), 1, "{alert:?}");
-    assert_eq!(alert[0]["node"], 1, "{alert:?}");
-    assert_eq!(
-        rig.owner(1),
-        NodeId(1),
-        "an answering owner keeps its partition"
-    );
-
-    rig.procs[0].faults.apply("mute\n");
+    // Node 1 still answers on its links, with its fault: moved with no mute (#122 half B).
     until("node 1's partition moves", Duration::from_secs(60), || {
         rig.owner(1) != NodeId(1)
     });
     let silent = logged_at_least(METHOD, "planner_node_silent", 1);
     assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    assert_eq!(silent[0]["reason"], "owner_faulted", "{silent:?}");
+    let alerts = logged(METHOD, "planner_owner_alive_not_serving");
+    assert!(
+        alerts.is_empty(),
+        "a faulted owner is moved, not alerted: {alerts:?}"
+    );
     let released = logged(METHOD, "planner_grant_released_host_faulted");
     assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
     assert_eq!(released[0]["node"], 1, "{released:?}");

@@ -16,8 +16,12 @@
 //!    to `X` echoed no clock probe within [`Failover::silent_after`] ([`Links::heard_within`],
 //!    ruling C-2); and `X` answers no look within the read timeout.
 //!
-//! An expired owner that is still heard, or still answers a look, is not failed over: it is
-//! faulted or cut from rEtcd but alive (customer answers 2 and 3). The planner logs
+//! 3. `grants/X`'s expiry is proven past and `X` answers a look with a host fault. A host fault
+//!    lasts the boot: a faulted node serves nothing and writes nothing more, so waiting for it
+//!    gains nothing (#122; the owner narrowed customer answer 2 on #81, Q13).
+//!
+//! An expired owner that is still heard, or still answers a look, without a fault is not failed
+//! over: it is slow or cut from rEtcd but alive (customer answers 2 and 3). The planner logs
 //! `planner_owner_alive_not_serving` once per change and leaves it to the operator.
 //!
 //! The target is [`choose_target`]'s. With fewer than two answering regular copies besides the
@@ -759,10 +763,17 @@ impl Planner {
         if !expired {
             return Verdict::Alive;
         }
+        // The look comes before the link: a faulted owner is still heard, and its answer is
+        // what tells it from a slow one (#122, owner's answer to Q13 on #81).
+        let looked = self.look(partition, owner).await;
+        // `planner_node_silent` names the reason once per change; the host logged the fault.
+        if looked.as_ref().is_some_and(|status| status.fault.is_some()) {
+            return Verdict::Dead("owner_faulted");
+        }
         if self.links.heard_within(owner, self.failover.silent_after) {
             return Verdict::AliveNotServing("heard_on_link");
         }
-        if self.look(partition, owner).await.is_some() {
+        if looked.is_some() {
             return Verdict::AliveNotServing("answered_look");
         }
         Verdict::Dead("silent_and_expired")
