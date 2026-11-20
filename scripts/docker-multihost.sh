@@ -232,14 +232,15 @@ up() {
 
 # The throwaway voter <name>-x. start_helper creates it only when no container has that name
 # (whoever owns it), records the id it created in HELPER_ID, and removes that id if the start
-# fails. Its /data is a tmpfs, so no anonymous volume outlives it. stop_helper removes only
+# fails. Its /data is a tmpfs (mode 1777, so the image's user can write it), so no anonymous
+# volume outlives it. stop_helper removes only
 # HELPER_ID. Arguments: what goes after `docker create`'s name, label and mount.
 HELPER_ID=""
 start_helper() {
     absent container "$HELPER" || { echo "multihost: a container named $HELPER exists; not touched" >&2; return 1; }
     local id
     id="$(docker create --name "$HELPER" --label "$LABEL" \
-            --mount type=tmpfs,destination=/data "$@")" \
+            --mount type=tmpfs,destination=/data,tmpfs-mode=1777 "$@")" \
         || { echo "multihost: could not create $HELPER" >&2; return 1; }
     HELPER_ID="$id"
     if ! docker start "$id" >/dev/null; then
@@ -568,6 +569,10 @@ selftest_docker() {
     absent container "$HELPER"
     [ $? = 0 ] && [ "$rc" != 0 ] && [ "$before" = "$after" ]
     st "a failed throwaway start removes its own container and leaves no volume" $?
+    # The image's own user can write the helper's /data, as the dev-voter role does.
+    ( HELPER_ID=""; start_helper --entrypoint sh "$IMAGE" -c 'mkdir /data/voter' >/dev/null \
+        && [ "$(docker wait "$HELPER_ID")" = 0 ]; rc=$?; stop_helper; exit $rc ) >/dev/null 2>&1
+    st "the throwaway voter's /data is writable by the image's user" $?
     # A normal start and stop leaves no container and no volume.
     ( HELPER_ID=""; start_helper --entrypoint sleep "$IMAGE" 30 >/dev/null && stop_helper ) >/dev/null 2>&1
     rc=$?
