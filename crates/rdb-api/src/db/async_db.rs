@@ -265,18 +265,27 @@ impl AsyncDb {
     /// Outside a tokio runtime, as `tokio::task::spawn_blocking` does.
     #[must_use]
     pub fn ownership_events(&self) -> tokio::sync::mpsc::Receiver<OwnershipEvent> {
-        let events = self.db.ownership_events();
+        // PR #178 review r1 T7: registering takes the nodes lock, which a restart holds, so it
+        // runs on the pool too, never on the calling worker. The bridge keeps the `Db` only
+        // while it registers, so a live receiver never makes `shutdown` answer `Err(self)`; a
+        // `Db` already gone ends the receiver at once.
+        let db = Arc::downgrade(&self.db);
         let (tx, rx) = tokio::sync::mpsc::channel(BRIDGE_CAPACITY);
-        drop(tokio::task::spawn_blocking(move || loop {
-            match events.recv_timeout(BRIDGE_POLL) {
-                Ok(event) => {
-                    if tx.blocking_send(event).is_err() {
-                        break;
+        drop(tokio::task::spawn_blocking(move || {
+            let Some(events) = db.upgrade().map(|db| db.ownership_events()) else {
+                return;
+            };
+            loop {
+                match events.recv_timeout(BRIDGE_POLL) {
+                    Ok(event) => {
+                        if tx.blocking_send(event).is_err() {
+                            break;
+                        }
                     }
+                    Err(RecvTimeoutError::Timeout) if tx.is_closed() => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                Err(RecvTimeoutError::Timeout) if tx.is_closed() => break,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
             }
         }));
         rx
@@ -310,4 +319,78 @@ fn borrowed(puts: &[TxnWrite]) -> Vec<TxnPut<'_>> {
             if_version: put.if_version,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use config_core::ConfigStore;
+
+    use super::super::{lock, Db, DbConfig, Timeouts, ALL_NODES, DEFAULT_CLIENT};
+    use super::AsyncDb;
+
+    /// PR #178 review r1 T7: on a current-thread runtime, subscribing while the nodes lock is
+    /// held (as a restart holds it) returns at once; the registration waits on the pool. Cut:
+    /// call `self.db.ownership_events()` before `spawn_blocking`, as before: red, the call
+    /// waits out the whole hold. Integration: one database open, which is most of its time.
+    #[config_log::retcd_test]
+    fn subscribing_while_a_restart_holds_the_nodes_lock_does_not_block_the_worker() {
+        const HOLD: Duration = Duration::from_millis(1_500);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let config = DbConfig {
+            failover: None,
+            partitions: Some(4),
+            ack_floor: true,
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
+            storage: crate::StorageOptions::default(),
+            addresses: None,
+        };
+        let handle = rt.handle().clone();
+        rt.block_on(async move {
+            let db = Db::open(config, store, handle).await.expect("open");
+            let db = AsyncDb::new(Arc::new(db));
+            db.wait_ready(Duration::from_secs(30)).await.expect("ready");
+
+            let held = Arc::new(AtomicBool::new(false));
+            let holder = {
+                let (db, held) = (Arc::clone(&db.db), Arc::clone(&held));
+                std::thread::spawn(move || {
+                    let nodes = lock(&db.nodes);
+                    held.store(true, Ordering::SeqCst);
+                    std::thread::sleep(HOLD);
+                    drop(nodes);
+                })
+            };
+            while !held.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let start = Instant::now();
+            let events = db.ownership_events();
+            let took = start.elapsed();
+            tracing::info!(took_ms = took.as_millis() as u64, "t7_subscribe_returned");
+            assert!(
+                took < HOLD / 3,
+                "subscribing waited {took:?} on the held nodes lock (held {HOLD:?})"
+            );
+            drop(events);
+            holder.join().expect("holder");
+            assert!(db.shutdown().await.is_ok(), "no other clone is alive");
+        });
+    }
 }
