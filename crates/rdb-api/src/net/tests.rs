@@ -2522,10 +2522,12 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         on_boot: std::sync::Mutex::new(None),
         link_tasks: std::sync::Mutex::new(Some(Vec::new())),
         stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let boot = BootId(22);
     let (first_tx, _first_out) = tokio::sync::mpsc::unbounded_channel();
-    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx);
+    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx)
+        .expect("recorded: no shutdown ran");
     super::install(&shared, NodeId(2), &first, boot);
     let (waiter, answer) = mpsc::channel();
     super::lock(&first.pending).insert(1, super::Waiter::Status(waiter));
@@ -2533,7 +2535,8 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
     // The second handshake, still live beside the first. On its own thread, so a lock that is
     // never let go fails the row at `PATIENCE` instead of hanging it.
     let (second_tx, _second_out) = tokio::sync::mpsc::unbounded_channel();
-    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx);
+    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx)
+        .expect("recorded: no shutdown ran");
     let (done, installed) = mpsc::channel();
     {
         let shared = Arc::clone(&shared);
@@ -2598,6 +2601,7 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
         on_boot: std::sync::Mutex::new(None),
         link_tasks: std::sync::Mutex::new(Some(Vec::new())),
         stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let net = Arc::new(Net {
         shared: Arc::clone(&shared),
@@ -2605,7 +2609,8 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
         addr: None,
     });
     let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
-    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    let conn =
+        super::new_conn(&shared, Label::Node(NodeId(2)), tx).expect("recorded: no shutdown ran");
     super::install(&shared, NodeId(2), &conn, BootId(22));
 
     let (reply, answer) = mpsc::channel();
@@ -2827,9 +2832,11 @@ fn a_future_or_duplicate_clock_echo_is_not_a_round() {
         on_boot: std::sync::Mutex::new(None),
         link_tasks: std::sync::Mutex::new(Some(Vec::new())),
         stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
-    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    let conn =
+        super::new_conn(&shared, Label::Node(NodeId(2)), tx).expect("recorded: no shutdown ran");
     let long_ago = std::time::Instant::now()
         .checked_sub(Duration::from_secs(3))
         .expect("an instant 3 s back");
@@ -3020,4 +3027,70 @@ async fn an_accepted_socket_has_nodelay_set() {
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
     );
+}
+
+/// `Net::shutdown` rows (#81, PR #171 review): node 1's `Net` with no sockets and a route to
+/// node 2, on a current-thread runtime.
+fn shutdown_rig() -> (tokio::runtime::Runtime, Arc<Net>) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let net = Net::unsocketed(NodeId(1), BootId(11), &[NodeId(2)], rt.handle().clone());
+    (rt, net)
+}
+
+/// Node 2's link on `net` is gone: no route up, no connection left, and the link's stream
+/// `out` has ended.
+fn no_link_to_2(net: &Net, out: &mut tokio::sync::mpsc::UnboundedReceiver<super::Envelope>) {
+    assert!(
+        !matches!(net.states()[&NodeId(2)], LinkState::Up(_)),
+        "node 2's route is not up: {:?}",
+        net.states()
+    );
+    assert_eq!(net.connection(NodeId(2)), None);
+    assert_eq!(net.conn_count(), 0, "no connection is left");
+    assert!(
+        matches!(
+            out.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the link's stream has ended"
+    );
+}
+
+/// PR #171 review (registration racing `Net::shutdown`): a link to node 2 registers on its own
+/// thread and is held after its connection is recorded and before its route is published;
+/// `Net::shutdown` runs; then the registration goes on. It is refused: node 2's route is not
+/// `Up`, no connection is left, and the link's stream has ended, so no call waits on it.
+/// Unit (no sockets).
+/// Cut: no stop-flag check in `new_conn` or `install`; the route is `Up` after the shutdown,
+/// red.
+#[config_log::retcd_test]
+fn a_registration_racing_shutdown_leaves_no_link_up() {
+    let (_rt, net) = shutdown_rig();
+    let (arrived_tx, arrived) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel::<()>();
+    net.hold_next_registration(move || {
+        let _ = arrived_tx.send(());
+        release
+            .recv_timeout(PATIENCE)
+            .expect("the row releases the registration");
+    });
+    let registering = {
+        let net = Arc::clone(&net);
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _entered = span.enter();
+            net.link_up_unsocketed(NodeId(2), BootId(22))
+        })
+    };
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the registration is held");
+    assert_eq!(net.conn_count(), 1, "its connection is recorded");
+    net.shutdown();
+    release_tx.send(()).expect("the registration waits");
+    let (id, mut out) = registering.join().expect("the registration thread");
+    assert_eq!(id, 0, "the registration is refused");
+    no_link_to_2(&net, &mut out);
 }
