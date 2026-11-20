@@ -176,6 +176,8 @@ pub enum WireMsg {
         correlation: CorrelationId,
         emitter: NodeId,
         not_before: Tick,
+        /// The committing owner's `live_readd` (#107 slice 2b, protocol 10).
+        owner_live_readd: bool,
     },
     Client {
         to: NodeId,
@@ -388,6 +390,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => WireMsg::Landed {
             to,
             result,
@@ -395,6 +398,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         },
         Msg::Client(client) => {
             return match WireCall::try_from(&client.call) {
@@ -608,6 +612,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => Inbound::Plain(
             to,
             Msg::Landed {
@@ -616,6 +621,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 correlation,
                 emitter,
                 not_before,
+                owner_live_readd,
             },
         ),
         WireMsg::Client {

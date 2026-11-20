@@ -120,11 +120,14 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
 /// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
-/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
-/// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// ADR-rdb-0009 section 7 sets the prerequisites. `10` settles that (below). Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// `10` came with issue #107 slice 2b: `WireMsg::Landed::owner_live_readd`, the committing
+/// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
+/// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
+/// refused at the handshake. Upgrade: stop every node, upgrade, start every node.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;

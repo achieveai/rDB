@@ -546,6 +546,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             correlation: zero(),
             emitter: NodeId(2),
             not_before: zero(),
+            owner_live_readd: true,
         },
     ];
     for msg in plain {
@@ -1587,6 +1588,7 @@ fn a_sender_is_held_to_its_certificate_label() {
         correlation: zero(),
         emitter: NodeId(2),
         not_before: zero(),
+        owner_live_readd: true,
     });
     for peer in [
         on_wire(frame_from(2)),
@@ -1781,7 +1783,27 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 10");
+}
+
+/// Issue #107 slice 2b: a build speaking protocol_version 9 is refused at the handshake naming
+/// both versions. A build at 9 may lack check B and the refusal mark (ADR-rdb-0009 section 7)
+/// and cannot read `WireMsg::Landed::owner_live_readd`, so it never links, and an owner's live
+/// re-add never probes it. Cut: `PROTOCOL_VERSION` left at 9 → the link comes up.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_peer_speaking_protocol_version_9_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let older = Spec {
+        version: 9,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(reason, "node-2 speaks protocol_version 9, node-1 speaks 10");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

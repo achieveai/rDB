@@ -1041,8 +1041,8 @@ on (below).
 
 **`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
 it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
-its own, both as an owner (to re-add a copy it dropped) and as a returning copy (to mark a
-landing it refused, see below). With it on, a copy the owner dropped on one of the two clocks
+its own, as an owner, to re-add a copy it dropped. A returning copy follows the setting of the
+owner that re-adds it, not its own (see below). With it on, a copy the owner dropped on one of the two clocks
 above comes back by itself once its link is back:
 
 - **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
@@ -1061,18 +1061,18 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
-  older build. The re-add itself needs a partition that takes writes. But if the partition goes
-  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
-  and the partition can then stay read-only until that copy's node restarts. A build older than
-  check B can also be left holding a lineage with a hole in it, which nothing refuses
+- **Mixed builds.** A build with this setting speaks wire version 10. An older build speaks 9,
+  and the two refuse each other when they connect, each logging `net_handshake_refused` with
+  both versions. So an older node is never added back live, and it cannot link at all. To
+  upgrade to 10: stop every node, upgrade, start every node. A rolling upgrade, with some
+  nodes at 9 and some at 10, does not link.
+- **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
+  whose node has the setting off is still protected when an owner with it on adds it back. A
+  copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
+  the same on every node anyway, so a partition behaves the same whichever node owns it
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
-  them apart. Turning it on by default first needs the protocol version raised to 10, or a
-  capability bit that gates the re-add, so a node without these guards is refused or never
-  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
+- **Default on.** The wire guard is now in place. The setting still stays off by default
+  until the 512-partition acceptance run passes.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote

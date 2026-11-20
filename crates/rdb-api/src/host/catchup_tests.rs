@@ -288,7 +288,7 @@ fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
         if armed {
             host.engine
                 .inject_fault(rdb_storage::InjectedFault::WalFlush);
-            let outcome = host.land(Box::new(result), site, NodeId(3));
+            let outcome = host.land(Box::new(result), site, NodeId(3), false);
             assert!(
                 outcome
                     .as_ref()
@@ -297,7 +297,8 @@ fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
             );
             assert_eq!(asked(&host), Generation::default(), "activate never ran");
         } else {
-            host.land(Box::new(result), site, NodeId(3)).expect("land");
+            host.land(Box::new(result), site, NodeId(3), false)
+                .expect("land");
             assert_eq!(
                 host.engine.link(PartitionId(1), Generation(2)),
                 Some(rdb_storage::Link {
@@ -340,7 +341,8 @@ fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_
         .expect("node 2 is pinned")
         .copy;
     assert_eq!(
-        host.land_link(PartitionId(1), &result).expect("no fault"),
+        host.land_link(PartitionId(1), &result, false)
+            .expect("no fault"),
         Some(RecoveryEvent::CopyCaughtUp {
             copy,
             head: Seq(2),
@@ -389,7 +391,7 @@ fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links
     let mut host = host_over(&path, &rt);
     let held = host.engine.lineages();
     for result in [&past, &off] {
-        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), result, false), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -433,7 +435,8 @@ fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head(
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
     assert_eq!(
-        host.land_link(PartitionId(1), &result).expect("no fault"),
+        host.land_link(PartitionId(1), &result, false)
+            .expect("no fault"),
         None,
         "not caught up"
     );
@@ -494,7 +497,7 @@ fn a_landing_with_nothing_to_link_is_refused_by_name() {
     let mut holding = host_over(&path, &rt);
     let refuses = |host: &mut Host, result: &RecoveryResult| {
         let held = host.engine.lineages();
-        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), result, false), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -548,7 +551,9 @@ fn m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root() {
     });
 
     let mut host = empty(root_dir.path());
-    let answered = host.land_link(PartitionId(1), &at_root).expect("no fault");
+    let answered = host
+        .land_link(PartitionId(1), &at_root, false)
+        .expect("no fault");
     assert!(
         matches!(
             answered,
@@ -576,7 +581,8 @@ fn m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root() {
 
     let mut host = empty(above_dir.path());
     assert_eq!(
-        host.land_link(PartitionId(1), &above).expect("no fault"),
+        host.land_link(PartitionId(1), &above, false)
+            .expect("no fault"),
         None,
         "behind the cutoff, not caught up"
     );
@@ -666,10 +672,13 @@ fn m10_s2_59_a_landing_whose_receiver_is_refused_faults_by_name() {
     }
     broken.committed.pinned_config.partition = PartitionId(9);
     let [(primary_host, _), (broken_host, _)] = &mut hosts;
-    assert_eq!(primary_host.land_link(PartitionId(1), &primary), Ok(None));
+    assert_eq!(
+        primary_host.land_link(PartitionId(1), &primary, false),
+        Ok(None)
+    );
     assert_eq!(logged!(METHOD, "land_receiver_primary").len(), 1);
     let fault = broken_host
-        .land_link(PartitionId(1), &broken)
+        .land_link(PartitionId(1), &broken, false)
         .expect_err("a refused receiver faults");
     assert!(
         fault
@@ -711,7 +720,7 @@ fn m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver() {
     for result in [&first, &second] {
         assert!(
             matches!(
-                host.land_link(PartitionId(1), result),
+                host.land_link(PartitionId(1), result, false),
                 Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
             ),
             "generation {} caught up at the cutoff",
@@ -826,7 +835,8 @@ fn m10_s2_59_a_post_commit_sync_before_the_landing_ends_the_re_sends() {
             );
             crate::host::drop_first_caught_up(&path);
         }
-        host.land(Box::new(result), site, NodeId(1)).expect("land");
+        host.land(Box::new(result), site, NodeId(1), false)
+            .expect("land");
         assert_eq!(
             host.caught_up_resends.len(),
             kept,
@@ -3810,8 +3820,9 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
 /// removed, quarantined or not, and `land_receiver_dropped` names the reason, so the copy
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
-/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With `live_readd`
-/// off it stays unchanged. With it on (#107 slice 2a, row 31b) it is also marked refused at
+/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With the owner's
+/// `live_readd` off (slice 2b: the flag `land_link` is handed) it stays unchanged. With it on
+/// (#107 slice 2a, row 31b) it is also marked refused at
 /// this generation (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused` per
 /// case), so its `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at
 /// the root. Nothing links in any case.
@@ -3855,11 +3866,14 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
             quarantine(&mut receiver, &result.committed.pinned_config);
         }
         let mut host = host_over(&path, &rt);
-        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        let case = format!("{mode:?}, quarantined {quarantined}, live_readd {live}");
-        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None), "{case}");
+        let case = format!("{mode:?}, quarantined {quarantined}, owner_live_readd {live}");
+        assert_eq!(
+            host.land_link(PartitionId(1), &result, live),
+            Ok(None),
+            "{case}"
+        );
         assert_eq!(host.engine.lineages(), held, "{case}: nothing linked");
         let after = host.replication.receiver(NodeId(2), PartitionId(1));
         if mode == PartitionMode::ReadOnly {
@@ -3954,7 +3968,7 @@ fn issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head() {
         host.replication.install_receiver(receiver.clone());
         assert!(
             matches!(
-                host.land_link(PartitionId(1), &result),
+                host.land_link(PartitionId(1), &result, false),
                 Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
             ),
             "{case}: linked and caught up"
@@ -4111,7 +4125,8 @@ fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
 /// takes writes (`DegradedRf2`). The dormant receiver stays installed and no
-/// `land_receiver_dropped` is logged. Nothing links. With `live_readd` off it stays unchanged.
+/// `land_receiver_dropped` is logged. Nothing links. With the owner's `live_readd` off (slice
+/// 2b: the flag `land_link` is handed) it stays unchanged.
 /// With it on (#107 slice 2a) it is also marked refused at generation 2
 /// (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused`). Generation 2's own
 /// `Recovered` does not read that mark: `Replication::recovered` removes a dormant receiver
@@ -4153,10 +4168,9 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
     assert!(receiver.is_dormant());
     for live in [false, true] {
         let mut host = host_over(&path, &rt);
-        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), &result, live), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         let mut kept = receiver.clone();
         if live {
@@ -4188,7 +4202,8 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
 /// #107 slice 2a review, round 3: the round-2 question (an earlier barrier and a later refused
 /// `ReadOnly` landing in one due batch, over a dormant receiver) through the host's own wiring,
 /// with no mark set by hand. Node 2 holds generation 1 at seqs 3 to 5 only, holed below 5, and
-/// a dormant receiver there, with `live_readd` on. Two `Landed` messages arrive and fall due in
+/// a dormant receiver there, and both `Landed` messages carry the owner's `live_readd` on
+/// (slice 2b; node 2's own setting stays off). They arrive and fall due in
 /// one `run_due`: generation 2, whose barrier node 2 is in, at cutoff 5 (`inherit` links it),
 /// then generation 3, `ReadOnly`, not in its barrier, at cutoff 7. `land_link` refuses 3
 /// `from_has_no_floor` (check B: 2 is linked onto the holed 1) and marks the dormant receiver,
@@ -4252,7 +4267,6 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
         RecoveryBarrier::try_new(&[], &BTreeSet::new(), Seq(7), Digest([7; 32])).expect("empty");
 
     let mut host = host_over(&path, &rt);
-    host.live_readd.on = true;
     let dormant = AppendReceiver::dormant(receiver_init(&barrier, 1, at_five), Revision(1))
         .expect("a dormant receiver");
     host.replication.install_receiver(dormant);
@@ -4264,6 +4278,7 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
             correlation: CorrelationId(0),
             emitter: NodeId(1),
             not_before: now,
+            owner_live_readd: true,
         });
     }
     host.run_due();
@@ -4308,6 +4323,172 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
         ),
         "generation 3's Recovered anchors it at the root, not at seq 5"
     );
+}
+
+/// #107 slice 2b: a copy marks a refused landing by the committing owner's setting, carried on
+/// the `Landed`, not by its own. Node 2 holds generation 1 to seq 3 and a live receiver there;
+/// a `ReadOnly` landing at cutoff 2, outside its barrier, is refused `held_past_base`. Each of
+/// the four (owner's flag on the `Landed`, node 2's own `live_readd`) cases goes through
+/// `Host::handle` and `run_due`, so the `Delayed::Landing` hop is in the path. The receiver is
+/// marked refused, with one `land_receiver_marked_refused`, exactly when the owner's flag is
+/// on, whatever node 2's own setting.
+/// Cuts: `land_link` reads `self.live_readd.on`, red (owner on, own off: no mark); either
+/// setting marks, red (owner off, own on: a mark); `Delayed::Landing` or `land` drops the flag
+/// for a constant, red.
+/// Unit, under a second here (one trio bootstrap, for the commit it lands).
+#[config_log::retcd_test]
+fn issue107_a_copy_marks_a_refused_landing_by_the_owners_setting_not_its_own() {
+    const METHOD: &str =
+        "issue107_a_copy_marks_a_refused_landing_by_the_owners_setting_not_its_own";
+    use rdb_core::contracts::recovery::RecoveryBarrier;
+    let rt = current_thread();
+    let mut landing: Option<RecoveryResult> = None;
+    for (owner, own) in [(false, false), (false, true), (true, false), (true, true)] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let result = landing
+            .get_or_insert_with(|| {
+                let mut result = landing_at(2, digests[1]);
+                result.mode = PartitionMode::ReadOnly;
+                result.barrier =
+                    RecoveryBarrier::try_new(&[], &BTreeSet::new(), Seq(2), digests[1])
+                        .expect("empty");
+                result
+            })
+            .clone();
+        let receiver = live_receiver(
+            &result,
+            1,
+            Head {
+                seq: Seq(3),
+                digest: digests[2],
+            },
+        );
+        let mut host = host_over(&path, &rt);
+        host.live_readd.on = own;
+        host.replication.install_receiver(receiver.clone());
+        let case = format!("owner_live_readd {owner}, own live_readd {own}");
+        let before = logged!(METHOD, "land_receiver_marked_refused").len();
+        let now = host.clock.now();
+        host.handle(Msg::Landed {
+            result: Box::new(result.clone()),
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+            emitter: NodeId(1),
+            not_before: now,
+            owner_live_readd: owner,
+        });
+        host.run_due();
+        assert_eq!(host.fault, None, "{case}");
+        let mut kept = receiver.clone();
+        if owner {
+            kept.refuse_landing(result.new_generation);
+        }
+        assert_eq!(
+            host.replication.receiver(NodeId(2), PartitionId(1)),
+            Some(&kept),
+            "{case}: marked only by the owner's setting"
+        );
+        assert_eq!(
+            logged!(METHOD, "land_receiver_marked_refused").len() - before,
+            usize::from(owner),
+            "{case}"
+        );
+    }
+    let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        refused,
+        ["held_past_base"; 4].map(serde_json::Value::from),
+        "every case refused"
+    );
+}
+
+/// #107 slice 2b: the `Landed` carries the committing owner's setting, and a re-post relays it.
+/// Node 1, the owner, runs with `live_readd` `owner`; node 3 with the other value. Node 1's
+/// fan-out of its bootstrap commit reaches node 3, which keeps the flag beside the root it
+/// landed. Node 3's `CopyAheadOnControl` for node 2's copy then re-posts that root, and the
+/// `Landed` node 2 receives carries node 1's value, not node 3's. Both ways round.
+/// Cuts: the fan-out stamps a constant, red (one orientation); `copy_ahead` stamps
+/// `self.live_readd.on`, red (both); `land` stores a constant beside `committed`, red.
+/// Integration (~4 s): two trio bootstraps.
+#[config_log::retcd_test]
+fn issue107_the_fanout_and_a_repost_carry_the_committing_owners_setting() {
+    for owner in [true, false] {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.nodes[0].0.live_readd.on = owner;
+        trio.nodes[2].0.live_readd.on = !owner;
+        trio.bootstrap();
+        trio.ready();
+        let committed = trio.nodes[0].0.committed[&PartitionId(1)].new_generation;
+        trio.until("node 3 landed node 1's commit", |trio| {
+            trio.nodes[2]
+                .0
+                .committed
+                .get(&PartitionId(1))
+                .filter(|result| result.new_generation == committed)
+                .map(|_| ())
+        });
+        assert_eq!(
+            trio.nodes[2].0.committed_correlation[&PartitionId(1)].1,
+            owner,
+            "owner {owner}: node 3 kept the fan-out's flag"
+        );
+        let copy = trio.nodes[0].0.committed[&PartitionId(1)]
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(2))
+            .expect("node 2 is a member")
+            .copy;
+        // Node 2's mailbox is drained now, so a `Landed` in it later is the re-post.
+        while let Ok(msg) = trio.nodes[1].2.try_recv() {
+            trio.nodes[1].0.handle(msg);
+        }
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(u64::MAX),
+        };
+        let host = &mut trio.nodes[2].0;
+        assert_eq!(
+            host.kernel(
+                ModuleName::Replication,
+                &KernelEffect::CopyAheadOnControl { copy },
+                site,
+                &[],
+                &StepFences::default(),
+            ),
+            Ok(()),
+            "owner {owner}"
+        );
+        assert_eq!(host.fault, None, "owner {owner}: node 3 faulted");
+        let mut landed = Vec::new();
+        while let Ok(msg) = trio.nodes[1].2.try_recv() {
+            if let Msg::Landed {
+                result,
+                emitter,
+                owner_live_readd,
+                ..
+            } = msg
+            {
+                landed.push((emitter, result.new_generation, owner_live_readd));
+            }
+        }
+        assert_eq!(
+            landed,
+            [(NodeId(3), committed, owner)],
+            "owner {owner}: node 3's re-post relays node 1's setting"
+        );
+    }
 }
 
 /// Generation 1 of partition 1 at `path`, seqs 1 to 3, with the stored `History` value at seq 1
