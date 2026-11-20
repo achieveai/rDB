@@ -9,7 +9,7 @@
 //! | M7F-44 | a snapshot taken before a multi-write batch never sees any of it, and one taken after sees all of it, across two namespaces and a delete |
 //! | M7F-45 | every crash boundary lands on a batch boundary: both crash kinds, every key of a surviving batch readable and every key of a lost one gone |
 //! | M7F-46 | `sync_wal_through` answers `min(captured, applied, short_flush)` — a commit that arrived after the capture is never covered by it |
-//! | t61 A9a | the snapshot install twins (issue #61 S2): `install_begin` wipes every level and the tail release in one step; `install_finish` reads as a lineage trimmed at its barrier, moves no durable mark, and survives a host crash; an installing lineage refuses commit and inherit and is cleared at open |
+//! | t61 A9a | the snapshot install twins (issue #61 S2): `install_begin` wipes every level and the tail release in one step; `install_finish` reads as a lineage trimmed at its barrier, moves no durable mark, and survives a host crash; an installing lineage refuses commit and inherit and is cleared at open; a host crash before a sync covers the begin brings the old copy back |
 //!
 //! Log fields are sequences and counts; never a key or value byte.
 
@@ -1057,4 +1057,70 @@ fn t61_sim_an_installing_lineage_refuses_commit_and_inherit_and_is_cleared_at_op
         Ok(AppliedSeq(1)),
         "the cleared lineage takes writes again"
     );
+}
+
+#[retcd_test]
+fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
+    support::preamble();
+    let mut engine = engine_with_two_levels_and_a_tail_release();
+    let synced = engine
+        .sync_wal_through(
+            [Generation(1), Generation(2)]
+                .into_iter()
+                .map(|generation| CapturedPrefix {
+                    partition: PARTITION,
+                    generation,
+                    through: AppliedSeq(3),
+                })
+                .collect(),
+        )
+        .expect("flush");
+    assert_eq!(synced.len(), 2, "both levels are durable through 3");
+    let (g, at) = (Generation(3), Seq(INSTALL_AT));
+    engine.install_begin(PARTITION, g, at).expect("begin");
+    engine
+        .install_chunk(PARTITION, g, at, &[chunk_entry(b"k", b"s", 3)])
+        .expect("chunk");
+
+    // No sync covered the begin: the host loses it with its wipe.
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(reopened.installing(PARTITION, g), None);
+    for level in [Generation(1), Generation(2)] {
+        assert_eq!(reopened.buffered_applied(PARTITION, level), AppliedSeq(3));
+        assert_eq!(reopened.durable(PARTITION, level), DurableSeq(3));
+    }
+    assert_eq!(
+        reopened.parent(PARTITION, Generation(2)),
+        Some(Generation(1))
+    );
+    assert_eq!(reopened.base(PARTITION, Generation(2)), Seq(2));
+    assert_eq!(
+        reopened.tail_release(PARTITION),
+        Some((Generation(1), Seq(2)))
+    );
+    let view = reopened.snapshot(PARTITION, Generation(2), SnapshotHandle(1));
+    assert_eq!(
+        view.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"v"))
+    );
+    assert_eq!(view.version(Namespace::User, b"k"), Some(2));
+    assert_eq!(
+        view.get(Namespace::User, b"j"),
+        Some(Bytes::from_static(b"w"))
+    );
+
+    // Control: once a sync covers the begin, a host crash keeps the wipe, and the open clears
+    // the unfinished install.
+    engine.sync_wal_through(Vec::new()).expect("flush");
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(reopened.installing(PARTITION, g), None);
+    for level in [Generation(1), Generation(2), g] {
+        assert_eq!(reopened.buffered_applied(PARTITION, level), AppliedSeq(0));
+    }
+    assert_eq!(reopened.tail_release(PARTITION), None);
+    assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
 }

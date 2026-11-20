@@ -173,6 +173,9 @@ impl TrimRefused {
     }
 }
 
+/// A lineage with its key, as an unsynced begin found it.
+type HeldLineage = ((PartitionId, Generation), Lineage);
+
 /// One core set's data engine.
 ///
 /// Holds its state and is not `Copy` (finding K-F-29). Records are keyed by
@@ -187,6 +190,11 @@ pub struct MemoryEngine {
     false_claims: Vec<AppliedSeq>,
     /// Each capture a [`StorageOp::StallFlush`] held, in order, for the oracle. Never synced.
     stalled: Vec<Vec<CapturedPrefix>>,
+    /// Each partition's lineages as they were before an `install_begin` no sync has covered yet
+    /// (issue #61). The host's begin is one unsynced batch, so a host crash loses it **with its
+    /// wipe** and the old copy comes back; [`crate::storage::crash_image::CrashImage`] reads
+    /// these in place of the partition's lineages then.
+    unsynced_begins: BTreeMap<PartitionId, Vec<HeldLineage>>,
 }
 
 impl MemoryEngine {
@@ -200,6 +208,7 @@ impl MemoryEngine {
             planned: Vec::new(),
             false_claims: Vec::new(),
             stalled: Vec::new(),
+            unsynced_begins: BTreeMap::new(),
         }
     }
 
@@ -373,6 +382,7 @@ impl MemoryEngine {
         for lineage in self.lineages.values_mut() {
             lineage.floor_synced = lineage.floor;
         }
+        self.unsynced_begins.clear();
         let mut durable = Vec::with_capacity(captured.len());
         for capture in captured {
             // A lineage this engine was never given holds nothing: its durable prefix is the
@@ -1018,6 +1028,24 @@ impl MemoryEngine {
         self.lineages.iter()
     }
 
+    /// The lineages a host crash finds, in `(partition, generation)` order: a partition whose
+    /// `install_begin` no sync covered shows its lineages from before that begin.
+    pub(crate) fn host_crash_lineages(&self) -> Vec<(&(PartitionId, Generation), &Lineage)> {
+        let mut lineages: Vec<_> = self
+            .lineages
+            .iter()
+            .filter(|((p, _), _)| !self.unsynced_begins.contains_key(p))
+            .chain(
+                self.unsynced_begins
+                    .values()
+                    .flatten()
+                    .map(|(key, lineage)| (key, lineage)),
+            )
+            .collect();
+        lineages.sort_by_key(|(key, _)| **key);
+        lineages
+    }
+
     /// Restore a lineage's trim mark from a crash image ([`CrashImage::reopen`]), as synced.
     ///
     /// [`CrashImage::reopen`]: crate::storage::crash_image::CrashImage::reopen
@@ -1121,6 +1149,16 @@ impl MemoryEngine {
             let refused = InstallError::NewerGeneration { held };
             self.install_refused(partition, generation, at, "begin", refused);
             return Err(refused);
+        }
+        // A second unsynced begin keeps the first one's pre-begin copy: a host crash loses both.
+        if !self.unsynced_begins.contains_key(&partition) {
+            let before: Vec<HeldLineage> = self
+                .lineages
+                .iter()
+                .filter(|((p, _), _)| *p == partition)
+                .map(|(key, lineage)| (*key, lineage.clone()))
+                .collect();
+            self.unsynced_begins.insert(partition, before);
         }
         self.lineages.retain(|&(p, _), _| p != partition);
         self.records.retain(|&(p, _, _), _| p != partition);
@@ -1262,6 +1300,11 @@ impl MemoryEngine {
             root_base: root.0,
             root_digest: root.1,
         };
+        // A synced write: the WAL is one log, so it covers the begin and every chunk before it.
+        self.unsynced_begins.clear();
+        for lineage in self.lineages.values_mut() {
+            lineage.floor_synced = lineage.floor;
+        }
         if let Some(lineage) = self.lineages.get_mut(&(partition, generation)) {
             lineage.floor = Some(floor);
             lineage.floor_synced = Some(floor);

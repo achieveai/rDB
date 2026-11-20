@@ -25,10 +25,13 @@
 //! `install_finish` is a synced write that moves no durable mark. A tail release is synced, so
 //! every crash keeps it.
 //!
-//! Not modelled: the host's WAL is in order, and the sim's image is not. On the host an unsynced
-//! `install_begin` is lost by a host crash **with its wipe**, so the old copy comes back; here the
-//! wipe has already happened and the copy comes back empty. Likewise a surviving trim mark on the
-//! host implies the commits before it survived, which the per-lineage cut here does not enforce.
+//! A begin is one unsynced batch on the host, so a host crash before any sync covers it loses
+//! the begin **with its wipe**: the image then holds the partition's lineages as they were before
+//! the begin, and the old copy comes back.
+//!
+//! Not modelled: the host's WAL is in order, and the sim's image is not. A surviving trim mark on
+//! the host implies the commits before it survived, which the per-lineage cut here does not
+//! enforce.
 
 use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, StorageFault};
@@ -88,7 +91,20 @@ impl CrashImage {
         let mut bases = Vec::new();
         let mut floors = Vec::new();
         let mut installs = Vec::new();
-        for ((partition, generation), lineage) in engine.lineages() {
+        let lineages = match fault {
+            StorageFault::HostCrash => engine.host_crash_lineages(),
+            _ => engine.lineages().collect(),
+        };
+        // A parent's durable mark as the image finds it, which for a partition whose begin
+        // was lost is the pre-begin copy's, not the engine's current one.
+        let durable_of = |partition: PartitionId, generation: Generation| {
+            lineages
+                .iter()
+                .find(|(key, _)| **key == (partition, generation))
+                .map_or(DurableSeq::default(), |(_, lineage)| lineage.durable)
+        };
+        for &(key, lineage) in &lineages {
+            let (partition, generation) = (&key.0, &key.1);
             let applied = match fault {
                 StorageFault::ProcessCrash => lineage.applied,
                 // The safe direction: applied is *lowered* to what a real sync covered. This
@@ -111,7 +127,7 @@ impl CrashImage {
             if let Some(parent) = lineage.parent {
                 let base = match fault {
                     StorageFault::HostCrash => {
-                        Seq(lineage.base.0.min(engine.durable(*partition, parent).0))
+                        Seq(lineage.base.0.min(durable_of(*partition, parent).0))
                     }
                     _ => lineage.base,
                 };
