@@ -5258,6 +5258,7 @@ fn m11_r463_b_the_catch_up_clock_starts_again_only_on_progress() {
         since: Tick(since),
         low,
         acked,
+        pulled: 0,
     };
     let mut duty = |last: CatchUp, seen: CatchUp| {
         host.move_lag_duty(p, Some(last), seen, 500, OwnerEpoch(1));
@@ -5287,6 +5288,49 @@ fn m11_r463_b_the_catch_up_clock_starts_again_only_on_progress() {
     );
 }
 
+/// Issue #61 S2-R6 (design M5): a move's shadow being rebuilt from this owner's snapshot makes
+/// progress while the transfer serves entries, though its lag and acknowledgement stand still
+/// past the cutoff. More entries pulled starts the catch-up clock again; the same count does
+/// not, and past the deadline the move is given up. The pull count comes from the owner's
+/// `Transfer` to the shadow's copy in `shadow_duty`.
+/// Cut: `move_lag_duty` without the pulled reset, red (the first case keeps since 0).
+#[test]
+fn t61_s2_r6_a_snapshot_transfer_serving_entries_is_move_progress() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(&dir.path().join("node"), &rt);
+    host.move_catch_up_millis = 1_000;
+    let p = PartitionId(1);
+    let clock = |since, pulled| CatchUp {
+        to: NodeId(4),
+        since: Tick(since),
+        low: 100,
+        acked: 600,
+        pulled,
+    };
+    let mut duty = |last: CatchUp, seen: CatchUp| {
+        host.move_lag_duty(p, Some(last), seen, 500, OwnerEpoch(1));
+        host.move_catching_up
+            .remove(&p)
+            .map(|kept| (kept.since.0, kept.pulled))
+    };
+    assert_eq!(
+        duty(clock(0, 40), clock(2_000, 80)),
+        Some((2_000, 80)),
+        "the transfer served more entries"
+    );
+    assert_eq!(
+        duty(clock(0, 40), clock(500, 40)),
+        Some((0, 40)),
+        "the same count, within the deadline"
+    );
+    assert_eq!(
+        duty(clock(0, 40), clock(2_000, 40)),
+        None,
+        "the same count past the deadline"
+    );
+}
+
 /// Critic-s1c R1 (ruling A-R464), the re-plan return: a duty that runs while a re-plan is
 /// running cannot judge the shadow, so it puts the catch-up clock back with its start kept,
 /// and the next duty past the deadline still gives the move up.
@@ -5303,6 +5347,7 @@ fn m11_r464_b_a_re_plan_keeps_the_catch_up_clock_start() {
         since: Tick(0),
         low: 100,
         acked: 600,
+        pulled: 0,
     };
     host.move_catching_up.insert(p, started);
     let replan = Replan {

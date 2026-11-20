@@ -1849,6 +1849,9 @@ struct CatchUp {
     low: u64,
     /// What the shadow had acknowledged at the last duty.
     acked: u64,
+    /// Issue #61 (design M5): entries this owner's snapshot transfer to the shadow had served
+    /// at the last duty, 0 with none. The owner is the source, so the copy advancing counts.
+    pulled: u64,
 }
 
 /// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
@@ -9542,11 +9545,17 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
+                let pulled = self
+                    .transfers
+                    .get(&(partition, shadow.copy))
+                    .filter(|transfer| transfer.node == shadow.node)
+                    .map_or(0, |transfer| transfer.pulled);
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
                     low: behind,
                     acked,
+                    pulled,
                 };
                 self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
             }
@@ -9579,7 +9588,8 @@ impl Host {
     /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
     /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
     /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
-    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// advancing (`lagging` is the entry this duty took), or this owner's snapshot transfer to
+    /// the shadow serving more entries (issue #61, M5). Any of them starts it again. Past
     /// `move_catch_up_millis` with no progress the move is given up as
     /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
     /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
@@ -9595,8 +9605,9 @@ impl Host {
         let (to, behind, now) = (seen.to, seen.low, seen.since);
         let clock = match lagging {
             Some(last) if last.to == to => {
-                let progress =
-                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                let progress = behind < last.low
+                    || (last.acked < cutoff && seen.acked > last.acked)
+                    || seen.pulled > last.pulled;
                 CatchUp {
                     since: if progress { now } else { last.since },
                     low: last.low.min(behind),
