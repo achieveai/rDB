@@ -27,6 +27,7 @@ pub(crate) fn config(dir: &Path) -> DbConfig {
         boot: None,
         storage: crate::StorageOptions::default(),
         failover: None,
+        addresses: None,
     }
 }
 
@@ -1399,6 +1400,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
     let (owner, mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
         partition_count: 1,
+        nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
         boot: open,
         budgets: rdb_core::contracts::event::Budgets::SPEC_DEFAULTS,
@@ -1503,6 +1505,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let (owner, _mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
         partition_count: 1,
+        nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
         boot: BootId((1 << 16) + 1),
         budgets,

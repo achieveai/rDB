@@ -16,10 +16,15 @@ use tokio::net::TcpListener;
 /// ready to use it — reading `local_addr()` and then rebinding later would race another
 /// process for the same port.
 pub async fn ephemeral_listener() -> (TcpListener, SocketAddr) {
-    let listener =
-        config_gossip::ports::bind_tcp("testkit", SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .await
-            .unwrap_or_else(|e| panic!("bind ephemeral 127.0.0.1:0: {e}"));
+    ephemeral_listener_on(Ipv4Addr::LOCALHOST).await
+}
+
+/// [`ephemeral_listener`] on `host`, such as `127.0.0.2`: a second loopback address is a second
+/// host on one machine, which rDB's one-node-per-host rows run on (#80 S1b).
+pub async fn ephemeral_listener_on(host: Ipv4Addr) -> (TcpListener, SocketAddr) {
+    let listener = config_gossip::ports::bind_tcp("testkit", SocketAddr::from((host, 0)))
+        .await
+        .unwrap_or_else(|e| panic!("bind ephemeral {host}:0: {e}"));
     let addr = listener
         .local_addr()
         .expect("bound listener has a local address");

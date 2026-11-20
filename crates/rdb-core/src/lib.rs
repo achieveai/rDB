@@ -23,7 +23,9 @@
 //! * [`authority`], [`transaction`], [`replication`], [`publication`], [`protection`],
 //!   [`recovery`] — the six kernel modules, one per spike §5 package.
 //! * [`route`] — which modules a kernel fact reaches, and in what order. Every host shares it.
-//! * [`placement`] — the M11 placement planner, a pure function over an inventory (model only).
+//! * [`placement`] — where a declared database first puts each partition ([`placement::initial`],
+//!   the ring, applied since #80 S1b), and the M11 placement planner, a pure function over an
+//!   inventory (model only).
 //!
 //! # State (2026-09-20)
 //!

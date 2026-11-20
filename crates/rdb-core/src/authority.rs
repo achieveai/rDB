@@ -97,6 +97,7 @@
 
 pub mod clock;
 pub mod grant;
+pub mod node;
 pub mod partition;
 
 use std::collections::{BTreeMap, BTreeSet};

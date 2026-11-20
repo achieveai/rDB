@@ -38,6 +38,7 @@ ADR that supersedes.
 | [0020](0020-change-feed-for-external-consumers.md) | A change feed for external apps — read every committed change, in order | Proposed (not scheduled; no code in M10) |
 | [0021](0021-check-b-floor-guard-on-landing-and-inventory.md) | Check B — a floor guard on landing and on the inventory link (extends 0010) | **Accepted** |
 | [0022](0022-formation-by-declaration.md) | Formation by declaration — each node forms its own partitions from its own folder (extends 0008) | Proposed |
+| [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
 enables no Merge family. 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation

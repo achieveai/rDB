@@ -82,6 +82,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         failover: None,
+        addresses: None,
     };
     let mut db = rt.block_on(Db::open(config, store, rt.handle().clone()))?;
     db.wait_ready(Duration::from_secs(60))?;

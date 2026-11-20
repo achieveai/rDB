@@ -22,6 +22,7 @@
 //! [`clear_grant`] (M9 S2b) is the planner's other duty here: it removes the `grants/{node}`
 //! record a restarted node's old process left behind, through rdb-core's three guards.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use config_core::{
 };
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
+use rdb_core::authority::node::{host_of, machine_refusal, parse_addr, NodeRecord, MAX_ADDR_LEN};
 use rdb_core::authority::partition::{
     prior_of, PartitionLifecycle, PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN,
 };
@@ -126,6 +128,59 @@ pub fn members_at(boot: BootId) -> Vec<Member> {
 #[must_use]
 pub const fn initial_owner(partition: PartitionId) -> NodeId {
     NodeId((partition.0 - 1) % 3 + 1)
+}
+
+/// How many copies every partition has: rf3, at any node count (#80 S1b). Every check that
+/// asks "does the partition hold all its copies" compares with this, never with a node count.
+pub const RF: usize = rdb_core::placement::INITIAL_COPIES;
+
+/// The members a declaration first places `partition` on, every node at `boot` (#80 S1b,
+/// ADR-rdb-0023): [`rdb_core::placement::initial`]'s ring over the declared `nodes`, in node
+/// order, each node's copy number `node - 1`, the Primary role on the ring's primary. Over
+/// [`crate::db::ALL_NODES`] it equals [`members_for`].
+///
+/// # Panics
+///
+/// As [`rdb_core::placement::initial`]: fewer than three nodes, or not in order. Every caller
+/// passes a declared node list, which [`declare`] and [`Formation::decode`] check.
+#[must_use]
+pub fn placed(nodes: &[NodeId], partition: PartitionId, boot: BootId) -> Vec<Member> {
+    let ids: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    let ring = rdb_core::placement::initial(&ids, partition.0);
+    ring.copies
+        .iter()
+        .map(|node| Member {
+            copy: copy_of(NodeId(*node)),
+            node: NodeId(*node),
+            boot,
+            role: if *node == ring.primary {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::RegularSecondary
+            },
+        })
+        .collect()
+}
+
+/// The owner a declaration places `partition` with over `nodes` (#80 S1b): the ring's primary.
+/// Over [`crate::db::ALL_NODES`] it equals [`initial_owner`].
+///
+/// # Panics
+///
+/// As [`placed`].
+#[must_use]
+pub fn owner_in(nodes: &[NodeId], partition: PartitionId) -> NodeId {
+    let ids: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    NodeId(rdb_core::placement::initial(&ids, partition.0).primary)
+}
+
+/// The copy number a node's copy takes when it is first placed: `node - 1`, as [`members`]
+/// numbers nodes 1 to 3 (#80 S1b).
+fn copy_of(node: NodeId) -> CopyId {
+    CopyId(
+        u8::try_from(node.0 - 1)
+            .unwrap_or_else(|_| panic!("node {} is past MAX_NODES: no copy number", node.0)),
+    )
 }
 
 /// [`members_at`] for `partition`: each node keeps its copy number, and the Primary role sits on
@@ -250,7 +305,7 @@ pub(crate) async fn form(
         tracing::info!(key = %key, revision = revision.0, partitions, "bootstrap_routes_root");
     }
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
-    let written = write_records(store, &all).await?;
+    let written = write_records(store, &crate::db::ALL_NODES, &all).await?;
     for (partition, revision) in &written {
         let members = members_for(*partition, boot);
         start_recovery(now, boot, *partition, *revision, members, &send)?;
@@ -258,14 +313,17 @@ pub(crate) async fn form(
     Ok(written[0].1)
 }
 
-/// Create the generation-0 record of each of `partitions`, or adopt one an earlier attempt
-/// wrote (issue #79): the half of [`form`] before any plan goes out. Answers each one's revision.
+/// Create the generation-0 record of each of `partitions`, placed over `nodes`, or adopt one an
+/// earlier attempt wrote (issue #79): the half of [`form`] before any plan goes out. Answers
+/// each one's revision. `nodes` is the declared node list, or [`crate::db::ALL_NODES`] for a
+/// database no declaration made (#80 S1b).
 ///
 /// # Errors
 ///
 /// As [`bootstrap`].
 pub(crate) async fn write_records(
     store: &Arc<dyn ConfigStore>,
+    nodes: &[NodeId],
     partitions: &[PartitionId],
 ) -> Result<Vec<(PartitionId, Revision)>, BootstrapError> {
     let mut written = Vec::with_capacity(partitions.len());
@@ -273,18 +331,19 @@ pub(crate) async fn write_records(
         let key = ControlKey::Partition(partition).encode();
         written.push((
             partition,
-            create_or_adopt(store, &key, &initial_record(partition).encode()).await?,
+            create_or_adopt(store, &key, &initial_record(nodes, partition).encode()).await?,
         ));
     }
     Ok(written)
 }
 
-/// The generation-0 record [`write_records`] creates for `partition`, placed as
-/// [`initial_owner`].
-fn initial_record(partition: PartitionId) -> PartitionRecord {
+/// The generation-0 record [`write_records`] creates for `partition`, its owner the one
+/// [`owner_in`] places over `nodes` (#80 S1b). Layout 2, as before S1b: the record names its
+/// owner and no members, so over nodes 1 to 3 its bytes are what they always were.
+fn initial_record(nodes: &[NodeId], partition: PartitionId) -> PartitionRecord {
     PartitionRecord {
         partition,
-        owner: initial_owner(partition),
+        owner: owner_in(nodes, partition),
         generation: Generation(0),
         owner_epoch: OwnerEpoch(0),
         config_version: CONFIG_VERSION,
@@ -317,7 +376,8 @@ async fn create_or_adopt(
     }
 }
 
-/// Send `partition`'s bootstrap plan, pinning `members`, and fence to its [`initial_owner`].
+/// Send `partition`'s bootstrap plan, pinning `members`, and fence to the member they pin
+/// Primary: the placement's owner (#80 S1b).
 fn start_recovery(
     now: Tick,
     boot: BootId,
@@ -326,7 +386,16 @@ fn start_recovery(
     members: Vec<Member>,
     send: &impl Fn(NodeId, Msg) -> Result<(), NodeStopped>,
 ) -> Result<(), BootstrapError> {
-    let owner = initial_owner(partition);
+    let owner = members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .map(|member| member.node)
+        .ok_or_else(|| {
+            BootstrapError::Control(format!(
+                "partition {}'s bootstrap plan pins no primary",
+                partition.0
+            ))
+        })?;
     let lineage = Lineage {
         partition,
         generation: Generation(0),
@@ -421,17 +490,53 @@ const FORMATION_LAYOUT: u8 = 1;
 /// of two declarations of different counts exactly one goes on to write.
 pub const RESERVATION_OPERATION: OperationId = OperationId(FORMATION_OPERATION.0 + 1);
 
-/// The version byte of the reservation: layout 1 is the partition count as a little-endian
-/// u32, then one little-endian u32 per declared node.
-const RESERVATION_LAYOUT: u8 = 1;
+/// The version byte an S1a build wrote its reservation with: the partition count as a
+/// little-endian u32, then one little-endian u32 per declared node. Read, never written, so a
+/// refusal can name such a reservation (#80 S1b, ADR-rdb-0023).
+const RESERVATION_LAYOUT_NODES_ONLY: u8 = 1;
+
+/// The version byte of the reservation (#80 S1b, ADR-rdb-0023): layout 2 is the partition
+/// count as a little-endian u32, the node count as one byte, then per node its id as a
+/// little-endian u32 and its address and machine, each as one length byte and that many
+/// bytes. So two declarations that differ in one address reserve different bytes, and only one
+/// goes on.
+const RESERVATION_LAYOUT: u8 = 2;
 
 /// What a declaration asks for (#80 S1a): the database's nodes and its partition count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
-    /// The data nodes. This build declares nodes 1, 2 and 3 only.
-    pub nodes: Vec<NodeId>,
+    /// The data nodes: 1 to K, K from 3 to [`crate::db::MAX_NODES`] ([`node_set_refusal`]),
+    /// each with where it listens and its machine (#80 S1b, [`Declaration::records`]).
+    pub nodes: Vec<NodeDecl>,
     /// The partition count, fixed from then on.
     pub partitions: u32,
+}
+
+/// One declared node (#80 S1b): its id, the address it listens on (`host:port`, as its
+/// `--listen` and every `--peers` name it), and the machine it runs on. `None` takes the
+/// address's host as [`parse_addr`] parses it as the machine: `[0:0:0:0:0:0:0:1]:7100` gives
+/// `::1`, and `DB-A.example.:7100` gives `db-a.example`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDecl {
+    /// The node.
+    pub node: NodeId,
+    /// Where it listens.
+    pub addr: String,
+    /// Its machine label; `None` is the host of [`Self::addr`] as [`parse_addr`] parses it,
+    /// not as written. Lowercased, then held to [`machine_refusal`]: 1 to 63 bytes of
+    /// `[a-z0-9._:-]`, so no whitespace, control byte or other character is ever stored.
+    pub machine: Option<String>,
+}
+
+/// The reservation a declaration created, as [`Declaration::decode_reservation`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    /// The reserved partition count.
+    pub partitions: u32,
+    /// The reserved nodes, in order.
+    pub nodes: Vec<NodeId>,
+    /// Each node's record, from layout 2; `None` for a layout-1 reservation an S1a build wrote.
+    pub records: Option<Vec<NodeRecord>>,
 }
 
 /// The formation record a declaration wrote: the database's identity, its partition count and
@@ -472,50 +577,198 @@ impl Formation {
         if !tail.is_empty() {
             return None;
         }
+        let nodes: Vec<NodeId> = nodes
+            .iter()
+            .map(|node| NodeId(u32::from_le_bytes(*node)))
+            .collect();
+        // #80 S1b: placement runs over this list, so a list no declaration could write is not
+        // a formation record this build reads.
+        if node_set_refusal(&nodes).is_some() {
+            return None;
+        }
         Some(Self {
             instance: instance.try_into().ok()?,
             partitions: u32::from_le_bytes(partitions.try_into().ok()?),
-            nodes: nodes
-                .iter()
-                .map(|node| NodeId(u32::from_le_bytes(*node)))
-                .collect(),
+            nodes,
         })
     }
 }
 
 impl Declaration {
-    /// The reservation's body, layout 1 ([`RESERVATION_LAYOUT`]).
+    /// The declared node ids, in order.
     #[must_use]
-    pub fn encode_reservation(&self) -> Bytes {
-        let mut out = Vec::with_capacity(1 + 4 + 4 * self.nodes.len());
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.nodes.iter().map(|decl| decl.node).collect()
+    }
+
+    /// The `nodes/{id}` records this declaration writes (#80 S1b), or why it is refused: the node
+    /// set ([`node_set_refusal`]), then each node in turn: its address (one [`parse_addr`]
+    /// takes: a port of 1 to 65535, and a dialable IP or a whitelisted host name; at most 255
+    /// bytes; not an earlier node's), then its machine label ([`machine_refusal`], after
+    /// lowercasing; unset, the address's host as [`parse_addr`] parses it). Last, across all
+    /// nodes, [`machine_clash`].
+    ///
+    /// # Errors
+    ///
+    /// The refusal's text.
+    pub fn records(&self) -> Result<Vec<NodeRecord>, String> {
+        if let Some(why) = node_set_refusal(&self.node_ids()) {
+            return Err(why);
+        }
+        let mut records: Vec<NodeRecord> = Vec::with_capacity(self.nodes.len());
+        for decl in &self.nodes {
+            let n = decl.node.0;
+            let host = parse_addr(&decl.addr).map_err(|why| format!("node {n}: {why}"))?;
+            if decl.addr.len() > MAX_ADDR_LEN {
+                return Err(format!(
+                    "node {n} address {:?} is longer than {MAX_ADDR_LEN} bytes",
+                    decl.addr
+                ));
+            }
+            if let Some(other) = records.iter().find(|record| record.addr == decl.addr) {
+                return Err(format!(
+                    "nodes {} and {n} both have address {}: each node listens on its own",
+                    other.node.0, decl.addr
+                ));
+            }
+            let machine = decl
+                .machine
+                .clone()
+                .unwrap_or_else(|| host.to_string())
+                .to_ascii_lowercase();
+            if let Some(why) = machine_refusal(&machine) {
+                return Err(format!(
+                    "node {n}: {why}{}",
+                    if decl.machine.is_none() {
+                        " (taken from its address's host; name one with --machines)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            records.push(NodeRecord {
+                node: decl.node,
+                addr: decl.addr.clone(),
+                machine,
+            });
+        }
+        if let Some(why) = machine_clash(&records) {
+            return Err(why);
+        }
+        Ok(records)
+    }
+
+    /// The reservation's body, layout 2 ([`RESERVATION_LAYOUT`]), over `records` as
+    /// [`Self::records`] made them.
+    #[must_use]
+    pub fn encode_reservation(&self, records: &[NodeRecord]) -> Bytes {
+        let mut out = Vec::with_capacity(1 + 4 + 1 + records.len() * (4 + 2 + 32));
         out.push(RESERVATION_LAYOUT);
         out.extend_from_slice(&self.partitions.to_le_bytes());
-        for node in &self.nodes {
-            out.extend_from_slice(&node.0.to_le_bytes());
+        // At most `MAX_NODES` records, checked by `records`.
+        out.push(u8::try_from(records.len()).unwrap_or(u8::MAX));
+        for record in records {
+            // The record's own layout without its version byte: id, address, machine.
+            out.extend_from_slice(&record.encode()[1..]);
         }
         Bytes::from(out)
     }
 
-    /// `None` for a body that is not reservation layout 1.
+    /// The reservation `body` holds: layout 2, or layout 1 from an S1a build (no records).
+    /// `None` for anything else.
     #[must_use]
-    pub fn decode_reservation(body: &[u8]) -> Option<Self> {
-        let [RESERVATION_LAYOUT, rest @ ..] = body else {
-            return None;
-        };
-        let (partitions, rest) = rest.split_at_checked(4)?;
-        let (nodes, tail) = rest.as_chunks::<4>();
-        if !tail.is_empty() {
-            return None;
+    pub fn decode_reservation(body: &[u8]) -> Option<Reservation> {
+        match body {
+            [RESERVATION_LAYOUT_NODES_ONLY, rest @ ..] => {
+                let (partitions, rest) = rest.split_at_checked(4)?;
+                let (nodes, tail) = rest.as_chunks::<4>();
+                if !tail.is_empty() {
+                    return None;
+                }
+                Some(Reservation {
+                    partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+                    nodes: nodes
+                        .iter()
+                        .map(|node| NodeId(u32::from_le_bytes(*node)))
+                        .collect(),
+                    records: None,
+                })
+            }
+            [RESERVATION_LAYOUT, rest @ ..] => {
+                let (partitions, rest) = rest.split_at_checked(4)?;
+                let (&count, mut rest) = rest.split_first()?;
+                let mut records = Vec::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    // Each entry is a node record's layout without its version byte: an id,
+                    // then two length-prefixed fields.
+                    let addr_len = usize::from(*rest.get(4)?);
+                    let machine_len = usize::from(*rest.get(4 + 1 + addr_len)?);
+                    let len = 4 + 1 + addr_len + 1 + machine_len;
+                    let mut one = vec![1];
+                    one.extend_from_slice(rest.get(..len)?);
+                    records.push(NodeRecord::decode(&one)?);
+                    rest = &rest[len..];
+                }
+                if !rest.is_empty() {
+                    return None;
+                }
+                Some(Reservation {
+                    partitions: u32::from_le_bytes(partitions.try_into().ok()?),
+                    nodes: records.iter().map(|record| record.node).collect(),
+                    records: Some(records),
+                })
+            }
+            _ => None,
         }
-        Some(Self {
-            partitions: u32::from_le_bytes(partitions.try_into().ok()?),
-            nodes: nodes
-                .iter()
-                .map(|node| NodeId(u32::from_le_bytes(*node)))
-                .collect(),
-        })
     }
 }
+
+/// Why `records` put two nodes on one machine (#80 S1b, ruling 1), or `None`: two nodes whose
+/// machine labels are equal, or whose addresses have the same host, whatever their labels say.
+/// So `127.0.0.1` and `127.0.0.2` are two hosts, and two ports of one address are one. Labels
+/// are compared as written, lowercase ([`Declaration::records`] lowercases them). Hosts are
+/// compared as [`host_of`] parses them: an IP by value, so `[::1]` and `[0:0:0:0:0:0:0:1]` are
+/// one host, and `[::ffff:127.0.0.1]` is `127.0.0.1`; a name lowercase and less one trailing
+/// dot. A name and an IP of one machine are not caught; only the labels can say so.
+#[must_use]
+pub fn machine_clash(records: &[NodeRecord]) -> Option<String> {
+    for (at, a) in records.iter().enumerate() {
+        for b in &records[at + 1..] {
+            let host_a = host_of(&a.addr);
+            if host_a.is_some() && host_a == host_of(&b.addr) {
+                return Some(format!(
+                    "nodes {} ({}) and {} ({}) are on one machine: their addresses have the same \
+                     host, and a database runs one data node per machine",
+                    a.node.0, a.addr, b.node.0, b.addr
+                ));
+            }
+            if a.machine == b.machine {
+                return Some(format!(
+                    "nodes {} and {} are both on machine {:?}: a database runs one data node per \
+                     machine",
+                    a.node.0, b.node.0, a.machine
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// How a node list prints in a refusal: `[1@127.0.0.1:7100/127.0.0.1, ...]`.
+fn records_in_words(records: &[NodeRecord]) -> String {
+    let each: Vec<String> = records
+        .iter()
+        .map(|record| format!("{}@{}/{}", record.node.0, record.addr, record.machine))
+        .collect();
+    format!("[{}]", each.join(", "))
+}
+
+/// What a store declared by an S1a build lacks, and what to do (#80 S1b ruling 4, ADR-rdb-0023):
+/// its formation record names the nodes, and no `nodes/` record says where each listens.
+pub const S1A_STORE: &str = "the store was declared by a build before #80 S1b: it holds a \
+                             formation record and no nodes/ records, so no node's address can \
+                             be checked; declare the database again, with --peers, on a new \
+                             empty control store";
 
 /// How [`declare`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +807,27 @@ pub enum DeclareError {
     },
 }
 
+/// Why `nodes` is not a node set a declaration takes (#80 S1b), or `None`: nodes 1 to K with no
+/// gap and none twice, K from 3 to [`crate::db::MAX_NODES`]. Ids are never reused, so a
+/// database declared with K nodes may add only `MAX_NODES - K` over its life (ruling C3).
+#[must_use]
+pub fn node_set_refusal(nodes: &[NodeId]) -> Option<String> {
+    let max = crate::db::MAX_NODES;
+    let named: Vec<u32> = nodes.iter().map(|node| node.0).collect();
+    let k = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+    if !(3..=max).contains(&k) {
+        return Some(format!(
+            "nodes {named:?}: a database is declared with 3 to {max} nodes"
+        ));
+    }
+    if named.iter().copied().ne(1..=k) {
+        return Some(format!(
+            "nodes {named:?}: a declaration names nodes 1 to K, each once, in order, with no gap"
+        ));
+    }
+    None
+}
+
 /// The formation record, `None` when no declaration wrote one (#80 S1a).
 ///
 /// # Errors
@@ -576,9 +850,144 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
         .transpose()
 }
 
+/// Every `nodes/{id}` record, by node (#80 S1b, ADR-rdb-0023); empty when none was written.
+///
+/// # Errors
+///
+/// [`DeclareError::Store`] when the store fails or truncates the list,
+/// [`DeclareError::Undecodable`] for a record this build does not read, a key that is not
+/// `nodes/` and a decimal id, or a body whose node is not its key's.
+pub async fn read_nodes(
+    store: &dyn ConfigStore,
+) -> Result<BTreeMap<NodeId, NodeRecord>, DeclareError> {
+    let prefix = ControlPrefix::Nodes.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("list {prefix}"),
+            error,
+        })?;
+    if listed.truncated {
+        return Err(DeclareError::Store {
+            step: format!("list {prefix}"),
+            error: ConfigError::Unavailable {
+                reason: format!("truncated at revision {}", listed.read_revision),
+            },
+        });
+    }
+    let mut records = BTreeMap::new();
+    for found in &listed.records {
+        let key = String::from_utf8_lossy(&found.key).into_owned();
+        let record = NodeRecord::decode(&found.value)
+            .filter(|record| ControlKey::Node(record.node).encode() == key)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        records.insert(record.node, record);
+    }
+    Ok(records)
+}
+
+/// Why node `node` may not start with `listen` and `peers` on a database declared as
+/// `formation` with node records `records` (#80 S1b rulings 2 and 4, ADR-rdb-0023), or `None`.
+/// Pure: `rdb_node` calls it before it writes its boot or binds, and a declared `Db::open` calls
+/// it with `DbConfig::addresses` before it creates `nodes/` or writes anything.
+///
+/// - No formation record: `None`; an undeclared database has no node records.
+/// - `node` not among the declared nodes: refused.
+/// - No `nodes/` record at all: an S1a store, refused with [`S1A_STORE`].
+/// - `node`'s record absent: refused.
+/// - `listen` must be its record's address, or the same port on the wildcard host (`0.0.0.0`,
+///   `::`).
+/// - Every `peers` entry, this node's included, must be its node's record's address, and every
+///   declared node other than `node` must have one.
+///
+/// Each refusal that compares a value with a record names the record (`nodes/N`) and both
+/// values.
+#[must_use]
+pub fn node_start_refusal(
+    node: NodeId,
+    listen: &str,
+    peers: &BTreeMap<NodeId, String>,
+    formation: Option<&Formation>,
+    records: &BTreeMap<NodeId, NodeRecord>,
+) -> Option<String> {
+    const NOTHING: &str = "nothing was started";
+    let formation = formation?;
+    let declared = || formation.nodes.iter().map(|n| n.0).collect::<Vec<_>>();
+    if !formation.nodes.contains(&node) {
+        return Some(format!(
+            "node {} is not declared: the database declares nodes {:?}; {NOTHING}",
+            node.0,
+            declared()
+        ));
+    }
+    if records.is_empty() {
+        return Some(format!("{S1A_STORE}; {NOTHING}"));
+    }
+    let key = |n: NodeId| ControlKey::Node(n).encode();
+    let Some(own) = records.get(&node) else {
+        return Some(format!(
+            "{} is absent, so where node {} listens is not declared; {NOTHING}",
+            key(node),
+            node.0
+        ));
+    };
+    let wildcard_same_port = || {
+        let (host, port) = listen.rsplit_once(':')?;
+        let (_, own_port) = own.addr.rsplit_once(':')?;
+        let wildcard = matches!(host, "0.0.0.0" | "[::]" | "::");
+        (wildcard && port == own_port).then_some(())
+    };
+    if listen != own.addr && wildcard_same_port().is_none() {
+        return Some(format!(
+            "listen address {listen} disagrees with {}, which records {}: a node listens where \
+             its record says; {NOTHING}",
+            key(node),
+            own.addr
+        ));
+    }
+    for (peer, addr) in peers {
+        let Some(record) = records.get(peer) else {
+            return Some(format!(
+                "peer address {}={addr} names node {}, which has no {}: the database declares \
+                 nodes {:?}; {NOTHING}",
+                peer.0,
+                peer.0,
+                key(*peer),
+                declared()
+            ));
+        };
+        if *addr != record.addr {
+            return Some(format!(
+                "peer address {}={addr} disagrees with {}, which records {}; {NOTHING}",
+                peer.0,
+                key(*peer),
+                record.addr
+            ));
+        }
+    }
+    for declared_node in &formation.nodes {
+        if *declared_node != node && !peers.contains_key(declared_node) {
+            let addr = records
+                .get(declared_node)
+                .map_or("no address", |record| record.addr.as_str());
+            return Some(format!(
+                "no peer address for node {}, which {} records at {addr}; {NOTHING}",
+                declared_node.0,
+                key(*declared_node)
+            ));
+        }
+    }
+    None
+}
+
 /// Declare a database (#80 S1a, ADR-rdb-0022): first the reservation under
 /// [`RESERVATION_OPERATION`] ([`reserve`]), then `routes/0` at more than one partition, every
-/// partition's generation-0 record ([`write_records`], placement as [`initial_owner`]), then
+/// partition's generation-0 record ([`write_records`], owner as [`owner_in`] places it), then
 /// **last** the formation record under [`FORMATION_OPERATION`], naming a new instance. No copy is
 /// written: each node process forms the partitions it owns from its own empty folder.
 ///
@@ -596,13 +1005,10 @@ pub async fn declare(
     store: &Arc<dyn ConfigStore>,
     declaration: &Declaration,
 ) -> Result<Declared, DeclareError> {
-    let wanted = crate::db::ALL_NODES.to_vec();
-    if declaration.nodes != wanted {
-        return Err(DeclareError::Refused(format!(
-            "nodes {:?}: this build declares nodes 1, 2 and 3 only; nothing was written",
-            declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
-        )));
-    }
+    let records = declaration
+        .records()
+        .map_err(|why| DeclareError::Refused(format!("{why}; nothing was written")))?;
+    let nodes = declaration.node_ids();
     let max = rdb_core::partition_map::MAX_PARTITIONS;
     if !(1..=max).contains(&declaration.partitions) {
         return Err(DeclareError::Refused(format!(
@@ -611,8 +1017,16 @@ pub async fn declare(
             declaration.partitions
         )));
     }
-    let same = |found: Formation| {
-        if found.partitions == declaration.partitions && found.nodes == declaration.nodes {
+    // #80 S1b: `Already` only when the node records are this declaration's too, so a run that
+    // changed an address is refused, and an S1a store (no records) is refused, not adopted.
+    let same = |found: Formation, held: BTreeMap<NodeId, NodeRecord>| {
+        let held: Vec<NodeRecord> = held.into_values().collect();
+        if held.is_empty() {
+            return Err(DeclareError::Refused(format!(
+                "{S1A_STORE}; nothing was written"
+            )));
+        }
+        if found.partitions == declaration.partitions && found.nodes == nodes && held == records {
             tracing::info!(
                 instance_hex = %instance_hex(&found.instance),
                 partitions = found.partitions,
@@ -621,19 +1035,19 @@ pub async fn declare(
             Ok(Declared::Already(found))
         } else {
             Err(DeclareError::Refused(format!(
-                "the database is already declared with {} partitions and nodes {:?}: a \
+                "the database is already declared with {} partitions and nodes {}: a \
                  declaration is written once; nothing was written",
                 found.partitions,
-                found.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+                records_in_words(&held)
             )))
         }
     };
     if let Some(found) = read_formation(&**store).await? {
-        return same(found);
+        return same(found, read_nodes(&**store).await?);
     }
     let partitions = declaration.partitions;
-    declare_preflight(&**store, partitions).await?;
-    reserve(store, declaration).await?;
+    declare_preflight(&**store, &records, partitions).await?;
+    reserve(store, declaration, &records).await?;
     if partitions > 1 {
         let key = ControlKey::Route(RangeId(0)).encode();
         let value = RoutesRoot {
@@ -642,12 +1056,18 @@ pub async fn declare(
         .encode();
         create_or_adopt(store, &key, &value).await?;
     }
+    // #80 S1b: every node's record, before any partition record, so a store that holds a
+    // partition record holds every node's address.
+    for record in &records {
+        let key = ControlKey::Node(record.node).encode();
+        create_or_adopt(store, &key, &record.encode()).await?;
+    }
     let all: Vec<PartitionId> = (1..=partitions).map(PartitionId).collect();
-    write_records(store, &all).await?;
+    write_records(store, &nodes, &all).await?;
     let formation = Formation {
         instance: *uuid::Uuid::new_v4().as_bytes(),
         partitions,
-        nodes: declaration.nodes.clone(),
+        nodes: nodes.clone(),
     };
     // PR #138 review r5: the declaration, not an open, creates the instance's counter, at no
     // opens yet. So a declared open never writes it from absent: an absent counter is refused
@@ -685,7 +1105,7 @@ pub async fn declare(
         Ok(_) | Err(ConfigError::DeadlineExceededUnknownOutcome) => {
             match read_formation(&**store).await? {
                 Some(found) if found == formation => Ok(Declared::Created(found)),
-                Some(found) => same(found),
+                Some(found) => same(found, read_nodes(&**store).await?),
                 None => Err(BootstrapError::Control(format!(
                     "{key} is absent after a create that was not reported applied"
                 ))
@@ -710,9 +1130,10 @@ pub async fn declare(
 async fn reserve(
     store: &Arc<dyn ConfigStore>,
     declaration: &Declaration,
+    records: &[NodeRecord],
 ) -> Result<(), DeclareError> {
     let key = ControlKey::Operation(RESERVATION_OPERATION).encode();
-    match create_or_adopt(store, &key, &declaration.encode_reservation()).await {
+    match create_or_adopt(store, &key, &declaration.encode_reservation(records)).await {
         Ok(revision) => {
             tracing::info!(
                 key = %key,
@@ -742,39 +1163,109 @@ async fn reserve(
                 asked = declaration.partitions,
                 "declare_reservation_refused"
             );
+            let Some(held_records) = held.records else {
+                return Err(s1a_reservation_refused(&key, &held));
+            };
             Err(DeclareError::Refused(format!(
-                "{key} reserves the store for a declaration of {} partitions and nodes {:?}, and \
-                 this declaration asks for {} partitions and nodes {:?}: only that declaration \
+                "{key} reserves the store for a declaration of {} partitions and nodes {}, and \
+                 this declaration asks for {} partitions and nodes {}: only that declaration \
                  may go on; nothing was written",
                 held.partitions,
-                held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+                records_in_words(&held_records),
                 declaration.partitions,
-                declaration.nodes.iter().map(|n| n.0).collect::<Vec<_>>()
+                records_in_words(records)
             )))
         }
         Err(error) => Err(error.into()),
     }
 }
 
+/// The refusal of a store an S1a build reserved (#80 S1b ruling 4): its reservation, layout 1,
+/// names no node addresses, so the database is declared again on a new store.
+fn s1a_reservation_refused(key: &str, held: &Reservation) -> DeclareError {
+    DeclareError::Refused(format!(
+        "{key} reserves the store for a declaration of {} partitions and nodes {:?} by a build \
+         before #80 S1b, which wrote no node addresses: declare the database again, with \
+         --peers, on a new empty control store; nothing was written",
+        held.partitions,
+        held.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+    ))
+}
+
 /// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
-/// prefix of what this declaration writes, which it then adopts. That is `routes/0` at this
-/// count, if any, and untouched generation-0 records of partitions 1 to `partitions` only. So a
-/// database formed some other way (a rooted `partitions/1`), or an interrupted declaration of
-/// another count (its `routes/0`, or a record past this count), refuses it with nothing
-/// written. This is a read: two declarations of different counts **at once** can both pass it,
-/// and [`reserve`], the first write, is what lets only one of them go on.
+/// prefix of what this declaration writes, which it then adopts. It reads, in order: the
+/// reservation, refused when an S1a build wrote it (#80 S1b); every `nodes/` record, each of which
+/// must be this declaration's record for its node, byte for byte; `routes/0`, which must be at this
+/// count, if any; and the partition records, which must be untouched generation-0 records of
+/// partitions 1 to `partitions` only. So a database formed some other way (a rooted
+/// `partitions/1`), or an interrupted declaration of another count (its `routes/0`, or a record
+/// past this count), refuses it with nothing written. This is a read: two declarations of different
+/// counts **at once** can both pass it, and [`reserve`], the first write, is what lets only one of
+/// them go on.
 ///
 /// # Errors
 ///
 /// [`DeclareError::Refused`] naming the record in the way, [`DeclareError::Store`] when the
 /// store fails, [`DeclareError::Undecodable`] for a record this build does not read.
-async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(), DeclareError> {
+async fn declare_preflight(
+    store: &dyn ConfigStore,
+    records: &[NodeRecord],
+    partitions: u32,
+) -> Result<(), DeclareError> {
     let refused = |what: String| {
         DeclareError::Refused(format!(
             "{what}: the store holds part of another database or of another declaration, which \
              this declaration cannot adopt; nothing was written"
         ))
     };
+    // #80 S1b ruling 4, PR #144 review: an S1a build's reservation first, so a store it left
+    // half-written is refused with what to do, not by whichever of its records differs. A
+    // layout-2 reservation is [`reserve`]'s to judge.
+    let key = ControlKey::Operation(RESERVATION_OPERATION).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("get {key}"),
+            error,
+        })?;
+    if let Some(found) = read.record {
+        let held = Declaration::decode_reservation(&found.value)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        if held.records.is_none() {
+            tracing::info!(key = %key, reserved = held.partitions, "declare_reservation_refused");
+            return Err(s1a_reservation_refused(&key, &held));
+        }
+    }
+    // #80 S1b: every `nodes/` record already there must be one this declaration writes, byte
+    // for byte. Read before `partitions/`, which stays the preflight's last read.
+    for (node, held) in read_nodes(store).await? {
+        let key = ControlKey::Node(node).encode();
+        match records.iter().find(|record| record.node == node) {
+            Some(record) if *record == held => {}
+            Some(record) => {
+                return Err(refused(format!(
+                    "{key} records {}@{}/{} and this declaration says {}@{}/{}",
+                    held.node.0,
+                    held.addr,
+                    held.machine,
+                    record.node.0,
+                    record.addr,
+                    record.machine
+                )));
+            }
+            None => {
+                return Err(refused(format!(
+                    "{key} exists and this declaration names nodes 1 to {}",
+                    records.len()
+                )));
+            }
+        }
+    }
+    let nodes: Vec<NodeId> = records.iter().map(|record| record.node).collect();
+    let nodes = nodes.as_slice();
     let key = ControlKey::Route(RangeId(0)).encode();
     let read = store
         .get(GetRequest {
@@ -825,7 +1316,7 @@ async fn declare_preflight(store: &dyn ConfigStore, partitions: u32) -> Result<(
                 "{key} exists and this declaration asks for {partitions} partitions"
             )));
         }
-        if found.value != initial_record(partition).encode()
+        if found.value != initial_record(nodes, partition).encode()
             || found.create_revision != found.mod_revision
         {
             return Err(refused(format!(
@@ -1576,6 +2067,9 @@ pub(crate) struct HealCtx {
     pub(crate) partitions: Vec<PartitionId>,
     /// How many partitions the database has: what a frozen grant's next step says depends on it.
     pub(crate) partition_count: u32,
+    /// The nodes partitions are placed over (#80 S1b): the formation record's, or nodes 1 to 3
+    /// for a database no declaration made. A partition still to form pins [`placed`] over them.
+    pub(crate) nodes: Arc<[NodeId]>,
     /// The partitions of that node still to form, each with its record's revision (design 7.2):
     /// their plans go out after the clear, so a bootstrap F1 cannot acquire before it.
     pub(crate) bootstrap: Vec<(PartitionId, Revision)>,
@@ -1626,7 +2120,7 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         .bootstrap
         .iter()
         .map(|(partition, _)| {
-            members_for(*partition, BOOT)
+            placed(&ctx.nodes, *partition, BOOT)
                 .iter()
                 .map(RecordMember::of)
                 .collect()
@@ -1952,6 +2446,7 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
             member_boot: Arc::clone(&ctx.member_boot),
             partitions: ctx.partitions.clone(),
             bootstrap: ctx.bootstrap.clone(),
+            nodes: Arc::clone(&ctx.nodes),
             ..ctx
         };
         match heal(again).await {
@@ -2338,12 +2833,7 @@ async fn judge_and_clear(
     store: &dyn ConfigStore,
     node: NodeId,
 ) -> Result<Clearance, ApiError> {
-    let boot = db.boot_of(node).ok_or_else(|| {
-        ApiError::invalid(format!(
-            "node {}: no such node; this Db runs nodes 1, 2 and 3",
-            node.0
-        ))
-    })?;
+    let boot = db.boot_of(node).ok_or_else(|| db.no_such_node(node))?;
     let budgets = db.budgets().ok_or_else(|| {
         ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
     })?;
@@ -4563,6 +5053,7 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store,
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -4822,11 +5313,66 @@ mod tests {
         assert!(sent.is_empty(), "{} messages sent", sent.len());
     }
 
+    /// #80 S1b (risk: K = 3 bytes or members move): over nodes 1 to 3 the ring places every
+    /// partition a database may have exactly as before S1b. `placed` is `members_for`,
+    /// `owner_in` is `initial_owner`, and each generation-0 record is byte for byte the record
+    /// the pre-S1b `initial_record` wrote (its owner `initial_owner`), so a store declared or
+    /// formed before S1b still passes `declare_preflight` and adopts. Two records are pinned as
+    /// literal layout-2 bytes: partition 5 over nodes 1 to 3 (owner 2) and over nodes 1 to 5
+    /// (owner 5). Unit.
+    /// Cut: `placed` numbers copies from 0 in ring order instead of `node - 1`; partition 2's
+    /// members differ, red.
+    #[test]
+    fn s1b_placement_over_nodes_one_to_three_is_unchanged_and_its_records_keep_their_bytes() {
+        let three = crate::db::ALL_NODES;
+        for p in 1..=rdb_core::partition_map::MAX_PARTITIONS {
+            let partition = PartitionId(p);
+            assert_eq!(
+                placed(&three, partition, BOOT),
+                members_for(partition, BOOT)
+            );
+            assert_eq!(owner_in(&three, partition), initial_owner(partition));
+            let before = PartitionRecord {
+                partition,
+                owner: initial_owner(partition),
+                generation: Generation(0),
+                owner_epoch: OwnerEpoch(0),
+                config_version: CONFIG_VERSION,
+                lifecycle: PartitionLifecycle::Serving,
+            };
+            assert_eq!(
+                initial_record(&three, partition).encode(),
+                before.encode(),
+                "partition {p}"
+            );
+        }
+        let five: Vec<NodeId> = (1..=5).map(NodeId).collect();
+        let layout_2 = |owner: u8| {
+            let mut bytes = vec![2, 5, 0, 0, 0, owner, 0, 0, 0];
+            bytes.extend_from_slice(&[0; 8]); // generation 0
+            bytes.extend_from_slice(&[0; 8]); // owner epoch 0
+            bytes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]); // config version 1
+            bytes.push(0); // Serving
+            bytes
+        };
+        assert_eq!(
+            initial_record(&three, PartitionId(5)).encode().as_ref(),
+            layout_2(2)
+        );
+        assert_eq!(
+            initial_record(&five, PartitionId(5)).encode().as_ref(),
+            layout_2(5)
+        );
+    }
+
     /// PR #138 review: the formation record and the declaration's reservation are written once
     /// and read by every later build, so their keys and layout-1 bytes are pinned as literals, as
     /// are the key and bytes of the counter a declaration creates (r5):
     /// changing `encode` and `decode` together cannot pass while old stores stop opening. A wrong
     /// version byte, a count cut short and a trailing byte each decode as nothing. Unit.
+    /// #80 S1b moved the reservation to layout 2 (pinned by
+    /// `s1b_reservation_layout_2_bytes_are_pinned`): layout 1 is now only read, so this row
+    /// decodes its literal, as an S1a build wrote it, and no longer encodes it.
     #[test]
     fn s1a_formation_and_reservation_layout_1_bytes_are_pinned() {
         assert_eq!(
@@ -4855,19 +5401,18 @@ mod tests {
         ];
         assert_eq!(formation.encode().as_ref(), formation_bytes);
         assert_eq!(Formation::decode(&formation_bytes), Some(formation));
-        let declaration = Declaration {
-            nodes,
-            partitions: 8,
-        };
         let reservation_bytes: [u8; 17] = [
             1, // layout
             8, 0, 0, 0, // partitions
             1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, // nodes
         ];
-        assert_eq!(declaration.encode_reservation().as_ref(), reservation_bytes);
         assert_eq!(
             Declaration::decode_reservation(&reservation_bytes),
-            Some(declaration)
+            Some(Reservation {
+                partitions: 8,
+                nodes,
+                records: None
+            })
         );
         // PR #138 review r5: the counter `declare` creates, under the formation's instance, is
         // counter layout 2 at N = 0, nothing activated; the first open's CAS reads it as such.
@@ -4898,6 +5443,39 @@ mod tests {
         for (what, body) in malformed(&formation_bytes, 1 + INSTANCE_LEN) {
             assert_eq!(Formation::decode(&body), None, "formation: {what}");
         }
+        // #80 S1b, PR #144 review: placement runs over the node list, so a list no declaration
+        // writes does not decode; 3 to 8 nodes numbered 1 to K do.
+        let with_nodes = |nodes: &[u32]| {
+            let mut body = formation_bytes[..=INSTANCE_LEN + 4].to_vec();
+            for node in nodes {
+                body.extend_from_slice(&node.to_le_bytes());
+            }
+            body
+        };
+        for (what, nodes) in [
+            ("no node", &[][..]),
+            ("two nodes", &[1, 2][..]),
+            ("nine nodes", &[1, 2, 3, 4, 5, 6, 7, 8, 9][..]),
+            ("a gap", &[1, 2, 4][..]),
+            ("a node twice", &[1, 2, 2][..]),
+            ("out of order", &[1, 3, 2][..]),
+            ("from node 0", &[0, 1, 2][..]),
+            ("not from node 1", &[2, 3, 4][..]),
+        ] {
+            assert_eq!(
+                Formation::decode(&with_nodes(nodes)),
+                None,
+                "formation: {what}"
+            );
+        }
+        for k in 3..=8u32 {
+            let nodes: Vec<u32> = (1..=k).collect();
+            assert_eq!(
+                Formation::decode(&with_nodes(&nodes)).map(|found| found.nodes.len()),
+                Some(k as usize),
+                "formation: {k} nodes"
+            );
+        }
         for (what, body) in malformed(&reservation_bytes, 1) {
             assert_eq!(
                 Declaration::decode_reservation(&body),
@@ -4905,6 +5483,278 @@ mod tests {
                 "reservation: {what}"
             );
         }
+    }
+
+    /// #80 S1b row 10 (rulings 2 and 4, ADR-rdb-0023 Decision 5): the node-start check's
+    /// table. An undeclared database and a start that matches its records pass, as does
+    /// `--listen` on the wildcard host at the recorded port. Each refusal names the record and
+    /// both values: an undeclared node, an S1a store (no records), a missing own record, a
+    /// `--listen` on another port, a `--peers` entry that disagrees (this node's own included),
+    /// a peer that is not declared, and a declared peer left out. Unit.
+    /// Cut: skip the `--peers` loop; the disagreeing peer passes, red.
+    #[test]
+    fn s1b_node_start_refusal_names_the_record_that_disagrees() {
+        let nodes: Vec<NodeId> = (1..=3).map(NodeId).collect();
+        let formation = Formation {
+            instance: [7; INSTANCE_LEN],
+            partitions: 8,
+            nodes: nodes.clone(),
+        };
+        let records: BTreeMap<NodeId, NodeRecord> = nodes
+            .iter()
+            .map(|node| {
+                let record = NodeRecord {
+                    node: *node,
+                    addr: format!("127.0.0.{}:7100", node.0),
+                    machine: format!("127.0.0.{}", node.0),
+                };
+                (*node, record)
+            })
+            .collect();
+        let peers = |entries: &[(u32, &str)]| -> BTreeMap<NodeId, String> {
+            entries
+                .iter()
+                .map(|(n, addr)| (NodeId(*n), (*addr).to_owned()))
+                .collect()
+        };
+        let good = peers(&[
+            (1, "127.0.0.1:7100"),
+            (2, "127.0.0.2:7100"),
+            (3, "127.0.0.3:7100"),
+        ]);
+        let three = NodeId(3);
+        assert_eq!(node_start_refusal(three, "x", &good, None, &records), None);
+        assert_eq!(
+            node_start_refusal(three, "127.0.0.3:7100", &good, Some(&formation), &records),
+            None
+        );
+        assert_eq!(
+            node_start_refusal(three, "0.0.0.0:7100", &good, Some(&formation), &records),
+            None
+        );
+        let others = peers(&[(1, "127.0.0.1:7100"), (2, "127.0.0.2:7100")]);
+        assert_eq!(
+            node_start_refusal(three, "127.0.0.3:7100", &others, Some(&formation), &records),
+            None,
+            "--peers need not name this node"
+        );
+        let mut no_three = records.clone();
+        no_three.remove(&three);
+        for (what, node, listen, given, held, names) in [
+            (
+                "an undeclared node",
+                NodeId(4),
+                "127.0.0.4:7100",
+                good.clone(),
+                records.clone(),
+                vec!["node 4 is not declared", "[1, 2, 3]"],
+            ),
+            (
+                "an S1a store",
+                three,
+                "127.0.0.3:7100",
+                good.clone(),
+                BTreeMap::new(),
+                vec![S1A_STORE],
+            ),
+            (
+                "its own record missing",
+                three,
+                "127.0.0.3:7100",
+                good.clone(),
+                no_three,
+                vec!["nodes/3 is absent"],
+            ),
+            (
+                "--listen on another port",
+                three,
+                "127.0.0.3:7101",
+                good.clone(),
+                records.clone(),
+                vec!["listen address 127.0.0.3:7101", "nodes/3", "127.0.0.3:7100"],
+            ),
+            (
+                "--listen on the wildcard at another port",
+                three,
+                "0.0.0.0:7101",
+                good.clone(),
+                records.clone(),
+                vec!["listen address 0.0.0.0:7101", "nodes/3", "127.0.0.3:7100"],
+            ),
+            (
+                "a peer elsewhere",
+                three,
+                "127.0.0.3:7100",
+                peers(&[
+                    (1, "127.0.0.1:7100"),
+                    (2, "127.0.0.2:7101"),
+                    (3, "127.0.0.3:7100"),
+                ]),
+                records.clone(),
+                vec![
+                    "peer address 2=127.0.0.2:7101",
+                    "nodes/2",
+                    "records 127.0.0.2:7100",
+                ],
+            ),
+            (
+                "this node's own entry elsewhere",
+                three,
+                "127.0.0.3:7100",
+                peers(&[
+                    (1, "127.0.0.1:7100"),
+                    (2, "127.0.0.2:7100"),
+                    (3, "127.0.0.9:7100"),
+                ]),
+                records.clone(),
+                vec![
+                    "peer address 3=127.0.0.9:7100",
+                    "nodes/3",
+                    "records 127.0.0.3:7100",
+                ],
+            ),
+            (
+                "an undeclared peer",
+                three,
+                "127.0.0.3:7100",
+                peers(&[
+                    (1, "127.0.0.1:7100"),
+                    (2, "127.0.0.2:7100"),
+                    (4, "127.0.0.4:7100"),
+                ]),
+                records.clone(),
+                vec!["peer address 4=127.0.0.4:7100", "nodes/4", "[1, 2, 3]"],
+            ),
+            (
+                "a declared peer left out",
+                three,
+                "127.0.0.3:7100",
+                peers(&[(1, "127.0.0.1:7100")]),
+                records.clone(),
+                vec!["no peer address for node 2", "nodes/2", "127.0.0.2:7100"],
+            ),
+        ] {
+            let refused = node_start_refusal(node, listen, &given, Some(&formation), &held);
+            let Some(text) = refused else {
+                panic!("{what}: refused");
+            };
+            for name in names {
+                assert!(text.contains(name), "{what}: {name:?} in {text}");
+            }
+            assert!(text.ends_with("nothing was started"), "{what}: {text}");
+        }
+    }
+
+    /// #80 S1b (ADR-rdb-0023 Decision 2): the reservation's layout 2 carries every node's address
+    /// and machine, so it is pinned as a literal too: one node with a machine label and two taking
+    /// their host, one of them an IPv6 host in long form, whose stored label is the parsed `::3`
+    /// (PR #144 review r2), so a change to the default label is red. It decodes back, and a body
+    /// cut short, a trailing byte, a count past the entries and a bad machine byte each decode as
+    /// nothing. Unit.
+    /// Cut: `Declaration::records` takes the host as written, less its brackets
+    /// (`0:0:0:0:0:0:0:3`); red at the pinned bytes.
+    #[test]
+    fn s1b_reservation_layout_2_bytes_are_pinned() {
+        let declaration = Declaration {
+            nodes: vec![
+                NodeDecl {
+                    node: NodeId(1),
+                    addr: "10.0.0.1:7100".to_owned(),
+                    machine: Some("M1".to_owned()),
+                },
+                NodeDecl {
+                    node: NodeId(2),
+                    addr: "10.0.0.2:7100".to_owned(),
+                    machine: None,
+                },
+                NodeDecl {
+                    node: NodeId(3),
+                    addr: "[0:0:0:0:0:0:0:3]:7100".to_owned(),
+                    machine: None,
+                },
+            ],
+            partitions: 8,
+        };
+        let records = declaration
+            .records()
+            .expect("a declaration this build takes");
+        let mut pinned = vec![2, 8, 0, 0, 0, 3];
+        for (n, addr, machine) in [
+            (1u8, &b"10.0.0.1:7100"[..], &b"m1"[..]),
+            (2, b"10.0.0.2:7100", b"10.0.0.2"),
+            (3, b"[0:0:0:0:0:0:0:3]:7100", b"::3"),
+        ] {
+            pinned.extend_from_slice(&[n, 0, 0, 0]);
+            pinned.push(u8::try_from(addr.len()).expect("short"));
+            pinned.extend_from_slice(addr);
+            pinned.push(u8::try_from(machine.len()).expect("short"));
+            pinned.extend_from_slice(machine);
+        }
+        assert_eq!(declaration.encode_reservation(&records).as_ref(), pinned);
+        assert_eq!(
+            Declaration::decode_reservation(&pinned),
+            Some(Reservation {
+                partitions: 8,
+                nodes: vec![NodeId(1), NodeId(2), NodeId(3)],
+                records: Some(records),
+            })
+        );
+        let mut trailing = pinned.clone();
+        trailing.push(0);
+        let mut count_past = pinned.clone();
+        count_past[5] = 4;
+        let mut bad_machine = pinned.clone();
+        // Header 6 bytes, then node 1: id 4, address length 1, address 13, machine length 1.
+        bad_machine[6 + 4 + 1 + 13 + 1] = b'M';
+        for (what, body) in [
+            ("a body cut short", pinned[..pinned.len() - 1].to_vec()),
+            ("a trailing byte", trailing),
+            ("a count past the entries", count_past),
+            ("a bad machine byte", bad_machine),
+        ] {
+            assert_eq!(Declaration::decode_reservation(&body), None, "{what}");
+        }
+    }
+
+    /// #80 S1b, PR #144 review r3: a default machine label is the host as `parse_addr` parses
+    /// it, not as written: an upper-case name with a trailing dot (`DB-A.example.`) gives
+    /// `db-a.example`, a long-form IPv6 host gives `::3`, and an IPv4-mapped host in upper case
+    /// gives its IPv4 address. Each record keeps its address as written. Unit.
+    /// Cut: `Declaration::records` takes the host as written, lowercased and less its brackets;
+    /// red at `db-a.example.`.
+    #[test]
+    fn s1b_default_labels_are_the_parsed_host() {
+        let declaration = Declaration {
+            nodes: [
+                "DB-A.example.:7100",
+                "[0:0:0:0:0:0:0:3]:7100",
+                "[::FFFF:127.0.0.2]:7100",
+            ]
+            .iter()
+            .zip(1..)
+            .map(|(addr, n)| NodeDecl {
+                node: NodeId(n),
+                addr: (*addr).to_owned(),
+                machine: None,
+            })
+            .collect(),
+            partitions: 8,
+        };
+        let records = declaration
+            .records()
+            .expect("a declaration this build takes");
+        let got: Vec<(&str, &str)> = records
+            .iter()
+            .map(|record| (record.addr.as_str(), record.machine.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("DB-A.example.:7100", "db-a.example"),
+                ("[0:0:0:0:0:0:0:3]:7100", "::3"),
+                ("[::FFFF:127.0.0.2]:7100", "127.0.0.2"),
+            ]
+        );
     }
 
     /// Design 7.2 (Critic R2): a partition still to form joins its owner's heal, after the
@@ -4987,6 +5837,7 @@ mod tests {
             let (owner, mailbox) = std::sync::mpsc::channel();
             let ctx = HealCtx {
                 partition_count: 2,
+                nodes: crate::db::ALL_NODES.into(),
                 store,
                 boot: OPEN_2,
                 budgets: Budgets::SPEC_DEFAULTS,
@@ -6400,6 +7251,7 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -6838,6 +7690,7 @@ mod tests {
         drop(mailbox);
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,
@@ -7734,6 +8587,7 @@ mod tests {
         let within = Duration::from_secs(10);
         let ctx = HealCtx {
             partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
             store: Arc::new(config_testkit::MemStore::new()),
             boot: OPEN_2,
             budgets: Budgets::SPEC_DEFAULTS,

@@ -492,7 +492,7 @@ flowchart LR
 | Key family | Required content |
 |---|---|
 | `cluster/schema` | Cluster UUID, protocol/schema versions, minimum compatible data version |
-| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state |
+| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only, written by the declaration (`admin::declare`), create-only; the boot comes from the link handshake; the rest is not stored yet |
 | `grants/{node}` | Grant ID, authority generation, allowed boot UUID, expiry, renewal version, mode |
 | `partitions/{id}` | Range, group-hash version, owner, owner epoch, generation, membership/config version, lineage root, lifecycle state |
 | `routes/{range}` | Versioned route root/manifest pointer; authoritative atomic cutover key |

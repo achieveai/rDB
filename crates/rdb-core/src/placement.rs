@@ -1,8 +1,12 @@
-//! The placement planner (M11, V9 Form line): **model only**.
+//! Placement: where a declared database first puts each partition, and the planner.
 //!
-//! A pure function from an [`Inventory`] (nodes and where each partition's copies and primary
-//! sit) and a move budget to an ordered list of [`Step`]s and the [`Residual`]s it could not
-//! clear. It reads no clock, opens no file and talks to no cluster; the same input gives the same
+//! [`initial`] is applied (#80 S1b, ADR-rdb-0023): the ring over the declared nodes that every
+//! writer of a generation-0 partition record places by. Everything else here is the placement
+//! planner (M11, V9 Form line), which is **model only**.
+//!
+//! [`plan`] is a pure function from an [`Inventory`] (nodes and where each partition's copies
+//! and primary sit) and a move budget to an ordered list of [`Step`]s and the [`Residual`]s it
+//! could not clear. It reads no clock, opens no file and talks to no cluster; the same input gives the same
 //! plan, byte for byte. `rdb_dev admin plan <file>` reads the inventory from a JSON file and
 //! prints the plan. Nothing applies it: the operator runs each line by hand.
 //!
@@ -483,6 +487,42 @@ fn validate(inventory: &Inventory) -> Result<(), InventoryError> {
         }
     }
     Ok(())
+}
+
+/// How many copies [`initial`] places per partition.
+pub const INITIAL_COPIES: usize = 3;
+
+/// Where a declared database first places `partition` (#80 S1b, ADR-rdb-0023): a ring over the
+/// declared `nodes`. With `K = nodes.len()`, the primary is `nodes[(partition - 1) % K]` and the
+/// copies are it and the next two nodes round the ring, listed in node order.
+///
+/// Unlike [`plan`] this is applied: every writer of a generation-0 record places by it. Its
+/// inputs are the formation record's node list and the partition, both written once, so it
+/// never moves a partition that was already placed. At `nodes = [1, 2, 3]` it is the placement
+/// every database had before S1b: copies on 1, 2 and 3, primary `(partition - 1) % 3 + 1`.
+///
+/// # Panics
+///
+/// When `nodes` holds fewer than [`INITIAL_COPIES`] nodes, is not strictly increasing, or
+/// `partition` is 0. Every caller passes a node list a declaration checked.
+#[must_use]
+pub fn initial(nodes: &[u32], partition: u32) -> Partition {
+    assert!(
+        nodes.len() >= INITIAL_COPIES && nodes.windows(2).all(|pair| pair[0] < pair[1]),
+        "placement::initial takes at least {INITIAL_COPIES} distinct nodes in order, got {nodes:?}"
+    );
+    assert!(partition >= 1, "partitions are numbered from 1");
+    let k = nodes.len();
+    let first = (partition as usize - 1) % k;
+    let mut copies: Vec<u32> = (0..INITIAL_COPIES)
+        .map(|step| nodes[(first + step) % k])
+        .collect();
+    copies.sort_unstable();
+    Partition {
+        id: partition,
+        copies,
+        primary: nodes[first],
+    }
 }
 
 /// Copies per node in service (`ok` or `full`), by node.

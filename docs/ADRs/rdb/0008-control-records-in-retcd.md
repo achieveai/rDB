@@ -38,7 +38,7 @@ real thing, or the fencing tests prove nothing.
 | Family | Required content | Who CASes it |
 |---|---|---|
 | `cluster/schema` | cluster UUID, protocol/schema versions, minimum compatible data version | operator / rollout |
-| `nodes/{id}` | boot UUID, role, failure domain, capacity, cores, drain state | node at start-up; planner for drain |
+| `nodes/{id}` | boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only; the boot comes from the link handshake; the rest is not stored yet | node at start-up; planner for drain. *Amended by ADR-rdb-0023:* `admin::declare` (later add-node), create-only; the node only reads it |
 | `grants/{node}` | grant id, authority generation, allowed boot UUID, expiry `E`, renewal version, mode | node (renew), planner (freeze/revoke) |
 | `partitions/{id}` | range, group-hash version, owner, owner epoch, generation, membership/config version, lineage root, lifecycle state | planner |
 | `routes/{range}` | versioned route root / manifest pointer; **the authoritative atomic cutover key** | planner |

@@ -265,6 +265,26 @@ pub struct DbConfig {
     /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
     /// default, never promotes: failover stays the operator's `promote`.
     pub failover: Option<crate::planner::Failover>,
+    /// Where this node process listens and where it was told each node listens (#80 S1b ruling 2,
+    /// ADR-rdb-0023 Decision 5). An open of a declared database compares them with the `nodes/`
+    /// records before it creates `nodes/` or writes to the store, and is refused naming the record
+    /// that disagrees, or when this is `None`: a declared node must say where it and its peers are.
+    /// The open does not bind; the caller's listener is bound before `Db::open`, so a caller that
+    /// must not bind a wrong address checks first with [`admin::node_start_refusal`], as `rdb_node`
+    /// does. Unused by an undeclared open.
+    pub addresses: Option<NodeAddresses>,
+}
+
+/// What [`DbConfig::addresses`] holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddresses {
+    /// The address the node's listener is bound to, `host:port`: its record's, or the same
+    /// port on `0.0.0.0` or `::`.
+    pub listen: String,
+    /// Every node's address as this process was given it, `host:port`: each must be that
+    /// node's record's, and every declared node needs one. This node's own entry may be
+    /// left out.
+    pub peers: BTreeMap<NodeId, String>,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -274,10 +294,11 @@ pub const DEFAULT_CLIENT: ClientId = ClientId(1);
 /// this process.
 pub const ALL_NODES: [NodeId; 3] = [NodeId(1), NodeId(2), NodeId(3)];
 
-/// The highest node number a node process may run (M11 WS A). Nodes past [`ALL_NODES`] are
-/// spares: a formed database's spare opens an empty copy bound to its instance and holds
-/// nothing until `admin move` pins it. Eight, the most members a `partitions/1` record pins
-/// (`MAX_RECORD_MEMBERS`).
+/// The highest node number a node process may run (M11 WS A). On a database `--form` made,
+/// nodes past [`ALL_NODES`] are spares: a spare opens an empty copy bound to its instance and
+/// holds nothing until `admin move` pins it. On a declared database every declared node holds
+/// the partitions ring placement gives it (#80 S1b, ADR-rdb-0023). Eight, the most members a
+/// `partitions/1` record pins (`MAX_RECORD_MEMBERS`), and the most a declaration names.
 pub const MAX_NODES: u32 = 8;
 
 impl DbConfig {
@@ -577,6 +598,10 @@ struct Opened {
     /// nodes, so a later restart that starts one hands it to the node. Weak: what keeps a
     /// subscriber alive is the nodes holding it, so a dropped one still ends.
     waiting: Mutex<Vec<Waiting>>,
+    /// The nodes partitions are placed over (#80 S1b): the formation record's for a declared
+    /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
+    /// given it, so an owner re-seats the copies its partition was placed on.
+    nodes: Arc<[NodeId]>,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -619,6 +644,7 @@ impl Default for Opened {
             control: None,
             instance: None,
             waiting: Mutex::new(Vec::new()),
+            nodes: ALL_NODES.into(),
         }
     }
 }
@@ -1520,7 +1546,7 @@ impl Db {
             store,
             rt,
             budgets,
-            move |node, engine, links, control, clock, boot, partitions| {
+            move |node, engine, links, control, clock, boot, partitions, nodes| {
                 host::spawn_on(
                     node,
                     engine,
@@ -1533,6 +1559,7 @@ impl Db {
                     live_readd,
                     boot,
                     partitions,
+                    nodes,
                 )
             },
         )
@@ -1669,6 +1696,7 @@ impl Db {
             HostClock,
             BootId,
             u32,
+            Arc<[NodeId]>,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
         std::fs::create_dir_all(&config.dir)?;
@@ -1686,7 +1714,17 @@ impl Db {
         } else {
             None
         };
+        if let Some(formation) = &formation {
+            declared_open_refusal(&config.local, config.addresses.as_ref(), formation, &*store)
+                .await?;
+        }
         let declared = formation.as_ref().map(|formation| formation.instance);
+        // #80 S1b: partitions are placed over the declared nodes; a database no declaration
+        // made keeps nodes 1 to 3.
+        let nodes: Arc<[NodeId]> = formation.as_ref().map_or_else(
+            || ALL_NODES.into(),
+            |formation| formation.nodes.as_slice().into(),
+        );
         if partial && declared.is_none() {
             let missing: Vec<NodeId> = config
                 .local
@@ -1728,6 +1766,7 @@ impl Db {
             &store,
             partial,
             declared,
+            &nodes,
         )
         .await?;
         let partitions = open_partition_count(&store, config.partitions, found.fresh).await?;
@@ -1749,6 +1788,7 @@ impl Db {
                 &store,
                 partial,
                 declared.is_some(),
+                &nodes,
                 partitions,
                 &found.instance,
             )
@@ -1860,6 +1900,7 @@ impl Db {
                 base_boot: boot,
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
+                nodes: Arc::clone(&nodes),
                 ..Opened::default()
             },
             route: Route {
@@ -1891,6 +1932,7 @@ impl Db {
                 db.clock,
                 boot,
                 partitions,
+                Arc::clone(&nodes),
             ) {
                 Ok(handle) => lock(&db.nodes).push(handle),
                 Err(detail) => {
@@ -1923,7 +1965,7 @@ impl Db {
                         .is_some_and(|owner| config.local.contains(owner))
                 });
             }
-            let formed = admin::write_records(&store, &forming).await?;
+            let formed = admin::write_records(&store, &nodes, &forming).await?;
             // One heal per owner this process runs, over all its partitions (issue #79).
             let mut heals: BTreeMap<NodeId, OwnerHeal> = BTreeMap::new();
             for (partition, owner) in found.owners() {
@@ -1960,6 +2002,7 @@ impl Db {
         store: &Arc<dyn ConfigStore>,
         partial: bool,
         declared: Option<[u8; INSTANCE_LEN]>,
+        nodes: &[NodeId],
     ) -> Result<Found, OpenError> {
         let bound: BTreeSet<[u8; INSTANCE_LEN]> =
             engines.values().filter_map(RocksEngine::instance).collect();
@@ -1987,7 +2030,7 @@ impl Db {
         let declared_found = |instance: [u8; INSTANCE_LEN]| Found {
             instance,
             fresh: false,
-            owner: admin::initial_owner(PARTITION),
+            owner: admin::owner_in(nodes, PARTITION),
             roll: None,
             others: Vec::new(),
             forms_first: true,
@@ -2231,7 +2274,7 @@ impl Db {
         // A-R467: a reopen does not re-add a copy the record left out (M11 T6 pins the
         // record's members), so the open says which local copy is out and the step that brings
         // it back, while the partition pins fewer copies than its count.
-        if pinned.len() < admin::members().len() {
+        if pinned.len() < admin::RF {
             let local: Vec<(NodeId, bool)> = engines
                 .iter()
                 .map(|(node, engine)| (*node, holds_partition(engine)))
@@ -2292,6 +2335,7 @@ impl Db {
         store: &Arc<dyn ConfigStore>,
         partial: bool,
         declared: bool,
+        nodes: &[NodeId],
         count: u32,
         instance: &[u8; INSTANCE_LEN],
     ) -> Result<Vec<(PartitionId, PartitionFound)>, OpenError> {
@@ -2322,7 +2366,7 @@ impl Db {
             let (record, root) = match state {
                 PartitionState::Absent | PartitionState::Unrooted { untouched: true } if !holds => {
                     let found = PartitionFound {
-                        owner: admin::initial_owner(partition),
+                        owner: admin::owner_in(nodes, partition),
                         roll: None,
                         forms: true,
                     };
@@ -2542,6 +2586,7 @@ impl Db {
                 owner_node: owner,
                 partitions,
                 partition_count: self.route.partitions(),
+                nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
             });
         }
@@ -4235,6 +4280,12 @@ impl Db {
         self.opened.base_boot
     }
 
+    /// [`no_such_node`] for `node`, naming the nodes this `Db` runs.
+    pub(crate) fn no_such_node(&self, node: NodeId) -> ApiError {
+        let runs: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        no_such_node(node, &runs)
+    }
+
     /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
     /// a restart that failed, the boot that restart gave it: no process runs it, and the old
     /// boot is retired either way (F-013).
@@ -4574,6 +4625,7 @@ impl Db {
                 boot,
                 config.storage,
                 1,
+                ALL_NODES.into(),
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -4814,12 +4866,11 @@ impl Db {
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
         let mut nodes = lock(&self.nodes);
-        let Some(handle) = nodes.iter_mut().find(|handle| handle.node == node) else {
-            return Err(ApiError::invalid(format!(
-                "node {}: no such node; this Db runs nodes 1, 2 and 3",
-                node.0
-            )));
+        let Some(at) = nodes.iter().position(|handle| handle.node == node) else {
+            let runs: Vec<NodeId> = nodes.iter().map(|handle| handle.node).collect();
+            return Err(no_such_node(node, &runs));
         };
+        let handle = &mut nodes[at];
         let old_boot = handle.boot;
         if let Some(aside) = aside.as_ref().filter(|aside| aside.boot != old_boot) {
             tracing::warn!(
@@ -4888,6 +4939,7 @@ impl Db {
                 boot,
                 respawn.storage,
                 self.route.partitions(),
+                Arc::clone(&self.opened.nodes),
             )
         };
         match started {
@@ -5035,6 +5087,7 @@ impl Db {
             respawn.live_readd,
             boot,
             self.route.partitions(),
+            Arc::clone(&self.opened.nodes),
         )
     }
 
@@ -6044,6 +6097,85 @@ fn roll_forward_copies(
     Ok(copies)
 }
 
+/// #80 S1b (ADR-rdb-0023 Decisions 4 and 5): what a node process of a declared database must
+/// be before it opens, checked before this open creates `nodes/` or reads anything else. One
+/// process runs one declared node: a process is certainly one machine, so two local nodes would
+/// be two data nodes on one machine. That node's `nodes/{id}` record must exist: a store with
+/// none was declared by an S1a build ([`admin::S1A_STORE`]). And its [`DbConfig::addresses`]
+/// must agree with the records, by [`admin::node_start_refusal`]. Nothing is written either way,
+/// and the open has created only its folder ([`DbConfig::dir`]).
+async fn declared_open_refusal(
+    local: &[NodeId],
+    addresses: Option<&NodeAddresses>,
+    formation: &admin::Formation,
+    store: &dyn ConfigStore,
+) -> Result<(), OpenError> {
+    let [node] = local else {
+        return Err(OpenError::Config(format!(
+            "this open runs nodes {:?} of a declared database, and a declared database runs one \
+             data node per process and per machine: open each node in its own process; nothing \
+             but its folder was created",
+            local.iter().map(|node| node.0).collect::<Vec<_>>()
+        )));
+    };
+    let records = admin::read_nodes(store)
+        .await
+        .map_err(|error| match error {
+            admin::DeclareError::Undecodable { key } => {
+                undecodable(&key, "not a node record this build reads")
+            }
+            other => formation_refused(other),
+        })?;
+    if records.is_empty() {
+        return Err(OpenError::Config(format!(
+            "{}; nothing but its folder was created",
+            admin::S1A_STORE
+        )));
+    }
+    if !records.contains_key(node) {
+        return Err(OpenError::Config(format!(
+            "{} is absent, so node {} is not a declared node of this database (it declares \
+             nodes {:?}); nothing but its folder was created",
+            ControlKey::Node(*node).encode(),
+            node.0,
+            formation
+                .nodes
+                .iter()
+                .map(|node| node.0)
+                .collect::<Vec<_>>()
+        )));
+    }
+    // Ruling 2: the embedded node is held to its records as `rdb_node` is.
+    let Some(addresses) = addresses else {
+        return Err(OpenError::Config(format!(
+            "node {} of a declared database opened with no DbConfig::addresses: a declared node \
+             says where it listens and where each peer does, and they are checked against the \
+             nodes/ records; nothing but its folder was created",
+            node.0
+        )));
+    };
+    if let Some(refused) = admin::node_start_refusal(
+        *node,
+        &addresses.listen,
+        &addresses.peers,
+        Some(formation),
+        &records,
+    ) {
+        return Err(OpenError::Config(refused));
+    }
+    Ok(())
+}
+
+/// The refusal of a call naming `node`, which this `Db` does not run: `runs` are the nodes it
+/// does, which since #80 S1b need not be 1, 2 and 3 (one declared node, say).
+pub(crate) fn no_such_node(node: NodeId, runs: &[NodeId]) -> ApiError {
+    ApiError::invalid(format!(
+        "node {}: no such node; this Db runs nodes {:?}",
+        node.0,
+        runs.iter().map(|node| node.0).collect::<Vec<_>>()
+    ))
+}
+
 /// [`admin::read_formation`]'s error as an open's (#80 S1a): one `control store:` prefix, and,
 /// when the store was not reachable, the rEtcd step the open's other `get` reads add
 /// (`partition_states`' `list` does not add it).
@@ -6929,6 +7061,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         }
     }
 
@@ -6971,6 +7104,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -7066,6 +7200,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -7201,6 +7336,7 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             failover: None,
+            addresses: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -7784,7 +7920,7 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot, partitions| {
+        let fail_node_2 = |node: NodeId, engine, links, control, clock, boot, partitions, nodes| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
@@ -7800,6 +7936,7 @@ mod tests {
                 false,
                 boot,
                 partitions,
+                nodes,
             )
         };
 
@@ -7892,31 +8029,37 @@ mod tests {
                 let race = Arc::clone(&race);
                 std::thread::spawn(move || {
                     let other = 1 - me;
-                    let spawn = |node: NodeId, engine, links, control, clock, boot, partitions| {
-                        if node == NodeId(1) {
-                            race.mark(me, |state| state.0 = true);
-                            race.wait("the other opener reaches node 1 or returns", other, |s| {
-                                s.0 || s.1
-                            });
-                        }
-                        let started = host::spawn_on(
-                            node,
-                            engine,
-                            links,
-                            control,
-                            clock,
-                            fast(),
-                            Limits::default(),
-                            host::UNREACHABLE_DROP_AFTER_MILLIS,
-                            false,
-                            boot,
-                            partitions,
-                        )?;
-                        if node == NodeId(3) {
-                            race.wait("the loser returns while these nodes run", other, |s| s.1);
-                        }
-                        Ok(started)
-                    };
+                    let spawn =
+                        |node: NodeId, engine, links, control, clock, boot, partitions, nodes| {
+                            if node == NodeId(1) {
+                                race.mark(me, |state| state.0 = true);
+                                race.wait(
+                                    "the other opener reaches node 1 or returns",
+                                    other,
+                                    |s| s.0 || s.1,
+                                );
+                            }
+                            let started = host::spawn_on(
+                                node,
+                                engine,
+                                links,
+                                control,
+                                clock,
+                                fast(),
+                                Limits::default(),
+                                host::UNREACHABLE_DROP_AFTER_MILLIS,
+                                false,
+                                boot,
+                                partitions,
+                                nodes,
+                            )?;
+                            if node == NodeId(3) {
+                                race.wait("the loser returns while these nodes run", other, |s| {
+                                    s.1
+                                });
+                            }
+                            Ok(started)
+                        };
                     let opened = handle.block_on(Db::open_spawning(
                         config(&path),
                         store,

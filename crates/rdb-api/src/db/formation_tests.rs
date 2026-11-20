@@ -12,14 +12,25 @@ use crate::test_store::{HoldAt, PutHold, Script, Scripted};
 /// The partition count the rows declare: more than one per node, so each owner forms several.
 const PARTITIONS: u32 = 8;
 
+/// The `nodes/{id}` puts a declaration of three nodes makes after `routes/0` and before its
+/// partition records (#80 S1b). Rows that stop a declaration after a count of puts add them.
+const NODE_PUTS: u32 = 3;
+
 /// One node process, its own folder kept alive with it.
 struct Proc {
     node: NodeId,
-    db: Db,
-    _net: Arc<Net>,
+    /// `None` once the process ended ([`Rig::stop`], [`Rig::shutdown_all`]): its `Links` held
+    /// its net, so only dropping it lets go of its listener, as a process exit does.
+    db: Option<Db>,
+    /// `None` once [`Rig::stop`] took the node down: its listener and links are gone.
+    _net: Option<Arc<Net>>,
     dir: PathBuf,
     /// The `TempDir` that removes `dir` when dropped.
     _dir: Box<dyn std::any::Any>,
+    /// This process's own runtime when the rig gives each one its own (#80 S1b): dropped,
+    /// it ends every task the process ran, its peers' accepted links included, as a process
+    /// exit does. Last, so it outlives the `Db` and net that run on it.
+    own_rt: Option<tokio::runtime::Runtime>,
 }
 
 struct Rig {
@@ -28,24 +39,80 @@ struct Rig {
     cert_dir: PathBuf,
     _cert_dir: Box<dyn std::any::Any>,
     procs: Vec<Proc>,
+    /// How many nodes the rig runs: nodes 1 to `k` (#80 S1b).
+    k: u32,
+    /// The timeouts [`Rig::open_all`] opens every node with.
+    timeouts: Timeouts,
+    /// Whether [`Rig::open_all`] runs each process on a runtime of its own, so that
+    /// [`Rig::stop`] and [`Rig::restart`] end it as a process exit would (#80 S1b).
+    own_runtimes: bool,
+    /// Where each node listens: node N on 127.0.0.N, so every node of the rig is a different
+    /// host on one machine (#80 S1b ruling 1). Bound when the rig is made, before anything is
+    /// declared, so [`Rig::declaration`] records the ports the nodes listen on.
+    addrs: BTreeMap<NodeId, String>,
+    /// The listeners bound when the rig was made, each until its node's first open takes it.
+    reserved: std::sync::Mutex<BTreeMap<NodeId, tokio::net::TcpListener>>,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         for proc in &mut self.procs {
-            proc.db.shutdown();
+            if let Some(db) = &mut proc.db {
+                db.shutdown();
+            }
         }
     }
 }
 
 fn declaration() -> admin::Declaration {
+    declaration_of(3, PARTITIONS)
+}
+
+/// A declaration of nodes 1 to `k` and `partitions` partitions (#80 S1b), node N at
+/// `127.0.0.N:7100` on machine `127.0.0.N`: for rows that only declare. A row that opens a node
+/// declares [`Rig::declaration`], the addresses its listeners are bound to, since a declared
+/// open checks them against the records.
+fn declaration_of(k: u32, partitions: u32) -> admin::Declaration {
+    declaration_at(
+        &(1..=k)
+            .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
+            .collect(),
+        partitions,
+    )
+}
+
+/// A declaration of the nodes of `addrs`, each at its address, and `partitions` partitions.
+fn declaration_at(addrs: &BTreeMap<NodeId, String>, partitions: u32) -> admin::Declaration {
     admin::Declaration {
-        nodes: ALL_NODES.to_vec(),
-        partitions: PARTITIONS,
+        nodes: addrs
+            .iter()
+            .map(|(node, addr)| admin::NodeDecl {
+                node: *node,
+                addr: addr.clone(),
+                machine: None,
+            })
+            .collect(),
+        partitions,
     }
 }
 
-/// Open `node`'s process on `dir` alone, linked to the other two at `addrs`.
+/// Bind `addr` again once whatever held it let go: a restarted process listens where its
+/// record says. Bounded at 5 s.
+fn rebind(rt: &tokio::runtime::Runtime, addr: &str) -> tokio::net::TcpListener {
+    let addr: std::net::SocketAddr = addr.parse().expect("an address");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match rt.block_on(tokio::net::TcpListener::bind(addr)) {
+            Ok(listener) => return listener,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "rebind {addr}: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Open `node`'s process on `dir` alone, linked to every other node of `addrs`.
 fn open_node(
     rt: &tokio::runtime::Runtime,
     store: &Arc<dyn ConfigStore>,
@@ -54,6 +121,30 @@ fn open_node(
     dir: &Path,
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
+) -> Result<(Db, Arc<Net>), OpenError> {
+    open_node_with(
+        rt,
+        store,
+        cert_dir,
+        node,
+        dir,
+        listener,
+        addrs,
+        Timeouts::default(),
+    )
+}
+
+/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop).
+#[allow(clippy::too_many_arguments)]
+fn open_node_with(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
@@ -64,7 +155,7 @@ fn open_node(
             tls: certs::load(cert_dir, &label).expect("node certs"),
             label,
             boot,
-            peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
+            peers: addrs.keys().copied().filter(|n| *n != node).collect(),
             dial: NetConfig::dial_lower(node, addrs),
             protocol_version: PROTOCOL_VERSION,
             admin_apps: BTreeSet::new(),
@@ -79,6 +170,11 @@ fn open_node(
             local: vec![node],
             links: Some(links),
             boot: Some(boot),
+            timeouts,
+            addresses: Some(NodeAddresses {
+                listen: addrs[&node].clone(),
+                peers: addrs.clone(),
+            }),
             ..config(dir)
         },
         Arc::clone(store),
@@ -88,34 +184,51 @@ fn open_node(
     Ok((db, net))
 }
 
-/// Listeners for nodes 1 to 3, and the address each is reached at.
+/// Listeners for nodes 1 to `k`, node N on 127.0.0.N at a port from the test range, and the
+/// address each is reached at (#80 S1b: one machine, `k` hosts).
 fn listeners(
     rt: &tokio::runtime::Runtime,
+    k: u32,
 ) -> (Vec<tokio::net::TcpListener>, BTreeMap<NodeId, String>) {
-    let listeners: Vec<tokio::net::TcpListener> = ALL_NODES
-        .iter()
-        .map(|_| rt.block_on(config_testkit::ports::ephemeral_listener()).0)
+    let listeners: Vec<tokio::net::TcpListener> = (1..=k)
+        .map(|n| {
+            let host = std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(n).expect("a node id"));
+            rt.block_on(config_testkit::ports::ephemeral_listener_on(host))
+                .0
+        })
         .collect();
-    let addrs = ALL_NODES
-        .iter()
+    let addrs = (1..=k)
+        .map(NodeId)
         .zip(&listeners)
-        .map(|(node, listener)| (*node, listener.local_addr().expect("bound").to_string()))
+        .map(|(node, listener)| (node, listener.local_addr().expect("bound").to_string()))
         .collect();
     (listeners, addrs)
 }
 
 /// A runtime, `store` and certificates for nodes 1 to 3; no node process yet.
 fn bare_rig(store: Arc<dyn ConfigStore>) -> Rig {
+    bare_rig_of(store, 3)
+}
+
+/// A runtime, `store` and certificates for nodes 1 to `k`; no node process yet.
+fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
     let rt = runtime();
     let cert_dir = config_testkit::fs::temp_dir();
-    let labels: Vec<Label> = ALL_NODES.iter().map(|node| Label::Node(*node)).collect();
+    let labels: Vec<Label> = (1..=k).map(|node| Label::Node(NodeId(node))).collect();
     certs::generate(cert_dir.path(), &labels).expect("certs");
+    let (held, addrs) = listeners(&rt, k);
+    let reserved = addrs.keys().copied().zip(held).collect();
     Rig {
         rt,
         store,
         cert_dir: cert_dir.path().to_path_buf(),
         _cert_dir: Box::new(cert_dir),
         procs: Vec::new(),
+        k,
+        timeouts: Timeouts::default(),
+        own_runtimes: false,
+        addrs,
+        reserved: std::sync::Mutex::new(reserved),
     }
 }
 
@@ -138,7 +251,12 @@ fn folder() -> Folder {
 
 /// Three new empty folders, for nodes 1 to 3.
 fn fresh_dirs() -> Vec<Folder> {
-    ALL_NODES.iter().map(|_| folder()).collect()
+    fresh_dirs_of(3)
+}
+
+/// `k` new empty folders, for nodes 1 to `k`.
+fn fresh_dirs_of(k: u32) -> Vec<Folder> {
+    (1..=k).map(|_| folder()).collect()
 }
 
 /// Every record in `store`: key, value, create and mod revision, in key order. Equal snapshots
@@ -176,13 +294,14 @@ fn keys(snap: &[(Bytes, Bytes, u64, u64)]) -> Vec<String> {
         .collect()
 }
 
-/// The keys a whole declaration of `partitions` (more than one) writes, its reservation first,
-/// then `routes/0`, the partition records and its open counter (`counters`: the counter keys
-/// expected), and the formation record last.
+/// The keys a whole declaration of `partitions` (more than one) over nodes 1 to 3 writes, its
+/// reservation first, then `routes/0`, the node records (#80 S1b), the partition records and
+/// its open counter (`counters`: the counter keys expected), and the formation record last.
 fn declared_keys(partitions: u32, counters: &[&str], marker: bool) -> Vec<String> {
     let mut keys: Vec<String> = (1..=partitions)
         .map(|id| ControlKey::Partition(PartitionId(id)).encode())
         .collect();
+    keys.extend(node_keys(3));
     keys.push(ControlKey::Route(RangeId(0)).encode());
     keys.push(ControlKey::Operation(admin::RESERVATION_OPERATION).encode());
     keys.extend(counters.iter().map(|key| (*key).to_owned()));
@@ -191,6 +310,13 @@ fn declared_keys(partitions: u32, counters: &[&str], marker: bool) -> Vec<String
     }
     keys.sort();
     keys
+}
+
+/// The `nodes/` keys a declaration of nodes 1 to `k` writes (#80 S1b).
+fn node_keys(k: u32) -> Vec<String> {
+    (1..=k)
+        .map(|n| ControlKey::Node(NodeId(n)).encode())
+        .collect()
 }
 
 /// Whether every record of `before` is in `after`, byte for byte, at the same revisions.
@@ -204,59 +330,92 @@ fn has_copies(dir: &Path) -> bool {
 }
 
 impl Rig {
-    /// `declaration()` on this rig's store, which must write it.
+    /// The rig's declaration: nodes 1 to `k` at the addresses its listeners are bound to, and
+    /// [`PARTITIONS`] partitions.
+    fn declaration(&self) -> admin::Declaration {
+        self.declaration_of(PARTITIONS)
+    }
+
+    /// [`Rig::declaration`] with `partitions` partitions.
+    fn declaration_of(&self, partitions: u32) -> admin::Declaration {
+        declaration_at(&self.addrs, partitions)
+    }
+
+    /// The listener `node` opens on: the one bound when the rig was made, or its address
+    /// bound again once that one is gone.
+    fn listen(&self, rt: &tokio::runtime::Runtime, node: NodeId) -> tokio::net::TcpListener {
+        let held = self
+            .reserved
+            .lock()
+            .expect("the reserved listeners")
+            .remove(&node);
+        held.unwrap_or_else(|| rebind(rt, &self.addrs[&node]))
+    }
+
+    /// [`Rig::declaration`] on this rig's store, which must write it.
     fn declare_created(&self) -> admin::Formation {
         match self
             .rt
-            .block_on(admin::declare(&self.store, &declaration()))
+            .block_on(admin::declare(&self.store, &self.declaration()))
         {
             Ok(admin::Declared::Created(formation)) => formation,
             other => panic!("the declaration is written: {other:?}"),
         }
     }
 
-    /// Open nodes 1 to 3, each on its folder in `dirs`, in that order; none waited on yet.
+    /// Open nodes 1 to `k`, each on its folder in `dirs`, in that order; none waited on yet.
     fn open_all(&mut self, dirs: Vec<Folder>) {
-        let (listeners, addrs) = listeners(&self.rt);
-        for ((node, listener), (dir, keep)) in ALL_NODES.iter().zip(listeners).zip(dirs) {
-            let (db, net) = open_node(
-                &self.rt,
+        let addrs = self.addrs.clone();
+        let nodes: Vec<NodeId> = addrs.keys().copied().collect();
+        for (node, (dir, keep)) in nodes.iter().zip(dirs) {
+            let listener = self.listen(&self.rt, *node);
+            let own_rt = self.own_runtimes.then(runtime);
+            let (db, net) = open_node_with(
+                own_rt.as_ref().unwrap_or(&self.rt),
                 &self.store,
                 &self.cert_dir,
                 *node,
                 &dir,
                 listener,
                 &addrs,
+                self.timeouts,
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
                 node: *node,
-                db,
-                _net: net,
+                db: Some(db),
+                _net: Some(net),
                 dir,
                 _dir: keep,
+                own_rt,
             });
         }
     }
 
     /// Open `node`'s process once more on its folder, alone, the others down.
     fn reopen(&self, node: NodeId) -> Result<(Db, Arc<Net>), OpenError> {
-        let (mut listeners, addrs) = listeners(&self.rt);
         open_node(
             &self.rt,
             &self.store,
             &self.cert_dir,
             node,
             &self.procs[node.0 as usize - 1].dir,
-            listeners.remove(node.0 as usize - 1),
-            &addrs,
+            self.listen(&self.rt, node),
+            &self.addrs,
         )
     }
 
-    /// Shut every process down.
+    /// End every process as an exit does: shut its `Db` down and drop it, its net and its
+    /// runtime, so its listener is free for a reopen at its recorded address. Its folder stays.
     fn shutdown_all(&mut self) {
         for proc in &mut self.procs {
-            proc.db.shutdown();
+            if let Some(mut db) = proc.db.take() {
+                db.shutdown();
+            }
+            proc._net = None;
+            if let Some(rt) = proc.own_rt.take() {
+                rt.shutdown_background();
+            }
         }
     }
 
@@ -270,6 +429,8 @@ impl Rig {
     fn wait_ready(&self) {
         for proc in &self.procs {
             proc.db
+                .as_ref()
+                .expect("a running process")
                 .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
                 .unwrap_or_else(|e| panic!("node {} is ready: {e}", proc.node.0));
         }
@@ -277,16 +438,19 @@ impl Rig {
 
     /// The process that runs `node`.
     fn of(&self, node: NodeId) -> &Db {
-        &self.procs[node.0 as usize - 1].db
+        self.procs[node.0 as usize - 1]
+            .db
+            .as_ref()
+            .expect("a running process")
     }
 
     /// Shut every process down and open each again on its own folder, at a new boot.
     fn restart_all(&mut self) {
+        // Each process listens again where its record says, once the old one let go.
+        self.shutdown_all();
+        let addrs = self.addrs.clone();
         for proc in &mut self.procs {
-            proc.db.shutdown();
-        }
-        let (listeners, addrs) = listeners(&self.rt);
-        for (proc, listener) in self.procs.iter_mut().zip(listeners) {
+            let listener = rebind(&self.rt, &addrs[&proc.node]);
             let (db, net) = open_node(
                 &self.rt,
                 &self.store,
@@ -297,8 +461,8 @@ impl Rig {
                 &addrs,
             )
             .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", proc.node.0));
-            proc.db = db;
-            proc._net = net;
+            proc.db = Some(db);
+            proc._net = Some(net);
         }
     }
 }
@@ -417,21 +581,22 @@ fn s1a_restart_of_each_node_reopens_its_own_folder() {
 }
 
 /// S1a: `declare` is write-once. The same declaration again answers `Already` with the same
-/// instance; another partition count, or nodes other than 1 to 3, is refused, before and after
-/// the declaration. None of the later calls writes anything: every record's bytes and create and
+/// instance; another partition count, or another node set, is refused, before and after the
+/// declaration. None of the later calls writes anything: every record's bytes and create and
 /// mod revisions are as they were (PR #138 review: an identical-byte rewrite would pass a
 /// compare of the decoded record). Unit (<100 ms, an in-memory store).
+/// #80 S1b changed what this row pins: four nodes are now a valid declaration, so before the
+/// declaration a node set with a gap (1, 2, 4) is the refused one, and after it four nodes are
+/// refused because they are not the declared three.
 #[config_log::retcd_test]
 fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-    let four = admin::Declaration {
-        nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
-        partitions: PARTITIONS,
-    };
-    let refused = rt.block_on(admin::declare(&store, &four));
+    let mut gap = declaration_of(4, PARTITIONS);
+    gap.nodes.remove(2);
+    let refused = rt.block_on(admin::declare(&store, &gap));
     assert!(
-        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
+        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes [1, 2, 4]")),
         "{refused:?}"
     );
     assert!(snapshot(&rt, &*store).is_empty(), "nothing was written");
@@ -476,9 +641,11 @@ fn s1a_declare_is_idempotent_and_refuses_a_changed_count() {
         "another count wrote nothing"
     );
 
+    let four = declaration_of(4, PARTITIONS);
     let refused = rt.block_on(admin::declare(&store, &four));
     assert!(
-        matches!(&refused, Err(admin::DeclareError::Refused(text)) if text.contains("nodes 1, 2 and 3 only")),
+        matches!(&refused, Err(admin::DeclareError::Refused(text))
+            if text.contains("already declared with 8 partitions and nodes [1@127.0.0.1:7100/127.0.0.1, ")),
         "{refused:?}"
     );
     assert_eq!(snapshot(&rt, &*store), declared, "four nodes wrote nothing");
@@ -640,7 +807,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         "the declaration of 1 wrote nothing at the reservation"
     );
 
-    stop_after(2 + 3);
+    stop_after(2 + NODE_PUTS + 3);
     let stopped = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
@@ -655,6 +822,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         "partitions/3".to_owned(),
         ControlKey::Route(RangeId(0)).encode(),
     ];
+    expected.extend(node_keys(3));
     expected.sort();
     assert_eq!(keys(&first), expected);
 
@@ -671,7 +839,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
         "the declaration of 1 wrote nothing"
     );
 
-    stop_after(2 + 5);
+    stop_after(2 + NODE_PUTS + 5);
     let stopped = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
@@ -679,7 +847,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
     );
     let second = snapshot(&rt, &*store);
     assert!(kept(&first, &second), "{first:?} -> {second:?}");
-    assert_eq!(keys(&second).len(), 7, "{:?}", keys(&second));
+    assert_eq!(keys(&second).len(), 10, "{:?}", keys(&second));
     assert_eq!(
         rt.block_on(admin::read_formation(&*store)).expect("reads"),
         None
@@ -688,7 +856,7 @@ fn s1a_an_interrupted_declaration_is_finished_by_its_own_count_only() {
     // PR #138 review r5: stopped after its counter, at the formation record. The run that
     // finishes names a new instance and a counter of its own; the stopped run's counter stays at
     // no opens, for an instance no formation record names.
-    stop_after(2 + PARTITIONS + 1);
+    stop_after(2 + NODE_PUTS + PARTITIONS + 1);
     let stopped = rt.block_on(admin::declare(&store, &declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
@@ -1002,14 +1170,16 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     drop(rt);
 
     let scripted = Arc::new(Scripted::new(Script {
-        pass_puts: 2 + (PARTITIONS - 1),
+        pass_puts: 2 + NODE_PUTS + (PARTITIONS - 1),
         fail_put_with: Some(config_core::ConfigError::Unavailable {
             reason: "scripted: the declaring process stopped".to_owned(),
         }),
         ..Script::default()
     }));
     let mut rig = bare_rig(scripted.clone());
-    let stopped = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+    let stopped = rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration()));
     assert!(
         matches!(stopped, Err(admin::DeclareError::Records(_))),
         "{stopped:?}"
@@ -1022,21 +1192,20 @@ fn s1a_the_formation_record_is_published_after_every_prerequisite() {
     );
     assert_eq!(
         keys(&prefix).len(),
-        PARTITIONS as usize + 1,
+        PARTITIONS as usize + 1 + NODE_PUTS as usize,
         "{:?}",
         keys(&prefix)
     );
 
     let (kept_dir, keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt);
     let refused = open_node(
         &rig.rt,
         &rig.store,
         &rig.cert_dir,
         NodeId(1),
         &kept_dir,
-        listeners.into_iter().next().expect("a listener"),
-        &addrs,
+        rig.listen(&rig.rt, NodeId(1)),
+        &rig.addrs,
     )
     .map(|_| ())
     .expect_err("an unfinished declaration forms nothing");
@@ -1171,9 +1340,10 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
         refuse: std::sync::atomic::AtomicBool::new(false),
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
-    let (listeners, addrs) = listeners(&rig.rt);
-    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
-        listeners.into_iter().map(Some).collect();
+    let addrs = rig.addrs.clone();
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> = (1..=rig.k)
+        .map(|n| Some(rig.listen(&rig.rt, NodeId(n))))
+        .collect();
     let dirs = fresh_dirs();
     let rooted_first = |rig: &Rig| {
         let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
@@ -1247,10 +1417,11 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
     for ((node, db, net), (dir, keep)) in opened.into_iter().zip(dirs) {
         rig.procs.push(Proc {
             node,
-            db,
-            _net: net,
+            db: Some(db),
+            _net: Some(net),
             dir,
             _dir: keep,
+            own_rt: None,
         });
     }
     rig.wait_ready();
@@ -1376,15 +1547,14 @@ fn s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused()
         let before = snapshot(&rig.rt, &*rig.store);
         assert!(!keys(&before).contains(&gone), "{gone} is gone");
         let (dir, _keep) = folder();
-        let (listeners, addrs) = listeners(&rig.rt);
         let opened = open_node(
             &rig.rt,
             &rig.store,
             &rig.cert_dir,
             NodeId(1),
             &dir,
-            listeners.into_iter().next().expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, NodeId(1)),
+            &rig.addrs,
         );
         let Err(refused) = opened.map(|(mut db, _net)| db.shutdown()) else {
             panic!("{gone}: node 1 opened a declared store missing it");
@@ -1498,7 +1668,9 @@ fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
             before,
             "{attempt}: nothing written"
         );
-        let again = rig.rt.block_on(admin::declare(&rig.store, &declaration()));
+        let again = rig
+            .rt
+            .block_on(admin::declare(&rig.store, &rig.declaration()));
         assert!(
             matches!(again, Ok(admin::Declared::Already(_))),
             "{again:?}"
@@ -1607,9 +1779,10 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     });
     let gated_store: Arc<dyn ConfigStore> = gated.clone();
     let dirs = fresh_dirs();
-    let (listeners, addrs) = listeners(&rig.rt);
-    let mut listeners: Vec<Option<tokio::net::TcpListener>> =
-        listeners.into_iter().map(Some).collect();
+    let addrs = rig.addrs.clone();
+    let mut listeners: Vec<Option<tokio::net::TcpListener>> = (1..=rig.k)
+        .map(|n| Some(rig.listen(&rig.rt, NodeId(n))))
+        .collect();
     assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
     std::thread::scope(|scope| {
         let _release = OpenOnDrop(&gated);
@@ -1680,18 +1853,14 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
     assert!(!keys(&before).contains(&counter), "{counter} is gone");
     for node in [NodeId(2), NodeId(3), NodeId(1)] {
         let dir = &dirs[node.0 as usize - 1].0;
-        let (listeners, addrs) = self::listeners(&rig.rt);
         let opened = open_node(
             &rig.rt,
             &rig.store,
             &rig.cert_dir,
             node,
             dir,
-            listeners
-                .into_iter()
-                .nth(node.0 as usize - 1)
-                .expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, node),
+            &rig.addrs,
         );
         let Err(refused) = opened else {
             panic!("node {}: an open with no counter opened", node.0);
@@ -1732,7 +1901,7 @@ fn s1a_a_partially_formed_declared_reopen_with_its_counter_gone_is_refused() {
 fn s1a_a_form_takes_over_a_declaration_stopped_before_its_formation_record() {
     let rt = runtime();
     let scripted = Arc::new(Scripted::new(Script {
-        pass_puts: 2 + PARTITIONS,
+        pass_puts: 2 + NODE_PUTS + PARTITIONS,
         fail_put_with: Some(config_core::ConfigError::Unavailable {
             reason: "scripted: the declaring process stopped".to_owned(),
         }),
@@ -1796,9 +1965,10 @@ fn s1a_a_reservation_of_unknown_outcome_whose_read_fails_is_finished_by_a_retry(
         let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
         let mut before = snapshot(&rt, &*store);
         for attempt in 1..=2 {
-            // The formation record and `routes/0` reads pass; the read after the put fails.
+            // The formation record, reservation (#80 S1b preflight, PR #144 review) and
+            // `routes/0` reads pass; the read after the put fails.
             scripted.rescript(Script {
-                pass_gets: 2,
+                pass_gets: 3,
                 fail_gets: 1,
                 lose_put_replies: u32::from(applied),
                 drop_puts: u32::from(!applied),
@@ -2129,15 +2299,14 @@ fn s1a_counter_deleted_after_lost_create_is_not_recreated() {
     });
     let raced: Arc<dyn ConfigStore> = race.clone();
     let (dir, _keep) = folder();
-    let (listeners, addrs) = listeners(&rig.rt);
     let opened = open_node(
         &rig.rt,
         &raced,
         &rig.cert_dir,
         NodeId(1),
         &dir,
-        listeners.into_iter().next().expect("a listener"),
-        &addrs,
+        rig.listen(&rig.rt, NodeId(1)),
+        &rig.addrs,
     );
     let Err(refused) = opened.map(|_| ()) else {
         panic!("node 1 opened over a counter deleted under it");
@@ -2182,18 +2351,14 @@ fn s1a_a_declared_restart_with_its_counter_gone_before_any_root_is_refused() {
     let gated_store: Arc<dyn ConfigStore> = gated;
     let dirs = fresh_dirs();
     let open = |store: &Arc<dyn ConfigStore>, node: NodeId| {
-        let (listeners, addrs) = listeners(&rig.rt);
         open_node(
             &rig.rt,
             store,
             &rig.cert_dir,
             node,
             &dirs[node.0 as usize - 1].0,
-            listeners
-                .into_iter()
-                .nth(node.0 as usize - 1)
-                .expect("a listener"),
-            &addrs,
+            rig.listen(&rig.rt, node),
+            &rig.addrs,
         )
         .map(|_| ())
     };
@@ -2286,4 +2451,1174 @@ fn s1a_a_declared_store_still_forming_names_its_node_processes_never_form() {
             ),
         "{undeclared}"
     );
+}
+
+// ---- #80 S1b: more than three nodes, placed on a ring (ADR-rdb-0023) ----
+
+/// Declare nodes 1 to `k` and `partitions`, then open each on a new empty folder of its own,
+/// node N listening on 127.0.0.N; none waited on yet.
+fn declared_rig_of(k: u32, partitions: u32) -> Rig {
+    declared_rig_with(k, partitions, false)
+}
+
+/// [`declared_rig_of`], each process on a runtime of its own when `own_runtimes`.
+fn declared_rig_with(k: u32, partitions: u32, own_runtimes: bool) -> Rig {
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), k);
+    rig.own_runtimes = own_runtimes;
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration of {k} nodes is written: {other:?}"),
+    }
+    rig.open_all(fresh_dirs_of(k));
+    rig
+}
+
+/// Where the ring places `partition` over nodes 1 to `k`.
+fn ring(k: u32, partition: u32) -> rdb_core::placement::Partition {
+    let nodes: Vec<u32> = (1..=k).collect();
+    rdb_core::placement::initial(&nodes, partition)
+}
+
+/// The partitions `node`'s copy in `dir` holds a lineage of, read from its engine after the
+/// process is shut down.
+fn held_partitions(dir: &Path, node: NodeId) -> BTreeSet<u32> {
+    let engine = RocksEngine::open_with(
+        dir.join("nodes").join(node.0.to_string()),
+        crate::StorageOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("node {}'s copy opens: {e}", node.0));
+    engine
+        .lineages()
+        .into_iter()
+        .map(|(partition, _)| partition.0)
+        .collect()
+}
+
+impl Rig {
+    /// Take `node`'s process down, the others running: shut its `Db` down and drop its net, so
+    /// its listener and every link to it are gone. [`Rig::restart`] brings it back.
+    fn stop(&mut self, node: NodeId) {
+        let proc = &mut self.procs[node.0 as usize - 1];
+        if let Some(mut db) = proc.db.take() {
+            db.shutdown();
+        }
+        proc._net = None;
+        if let Some(rt) = proc.own_rt.take() {
+            rt.shutdown_background();
+        }
+    }
+
+    /// Restart `node`'s process on its own folder and its own address, the others running:
+    /// shut it down, let go of its listener, bind the same address again, open again.
+    fn restart(&mut self, node: NodeId, timeouts: Timeouts) {
+        let at = node.0 as usize - 1;
+        let Proc {
+            node,
+            db,
+            _net,
+            dir,
+            _dir,
+            own_rt,
+        } = self.procs.remove(at);
+        if let Some(mut db) = db {
+            db.shutdown();
+        }
+        // The old net holds the listener until it is dropped and its tasks end; its own
+        // runtime, dropped, ends every task it ran, as the process's exit would.
+        drop(_net);
+        if let Some(rt) = own_rt {
+            rt.shutdown_background();
+        }
+        let own_rt = self.own_runtimes.then(runtime);
+        let rt = own_rt.as_ref().unwrap_or(&self.rt);
+        let listener = rebind(rt, &self.addrs[&node]);
+        let (db, net) = open_node_with(
+            rt,
+            &self.store,
+            &self.cert_dir,
+            node,
+            &dir,
+            listener,
+            &self.addrs,
+            timeouts,
+        )
+        .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
+        self.procs.insert(
+            at,
+            Proc {
+                node,
+                db: Some(db),
+                _net: Some(net),
+                dir,
+                _dir,
+                own_rt,
+            },
+        );
+    }
+}
+
+/// The node count and partition count the S1b integration rows declare.
+const S1B_K: u32 = 5;
+const S1B_P: u32 = 16;
+
+/// #80 S1b row 11, acceptance: five nodes declared, each node process on its own empty folder
+/// and its own host on this machine (127.0.0.1 to 127.0.0.5), sixteen partitions. Every node
+/// becomes ready; each partition's route names the ring's primary, and a put through it reads
+/// back; each node's copy holds exactly the partitions the ring places on it and no other, so
+/// nodes 4 and 5 hold partitions and no node holds every partition; and each folder holds only
+/// its own copy. Integration (~5 s): one formation of 16 partitions over five processes' links.
+/// Red before S1b: `declare` refuses five nodes. Cut: the heal's forming members back to
+/// `members_for` (nodes 1 to 3): partition 4's plan pins node 1 primary, and its route names
+/// node 1, not node 4, red at the route.
+#[config_log::retcd_test]
+fn s1b_five_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(S1B_K);
+}
+
+/// #80 S1b, PR #144 review: row 11 at six, seven and eight nodes, the most a declaration takes,
+/// each node process on its own folder and its own host (127.0.0.1 to 127.0.0.K). Integration
+/// (~1 s each). Cut: `admin::placed` and `admin::owner_in` ring over the first five declared
+/// nodes only; partition 6's route names node 1, not node 6, red at 6, 7 and 8 (row 11 green).
+#[config_log::retcd_test]
+fn s1b_six_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(6);
+}
+
+/// Row 11 at seven nodes; see the six-node row.
+#[config_log::retcd_test]
+fn s1b_seven_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(7);
+}
+
+/// Row 11 at eight nodes, `db::MAX_NODES`; see the six-node row.
+#[config_log::retcd_test]
+fn s1b_eight_declared_nodes_form_sixteen_partitions_each_from_its_own_folder() {
+    forms_each_from_its_own_folder(8);
+}
+
+/// Row 11's body over `k` declared nodes and [`S1B_P`] partitions.
+fn forms_each_from_its_own_folder(k: u32) {
+    let mut rig = declared_rig_of(k, S1B_P);
+    rig.wait_ready();
+    for partition in 1..=S1B_P {
+        let owner = NodeId(ring(k, partition).primary);
+        let db = rig.of(owner);
+        let group = group_of(db, partition);
+        let route = db.route(group).expect("a route");
+        assert_eq!(
+            (route.partition, route.owner),
+            (PartitionId(partition), owner),
+            "{route:?}"
+        );
+        let key = format!("k{partition}");
+        let put = put_lands(db, group, key.as_bytes(), b"v");
+        assert_eq!(put.partition, PartitionId(partition), "{put:?}");
+        let got = db.get_in(group, key.as_bytes()).expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"v"[..]),
+            "{got:?}"
+        );
+    }
+    rig.shutdown_all();
+    for proc in &rig.procs {
+        assert_eq!(
+            copies_in(&proc.dir),
+            [proc.node.0.to_string()],
+            "node {}'s folder holds only its own copy",
+            proc.node.0
+        );
+        let placed: BTreeSet<u32> = (1..=S1B_P)
+            .filter(|p| ring(k, *p).copies.contains(&proc.node.0))
+            .collect();
+        assert!(!placed.is_empty(), "node {} is placed", proc.node.0);
+        assert!(placed.len() < S1B_P as usize, "node {}", proc.node.0);
+        assert_eq!(
+            held_partitions(&proc.dir, proc.node),
+            placed,
+            "node {} holds exactly what the ring places on it",
+            proc.node.0
+        );
+    }
+}
+
+/// #80 S1b row 12: each of five node processes restarted on its own folder, the others
+/// running, reopens its copy and serves what was written before; nodes 4 and 5 hold no copy of
+/// partition 1, so their reopen decides partition 1 from the record alone. New puts land after.
+/// A rolling restart: each node is ready again before the next stops, since a recovery that
+/// loses a copy mid-barrier stops for that open by design. Integration (~10 s): a formation,
+/// then five restarts one by one.
+/// Cut: `Db::check`'s owner of a still-forming partition 1 is not the ring's: it holds as at
+/// S1a for partition 1 (node 1 at every K), so this row is red only through the cuts it shares
+/// with row 11; what it adds is the reopen of a node holding no partition 1.
+#[config_log::retcd_test]
+fn s1b_restart_of_each_of_five_nodes_reopens_its_own_folder() {
+    let mut rig = declared_rig_with(S1B_K, S1B_P, true);
+    rig.wait_ready();
+    let groups: Vec<(u32, AffinityId)> = (1..=S1B_P)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    for (partition, group) in &groups {
+        let owner = rig.of(NodeId(ring(S1B_K, *partition).primary));
+        put_lands(owner, *group, b"before", b"1");
+    }
+    for node in (1..=S1B_K).map(NodeId) {
+        rig.restart(node, Timeouts::default());
+        rig.wait_ready();
+    }
+    for (partition, group) in &groups {
+        let owner = rig.of(NodeId(ring(S1B_K, *partition).primary));
+        let got = owner.get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(owner, *group, b"after", b"2");
+    }
+    rig.shutdown_all();
+    for node in [NodeId(4), NodeId(5)] {
+        let held = held_partitions(&rig.procs[node.0 as usize - 1].dir, node);
+        assert!(!held.contains(&1), "node {} holds {held:?}", node.0);
+    }
+    for proc in &rig.procs {
+        assert_eq!(copies_in(&proc.dir), [proc.node.0.to_string()]);
+    }
+}
+
+/// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
+fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(partition)).encode()),
+        }))
+        .expect("the store answers");
+    read.record
+        .and_then(|found| RecordMember::decode_all(&found.value))
+        .map(|members| members.iter().map(|member| member.node.0).collect())
+        .unwrap_or_default()
+}
+
+/// Poll `partitions/{partition}`'s pinned nodes until `done` holds of them, and answer every
+/// set seen on the way, the last one included. Panics after `within`.
+fn pins_until(
+    rig: &Rig,
+    partition: u32,
+    within: Duration,
+    what: &str,
+    done: impl Fn(&BTreeSet<u32>) -> bool,
+) -> Vec<BTreeSet<u32>> {
+    let deadline = Instant::now() + crate::host::test_patience(within);
+    let mut seen = Vec::new();
+    loop {
+        let now = pinned_nodes(rig, partition);
+        if seen.last() != Some(&now) {
+            seen.push(now.clone());
+        }
+        if done(&now) {
+            return seen;
+        }
+        assert!(Instant::now() < deadline, "{what}: pins seen {seen:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// #80 S1b row 13: partition 2 is placed on nodes 2, 3 and 4. Node 4 goes down and its owner,
+/// node 2, drops it after the unreachable clock. Node 2 then restarts, which empties what it
+/// remembered was left out, while node 4 is still down. Node 4 comes back (owner 2 relearns it
+/// at that boot, the seat the ring placed it on) and restarts once more, and owner 2 pins it
+/// again. Node 1, which the ring never placed partition 2 on, is never pinned. Each process
+/// runs on its own runtime, so a stop ends its links as a process exit does. Integration
+/// (~15 s): a formation, a 2 s drop clock, three restarts.
+/// Cut: `Host::restore_left_out`'s seats back to `admin::members()` (nodes 1 to 3): owner 2
+/// relearns node 1, whose copy slot 0 is free, and never node 4: red at the wait for
+/// `left_out_restored` of node 4.
+#[config_log::retcd_test]
+fn s1b_a_dropped_copy_outside_nodes_one_to_three_is_restored_after_an_owner_restart() {
+    const PARTITION_2: u32 = 2;
+    let fast_drop = Timeouts {
+        unreachable_drop_after: Duration::from_secs(2),
+        ..Timeouts::default()
+    };
+    assert_eq!(ring(S1B_K, PARTITION_2).copies, [2, 3, 4]);
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), S1B_K);
+    rig.timeouts = fast_drop;
+    rig.own_runtimes = true;
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(S1B_P)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("declared: {other:?}"),
+    }
+    rig.open_all(fresh_dirs_of(S1B_K));
+    rig.wait_ready();
+    let group = group_of(rig.of(NodeId(2)), PARTITION_2);
+    put_lands(rig.of(NodeId(2)), group, b"before", b"1");
+    let mut seen = pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(10),
+        "formed",
+        |pins| *pins == BTreeSet::from([2, 3, 4]),
+    );
+
+    rig.stop(NodeId(4));
+    seen.extend(pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(30),
+        "owner 2 drops node 4",
+        |pins| *pins == BTreeSet::from([2, 3]),
+    ));
+    // Owner 2's other partitions are on nodes 2, 3 and 4 too: its heal after the restart waits
+    // for every member it pins, so each must have dropped node 4 first.
+    for other in (1..=S1B_P).filter(|p| *p != PARTITION_2 && ring(S1B_K, *p).primary == 2) {
+        assert_eq!(ring(S1B_K, other).copies, [2, 3, 4], "partition {other}");
+        pins_until(
+            &rig,
+            other,
+            Duration::from_secs(30),
+            "owner 2 drops node 4",
+            |pins| *pins == BTreeSet::from([2, 3]),
+        );
+    }
+    rig.restart(NodeId(2), fast_drop);
+    rig.of(NodeId(2))
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("owner 2 is ready again on nodes 2 and 3");
+    rig.restart(NodeId(4), fast_drop);
+    let relearned = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while !config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "s1b_a_dropped_copy_outside_nodes_one_to_three_is_restored_after_an_owner_restart",
+    )
+    .iter()
+    .any(|line| line["@m"] == "left_out_restored" && line["left_out"] == 4)
+    {
+        assert!(Instant::now() < relearned, "owner 2 never relearned node 4");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rig.restart(NodeId(4), fast_drop);
+    seen.extend(pins_until(
+        &rig,
+        PARTITION_2,
+        Duration::from_secs(30),
+        "owner 2 pins node 4 again",
+        |pins| pins.contains(&4),
+    ));
+    assert!(
+        seen.iter().all(|pins| !pins.contains(&1)),
+        "node 1 is never pinned in partition 2: {seen:?}"
+    );
+    rig.wait_ready();
+    let got = rig.of(NodeId(2)).get_in(group, b"before").expect("a get");
+    assert_eq!(
+        got.value.as_ref().map(|(_, value)| &value[..]),
+        Some(&b"1"[..]),
+        "{got:?}"
+    );
+}
+
+/// `declaration()` with node `node`'s address and machine label replaced.
+fn with_node(node: u32, addr: &str, machine: Option<&str>) -> admin::Declaration {
+    let mut declared = declaration();
+    let decl = &mut declared.nodes[node as usize - 1];
+    decl.addr = addr.to_owned();
+    decl.machine = machine.map(str::to_owned);
+    declared
+}
+
+/// #80 S1b row 5 (ruling 1): two nodes on one machine are refused, whatever their labels say,
+/// and nothing is written: the same label, a label differing only in case, one host on two
+/// ports, and distinct labels on one host. Distinct loopback addresses are distinct hosts, so
+/// the rig's 127.0.0.1 to .3 declare. Unit (<100 ms, an in-memory store).
+/// Cut: `Declaration::records` skips `machine_clash`; each case declares, red at the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_two_nodes_on_one_machine_and_writes_nothing() {
+    let rt = runtime();
+    let labelled = |labels: [&str; 3]| {
+        let mut declared = declaration();
+        for (decl, label) in declared.nodes.iter_mut().zip(labels) {
+            decl.machine = Some(label.to_owned());
+        }
+        declared
+    };
+    for (what, declared, names) in [
+        ("the same label", labelled(["a", "b", "b"]), "machine \"b\""),
+        (
+            "a case variant",
+            labelled(["a", "HostB", "hostb"]),
+            "machine \"hostb\"",
+        ),
+        (
+            "one host on two ports",
+            with_node(2, "127.0.0.1:7101", None),
+            "the same host",
+        ),
+        (
+            "distinct labels on one host",
+            {
+                let mut declared = with_node(2, "127.0.0.1:7101", Some("b"));
+                declared.nodes[0].machine = Some("a".to_owned());
+                declared
+            },
+            "the same host",
+        ),
+    ] {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = rt.block_on(admin::declare(&store, &declared));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("one data node per machine") && text.contains(names)
+                    && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
+    }
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    assert!(
+        matches!(
+            rt.block_on(admin::declare(&store, &declaration())),
+            Ok(admin::Declared::Created(_))
+        ),
+        "127.0.0.1, .2 and .3 are three machines"
+    );
+}
+
+/// #80 S1b, PR #144 review: two spellings of one IP are one host, so their nodes are refused
+/// as on one machine, with default labels and with distinct explicit ones, and nothing is
+/// written: `[::1]` and `[0:0:0:0:0:0:0:1]`, and `127.0.0.1` and `[::ffff:127.0.0.1]`. A host
+/// name differing only in case or a trailing dot is one host too. Unit (<100 ms).
+/// Cut: `machine_clash` compares the address text, lowercase; every IP case declares, red at
+/// the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
+    let rt = runtime();
+    let pair = |a: &str, b: &str, labels: Option<[&str; 2]>| {
+        let mut declared = with_node(1, a, labels.map(|l| l[0]));
+        declared.nodes[1].addr = b.to_owned();
+        declared.nodes[1].machine = labels.map(|l| l[1].to_owned());
+        declared
+    };
+    for labels in [None, Some(["a", "b"])] {
+        for (a, b) in [
+            ("[::1]:7100", "[0:0:0:0:0:0:0:1]:7100"),
+            ("[::1]:7100", "[0:0:0:0:0:0:0:1]:7101"),
+            ("127.0.0.1:7100", "[::ffff:127.0.0.1]:7101"),
+            ("DB-A.example:7100", "db-a.example.:7101"),
+        ] {
+            let what = format!("{a} and {b}, labels {labels:?}");
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let refused = rt.block_on(admin::declare(&store, &pair(a, b, labels)));
+            assert!(
+                matches!(&refused, Err(admin::DeclareError::Refused(text))
+                    if text.contains("the same host") && text.contains("nodes 1 (")
+                        && text.contains("nothing was written")),
+                "{what}: {refused:?}"
+            );
+            assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
+        }
+    }
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let declared = rt.block_on(admin::declare(
+        &store,
+        &pair("[::1]:7100", "[::2]:7100", None),
+    ));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(_))),
+        "::1 and ::2 are two hosts: {declared:?}"
+    );
+}
+
+/// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
+/// written, since a node record is never rewritten: port 0, a bracketed host that is not an IPv6
+/// address (`[::gg]`), and (PR #144 review r2) an unspecified, broadcast or multicast host
+/// (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`, `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same
+/// store then takes the corrected addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
+/// parses no bracketed host; both declare, red at the first. Cut: `dialable` refuses nothing; red
+/// at `255.255.255.255`. Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0`.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
+    let rt = runtime();
+    for (bad, names, corrected) in [
+        (
+            "127.0.0.3:0",
+            "has port 0, which no peer can dial",
+            "127.0.0.3:7100",
+        ),
+        (
+            "[::gg]:7100",
+            "a bracketed host must be an IPv6 address",
+            "[::3]:7100",
+        ),
+        (
+            "255.255.255.255:7100",
+            "broadcast or multicast address",
+            "127.0.0.3:7100",
+        ),
+        (
+            "224.0.0.1:7100",
+            "broadcast or multicast address",
+            "127.0.0.3:7100",
+        ),
+        (
+            "[ff02::1]:7100",
+            "broadcast or multicast address",
+            "[::3]:7100",
+        ),
+        ("0.0.0.0:7100", "an unspecified", "127.0.0.3:7100"),
+        ("[::]:7100", "an unspecified", "[::3]:7100"),
+        ("[::ffff:0.0.0.0]:7100", "an unspecified", "127.0.0.3:7100"),
+    ] {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, None)));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains(bad) && text.contains(names)
+                    && text.contains("nothing was written")),
+            "{bad}: {refused:?}"
+        );
+        assert!(snapshot(&rt, &*store).is_empty(), "{bad}: nothing written");
+        let declared = rt.block_on(admin::declare(&store, &with_node(3, corrected, None)));
+        assert!(
+            matches!(&declared, Ok(admin::Declared::Created(formation))
+                if formation.nodes.len() == 3),
+            "{corrected} on the store {bad} left: {declared:?}"
+        );
+    }
+}
+
+/// #80 S1b, PR #144 review r3: a host that is not an IP address must be a whitelisted host name,
+/// and a machine label is `[a-z0-9._:-]`, 1 to 63 bytes, so nothing a peer cannot resolve and
+/// no control byte is stored forever. Each case is declared with an explicit machine label, so
+/// the label cannot be what refuses a bad host: a host holding a space, tab, CR, LF or NUL,
+/// hosts of only dots, and the hex and short numeric spellings of an IPv4 address. Then an
+/// explicit label holding a space, tab, CR, LF, NUL or DEL. Each is refused naming node 3, with
+/// nothing written; the same store then takes `db-c.example` with label `m3`. Unit (<100 ms).
+/// Cut: `name_refusal` answers `None`; `db c.example` declares, red at the first.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_a_host_or_label_outside_the_whitelist() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let hosts = [
+        "db c.example:7100",
+        "db\tc.example:7100",
+        "db\rc.example:7100",
+        "db\nc.example:7100",
+        "db\0c.example:7100",
+        "..:7100",
+        "...:7100",
+        "0xffffffff:7100",
+        "0xe0000001:7100",
+        "0x7f.1:7100",
+        "127.1:7100",
+    ];
+    for bad in hosts {
+        let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, Some("m3"))));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains(&format!("{bad:?}"))
+                    && text.contains("host name") && text.contains("nothing was written")),
+            "{bad:?}: {refused:?}"
+        );
+        assert!(
+            snapshot(&rt, &*store).is_empty(),
+            "{bad:?}: nothing written"
+        );
+    }
+    for label in ["m 3", "m\t3", "m\r3", "m\n3", "m\0x", "m\u{7f}3"] {
+        let refused = rt.block_on(admin::declare(
+            &store,
+            &with_node(3, "db-c.example:7100", Some(label)),
+        ));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("node 3") && text.contains("is not one of a-z")
+                    && text.contains("nothing was written")),
+            "{label:?}: {refused:?}"
+        );
+        assert!(
+            snapshot(&rt, &*store).is_empty(),
+            "{label:?}: nothing written"
+        );
+    }
+    let declared = rt.block_on(admin::declare(
+        &store,
+        &with_node(3, "db-c.example:7100", Some("m3")),
+    ));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(formation)) if formation.nodes.len() == 3),
+        "{declared:?}"
+    );
+}
+
+/// #80 S1b row 6: the node sets and addresses a declaration refuses, each with nothing
+/// written: 2 nodes, 9 nodes, a gap (1, 2, 4), a node named twice, one address for two nodes,
+/// and an address with no port. Four nodes, refused at S1a, now declare. This replaces the S1a
+/// `rdb_node` row that declared four nodes to reach a refusal: K = 4 is legal. Unit (<100 ms).
+/// Cut: `Declaration::records` skips its duplicate-address check; that case is then refused by
+/// `machine_clash` as one host instead, red at the text naming the address twice.
+#[config_log::retcd_test]
+fn s1b_declare_refuses_node_sets_outside_three_to_eight_or_with_gaps() {
+    let rt = runtime();
+    let mut gap = declaration_of(4, PARTITIONS);
+    gap.nodes.remove(2);
+    let mut twice = declaration_of(3, PARTITIONS);
+    twice.nodes[2].node = NodeId(2);
+    for (what, declared, names) in [
+        ("two nodes", declaration_of(2, PARTITIONS), "3 to 8 nodes"),
+        ("nine nodes", declaration_of(9, PARTITIONS), "3 to 8 nodes"),
+        ("a gap", gap, "nodes [1, 2, 4]"),
+        ("a node twice", twice, "nodes [1, 2, 2]"),
+        (
+            "one address twice",
+            with_node(3, "127.0.0.2:7100", None),
+            "nodes 2 and 3 both have address 127.0.0.2:7100",
+        ),
+        (
+            "no port",
+            with_node(3, "127.0.0.3", None),
+            "address \"127.0.0.3\" is not host:port",
+        ),
+    ] {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = rt.block_on(admin::declare(&store, &declared));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains(names) && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
+    }
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let four = rt.block_on(admin::declare(&store, &declaration_of(4, PARTITIONS)));
+    assert!(
+        matches!(&four, Ok(admin::Declared::Created(formation)) if formation.nodes.len() == 4),
+        "{four:?}"
+    );
+}
+
+/// #80 S1b row 7: a declaration writes every `nodes/{id}` record after `routes/0` and before
+/// any partition record, so the formation record, published last, is published after them
+/// too. Held at its first partition record, the store holds the reservation, `routes/0` and
+/// the three node records, each the bytes its `NodeRecord` encodes; held at the formation
+/// record, all of them and every partition record. Unit (<200 ms, an in-memory store).
+/// Cut: write the node records after the counter, before the formation record; the first hold
+/// finds none, red.
+#[config_log::retcd_test]
+fn s1b_declare_writes_every_node_record_before_the_formation_record() {
+    let rt = runtime();
+    let records = declaration().records().expect("the rig's declaration");
+    for (held_at, expected) in [
+        (
+            ControlKey::Partition(PartitionId(1)).encode(),
+            vec![
+                ControlKey::Operation(admin::RESERVATION_OPERATION).encode(),
+                ControlKey::Route(RangeId(0)).encode(),
+            ],
+        ),
+        (
+            ControlKey::Operation(admin::FORMATION_OPERATION).encode(),
+            Vec::new(),
+        ),
+    ] {
+        let mem: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let held = PutHold::new(Arc::clone(&mem), &held_at, HoldAt::BeforeApply);
+        let held_store: Arc<dyn ConfigStore> = held.clone();
+        let declaring = rt.spawn(async move { admin::declare(&held_store, &declaration()).await });
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), held.arrived.notified())
+                .await
+                .unwrap_or_else(|_| panic!("the put of {held_at} arrives"));
+        });
+        let at = snapshot(&rt, &*mem);
+        for record in &records {
+            let key = ControlKey::Node(record.node).encode();
+            let found = at.iter().find(|(k, ..)| k.as_ref() == key.as_bytes());
+            assert_eq!(
+                found.map(|(_, value, ..)| value.clone()),
+                Some(record.encode()),
+                "held at {held_at}: {key}"
+            );
+        }
+        if expected.is_empty() {
+            let counter: Vec<String> = keys(&at)
+                .into_iter()
+                .filter(|key| key.starts_with("rdb/instances/"))
+                .collect();
+            assert_eq!(keys(&at), declared_keys(PARTITIONS, &[&counter[0]], false));
+        } else {
+            let mut expected = expected;
+            expected.extend(node_keys(3));
+            expected.sort();
+            assert_eq!(keys(&at), expected, "held at {held_at}");
+        }
+        declaring.abort();
+    }
+}
+
+/// #80 S1b row 8: two declarations that differ only in node 3's address run at once and both
+/// pass the preflight before either writes. In both winner orders the loser is refused at the
+/// reservation, naming both node lists, and writes nothing (a full snapshot is the same before
+/// and after it); the winner publishes, and `nodes/3` holds the winner's address. Unit
+/// (<200 ms, an in-memory store).
+/// Cut: the reservation without its node records (a count of 0); the loser adopts it, then
+/// fails at `nodes/3` with the winner's bytes there, red at the loser's outcome.
+#[config_log::retcd_test]
+fn s1b_concurrent_declarations_differing_only_in_an_address_publish_one() {
+    let rt = runtime();
+    let near = declaration();
+    let far = with_node(3, "127.0.0.33:7100", None);
+    for (won, lost) in [(&near, &far), (&far, &near)] {
+        let mem: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let both = Arc::new(tokio::sync::Barrier::new(2));
+        let winner = Arc::new(DeclareRace::new(Arc::clone(&mem), Arc::clone(&both), true));
+        let loser = Arc::new(DeclareRace::new(Arc::clone(&mem), both, false));
+        let declare = |store: Arc<DeclareRace>, declared: admin::Declaration| {
+            let store: Arc<dyn ConfigStore> = store;
+            rt.spawn(async move { admin::declare(&store, &declared).await })
+        };
+        let won_addr = won.nodes[2].addr.clone();
+        let winning = declare(Arc::clone(&winner), won.clone());
+        let losing = declare(Arc::clone(&loser), lost.clone());
+        let within = Duration::from_secs(10);
+        rt.block_on(async {
+            tokio::time::timeout(within, winner.at_marker.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{won_addr} wins: its formation put arrives"));
+        });
+        let before = snapshot(&rt, &*mem);
+        loser.go.add_permits(1);
+        let outcome = rt
+            .block_on(async { tokio::time::timeout(within, losing).await })
+            .unwrap_or_else(|_| panic!("{won_addr} wins: the loser ends"))
+            .expect("the task ends");
+        assert!(
+            matches!(&outcome, Err(admin::DeclareError::Refused(text))
+                if text.contains("reserves the store for a declaration of 8 partitions")
+                    && text.contains(&format!("3@{won_addr}/"))
+                    && text.contains(&format!("3@{}/", lost.nodes[2].addr))
+                    && text.contains("nothing was written")),
+            "{won_addr} wins: the loser is refused at the reservation: {outcome:?}"
+        );
+        assert_eq!(
+            snapshot(&rt, &*mem),
+            before,
+            "{won_addr} wins: the loser wrote nothing"
+        );
+        winner.marker.add_permits(1);
+        let outcome = rt
+            .block_on(async { tokio::time::timeout(within, winning).await })
+            .unwrap_or_else(|_| panic!("{won_addr} wins: it ends"))
+            .expect("the task ends");
+        assert!(
+            matches!(&outcome, Ok(admin::Declared::Created(_))),
+            "{won_addr} wins: {outcome:?}"
+        );
+        let nodes = rt
+            .block_on(admin::read_nodes(&*mem))
+            .expect("the node records read");
+        assert_eq!(nodes[&NodeId(3)].addr, won_addr);
+    }
+}
+
+/// #80 S1b row 9: a declaration stopped after `nodes/2` is finished only by itself. Another
+/// declaration whose node 2 differs is refused by the preflight, naming `nodes/2` and both
+/// values; one whose node 3 differs (no record yet) is refused at the reservation. Neither
+/// writes. The same declaration run again adopts the reservation, `routes/0` and both node
+/// records, unchanged at their revisions, and publishes. Unit (<200 ms, an in-memory store).
+/// Cut: the preflight skips `nodes/`; the node-2 variant passes it and is refused at the
+/// reservation instead, red at the text.
+#[config_log::retcd_test]
+fn s1b_an_interrupted_declaration_is_finished_by_its_own_node_records_only() {
+    let rt = runtime();
+    let scripted = Arc::new(Scripted::new(Script {
+        pass_puts: 2 + 2,
+        fail_put_with: Some(config_core::ConfigError::Unavailable {
+            reason: "scripted: the declaring process stopped".to_owned(),
+        }),
+        ..Script::default()
+    }));
+    let store: Arc<dyn ConfigStore> = scripted.clone();
+    let stopped = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(stopped, Err(admin::DeclareError::Records(_))),
+        "{stopped:?}"
+    );
+    let stopped_at = snapshot(&rt, &*store);
+    let mut expected = vec![
+        ControlKey::Operation(admin::RESERVATION_OPERATION).encode(),
+        ControlKey::Route(RangeId(0)).encode(),
+        ControlKey::Node(NodeId(1)).encode(),
+        ControlKey::Node(NodeId(2)).encode(),
+    ];
+    expected.sort();
+    assert_eq!(keys(&stopped_at), expected);
+    scripted.rescript(Script::default());
+
+    for (what, other, names) in [
+        (
+            "node 2 elsewhere",
+            with_node(2, "127.0.0.22:7100", None),
+            "nodes/2 records 2@127.0.0.2:7100/127.0.0.2 and this declaration says \
+             2@127.0.0.22:7100/127.0.0.22",
+        ),
+        (
+            "node 3 elsewhere",
+            with_node(3, "127.0.0.33:7100", None),
+            "reserves the store for a declaration of 8 partitions and nodes [1@127.0.0.1:7100",
+        ),
+    ] {
+        let refused = rt.block_on(admin::declare(&store, &other));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains(names) && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert_eq!(
+            snapshot(&rt, &*store),
+            stopped_at,
+            "{what}: nothing written"
+        );
+    }
+
+    let done = rt.block_on(admin::declare(&store, &declaration()));
+    let Ok(admin::Declared::Created(formation)) = done else {
+        panic!("the same declaration finishes: {done:?}");
+    };
+    let finished = snapshot(&rt, &*store);
+    assert!(
+        kept(&stopped_at, &finished),
+        "{stopped_at:?} -> {finished:?}"
+    );
+    let counter = admin::instance_key(&formation.instance);
+    assert_eq!(
+        keys(&finished),
+        declared_keys(PARTITIONS, &[&counter], true)
+    );
+}
+
+/// #80 S1b row 14 (ADR-rdb-0023 Decision 4): a declared open of two local nodes is refused: one
+/// process is one machine, so it would run two data nodes on one. It is refused before
+/// anything is created or read past the records: the store is unchanged and no `nodes/` folder
+/// is left. Unit (<1 s, an in-memory store).
+/// Cut: drop the `local.len() != 1` arm of `declared_open_refusal`; the open goes on and forms
+/// copies 1 and 2, red at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_of_two_local_nodes_is_refused() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    let declared = snapshot(&rt, &*store);
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(1), NodeId(2)],
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|_| ())
+        .expect_err("two declared nodes do not open in one process");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Config(_))
+            && text.contains("runs nodes [1, 2] of a declared database")
+            && text.contains("one data node per process")
+            && text.contains("nothing but its folder was created"),
+        "{text}"
+    );
+    assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
+    assert_eq!(snapshot(&rt, &*store), declared, "nothing was written");
+}
+
+/// Node 1 of `declaration()` opened alone on `dir` with `addresses` (#80 S1b ruling 2): no
+/// net, since the address check comes before anything an open links or creates.
+fn open_declared_one(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    dir: &Path,
+    addresses: Option<NodeAddresses>,
+) -> Result<Db, OpenError> {
+    rt.block_on(Db::open_with(
+        DbConfig {
+            local: vec![NodeId(1)],
+            addresses,
+            ..config(dir)
+        },
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))
+}
+
+/// `declaration()`'s addresses as node 1 was given them: its own and every node's.
+fn declared_addresses() -> NodeAddresses {
+    NodeAddresses {
+        listen: "127.0.0.1:7100".to_owned(),
+        peers: (1..=3)
+            .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
+            .collect(),
+    }
+}
+
+/// The names in a folder's `nodes/`, or none when it has no `nodes/`.
+fn folder_listing(dir: &Path) -> Vec<String> {
+    if dir.join("nodes").exists() {
+        copies_in(dir)
+    } else {
+        Vec::new()
+    }
+}
+
+/// #80 S1b ruling 2: node 1 opened with `wrong` addresses is refused, naming every one of
+/// `names`, on its first open, a retry of it, and a restart after an open with the right
+/// addresses. Each refusal leaves the store and the folder as they were.
+fn refused_on_every_open(wrong: Option<NodeAddresses>, names: &[&str]) {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    let dir = config_testkit::fs::temp_dir();
+    let refused_here = |what: &str| {
+        let before = snapshot(&rt, &*store);
+        let listing = folder_listing(dir.path());
+        let refused = open_declared_one(&rt, &store, dir.path(), wrong.clone())
+            .map(|mut db| db.shutdown())
+            .expect_err("a declared node whose addresses disagree is refused");
+        let text = refused.to_string();
+        assert!(matches!(refused, OpenError::Config(_)), "{what}: {text}");
+        for name in names {
+            assert!(text.contains(name), "{what}: {name:?} in {text}");
+        }
+        assert_eq!(snapshot(&rt, &*store), before, "{what}: nothing written");
+        assert_eq!(
+            folder_listing(dir.path()),
+            listing,
+            "{what}: the folder is as it was"
+        );
+    };
+    refused_here("the first open");
+    refused_here("a retry");
+    let mut db = open_declared_one(&rt, &store, dir.path(), Some(declared_addresses()))
+        .expect("node 1 opens with its recorded addresses");
+    db.shutdown();
+    drop(db);
+    assert_eq!(
+        folder_listing(dir.path()),
+        ["1"],
+        "the right open made node 1's copy"
+    );
+    refused_here("a restart");
+}
+
+/// #80 S1b ruling 2 (ADR-rdb-0023 Decision 5): an embedded node of a declared database whose
+/// `DbConfig::addresses.listen` is not its `nodes/1` record's address is refused, naming the
+/// record and both addresses, on the first open, a retry and a restart; nothing is written and
+/// the folder is as it was. Unit (<1 s, an in-memory store, no net).
+/// Cut: `declared_open_refusal` skips its `node_start_refusal` call; the first open opens, red
+/// at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_whose_listen_address_disagrees_with_its_record_is_refused() {
+    refused_on_every_open(
+        Some(NodeAddresses {
+            listen: "127.0.0.1:7101".to_owned(),
+            ..declared_addresses()
+        }),
+        &[
+            "listen address 127.0.0.1:7101",
+            "nodes/1",
+            "records 127.0.0.1:7100",
+        ],
+    );
+}
+
+/// #80 S1b ruling 2 (ADR-rdb-0023 Decision 5): an embedded node given an address for one peer
+/// that its `nodes/` record does not hold is refused naming that entry and the record, on the
+/// first open, a retry and a restart; nothing is written. Unit (<1 s).
+/// Cut: as the listen row; red at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_given_a_peer_address_that_disagrees_is_refused() {
+    let mut wrong = declared_addresses();
+    wrong.peers.insert(NodeId(3), "127.0.0.33:7100".to_owned());
+    refused_on_every_open(
+        Some(wrong),
+        &[
+            "peer address 3=127.0.0.33:7100",
+            "nodes/3",
+            "records 127.0.0.3:7100",
+        ],
+    );
+}
+
+/// #80 S1b ruling 2: a declared open with no `DbConfig::addresses` is refused, so the check
+/// cannot be skipped by leaving them out; first open, retry and restart. Unit (<1 s).
+/// Cut: `declared_open_refusal` lets `None` through; the first open opens, red at `expect_err`.
+#[config_log::retcd_test]
+fn s1b_a_declared_open_with_no_addresses_is_refused() {
+    refused_on_every_open(
+        None,
+        &[
+            "no DbConfig::addresses",
+            "nothing but its folder was created",
+        ],
+    );
+}
+
+/// #80 S1b, PR #144 review r2: the preflight's reservation read failing is a refusal naming
+/// that read, not a reservation taken as absent: the store's error stays typed
+/// (`DeclareError::Store`, step `get operations/<reservation>`) and nothing is written. The same
+/// declaration then declares once the store answers. Unit (<100 ms, an in-memory store).
+/// Cut: `declare_preflight` takes a failed reservation read as no reservation; the declaration
+/// goes on and creates, red at the first `matches!`.
+#[config_log::retcd_test]
+fn s1b_a_failing_reservation_read_in_the_preflight_is_refused() {
+    let rt = runtime();
+    // The formation record's read passes; the next get, the preflight's reservation read, fails.
+    let scripted = Arc::new(Scripted::new(Script {
+        pass_gets: 1,
+        fail_gets: 1,
+        ..Script::default()
+    }));
+    let store: Arc<dyn ConfigStore> = scripted.clone();
+    let reservation = ControlKey::Operation(admin::RESERVATION_OPERATION).encode();
+    let failed = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&failed, Err(admin::DeclareError::Store { step, error })
+            if *step == format!("get {reservation}")
+                && error.to_string().contains("scripted: the read failed")),
+        "{failed:?}"
+    );
+    assert!(snapshot(&rt, &*store).is_empty(), "nothing written");
+    scripted.rescript(Script::default());
+    let declared = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&declared, Ok(admin::Declared::Created(_))),
+        "{declared:?}"
+    );
+}
+
+/// #80 S1b ruling 4, PR #144 review: a store an S1a build began declaring and did not finish
+/// holds its layout-1 reservation (partitions and node numbers, no addresses), `routes/0` and
+/// partition records, and no formation or `nodes/` record. Declaring it again is refused with
+/// what to do, whatever the new declaration says: five nodes, whose partition 4 differs from
+/// the S1a record, and the same three nodes, whose records match it byte for byte so only the
+/// reservation can refuse it. Nothing is written. Unit (<100 ms).
+/// Cut: `declare_preflight` skips its reservation read; five nodes are refused at
+/// `partitions/4` without what to do, red at the text.
+#[config_log::retcd_test]
+fn s1b_a_half_written_s1a_declaration_is_refused_with_how_to_redeclare() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(formation)) =
+        rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    // What an S1a build left when it stopped before its formation record.
+    let mut gone: Vec<String> = (1..=3)
+        .map(|n| ControlKey::Node(NodeId(n)).encode())
+        .collect();
+    gone.push(ControlKey::Operation(admin::FORMATION_OPERATION).encode());
+    gone.push(admin::instance_key(&formation.instance));
+    for key in gone {
+        rt.block_on(store.delete(config_core::DeleteRequest {
+            key: Bytes::from(key),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("delete");
+    }
+    let mut layout_1 = vec![1];
+    layout_1.extend_from_slice(&PARTITIONS.to_le_bytes());
+    for n in 1..=3u32 {
+        layout_1.extend_from_slice(&n.to_le_bytes());
+    }
+    rt.block_on(store.put(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Operation(admin::RESERVATION_OPERATION).encode()),
+        value: Bytes::from(layout_1),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("the S1a reservation");
+    let s1a = snapshot(&rt, &*store);
+    for (what, declared) in [
+        ("five nodes", declaration_of(5, PARTITIONS)),
+        ("the same three nodes", declaration()),
+    ] {
+        let refused = rt.block_on(admin::declare(&store, &declared));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains("by a build before #80 S1b")
+                    && text.contains("declare the database again, with --peers, on a new empty \
+                                      control store")
+                    && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert_eq!(snapshot(&rt, &*store), s1a, "{what}: nothing was written");
+    }
+}
+
+/// #80 S1b ruling 4 (ADR-rdb-0023): a store an S1a build declared holds a formation record and
+/// no `nodes/` record. A node process opening it is refused with what to do (declare again on
+/// a new store), before any folder is claimed; `admin::declare` of it again is refused the same
+/// way rather than answering `Already`. Nothing is written by either. Unit (<1 s).
+/// Cut: `declared_open_refusal` skips its empty-records check; the open is refused by the next
+/// check instead (`nodes/2 is absent`), without what to do, red at the text.
+#[config_log::retcd_test]
+fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&store, &declaration()))
+    else {
+        panic!("declared");
+    };
+    // What an S1a build left: every record but `nodes/`.
+    for n in 1..=3 {
+        rt.block_on(store.delete(config_core::DeleteRequest {
+            key: Bytes::from(ControlKey::Node(NodeId(n)).encode()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("delete");
+    }
+    let s1a = snapshot(&rt, &*store);
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(2)],
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|_| ())
+        .expect_err("an S1a store does not open");
+    let text = refused.to_string();
+    assert!(
+        text.contains(admin::S1A_STORE) && text.contains("nothing but its folder was created"),
+        "{text}"
+    );
+    assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
+    let again = rt.block_on(admin::declare(&store, &declaration()));
+    assert!(
+        matches!(&again, Err(admin::DeclareError::Refused(text)) if text.contains(admin::S1A_STORE)),
+        "{again:?}"
+    );
+    assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
 }

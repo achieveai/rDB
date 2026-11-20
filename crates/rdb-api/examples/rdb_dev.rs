@@ -965,6 +965,7 @@ where
         client: rdb_api::db::DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        addresses: None,
     };
     // Before the voters start (PC-2): a refused option starts nothing.
     if let Err(e) = config.check() {
@@ -2615,7 +2616,7 @@ fn members_text(
 /// ones; the dropped node's own open logs `db_open_copy_left_out`. `None` at the full count: an
 /// unpinned node is then a spare, which the members line says as `not pinned N`.
 fn out_line(pinned: &[NodeId], known: &[NodeId], in_process: bool) -> Option<String> {
-    let copies = rdb_api::admin::members().len();
+    let copies = rdb_api::admin::RF;
     if pinned.len() >= copies {
         return None;
     }
@@ -5235,7 +5236,8 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) -> bool {
 /// `admin status` print them. A list that fails is one `err <verb> list <prefix>: ..` line.
 fn record_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore, verb: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    for prefix in ["partitions/", "grants/"] {
+    // #80 S1b: and each declared node's record, where it listens and its machine.
+    for prefix in ["partitions/", "grants/", "nodes/"] {
         let listed = rt.block_on(store.list(ListRequest {
             prefix: Bytes::from_static(prefix.as_bytes()),
             max_items: 0,
@@ -5245,10 +5247,13 @@ fn record_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore, verb: &st
             Ok(response) => {
                 for record in response.records {
                     let key = String::from_utf8_lossy(&record.key).into_owned();
-                    let body = if prefix == "partitions/" {
-                        partition_body(&record.value)
-                    } else {
-                        GrantRecord::decode(&record.value).map(|r| format!("{r:?}"))
+                    let body = match prefix {
+                        "partitions/" => partition_body(&record.value),
+                        "nodes/" => rdb_core::authority::node::NodeRecord::decode(&record.value)
+                            .map(|r| {
+                                format!("node={} addr={} machine={}", r.node.0, r.addr, r.machine)
+                            }),
+                        _ => GrantRecord::decode(&record.value).map(|r| format!("{r:?}")),
                     };
                     lines.push(format!(
                         "{key} rev={} {}",
@@ -9029,16 +9034,28 @@ mod tests {
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,
     /// with the revision, and says `<undecodable>` for a body it cannot read. Cut: list only
     /// `partitions/` and the grants line goes red. Unit.
+    /// #80 S1b: and `nodes/`, a node record decoded as its address and machine; a failed store
+    /// gives one error line per prefix, now three.
     #[test]
     fn admin_status_lists_partitions_and_grants_through_the_given_store() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
         let store = config_testkit::memstore::MemStore::new();
-        for key in ["partitions/1", "grants/2", "other/3"] {
+        let node = rdb_core::authority::node::NodeRecord {
+            node: NodeId(4),
+            addr: "127.0.0.4:7100".to_owned(),
+            machine: "m4".to_owned(),
+        };
+        for (key, value) in [
+            ("partitions/1", Bytes::from_static(b"x")),
+            ("grants/2", Bytes::from_static(b"x")),
+            ("other/3", Bytes::from_static(b"x")),
+            ("nodes/4", node.encode()),
+        ] {
             rt.block_on(store.put(PutRequest {
                 key: Bytes::from(key),
-                value: Bytes::from_static(b"x"),
+                value,
                 expected_mod_revision: None,
                 dedup: None,
             }))
@@ -9048,14 +9065,15 @@ mod tests {
             record_lines(&rt, &store, "admin status"),
             [
                 "partitions/1 rev=1 <undecodable>",
-                "grants/2 rev=2 <undecodable>"
+                "grants/2 rev=2 <undecodable>",
+                "nodes/4 rev=4 node=4 addr=127.0.0.4:7100 machine=m4"
             ]
         );
         store.failing_with(config_core::ConfigError::Unavailable {
             reason: "down".to_owned(),
         });
         let failed = record_lines(&rt, &store, "admin status");
-        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert_eq!(failed.len(), 3, "{failed:?}");
         assert!(
             failed[0].starts_with("err admin status list partitions/: "),
             "{failed:?}"
@@ -9439,6 +9457,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9520,6 +9539,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9577,6 +9597,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))
@@ -9640,6 +9661,7 @@ mod tests {
             client: rdb_api::db::DEFAULT_CLIENT,
             boot: None,
             storage: rdb_api::StorageOptions::default(),
+            addresses: None,
         };
         let mut db = rt
             .block_on(Db::open(config, store, rt.handle().clone()))

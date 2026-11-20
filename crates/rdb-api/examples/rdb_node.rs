@@ -4,7 +4,8 @@
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
 //! rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
-//! rdb_node --declare --control E [--partitions P] [--nodes K] [--log-dir L]
+//! rdb_node --declare --control E --peers 1=ADDR,...,K=ADDR [--machines N=LABEL,...]
+//!          [--partitions P] [--nodes K] [--log-dir L]
 //! rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E
 //!          --cert-dir C [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L]
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
@@ -22,14 +23,25 @@
 //! * `--declare` makes the database with no copy at all (#80 S1a, ADR-rdb-0022): it writes the
 //!   control records and, last, the formation record naming the database's instance, then exits.
 //!   Each node process then opens its own empty `--dir`, and the owner of each partition forms
-//!   it. `--partitions` defaults to 1; `--nodes` is the node count, and this build declares 3.
-//!   Run again with the same arguments it says `already`; with another count it is refused.
-//!   It takes no `--form`, `--gen-certs`, `--node`, `--dir` or `--live-readd`: each of these
-//!   five is refused, and so are `--failover` and its knobs. Other node-process flags, such as
-//!   `--listen` and `--peers`, still parse and are ignored.
+//!   it. `--partitions` defaults to 1. `--peers` is required: nodes 1 to K, K from 3 to 8, each
+//!   with the address its node process will `--listen` on, as the node processes take
+//!   `--peers` (#80 S1b, ADR-rdb-0023). It writes one `nodes/N` record per node. `--machines`
+//!   gives a node's machine label; unset, it is the host as `parse_addr` parses it (so
+//!   `DB-A.example.` gives `db-a.example`, and `[0:0:0:0:0:0:0:1]` gives `::1`). Two nodes on one
+//!   machine are refused: the same label, or the same host whatever the labels say. So 127.0.0.1
+//!   and 127.0.0.2 are two machines, and a whole database runs on one box over loopback addresses.
+//!   `--nodes`, if given, must count the `--peers` nodes. It prints the records it reads back,
+//!   `nodes=N@ADDR/MACHINE,...`. Run again with the same arguments it says `already`; with
+//!   another count or another address it is refused. It takes no `--form`, `--gen-certs`,
+//!   `--node`, `--dir` or `--live-readd`: each of these five is refused, and so are `--failover`
+//!   and its knobs. `--listen` and the other node-process flags still parse and are ignored.
 //! * Otherwise the process runs node `N` of the database in `--dir`, holding only `nodes/N`.
 //!   `--peers` names every other node; with this one they are nodes 1 to K, K at least 3 (M11
-//!   WS A). Nodes past 3 are spares: they hold nothing until `admin move` pins them.
+//!   WS A). On a database `--form` made, nodes past 3 are spares: they hold nothing until
+//!   `admin move` pins them. On a declared one, partitions are placed round the ring of all K
+//!   nodes, and before it writes its boot or binds, the process checks `--listen` and every
+//!   `--peers` entry against the `nodes/` records and is refused, naming the record, when one
+//!   disagrees; a store an S1a build declared (no `nodes/` records) is refused too (#80 S1b).
 //!   It serves its peers and apps on `--listen` and dials each lower-numbered node. Its boot is
 //!   `next_boot(--dir)`, the same value in the handshake and in the `Db` (ruling A-R227).
 //!   `--protocol-version` makes it speak another wire version, to walk the refusal.
@@ -121,6 +133,9 @@ struct Args {
     failover_max_concurrent: Option<usize>,
     /// `--live-readd` (#107).
     live_readd: bool,
+    /// `--machines N=label,...` (#80 S1b): `--declare`'s machine label per node; a node left
+    /// out takes its `--peers` address's host as `parse_addr` parses it.
+    machines: BTreeMap<NodeId, String>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -132,7 +147,8 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
   rdb_node --form --dir D --control E [--log-dir L] [--partitions P]
-  rdb_node --declare --control E [--partitions P] [--nodes K] [--log-dir L]
+  rdb_node --declare --control E --peers 1=ADDR,...,K=ADDR [--machines N=LABEL,...]
+           [--partitions P] [--nodes K] [--log-dir L]
   rdb_node --node N --dir D --listen ADDR --peers 1=ADDR,2=ADDR,3=ADDR --control E --cert-dir C
            [--protocol-version V] [--faults F] [--stop-file S] [--log-dir L] [--ready-secs S]
            [--admin-apps a,b] [--partitions P]
@@ -194,7 +210,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     let n: u32 = n
                         .parse()
                         .map_err(|_| format!("--peers: {n:?} is not a node number"))?;
-                    args.peers.insert(NodeId(n), addr.to_owned());
+                    if let Some(first) = args.peers.insert(NodeId(n), addr.to_owned()) {
+                        return Err(format!(
+                            "--peers names node {n} twice, as {first} and {addr}; name each \
+                             node once"
+                        ));
+                    }
                 }
             }
             "--control" => {
@@ -268,6 +289,22 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.failover_max_concurrent = Some(count);
             }
             "--live-readd" => args.live_readd = true,
+            "--machines" => {
+                for pair in value("--machines")?.split(',') {
+                    let (n, label) = pair
+                        .split_once('=')
+                        .ok_or_else(|| format!("--machines: {pair:?} is not N=label"))?;
+                    let n: u32 = n
+                        .parse()
+                        .map_err(|_| format!("--machines: {n:?} is not a node number"))?;
+                    if let Some(first) = args.machines.insert(NodeId(n), label.to_owned()) {
+                        return Err(format!(
+                            "--machines names node {n} twice, as {first} and {label}; name each \
+                             node once"
+                        ));
+                    }
+                }
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -280,10 +317,15 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
 /// Five mode and copy flags `--declare` refuses (PR #138 review): it writes control records
 /// only, so it makes no copy (`--form`), certificates (`--gen-certs`) or node process (`--node`,
 /// `--dir`, `--live-readd`). Not every flag it does not read: `--failover` and its knobs are
-/// refused by `failover_refusal`, while `--listen`, `--peers` and the other node-process flags
-/// still parse and are ignored.
+/// refused by `failover_refusal`, while `--listen` and the other node-process flags still parse
+/// and are ignored. #80 S1b: it needs `--peers`, which it records; `--nodes`, when given, must
+/// count the same nodes; `--machines` may name only nodes `--peers` names, and is refused
+/// without `--declare`.
 fn declare_refusal(args: &Args) -> Result<(), String> {
     if !args.declare {
+        if !args.machines.is_empty() {
+            return Err("--machines is read only by --declare".to_owned());
+        }
         return Ok(());
     }
     for (given, flag) in [
@@ -298,6 +340,27 @@ fn declare_refusal(args: &Args) -> Result<(), String> {
                 "--declare writes only control records and takes no {flag}"
             ));
         }
+    }
+    // #80 S1b: the declaration records each node's address, from `--peers` as the node
+    // processes take it.
+    if args.peers.is_empty() {
+        return Err(
+            "--declare needs --peers 1=ADDR,...,K=ADDR: each node's address, as its node \
+             process takes it"
+                .to_owned(),
+        );
+    }
+    let k = args.peers.len();
+    if let Some(nodes) = args.nodes.filter(|nodes| usize::try_from(*nodes) != Ok(k)) {
+        return Err(format!(
+            "--nodes {nodes} disagrees with --peers, which names {k} nodes"
+        ));
+    }
+    if let Some(stray) = args.machines.keys().find(|n| !args.peers.contains_key(n)) {
+        return Err(format!(
+            "--machines names node {}, which --peers does not",
+            stray.0
+        ));
     }
     Ok(())
 }
@@ -507,6 +570,7 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         client: DEFAULT_CLIENT,
         boot: None,
         storage: rdb_api::StorageOptions::default(),
+        addresses: None,
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))
@@ -528,15 +592,25 @@ fn declare(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     Ok(())
 }
 
-/// [`declare`] on `store`, answering the line it prints: the parsed `--nodes` and
-/// `--partitions` go to `admin::declare` as given, so a row can run this path on its own store.
+/// [`declare`] on `store`, answering the line it prints: each `--peers` node with its address
+/// and `--machines` label, and `--partitions`, go to `admin::declare` as given, so a row can
+/// run this path on its own store. The line's `nodes=` lists the records read back from the
+/// store, `N@addr/machine` each (#80 S1b).
 fn declare_on(
     args: &Args,
     store: &Arc<dyn ConfigStore>,
     rt: &tokio::runtime::Runtime,
 ) -> Result<String, String> {
     let declaration = rdb_api::admin::Declaration {
-        nodes: (1..=args.nodes.unwrap_or(3)).map(NodeId).collect(),
+        nodes: args
+            .peers
+            .iter()
+            .map(|(node, addr)| rdb_api::admin::NodeDecl {
+                node: *node,
+                addr: addr.clone(),
+                machine: args.machines.get(node).cloned(),
+            })
+            .collect(),
         partitions: args.partitions.unwrap_or(1),
     };
     let (word, formation) = match rt.block_on(rdb_api::admin::declare(store, &declaration)) {
@@ -544,14 +618,55 @@ fn declare_on(
         Ok(rdb_api::admin::Declared::Already(formation)) => ("already", formation),
         Err(e) => return Err(format!("declare: {e}")),
     };
+    let records = rt
+        .block_on(rdb_api::admin::read_nodes(&**store))
+        .map_err(|e| format!("declare: read back the node records: {e}"))?;
     let instance = rdb_api::admin::instance_hex(&formation.instance);
-    let nodes: Vec<String> = formation.nodes.iter().map(|n| n.0.to_string()).collect();
+    let nodes: Vec<String> = records
+        .values()
+        .map(|record| format!("{}@{}/{}", record.node.0, record.addr, record.machine))
+        .collect();
     tracing::info!(%instance, partitions = formation.partitions, word, "rdb_node_declared");
     Ok(format!(
         "rdb_node {word} instance={instance} partitions={} nodes={}",
         formation.partitions,
         nodes.join(",")
     ))
+}
+
+/// The node-start check (#80 S1b rulings 2 and 4, ADR-rdb-0023 Decision 5): on a declared
+/// database, `--listen` and every `--peers` entry must be what the `nodes/` records say, and an
+/// S1a store (no records) is refused. Run before this process writes its boot or binds, so a
+/// refused start leaves nothing behind. An undeclared database passes.
+fn start_check_on(
+    args: &Args,
+    node: NodeId,
+    listen: &str,
+    store: &dyn ConfigStore,
+    rt: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    let formation = rt
+        .block_on(rdb_api::admin::read_formation(store))
+        .map_err(|e| format!("start check: {e}"))?;
+    let records = match &formation {
+        Some(_) => rt
+            .block_on(rdb_api::admin::read_nodes(store))
+            .map_err(|e| format!("start check: {e}"))?,
+        None => BTreeMap::new(),
+    };
+    match rdb_api::admin::node_start_refusal(
+        node,
+        listen,
+        &args.peers,
+        formation.as_ref(),
+        &records,
+    ) {
+        Some(refused) => {
+            tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
+            Err(format!("start check: {refused}"))
+        }
+        None => Ok(()),
+    }
 }
 
 /// How often [`watch_ownership`] reads each partition's ownership.
@@ -730,6 +845,35 @@ fn peer_set(node: NodeId, peers: &BTreeMap<NodeId, String>) -> Result<BTreeSet<N
 }
 
 fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    // The client may start tasks as it connects, so it is made inside the runtime.
+    let store = {
+        let _entered = rt.enter();
+        control(args)?
+    };
+    serve_on(args, rt, store)
+}
+
+/// [`serve`] on `store`, so a row can run the node process's start on its own store.
+fn serve_on(
+    args: &Args,
+    rt: &tokio::runtime::Runtime,
+    store: Arc<dyn ConfigStore>,
+) -> Result<(), String> {
+    serve_on_ready(args, rt, store, None, &|_| {})
+}
+
+/// [`serve_on`], calling `on_ready` with the node each time it prints its `ready` line, so a
+/// row can wait for every node of a database to be ready (#80 S1b). Given `bound`, a listener
+/// already bound to `--listen`, the node listens on it instead of binding `--listen` itself, so
+/// a row that picked the port never releases it for another process to take (PR #144 review).
+/// A `bound` on another address is refused before anything is written.
+fn serve_on_ready(
+    args: &Args,
+    rt: &tokio::runtime::Runtime,
+    store: Arc<dyn ConfigStore>,
+    bound: Option<tokio::net::TcpListener>,
+    on_ready: &(dyn Fn(NodeId) + Sync),
+) -> Result<(), String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
     let dir = need(args.dir.as_ref(), "--dir")?;
     let listen = need(args.listen.as_ref(), "--listen")?;
@@ -740,13 +884,28 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     if let Some(path) = &args.faults {
         faults.watch_file(path.clone());
     }
-    let store: Arc<dyn ConfigStore> = CutStore::new(control(args)?, Arc::clone(&faults));
+    // #80 S1b: before the boot is written or anything is bound.
+    start_check_on(args, node, &listen, &*store, rt)?;
+    if let Some(bound) = &bound {
+        let at = bound
+            .local_addr()
+            .map_err(|e| format!("--listen {listen}: the listener given: {e}"))?;
+        if at.to_string() != listen {
+            return Err(format!(
+                "--listen {listen}: the listener given is bound to {at}; nothing was started"
+            ));
+        }
+    }
+    let store: Arc<dyn ConfigStore> = CutStore::new(store, Arc::clone(&faults));
     let boot = next_boot(&dir).map_err(|e| format!("boot: {}: {e}", dir.display()))?;
     let label = Label::Node(node);
     let tls = certs::load(&cert_dir, &label)?;
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind(&listen))
-        .map_err(|e| format!("--listen {listen}: {e}"))?;
+    let listener = match bound {
+        Some(bound) => bound,
+        None => rt
+            .block_on(tokio::net::TcpListener::bind(&listen))
+            .map_err(|e| format!("--listen {listen}: {e}"))?,
+    };
     let links = Links::with_clock_offset(args.clock_offset_ms);
     if let Some(file) = args.clock_step_file.clone() {
         watch_clock_step(file, Arc::clone(&links));
@@ -793,6 +952,11 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         boot: Some(boot),
         storage: rdb_api::StorageOptions::default(),
         failover: failover(args),
+        // #80 S1b ruling 2: checked against the records by the open too, as an embedded node is.
+        addresses: Some(rdb_api::NodeAddresses {
+            listen: listen.clone(),
+            peers: args.peers.clone(),
+        }),
     };
     let mut db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))
@@ -802,7 +966,11 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
     let waited = std::time::Instant::now();
     // A missed deadline is a line, not a stop (tester-s2 `lr up` race, A-R271): only a time-out
     // keeps waiting, and the late `ready` line says how long it took. Any other refusal ends it.
-    let mut retrying = report_ready(node, db.wait_ready(within));
+    let first = db.wait_ready(within);
+    if first.is_ok() {
+        on_ready(node);
+    }
+    let mut retrying = report_ready(node, first);
     let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -818,6 +986,7 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
                     let after = waited.elapsed().as_secs();
                     tracing::info!(node = node.0, after_s = after, "rdb_node_ready_late");
                     println!("rdb_node ready node={} (after {after}s)", node.0);
+                    on_ready(node);
                     retrying = false;
                 }
                 Err(ReadyError::TimedOut { .. }) => {}
@@ -840,7 +1009,10 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{admin_apps, declare_on, parse, ConfigStore};
+    use super::{admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore};
+
+    /// The `--peers` value of three nodes on three loopback hosts (#80 S1b).
+    const PEERS: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
 
     fn apps(argv: &[&str]) -> Vec<String> {
         let args = parse(argv.iter().map(|a| (*a).to_owned())).expect("parses");
@@ -873,15 +1045,17 @@ mod tests {
     }
 
     /// #80 S1a: `--declare` runs no planner either, so `--failover` with it is refused; plain
-    /// `--declare` with its count parses. Unit.
+    /// `--declare` with its count parses. Unit. (#80 S1b: with the `--peers` it now needs.)
     #[test]
     fn s1a_declare_rejects_failover() {
         assert_eq!(
             parsed(&["--declare", "--failover"]).map(|_| ()),
             Err("--failover runs only in a node process, not with --declare".to_owned())
         );
-        assert!(parsed(&["--declare", "--partitions", "8"])
-            .is_ok_and(|args| args.declare && args.partitions == Some(8) && !args.failover));
+        assert!(
+            parsed(&["--declare", "--partitions", "8", "--peers", PEERS])
+                .is_ok_and(|args| args.declare && args.partitions == Some(8) && !args.failover)
+        );
     }
 
     /// PR #138 review: each planner knob with `--declare` is refused, with `--failover` (no
@@ -949,37 +1123,402 @@ mod tests {
         }
     }
 
-    /// PR #138 review: `--declare --nodes 4` parses, reaches `admin::declare` with four nodes
-    /// (not the default three), and is refused there with no formation record written. Unit
-    /// (<100 ms, an in-memory store).
-    /// Cut: `declare_on` builds nodes 1 to 3 whatever `--nodes` says; it declares, red.
+    /// #80 S1b row 15: `--declare` takes the nodes and their addresses from `--peers`, and
+    /// optional machine labels from `--machines`; it declares five nodes and prints each record
+    /// read back from the store, `N@addr/machine`, a node with no label taking its host. Run
+    /// again it says `already`. While parsing it refuses no `--peers`, a `--nodes` that counts
+    /// otherwise, and a `--machines` node `--peers` does not name; `--machines` without
+    /// `--declare` is refused too, and so is a node `--peers` or `--machines` names twice,
+    /// within one flag or across two, rather than the later entry silently winning (PR #144
+    /// review). And two nodes on one machine reach `admin::declare`'s refusal with nothing
+    /// written. Unit (<100 ms, an in-memory store). This replaces the S1a
+    /// row that declared `--nodes 4` to reach a refusal: four nodes are now legal (row 6).
+    /// Cut: `declare_on` ignores `--machines`; node 4's label is its host, red at the line.
+    /// Cut: the parser's `insert` overwrites a repeated node; the four twice-named cases parse,
+    /// red at the first.
     #[config_log::retcd_test]
-    fn s1a_declare_four_nodes_reaches_the_refusal_and_writes_nothing() {
+    fn s1b_declare_takes_peers_and_machines_and_prints_the_records() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
+        for (argv, refused) in [
+            (&["--declare"][..], "--declare needs --peers"),
+            (
+                &["--declare", "--peers", PEERS, "--nodes", "4"][..],
+                "--nodes 4 disagrees with --peers, which names 3 nodes",
+            ),
+            (
+                &["--declare", "--peers", PEERS, "--machines", "4=m4"][..],
+                "--machines names node 4, which --peers does not",
+            ),
+            (
+                &["--node", "1", "--machines", "1=m1"][..],
+                "--machines is read only by --declare",
+            ),
+            (
+                &[
+                    "--declare",
+                    "--peers",
+                    "1=127.0.0.1:7100,2=127.0.0.2:7100,2=127.0.0.3:7100",
+                ][..],
+                "--peers names node 2 twice, as 127.0.0.2:7100 and 127.0.0.3:7100",
+            ),
+            (
+                &["--declare", "--peers", PEERS, "--peers", "3=127.0.0.9:7100"][..],
+                "--peers names node 3 twice",
+            ),
+            (
+                &["--declare", "--peers", PEERS, "--machines", "1=a,1=b"][..],
+                "--machines names node 1 twice, as a and b",
+            ),
+            (
+                &[
+                    "--declare",
+                    "--peers",
+                    PEERS,
+                    "--machines",
+                    "1=a",
+                    "--machines",
+                    "1=a",
+                ][..],
+                "--machines names node 1 twice",
+            ),
+        ] {
+            assert!(
+                matches!(parsed(argv), Err(text) if text.contains(refused)),
+                "{argv:?}"
+            );
+        }
+        let five = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100,4=127.0.0.4:7100,\
+                    5=127.0.0.5:7100";
+        let args = parsed(&[
+            "--declare",
+            "--peers",
+            five,
+            "--machines",
+            "4=Rack-4,5=r5",
+            "--partitions",
+            "16",
+        ])
+        .expect("parses");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let args = parsed(&["--declare", "--nodes", "4", "--partitions", "8"]).expect("parses");
-        let refused = declare_on(&args, &store, &rt);
+        let line = declare_on(&args, &store, &rt).expect("five nodes declare");
+        assert!(line.starts_with("rdb_node declared "), "{line}");
         assert!(
-            matches!(&refused, Err(text) if text.contains("nodes [1, 2, 3, 4]")
+            line.ends_with(
+                " partitions=16 nodes=1@127.0.0.1:7100/127.0.0.1,2@127.0.0.2:7100/127.0.0.2,\
+                 3@127.0.0.3:7100/127.0.0.3,4@127.0.0.4:7100/rack-4,5@127.0.0.5:7100/r5"
+            ),
+            "{line}"
+        );
+        let again = declare_on(&args, &store, &rt).expect("the same declaration");
+        assert!(again.starts_with("rdb_node already "), "{again}");
+
+        let empty: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let clash = parsed(&[
+            "--declare",
+            "--peers",
+            "1=127.0.0.1:7100,2=127.0.0.1:7101,3=127.0.0.3:7100",
+        ])
+        .expect("parses");
+        let refused = declare_on(&clash, &empty, &rt);
+        assert!(
+            matches!(&refused, Err(text) if text.contains("one data node per machine")
                 && text.contains("nothing was written")),
             "{refused:?}"
         );
         assert_eq!(
-            rt.block_on(rdb_api::admin::read_formation(&*store))
+            rt.block_on(rdb_api::admin::read_formation(&*empty))
                 .expect("the store answers"),
             None,
             "no formation record"
         );
-        let line = declare_on(
-            &parsed(&["--declare", "--partitions", "8"]).expect("parses"),
+    }
+
+    /// #80 S1b row 16 (rulings 2 and 4): a node process whose `--listen` disagrees with its
+    /// `nodes/` record is refused by `serve` before it writes its boot or binds: the error
+    /// names `nodes/3` and both addresses, and no `--dir` is created. `serve` writes the boot
+    /// (`next_boot` creates `--dir`) before it binds, so no folder means no bind either. So is
+    /// one whose `--peers` names another address for node 2, naming `nodes/2`. Unit (<200 ms,
+    /// an in-memory store).
+    /// Cut: drop the `start_check_on` call from `serve_on`; the start goes on, writes the boot
+    /// and fails at the missing certificates, red at the error's text (and the folder exists).
+    #[config_log::retcd_test]
+    fn s1b_a_listen_that_disagrees_with_its_record_is_refused_before_boot_or_bind() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = config_testkit::fs::temp_dir();
+        let wrong = {
+            let free = std::net::TcpListener::bind("127.0.0.3:0").expect("a free port");
+            free.local_addr().expect("bound").to_string()
+        };
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        declare_on(
+            &parsed(&["--declare", "--peers", PEERS, "--partitions", "8"]).expect("parses"),
             &store,
             &rt,
         )
-        .expect("three nodes declare");
+        .expect("declared");
+        let path = |p: &std::path::Path| p.display().to_string();
+        let dir = root.path().join("node-3");
+        for (listen, peers, names) in [
+            (
+                wrong.as_str(),
+                PEERS.to_owned(),
+                vec![
+                    format!("listen address {wrong}"),
+                    "nodes/3".to_owned(),
+                    "127.0.0.3:7100".to_owned(),
+                ],
+            ),
+            (
+                "127.0.0.3:7100",
+                "1=127.0.0.1:7100,2=127.0.0.2:7101".to_owned(),
+                vec![
+                    "peer address 2=127.0.0.2:7101".to_owned(),
+                    "nodes/2".to_owned(),
+                ],
+            ),
+        ] {
+            let args = parsed(&[
+                "--node",
+                "3",
+                "--dir",
+                &path(&dir),
+                "--listen",
+                listen,
+                "--peers",
+                &peers,
+                "--control",
+                "http://127.0.0.1:1",
+                "--cert-dir",
+                &path(&root.path().join("certs")),
+            ])
+            .expect("parses");
+            let refused = serve_on(&args, &rt, Arc::clone(&store));
+            assert!(
+                matches!(&refused, Err(text) if text.starts_with("start check: ")
+                    && names.iter().all(|name| text.contains(name.as_str()))),
+                "{listen} {peers}: {refused:?}"
+            );
+            assert!(
+                !dir.exists(),
+                "{listen}: a boot was written in {}",
+                dir.display()
+            );
+        }
+    }
+
+    /// #80 S1b, PR #144 review r2: a node process handed a listener (`serve_on_ready`'s
+    /// `bound`) that is bound to another address than `--listen` is refused before it writes
+    /// its boot: the error names `--listen` and where the listener is bound, and no `--dir` is
+    /// created. `--listen` and `--peers` are the records', so the start check passes and only
+    /// the listener's address can refuse it. Unit (<200 ms, an in-memory store).
+    /// Cut: drop the bound-address check from `serve_on_ready`; the start goes on, writes the
+    /// boot and fails at the missing certificates, red at the error's text (and the folder
+    /// exists).
+    #[config_log::retcd_test]
+    fn s1b_a_listener_bound_to_another_address_is_refused_before_boot() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        declare_on(
+            &parsed(&["--declare", "--peers", PEERS, "--partitions", "8"]).expect("parses"),
+            &store,
+            &rt,
+        )
+        .expect("declared");
+        let bound = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.3:0"))
+            .expect("a free port");
+        let at = bound.local_addr().expect("bound").to_string();
+        let path = |p: &std::path::Path| p.display().to_string();
+        let dir = root.path().join("node-3");
+        let args = parsed(&[
+            "--node",
+            "3",
+            "--dir",
+            &path(&dir),
+            "--listen",
+            "127.0.0.3:7100",
+            "--peers",
+            PEERS,
+            "--control",
+            "http://127.0.0.1:1",
+            "--cert-dir",
+            &path(&root.path().join("certs")),
+        ])
+        .expect("parses");
+        let refused = serve_on_ready(&args, &rt, Arc::clone(&store), Some(bound), &|_| {});
+        assert!(
+            matches!(&refused, Err(text)
+                if text.contains("--listen 127.0.0.3:7100")
+                    && text.contains(&format!("the listener given is bound to {at}"))
+                    && text.ends_with("nothing was started")),
+            "{refused:?}"
+        );
+        assert!(!dir.exists(), "a boot was written in {}", dir.display());
+    }
+
+    /// #80 S1b ruling 1 (single machine): a whole declared database runs on one box. Four
+    /// node processes' start paths (`serve_on`, one thread each) on 127.0.0.1 to .4, the hosts
+    /// `--declare` recorded, pass the start check, open their own empty folders and form every
+    /// partition: each `partitions/{p}` gains its root, and every node reaches ready (its
+    /// `ready` line, through `serve_on_ready`). Only then is the stop file written, so no node
+    /// is still in a readiness wait when its peers go. Stopped through `--stop-file`, each ends
+    /// cleanly and its folder holds only its own `nodes/N`. Cluster row (~0.5 s measured,
+    /// bounded at 30 s): four nodes link over TLS, form four partitions and admit writes. The
+    /// node threads log outside this row's span, so their lines land in the run's
+    /// `_untagged-<pid>.jsonl`.
+    /// Cut: `machine_clash` compares only a host's first three characters, so every loopback
+    /// address is one machine; the declaration is refused, red. Cut: `serve_on_ready` never
+    /// calls `on_ready`; red at "every node is ready" after the 30 s bound. Cut: `serve_on_ready`
+    /// drops the listener it is handed and binds `--listen` again; the row's second handle
+    /// holds each port, so every node ends `Address already in use`, red after the 30 s bound.
+    #[config_log::retcd_test]
+    fn s1b_four_declared_node_processes_run_on_one_machine() {
+        const K: u32 = 4;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = config_testkit::fs::temp_dir();
+        let certs = root.path().join("certs");
+        let labels: Vec<rdb_api::net::wire::Label> = (1..=K)
+            .map(|n| rdb_api::net::wire::Label::Node(rdb_api::NodeId(n)))
+            .collect();
+        rdb_api::net::certs::generate(&certs, &labels).expect("certificates");
+        // Each port stays bound from its pick to its node's start, which listens on the very
+        // socket (PR #144 review). The row keeps a second handle on each socket throughout, so
+        // a start that dropped the listener and bound `--listen` again fails `AddrInUse`.
+        let mut handed: Vec<Option<tokio::net::TcpListener>> = Vec::new();
+        let mut kept: Vec<std::net::TcpListener> = Vec::new();
+        let addrs: Vec<String> = (1..=K)
+            .map(|n| {
+                let host = std::net::Ipv4Addr::new(127, 0, 0, u8::try_from(n).expect("small"));
+                let (listener, addr) =
+                    rt.block_on(config_testkit::ports::ephemeral_listener_on(host));
+                let std = listener.into_std().expect("a std listener");
+                kept.push(std.try_clone().expect("a second handle"));
+                let _entered = rt.enter();
+                handed.push(Some(
+                    tokio::net::TcpListener::from_std(std).expect("a tokio listener"),
+                ));
+                addr.to_string()
+            })
+            .collect();
+        let peers: Vec<String> = addrs
+            .iter()
+            .zip(1..)
+            .map(|(addr, n)| format!("{n}={addr}"))
+            .collect();
+        let peers = peers.join(",");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let line = declare_on(
+            &parsed(&["--declare", "--peers", &peers, "--partitions", "4"]).expect("parses"),
+            &store,
+            &rt,
+        )
+        .expect("four nodes on four loopback hosts declare");
         assert!(line.starts_with("rdb_node declared "), "{line}");
+        let stop = root.path().join("stop");
+        let path = |p: &std::path::Path| p.display().to_string();
+        let ready = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let on_ready = |node: rdb_api::NodeId| {
+            ready.lock().expect("the ready set").insert(node.0);
+        };
+        let dirs: Vec<std::path::PathBuf> = (1..=K)
+            .map(|n| root.path().join(format!("node-{n}")))
+            .collect();
+        let ended = std::thread::scope(|scope| {
+            let running: Vec<_> = (1..=K)
+                .map(|n| {
+                    let args = parsed(&[
+                        "--node",
+                        &n.to_string(),
+                        "--dir",
+                        &path(&dirs[n as usize - 1]),
+                        "--listen",
+                        &addrs[n as usize - 1],
+                        "--peers",
+                        &peers,
+                        "--control",
+                        "http://127.0.0.1:1",
+                        "--cert-dir",
+                        &path(&certs),
+                        "--stop-file",
+                        &path(&stop),
+                        "--ready-secs",
+                        "30",
+                    ])
+                    .expect("parses");
+                    let store = Arc::clone(&store);
+                    let (rt, on_ready) = (&rt, &on_ready);
+                    let bound = handed[n as usize - 1].take();
+                    scope.spawn(move || serve_on_ready(&args, rt, store, bound, on_ready))
+                })
+                .collect();
+            let rooted = |p: u32| {
+                let key = rdb_core::contracts::control::ControlKey::Partition(
+                    rdb_core::contracts::ids::PartitionId(p),
+                )
+                .encode();
+                rt.block_on(store.get(config_core::GetRequest {
+                    key: bytes::Bytes::from(key),
+                }))
+                .ok()
+                .and_then(|read| read.record)
+                .is_some_and(|record| {
+                    rdb_core::authority::partition::PartitionRoot::decode(&record.value).is_some()
+                })
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (mut formed, mut all_ready) = (false, false);
+            while std::time::Instant::now() < deadline {
+                formed = formed || (1..=4).all(rooted);
+                all_ready = ready.lock().expect("the ready set").len() == K as usize;
+                if formed && all_ready {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            std::fs::write(&stop, b"").expect("the stop file");
+            let ended: Vec<Result<(), String>> = running
+                .into_iter()
+                .map(|handle| handle.join().expect("a node thread"))
+                .collect();
+            assert!(formed, "every partition formed: {ended:?}");
+            assert!(
+                all_ready,
+                "every node is ready: {:?} of {K}: {ended:?}",
+                ready.lock().expect("the ready set")
+            );
+            ended
+        });
+        drop(kept);
+        for (n, outcome) in (1..=K).zip(ended) {
+            assert_eq!(outcome, Ok(()), "node {n} ends cleanly");
+            let held: Vec<String> = std::fs::read_dir(dirs[n as usize - 1].join("nodes"))
+                .expect("its nodes/ folder")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert_eq!(held, [n.to_string()], "node {n} holds only its own copy");
+        }
     }
 
     /// PR #119 review: `--failover` with `--form` is a parse error, since forming runs no
