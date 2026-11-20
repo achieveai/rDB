@@ -1107,9 +1107,12 @@ fn serve_on_ready(
     let mut retrying = report_ready(node, first);
     let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
     let done = AtomicBool::new(false);
+    // Each watcher logs in the span this serve runs in, as the node's own lines do, so a row's
+    // node logs land in that row's file, not untagged.
+    let span = tracing::Span::current();
     let served = std::thread::scope(|scope| {
-        scope.spawn(|| watch_ownership(&db, node, &done));
-        scope.spawn(|| print_ownership_events(&db, &done));
+        scope.spawn(|| span.in_scope(|| watch_ownership(&db, node, &done)));
+        scope.spawn(|| span.in_scope(|| print_ownership_events(&db, &done)));
         let mut served = Served::Stopped;
         let mut checked = std::time::Instant::now();
         while !stopped() {
@@ -2060,8 +2063,11 @@ mod tests {
     /// started again on its folder, as a supervisor would, at a new boot: it says ready, the
     /// owners take it back as a regular copy of every partition, and at the stop file it
     /// ends `Stopped`, not `Restart` again.
-    /// Cluster row (~30 s): one grant lapse (6 s), four promotes, the 5 s hold, a re-add. The
-    /// node threads log outside this row's span (`_untagged-<pid>.jsonl`).
+    /// Cluster row (~30 s): one grant lapse (6 s), four promotes, the 5 s hold, a re-add. Every
+    /// node thread runs in this row's span, so the nodes log into this row's own file: each of
+    /// the four serves says `rdb_node_listening`, and each node's ownership watcher says
+    /// `ownership_held` (PR #171 review). The library's own node and sync threads still log
+    /// untagged from here: they enter the opener's span only under rdb-api's own `cfg(test)`.
     /// No cut is red here for the owns-none guard: the four promotes took 1.2 s in all
     /// (measured), well inside the 5 s hold, so the guard is pinned by the `restart_due` units
     /// (`rdb_api::db::restart`).
@@ -2069,6 +2075,7 @@ mod tests {
     /// "node 1's serve returns".
     #[config_log::retcd_test]
     fn own81_v10_frozen_returning_node_exits_after_the_sweep() {
+        const METHOD: &str = "own81_v10_frozen_returning_node_exits_after_the_sweep";
         use rdb_api::NodeId;
         use rdb_core::contracts::ids::ReplicaRole;
         use std::time::{Duration, Instant};
@@ -2173,15 +2180,18 @@ mod tests {
                 let _ = std::fs::write(self.0, b"");
             }
         }
+        let span = tracing::Span::current();
         std::thread::scope(|scope| {
             let _stop_on_panic = StopOnDrop(&stop);
             let mut running: Vec<_> = (1..=3usize)
                 .map(|n| {
                     let args = args_of(n);
                     let store = Arc::clone(&store);
-                    let (rt, on_ready) = (&rt, &on_ready);
+                    let (rt, on_ready, span) = (&rt, &on_ready, &span);
                     let bound = handed[n - 1].take();
-                    scope.spawn(move || serve_on_ready(&args, rt, store, bound, on_ready))
+                    scope.spawn(move || {
+                        span.in_scope(|| serve_on_ready(&args, rt, store, bound, on_ready))
+                    })
                 })
                 .collect();
             wait("every node is ready", Duration::from_secs(30), &mut || {
@@ -2226,8 +2236,10 @@ mod tests {
             let again = {
                 let args = args_of(1);
                 let store = Arc::clone(&store);
-                let (rt, on_ready) = (&rt, &on_ready);
-                scope.spawn(move || serve_on_ready(&args, rt, store, None, on_ready))
+                let (rt, on_ready, span) = (&rt, &on_ready, &span);
+                scope.spawn(move || {
+                    span.in_scope(|| serve_on_ready(&args, rt, store, None, on_ready))
+                })
             };
             wait(
                 "node 1 is ready again",
@@ -2259,6 +2271,28 @@ mod tests {
                 );
             }
         });
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let nodes_saying = |message: &str| -> Vec<u64> {
+            let mut nodes: Vec<u64> = lines
+                .iter()
+                .filter(|line| line["@m"] == message)
+                .filter_map(|line| line["node"].as_u64())
+                .collect();
+            nodes.sort_unstable();
+            nodes
+        };
+        assert_eq!(
+            nodes_saying("rdb_node_listening"),
+            [1, 1, 2, 3],
+            "each serve logs into this row's file"
+        );
+        let mut held = nodes_saying("ownership_held");
+        held.dedup();
+        assert_eq!(
+            held,
+            [1, 2, 3],
+            "each node's ownership watcher logs into this row's file"
+        );
     }
 
     /// The `--peers` value of three nodes on three private hosts (#80 S2).
