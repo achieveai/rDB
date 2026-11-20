@@ -188,6 +188,141 @@ mod tests {
         }
     }
 
+    /// `restart_wanted`'s last step for a faulted host, which is due at once whatever the hold:
+    /// `restart_due` with [`owns_none_within`] over `store` for node 1, as `Db::restart_wanted`
+    /// runs it with `Db::owns_no_partition`.
+    fn faulted_host_restart(store: Arc<dyn ConfigStore>) -> Option<RestartReason> {
+        let rt = crate::db::reopen_tests::runtime();
+        restart_due(None, true, Instant::now(), || {
+            owns_none_within(rt.handle(), store, vec![NodeId(1)], WITHIN)
+        })
+    }
+
+    /// An in-memory store holding `partitions/{id}` as `body`.
+    fn holding(id: u32, body: &[u8]) -> Arc<dyn ConfigStore> {
+        let store = config_testkit::MemStore::new();
+        crate::db::reopen_tests::runtime()
+            .block_on(
+                store.put(config_core::PutRequest {
+                    key: bytes::Bytes::from(
+                        rdb_core::contracts::control::ControlKey::Partition(
+                            rdb_core::contracts::ids::PartitionId(id),
+                        )
+                        .encode(),
+                    ),
+                    value: bytes::Bytes::copy_from_slice(body),
+                    expected_mod_revision: None,
+                    dedup: None,
+                }),
+            )
+            .expect("the put lands");
+        Arc::new(store)
+    }
+
+    /// `partitions/{id}` naming `owner`.
+    fn owned_by(id: u32, owner: u32) -> Arc<dyn ConfigStore> {
+        let record = rdb_core::authority::partition::PartitionRecord {
+            partition: rdb_core::contracts::ids::PartitionId(id),
+            owner: NodeId(owner),
+            ..rdb_core::authority::partition::PartitionRecord::default()
+        };
+        holding(id, &record.encode())
+    }
+
+    /// PR #171 review (item 4), fail closed: the restart check's `partitions/` list fails. The
+    /// check reads "owns some", so a faulted host is not restarted (`None`), and the failure is
+    /// said (`db_restart_check_unread`). Unit.
+    /// Cut: the error arm of `owns_none_within` answers "owns none"; `Some`, red.
+    #[config_log::retcd_test]
+    fn own81_v10_a_failed_restart_check_keeps_the_node_up() {
+        const METHOD: &str = "own81_v10_a_failed_restart_check_keeps_the_node_up";
+        let store = crate::test_store::PrefixCut::new(
+            Arc::new(config_testkit::MemStore::new()),
+            rdb_core::contracts::control::ControlPrefix::Partitions.encode(),
+            crate::test_store::CutCalls::Lists,
+        );
+        assert_eq!(faulted_host_restart(store), None);
+        let said = unread(METHOD);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("list partitions/")),
+            "{said:?}"
+        );
+    }
+
+    /// PR #171 review (item 4), fail closed: the list does not answer within the read
+    /// timeout. `None`, and said. Unit.
+    /// Cut: the timeout arm answers "owns none"; `Some`, red.
+    #[config_log::retcd_test]
+    fn own81_v10_a_restart_check_that_times_out_keeps_the_node_up() {
+        const METHOD: &str = "own81_v10_a_restart_check_that_times_out_keeps_the_node_up";
+        let store = crate::test_store::ListFault::new(
+            Arc::new(config_testkit::MemStore::new()),
+            crate::test_store::ListFaultMode::Never(Arc::new(std::sync::atomic::AtomicUsize::new(
+                0,
+            ))),
+        );
+        assert_eq!(faulted_host_restart(store), None);
+        assert_eq!(unread(METHOD).len(), 1);
+    }
+
+    /// PR #171 review (item 4), fail closed: the list comes back truncated, so it cannot say
+    /// that nothing names the node. `None`, and said. Unit.
+    /// Cut: the error arm answers "owns none"; `Some`, red.
+    #[config_log::retcd_test]
+    fn own81_v10_a_truncated_restart_check_keeps_the_node_up() {
+        const METHOD: &str = "own81_v10_a_truncated_restart_check_keeps_the_node_up";
+        let store = crate::test_store::ListFault::new(
+            owned_by(3, 2),
+            crate::test_store::ListFaultMode::Truncate,
+        );
+        assert_eq!(faulted_host_restart(store), None);
+        let said = unread(METHOD);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("truncated")),
+            "{said:?}"
+        );
+    }
+
+    /// PR #171 review (item 4), fail closed: `partitions/5` holds bytes that are no partition
+    /// record, so the read cannot say who owns it. `None`, and said. Unit.
+    /// Cut: the error arm answers "owns none"; `Some`, red.
+    #[config_log::retcd_test]
+    fn own81_v10_an_undecodable_restart_check_keeps_the_node_up() {
+        const METHOD: &str = "own81_v10_an_undecodable_restart_check_keeps_the_node_up";
+        assert_eq!(faulted_host_restart(holding(5, b"not a record")), None);
+        let said = unread(METHOD);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("is not a partition record")),
+            "{said:?}"
+        );
+    }
+
+    /// PR #171 review (item 4), owner match: `partitions/3` names node 1 owner, so node 1's
+    /// faulted host is not restarted (`None`) and nothing is said: the read answered. The same
+    /// record naming node 2 lets node 1 restart (`Some(HostFaulted)`), so the `None` is the
+    /// owner match and not a failed read. Unit.
+    /// Cut: `owns_no_partition` never matches an owner (always `Ok(true)`); the first is
+    /// `Some`, red.
+    #[config_log::retcd_test]
+    fn own81_v10_a_partition_naming_the_node_keeps_restart_wanted_none() {
+        const METHOD: &str = "own81_v10_a_partition_naming_the_node_keeps_restart_wanted_none";
+        assert_eq!(faulted_host_restart(owned_by(3, 1)), None);
+        assert_eq!(
+            faulted_host_restart(owned_by(3, 2)),
+            Some(RestartReason::HostFaulted)
+        );
+        assert!(unread(METHOD).is_empty(), "both reads answered");
+    }
+
     /// V10 (#81) `restart_due`: a stopped self-replace is due only once held for
     /// `RESTART_HOLD`, and only when the node owns no partition; the ownership read is not
     /// made while nothing else is due. Unit.
