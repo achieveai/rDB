@@ -1424,3 +1424,117 @@ fn f87_2_a_held_control_read_refuses_within_the_wait_shared_and_fenced_by_boot()
     assert_eq!(dropped.len(), 1, "{dropped:?}");
     assert_eq!(dropped[0]["from_boot"], old.0, "{dropped:?}");
 }
+
+/// `source`'s answer from `from`, which must be `Trimmed`; its floor.
+fn trimmed_from(db: &Db, from: FeedCursor, source: Source, who: &str) -> Seq {
+    match page_from(db, from, source) {
+        FeedPage::Trimmed { floor } => floor,
+        other => panic!("{who} from {from:?} on {source:?}: {other:?}"),
+    }
+}
+
+/// A put that lands in a generation newer than `than`, retried with fresh keys while node 2's
+/// rejoin commits one.
+fn put_in_newer(db: &Db, than: Generation) -> PutOk {
+    let deadline = Instant::now() + patience();
+    let mut tries = 0_u32;
+    loop {
+        tries += 1;
+        match db.put(format!("newer-{tries}").as_bytes(), b"v", None) {
+            Ok(put) if put.generation > than => return put,
+            Ok(_) => {}
+            Err(_) if Instant::now() < deadline => {}
+            Err(error) => panic!("no newer generation: {error:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Review r1/r2 (lead ruling 2026-11-20): a real `History` floor above seq 1, computed by
+/// storage (`RocksEngine::history_floor`) and read through the Db feed path. The debug-only
+/// `Db::drop_history` deletes one copy's records below a seq through its lineage's chain,
+/// as a history trim (#61) would; `applied`, `Progress` and state stay.
+/// Node 2 restarts first, so the newest generation is an inherited lineage linked to the level
+/// that holds k1-k4; then records below k3 are dropped on the owner and on node 3.
+/// (a) Owner and secondary: `START` and a cursor at k1 answer exactly `Trimmed { floor: k3 }`,
+/// found through the link; a retained cursor at k3 resumes across the link. Node 2, untouched,
+/// still serves from `START`: the floor is per copy.
+/// (b) An empty lineage: node 3 with every record dropped answers `Trimmed` at its applied head
+/// plus one; after the next put that is its first record, and a cursor there resumes.
+/// No re-plan follows a drop: recovery reads `History` a dropped copy no longer holds (tried
+/// while writing this row: the partition stayed `ReadOnly`), which is #61's work.
+/// Cuts: `Host::changes` ignoring `history_floor` (floor `Seq(1)`), red ((a): `START` meets the
+/// hole, `CORRUPT_HISTORY`, not `Trimmed`); `RocksEngine::history_floor`'s empty-lineage
+/// fallback answering `Seq(1)`, red ((b)).
+/// Integration (~10 s): one restart's rejoin.
+#[config_log::retcd_test]
+fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let mut acks = Vec::new();
+    for key in [b"k1", b"k2", b"k3", b"k4"] {
+        acks.push(db.put(key, b"v", None).expect("a put"));
+    }
+    let (k1, k3, k4) = (&acks[0], &acks[2], &acks[3]);
+    db.restart_node(NodeId(2)).expect("node 2 restarts");
+    let newer = put_in_newer(&db, k4.generation);
+    db.wait_durable(DEFAULT_GROUP, (newer.generation, newer.seq), patience())
+        .expect("the newer put on every disk");
+    let (all, _) = tail(&db, FeedCursor::START, Source::Owner, newer.seq);
+    let at = |seq: Seq| {
+        all.iter()
+            .find(|record| record.at.seq == seq)
+            .expect("held")
+            .at
+    };
+    let (owner, two, three) = (
+        Source::Owner,
+        Source::Node(NodeId(2)),
+        Source::Node(NodeId(3)),
+    );
+    for node in [1, 3] {
+        let dropped = db
+            .drop_history(NodeId(node), newer.generation, 0..k3.seq.0)
+            .expect("drop below k3");
+        assert!(dropped >= 2, "node {node}: {dropped}");
+    }
+
+    for source in [owner, three] {
+        assert_eq!(trimmed_from(&db, FeedCursor::START, source, "(a)"), k3.seq);
+        assert_eq!(trimmed_from(&db, at(k1.seq), source, "(a)"), k3.seq);
+        let (resumed, _) = tail(&db, at(k3.seq), source, newer.seq);
+        let got = seqs(&resumed);
+        assert!(
+            got.first() == Some(&k4.seq.0)
+                && got.last() == Some(&newer.seq.0)
+                && got.windows(2).all(|pair| pair[0] < pair[1]),
+            "(a) {source:?} across the link: {got:?}"
+        );
+    }
+    let (untouched, _) = tail(&db, FeedCursor::START, two, newer.seq);
+    assert_eq!(seqs(&untouched), seqs(&all), "(a) node 2 is untouched");
+
+    let head = all.last().expect("records").at;
+    db.drop_history(NodeId(3), newer.generation, 0..newer.seq.0 + 1)
+        .expect("drop every record");
+    let empty = trimmed_from(&db, FeedCursor::START, three, "(b) empty");
+    assert_eq!(empty, Seq(newer.seq.0 + 1), "(b) the applied head plus one");
+    let next = db.put(b"k-next", b"v", None).expect("the next put");
+    assert_eq!(next.seq, empty, "no record between");
+    db.wait_durable(DEFAULT_GROUP, (next.generation, next.seq), patience())
+        .expect("next on every disk");
+    assert_eq!(
+        trimmed_from(&db, head, three, "(b) at the old head"),
+        next.seq
+    );
+    let (to_next, _) = tail(&db, head, owner, next.seq);
+    let after = db.put(b"k-after", b"v", None).expect("one more");
+    let (resumed, _) = tail(&db, to_next[0].at, three, after.seq);
+    assert_eq!(
+        seqs(&resumed),
+        vec![after.seq.0],
+        "(b) resumed at its floor"
+    );
+}

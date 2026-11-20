@@ -4364,6 +4364,51 @@ impl Db {
         }
     }
 
+    /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete `node`'s
+    /// `History` records of partition 1 with a seq in `seqs`, through lineage `generation`'s
+    /// chain ([`Msg::DropHistory`]). From seq 1 up, as a history trim (#61) would on that one
+    /// copy, its change feed floor rises; higher up it leaves a hole. Returns how many it
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
+    /// not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn drop_history(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        seqs: std::ops::Range<u64>,
+    ) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("drop_history", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::DropHistory {
+            partition: PARTITION,
+            generation,
+            seqs,
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => return Err(format!("node {} is not run by this process", node.0)),
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
     /// **Dev tool only**, debug builds (#65 mode C; `rdb_dev admin fork-copy`): make `node`'s
     /// copy diverge. Its head `History` record of partition 1's lineage `generation` is
     /// replaced by another validly chained record at the same seq ([`Msg::Fork`]), so the next

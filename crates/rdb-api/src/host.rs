@@ -700,6 +700,21 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
     },
+    /// **Dev tool only**, debug builds (#170 review r1): delete this node's `History` records
+    /// with a seq in `seqs` through lineage `(partition, generation)`'s chain
+    /// ([`RocksEngine::drop_history`]): a raised floor, or a hole. Local only, like
+    /// [`Msg::Damage`]. Answers how many it deleted.
+    #[cfg(debug_assertions)]
+    DropHistory {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// The seqs dropped.
+        seqs: std::ops::Range<u64>,
+        /// Where the answer goes.
+        reply: Sender<Result<u64, String>>,
+    },
     /// **Dev tool only**, debug builds (#65, critic-bb §3 mode C): replace the head `History`
     /// record of lineage `(partition, generation)` in this node's own copy with a different one
     /// that is still validly chained (same seq and `prev_digest`, another `request_digest`, the
@@ -3933,6 +3948,28 @@ impl Host {
             }
             Msg::PeerBooted { node, boot } => {
                 self.peer_booted(node, boot);
+                Ok(())
+            }
+            #[cfg(debug_assertions)]
+            Msg::DropHistory {
+                partition,
+                generation,
+                seqs,
+                reply,
+            } => {
+                let answer = self
+                    .engine
+                    .drop_history(partition, generation, seqs.clone());
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    from = seqs.start,
+                    below = seqs.end,
+                    answer = ?answer,
+                    "host_history_dropped"
+                );
+                let _ = reply.send(answer);
                 Ok(())
             }
             #[cfg(debug_assertions)]
@@ -16919,6 +16956,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",
+        #[cfg(debug_assertions)]
+        Msg::DropHistory { .. } => "drop_history",
         #[cfg(debug_assertions)]
         Msg::Fork { .. } => "fork",
         Msg::Rebuild { .. } => "rebuild",

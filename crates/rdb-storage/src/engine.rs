@@ -1314,6 +1314,72 @@ impl RocksEngine {
         Ok(())
     }
 
+    /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete every
+    /// `History` record with a seq in `seqs` that lineage `(partition, generation)` reaches
+    /// through its chain, from this copy only. From seq 1 up it is a history trim (#61) would
+    /// make: [`Self::history_floor`] rises to the lowest record left, or to the applied head
+    /// plus one when none is left. Higher up it leaves a hole. Nothing else moves: no `applied`
+    /// mark, no state. A synced write. Answers how many records it deleted.
+    ///
+    /// # Errors
+    ///
+    /// The read or the write failed, named.
+    #[cfg(debug_assertions)]
+    pub fn drop_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        seqs: std::ops::Range<u64>,
+    ) -> Result<u64, String> {
+        let mut levels = vec![generation];
+        let mut level = generation;
+        while let Some(link) = self.link(partition, level) {
+            levels.push(link.parent);
+            level = link.parent;
+        }
+        let cf = self.cf(keys::cf_for(Namespace::History));
+        let mut write = WriteBatch::default();
+        let mut dropped = 0_u64;
+        for level in levels {
+            let prefix = encode_key(partition, level, Namespace::History, &[]);
+            for item in self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+            {
+                let (raw, _) = item.map_err(|e| format!("history read: {e}"))?;
+                if !raw.starts_with(&prefix) {
+                    break;
+                }
+                let seq = decode_mark(&raw[keys::PREFIX_LEN..])
+                    .ok_or_else(|| format!("a History key does not decode: {}", hex(&raw)))?;
+                if seq >= seqs.end {
+                    break;
+                }
+                if seqs.contains(&seq) {
+                    write.delete_cf(cf, &raw);
+                    dropped += 1;
+                }
+            }
+        }
+        self.note_synced_write("drop_history");
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(write, &opts)
+            .map_err(|e| format!("history delete: {e}"))?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            from = seqs.start,
+            below = seqs.end,
+            dropped,
+            "history_dropped"
+        );
+        Ok(dropped)
+    }
+
     fn decode_epochs(
         partition: PartitionId,
         raw: &[u8],

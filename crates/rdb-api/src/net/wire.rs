@@ -439,6 +439,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             return Err(Box::new((WireError::LocalOnly("Damage"), local)))
         }
         #[cfg(debug_assertions)]
+        local @ Msg::DropHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("DropHistory"), local)))
+        }
+        #[cfg(debug_assertions)]
         local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
     };
     Ok(Outbound::Plain(plain))
