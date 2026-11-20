@@ -459,6 +459,68 @@ the new boot's links come up it reads a boot it has not seen on them (`net_peer_
 the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
 restart: the control store, the runtime and your app's own state stay as they are.
 
+### When a host is lost: automatic failover
+
+Start each node process with `rdb_node --failover` (`DbConfig::failover`). Then a lost host
+does not need an operator. The design and the measurements are in ADR-rdb-0025.
+
+**How long writes stop.** A partition stops taking writes for a while. How long depends on
+what the lost host was to it. These are the expected times at the default settings:
+
+| The lost host was the partition's | It ended (crash, `kill`) | It went silent (hang, pause) |
+|---|---|---|
+| owner | about 12 s | about 12 s |
+| copy (secondary) | about 13.5 s | about 17 s |
+| neither | no stop | no stop |
+
+- **A crash: every partition takes writes again within 15 s.** That is the pass/fail bound.
+- **A hang: about 17 s.** A silent host's sockets stay open, so the owner first waits to be
+  sure the copy is gone, not just slow. 25 s is the hard ceiling.
+- A loaded machine runs longer. One test run at load 47 took 13.7 s for a copy.
+- `rdb_node --failover` prints these figures once at open, as `rdb_node failover bound_ms=...`.
+
+**What your app sees during the stop.**
+
+- A write that gets no answer in time is `UNKNOWN_OUTCOME` ("no answer in ..."). It was sent.
+  It may still land. Ask `db.status` with the same request id, or `db.resend` it.
+- `UNAVAILABLE` with "nothing was sent" is different. It comes only when the write could not
+  be compiled in time, or the owner had no link at all. Nothing was written. Send it again as
+  a new write.
+- A read that gets no answer is `UNAVAILABLE`. A read changes nothing, so just retry.
+- Keep retrying with a short pause. After a timeout, the `Db` reads the partition's owner
+  again, so the next try goes to the new owner. You do not need to reopen anything.
+- `db.wait_ready` and `db.readiness` follow the new owner the same way.
+
+**A node that was lost and comes back.**
+
+- **After a crash,** restart it on its own folder. It rejoins as a copy by itself. It does not
+  get its partitions back. It can be made owner again by a later failover.
+- **After a hang,** the node may wake up with its grant frozen. It then runs but can never
+  lead. Restart it. `rdb_node` does this for you: it exits 75 for its supervisor (section 4,
+  "Supervising a node process"). An embedded `Db` polls `db.restart_wanted()` about once a
+  second. On `Some(RestartReason::ReplaceStopped)`, restart the `Db` and its `Net` in-process,
+  as in "Embedded restart" above. Run one `Db` per node.
+
+**Limits in this release.**
+
+- **Two copies of one partition down: that partition stops taking writes.** The one copy
+  left may be missing acknowledged writes, so it is never promoted. Writes return when a
+  second copy is back. Other partitions fail over as usual.
+- **An owner restarted while one of its copies is still down does not take writes** until
+  that copy is back too, though 2 of 3 copies are up (#169, being fixed).
+- **A copy restarted while its owner is dead never rejoins** (#177).
+- **A hung node that wakes up stays frozen until it is restarted** (#168). See above.
+- If a host hangs while it is the last reachable copy of a partition, and the partition's
+  other copies are also down, restarting that host does not bring the partition back; it
+  returns when one of its other copies returns. See #168 and #172.
+- **Tested on one machine.** Five node processes, each in its own Docker container, are the
+  closest run so far.
+
+<!-- #176: the Docker d1 result goes here: per-class outage times and the host load. -->
+
+<!-- S4 (membership, dev-s4): adding and removing a node goes here, with its limits: layout 3,
+the start check, the N-3 mixed-version rule, the R8-7 ruling, one change at a time. -->
+
 ### Fencing your own side effects
 
 Your app may do things outside rDB for a partition it leads: start a container, upload a
