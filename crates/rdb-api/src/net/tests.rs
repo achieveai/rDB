@@ -1814,6 +1814,52 @@ async fn a_certificate_from_another_ca_gets_no_link() {
     assert!(!matches!(one.net.states()[&NodeId(2)], LinkState::Up(_)));
 }
 
+/// #80 S4 M12 (T10): a node added at runtime gets its certificate from `certs::issue_node`
+/// on the operator's existing `--cert-dir`. Node 3, issued from the folder that signed nodes 1
+/// and 2, links to node 1 both ways. Node 3 issued from another folder's CA dials the same
+/// listener and is refused at once, naming the certificate, and node 1 never holds it up. The
+/// other-CA half is the same check as `a_certificate_from_another_ca_gets_no_link`, here
+/// for an issued certificate. Integration (~300 ms: real TLS on loopback).
+/// Cut: `issue_node` signs with a freshly generated CA key instead of `ca.key`: the issued
+/// node 3 is refused like a stranger, red, observed 2026-11-20.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn s80s4_a_node_certificate_from_another_ca_is_refused_by_the_listener() {
+    let dir = config_testkit::fs::temp_dir();
+    let ours = dir.path().join("ours");
+    let other = dir.path().join("other");
+    certs_for(&ours, &[1, 2]);
+    certs_for(&other, &[1, 2]);
+    certs::issue_node(&ours, NodeId(3)).expect("issue node 3 from our CA");
+    certs::issue_node(&other, NodeId(3)).expect("issue node 3 from another CA");
+    let one = side(Spec::node(1, &ours, &[2, 3]), true).await;
+    let addr = one.net.addr().expect("listening");
+
+    let stranger = side(Spec::node(3, &other, &[1]).dialling(1, addr), false).await;
+    let error = stranger
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect_err("another CA gets no link");
+    assert!(
+        error.contains("node 1: refused") && error.contains("certificate"),
+        "names the certificate: {error}"
+    );
+    assert!(!matches!(one.net.states()[&NodeId(3)], LinkState::Up(_)));
+    drop(stranger);
+
+    let added = side(Spec::node(3, &ours, &[1]).dialling(1, addr), false).await;
+    added
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("an issued node 3 links to node 1");
+    one.net
+        .wait_up(&[NodeId(3)], PATIENCE)
+        .await
+        .expect("node 1 sees node 3");
+    assert_eq!(one.links.boot_of(NodeId(3)), Some(BootId(33)));
+}
+
 /// M10 S2, found walking `lr up`: node 3's link came up while its `Db` was still opening, so
 /// node 1's recovery ask reached a process whose node could not take it yet and was dropped
 /// (`net_deliver_unreachable`), and node 1 healed `DegradedRf2`. A node's link now comes up

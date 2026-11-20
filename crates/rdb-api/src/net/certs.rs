@@ -235,37 +235,97 @@ pub fn generate(dir: &Path, labels: &[Label]) -> Result<(), String> {
     write(dir.join("ca.pem"), ca_cert.pem())?;
     write(dir.join("ca.key"), ca_key.serialize_pem())?;
     for label in labels {
-        let key = KeyPair::generate().map_err(rcgen)?;
-        let mut params = CertificateParams::default();
-        params.distinguished_name = named(&label.to_string());
-        params.is_ca = IsCa::NoCa;
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
-        // A node is a server on its listener and a client when it dials a peer.
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        params
-            .subject_alt_names
-            .push(SanType::URI(ia5(&label_uri(label))?));
-        if let Label::Node(node) = label {
-            params
-                .subject_alt_names
-                .push(SanType::DnsName(ia5(&node_domain(*node))?));
-        }
-        let cert = params.signed_by(&key, &ca_cert, &ca_key).map_err(rcgen)?;
+        let (cert, key) = leaf(label, &ca_cert, &ca_key)?;
         let (cert_path, key_path) = files(dir, label);
-        write(cert_path, cert.pem())?;
-        write(key_path, key.serialize_pem())?;
+        write(cert_path, cert)?;
+        write(key_path, key)?;
     }
     tracing::info!(
         dir = %dir.display(),
         labels = ?labels.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "net_certs_generated"
     );
+    Ok(())
+}
+
+/// A fresh key and `label`'s certificate signed by `ca_cert` / `ca_key`, as PEM `(cert, key)`.
+/// Both [`generate`] and [`issue_node`] use it, so an issued node's certificate has exactly the
+/// SANs and usages a generated one has.
+fn leaf(
+    label: &Label,
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+) -> Result<(String, String), String> {
+    let rcgen = |error: rcgen::Error| error.to_string();
+    let key = KeyPair::generate().map_err(rcgen)?;
+    let mut params = CertificateParams::default();
+    params.distinguished_name = named(&label.to_string());
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    // A node is a server on its listener and a client when it dials a peer.
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params
+        .subject_alt_names
+        .push(SanType::URI(ia5(&label_uri(label))?));
+    if let Label::Node(node) = label {
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(ia5(&node_domain(*node))?));
+    }
+    let cert = params.signed_by(&key, ca_cert, ca_key).map_err(rcgen)?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// Sign `node-<n>.pem` / `node-<n>.key` for one more node with the development CA already in
+/// `dir` (`ca.pem`, `ca.key`), for a node added at runtime (#80 S4, `rdb_node --gen-certs
+/// --issue-node N`). Only the rDB node certificate: the rEtcd client certificate stays the
+/// shared `rdb` one (owner ruling Q5 b). Nothing else in `dir` changes.
+///
+/// # Errors
+///
+/// Refused, writing nothing, when `ca.pem` or `ca.key` is missing (a fresh CA would sign a
+/// certificate no formed node trusts), or when `node-<n>.pem` or `node-<n>.key` already exists
+/// (a node's key is never replaced under it). Otherwise the step that failed, with the path.
+pub fn issue_node(dir: &Path, node: NodeId) -> Result<(), String> {
+    let rcgen = |error: rcgen::Error| error.to_string();
+    let label = Label::Node(node);
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "{}: {error}; node-{} is signed by the CA that signed the running nodes, so \
+                 issue it from that --cert-dir (`rdb_node --gen-certs --cert-dir DIR` made it); \
+                 nothing was written",
+                path.display(),
+                node.0
+            )
+        })
+    };
+    let _ca_pem = read("ca.pem")?;
+    let ca_key_pem = read("ca.key")?;
+    let (cert_path, key_path) = files(dir, &label);
+    for path in [&cert_path, &key_path] {
+        if path.exists() {
+            return Err(format!(
+                "{} exists: node-{} already has a certificate, and a node's key is never \
+                 replaced; nothing was written",
+                path.display(),
+                node.0
+            ));
+        }
+    }
+    let ca_key = KeyPair::from_pem(&ca_key_pem).map_err(rcgen)?;
+    let ca_cert = dev_ca().self_signed(&ca_key).map_err(rcgen)?;
+    let (cert, key) = leaf(&label, &ca_cert, &ca_key)?;
+    write_file(&key_path, &key)?;
+    write_file(&cert_path, &cert)?;
+    tracing::info!(dir = %dir.display(), node = node.0, "net_node_cert_issued");
     Ok(())
 }
 
@@ -624,6 +684,80 @@ mod tests {
             );
             assert!(sans.contains(host), "voter {n}'s host SAN: {sans:?}");
         }
+    }
+
+    /// The issuer and subject names of `der`, as text.
+    fn issuer_and_subject(der: &[u8]) -> (String, String) {
+        use x509_parser::prelude::{FromDer, X509Certificate};
+        let (_, cert) = X509Certificate::from_der(der).expect("parses");
+        (cert.issuer().to_string(), cert.subject().to_string())
+    }
+
+    /// #80 S4 T10: `issue_node` signs `node-6.*` with the CA already in the folder. The
+    /// certificate names node 6 exactly as a generated one does (URI SAN `rdb://node/6`, DNS SAN
+    /// `node-6.rdb`), its issuer is that CA, and nothing else in the folder changes. Issuing 6
+    /// again is refused and leaves its certificate alone. A folder without `ca.key` is refused
+    /// and nothing is written: a fresh CA would sign a certificate no running node trusts. That
+    /// the formed nodes trust the result over a real handshake is row M12
+    /// (`net::tests::s80s4_a_node_certificate_from_another_ca_is_refused_by_the_listener`).
+    /// Unit.
+    /// Cut: with `ca.key` missing, sign with a freshly generated CA key: the missing-key case
+    /// is accepted, red, observed 2026-11-20.
+    #[config_log::retcd_test]
+    fn s80s4_issue_node_signs_one_more_node_with_the_existing_ca() {
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        generate(&dir, &[Label::Node(NodeId(1)), Label::Node(NodeId(2))]).expect("certs");
+        let read = |path: PathBuf| {
+            std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        let before: Vec<Vec<u8>> = ["ca.pem", "ca.key", "node-1.pem", "node-2.key"]
+            .iter()
+            .map(|name| read(dir.join(name)))
+            .collect();
+
+        issue_node(&dir, NodeId(6)).expect("node 6 is issued");
+        let der = der_of(&dir.join("node-6.pem"));
+        assert_eq!(label_from_der(&der), Some(Label::Node(NodeId(6))));
+        assert_eq!(dns_and_ip_sans(&der), vec!["node-6.rdb".to_owned()]);
+        let (_, ca_subject) = issuer_and_subject(&der_of(&dir.join("ca.pem")));
+        let (issuer, subject) = issuer_and_subject(&der);
+        assert_eq!(issuer, ca_subject, "signed by the folder's CA");
+        assert_eq!(subject, "CN=node-6");
+        assert!(dir.join("node-6.key").exists());
+        let after: Vec<Vec<u8>> = ["ca.pem", "ca.key", "node-1.pem", "node-2.key"]
+            .iter()
+            .map(|name| read(dir.join(name)))
+            .collect();
+        assert!(before == after, "nothing else in the folder changes");
+
+        let issued = read(dir.join("node-6.pem"));
+        let again = issue_node(&dir, NodeId(6)).expect_err("node 6 has a certificate");
+        assert!(
+            again.contains("node-6.pem exists") && again.contains("nothing was written"),
+            "{again}"
+        );
+        assert!(
+            read(dir.join("node-6.pem")) == issued,
+            "node 6 is left alone"
+        );
+
+        let keyless = root.path().join("keyless");
+        generate(&keyless, &[Label::Node(NodeId(1))]).expect("certs");
+        std::fs::remove_file(keyless.join("ca.key")).expect("remove ca.key");
+        let ca_pem = read(keyless.join("ca.pem"));
+        let refused = issue_node(&keyless, NodeId(6)).expect_err("no ca.key");
+        assert!(
+            refused.contains(&keyless.join("ca.key").display().to_string())
+                && refused.contains("nothing was written"),
+            "{refused}"
+        );
+        assert!(!keyless.join("node-6.pem").exists() && !keyless.join("node-6.key").exists());
+        assert!(!keyless.join("ca.key").exists(), "no CA key appears");
+        assert!(
+            read(keyless.join("ca.pem")) == ca_pem,
+            "the CA is unchanged"
+        );
     }
 
     /// #80 S2 review r1: `generate` and `generate_control` leave the generation folder and

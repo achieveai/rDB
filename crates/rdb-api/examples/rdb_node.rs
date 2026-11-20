@@ -4,6 +4,7 @@
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
 //!          [--control-cluster CID --control-voters 1=HOST,...]
+//! rdb_node --gen-certs --cert-dir C --issue-node N
 //! rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
 //! rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
 //!          [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
@@ -23,6 +24,10 @@
 //!   presents (`retcd://CID/client/rdb`), and one certificate per rEtcd voter, for its node id,
 //!   `node-N.CID.retcd` and HOST, all signed by the same development CA (#80 S2,
 //!   ADR-rdb-0024). Production brings its own files in that layout.
+//! * `--gen-certs --issue-node N` (#80 S4) signs `node-N.pem` / `node-N.key` for a node added at
+//!   runtime with the CA already in `--cert-dir` (`ca.pem`, `ca.key`), and changes nothing else.
+//!   It refuses, writing nothing, when `ca.key` is missing or node N already has a certificate,
+//!   and takes no `--nodes`, `--apps` or control flags: those make a fresh CA.
 //! * `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
 //!   `T/client.key`, the cluster id read from the client certificate's SAN; it prints
 //!   `rdb_node control tls cluster=CID principal=P`. Without it the link is plaintext, and
@@ -161,6 +166,8 @@ struct Args {
     control_cluster: Option<config_core::ClusterId>,
     /// `--control-voters 1=HOST,...` (#80 S2): the rEtcd voters `--gen-certs` certifies.
     control_voters: Vec<(u64, String)>,
+    /// `--issue-node N` (#80 S4): `--gen-certs` signs node N with the existing CA instead.
+    issue_node: Option<u32>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -172,6 +179,7 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
            [--control-cluster CID --control-voters 1=HOST,...]
+  rdb_node --gen-certs --cert-dir C --issue-node N
   rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
   rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
            [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
@@ -253,6 +261,15 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .collect();
             }
             "--cert-dir" => args.cert_dir = Some(value("--cert-dir")?.into()),
+            "--issue-node" => {
+                let text = value("--issue-node")?;
+                args.issue_node = Some(
+                    text.parse()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| format!("--issue-node {text:?} is not a node number"))?,
+                );
+            }
             "--control-tls" => args.control_tls = Some(value("--control-tls")?.into()),
             "--control-cluster" => {
                 let text = value("--control-cluster")?;
@@ -361,7 +378,32 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     failover_refusal(&args)?;
     declare_refusal(&args)?;
     control_certs_refusal(&args)?;
+    issue_node_refusal(&args)?;
     Ok(args)
+}
+
+/// `--issue-node` (#80 S4) is read by `--gen-certs` only, and alone: `--nodes`, `--apps` and
+/// the control flags make a fresh CA, which would sign certificates no running node trusts.
+fn issue_node_refusal(args: &Args) -> Result<(), String> {
+    if args.issue_node.is_none() {
+        return Ok(());
+    }
+    if !args.gen_certs {
+        return Err("--issue-node is read only by --gen-certs".into());
+    }
+    for (given, flag) in [
+        (args.nodes.is_some(), "--nodes"),
+        (!args.apps.is_empty(), "--apps"),
+        (args.control_cluster.is_some(), "--control-cluster"),
+    ] {
+        if given {
+            return Err(format!(
+                "--issue-node signs with the CA already in --cert-dir and takes no {flag}, \
+                 which makes a fresh CA"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `--control-cluster` and `--control-voters` (#80 S2) are read by `--gen-certs` only, and
@@ -632,6 +674,18 @@ fn gen_certs(args: &Args) -> ExitCode {
         eprintln!("rdb_node: --gen-certs needs --cert-dir");
         return ExitCode::from(2);
     };
+    if let Some(n) = args.issue_node {
+        return match certs::issue_node(dir, NodeId(n)) {
+            Ok(()) => {
+                println!("rdb_node certs dir={} issued=node-{n}", dir.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("rdb_node: --gen-certs --issue-node {n}: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let labels: Vec<Label> = (1..=args.nodes.unwrap_or(3))
         .map(|n| Label::Node(NodeId(n)))
         .chain(args.apps.iter().cloned().map(Label::App))
@@ -2192,6 +2246,114 @@ mod tests {
             assert!(control.join(format!("voter-{n}.key")).exists(), "voter {n}");
         }
         assert!(dir.join("node-5.pem").exists() && dir.join("app-admin.pem").exists());
+    }
+
+    /// #80 S4 T10 (M12's operator step): `--gen-certs --cert-dir C --issue-node 6` over a
+    /// formed `C` exits 0, prints `issued=node-6`, and writes `node-6.*` signed by C's CA, with
+    /// `ca.pem` and every other node's files unchanged. Issuing 6 again, or from a folder
+    /// without `ca.key`, exits 1 and writes nothing. `--issue-node` parses only with
+    /// `--gen-certs`, alone (no `--nodes`, `--apps` or control flags) and for a node number.
+    /// Unit. That the formed nodes trust the result over a handshake is
+    /// `net::tests::s80s4_a_node_certificate_from_another_ca_is_refused_by_the_listener`.
+    /// Cut: `gen_certs` ignores `--issue-node` and generates as before (a fresh CA, nodes 1-3):
+    /// no `node-6.pem` is written, red, observed 2026-11-20.
+    #[config_log::retcd_test]
+    fn s80s4_gen_certs_issue_node_signs_one_more_node_with_the_existing_ca() {
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        let run = |extra: &[&str], dir: &std::path::Path| {
+            let argv: Vec<String> = ["--gen-certs", "--cert-dir", &dir.display().to_string()]
+                .iter()
+                .chain(extra)
+                .map(|a| (*a).to_owned())
+                .collect();
+            super::run(argv.into_iter(), |_| Ok(None))
+        };
+        let read = |path: std::path::PathBuf| {
+            std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        assert_eq!(
+            run(&["--nodes", "5"], &dir),
+            std::process::ExitCode::SUCCESS
+        );
+        let kept = ["ca.pem", "ca.key", "node-1.pem", "node-5.key"];
+        let before: Vec<Vec<u8>> = kept.iter().map(|f| read(dir.join(f))).collect();
+
+        assert_eq!(
+            run(&["--issue-node", "6"], &dir),
+            std::process::ExitCode::SUCCESS
+        );
+        let issued = read(dir.join("node-6.pem"));
+        assert!(dir.join("node-6.key").exists());
+        let after: Vec<Vec<u8>> = kept.iter().map(|f| read(dir.join(f))).collect();
+        assert!(before == after, "the CA and nodes 1-5 are unchanged");
+        let der = rustls_pemfile::certs(&mut &issued[..])
+            .next()
+            .expect("one certificate")
+            .expect("parses");
+        assert_eq!(
+            rdb_api::net::certs::label_from_der(der.as_ref()),
+            Some(super::Label::Node(super::NodeId(6)))
+        );
+
+        assert_eq!(
+            run(&["--issue-node", "6"], &dir),
+            std::process::ExitCode::from(1),
+            "node 6 already has a certificate"
+        );
+        assert!(
+            read(dir.join("node-6.pem")) == issued,
+            "node 6 is left alone"
+        );
+
+        let keyless = root.path().join("keyless");
+        assert_eq!(run(&[], &keyless), std::process::ExitCode::SUCCESS);
+        std::fs::remove_file(keyless.join("ca.key")).expect("remove ca.key");
+        assert_eq!(
+            run(&["--issue-node", "6"], &keyless),
+            std::process::ExitCode::from(1),
+            "no ca.key"
+        );
+        assert!(!keyless.join("node-6.pem").exists() && !keyless.join("ca.key").exists());
+
+        const CID: &str = "80808080808080808080808080808080";
+        for (argv, refused) in [
+            (&["--issue-node", "6"][..], "read only by --gen-certs"),
+            (
+                &["--gen-certs", "--issue-node", "6", "--nodes", "6"][..],
+                "takes no --nodes",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "6", "--apps", "admin"][..],
+                "takes no --apps",
+            ),
+            (
+                &[
+                    "--gen-certs",
+                    "--issue-node",
+                    "6",
+                    "--control-cluster",
+                    CID,
+                    "--control-voters",
+                    "1=10.0.0.2",
+                ][..],
+                "takes no --control-cluster",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "0"][..],
+                "is not a node number",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "x"][..],
+                "is not a node number",
+            ),
+        ] {
+            assert!(
+                matches!(parsed(argv), Err(text) if text.contains(refused)),
+                "{argv:?}: {:?}",
+                parsed(argv).map(|_| ())
+            );
+        }
     }
 
     /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
