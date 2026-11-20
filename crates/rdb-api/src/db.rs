@@ -4259,7 +4259,10 @@ impl Db {
             });
         }
         let identity = self.write_identity()?;
-        self.compile_and_send(identity, puts, deadline, send_wait(deadline))
+        let answer = self.compile_and_send(identity, puts, deadline, send_wait(deadline));
+        // PR #178 review r1 T3: every id `write_identity` begins is finished, or the ack floor
+        // stays below it and its dedup slot is never released.
+        self.finished(identity.request, answer)
     }
 
     fn status_at(

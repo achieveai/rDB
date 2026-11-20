@@ -42,6 +42,11 @@ mod tempfile_dir {
 }
 
 fn world(ack_floor: bool) -> World {
+    world_with(ack_floor, None)
+}
+
+/// [`world`] with dedup cap `dedup_cap` (the default when `None`).
+fn world_with(ack_floor: bool, dedup_cap: Option<usize>) -> World {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -56,7 +61,7 @@ fn world(ack_floor: bool) -> World {
         dir: dir.path().to_path_buf(),
         hold: Vec::new(),
         timeouts: Timeouts::default(),
-        dedup_cap: None,
+        dedup_cap,
         dedup_retention: None,
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
@@ -711,4 +716,33 @@ fn sbx_147_p_delete_prefix_splits_documents_by_their_cost() {
     let left = left_after(w, &scope_c, 0);
     assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
     assert_eq!(deleted, 2, "two documents");
+}
+
+/// PR #178 review r1 T3: every write id delete prefix takes is finished, so the ack floor
+/// passes it and the owner frees its dedup slot. With a cap of 3, six maps cost six delete
+/// batches and six unchanged ends, and puts go on afterwards. Cut: `changes` returns
+/// `compile_and_send`'s answer without `finished`: red, the floor stays at the first delete
+/// and the fourth batch or a later put is OVERLOADED.
+#[config_log::retcd_test]
+fn sbx_147_q_delete_prefix_finishes_every_write_id_it_takes() {
+    let w = world_with(true, Some(3));
+    let [_, _, c, _] = w.pinned();
+    w.on(async {
+        for i in 0..6 {
+            let put = vec![ElemOp::Put(Value::Text("k".into()), Value::Text("v".into()))];
+            c.write(0, Bytes::from(format!("map{i}")), Change::Map(put), None)
+                .await
+                .unwrap_or_else(|e| panic!("control: map {i} under the cap: {:?}", e));
+        }
+        let deleted = c
+            .delete_prefix(0, Bytes::new(), DEADLINE)
+            .await
+            .unwrap_or_else(|e| panic!("delete_prefix: {} after {}", e.error, e.deleted));
+        assert_eq!(deleted, 6, "six maps");
+        for i in 0..6 {
+            c.put(0, Bytes::from(format!("after{i}")), b(b"v"), None)
+                .await
+                .unwrap_or_else(|e| panic!("put {i} after the delete: {:?}", e));
+        }
+    });
 }
