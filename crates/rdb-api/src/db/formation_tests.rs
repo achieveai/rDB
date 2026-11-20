@@ -3947,6 +3947,9 @@ enum NodePut {
     Park,
     /// Applied, answered `DeadlineExceededUnknownOutcome`.
     AppliedLost,
+    /// [`NodePut::AppliedLost`], and the next `nodes/` read fails: applied, and the read back
+    /// fails.
+    AppliedUnread,
     /// These bytes written over the record first, then the put sent: it meets a record that
     /// moved after the open read it.
     Rival(Bytes),
@@ -4086,6 +4089,11 @@ impl ConfigStore for AddrPuts {
             }
             NodePut::AppliedLost => {
                 self.inner.put(request).await?;
+                Err(Unknown)
+            }
+            NodePut::AppliedUnread => {
+                self.inner.put(request).await?;
+                self.failing_reads.store(1, Ordering::SeqCst);
                 Err(Unknown)
             }
             NodePut::Rival(value) => {
@@ -4446,6 +4454,44 @@ fn own83_b2_6_an_unknown_registration_outcome_is_read_back() {
         ]
     );
     assert_eq!(fence.record().0.as_deref(), Some("gw-1.d:9443"));
+}
+
+/// own83_b2_11 (#83 B2, PR #159 review r2, T5): a registration write that applied, whose reply
+/// was lost and whose read back failed. Twice: the open with B is refused naming both, no host
+/// started, the marker kept, and the record holds B at a new revision (the second attempt finds
+/// B already there, and the marker makes it write again). Then the store is healthy and the
+/// open with B, an equal-address retry, writes once more (the fence): the open goes on, the
+/// marker is resolved and the revision moves on. A further open writes nothing. Cut: the
+/// marker removed on a failed read back, red at "kept". Integration (~3 s): one node, five
+/// opens.
+#[config_log::retcd_test]
+fn own83_b2_11_an_applied_write_whose_read_back_fails_is_settled_by_a_retry() {
+    const B: &str = "gw-1.b:9443";
+    let fence = Fence::new("gw-1.a:8443");
+    let (_, mut last) = fence.record();
+    for attempt in 1..=2 {
+        fence.store.next(NodePut::AppliedUnread);
+        let refused = fence.open(B).expect_err("the outcome is unknown");
+        let text = refused.to_string();
+        assert!(
+            text.contains("outcome is unknown")
+                && text.contains("read back failed")
+                && text.contains("scripted to fail"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: kept");
+        let (held, revision) = fence.record();
+        assert_eq!(held.as_deref(), Some(B), "{attempt}: the write applied");
+        assert!(revision > last, "{attempt}: at a new revision");
+        last = revision;
+    }
+    fence.open(B).expect("a healthy store: the retry opens");
+    let (held, settled) = fence.record();
+    assert_eq!(held.as_deref(), Some(B));
+    assert!(settled > last, "the retry fenced: the revision moved on");
+    assert!(!fence.marked(), "and the marker is resolved");
+    fence.open(B).expect("an unchanged open");
+    assert_eq!(fence.record().1, settled, "no marker: nothing written");
 }
 
 /// own83_b2_7 (#83 B2, PR #159 review, the revision race): the record changes after the open
