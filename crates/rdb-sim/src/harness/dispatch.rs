@@ -3446,6 +3446,8 @@ impl Dispatcher {
     /// generation was recorded, so there is no committed root to anchor at; naming
     /// `survivor_base` when the holder's engine does not store the committed digest at the
     /// cutoff, or its own mark names another digest there (the host's `base_digest_differs`);
+    /// naming `survivor_unlinked` when the generation has no parent and no own mark rooted at or
+    /// below the cutoff (the host's `anchor_generation_unlinked`, issue #61 R26);
     /// naming `survivor_base_below_floor` when the cutoff is below the floor and the mark is a
     /// parent's or rooted elsewhere (the host's `base_below_floor`); naming `survivor_head` when
     /// it stores no record at its own applied head.
@@ -3485,6 +3487,19 @@ impl Dispatcher {
         })?;
         let lineage = (holder, partition, generation);
         let base = selected.cutoff_seq;
+        // Issue #61 R26, the twin of the host's `Host::survivor` (92d2084): a lineage a snapshot
+        // installed has no parent; its own trim mark roots it at the barrier (B1). It answers
+        // only when that mark is the generation's own and rooted at or below the base; the base
+        // checks below then prove the prefix as for any lineage.
+        if engine.parent(partition, generation).is_none()
+            && !engine
+                .floor(partition, generation)
+                .is_some_and(|(level, mark)| level == generation && mark.root_base <= base)
+        {
+            return Err(SimError::Config {
+                field: "survivor_unlinked",
+            });
+        }
         let trimmed = engine.floor_seq(partition, generation);
         let root = if base < trimmed {
             let below = SimError::Config {
@@ -4990,36 +5005,16 @@ mod dormant_twin_tests {
         );
     }
 
-    /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
-    /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
-    /// (issue #105 unit 2, architect section 14). No receiver is held.
-    ///
-    /// With `floor`, node 1's engine is trimmed there before the `Recovered`, which is stepped
-    /// through [`Dispatcher::step`], so the harness's ladder alignment runs (issue #61).
-    fn stood_down_owner(floor: Option<u64>) -> (Dispatcher, DormantSeed) {
-        use rdb_core::contracts::authority::{
-            AuthorityEvent, AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
-        };
-        use rdb_core::contracts::event::{
-            Budgets, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
-        };
-        use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
-        use rdb_core::contracts::recovery::{
-            CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult,
-            RetainedStatusMap, SelectedLineage, TailLedger,
-        };
-        use rdb_core::contracts::time::{ControlTime, Tick};
+    /// Node 1's authority view of `lineage` at `authority_seq`, denied `past_horizon`.
+    fn owner_view(
+        lineage: Lineage,
+        authority_seq: u64,
+        past_horizon: rdb_core::contracts::authority::DenyReason,
+    ) -> rdb_core::contracts::authority::AuthorityView {
+        use rdb_core::contracts::ids::{AuthorityGeneration, GrantId};
+        use rdb_core::contracts::time::Tick;
 
-        use crate::storage::snapshot::EmptySnapshot;
-
-        let (mut dispatcher, seed) = serving_owner();
-        dispatcher.replication.forget_node(OWNER);
-        let lineage = seed.lineage;
-        let cutoff = Seq(HEAD);
-        let cutoff_digest = canonical_history(lineage, ConfigVersion(1), HEAD)
-            .expect("history")
-            .digest(HEAD);
-        let view = |authority_seq, past_horizon| AuthorityView {
+        rdb_core::contracts::authority::AuthorityView {
             lineage,
             grant_id: GrantId(1),
             boot_id: BootId(1),
@@ -5028,8 +5023,27 @@ mod dormant_twin_tests {
             authority_seq,
             valid_through_tick: Tick(u64::MAX),
             past_horizon,
+        }
+    }
+
+    /// F1's `ReadOnly` result for generation 1 of `P` at cutoff [`HEAD`], node 1 proving it, as
+    /// [`stood_down_owner`] steps it.
+    fn owner_recovery_result(seed: &DormantSeed) -> rdb_core::contracts::recovery::RecoveryResult {
+        use rdb_core::contracts::authority::DenyReason;
+        use rdb_core::contracts::authority::{FencingProof, PartitionMode, Revocation};
+        use rdb_core::contracts::ids::GrantId;
+        use rdb_core::contracts::recovery::{
+            CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult,
+            RetainedStatusMap, SelectedLineage, TailLedger,
         };
-        let result = RecoveryResult {
+        use rdb_core::contracts::time::Tick;
+
+        let lineage = seed.lineage;
+        let cutoff = Seq(HEAD);
+        let cutoff_digest = canonical_history(lineage, ConfigVersion(1), HEAD)
+            .expect("history")
+            .digest(HEAD);
+        RecoveryResult {
             fenced_prior: FencingProof {
                 partition: P,
                 prior_generation: Generation(0),
@@ -5074,7 +5088,7 @@ mod dormant_twin_tests {
             committed: CommittedRoot {
                 revision: Revision(1),
                 pinned_config: seed.config.clone(),
-                authority_view: view(1, DenyReason::NoGrant),
+                authority_view: owner_view(lineage, 1, DenyReason::NoGrant),
             },
             retained_status_map: RetainedStatusMap {
                 predecessor_generation: Generation(0),
@@ -5084,7 +5098,30 @@ mod dormant_twin_tests {
                 uncertain: false,
             },
             ledger: TailLedger::unknown(),
+        }
+    }
+
+    /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
+    /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
+    /// (issue #105 unit 2, architect section 14). No receiver is held.
+    ///
+    /// With `floor`, node 1's engine is trimmed there before the `Recovered`, which is stepped
+    /// through [`Dispatcher::step`], so the harness's ladder alignment runs (issue #61).
+    fn stood_down_owner(floor: Option<u64>) -> (Dispatcher, DormantSeed) {
+        use rdb_core::contracts::authority::{AuthorityEvent, DenyReason};
+        use rdb_core::contracts::event::{
+            Budgets, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
         };
+        use rdb_core::contracts::ids::{CorrelationId, EventId};
+        use rdb_core::contracts::time::{ControlTime, Tick};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.replication.forget_node(OWNER);
+        let lineage = seed.lineage;
+        let view = |authority_seq, past_horizon| owner_view(lineage, authority_seq, past_horizon);
+        let result = owner_recovery_result(&seed);
         let snapshot = EmptySnapshot::new();
         let budgets = Budgets::SPEC_DEFAULTS;
         let ctx = StepCtx {
@@ -5785,6 +5822,129 @@ mod dormant_twin_tests {
             scheduler.take_for(two, Tick(u64::MAX)).len(),
             1,
             "node 3's ACK is queued for node 2"
+        );
+    }
+
+    /// Issue #61 R26, the twin of the host's 92d2084 rows: node 3 holds generation 2 of `P` as a
+    /// snapshot install left it, the barrier at 4 rooted at `(4, d4)` and no parent, and has
+    /// adopted it. F1's committed result for generation 2 is node 1's, cut at `cutoff` with
+    /// `cutoff_digest`. Returns the dispatcher and node 3's placement under generation 1.
+    fn installed_survivor(
+        cutoff: u64,
+        cutoff_digest: Digest,
+    ) -> (Dispatcher, rdb_core::contracts::recovery::SurvivorInventory) {
+        use rdb_core::contracts::recovery::{LineageAnchor, SurvivorInventory};
+
+        let (mut dispatcher, seed) = stood_down_owner(None);
+        let three = NodeId(3);
+        let mut result = owner_recovery_result(&seed);
+        let history = canonical_history(seed.lineage, ConfigVersion(1), 4).expect("history");
+        let barrier = history
+            .batch(4)
+            .writes
+            .iter()
+            .find(|write| write.ns == rdb_core::contracts::storage::Namespace::History)
+            .and_then(|write| write.value.clone())
+            .expect("record 4");
+        let mut engine = MemoryEngine::new(three);
+        let g2 = Generation(2);
+        engine.install_begin(P, g2, Seq(4)).expect("begin");
+        engine
+            .install_finish(P, g2, Seq(4), &barrier, (Seq(4), history.digest(4)))
+            .expect("finish");
+        assert_eq!(
+            engine.parent(P, g2),
+            None,
+            "control: an install has no parent"
+        );
+        dispatcher.engines.insert(three, engine);
+        result.new_generation = g2;
+        result.selected.root.generation = g2;
+        result.selected.cutoff_seq = Seq(cutoff);
+        result.selected.cutoff_digest = cutoff_digest;
+        dispatcher.committed.insert(
+            (three, P),
+            (Box::new(result), rdb_core::contracts::ids::CorrelationId(0)),
+        );
+        dispatcher.adopted.insert(
+            (three, P),
+            super::Adopted {
+                generation: g2,
+                owner_epoch: seed.lineage.owner_epoch,
+                config_version: ConfigVersion(1),
+            },
+        );
+        let placed = SurvivorInventory {
+            copy: CopyId(2),
+            anchor_seen: LineageAnchor {
+                lineage: seed.lineage,
+                base_seq: Seq::ZERO,
+                base_digest: Digest::ROOT,
+            },
+            head: (Seq(4), history.digest(4)),
+            ladder: Vec::new(),
+            quarantined: None,
+            holds_last_writable: false,
+        };
+        (dispatcher, placed)
+    }
+
+    /// Issue #61 R26, host rows (i) to (iii) on the sim's `current_inventory`: an installed
+    /// lineage answers an inventory at its barrier; rooted above the base it is refused
+    /// unlinked; another digest at the base is refused as any lineage's is.
+    ///
+    /// **Asserted.** (i) Cut at the barrier 4 with its digest, node 3 answers from generation
+    /// 2: anchor `(4, d4)`, head `(4, d4)`, ladder the one barrier rung. (ii) Cut at 3, below the
+    /// mark's root 4: `survivor_unlinked` (the host's `anchor_generation_unlinked`). (iii) Cut at
+    /// 4 with another digest: `survivor_base` (the host's `base_digest_differs`).
+    ///
+    /// **Differs.** Built inside the harness: no sim API both installs a snapshot and adopts its
+    /// generation on a survivor, so the engine, committed result and adoption are set directly.
+    ///
+    /// Cut: the unlinked check dropped, red ((ii) answers `survivor_base_below_floor`, as before
+    /// R26). Unit, under a second.
+    #[test]
+    fn t61_r26_sim_an_installed_lineage_answers_at_its_barrier_and_only_there() {
+        use rdb_core::contracts::recovery::LineageAnchor;
+
+        let history =
+            canonical_history(stood_down_owner(None).1.lineage, ConfigVersion(1), 4).expect("h");
+        let three = NodeId(3);
+
+        let (dispatcher, placed) = installed_survivor(4, history.digest(4));
+        let answer = dispatcher
+            .current_inventory(three, P, &placed)
+            .expect("(i) an installed lineage answers");
+        assert_eq!(
+            answer.anchor_seen,
+            LineageAnchor {
+                lineage: Lineage {
+                    generation: Generation(2),
+                    ..placed.anchor_seen.lineage
+                },
+                base_seq: Seq(4),
+                base_digest: history.digest(4),
+            }
+        );
+        assert_eq!(answer.head, (Seq(4), history.digest(4)));
+        assert_eq!(answer.ladder, vec![(Seq(4), history.digest(4))]);
+
+        let (dispatcher, placed) = installed_survivor(3, history.digest(3));
+        assert_eq!(
+            dispatcher.current_inventory(three, P, &placed),
+            Err(SimError::Config {
+                field: "survivor_unlinked"
+            }),
+            "(ii) rooted above the base"
+        );
+
+        let (dispatcher, placed) = installed_survivor(4, history.digest(3));
+        assert_eq!(
+            dispatcher.current_inventory(three, P, &placed),
+            Err(SimError::Config {
+                field: "survivor_base"
+            }),
+            "(iii) another digest at the base"
         );
     }
 }
