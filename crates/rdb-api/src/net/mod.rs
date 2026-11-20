@@ -671,6 +671,16 @@ impl Net {
         }
     }
 
+    /// An abort handle of each of this `Net`'s own tasks (serve, dials, release loop), so a row
+    /// can see each one end after [`Net::shutdown`]. Empty once `shutdown` has drained them.
+    #[cfg(test)]
+    fn own_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        lock(&self.tasks)
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect()
+    }
+
     /// Send an already-encoded client call, as [`Net::send`] does after `outbound`. Rows use it
     /// to send a call the far side cannot decode, which `outbound` never produces.
     #[cfg(test)]

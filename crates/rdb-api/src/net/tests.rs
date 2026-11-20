@@ -3168,10 +3168,11 @@ fn net_shutdown_then_drop_is_one_shutdown() {
 }
 
 /// PR #171 review (lifecycle): a `Net` started with no listener (it only dials, as `rdb_node
-/// --form` does) shuts down: its dial task ends, one `net_shutdown` line names no link ended,
-/// and nothing panics. Integration (~10 ms: no handshake is made).
-/// No cut is shown: nothing in `shutdown` depends on a listener. The row pins that a dial-only
-/// `Net` shuts down whole. Under the cut "no once-only guard" it stays green (one call).
+/// --form` does) shuts down: its own tasks, the dial to node 1 and the release loop, both end,
+/// one `net_shutdown` line names no link ended, and nothing panics. The dial never stops by
+/// itself (nothing listens at its address, so it backs off and dials again), so only the
+/// shutdown's abort ends it. Integration (~10 ms: no handshake is made).
+/// Cut: `shutdown` neither drains nor aborts its tasks; red at "every task of the `Net` ends".
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn net_shutdown_with_no_server() {
     const TEST: &str = "net_shutdown_with_no_server";
@@ -3182,7 +3183,19 @@ async fn net_shutdown_with_no_server() {
         false,
     )
     .await;
+    let tasks = side.net.own_tasks();
+    assert_eq!(tasks.len(), 2, "the dial and the release loop, no serve");
     side.net.shutdown();
+    let deadline = std::time::Instant::now() + crate::host::test_patience(PATIENCE);
+    while !tasks.iter().all(tokio::task::AbortHandle::is_finished) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every task of the `Net` ends: {} of {} still running",
+            tasks.iter().filter(|task| !task.is_finished()).count(),
+            tasks.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let lines: Vec<serde_json::Value> =
         config_testkit::logs::lines_for_current_test(module_path!(), TEST)
             .into_iter()
