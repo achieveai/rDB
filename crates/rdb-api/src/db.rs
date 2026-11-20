@@ -581,6 +581,9 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Why the running heal is waiting, as its latest `heal_retry` said (R5): `wait_ready`'s
+    /// time-out names it. `None` once the heal ends, or before it has waited.
+    heal_waiting: Arc<Mutex<Option<String>>>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
@@ -639,6 +642,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
             stuck: Mutex::new(None),
             control: None,
@@ -2610,29 +2614,36 @@ impl Db {
         }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
-        self.opened.heal_task = Some(rt.spawn(async move {
-            // One after another: every grant expires on its own clock, so the later heals
-            // find theirs already expired.
-            let mut first = None;
-            let mut ended = Ok(());
-            for ctx in ctxs {
-                match admin::heal_retrying(ctx).await {
-                    Ok(healed) => {
-                        first.get_or_insert(healed);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "heal_failed");
-                        ended = Err(error);
-                        break;
+        let waiting = Arc::clone(&self.opened.heal_waiting);
+        // R5: the heal runs in the span of the open that started it, so its lines (`heal_retry`
+        // among them) reach that open's log and not an untagged one.
+        self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
+            async move {
+                // One after another: every grant expires on its own clock, so the later heals
+                // find theirs already expired.
+                let mut first = None;
+                let mut ended = Ok(());
+                for ctx in ctxs {
+                    match admin::heal_retrying(ctx, &waiting).await {
+                        Ok(healed) => {
+                            first.get_or_insert(healed);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "heal_failed");
+                            ended = Err(error);
+                            break;
+                        }
                     }
                 }
-            }
-            *lock(&state) = match (ended, first) {
-                (Ok(()), Some(healed)) => HealState::Handed(healed),
-                (Err(error), _) => HealState::Failed(error),
-                (Ok(()), None) => HealState::NotNeeded,
-            };
-        }));
+                *lock(&state) = match (ended, first) {
+                    (Ok(()), Some(healed)) => HealState::Handed(healed),
+                    (Err(error), _) => HealState::Failed(error),
+                    (Ok(()), None) => HealState::NotNeeded,
+                };
+                *lock(&waiting) = None;
+            },
+            tracing::Span::current(),
+        )));
         Ok(())
     }
 
@@ -2674,14 +2685,22 @@ impl Db {
             self.ready_seen.store(true, Ordering::Relaxed);
             return Ok(());
         };
-        let timed_out = |partition: PartitionId, phase: String| ReadyError::TimedOut {
-            within_ms: within.as_millis(),
-            owner: self.route.owner_of(partition),
-            phase: if self.route.partitions() > 1 {
+        let timed_out = |partition: PartitionId, phase: String| {
+            let phase = if self.route.partitions() > 1 {
                 format!("partition {}: {phase}", partition.0)
             } else {
                 phase
-            },
+            };
+            // R5: a heal still waiting is why there is no recovery to look at; say what for.
+            let phase = match lock(&self.opened.heal_waiting).as_deref() {
+                Some(reason) => format!("{phase}; the reopen's heal is waiting: {reason}"),
+                None => phase,
+            };
+            ReadyError::TimedOut {
+                within_ms: within.as_millis(),
+                owner: self.route.owner_of(partition),
+                phase,
+            }
         };
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {

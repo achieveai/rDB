@@ -2473,9 +2473,13 @@ const HEAL_RETRY_MAX: Duration = Duration::from_secs(5);
 /// A-R271). On a slow host a peer's process can start after the first window has passed, and
 /// one attempt left the owner dead until it was opened again. Waiting for boots is the heal's
 /// first step and has done nothing yet, so trying again is safe. Any other error ends the heal
-/// as before. Each miss logs `heal_retry{attempt, missing, error, next_ms}`; the wait doubles
-/// from 0.5 s to 5 s.
-pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
+/// as before. Each miss logs `heal_retry{attempt, missing, error, next_ms}` and puts the error's
+/// text in `waiting`, for `wait_ready`'s time-out to name (R5); the wait doubles from 0.5 s to
+/// 5 s.
+pub(crate) async fn heal_retrying(
+    ctx: HealCtx,
+    waiting: &std::sync::Mutex<Option<String>>,
+) -> Result<Healed, HealError> {
     let mut backoff = HEAL_RETRY_FIRST;
     let mut attempt: u64 = 0;
     loop {
@@ -2500,6 +2504,9 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
                     next_ms = backoff.as_millis(),
                     "heal_retry"
                 );
+                *waiting
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(HEAL_RETRY_MAX);
             }

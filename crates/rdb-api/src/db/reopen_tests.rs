@@ -3703,6 +3703,61 @@ fn m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart
     );
 }
 
+/// R5 side fixes: node 1's process opens alone, so its heal waits for nodes 2 and 3 and logs
+/// `heal_retry`. (1) That line lands in this row's own log file: the heal task runs in the span
+/// of the open that started it, not untagged. (2) `wait_ready`'s time-out names what the heal
+/// waits for, the `heal_retry` error, not only "none". Cuts: the heal task spawned without
+/// `instrument`: no `heal_retry` in this row's file, red at the wait for it; `wait_ready`'s
+/// `timed_out` leaves `heal_waiting` out: the text names no heal reason, red.
+/// Integration (~16 s): the first attempt must run out the heal's window (`heal_within`).
+#[config_log::retcd_test]
+fn r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why() {
+    const METHOD: &str = "r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut one = rt
+        .block_on(Db::open_with(
+            node_config(dir.path(), &[1]),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 1's process opens");
+    let window = heal_within(&fast());
+    let deadline =
+        std::time::Instant::now() + crate::host::test_patience(window + Duration::from_secs(10));
+    let retry = loop {
+        let found = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .find(|line| line["@m"] == "heal_retry");
+        if let Some(line) = found {
+            break line;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no heal_retry in this row's own log within {window:?} and patience"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let reason = retry["error"].as_str().expect("heal_retry names its error");
+    assert!(reason.contains("no link to node"), "{retry}");
+    let timed_out = one
+        .wait_ready(Duration::from_millis(300))
+        .expect_err("node 1 cannot heal alone");
+    assert!(
+        matches!(timed_out, ReadyError::TimedOut { .. }),
+        "{timed_out:?}"
+    );
+    let text = timed_out.to_string();
+    assert!(
+        text.contains(&format!("the reopen's heal is waiting: {reason}")),
+        "{text}"
+    );
+    one.shutdown();
+}
+
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
 
 /// A-R256 follow-up, arch-s2 B1/B2: after `admin promote 2`, the folder is closed and opened
