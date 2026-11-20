@@ -1225,3 +1225,39 @@ fn i127_a_planner_panic_is_logged() {
     assert_eq!(lines[1]["node"], 3, "{lines:?}");
     assert_eq!(lines[1]["panic"], "i127 formatted 7", "{lines:?}");
 }
+
+/// #122 cost, bounded: an owner whose grant ran out is looked at before it is judged, and an
+/// owner that never answers holds its judge for the whole look. A sweep judges every owner at
+/// once, so four such owners cost one look, not four: a dead owner's failover is not held
+/// back by other owners that are slow in the same sweep (t1 S3, 15 s bound).
+/// Cut: judge the owners in turn in `judge_all`; it takes four looks, red.
+#[config_log::retcd_test]
+fn i122_owners_are_judged_at_once() {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script::default(),
+    ));
+    let links = Links::new();
+    // Mailboxes that take a look and never answer it: each judge waits out `look_within`.
+    let mut held = Vec::new();
+    for node in 1..=4u32 {
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        links.register(NodeId(node), tx, BootId(1));
+        held.push(rx);
+    }
+    let planner = Planner {
+        look_within: Duration::from_millis(400),
+        ..planner(9, &store, links)
+    };
+    let started = Instant::now();
+    let verdicts = rt.block_on(
+        planner.judge_all((1..=4u32).map(|node| (NodeId(node), None, PartitionId(node)))),
+    );
+    let took = started.elapsed();
+    assert_eq!(verdicts, vec![Verdict::Dead("silent_and_expired"); 4]);
+    assert!(
+        took < Duration::from_millis(1_200),
+        "four slow owners cost one look (400 ms), not four: took {took:?}"
+    );
+    drop(held);
+}

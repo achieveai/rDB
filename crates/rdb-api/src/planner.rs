@@ -614,17 +614,26 @@ impl Planner {
             .map(|(node, _)| *node)
             .collect();
         let mut todo = Vec::new();
-        for (owner, records) in owned {
-            // A planner does not judge its own node while that node's grant stands: its own
-            // host answers for itself. A frozen grant never comes back for this process, so
-            // its own remaining partitions go through the judgment like any owner's (PR #119
-            // review): otherwise a frozen node holding `planner/grant` strands them.
-            if owner == self.node && !frozen.contains(&owner) {
-                continue;
-            }
-            let verdict = self
-                .judge(owner, grants.get(&owner), records[0].0.partition)
-                .await;
+        // A planner does not judge its own node while that node's grant stands: its own
+        // host answers for itself. A frozen grant never comes back for this process, so
+        // its own remaining partitions go through the judgment like any owner's (PR #119
+        // review): otherwise a frozen node holding `planner/grant` strands them.
+        let judged: Vec<(NodeId, Vec<&Entry>)> = owned
+            .into_iter()
+            .filter(|(owner, _)| *owner != self.node || frozen.contains(owner))
+            .collect();
+        // Every owner is judged at once. A judge can wait out one look, and an owner that is
+        // heard but slow to answer costs that wait each sweep (#122), so judged in turn, k
+        // slow owners would hold back a dead owner's failover by k looks. At once, a sweep's
+        // judging takes one look at most, however many owners are slow.
+        let verdicts = self
+            .judge_all(
+                judged
+                    .iter()
+                    .map(|(owner, records)| (*owner, grants.get(owner), records[0].0.partition)),
+            )
+            .await;
+        for ((owner, records), verdict) in judged.into_iter().zip(verdicts) {
             // No alert before the owner's first grant of its own, within [`no_grant_grace`]: a
             // node just started has none until its recovery takes one, and it is not "not
             // serving" (lead ruling on PR #119). Until then `grants/{owner}` is absent or still
@@ -773,6 +782,17 @@ impl Planner {
         answers
     }
 
+    /// [`Self::judge`] for each `(owner, grant, partition)`, all at once, in the given order.
+    async fn judge_all<'a>(
+        &self,
+        owners: impl Iterator<Item = (NodeId, Option<&'a GrantRecord>, PartitionId)>,
+    ) -> Vec<Verdict> {
+        futures::future::join_all(
+            owners.map(|(owner, grant, partition)| self.judge(owner, grant, partition)),
+        )
+        .await
+    }
+
     async fn judge(
         &self,
         owner: NodeId,
@@ -844,10 +864,18 @@ impl Planner {
         quiet: bool,
     ) -> Result<(NodeId, Result<Promoted, PromoteError>), NoEligible> {
         let members = members.ok_or(NoEligible::MembersUnknown)?;
-        let mut looks = Vec::new();
-        for member in members.iter().filter(|member| member.node != dead) {
-            looks.push((member.node, self.look(partition, member.node).await));
-        }
+        // The members are looked at once, so one slow member costs one look, not one each.
+        let others: Vec<NodeId> = members
+            .iter()
+            .filter(|member| member.node != dead)
+            .map(|member| member.node)
+            .collect();
+        let looks: Vec<(NodeId, Option<NodeStatus>)> = futures::future::join_all(
+            others
+                .iter()
+                .map(|node| async move { (*node, self.look(partition, *node).await) }),
+        )
+        .await;
         let to = choose_target(partition, members, dead, &looks, frozen)?;
         let looked = looks
             .iter()
