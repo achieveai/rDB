@@ -105,6 +105,8 @@ use crate::transport::Links;
 
 mod dedup_fill;
 use dedup_fill::{Crossed, Fill};
+pub mod snapshot;
+use snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
 /// (`rdb_sim` tests, `support::scenarios::run::BOOT`). `Db::restart_node` starts a node again
@@ -606,6 +608,14 @@ pub enum Msg {
         /// How far.
         through: Seq,
     },
+    /// Issue #61 S2: a primary offers `copy` a snapshot ([`snapshot`] module docs).
+    SnapshotOffer(Box<SnapshotOffer>),
+    /// Issue #61 S2: the target asks for the next page.
+    SnapshotPull(SnapshotPull),
+    /// Issue #61 S2: one page of the source's pinned view.
+    SnapshotChunk(Box<SnapshotChunk>),
+    /// Issue #61 S2: the target refused an offer or stopped an install.
+    SnapshotOfferRefused(SnapshotOfferRefused),
     /// A copy's answer to an inventory ask, stamped with the anchor it was asked about. The
     /// asker drops it when that is not its current plan's anchor: a late answer to an older
     /// run's ask, queued by the link while the copy was down (D8, A-R337).
@@ -2836,12 +2846,27 @@ struct Host {
     /// Critic-s1b A2: how many passes [`Self::ladder_duty`] has made. Each starts one partition
     /// further on, so a write rate above its budget cannot starve the partitions at the end.
     ladder_passes: usize,
-    /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
-    /// once by the first `SnapshotCatchupRequired` served at that generation.
-    primary_ladders: BTreeSet<(PartitionId, Generation)>,
-    /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
-    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
-    snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
+    /// H2 (A-R254): each `(partition, copy)`'s last barrier served, so a repeat is dropped
+    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups). Issue #61: one per copy,
+    /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it.
+    snapshots_served: BTreeMap<(PartitionId, CopyId), Seq>,
+    /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
+    transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
+    /// Issue #61 S2: the install this target runs, per partition.
+    installs: BTreeMap<PartitionId, snapshot::Install>,
+    /// Issue #61 S2: the most entries one snapshot page carries. [`COPY_BATCH_KEYS`]; rows set
+    /// it lower to reach a later page with few keys.
+    ///
+    /// [`COPY_BATCH_KEYS`]: rdb_storage::COPY_BATCH_KEYS
+    snapshot_page_keys: usize,
+    /// Issue #61 S2-R3: flip one byte of the page with this index (0 is the first) this source
+    /// sends, after its chain is computed. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_chunk_fault: Option<u64>,
+    /// Issue #61 S2-R1b: while set, this source opens transfers but sends no offer, so a row
+    /// can land writes past `S` first. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_offer_held: bool,
     /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
     committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
@@ -3138,8 +3163,14 @@ impl Host {
             dormant_ladders: BTreeMap::new(),
             inventory_ladders: BTreeMap::new(),
             ladder_passes: 0,
-            primary_ladders: BTreeSet::new(),
-            snapshots_served: BTreeSet::new(),
+            snapshots_served: BTreeMap::new(),
+            transfers: BTreeMap::new(),
+            installs: BTreeMap::new(),
+            snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
+            #[cfg(debug_assertions)]
+            snapshot_chunk_fault: None,
+            #[cfg(debug_assertions)]
+            snapshot_offer_held: false,
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             caught_up_resends: BTreeMap::new(),
@@ -3667,6 +3698,19 @@ impl Host {
                 self.restore_dormant(partition, &seed, false);
                 Ok(())
             }
+            Msg::SnapshotOffer(offer) => {
+                self.snapshot_offer(*offer);
+                Ok(())
+            }
+            Msg::SnapshotPull(pull) => {
+                self.snapshot_pull(pull);
+                Ok(())
+            }
+            Msg::SnapshotChunk(chunk) => self.snapshot_chunk(*chunk),
+            Msg::SnapshotOfferRefused(refused) => {
+                self.snapshot_refused_heard(&refused);
+                Ok(())
+            }
             Msg::DurableProved {
                 partition,
                 barrier,
@@ -4129,6 +4173,7 @@ impl Host {
             self.slow_step("duty", || "ladder".to_owned(), started);
         }
         self.rebuild_duty(now);
+        self.transfer_duty(now);
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -6709,6 +6754,12 @@ impl Host {
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
                 self.shadow_at_head(site.partition, *copy);
+                self.end_transfer(
+                    site.partition,
+                    *copy,
+                    "caught_up",
+                    "snapshot_transfer_released",
+                );
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -6903,6 +6954,7 @@ impl Host {
             link_boot = ?link_boot,
             "peer_booted"
         );
+        self.transfers_peer_booted(node);
         if self.committed.is_empty() {
             tracing::info!(
                 node = self.node.0,
@@ -11993,7 +12045,8 @@ impl Host {
     /// as `admin trim-history --through N` asks ([`Msg::TrimHistory`]). Answers the new floor.
     ///
     /// Refused, with nothing changed, when this node holds no lineage of the partition
-    /// (`no_lineage`); while an inventory pin is held (`inventory_pinned`, rev 4 m-c); when the
+    /// (`no_lineage`); while an inventory pin is held (`inventory_pinned`, rev 4 m-c); past the
+    /// lowest `S` of a snapshot transfer this node serves (`transfer_pinned`, design 3.1); when the
     /// newest generation's root is unknown here (`root_unknown`: neither its commit nor a mark
     /// of its own names it); or when the record at `through` is not held (`digest_at`'s
     /// reason). Then in one step (design section 3.4): R1's ladders first
@@ -12035,6 +12088,16 @@ impl Host {
                 );
                 return Err("inventory_pinned".to_owned());
             }
+        }
+        if let Some(pin) = self.transfer_pin(partition).filter(|pin| through > *pin) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                pin = pin.0,
+                through = through.0,
+                "history_trim_transfer_pinned"
+            );
+            return Err("transfer_pinned".to_owned());
         }
         let root = match self
             .committed
@@ -12940,88 +13003,6 @@ impl Host {
             full.get(first..first + ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
             tip,
         ))
-    }
-
-    /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
-    /// does not retain; this engine still holds every record, so the primary is given its
-    /// engine's ladder ([`Replication::restore_primary_history`], K3), once per generation, and
-    /// the copy's next `NeedPrefix` walks it record by record. The sim's twin is
-    /// `snapshot_catchup` in `rdb-sim`'s dispatch.
-    ///
-    /// Never faults the node. A repeat `(copy, barrier)` is dropped (B-R48). An ask after the
-    /// ladder was restored cannot be served by re-sending, so it is logged
-    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named. No primary here, an
-    /// unreadable ladder or a refused one is logged `snapshot_catchup_unserved{reason}` (warn).
-    fn snapshot_catchup(&mut self, partition: PartitionId, copy: CopyId, barrier: Seq) {
-        let node = self.node;
-        let started = Instant::now();
-        let unserved = |reason: &str| {
-            tracing::warn!(
-                node = node.0,
-                partition = partition.0,
-                copy = copy.0,
-                barrier = barrier.0,
-                reason,
-                "snapshot_catchup_unserved"
-            );
-        };
-        let Some(primary) = self.replication.primary(node, partition) else {
-            return unserved("no_primary");
-        };
-        let generation = primary.tracker().lineage().generation;
-        if !self.snapshots_served.insert((partition, copy, barrier)) {
-            return;
-        }
-        // Issue #61 (design rev 4 N4): a trimmed engine holds nothing below its floor, so the
-        // walk this serves cannot start at the copy's head. Nothing is read; the copy stays
-        // behind, named, until the snapshot transfer (PR-A commit A8) serves it.
-        let floor = self.engine.floor_seq(partition, generation);
-        if floor > Seq::ZERO {
-            tracing::warn!(
-                node = node.0,
-                partition = partition.0,
-                copy = copy.0,
-                barrier = barrier.0,
-                generation = generation.0,
-                floor = floor.0,
-                reason = "below_floor",
-                "snapshot_catchup_unservable"
-            );
-            return;
-        }
-        if self.primary_ladders.contains(&(partition, generation)) {
-            tracing::warn!(
-                node = node.0,
-                partition = partition.0,
-                copy = copy.0,
-                barrier = barrier.0,
-                generation = generation.0,
-                "snapshot_catchup_unservable"
-            );
-            return;
-        }
-        let read = match self.dormant_rungs(partition, generation) {
-            Ok(read) => read,
-            Err(reason) => return unserved(reason),
-        };
-        if self
-            .replication
-            .restore_primary_history(node, partition, &read)
-            .is_err()
-        {
-            return unserved("ladder_refused");
-        }
-        self.primary_ladders.insert((partition, generation));
-        tracing::info!(
-            node = node.0,
-            partition = partition.0,
-            copy = copy.0,
-            barrier = barrier.0,
-            generation = generation.0,
-            rungs = read.len(),
-            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "snapshot_catchup_served"
-        );
     }
 
     /// H3 (I1, A-R254): R1's `CopyAheadOnControl`. `copy` answered `NeedLineage`, `NeedConfig`
@@ -16593,6 +16574,10 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Restore { .. } => "restore",
         Msg::Routed { .. } => "routed",
         Msg::DurableProved { .. } => "durable_proved",
+        Msg::SnapshotOffer(_) => "snapshot_offer",
+        Msg::SnapshotPull(_) => "snapshot_pull",
+        Msg::SnapshotChunk(_) => "snapshot_chunk",
+        Msg::SnapshotOfferRefused(_) => "snapshot_offer_refused",
         Msg::Answered { .. } => "answered",
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",

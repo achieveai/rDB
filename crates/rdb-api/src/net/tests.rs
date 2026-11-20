@@ -30,12 +30,16 @@ use super::faults::Faults;
 use super::wire::{self, Frame, Inbound, Label, Outbound, WireAnswer, WireMsg, WireReply};
 use super::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use crate::db::ApiError;
+use crate::host::snapshot::{
+    SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull, SnapshotRefusal,
+};
 use crate::host::{
     Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg,
     NodeStatus, PeerAsk, PutOp, Seen,
 };
 use crate::transport::Links;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
+use rdb_core::contracts::storage::Namespace;
 
 /// A value of `T` decoded from zeros: every integer 0, every list empty, every enum its first
 /// variant. For contract types a link carries as they are (serde-derived in rdb-core), where
@@ -73,9 +77,13 @@ const fn kind(msg: &WireMsg) -> usize {
         WireMsg::Inspect { .. } => 7,
         WireMsg::Answered { .. } => 8,
         WireMsg::DurableProved { .. } => 9,
+        WireMsg::SnapshotOffer { .. } => 10,
+        WireMsg::SnapshotPull { .. } => 11,
+        WireMsg::SnapshotChunk { .. } => 12,
+        WireMsg::SnapshotOfferRefused { .. } => 13,
     }
 }
-const KINDS: usize = 10;
+const KINDS: usize = 14;
 
 /// `msg` as the far side of a link posts it, and the kind it travelled as.
 fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
@@ -111,6 +119,74 @@ fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
     };
     let kind = kind(&wire);
     (wire::inbound(wire).expect("lands"), kind)
+}
+
+/// Issue #61 S2: one of each snapshot message, every field away from its default, the refusal
+/// carrying `reason`.
+fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
+    let lineage = rdb_core::contracts::authority::Lineage {
+        partition: PartitionId(1),
+        generation: Generation(4),
+        owner_epoch: rdb_core::contracts::ids::OwnerEpoch(3),
+    };
+    let digest = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let after = Some((Namespace::Dedup, Bytes::from_static(b"key-9")));
+    vec![
+        Msg::SnapshotOffer(Box::new(SnapshotOffer {
+            lineage,
+            config_version: rdb_core::contracts::ids::ConfigVersion(6),
+            from: NodeId(1),
+            boot: BootId(5),
+            copy: CopyId(3),
+            at: Seq(800),
+            root: (Seq(120), digest),
+            barrier: Bytes::from_static(b"barrier record"),
+            released_through: Some(Seq(640)),
+        })),
+        Msg::SnapshotPull(SnapshotPull {
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            node: NodeId(3),
+            after: after.clone(),
+            prev: digest,
+        }),
+        Msg::SnapshotChunk(Box::new(SnapshotChunk {
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            after,
+            entries: vec![
+                (
+                    Namespace::User,
+                    Bytes::from_static(b"user-1"),
+                    Bytes::from_static(b"value"),
+                    17,
+                    Generation(2),
+                ),
+                (
+                    Namespace::Progress,
+                    Bytes::from_static(b"p"),
+                    Bytes::new(),
+                    u64::MAX,
+                    Generation(4),
+                ),
+            ],
+            chain: digest,
+            done: true,
+        })),
+        Msg::SnapshotOfferRefused(SnapshotOfferRefused {
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            node: NodeId(3),
+            reason,
+            through: Some(Seq(812)),
+        }),
+    ]
 }
 
 /// A valid partition 1 configuration: the two contract types that validate on decode
@@ -559,6 +635,9 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             not_before: zero(),
         },
     ];
+    let plain = plain
+        .into_iter()
+        .chain(snapshot_msgs(SnapshotRefusal::TailHeld));
     for msg in plain {
         let before = format!("{msg:?}");
         match across(to, msg) {
@@ -3051,5 +3130,42 @@ async fn an_accepted_socket_has_nodelay_set() {
     assert!(
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
+    );
+}
+
+/// Issue #61 S2 (PR-A A8a): every snapshot message crosses the wire field for field, in its own
+/// kind, and the refusal carries each reason, `tail_held` included though A8a never sends it, so
+/// A8b changes no wire shape. Cut: a kind not appended last moves an index, red in `across`.
+/// Unit.
+#[test]
+fn t61_snapshot_wire_round_trip() {
+    let to = NodeId(2);
+    let reasons = [
+        SnapshotRefusal::NotAdopted,
+        SnapshotRefusal::NotPrimary,
+        SnapshotRefusal::NotAhead,
+        SnapshotRefusal::BadBarrier,
+        SnapshotRefusal::TailHeld,
+        SnapshotRefusal::Chain,
+        SnapshotRefusal::Install,
+    ];
+    let mut kinds = BTreeSet::new();
+    for reason in reasons {
+        for msg in snapshot_msgs(reason) {
+            let before = format!("{msg:?}");
+            match across(to, msg) {
+                (Inbound::Plain(at, after), kind) => {
+                    assert_eq!(at, to);
+                    assert_eq!(format!("{after:?}"), before);
+                    kinds.insert(kind);
+                }
+                (other, _) => panic!("{before} landed as {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        kinds,
+        (10..14).collect(),
+        "the four snapshot kinds, appended last"
     );
 }

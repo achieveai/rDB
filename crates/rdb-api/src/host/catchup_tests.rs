@@ -1412,32 +1412,48 @@ fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
     );
 }
 
-/// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired` on the primary is served from its
-/// engine, never by faulting the node. The first ask restores the primary's ladder at its
-/// generation and logs `snapshot_catchup_served` with every rung, root through the head; a
-/// repeat `(copy, barrier)` is dropped; a new ask at that generation logs
-/// `snapshot_catchup_unservable`; and a node that hosts no primary logs
-/// `snapshot_catchup_unserved{reason=no_primary}`. Before H2 every one of these faulted the
-/// node `host_unsupported: kernel_effect SnapshotCatchupRequired`.
-/// Cuts: the arm removed, red (a fault); the dedup removed, red (the repeat logs
-/// `unservable`); the ladder check removed, red (the new ask is served again).
+/// H2 (A-R223, A-R254; issue #61 lead ruling 1): R1's `SnapshotCatchupRequired` on the primary
+/// is served, never by faulting the node, by one of two branches. When the primary's ladder is
+/// thinner than its engine (its first rung above the engine's floor), the ladder is refilled
+/// from the engine and logged `snapshot_catchup_served{how = "ladder"}` with every rung, root
+/// through the head. Once it is dense, a new ask opens a snapshot transfer at the head
+/// (`snapshot_transfer_opened`): copy 2's second ask, at the same barrier, since a refill is
+/// never deduped. Its third reaches the open transfer and is dropped
+/// (`snapshot_catchup_in_flight{at = S}`, lead ruling 2), and a node that hosts no primary logs
+/// `snapshot_catchup_unserved{reason = no_primary}`.
+/// Cuts: the arm removed, red (a fault); the in-flight check removed, red (the third ask is
+/// deduped silently, no `in_flight` line); a refill deduped, red (the second ask is dropped, no transfer); the transfer
+/// branch always taken, red (the first ask opens a transfer).
 /// Integration (~2 s): bootstrap's discovery window, then direct calls.
 #[config_log::retcd_test]
-fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
+fn h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer() {
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), Trio::fast);
     trio.bootstrap();
     trio.ready();
     let head = trio.head().expect("node 1 holds a head");
+    let p = PartitionId(1);
+    // Thin the primary's ladder only: its engine still holds every record from the root.
+    let primary = &mut trio.nodes[0].0;
+    let rung = primary
+        .replication
+        .primary(NodeId(1), p)
+        .and_then(|primary| primary.tracker().history().digest_at(Seq(head)))
+        .expect("node 1's ladder holds its head");
+    primary
+        .replication
+        .trim_history(NodeId(1), p, Seq(head), rung)
+        .expect("thin the primary's ladder");
+    assert_eq!(super::trio::ladder_floor(primary), Some(Seq(head)));
     let site = Site {
-        partition: PartitionId(1),
+        partition: p,
         correlation: CorrelationId(u64::MAX),
     };
     let ask = |copy: u8, barrier: u64| KernelEffect::SnapshotCatchupRequired {
         copy: CopyId(copy),
         barrier: Seq(barrier),
     };
-    for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 3, head), (1, 3, head)] {
+    for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 2, head), (1, 3, head)] {
         let host = &mut trio.nodes[node].0;
         assert_eq!(
             host.kernel(
@@ -1453,39 +1469,31 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
         );
         assert_eq!(host.fault, None, "node {} faulted", host.node.0);
     }
-    let generation = trio.nodes[0]
-        .0
-        .replication
-        .primary(NodeId(1), PartitionId(1))
-        .expect("node 1 is primary")
-        .tracker()
-        .lineage()
-        .generation;
-    assert!(
-        trio.nodes[0]
-            .0
-            .primary_ladders
-            .contains(&(PartitionId(1), generation)),
-        "node 1's primary holds its ladder at generation {}",
-        generation.0
+    assert_eq!(
+        super::trio::ladder_floor(&trio.nodes[0].0),
+        Some(Seq::ZERO),
+        "the refill made node 1's ladder dense from the root"
     );
     let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
         module_path!(),
-        "h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine",
+        "h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer",
     )
     .into_iter()
     .filter(|line| {
         line["@m"]
             .as_str()
-            .is_some_and(|m| m.starts_with("snapshot_catchup_"))
+            .is_some_and(|m| m.starts_with("snapshot_catchup_") || m == "snapshot_transfer_opened")
     })
     .map(|line| {
         (
             line["@m"].as_str().unwrap_or_default().to_owned(),
             line["node"].as_u64(),
             line["copy"].as_u64(),
-            line["rungs"].as_u64(),
-            line["reason"].as_str().map(str::to_owned),
+            line["rungs"].as_u64().or(line["at"].as_u64()),
+            line["how"]
+                .as_str()
+                .or(line["reason"].as_str())
+                .map(str::to_owned),
         )
     })
     .collect();
@@ -1497,13 +1505,20 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
                 Some(1),
                 Some(2),
                 Some(head + 1),
+                Some("ladder".to_owned())
+            ),
+            (
+                "snapshot_transfer_opened".to_owned(),
+                Some(1),
+                Some(2),
+                Some(head),
                 None
             ),
             (
-                "snapshot_catchup_unservable".to_owned(),
+                "snapshot_catchup_in_flight".to_owned(),
                 Some(1),
-                Some(3),
-                None,
+                Some(2),
+                Some(head),
                 None
             ),
             (
@@ -1514,7 +1529,12 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
                 Some("no_primary".to_owned())
             ),
         ],
-        "served once, the repeat dropped, a new ask unservable, no primary unserved"
+        "refilled, then a transfer at the head, the third ask in flight, no primary unserved"
+    );
+    assert_eq!(
+        trio.nodes[0].0.transfers.keys().collect::<Vec<_>>(),
+        [&(p, CopyId(2))],
+        "node 1 holds copy 2's transfer only"
     );
 }
 
@@ -4786,19 +4806,29 @@ fn t61_a_restarted_holder_does_not_trim_before_adopting() {
     assert_eq!(logged!(METHOD, "host_history_trimmed").len(), 2);
 }
 
-/// Issue #61 (design rev 4 N4): until the snapshot transfer (A8) lands, a primary whose engine
-/// is trimmed refuses a copy's snapshot catch-up and reads nothing below its floor. Node 1, the
-/// primary, is trimmed to its head; R1's `SnapshotCatchupRequired` for copy 3 logs
-/// `snapshot_catchup_unservable{reason=below_floor, floor}`, no ladder is restored, and
-/// nothing is served.
-/// Cut: the floor refusal removed, red (`snapshot_catchup_served`, rungs from F).
-/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+/// Issue #61 S2 (A8a, lead ruling 1, the transfer branch): a primary trimmed to its head holds a
+/// ladder as dense as its engine, so R1's `SnapshotCatchupRequired` for node 3's copy opens a transfer
+/// at its applied seq `S` (`snapshot_transfer_opened{at = S, floor = F}`) and refills nothing.
+/// While it is open the transfer pins `S`: with node 3's links held, two more puts land and a
+/// trim past `S` is refused `transfer_pinned` (`history_trim_transfer_pinned{pin = S}`). Then
+/// the heal ends the transfer one of two ways, whichever lands first: the offer reaches copy 3,
+/// which already applied `S` and refuses `not_ahead` (`why = refused`), or R1's cursor sends it
+/// the two puts and its `CopyCaughtUp` releases the pin (`why = caught_up`). Either way the
+/// transfer is released once and the same trim goes through. Accepting either ending is sound
+/// only because S2-R5 (`t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched`)
+/// pins the `not_ahead` refusal on its own; drop that row and this one must pin it.
+/// Replaces A5's `t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor`, whose refusal
+/// A8a deletes.
+/// Cuts: the refill branch always taken, red (no transfer); the pin ignored, red (the trim
+/// past `S` lands); the transfer never released, red (the trim stays pinned).
+/// Integration (~3 s): bootstrap's discovery window, a hold and a heal.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
-fn t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor() {
-    const METHOD: &str = "t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor";
+fn t61_a_trimmed_primary_opens_a_transfer_and_pins_its_seq() {
+    const METHOD: &str = "t61_a_trimmed_primary_opens_a_transfer_and_pins_its_seq";
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), Trio::fast);
+    let p = PartitionId(1);
     trio.bootstrap();
     trio.ready();
     for request in 1..=3 {
@@ -4808,13 +4838,29 @@ fn t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor() {
         ));
     }
     let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
     assert_eq!(
         super::trio::trim(&mut trio, 0, head),
         Ok(Seq(head)),
         "node 1 trimmed to its head"
     );
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
     let site = Site {
-        partition: PartitionId(1),
+        partition: p,
         correlation: CorrelationId(u64::MAX),
     };
     let host = &mut trio.nodes[0].0;
@@ -4822,7 +4868,7 @@ fn t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor() {
         host.kernel(
             ModuleName::Replication,
             &KernelEffect::SnapshotCatchupRequired {
-                copy: CopyId(3),
+                copy: three,
                 barrier: Seq(head),
             },
             site,
@@ -4832,32 +4878,54 @@ fn t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor() {
         Ok(())
     );
     assert_eq!(host.fault, None);
-    assert!(host.primary_ladders.is_empty(), "no ladder restored");
-    let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
-        .into_iter()
-        .filter(|line| {
-            line["@m"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("snapshot_catchup_"))
-        })
-        .map(|line| {
-            (
-                line["@m"].as_str().unwrap_or_default().to_owned(),
-                line["copy"].as_u64(),
-                line["reason"].as_str().map(str::to_owned),
-                line["floor"].as_u64(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        lines,
-        [(
-            "snapshot_catchup_unservable".to_owned(),
-            Some(3),
-            Some("below_floor".to_owned()),
-            Some(head)
-        )]
+    assert!(
+        host.transfers.contains_key(&(p, three)),
+        "a transfer opened"
     );
+    for request in 4..=5 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let past = trio.head().expect("node 1 holds a head");
+    assert!(past > head, "the puts moved the head past S");
+    assert_eq!(
+        super::trio::trim(&mut trio, 0, past),
+        Err("transfer_pinned".to_owned()),
+        "a trim past S is refused while the transfer is open"
+    );
+    trio.links.heal_all();
+    trio.until("the refusal frees the pin", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(p, three))).then_some(())
+    });
+    assert_eq!(super::trio::trim(&mut trio, 0, past), Ok(Seq(past)));
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(
+        (&opened[0]["copy"], &opened[0]["at"], &opened[0]["floor"]),
+        (
+            &serde_json::json!(three.0),
+            &serde_json::json!(head),
+            &serde_json::json!(head)
+        )
+    );
+    assert!(
+        logged!(METHOD, "snapshot_catchup_served").is_empty(),
+        "nothing refilled"
+    );
+    let pinned = logged!(METHOD, "history_trim_transfer_pinned");
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(pinned[0]["pin"], head);
+    let released = logged!(METHOD, "snapshot_transfer_released");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert!(
+        released[0]["why"] == "refused" || released[0]["why"] == "caught_up",
+        "{released:?}"
+    );
+    for refused in logged!(METHOD, "snapshot_offer_refused") {
+        assert_eq!(refused["reason"], "not_ahead", "{refused:?}");
+    }
 }
 
 /// Issue #61: put on whichever trio node admits writes (as `Db` routes a put to the owner)
@@ -5128,5 +5196,252 @@ fn t61_refused_receiver_without_live_readd_anchors_at_root_below_floor() {
             digest: Digest::ROOT
         },
         "anchored at the root, not at rung 2"
+    );
+}
+
+/// Issue #61 S2 (A8a): the chunk chain's known answer, so the sim's twin and any later change to
+/// the encoding are caught: two pages chained from a barrier digest, pinned in hex. Each part's
+/// change moves the answer: the label, `prev`, a namespace, a key, a value, a version and a
+/// generation. Cut: drop any one part from [`super::snapshot::chunk_chain`], red (the pin).
+/// Unit.
+#[test]
+fn t61_chunk_chain_known_answer() {
+    use super::snapshot::chunk_chain;
+    let hex = |digest: Digest| -> String { digest.0.iter().map(|b| format!("{b:02x}")).collect() };
+    let barrier = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let entry = |ns, key: &'static [u8], value: &'static [u8], version, generation| {
+        (
+            ns,
+            Bytes::from_static(key),
+            Bytes::from_static(value),
+            version,
+            Generation(generation),
+        )
+    };
+    let first = [
+        entry(Namespace::User, b"a", b"1", 7, 2),
+        entry(Namespace::Dedup, b"b", b"", 8, 3),
+    ];
+    let second = [entry(Namespace::Progress, b"c", b"3", 9, 3)];
+    let one = chunk_chain(barrier, &first);
+    let two = chunk_chain(one, &second);
+    assert_eq!(
+        (hex(one), hex(two), hex(chunk_chain(barrier, &[]))),
+        (
+            "0e0607de51f50f0fcd0ce19c419996f45880bf894411fb348032f30ac9c5fc75".to_owned(),
+            "164ff67cfb79c6342b15d1979f39cc50e3236363bd94e89cfc375a05466aa64e".to_owned(),
+            "cebb77f7a3478e41f2072ae75121888594fd5b50dbfeecf20da013017ef16be8".to_owned()
+        ),
+        "the chunk chain's encoding moved"
+    );
+    let moved = [
+        chunk_chain(Digest::ROOT, &first),
+        chunk_chain(
+            barrier,
+            &[
+                entry(Namespace::Progress, b"a", b"1", 7, 2),
+                first[1].clone(),
+            ],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"x", b"1", 7, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"2", 7, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"1", 6, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"1", 7, 1), first[1].clone()],
+        ),
+        chunk_chain(barrier, &first[..1]),
+    ];
+    for (at, digest) in moved.iter().enumerate() {
+        assert_ne!(*digest, one, "change {at} left the chain unmoved");
+    }
+}
+
+/// Issue #61 S2-R5 (design section 2 step 2, rev 5 M1): an offer the target did not ask for is
+/// refused before anything is written. Node 3, a live copy at `applied`, is handed offers
+/// built from its own adopted view with one thing wrong each: the owner epoch below its own
+/// (a deposed primary of the same generation), the generation below its own (an older offer
+/// replayed), the primary's boot changed, `S` at its own applied seq, and a barrier that names
+/// another seq. Each logs `snapshot_offer_refused` with its reason, in that order
+/// (`not_adopted`, `not_adopted`, `not_primary`, `not_ahead`, `bad_barrier`), no install
+/// starts, and node 3's engine is record-for-record what it was (`rdb_storage::dump`).
+/// Cut: the authority check skipped, red (the first offer is accepted and pulls).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls on node 3.
+#[config_log::retcd_test]
+fn t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched() {
+    const METHOD: &str = "t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    let p = PartitionId(1);
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    let barrier_at = |seq: u64| {
+        trio.nodes[0]
+            .0
+            .engine
+            .history_at(
+                p,
+                trio.nodes[0]
+                    .0
+                    .replication
+                    .primary(NodeId(1), p)
+                    .expect("primary")
+                    .tracker()
+                    .lineage()
+                    .generation,
+                Seq(seq),
+            )
+            .expect("read")
+            .expect("held")
+            .0
+    };
+    let barrier = barrier_at(head);
+    let host = &mut trio.nodes[2].0;
+    let receiver = host
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver");
+    let lineage = receiver.lineage();
+    let applied = receiver.applied_head().seq;
+    let primary = *receiver
+        .config()
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .expect("a primary");
+    assert!(
+        lineage.generation.0 > 0 && lineage.owner_epoch.0 > 0,
+        "{lineage:?}"
+    );
+    let good = SnapshotOffer {
+        lineage,
+        config_version: receiver.config().config_version,
+        from: primary.node,
+        boot: primary.boot,
+        copy: receiver.copy(),
+        at: Seq(applied.0 + 5),
+        root: (Seq::ZERO, Digest::ROOT),
+        barrier: barrier.clone(),
+        released_through: None,
+    };
+    let offers = [
+        SnapshotOffer {
+            lineage: Lineage {
+                owner_epoch: OwnerEpoch(lineage.owner_epoch.0 - 1),
+                ..lineage
+            },
+            ..good.clone()
+        },
+        SnapshotOffer {
+            lineage: Lineage {
+                generation: Generation(lineage.generation.0 - 1),
+                ..lineage
+            },
+            ..good.clone()
+        },
+        SnapshotOffer {
+            boot: BootId(primary.boot.0 + 1),
+            ..good.clone()
+        },
+        SnapshotOffer {
+            at: applied,
+            ..good.clone()
+        },
+        good,
+    ];
+    let before = format!(
+        "{:?}",
+        rdb_storage::dump(dir.path().join("3")).expect("dump")
+    );
+    for offer in offers {
+        host.snapshot_offer(offer);
+        assert!(host.installs.is_empty(), "an install started");
+        assert_eq!(host.fault, None);
+    }
+    let after = format!(
+        "{:?}",
+        rdb_storage::dump(dir.path().join("3")).expect("dump")
+    );
+    assert!(before == after, "node 3's engine changed");
+    let reasons: Vec<_> = logged!(METHOD, "snapshot_offer_refused")
+        .iter()
+        .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "not_adopted",
+            "not_adopted",
+            "not_primary",
+            "not_ahead",
+            "bad_barrier"
+        ]
+    );
+    assert!(logged!(METHOD, "snapshot_offer_accepted").is_empty());
+}
+
+/// Issue #61 S2 (A8a, lead ruling on the re-seed, condition 1): a re-seeded receiver ACKs `S`
+/// only when it is durable through `S`. Over node 3's adopted config, copy and lineage, a
+/// receiver at head `S` with `durable = S - 1` gets no ACK from [`super::snapshot::reseed_ack`]
+/// (the re-seed would log `snapshot_reseed_ack_withheld` and wait for its flush); with
+/// `durable = S` it gets an ACK at `S`, durable `S`, with the barrier's digest.
+/// Cut: the durable check dropped, red (the first receiver ACKs `S`).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn t61_a_reseed_below_its_durable_does_not_ack_s() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), PartitionId(1))
+        .expect("node 3's receiver");
+    let at = Seq(7);
+    let digest = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let reseeded = |durable: u64| {
+        AppendReceiver::new(ReceiverInit {
+            config: held.config().clone(),
+            own: held.copy(),
+            lineage: held.lineage(),
+            head: Head { seq: at, digest },
+            durable: DurableSeq(durable),
+        })
+        .expect("a live receiver")
+    };
+    assert_eq!(super::snapshot::reseed_ack(&reseeded(at.0 - 1), at), None);
+    let ack = super::snapshot::reseed_ack(&reseeded(at.0), at).expect("an ACK at S");
+    assert_eq!(
+        (
+            ack.progress.buffered_applied.0,
+            ack.progress.durable.0,
+            ack.digest_at_buffered
+        ),
+        (at.0, at.0, digest)
     );
 }

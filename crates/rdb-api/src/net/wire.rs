@@ -42,6 +42,7 @@ use rdb_value::{cbor, Document, Expected};
 use serde::{Deserialize, Serialize};
 
 use crate::db::ApiError;
+use crate::host::snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 use crate::host::{
     Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg, NodeStatus,
     PeerAsk, PutOp, Seen,
@@ -208,6 +209,18 @@ pub enum WireMsg {
         generation: Generation,
         through: Seq,
     },
+    /// Appended (PR-A's protocol bump, issue #61 S2): a snapshot offer, its pulls, its pages and
+    /// its refusal. Last, so no earlier kind's encoded index moves (`net::tests::kind`).
+    SnapshotOffer { to: NodeId, offer: SnapshotOffer },
+    /// Issue #61 S2: the target asks for a page.
+    SnapshotPull { to: NodeId, pull: SnapshotPull },
+    /// Issue #61 S2: one page.
+    SnapshotChunk { to: NodeId, chunk: SnapshotChunk },
+    /// Issue #61 S2: the target refused.
+    SnapshotOfferRefused {
+        to: NodeId,
+        refused: SnapshotOfferRefused,
+    },
 }
 
 impl WireMsg {
@@ -221,6 +234,10 @@ impl WireMsg {
             | Self::Restore { to, .. }
             | Self::Routed { to, .. }
             | Self::DurableProved { to, .. }
+            | Self::SnapshotOffer { to, .. }
+            | Self::SnapshotPull { to, .. }
+            | Self::SnapshotChunk { to, .. }
+            | Self::SnapshotOfferRefused { to, .. }
             | Self::Landed { to, .. }
             | Self::Client { to, .. }
             | Self::Inspect { to, .. }
@@ -238,6 +255,10 @@ impl WireMsg {
             Self::Restore { .. } => "restore",
             Self::Routed { .. } => "routed",
             Self::DurableProved { .. } => "durable_proved",
+            Self::SnapshotOffer { .. } => "snapshot_offer",
+            Self::SnapshotPull { .. } => "snapshot_pull",
+            Self::SnapshotChunk { .. } => "snapshot_chunk",
+            Self::SnapshotOfferRefused { .. } => "snapshot_offer_refused",
             Self::Landed { .. } => "landed",
             Self::Client { .. } => "client",
             Self::Inspect { .. } => "inspect",
@@ -360,6 +381,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             generation,
             through,
         },
+        Msg::SnapshotOffer(offer) => WireMsg::SnapshotOffer { to, offer: *offer },
+        Msg::SnapshotPull(pull) => WireMsg::SnapshotPull { to, pull },
+        Msg::SnapshotChunk(chunk) => WireMsg::SnapshotChunk { to, chunk: *chunk },
+        Msg::SnapshotOfferRefused(refused) => WireMsg::SnapshotOfferRefused { to, refused },
         Msg::Routed {
             partition,
             correlation,
@@ -566,6 +591,16 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 through,
             },
         ),
+        WireMsg::SnapshotOffer { to, offer } => {
+            Inbound::Plain(to, Msg::SnapshotOffer(Box::new(offer)))
+        }
+        WireMsg::SnapshotPull { to, pull } => Inbound::Plain(to, Msg::SnapshotPull(pull)),
+        WireMsg::SnapshotChunk { to, chunk } => {
+            Inbound::Plain(to, Msg::SnapshotChunk(Box::new(chunk)))
+        }
+        WireMsg::SnapshotOfferRefused { to, refused } => {
+            Inbound::Plain(to, Msg::SnapshotOfferRefused(refused))
+        }
         WireMsg::Restore {
             to,
             partition,
