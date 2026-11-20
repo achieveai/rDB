@@ -49,9 +49,9 @@ pub mod transport;
 mod test_store;
 
 pub use db::{
-    app_request_id, ApiError, Db, DbConfig, GetOk, Limit, NodeAddresses, NotReady,
+    app_request_id, ApiError, AsyncDb, Db, DbConfig, GetOk, Limit, NodeAddresses, NotReady,
     OpenError, PartitionReady, PutError, PutOk, ReadOk, StorageOptions, Timeouts, TooLarge, TxnPut,
-    MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE,
+    TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE,
     TENANT,
 };
 pub use host::{Change, ListEdit, Look, Seen};

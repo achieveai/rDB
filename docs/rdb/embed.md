@@ -170,7 +170,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 ```
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
-  calls; do not call them from inside an async task.
+  calls. Do not call them inline from an async task: wrap the `Db` in `AsyncDb`
+  ([Async calls](#async-calls)), whose calls never block a tokio worker.
 - The runtime whose handle you pass must keep running until `db.shutdown()` returns. Control
   calls to rEtcd, watches and the reopen's repair run as tasks on it, also while your thread
   sits in `wait_ready`, `put` or `get`. A multi-thread runtime, as above, does that. A
@@ -271,6 +272,45 @@ fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
 - Sets work the same way with `Change::Set` and `ElemOp::Add` / `ElemOp::Remove`.
 - This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
   (`guide_sample`), so it matches this release.
+
+### Async calls
+
+Every `Db` call but `open` blocks its thread until the node answers (#146). Called inline from
+a task, it parks a tokio worker for the whole call. On a current-thread runtime it can also wait
+for a task that cannot run: `db.route(..)` on a cold cache waits for a control read on the
+`Db`'s own runtime, and answers `UNAVAILABLE "did not read within"`.
+
+`rdb_api::AsyncDb` wraps an `Arc<Db>` and runs each call, unchanged, on tokio's blocking pool
+(`spawn_blocking`), so no worker waits:
+
+```rust,ignore
+let db = AsyncDb::new(Arc::new(Db::open(config, store, handle).await?));
+db.wait_ready(Duration::from_secs(30)).await?;
+let put = db.put(group, Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).await?;
+let got = db.get(group, Bytes::from_static(b"k")).await?;
+db.shutdown().await.ok();
+```
+
+- The calls are `wait_ready`, `put`, `get`, `read`, `write`, `txn`, `txn_as`, `resend_within`,
+  `status`, `route` and `ownership_events`. Each names its group; each answers exactly what the
+  sync `_in` call answers, with the same timeouts, errors and retry rules.
+- `txn` and `txn_as` take `Vec<TxnWrite>`, the owned form of `TxnPut`.
+- `status(group, request, generation)` is `status_in`. Ask with the write's generation: with
+  the ack floor on, asked with `None`, an acknowledged write answers `Unknown`.
+- `ownership_events()` returns a `tokio::sync::mpsc::Receiver`. One blocking-pool thread carries
+  the events; it lets go within 100 ms of the receiver being dropped.
+- `db.db()` gives the `Db` for the calls that never block: `ownership` and `still_owner`. Admin and dev calls have no async form; wrap them in `spawn_blocking` yourself.
+- Await the calls inside any tokio runtime: its blocking pool runs them. That pool is bounded
+  (512 threads by default). Past that, calls queue on the pool; no worker blocks.
+- A panic inside a call reaches the task that awaited it, as the sync call's panic would.
+- Dropping the last `AsyncDb` (and the last `Arc<Db>`) inside a task drops the `Db`, whose
+  `Drop` stops and joins its node threads, on that task's thread. End with
+  `db.shutdown().await`, which does that on the blocking pool. It answers `Err(db)`, doing
+  nothing, while another clone is alive.
+- A runtime that is dropped waits for the blocking-pool calls still running.
+- To restart an embedded `Db` that runs its own links: `db.shutdown().await`, then shut the
+  `Net` down (`Net::shutdown`, which #81 adds), then drop the `Db`, the `Net` and the `Links`,
+  then open again. A `Db` shutdown does not stop its `Net`.
 
 ### How big a transaction can be
 

@@ -139,6 +139,14 @@ const PUT_COST: usize = 71;
 pub const MAX_PAGE: usize = 1_000;
 
 mod ack_floor;
+mod async_db;
+pub use async_db::{AsyncDb, TxnWrite};
+
+// `AsyncDb` hands an `Arc<Db>` to the blocking pool, so `Db` must be `Send + Sync` (#146).
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    shared::<Db>();
+};
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
