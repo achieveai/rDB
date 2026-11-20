@@ -3215,12 +3215,17 @@ fn where_line(db: &Db, group: rdb_api::AffinityId) -> String {
 }
 
 /// `admin route G` (#83): `Db::route`'s answer, the partition and the owner and token its record
-/// names, or `err admin route G: <why>`.
+/// names, and the owner's app address (`addr none` when it registered none), or
+/// `err admin route G: <why>`.
 fn route_line(db: &Db, group: rdb_api::AffinityId) -> String {
     match db.route(group) {
         Ok(route) => format!(
-            "route group {} partition {} owner node {} token {}",
-            group.0, route.partition.0, route.owner.0, route.token
+            "route group {} partition {} owner node {} token {} addr {}",
+            group.0,
+            route.partition.0,
+            route.owner.0,
+            route.token,
+            route.app_address().unwrap_or("none")
         ),
         Err(e) => format!("err admin route {}: {e}", group.0),
     }

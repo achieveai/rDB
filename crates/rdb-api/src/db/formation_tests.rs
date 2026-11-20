@@ -52,6 +52,9 @@ struct Rig {
     addrs: BTreeMap<NodeId, String>,
     /// The listeners bound when the rig was made, each until its node's first open takes it.
     reserved: std::sync::Mutex<BTreeMap<NodeId, tokio::net::TcpListener>>,
+    /// The app address each node registers when [`Rig::open_all`] or [`Rig::restart`] opens it
+    /// (#83 B2); a node not named registers none.
+    apps: BTreeMap<NodeId, String>,
 }
 
 impl Drop for Rig {
@@ -131,10 +134,12 @@ fn open_node(
         listener,
         addrs,
         Timeouts::default(),
+        None,
     )
 }
 
-/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop).
+/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop) and the app address the
+/// node registers (#83 B2).
 #[allow(clippy::too_many_arguments)]
 fn open_node_with(
     rt: &tokio::runtime::Runtime,
@@ -145,6 +150,7 @@ fn open_node_with(
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
+    app: Option<&str>,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
@@ -174,6 +180,7 @@ fn open_node_with(
             addresses: Some(NodeAddresses {
                 listen: addrs[&node].clone(),
                 peers: addrs.clone(),
+                app: app.map(str::to_owned),
             }),
             ..config(dir)
         },
@@ -229,6 +236,7 @@ fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
         own_runtimes: false,
         addrs,
         reserved: std::sync::Mutex::new(reserved),
+        apps: BTreeMap::new(),
     }
 }
 
@@ -379,6 +387,7 @@ impl Rig {
                 listener,
                 &addrs,
                 self.timeouts,
+                self.apps.get(node).map(String::as_str),
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
@@ -2544,6 +2553,7 @@ impl Rig {
             listener,
             &self.addrs,
             timeouts,
+            self.apps.get(&node).map(String::as_str),
         )
         .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
         self.procs.insert(
@@ -3370,6 +3380,7 @@ fn declared_addresses() -> NodeAddresses {
         peers: (1..=3)
             .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
             .collect(),
+        app: None,
     }
 }
 
@@ -3621,4 +3632,278 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
         "{again:?}"
     );
     assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
+}
+
+/// Two groups that both map to `partition`: two workspaces that move together.
+fn two_groups_of(db: &Db, partition: u32) -> (AffinityId, AffinityId) {
+    let mut groups = (1..1_000_000)
+        .map(AffinityId)
+        .filter(|group| db.partition_of(*group) == PartitionId(partition));
+    let first = groups.next().expect("a group");
+    (first, groups.next().expect("a second group"))
+}
+
+/// `route(group)` on `db` until it names `owner`, bounded: the gateway's node reads the new
+/// record once its `partitions/` watch delivers the change.
+fn route_names(db: &Db, group: AffinityId, owner: NodeId) -> crate::RouteInfo {
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let route = db.route(group).expect("a route");
+        if route.owner == owner {
+            return route;
+        }
+        assert!(Instant::now() < until, "route still names {route:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The app address node N registers in the B2 rows: SBX's gateway port beside it.
+fn app_of(node: NodeId) -> String {
+    format!("https://gw-{}.example:8443", node.0)
+}
+
+/// [`declared_rig_of`] with every node registering [`app_of`] at open (#83 B2).
+fn declared_rig_with_apps(k: u32, partitions: u32) -> Rig {
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), k);
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration of {k} nodes is written: {other:?}"),
+    }
+    rig.apps = (1..=k).map(|n| (NodeId(n), app_of(NodeId(n)))).collect();
+    rig.open_all(fresh_dirs_of(k));
+    rig
+}
+
+/// own83_b2_1 (#83 B2 acceptance; SBX's scenarios "forwarding to the owner" and "a partition's
+/// workspaces move together"; #84's epoch): five declared node processes, each on its own host,
+/// each registering its app address at open. The gateway in node 2's process routes two
+/// workspaces of partition 4, which the ring places on node 4: both name node 4, node 4's app
+/// address and one token, and `leader_of(4)` says the same. In node 4's process,
+/// `ownership(4)` holds that token, the epoch SBX stamps on its side effects. Node 4 stops and
+/// partition 4 is promoted to node 5 from node 2's process: both workspaces now route to node 5
+/// at node 5's app address, under a higher token, which node 5's `ownership` holds; node 5 does
+/// not own the old token; a put through the gateway lands in partition 4 and the write made
+/// before the move reads back. Cuts: the open's `register_app_addr` call removed, red at the
+/// first route (no address); the address read for a fixed node (node 1), red at the first
+/// route (node 1's address). Integration (~10 s): five processes' formation and a promote that
+/// waits out node 4's grant.
+#[config_log::retcd_test]
+fn own83_b2_1_route_forwards_to_the_owners_app_address_across_a_promote() {
+    const P: u32 = 4;
+    let mut rig = declared_rig_with_apps(S1B_K, S1B_P);
+    rig.wait_ready();
+    let owner = NodeId(ring(S1B_K, P).primary);
+    assert_eq!(owner, NodeId(4), "the ring places partition 4 on node 4");
+    let gateway = rig.of(NodeId(2));
+    let (a, b) = two_groups_of(gateway, P);
+    let before = gateway.route(a).expect("a route");
+    assert_eq!(
+        (before.partition, before.owner, before.app_address()),
+        (PartitionId(P), owner, Some(app_of(owner).as_str())),
+        "{before:?}"
+    );
+    assert_eq!(
+        gateway.route(b).expect("a route"),
+        before,
+        "workspaces move together"
+    );
+    assert_eq!(
+        gateway.leader_of(PartitionId(P)).expect("leader_of"),
+        before
+    );
+    let held = rig
+        .of(owner)
+        .ownership(PartitionId(P))
+        .expect("node 4 leads partition 4");
+    assert_eq!(
+        held.token, before.token,
+        "the epoch the owner stamps is route's"
+    );
+    put_lands(gateway, a, b"before", b"1");
+
+    rig.stop(owner);
+    let to = NodeId(5);
+    rig.of(NodeId(2))
+        .promote_partition(PartitionId(P), to, None)
+        .unwrap_or_else(|e| panic!("node 4 is stopped: {e}"));
+    let gateway = rig.of(NodeId(2));
+    let after = route_names(gateway, a, to);
+    assert_eq!(
+        (after.partition, after.app_address()),
+        (PartitionId(P), Some(app_of(to).as_str())),
+        "{after:?}"
+    );
+    assert!(after.token > before.token, "{after:?} after {before:?}");
+    assert_eq!(
+        route_names(gateway, b, to),
+        after,
+        "workspaces move together"
+    );
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    let now_held = loop {
+        if let Some(held) = rig.of(to).ownership(PartitionId(P)) {
+            break held;
+        }
+        assert!(Instant::now() < until, "node 5 never led partition 4");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        now_held.token, after.token,
+        "the new owner stamps route's token"
+    );
+    assert!(!rig.of(to).still_owner(PartitionId(P), before.token));
+    let put = put_lands(gateway, b, b"after", b"2");
+    assert_eq!(put.partition, PartitionId(P), "{put:?}");
+    let got = gateway.get_in(a, b"before").expect("a get");
+    assert_eq!(
+        got.value.as_ref().map(|(_, value)| &value[..]),
+        Some(&b"1"[..]),
+        "the write made before the move reads back: {got:?}"
+    );
+}
+
+/// The `nodes/{id}` record's body and its mod revision.
+fn node_record(rig: &Rig, node: NodeId) -> (Bytes, u64) {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Node(node).encode()),
+        }))
+        .expect("a read");
+    let record = read.record.expect("the record");
+    (record.value, record.mod_revision)
+}
+
+/// own83_b2_2 (#83 B2, owner ruling 2026-11-19): a declared open writes its app address into
+/// its own `nodes/{id}` record (layout 2), changing no declared field: `read_nodes` reads the
+/// records the declaration wrote, and declaring the same again is `Already`. A restart with the
+/// same address writes nothing (the mod revision stays); a restart with another replaces it;
+/// a restart with none keeps the stored one. Cut: the "already holds it" check removed, red at
+/// "same address". Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_2_a_declared_open_registers_its_app_address_once_per_change() {
+    let mut rig = declared_rig_with_apps(3, PARTITIONS);
+    rig.wait_ready();
+    let node = NodeId(2);
+    let (body, first) = node_record(&rig, node);
+    assert_eq!(
+        NodeRecord::decode_with_app(&body).and_then(|(_, app)| app),
+        Some(app_of(node)),
+        "layout 2 holds the app address"
+    );
+    let declared = rig.declaration();
+    let read = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("records");
+    for decl in &declared.nodes {
+        assert_eq!(
+            read[&decl.node].addr, decl.addr,
+            "the declared fields are unchanged"
+        );
+    }
+    assert!(
+        matches!(
+            rig.rt.block_on(admin::declare(&rig.store, &declared)),
+            Ok(admin::Declared::Already(_))
+        ),
+        "the same declaration is adopted"
+    );
+
+    rig.restart(node, Timeouts::default());
+    assert_eq!(
+        node_record(&rig, node).1,
+        first,
+        "same address: nothing written"
+    );
+
+    rig.apps.insert(node, "gw-2.other:9000".to_owned());
+    rig.restart(node, Timeouts::default());
+    let (body, moved) = node_record(&rig, node);
+    assert!(moved > first, "another address is written");
+    assert_eq!(
+        NodeRecord::decode_with_app(&body)
+            .and_then(|(_, app)| app)
+            .as_deref(),
+        Some("gw-2.other:9000")
+    );
+
+    rig.apps.remove(&node);
+    rig.restart(node, Timeouts::default());
+    let (body, kept) = node_record(&rig, node);
+    assert_eq!(kept, moved, "no address: nothing written");
+    assert_eq!(
+        NodeRecord::decode_with_app(&body)
+            .and_then(|(_, app)| app)
+            .as_deref(),
+        Some("gw-2.other:9000"),
+        "kept"
+    );
+}
+
+/// own83_b2_3 (#83 B2): an app address is refused where no record can hold it, or out of
+/// bounds, before anything is written: an empty one and one of 513 bytes on a declared open,
+/// and any on an undeclared one. Each leaves the store as it was. Cut: the undeclared refusal
+/// removed, red: the open goes on and is refused for another reason (no `partitions/1`).
+/// Unit (<1 s, an in-memory store, no net).
+#[config_log::retcd_test]
+fn own83_b2_3_an_app_address_is_refused_where_no_record_can_hold_it() {
+    let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let empty = snapshot(&rig.rt, &*rig.store);
+    let dir = folder();
+    let undeclared = rig.rt.block_on(Db::open_with(
+        DbConfig {
+            local: vec![NodeId(1)],
+            addresses: Some(NodeAddresses {
+                app: Some("gw-1:8443".to_owned()),
+                ..declared_addresses()
+            }),
+            ..config(&dir.0)
+        },
+        Arc::clone(&rig.store),
+        rig.rt.handle().clone(),
+        fast(),
+    ));
+    let refused = undeclared.expect_err("undeclared");
+    assert!(
+        refused.to_string().contains("only a declared database"),
+        "{refused}"
+    );
+    assert_eq!(snapshot(&rig.rt, &*rig.store), empty, "nothing was written");
+
+    rig.declare_created();
+    let declared = snapshot(&rig.rt, &*rig.store);
+    for app in [
+        String::new(),
+        "a".repeat(rdb_core::authority::node::MAX_APP_ADDR_LEN + 1),
+    ] {
+        let dir = folder();
+        let opened = rig.rt.block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(1)],
+                addresses: Some(NodeAddresses {
+                    app: Some(app.clone()),
+                    ..declared_addresses()
+                }),
+                ..config(&dir.0)
+            },
+            Arc::clone(&rig.store),
+            rig.rt.handle().clone(),
+            fast(),
+        ));
+        let refused = opened.expect_err("out of bounds");
+        assert!(
+            refused.to_string().contains("app address"),
+            "{} bytes: {refused}",
+            app.len()
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            declared,
+            "nothing was written"
+        );
+    }
 }

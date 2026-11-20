@@ -2555,6 +2555,8 @@ struct RouteStore {
     inner: config_testkit::MemStore,
     /// Reads of a `partitions/` key so far.
     reads: std::sync::atomic::AtomicU32,
+    /// Reads of a `nodes/` key so far (#83 B2).
+    node_reads: std::sync::atomic::AtomicU32,
     /// While set, a `partitions/` read waits at `gate` after it has read.
     hold: AtomicBool,
     gate: tokio::sync::Semaphore,
@@ -2577,6 +2579,9 @@ impl ConfigStore for RouteStore {
         'a: 'b,
         Self: 'b,
     {
+        if request.key.starts_with(b"nodes/") {
+            self.node_reads.fetch_add(1, Ordering::SeqCst);
+        }
         if !request.key.starts_with(b"partitions/") {
             return self.inner.get(request);
         }
@@ -2663,6 +2668,7 @@ fn route_db(rt: &tokio::runtime::Runtime) -> (Db, Arc<RouteStore>, std::sync::mp
     let store = Arc::new(RouteStore {
         inner: config_testkit::MemStore::new(),
         reads: std::sync::atomic::AtomicU32::new(0),
+        node_reads: std::sync::atomic::AtomicU32::new(0),
         hold: AtomicBool::new(false),
         gate: tokio::sync::Semaphore::new(0),
         held: Mutex::new(held),
@@ -2892,5 +2898,154 @@ fn own83_22_a_change_during_a_route_read_leaves_its_answer_stale() {
         "the next call reads again"
     );
     assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+    db.shutdown();
+}
+
+// ---- #83 slice B2: `route` names the owner's address ----
+
+/// Write `node`'s `nodes/{id}` record as a declaration writes it (layout 1), or, with `app`,
+/// as the node rewrites it at open (layout 2).
+fn write_node(rt: &tokio::runtime::Runtime, store: &RouteStore, node: NodeId, app: Option<&str>) {
+    let record = NodeRecord {
+        node,
+        addr: format!("127.0.0.{}:7100", node.0),
+        machine: format!("m{}", node.0),
+    };
+    let body = app.map_or_else(|| record.encode(), |app| record.encode_with_app(app));
+    put_raw(rt, store, ControlKey::Node(node).encode(), body);
+}
+
+/// Put `value` at `key` as it is, and return the watch event that delivers it.
+fn put_raw(
+    rt: &tokio::runtime::Runtime,
+    store: &RouteStore,
+    key: String,
+    value: Bytes,
+) -> config_core::WatchItem {
+    let key = Bytes::from(key);
+    let written = rt
+        .block_on(store.inner.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the record is written");
+    config_core::WatchItem::Event(config_core::MutationEvent {
+        revision: written.revision,
+        key,
+        kind: config_core::MutationEventKind::Put {
+            value,
+            create_revision: 1,
+        },
+    })
+}
+
+/// own83_26 (#83 B2): `route` names the app address the owner registered in its `nodes/{id}`
+/// record, and the answer moves with the owner: once a change of partition 1's record is
+/// delivered, the next call names the new owner and its app address, never the old owner's. An
+/// owner whose record holds no app address (layout 1, as the declaration wrote it) and an owner
+/// with no record at all (a database formed in one process) answer none, and the rest of the
+/// answer still. `leader_of` of the partition answers what `route` does, and `partition_of`
+/// names the partition `route` does. Cut: the address read for a fixed node (node 1) rather
+/// than the record's owner, red at "moved". Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_26_route_names_the_owners_app_address_and_follows_the_owner() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(
+        &rt,
+        &store,
+        NodeId(1),
+        Some("https://gw-1.example:8443/sbx"),
+    );
+    write_node(&rt, &store, NodeId(3), Some("[::1]:9130"));
+    write_node(&rt, &store, NodeId(2), None);
+    let items = open_route_watch(&db, &store, 1);
+    let first = db.route(G1).expect("route answers");
+    assert_eq!(
+        first.app_address(),
+        Some("https://gw-1.example:8443/sbx"),
+        "{first:?}"
+    );
+    assert_eq!(db.partition_of(G1), first.partition);
+    assert_eq!(db.leader_of(first.partition).expect("leader_of"), first);
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(3), 2)))
+        .expect("the watch is open");
+    let moved = route_until_read(&db, &store, 2, "delivered");
+    assert_eq!(
+        (moved.owner, moved.token, moved.app_address()),
+        (NodeId(3), token_at(2), Some("[::1]:9130")),
+        "moved"
+    );
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(2), 3)))
+        .expect("the watch is open");
+    let bare = route_until_read(&db, &store, 3, "delivered again");
+    assert_eq!(
+        (bare.owner, bare.token, bare.app_address()),
+        (NodeId(2), token_at(3), None),
+        "layout 1: no app address, the rest of the answer still"
+    );
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(4), 4)))
+        .expect("the watch is open");
+    let none = route_until_read(&db, &store, 4, "no record");
+    assert_eq!(
+        (none.owner, none.app_address()),
+        (NodeId(4), None),
+        "no record"
+    );
+    db.shutdown();
+}
+
+/// own83_25 (#83 B2): an owner restarted with a new app address is seen within
+/// `APP_ADDR_REREAD_GAP`, and no sooner reads cost more than one `nodes/` read per gap. The
+/// record is rewritten under a cached answer: calls inside the gap serve the old address with
+/// no node read; the first call after the gap names the new one. Cut: the gap never expires
+/// (1000 times as long), red at "after the gap". Unit (~1.1 s: the gap is wall time).
+#[config_log::retcd_test]
+fn own83_25_a_changed_app_address_is_seen_within_the_gap() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    let before = db.route(G1).expect("route answers");
+    assert_eq!(before.app_address(), Some("gw-1:8443"));
+    let node_reads = || store.node_reads.load(Ordering::SeqCst);
+    let read_once = node_reads();
+    assert_eq!(read_once, 1, "the first call read nodes/1");
+    write_node(&rt, &store, NodeId(1), Some("gw-1:9443"));
+    for _ in 0..20 {
+        assert_eq!(
+            db.route(G1).expect("route answers"),
+            before,
+            "inside the gap"
+        );
+    }
+    assert_eq!(node_reads(), read_once, "one read per gap");
+    std::thread::sleep(APP_ADDR_REREAD_GAP + Duration::from_millis(50));
+    let after = db.route(G1).expect("route answers");
+    assert_eq!(after.app_address(), Some("gw-1:9443"), "after the gap");
+    db.shutdown();
+}
+
+/// own83_24 (#83, SBX's `leader_of`): a partition the database does not have is refused as
+/// `INVALID_ARGUMENT`, without a read: partition 0 and one past the count. Cut: the range check
+/// removed, red: partition 2's absent record answers `UNAVAILABLE`. Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_24_leader_of_a_partition_the_database_lacks_is_invalid() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let count = db.partition_count();
+    for partition in [PartitionId(0), PartitionId(count + 1)] {
+        let refused = db.leader_of(partition).expect_err("no such partition");
+        assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused}");
+    }
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0, "nothing was read");
     db.shutdown();
 }

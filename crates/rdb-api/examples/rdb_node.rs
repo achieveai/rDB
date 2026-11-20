@@ -57,6 +57,10 @@
 //!   `--live-readd` lets this node, as an owner, add back a copy its own drop clock left out
 //!   once that copy's link is back, with no restart of the copy (`Timeouts::live_readd`, #107).
 //!   Off unless given.
+//!   `--app-addr A` writes A, the address this node's app takes forwarded requests on, into the
+//!   node's `nodes/{id}` record before the node starts, so `Db::route` names it (#83 B2). Only
+//!   a declared database has the record; on one `--form` made it is refused. Unset, the
+//!   record keeps what an earlier start wrote.
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -108,6 +112,8 @@ struct Args {
     node: Option<u32>,
     dir: Option<PathBuf>,
     listen: Option<String>,
+    /// #83 B2: `--app-addr`, the address this node's app takes forwarded requests on.
+    app_addr: Option<String>,
     peers: BTreeMap<NodeId, String>,
     control: Vec<String>,
     cert_dir: Option<PathBuf>,
@@ -154,7 +160,7 @@ const USAGE: &str = "usage:
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
            [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
-           [--live-readd]
+           [--live-readd] [--app-addr A]
   --faults F: a file of lines, each one of
            hold N | hold all | drop-request N | drop-reply N | cut-control | mute
 ";
@@ -202,6 +208,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--dir" => args.dir = Some(value("--dir")?.into()),
             "--listen" => args.listen = Some(value("--listen")?),
+            "--app-addr" => args.app_addr = Some(value("--app-addr")?),
             "--peers" => {
                 for pair in value("--peers")?.split(',') {
                     let (n, addr) = pair
@@ -956,6 +963,7 @@ fn serve_on_ready(
         addresses: Some(rdb_api::NodeAddresses {
             listen: listen.clone(),
             peers: args.peers.clone(),
+            app: args.app_addr.clone(),
         }),
     };
     let mut db = rt

@@ -117,6 +117,25 @@
    `Db::open` also refuses, first, an open whose local node has no record and a store with no
    records at all (the S1a text).
 
+6. **Amendment (#83 slice B2, owner ruling 2026-11-19): layout 2 carries the node's app
+   address, and the node rewrites its own record once per open.** Layout 2 is layout 1's bytes
+   after a version byte of 2, then the app address as a u16 LE length and that many bytes of
+   UTF-8, at least 1. Only the writer caps it, at 512 bytes
+   (`rdb_core::authority::node::MAX_APP_ADDR_LEN`, a lead decision), so the cap can rise
+   without a new layout. A declared `Db::open` given `NodeAddresses::app` (`rdb_node
+   --app-addr`) reads its own record after its engines' locks and before any host starts, and,
+   unless the record already holds that address, puts layout 2 at the revision it read: node,
+   address and machine as they are. A changed revision refuses the open (only the declaration,
+   create-only, also writes the record, so a change means another process claims the node). An
+   open with no app address writes nothing and keeps the stored one. An app address on an
+   undeclared open is refused. `NodeRecord::decode` reads both layouts as the declared fields
+   alone, so the declaration's adopt check and the start check are unchanged;
+   `NodeRecord::decode_with_app` also returns the app address. `Db::route` returns it as
+   `RouteInfo::app_address`, read again at most once a second per owner. **This amends
+   Decision 1's "nothing updates one in place":** the node itself may update its app address
+   and nothing else. Builds before layout 2 (S1b, never shipped) cannot read such a record, and
+   refuse to start on that store. Layout 3 is reserved for #80 S4's removed-node state.
+
 ## Consequences
 
 - More than three nodes form one database, each from its own folder; each node holds only the
@@ -193,6 +212,16 @@ every rig open passes the address check it would meet in use.
   then `rdb_node --gen-certs --cert-dir C --nodes 5`, then five
   `rdb_node --node N --dir D --listen 127.0.0.N:7100 --peers <the same list> --control E --cert-dir C`
   processes, each with its own `--dir`.
+
+- #83 B2 (amendment 6): `rdb-core` `authority::node` row
+  `b2_1_node_record_layout_2_bytes_are_pinned_and_layout_1_still_reads`;
+  `crates/rdb-api/src/db/formation_tests.rs`:
+  `own83_b2_1_route_forwards_to_the_owners_app_address_across_a_promote`,
+  `own83_b2_2_a_declared_open_registers_its_app_address_once_per_change`,
+  `own83_b2_3_an_app_address_is_refused_where_no_record_can_hold_it`;
+  `crates/rdb-api/src/db/partition_tests.rs`:
+  `own83_26_route_names_the_owners_app_address_and_follows_the_owner`,
+  `own83_25_a_changed_app_address_is_seen_within_the_gap`.
 
 ## References
 

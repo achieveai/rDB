@@ -711,21 +711,37 @@ For SBX, subscribe once at start-up, then:
 
 ### Which node owns a group: `route`
 
-`db.route(group)` returns `RouteInfo { partition, owner, token }`: the group's partition, the
-node that owns it, and the owner's token, read from the partition's control record. Use it to
-send a request to the right node.
+`db.route(group)` returns a `RouteInfo`: `partition`, `owner` and `token`, read from the
+partition's control record, and the owner's app address, read from the owner's `nodes/{id}`
+record. Use it to send a request to the right node.
+
+- `route.app_address()` is where the owner's app takes forwarded requests. Each node registers
+  its own at open: `NodeAddresses::app` (in `rdb_node`, `--app-addr A`), 1 to 512 bytes, opaque
+  to rDB, so a URL, `host:port` or anything your gateway dials works. The open writes it into
+  the node's `nodes/{id}` record before the node starts, so a node never leads a partition
+  before its address is there. An open with no app address keeps the one stored before.
+- It is `None` when the owner registered none, or on a database formed in one process
+  (`rdb_node --form`), which has no `nodes/` records. An app address on such a database is
+  refused at open.
+- `route` reads an owner's address again at most once a second, so a node restarted with a new
+  address is seen within about a second.
+- `db.partition_of(group)` names the group's partition without reading anything. The count is
+  fixed when the database is declared (at most 512), so a group never changes partition, and
+  every group of a partition moves with it.
+- `db.leader_of(partition)` is `route` by partition. A partition the database does not have
+  is `INVALID_ARGUMENT`.
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.
 - A node's `Db` keeps the answer while its control watch is open, until the watch delivers a
   change to that partition or ends. It opens no new watch. An app-only `Db` (no local node)
   reads rEtcd on every call.
-- It does not yet return the owner's network address.
 
 **Try it.** `rdb_node` prints each event as
 `rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
-`admin route G` prints `route group G partition P owner node N token G.E`.
+`admin route G` prints `route group G partition P owner node N token G.E addr HOST:PORT`
+(`addr none` when no address is recorded).
 
 ## 5. Reopening your folder
 

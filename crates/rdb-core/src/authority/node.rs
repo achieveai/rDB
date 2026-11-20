@@ -15,6 +15,17 @@
 //! may follow. A decoder that meets anything else answers `None`. It is outside `contracts/` on
 //! purpose, as [`crate::authority::partition`]'s codec is: a layout of one record family, not a
 //! seam between teams.
+//!
+//! # Layout 2 (#83 slice B2)
+//!
+//! Layout 1's bytes after a version byte of `[2]`, then the app address as a little-endian u16
+//! length and that many bytes of UTF-8, 1 or more. The app address is where the node's app
+//! takes forwarded requests, opaque to rDB. The node writes it into its own record at open, and
+//! changes nothing else in it (owner ruling, 2026-11-19; amends ADR-rdb-0023's "nothing updates
+//! one in place"). The decoder takes any length; only the writer holds it to
+//! [`MAX_APP_ADDR_LEN`] ([`app_addr_refusal`]), so the cap can rise without a new layout.
+//! [`NodeRecord::decode`] reads both layouts as the declared fields alone, so a record with an
+//! app address equals the one the declaration wrote.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -24,6 +35,28 @@ use crate::contracts::ids::NodeId;
 
 /// The version byte of layout 1.
 const LAYOUT_VERSION: u8 = 1;
+
+/// The version byte of layout 2: layout 1's fields and an app address (#83 B2).
+const LAYOUT_APP: u8 = 2;
+
+/// The longest app address a node writes, in bytes (#83 B2, lead decision 2026-11-19): a
+/// 253-byte DNS name, a port and a scheme or path fit.
+pub const MAX_APP_ADDR_LEN: usize = 512;
+
+/// Why `app` is not an app address a node may write, or `None`: 1 to [`MAX_APP_ADDR_LEN`]
+/// bytes. Its content is the app's own: rDB never dials it.
+#[must_use]
+pub fn app_addr_refusal(app: &str) -> Option<String> {
+    if app.is_empty() {
+        return Some("the app address is empty".to_owned());
+    }
+    (app.len() > MAX_APP_ADDR_LEN).then(|| {
+        format!(
+            "the app address is {} bytes; the most is {MAX_APP_ADDR_LEN}",
+            app.len()
+        )
+    })
+}
 
 /// The longest address, in bytes: one length byte.
 pub const MAX_ADDR_LEN: usize = 255;
@@ -233,25 +266,62 @@ impl NodeRecord {
         Bytes::from(out)
     }
 
-    /// The record `body` holds, exactly: `None` for another version, a short or long body, an
-    /// empty or non-UTF-8 address, or a machine [`machine_refusal`] refuses.
+    /// Layout 2: this record and `app`, the node's app address (#83 B2). The caller checks
+    /// `app` with [`app_addr_refusal`] first.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encode`], and when `app` is longer than a u16 holds.
+    #[must_use]
+    pub fn encode_with_app(&self, app: &str) -> Bytes {
+        let len = u16::try_from(app.len()).expect("an app address of at most 65535 bytes");
+        let mut out = self.encode().to_vec();
+        out[0] = LAYOUT_APP;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(app.as_bytes());
+        Bytes::from(out)
+    }
+
+    /// The declared fields `body` holds, in layout 1 or 2: `None` for another version, a short
+    /// or long body, an empty or non-UTF-8 address or app address, or a machine
+    /// [`machine_refusal`] refuses. An app address is not one of them: see
+    /// [`Self::decode_with_app`].
     #[must_use]
     pub fn decode(body: &[u8]) -> Option<Self> {
-        let [LAYOUT_VERSION, rest @ ..] = body else {
+        Self::decode_with_app(body).map(|(record, _)| record)
+    }
+
+    /// [`Self::decode`] and the app address: `None` in layout 1, which holds none.
+    #[must_use]
+    pub fn decode_with_app(body: &[u8]) -> Option<(Self, Option<String>)> {
+        let (&version, rest) = body.split_first()?;
+        if version != LAYOUT_VERSION && version != LAYOUT_APP {
             return None;
-        };
+        }
         let (node, rest) = rest.split_at_checked(4)?;
         let node = NodeId(u32::from_le_bytes(node.try_into().ok()?));
         let (addr, rest) = field(rest)?;
         let (machine, rest) = field(rest)?;
+        let (app, rest) = if version == LAYOUT_APP {
+            let (len, rest) = rest.split_at_checked(2)?;
+            let len = usize::from(u16::from_le_bytes(len.try_into().ok()?));
+            let (app, rest) = rest.split_at_checked(len)?;
+            let app = std::str::from_utf8(app)
+                .ok()
+                .filter(|app| !app.is_empty())?;
+            (Some(app.to_owned()), rest)
+        } else {
+            (None, rest)
+        };
         if !rest.is_empty() || addr.is_empty() || machine_refusal(machine).is_some() {
             return None;
         }
-        Some(Self {
+        let record = Self {
             node,
             addr: addr.to_owned(),
             machine: machine.to_owned(),
-        })
+        };
+        Some((record, app))
     }
 }
 
@@ -264,8 +334,74 @@ fn field(body: &[u8]) -> Option<(&str, &[u8])> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_of, machine_refusal, parse_addr, Host, NodeRecord};
+    use super::{
+        app_addr_refusal, host_of, machine_refusal, parse_addr, Host, NodeRecord, MAX_APP_ADDR_LEN,
+    };
     use crate::contracts::ids::NodeId;
+
+    /// b2_1 (#83 B2): layout 2's bytes are pinned as a literal, as layout 1's are. It decodes
+    /// to the declared fields alone, equal to layout 1's record, and its app address through
+    /// `decode_with_app`; layout 1 holds none. An empty or non-UTF-8 app address, a length past
+    /// the body, and a trailing byte decode as nothing. An app address past the writer's cap
+    /// still decodes: the cap is the writer's. The writer's check refuses empty and 513 bytes,
+    /// and takes 512. Cut: `decode_with_app` reads `[2]` as layout 1 (no app field), red at the
+    /// pinned literal. Unit.
+    #[test]
+    fn b2_1_node_record_layout_2_bytes_are_pinned_and_layout_1_still_reads() {
+        let record = NodeRecord {
+            node: NodeId(3),
+            addr: "127.0.0.3:7100".to_owned(),
+            machine: "rack1-b".to_owned(),
+        };
+        let mut pinned = vec![2, 3, 0, 0, 0, 14];
+        pinned.extend_from_slice(b"127.0.0.3:7100");
+        pinned.push(7);
+        pinned.extend_from_slice(b"rack1-b");
+        pinned.extend_from_slice(&[9, 0]);
+        pinned.extend_from_slice(b"gw-3:8443");
+        assert_eq!(
+            record.encode_with_app("gw-3:8443").as_ref(),
+            pinned.as_slice()
+        );
+        assert_eq!(NodeRecord::decode(&pinned), Some(record.clone()));
+        assert_eq!(
+            NodeRecord::decode_with_app(&pinned),
+            Some((record.clone(), Some("gw-3:8443".to_owned())))
+        );
+        assert_eq!(
+            NodeRecord::decode_with_app(&record.encode()),
+            Some((record.clone(), None)),
+            "layout 1 holds no app address"
+        );
+
+        let mut empty_app = pinned[..pinned.len() - 11].to_vec();
+        empty_app.extend_from_slice(&[0, 0]);
+        let mut bad_utf8 = pinned[..pinned.len() - 11].to_vec();
+        bad_utf8.extend_from_slice(&[1, 0, 0xFF]);
+        let mut trailing = pinned.clone();
+        trailing.push(0);
+        for (what, body) in [
+            ("an empty app address", empty_app),
+            ("a non-UTF-8 app address", bad_utf8),
+            (
+                "an app address cut short",
+                pinned[..pinned.len() - 1].to_vec(),
+            ),
+            ("a trailing byte", trailing),
+        ] {
+            assert_eq!(NodeRecord::decode_with_app(&body), None, "{what}");
+        }
+
+        let long = "a".repeat(MAX_APP_ADDR_LEN + 1);
+        assert_eq!(
+            NodeRecord::decode_with_app(&record.encode_with_app(&long)),
+            Some((record, Some(long.clone()))),
+            "the cap is the writer's"
+        );
+        assert!(app_addr_refusal("").is_some());
+        assert!(app_addr_refusal(&long).is_some());
+        assert_eq!(app_addr_refusal(&long[1..]), None);
+    }
 
     /// #80 S1b row 4: layout 1's bytes are pinned as a literal, since every later build reads
     /// what a declaration wrote: changing `encode` and `decode` together cannot pass while old
@@ -288,7 +424,7 @@ mod tests {
         assert_eq!(NodeRecord::decode(&pinned), Some(record));
 
         let mut wrong_version = pinned.clone();
-        wrong_version[0] = 2;
+        wrong_version[0] = 0xEE;
         let mut trailing = pinned.clone();
         trailing.push(0);
         let mut upper = pinned.clone();
