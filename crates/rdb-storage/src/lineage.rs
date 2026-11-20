@@ -120,7 +120,10 @@ fn check(
     generation: Generation,
     applied: AppliedSeq,
 ) -> Result<VerifiedLineage, LineageFault> {
-    if engine.staging(partition, generation).is_some() {
+    // A copy mid full copy or mid snapshot install holds a part of its keys (issue #61).
+    if engine.staging(partition, generation).is_some()
+        || engine.installing(partition, generation).is_some()
+    {
         return Err(LineageFault::CopyIncomplete);
     }
     // A trimmed lineage holds `floor..=applied` (issue #61): the record at the floor is checked

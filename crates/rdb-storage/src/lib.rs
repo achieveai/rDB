@@ -21,6 +21,7 @@
 
 mod engine;
 mod inherit;
+mod install;
 pub mod keys;
 mod lineage;
 mod snapshot;
@@ -33,6 +34,7 @@ pub use engine::{
 #[cfg(debug_assertions)]
 pub use inherit::flatten_at_depth;
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
+pub use install::InstallError;
 pub use keys::{Link, PublishMark, TrimFloor, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
 pub use snapshot::{RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};

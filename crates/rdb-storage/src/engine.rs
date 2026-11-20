@@ -47,8 +47,9 @@ use crate::keys::{
     decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
     ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
     Link, PublishMark, TrimFloor, APPLIED_KEY, CF_HISTORY, CF_METADATA, COLUMN_FAMILIES,
-    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN,
-    OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TRIM_FLOOR_KEY, TRIM_FLOOR_LEN,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTALLING_KEY, INSTANCE_KEY,
+    INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TAIL_RELEASE_KEY,
+    TRIM_FLOOR_KEY, TRIM_FLOOR_LEN,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -305,6 +306,9 @@ pub enum TrimRefused {
         /// [`RocksEngine::floor_seq`] now.
         current: Seq,
     },
+    /// The lineage is mid snapshot install: its History is not written yet.
+    #[error("a snapshot install is in progress in this lineage")]
+    Installing,
     /// RocksDB refused the write.
     #[error("the trim write failed")]
     WriteFailed,
@@ -320,6 +324,7 @@ impl TrimRefused {
             Self::Sealed { .. } => "sealed",
             Self::AboveApplied { .. } => "above_applied",
             Self::BelowFloor { .. } => "below_floor",
+            Self::Installing => "installing",
             Self::WriteFailed => "write_failed",
         }
     }
@@ -340,6 +345,12 @@ pub(crate) struct Marks {
     /// or of a child that cut it (design rev 5c). [`RocksEngine::floor`] takes the highest mark
     /// that cuts what a lineage reads.
     pub(crate) floor: Option<TrimFloor>,
+    /// Set on a lineage mid snapshot install: its `installing` record, `(generation, at)`
+    /// (issue #61). A read-write open clears such a lineage.
+    pub(crate) installing: Option<(Generation, Seq)>,
+    /// Set on a lineage whose held tail the host released: its `tail_release` record, the seq
+    /// released through (issue #61, design rev 5c).
+    pub(crate) tail_release: Option<Seq>,
 }
 
 /// One core set's data engine on RocksDB.
@@ -414,6 +425,11 @@ pub enum InjectedFault {
     /// [`RocksEngine::put_publish_marks`], [`RocksEngine::persist_epoch_revocation`]): nothing is
     /// written and nothing counts as synced (review-s1 F-008). Not reached by a bind of the id the copy already holds.
     SyncedPut,
+    /// The next [`RocksEngine::install_begin`]'s batch: nothing is wiped and nothing is marked
+    /// installing (issue #61, design rev 5b).
+    InstallBegin,
+    /// The next [`RocksEngine::install_chunk`]'s batch: nothing of the chunk lands.
+    InstallChunk,
 }
 
 impl InjectedFault {
@@ -428,6 +444,8 @@ impl InjectedFault {
             Self::Switch => "switch",
             Self::CopyBatch => "copy-batch",
             Self::SyncedPut => "synced-put",
+            Self::InstallBegin => "install-begin",
+            Self::InstallChunk => "install-chunk",
         }
     }
 }
@@ -744,7 +762,7 @@ impl RocksEngine {
         steps.done("ensure_format");
         let instance = read_instance(&db, &path)?;
         steps.done("read_instance");
-        let lineages = restore_lineages(&db, &path)?;
+        let mut lineages = restore_lineages(&db, &path)?;
         steps.done("restore_lineages");
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
@@ -757,11 +775,15 @@ impl RocksEngine {
                 sealed_by = ?marks.sealed_by.map(|child| child.0),
                 staging = ?marks.staging,
                 floor = marks.floor.map(|floor| floor.seq.0),
+                installing = ?marks.installing.map(|(_, at)| at.0),
+                tail_release = marks.tail_release.map(|through| through.0),
                 "lineage_restored"
             );
         }
         check_marks(&lineages)?;
         steps.done("check_marks");
+        clear_installs(&db, &path, &mut lineages)?;
+        steps.done("clear_installs");
         steps.finish();
         tracing::info!(
             target: LOG_TARGET,
@@ -1026,6 +1048,73 @@ impl RocksEngine {
         self.instance = Some(id);
         tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
         Ok(())
+    }
+
+    /// Write `write` with `sync` set, as [`Self::put_metadata_synced_all`] does: logged when a
+    /// sync is in flight, and counted by [`Self::wal_synced_through_latest`] once it returns.
+    pub(crate) fn write_batch_synced(
+        &mut self,
+        write: WriteBatch,
+        what: &'static str,
+    ) -> Result<(), String> {
+        self.note_synced_write(what);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        Ok(())
+    }
+
+    /// Record that lineage `(partition, generation)`'s held tail was released through `through`
+    /// (issue #61, design rev 5c), with a synced write, before this returns `Ok`: the host
+    /// answers the inventory only after. A lineage private record, so `install_begin` deletes it
+    /// with the lineage and a build from before it refuses the copy at open. Logs
+    /// `tail_release_written`. Fault point [`InjectedFault::SyncedPut`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] when the engine holds no such lineage or RocksDB refuses
+    /// the write; the record held before stays.
+    pub fn put_tail_release(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        through: Seq,
+    ) -> Result<(), StorageFault> {
+        let (p, g) = (partition.0, generation.0);
+        if !self.lineages.contains_key(&(partition, generation)) {
+            tracing::error!(
+                target: LOG_TARGET, partition = p, generation = g, through = through.0,
+                "tail_release_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        let key = private_key(partition, generation, TAIL_RELEASE_KEY);
+        if let Err(e) = self.put_metadata_synced(&key, &through.0.to_be_bytes()) {
+            tracing::error!(
+                target: LOG_TARGET, partition = p, generation = g, through = through.0,
+                error = %e, "tail_release_write_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        if let Some(marks) = self.lineages.get_mut(&(partition, generation)) {
+            marks.tail_release = Some(through);
+        }
+        tracing::info!(
+            target: LOG_TARGET, partition = p, generation = g, through = through.0,
+            "tail_release_written"
+        );
+        Ok(())
+    }
+
+    /// The newest `tail_release` record over `partition`'s lineages: the generation that holds
+    /// it and the seq released through. `None` when no lineage of the partition holds one.
+    #[must_use]
+    pub fn tail_release(&self, partition: PartitionId) -> Option<(Generation, Seq)> {
+        self.lineages
+            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
+            .rev()
+            .find_map(|(&(_, generation), marks)| marks.tail_release.map(|t| (generation, t)))
     }
 
     /// Replace `partition`'s publish marks with `marks`, with a synced write, before this
@@ -1392,6 +1481,19 @@ impl RocksEngine {
                 parent = parent.0,
                 base = base.0,
                 "staging_generation_write_refused"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        // An install in progress owns the lineage's key range until it finishes (issue #61): a
+        // commit would land among chunks and under a barrier it does not chain to.
+        if let Some((_, at)) = marks.installing {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition,
+                generation,
+                seq,
+                at = at.0,
+                "installing_generation_write_refused"
             );
             return Err(StorageFault::WriteFailed);
         }
@@ -1968,6 +2070,9 @@ impl RocksEngine {
         if marks.staging.is_some() {
             return Err(TrimRefused::Staging);
         }
+        if marks.installing.is_some() {
+            return Err(TrimRefused::Installing);
+        }
         if let Some(child) = marks.sealed_by {
             return Err(TrimRefused::Sealed { child });
         }
@@ -2289,6 +2394,10 @@ impl std::fmt::Display for RawRecord {
                 decode_copying(&self.value).map_or_else(undecodable, |(parent, base)| {
                     format!("parent:{} base:{}", parent.0, base.0)
                 })
+            } else if key == INSTALLING_KEY {
+                decode_copying(&self.value).map_or_else(undecodable, |(generation, at)| {
+                    format!("generation:{} at:{}", generation.0, at.0)
+                })
             } else {
                 decode_mark(&self.value).map_or_else(undecodable, |v| v.to_string())
             };
@@ -2528,6 +2637,41 @@ fn read_instance(db: &DB, path: &Path) -> Result<Option<[u8; INSTANCE_LEN]>, Ope
 }
 
 /// Refuse a lineage with `durable > applied`.
+/// Remove every lineage a crash left mid snapshot install (issue #61), in one synced batch: its
+/// keys in every namespace and its engine records, exactly as `install_begin` wiped the
+/// lineages before it. The copy rejoins with the partition empty and asks again. Logs
+/// `snapshot_install_cleared_at_open` per lineage. A read-only open keeps them, and verify
+/// reports them `CopyIncomplete`.
+fn clear_installs(db: &DB, path: &Path, lineages: &mut Lineages) -> Result<(), OpenError> {
+    let cleared: Vec<((PartitionId, Generation), Seq)> = lineages
+        .iter()
+        .filter_map(|(&key, marks)| marks.installing.map(|(_, at)| (key, at)))
+        .collect();
+    if cleared.is_empty() {
+        return Ok(());
+    }
+    let mut write = WriteBatch::default();
+    for &((partition, generation), _) in &cleared {
+        for (cf, start, end) in keys::lineage_ranges(partition, generation) {
+            write.delete_range_cf(handle(db, path, cf)?, start, end);
+        }
+    }
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    db.write_opt(write, &opts).map_err(|e| backend(path, &e))?;
+    for ((partition, generation), at) in cleared {
+        lineages.remove(&(partition, generation));
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            "snapshot_install_cleared_at_open"
+        );
+    }
+    Ok(())
+}
+
 fn check_marks(lineages: &Lineages) -> Result<(), OpenError> {
     match lineages
         .iter()
@@ -2704,6 +2848,18 @@ fn restore_lineages(
                     )));
                 }
                 marks.link = Some(link);
+            }
+            INSTALLING_KEY => {
+                sized("installing", 16)?;
+                marks.installing = Some(
+                    decode_copying(&value)
+                        .ok_or_else(|| corrupt("installing record did not decode"))?,
+                );
+            }
+            TAIL_RELEASE_KEY => {
+                sized("tail_release", 8)?;
+                marks.tail_release = Some(Seq(decode_mark(&value)
+                    .ok_or_else(|| corrupt("tail_release record did not decode"))?));
             }
             COPYING_KEY => {
                 sized("copying", 16)?;

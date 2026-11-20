@@ -151,6 +151,13 @@ pub enum InheritError {
         /// History was trimmed below the seq it needs (issue #61).
         at: String,
     },
+    /// The parent is mid snapshot install (`installing_inherit_refused`, issue #61): its view
+    /// is half written, so neither a link nor a copy may read it. Nothing written.
+    #[error("parent is mid snapshot install at {}", at.0)]
+    ParentInstalling {
+        /// The barrier seq of the install in progress.
+        at: Seq,
+    },
     /// A batch failed (`inherit_failed`). A copy left staged is cleared by a re-run.
     #[error("storage fault {0:?}")]
     Storage(StorageFault),
@@ -201,6 +208,10 @@ impl RocksEngine {
                 target: LOG_TARGET, partition = p, from = f, to = t, base = b, at = %at,
                 "inherit_history_missing"
             ),
+            Err(InheritError::ParentInstalling { at }) => tracing::error!(
+                target: LOG_TARGET, partition = p, from = f, to = t, base = b, at = at.0,
+                "installing_inherit_refused"
+            ),
             Err(InheritError::Storage(fault)) => tracing::error!(
                 target: LOG_TARGET, partition = p, from = f, to = t, base = b,
                 fault = ?fault, "inherit_failed"
@@ -242,6 +253,11 @@ impl RocksEngine {
             .unwrap_or_default();
         if parent.staging.is_some() {
             return conflict(ConflictReason::ParentStaging);
+        }
+        // Before the cutoff check: an installing parent holds applied 0, so a base above 0
+        // would read as behind and a base of 0 would link an empty, half-written view.
+        if let Some((_, at)) = parent.installing {
+            return Err(InheritError::ParentInstalling { at });
         }
         let sibling_staging = self.lineages.iter().any(|(&(p, g), marks)| {
             p == partition && g != to && marks.staging.is_some_and(|(of, _)| of == from)
@@ -545,6 +561,8 @@ impl RocksEngine {
                 sealed_by: None,
                 staging: None,
                 floor: None,
+                installing: None,
+                tail_release: None,
             },
         );
         self.lineages

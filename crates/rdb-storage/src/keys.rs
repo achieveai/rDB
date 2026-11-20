@@ -18,7 +18,9 @@
 //!   and `durable` (u64 BE, no frame); on an inherited lineage, `parent` ([`Link`], 17 bytes);
 //!   on a parent, `sealed` (the child generation, u64 BE); on a child mid full copy, `copying`
 //!   (parent and base, 16 bytes); on a trimmed lineage, `trim_floor` ([`TrimFloor`], 48 bytes,
-//!   issue #61). A lineage with no parent has no
+//!   issue #61); on a lineage mid snapshot install, `installing` (generation and barrier seq,
+//!   16 bytes, issue #61); on a lineage whose held tail was released, `tail_release` (the seq
+//!   released through, u64 BE, issue #61). A lineage with no parent has no
 //!   `parent` record, never "parent 0": generation 0 is legal (ADR-rdb-0010 decision 11). The
 //!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
 //!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
@@ -131,6 +133,62 @@ impl TrimFloor {
             root_digest: Digest(raw[16..48].try_into().ok()?),
         })
     }
+}
+
+/// Engine-private record: on a lineage mid snapshot install (issue #61), the install's
+/// `generation u64 BE | at u64 BE` (16 bytes, the `copying` layout). Written by
+/// [`crate::RocksEngine::install_begin`], deleted by `install_finish`, and cleared with the
+/// lineage at a read-write open. A build from before it refuses the name at open.
+pub(crate) const INSTALLING_KEY: &[u8] = b"installing";
+
+/// Engine-private record: the seq through which lineage `(p, g)`'s held tail was released by
+/// the host (issue #61, design rev 5c), u64 BE. Written synced by
+/// [`crate::RocksEngine::put_tail_release`]; [`crate::RocksEngine::install_begin`] deletes it
+/// with the rest of the lineage. A build from before it refuses the name at open.
+pub(crate) const TAIL_RELEASE_KEY: &[u8] = b"tail_release";
+
+/// The key range `[start, end)` holding every key lineage `(partition, generation)` has under
+/// ns byte `ns`. Both bounds are longer than every engine-wide key and share its first 12 bytes
+/// with only this lineage's keys, so no engine-wide key (format, instance, publish marks,
+/// revocations) is ever inside it.
+pub(crate) fn lineage_ns_range(
+    partition: PartitionId,
+    generation: Generation,
+    ns: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut start = Vec::with_capacity(PREFIX_LEN + 1);
+    start.extend_from_slice(&partition.0.to_be_bytes());
+    start.extend_from_slice(&generation.0.to_be_bytes());
+    start.push(ns);
+    let mut end = start.clone();
+    match ns.checked_add(1) {
+        Some(next) => end[PREFIX_LEN - 1] = next,
+        // The private ns is the last byte value: every private name is ASCII, below 0xFF.
+        None => end.push(0xFF),
+    }
+    (start, end)
+}
+
+/// Every key range lineage `(partition, generation)` holds, with the column family each is in:
+/// one per namespace a lineage writes, and its engine records. Deleting all of them removes the
+/// lineage and nothing else ([`lineage_ns_range`]).
+pub(crate) fn lineage_ranges(
+    partition: PartitionId,
+    generation: Generation,
+) -> [(&'static str, Vec<u8>, Vec<u8>); 6] {
+    let range = |ns: Namespace| {
+        let (start, end) = lineage_ns_range(partition, generation, ns_byte(ns));
+        (cf_for(ns), start, end)
+    };
+    let (start, end) = lineage_ns_range(partition, generation, PRIVATE_NS);
+    [
+        range(Namespace::User),
+        range(Namespace::History),
+        range(Namespace::Dedup),
+        range(Namespace::Progress),
+        range(Namespace::Meta),
+        (CF_METADATA, start, end),
+    ]
 }
 
 /// Encode a `copying` record.
