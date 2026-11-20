@@ -2611,7 +2611,8 @@ impl Fault {
 
     /// [`Self::error`] for a call that reached the node after it faulted: refused before
     /// admission, so it mutated nothing (#124, ruling Q15 (b)). Its retry rule is unchanged.
-    /// A call admitted before the fault keeps [`Self::error`].
+    /// A call admitted before the fault keeps [`Self::error`], and so does a status query or a
+    /// resend after it: each is about an earlier write that may have applied (#136).
     fn refusal(&self) -> ApiError {
         let mut error = self.error();
         error.no_mutation = true;
@@ -3858,8 +3859,15 @@ impl Host {
     fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
+                // A status query or a resend is about an earlier write, which may have applied
+                // before the fault: its refusal must not say nothing was applied, or the step
+                // sends that write again as a new one (#136).
+                let error = match client.call {
+                    ClientCall::Status { .. } | ClientCall::Resend { .. } => fault.error(),
+                    _ => fault.refusal(),
+                };
                 let _ = client.reply.send(Answer::Error {
-                    error: fault.refusal(),
+                    error,
                     request: None,
                 });
             }
