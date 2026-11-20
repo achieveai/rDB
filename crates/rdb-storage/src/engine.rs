@@ -2020,6 +2020,10 @@ impl RocksEngine {
     /// `estimate-live-data-size / estimate-num-keys` (every partition alike, and an on-disk,
     /// compressed size), or [`HISTORY_RECORD_BYTES_SEED`] when either is 0 or missing.
     ///
+    /// Known limit: the mean weighs every record since open alike, so on an engine up for
+    /// months a shift in record size moves it slowly, and the estimate lags the new size for as
+    /// long as the old records dominate the sample.
+    ///
     /// Unlike the memory twin, no `Progress` bytes count: RocksDB keeps only the head's. The
     /// retention cap (`rdb_core::replication::retention::cap_seq`) needs only that the answer
     /// never grows as `from` or the floor rises, which holds for any fixed mean. 0 when `from`
