@@ -630,9 +630,11 @@ fn f87_1_owner_and_secondary_partitioned_together_secondary_stops_within_bound()
 
 /// An idle partition: no write for three grants, and the secondary still serves, because its
 /// freshness comes from its own control reads, started while feed calls arrive, never from
-/// owner traffic.
-/// Cut: start the next read only once the last is older than the grant (not half of it), red
-/// (`UNAVAILABLE` at the first call past a grant).
+/// owner traffic. Sixteen polls a fifth of a grant apart, so they span three grants however
+/// slowly they run; every one is served (review r1: no minimum call count).
+/// Cut: `Host::feed_fresh` starts a read only when none has answered yet (`age.is_none()`),
+/// red (`UNAVAILABLE` "call again" at the first call past a grant: the parked call waits for a
+/// read nobody started).
 /// Integration (~6 s): three 1.5 s grants.
 #[config_log::retcd_test]
 fn f87_1_idle_secondary_keeps_serving_past_grant() {
@@ -646,16 +648,16 @@ fn f87_1_idle_secondary_keeps_serving_past_grant() {
     let (_, at) = tail(&db, FeedCursor::START, two, k1.seq);
     let idle = Duration::from_millis(3 * budgets.grant_millis);
     let started = Instant::now();
-    let mut calls = 0_u32;
-    while started.elapsed() < idle {
+    for call in 0..16 {
+        if call > 0 {
+            std::thread::sleep(Duration::from_millis(budgets.grant_millis / 5));
+        }
         match db.changes(PARTITION, at, 10, two) {
             Ok(FeedPage::Records { records, .. }) => assert!(records.is_empty()),
-            other => panic!("call {calls} at {:?} idle: {other:?}", started.elapsed()),
+            other => panic!("call {call} at {:?} idle: {other:?}", started.elapsed()),
         }
-        calls += 1;
-        std::thread::sleep(Duration::from_millis(budgets.grant_millis / 5));
     }
-    assert!(calls >= 15, "{calls} calls");
+    assert!(started.elapsed() >= idle, "{:?}", started.elapsed());
 }
 
 /// A secondary's feed takes no work from the owner: with node 1's thread stalled, node 2 still
