@@ -1101,3 +1101,70 @@ fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
     }
     assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
 }
+
+// ---- issue #61 S3: the bytes the retention cap searches ----
+
+/// `history_bytes` (the twin of the proposed `RocksEngine::history_bytes`) counts the History a
+/// lineage shows from a seq through its head: it falls as the seq rises and is 0 above the head;
+/// below a trim floor nothing counts, so asking from 1 and from the floor agree; a linked child
+/// counts its parent's records through the link. Red if the floor is ignored (bytes from 1 stay
+/// above bytes from the floor), or the link is not read (the child's bytes are 0).
+#[retcd_test]
+fn t61_sim_history_bytes_fall_with_the_seq_and_skip_the_trimmed() {
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{ConfigVersion, OwnerEpoch};
+    use rdb_sim::storage::memory::TrimFloor;
+    support::preamble();
+    let history = rdb_sim::storage::history::canonical_history(
+        Lineage {
+            partition: PARTITION,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+        },
+        ConfigVersion(1),
+        6,
+    )
+    .expect("a canonical history");
+    let mut engine = MemoryEngine::new(NODE);
+    for batch in &history.batches {
+        engine.commit(batch.clone()).expect("commit");
+    }
+    let from = |engine: &MemoryEngine, generation: u64, seq: u64| {
+        engine.history_bytes(PARTITION, Generation(generation), Seq(seq))
+    };
+    let all: Vec<u64> = (1..=7).map(|seq| from(&engine, 1, seq)).collect();
+    assert!(all[0] > 0, "six records hold bytes: {all:?}");
+    assert!(
+        all.windows(2).all(|pair| pair[0] > pair[1]),
+        "each record raises the count: {all:?}"
+    );
+    assert_eq!(all[6], 0, "nothing above the head");
+
+    engine
+        .trim_history(
+            PARTITION,
+            Generation(1),
+            TrimFloor {
+                seq: Seq(3),
+                root_base: Seq::ZERO,
+                root_digest: Digest::ROOT,
+            },
+        )
+        .expect("a trim");
+    assert_eq!(
+        from(&engine, 1, 1),
+        from(&engine, 1, 3),
+        "nothing below the floor counts"
+    );
+    assert_eq!(from(&engine, 1, 3), all[2], "from the floor up, unchanged");
+
+    engine
+        .inherit(PARTITION, Generation(1), Generation(2), Seq(6))
+        .expect("link generation 2 at 6");
+    assert_eq!(
+        from(&engine, 2, 4),
+        all[3],
+        "the child counts its parent's records through the link"
+    );
+}
