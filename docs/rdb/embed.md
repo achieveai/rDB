@@ -299,11 +299,22 @@ db.shutdown().await.ok();
 - `status(group, request, generation)` is `status_in`. Ask with the write's generation: with
   the ack floor on, asked with `None`, an acknowledged write answers `Unknown`.
 - `ownership_events()` returns a `tokio::sync::mpsc::Receiver`. One blocking-pool thread carries
-  the events; it lets go within 100 ms of the receiver being dropped.
+  the events for as long as the receiver lives; it lets go within 100 ms of the receiver being
+  dropped. So size the pool (`max_blocking_threads`) to at least the receivers you keep plus
+  one, or every other call, `shutdown` included, queues behind them.
 - `db.db()` gives the `Db` for the calls that never block: `ownership` and `still_owner`. Admin and dev calls have no async form; wrap them in `spawn_blocking` yourself.
 - Await the calls inside any tokio runtime: its blocking pool runs them. That pool is bounded
   (512 threads by default). Past that, calls queue on the pool; no worker blocks.
 - A panic inside a call reaches the task that awaited it, as the sync call's panic would.
+- **Dropping a write's future does not cancel the write.** It stops the wait only: a `put`,
+  `txn` or `write` already on the pool runs on and may apply, and its request id is lost with
+  the future. That is intended. When exactly-once matters, write under a request id you saved
+  before the call (`app_request_id(n)`): `txn_as` here (a one-put transaction for a single put),
+  or `Db::put_as` and `Db::txn_as` on the sync `Db`. Then ask `status` with that id, or send it
+  again with `resend_within`.
+- A call the pool never ran (the runtime shut down first) sent nothing: a write answers
+  `no_mutation` true. `wait_ready` and `shutdown` panic then instead, having no error to
+  return.
 - Dropping the last `AsyncDb` (and the last `Arc<Db>`) inside a task drops the `Db`, whose
   `Drop` stops and joins its node threads, on that task's thread. End with
   `db.shutdown().await`, which does that on the blocking pool. It answers `Err(db)`, doing

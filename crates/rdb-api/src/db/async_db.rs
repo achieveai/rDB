@@ -10,6 +10,17 @@
 //! it. So every timeout, error and retry rule is the sync call's own. The pool's threads are
 //! bounded (tokio's default is 512); past that, calls queue on the pool, and still no worker
 //! waits.
+//!
+//! **Pool size.** Each live [`AsyncDb::ownership_events`] receiver holds one blocking-pool thread
+//! for as long as it lives. Size the pool (`max_blocking_threads`) to at least the receivers
+//! you keep plus one, or every other call, `shutdown` included, queues behind them.
+//!
+//! **A dropped future does not cancel its call.** Dropping the future of [`AsyncDb::put`],
+//! [`AsyncDb::txn`] or [`AsyncDb::write`] stops the wait, not the call: the write still runs on
+//! the pool and may apply, and its id is lost with the future. That is intended. When
+//! exactly-once matters, write with [`AsyncDb::txn_as`] (one put is a one-put transaction) or
+//! the sync [`Db::put_as`] under a request id you saved first, then ask [`AsyncDb::status`] or
+//! send it again with [`AsyncDb::resend_within`].
 
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -82,11 +93,14 @@ where
     }
 }
 
-/// A put answer from [`blocking`]: a call that never ran sent nothing.
+/// A put answer from [`blocking`]: a call that never ran sent nothing, so its refusal says
+/// `no_mutation` and never "an earlier send may have applied" (PR #178 review r1).
 pub(super) fn put_answer<T>(answer: Result<Result<T, PutError>, String>) -> Result<T, PutError> {
     answer.unwrap_or_else(|detail| {
+        let mut error = ApiError::host(&detail);
+        error.no_mutation = true;
         Err(PutError {
-            error: ApiError::host(&detail),
+            error,
             request: None,
         })
     })
@@ -132,7 +146,8 @@ impl AsyncDb {
             .unwrap_or_else(|detail| panic!("wait_ready: {detail}"))
     }
 
-    /// [`Db::put_in`].
+    /// [`Db::put_in`]. Dropping the future does not cancel the write: it may still apply,
+    /// with no id returned (see the module docs for an exactly-once write).
     ///
     /// # Errors
     ///
@@ -173,7 +188,8 @@ impl AsyncDb {
         read_answer(blocking(move || db.read_in(group, &object, look)).await)
     }
 
-    /// [`Db::write_in`].
+    /// [`Db::write_in`]. Dropping the future does not cancel the write: it may still apply,
+    /// with no id returned (see the module docs for an exactly-once write).
     ///
     /// # Errors
     ///
@@ -189,7 +205,8 @@ impl AsyncDb {
         put_answer(blocking(move || db.write_in(group, &object, change, expect)).await)
     }
 
-    /// [`Db::txn`].
+    /// [`Db::txn`]. Dropping the future does not cancel the write: it may still apply,
+    /// with no id returned (see the module docs for an exactly-once write).
     ///
     /// # Errors
     ///
@@ -257,7 +274,7 @@ impl AsyncDb {
     }
 
     /// [`Db::ownership_events`] as a tokio receiver. One blocking-pool thread carries the events
-    /// across. It ends, and the receiver then answers `None`, when the subscription ends; it lets
+    /// across, for as long as the receiver lives (see "Pool size" in the module docs). It ends, and the receiver then answers `None`, when the subscription ends; it lets
     /// go of its thread within 100 ms of the receiver being dropped.
     ///
     /// # Panics
@@ -297,6 +314,11 @@ impl AsyncDb {
     /// # Errors
     ///
     /// `Err(self)`, with nothing done, while another `AsyncDb` clone or `Arc<Db>` is alive.
+    ///
+    /// # Panics
+    ///
+    /// When the runtime shuts down before the call ran: the `Db` is then dropped unshut, and
+    /// there is no `Self` to hand back. As [`Self::wait_ready`].
     pub async fn shutdown(self) -> Result<(), Self> {
         let mut db = Arc::try_unwrap(self.db).map_err(|db| Self { db })?;
         blocking(move || {
@@ -330,7 +352,7 @@ mod tests {
     use config_core::ConfigStore;
 
     use super::super::{lock, Db, DbConfig, Timeouts, ALL_NODES, DEFAULT_CLIENT};
-    use super::AsyncDb;
+    use super::{put_answer, AsyncDb};
 
     /// PR #178 review r1 T7: on a current-thread runtime, subscribing while the nodes lock is
     /// held (as a restart holds it) returns at once; the registration waits on the pool. Cut:
@@ -392,5 +414,16 @@ mod tests {
             holder.join().expect("holder");
             assert!(db.shutdown().await.is_ok(), "no other clone is alive");
         });
+    }
+
+    /// PR #178 review r1: a put the blocking pool never ran sent nothing, so it says
+    /// `no_mutation` and its step sends it again as a new write, not a status look. Cut: drop
+    /// the `no_mutation = true` line: red.
+    #[test]
+    fn a_put_the_pool_never_ran_wrote_nothing() {
+        let refused = put_answer::<()>(Err("the blocking call did not run".to_owned()))
+            .expect_err("refused");
+        assert!(refused.request.is_none(), "{refused:?}");
+        assert!(refused.error.no_mutation, "{refused:?}");
     }
 }
