@@ -18,13 +18,16 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::ReplicationEnvelope;
 use rdb_core::contracts::ids::{
-    AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, Seq, SnapshotHandle,
+    AppliedSeq, BatchId, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, Seq,
+    SnapshotHandle,
 };
 use rdb_core::contracts::storage::{
     Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault, Write,
 };
 use rdb_core::contracts::trace::Version;
+use rdb_core::replication::append::PROGRESS_KEY;
 
 use crate::error::SimError;
 use crate::storage::history::history_writes;
@@ -54,6 +57,66 @@ pub(crate) struct Lineage {
     /// before the next WAL sync reopens with the older mark and its rows back
     /// ([`crate::storage::crash_image::CrashImage`]).
     pub(crate) floor_synced: Option<TrimFloor>,
+    /// This lineage's snapshot install (issue #61 S2), the twin of `rdb-storage`'s `installing`
+    /// record and the chunks written under it: unfinished from [`MemoryEngine::install_begin`]
+    /// until [`MemoryEngine::install_finish`], and the base every read of the lineage starts
+    /// from once finished.
+    pub(crate) install: Option<Install>,
+    /// The highest seq the host released this lineage's tail through, the twin of
+    /// `rdb-storage`'s `tail_release` record. Synced when written, so every crash keeps it.
+    pub(crate) tail_release: Option<Seq>,
+}
+
+/// One page entry of a snapshot install, the twin of `rdb_storage::SnapshotEntry` without the
+/// source generation: namespace, key, value, and the version it was written at.
+pub type InstallEntry = (Namespace, Bytes, Bytes, Version);
+
+/// A lineage's snapshot install: the barrier seq `at` and every chunk entry written so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Install {
+    pub(crate) at: Seq,
+    pub(crate) finished: bool,
+    pub(crate) entries: Vec<InstallEntry>,
+}
+
+/// Why an install step refused, the twin of `rdb_storage::InstallError` (the sim injects no
+/// install write fault, so no `Storage`). Nothing of that step was written in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// The copy holds a generation of the partition newer than the one being installed.
+    NewerGeneration {
+        /// The newest generation held.
+        held: Generation,
+    },
+    /// The lineage is not mid install, or is mid install at another `S`.
+    NotInstalling {
+        /// The `S` the step named.
+        at: Seq,
+    },
+    /// A chunk entry the export never sends: `History`, `Meta`, or the head `Progress`.
+    ForeignEntry {
+        /// Its namespace.
+        ns: Namespace,
+    },
+    /// The barrier record does not decode, claims another seq, or carries a digest that does
+    /// not recompute.
+    BadBarrier {
+        /// The `S` it should name.
+        at: Seq,
+    },
+}
+
+impl InstallError {
+    /// The `reason` field `snapshot_install_refused` carries, as the host names it.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NewerGeneration { .. } => "newer_generation",
+            Self::NotInstalling { .. } => "not_installing",
+            Self::ForeignEntry { .. } => "foreign_entry",
+            Self::BadBarrier { .. } => "bad_barrier",
+        }
+    }
 }
 
 /// A lineage's trim floor (issue #61), the twin of `rdb_storage::TrimFloor`: History holds
@@ -206,6 +269,19 @@ impl MemoryEngine {
     ///
     /// The planned [`StorageFault`] for the next commit, with nothing applied.
     pub fn commit(&mut self, batch: Batch) -> Result<AppliedSeq, StorageFault> {
+        // The twin of the host's refusal (issue #61): an install in progress owns the lineage
+        // until it finishes; a commit would land among chunks under a barrier it does not chain to.
+        if let Some((_, at)) = self.installing(batch.partition, batch.generation) {
+            tracing::error!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                generation = batch.generation.0,
+                seq = batch.seq.0,
+                at = at.0,
+                "installing_generation_write_refused"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
         if let Some(StorageOp::Fail { fault, .. }) = self.take_planned(|op| {
             matches!(
                 op,
@@ -526,6 +602,17 @@ impl MemoryEngine {
         if let Some(parent) = lineage.parent {
             let cut = through.map_or(lineage.base, |through| through.min(lineage.base));
             self.replay_into(partition, parent, Some(cut), records);
+        }
+        // An install is the lineage's state as of its barrier: a read cut below it shows none of
+        // it (`inherit` refuses such a cut above zero, as the floor sits at the barrier).
+        if let Some(install) = lineage
+            .install
+            .as_ref()
+            .filter(|install| through.is_none_or(|through| through >= install.at))
+        {
+            for (ns, key, value, version) in &install.entries {
+                records.insert((*ns, key.clone()), (value.clone(), *version));
+            }
         }
         let within = |batch: &&Batch| through.is_none_or(|through| batch.seq <= through);
         for batch in lineage.batches.iter().filter(within) {
@@ -851,6 +938,28 @@ impl MemoryEngine {
         {
             return Err(refused);
         }
+        // The twin of `InheritError::ParentInstalling` (issue #61), and its mirror into an
+        // installing lineage: a half-written view is neither inherited from nor linked under.
+        let installing = [(from, "from"), (to, "to")]
+            .into_iter()
+            .find_map(|(generation, side)| {
+                self.installing(partition, generation)
+                    .map(|(_, at)| (side, at))
+            });
+        if let Some((side, at)) = installing {
+            tracing::error!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                side,
+                at = at.0,
+                "installing_inherit_refused"
+            );
+            return Err(SimError::Config {
+                field: "inherit_installing",
+            });
+        }
         let held = self.buffered_applied(partition, from);
         let base = Seq(through.0.min(held.0));
         // The twin of `as_of_base`'s floor bound (issue #61, A2): the record at a base below
@@ -934,6 +1043,347 @@ impl MemoryEngine {
     ) {
         let lineage = self.lineages.entry((partition, generation)).or_default();
         lineage.durable = durable;
+    }
+
+    /// Record that the host released lineage `(partition, generation)`'s tail through
+    /// `through`, the twin of `RocksEngine::put_tail_release` (synced there, so kept by every
+    /// crash image here).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] when the engine holds no such lineage; nothing is written.
+    pub fn put_tail_release(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        through: Seq,
+    ) -> Result<(), StorageFault> {
+        let (node, p, g) = (self.node.0, partition.0, generation.0);
+        let Some(lineage) = self.lineages.get_mut(&(partition, generation)) else {
+            tracing::error!(
+                node,
+                partition = p,
+                generation = g,
+                through = through.0,
+                "tail_release_unknown_lineage"
+            );
+            return Err(StorageFault::WriteFailed);
+        };
+        lineage.tail_release = Some(through);
+        tracing::info!(
+            node,
+            partition = p,
+            generation = g,
+            through = through.0,
+            "tail_release_written"
+        );
+        Ok(())
+    }
+
+    /// The newest generation of `partition` holding a tail release, and its `through`.
+    #[must_use]
+    pub fn tail_release(&self, partition: PartitionId) -> Option<(Generation, Seq)> {
+        self.lineages
+            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
+            .rev()
+            .find_map(|(&(_, generation), lineage)| {
+                lineage.tail_release.map(|through| (generation, through))
+            })
+    }
+
+    /// Step 1 of a snapshot install (issue #61 S2), the twin of `RocksEngine::install_begin`:
+    /// wipe every lineage `partition` holds — its records, batches, links, marks and tail
+    /// release — and start lineage `(partition, generation)` installing at barrier `at`, as one
+    /// step (the host's one `WriteBatch`, rev 5b). A begin while already installing starts over.
+    /// Logs `snapshot_install_begun{wiped}` or `snapshot_install_refused{step: "begin"}`.
+    ///
+    /// Unsynced on the host. The sim does not model a host crash undoing it: see
+    /// [`crate::storage::crash_image::CrashImage`].
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NewerGeneration`] when the copy holds a newer generation of the
+    /// partition. Nothing is written.
+    pub fn install_begin(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        let wiped: Vec<u64> = self
+            .lineages
+            .keys()
+            .filter(|(p, _)| *p == partition)
+            .map(|(_, g)| g.0)
+            .collect();
+        let held = wiped.last().copied().map(Generation);
+        if let Some(held) = held.filter(|held| *held > generation) {
+            let refused = InstallError::NewerGeneration { held };
+            self.install_refused(partition, generation, at, "begin", refused);
+            return Err(refused);
+        }
+        self.lineages.retain(|&(p, _), _| p != partition);
+        self.records.retain(|&(p, _, _), _| p != partition);
+        self.lineages.insert(
+            (partition, generation),
+            Lineage {
+                install: Some(Install {
+                    at,
+                    finished: false,
+                    entries: Vec::new(),
+                }),
+                ..Lineage::default()
+            },
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            wiped = ?wiped,
+            "snapshot_install_begun"
+        );
+        Ok(())
+    }
+
+    /// Step 2, the twin of `RocksEngine::install_chunk`: write one page of the source's view
+    /// into the installing lineage, each entry at its own version. Returns how many it wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
+    /// [`InstallError::ForeignEntry`] for a `History` or `Meta` entry or the head `Progress`.
+    /// Nothing of the chunk is written.
+    pub fn install_chunk(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        entries: &[InstallEntry],
+    ) -> Result<usize, InstallError> {
+        let result = self.chunk_install(partition, generation, at, entries);
+        match result {
+            Ok(written) => tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = at.0,
+                written,
+                "snapshot_install_chunk"
+            ),
+            Err(refused) => self.install_refused(partition, generation, at, "chunk", refused),
+        }
+        result
+    }
+
+    fn chunk_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        entries: &[InstallEntry],
+    ) -> Result<usize, InstallError> {
+        self.check_installing(partition, generation, at)?;
+        if let Some((ns, _, _, _)) = entries.iter().find(|(ns, key, _, _)| {
+            matches!(ns, Namespace::History | Namespace::Meta)
+                || (*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
+        }) {
+            return Err(InstallError::ForeignEntry { ns: *ns });
+        }
+        for (ns, key, value, version) in entries {
+            self.records
+                .insert((partition, *ns, key.clone()), (value.clone(), *version));
+        }
+        if let Some(install) = self
+            .lineages
+            .get_mut(&(partition, generation))
+            .and_then(|lineage| lineage.install.as_mut())
+        {
+            install.entries.extend_from_slice(entries);
+        }
+        Ok(entries.len())
+    }
+
+    /// Step 3, the twin of `RocksEngine::install_finish`: commit the barrier's History record
+    /// and head `Progress` at `at` (so `applied = at`), set the [`TrimFloor`] at `at` with
+    /// `root`, and end the install. Synced on the host, so the floor is marked synced and a host
+    /// crash keeps the install ([`crate::storage::crash_image::CrashImage`]). `durable` is
+    /// **not** moved: the next real sync credits it, as after any commit.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
+    /// [`InstallError::BadBarrier`] when `barrier` does not decode, claims another seq or
+    /// carries a digest that does not recompute. Nothing is written; the lineage stays
+    /// installing.
+    pub fn install_finish(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        barrier: &Bytes,
+        root: (Seq, Digest),
+    ) -> Result<(), InstallError> {
+        let result = self.finish_install(partition, generation, at, barrier, root);
+        match result {
+            Ok(()) => tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = at.0,
+                root_base = root.0 .0,
+                "snapshot_install_finished"
+            ),
+            Err(refused) => self.install_refused(partition, generation, at, "finish", refused),
+        }
+        result
+    }
+
+    fn finish_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        barrier: &Bytes,
+        root: (Seq, Digest),
+    ) -> Result<(), InstallError> {
+        self.check_installing(partition, generation, at)?;
+        let bad = InstallError::BadBarrier { at };
+        let envelope = ReplicationEnvelope::decode(barrier).map_err(|_| bad)?;
+        if envelope.header.seq != at
+            || envelope.compute_record_digest().ok() != Some(envelope.record_digest)
+        {
+            return Err(bad);
+        }
+        let mut progress = at.0.to_le_bytes().to_vec();
+        progress.extend_from_slice(&envelope.record_digest.0);
+        let floor = TrimFloor {
+            seq: at,
+            root_base: root.0,
+            root_digest: root.1,
+        };
+        if let Some(lineage) = self.lineages.get_mut(&(partition, generation)) {
+            lineage.floor = Some(floor);
+            lineage.floor_synced = Some(floor);
+            if let Some(install) = lineage.install.as_mut() {
+                install.finished = true;
+            }
+        }
+        self.apply(Batch {
+            id: BatchId(at.0),
+            partition,
+            generation,
+            seq: at,
+            writes: vec![
+                Write {
+                    ns: Namespace::History,
+                    key: Bytes::copy_from_slice(&at.0.to_be_bytes()),
+                    value: Some(barrier.clone()),
+                },
+                Write {
+                    ns: Namespace::Progress,
+                    key: Bytes::from_static(PROGRESS_KEY),
+                    value: Some(Bytes::from(progress)),
+                },
+            ],
+        });
+        Ok(())
+    }
+
+    /// The `(source generation, at)` of lineage `(partition, generation)`'s unfinished install,
+    /// `None` when none is in progress, the twin of `RocksEngine::installing`.
+    #[must_use]
+    pub fn installing(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, Seq)> {
+        self.lineage(partition, generation)
+            .and_then(|lineage| lineage.install.as_ref())
+            .filter(|install| !install.finished)
+            .map(|install| (generation, install.at))
+    }
+
+    fn check_installing(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        if self.installing(partition, generation) == Some((generation, at)) {
+            Ok(())
+        } else {
+            Err(InstallError::NotInstalling { at })
+        }
+    }
+
+    fn install_refused(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        step: &'static str,
+        refused: InstallError,
+    ) {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            step,
+            reason = refused.reason(),
+            "snapshot_install_refused"
+        );
+    }
+
+    /// Restore a lineage's install and tail release from a crash image, before its batches
+    /// replay: an install's entries are the base its batches write over.
+    pub(crate) fn restore_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        install: Option<&Install>,
+        tail_release: Option<Seq>,
+    ) {
+        if let Some(install) = install {
+            for (ns, key, value, version) in &install.entries {
+                self.records
+                    .insert((partition, *ns, key.clone()), (value.clone(), *version));
+            }
+        }
+        let lineage = self.lineages.entry((partition, generation)).or_default();
+        lineage.install = install.cloned();
+        lineage.tail_release = tail_release;
+    }
+
+    /// Clear every lineage still installing, the twin of the host's `clear_installs` at a
+    /// read-write open: the partial copy is removed and the lineage rejoins empty. Logs
+    /// `snapshot_install_cleared_at_open` for each.
+    pub(crate) fn clear_installs(&mut self) {
+        let cleared: Vec<((PartitionId, Generation), Install)> = self
+            .lineages
+            .iter()
+            .filter_map(|(&key, lineage)| {
+                lineage
+                    .install
+                    .clone()
+                    .filter(|install| !install.finished)
+                    .map(|install| (key, install))
+            })
+            .collect();
+        for ((partition, generation), install) in cleared {
+            self.lineages.remove(&(partition, generation));
+            for (ns, key, _, _) in &install.entries {
+                self.records.remove(&(partition, *ns, key.clone()));
+            }
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = install.at.0,
+                "snapshot_install_cleared_at_open"
+            );
+        }
     }
 
     fn lineage(&self, partition: PartitionId, generation: Generation) -> Option<&Lineage> {
