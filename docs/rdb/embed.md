@@ -294,24 +294,51 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
-  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
-  bytes.
+- The largest single value a put takes is `MAX_VALUE`, 1,044,480 bytes, for any id. A byte
+  write over the bound is refused by the `Db` with `TOO_LARGE` before it is sent (see
+  [Size limits](#size-limits)).
 
-A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
+A `write` (`Change::Doc`, a map, a set or a list) one byte over the record is refused with
+`INVALID_ARGUMENT`, and nothing is written:
 
 | Over the limit | Refused by | Detail |
 |---|---|---|
 | One put, alone | the compile, with the kernel's `record_len` | `over the 1 MiB limit for the whole write` |
 | Only all the puts together | the kernel's admission check | `envelope_bytes` |
 
-- A single value of 1 MiB or more can get a different detail, naming the 1,048,536-byte limit for
-  one value (`rdb_value::envelope::MAX_PAYLOAD`). Sent to an owner in another process, it reads
-  `a value cannot be carried`. Both are `INVALID_ARGUMENT`. The record limit above is always the
-  lower one.
 - The ack floor uses only the room a transaction leaves, so it is not part of the sum.
 - `write` (`Change::Doc`, maps, sets, lists and blob chunks) has the same limit, but its overhead
   differs, so this sum does not apply to it.
+
+### Size limits
+
+Every limit below is checked by the `Db` before anything is compiled or sent (#148). Over one,
+the call is refused with `TOO_LARGE`, `retry: Definitive` and `no_mutation: true`, and nothing is
+written. The same call fails the same way, so make it smaller. `ApiError::too_large()` returns a
+`TooLarge { limit, size, max }`: which limit, the size the call carried, and the maximum.
+
+| Limit (`rdb_api::Limit`) | Constant | Maximum | Applies to |
+|---|---|---|---|
+| `ObjectId` | `MAX_OBJECT_ID` | 1,024 bytes | Every write and read |
+| `Key` | `MAX_KEY` | 1,024 bytes | A map key or set member, and `Look::Members { after }` |
+| `Value` | `MAX_VALUE` | 1,044,480 bytes | Each value of `put`, `put_in`, `put_as`, `txn` and `txn_as` |
+| `Write` | `MAX_WRITE` | 1,048,576 bytes | A whole `put` or `txn`, by the upper-bound sum above |
+| `Ops` | `MAX_OPS` | 255 | The ops of one change, and the puts of one `txn` |
+| `Chunk` | `rdb_value::blob::MAX_CHUNK` | 1,044,480 bytes | One `Change::Chunk` |
+
+- `MAX_VALUE` is fixed: it does not move with the id. A value of up to `MAX_VALUE` bytes fits one
+  put under any id the `Db` accepts. Values above it, up to the old id-dependent ceiling, were
+  accepted before #148 and are refused now. Values already stored stay readable.
+- A "1 MiB" value (1,048,576 bytes) does not fit, and never did. Store larger data as a blob:
+  `Change::Chunk` with chunks of at most `MAX_CHUNK` bytes, then `Change::Publish`.
+- For `Write`, `size` is the upper-bound sum, never below the exact record. So a write at the
+  limit always passes, and no refusal from the compile or the kernel lands first.
+- An over-long object id answers first. In a byte write, a value over `MAX_VALUE` answers
+  before the whole write.
+- A page `limit` over `MAX_PAGE` and a deadline over `MAX_TXN_DEADLINE` are not sizes. They stay
+  `INVALID_ARGUMENT`.
+- Only the `Db` raises `TOO_LARGE`, so `too_large` is never set on an answer that came over a
+  link. The gateway sends wire kind `TOO_LARGE` with gRPC code `INVALID_ARGUMENT`.
 
 ### More than one partition
 
@@ -976,6 +1003,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` tries to re-read the owner on this answer (see the barrier notes below for when it does not); the retry goes to the new one once a re-read succeeds. |
+| `TOO_LARGE` | The call is over a fixed size limit: an object id, a key, a value, a whole write, a change's ops or a blob chunk. Nothing was sent. `refused.error.too_large()` names the limit, the size and the maximum ([Size limits](#size-limits)). | Never as it is. Make it smaller, and send it as a new write. |
 | `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without confirming the position. When the owner answers it, either a regular copy has not proved it, and the message names the copies still owed; or every copy proved it but the owner's grant stopped admitting before it could answer `Ok`, and the message says so, names no copy, and says to read back, since a newer owner may have replaced it. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |

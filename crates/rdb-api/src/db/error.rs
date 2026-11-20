@@ -22,6 +22,40 @@ pub struct ApiError {
     /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
     /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
     pub retry_after: Option<Duration>,
+    /// The size limit a `TOO_LARGE` refusal broke, with the size found and the maximum (#148).
+    /// Set on every `TOO_LARGE` the `Db` raises and on nothing else. The `Db` checks before it
+    /// sends, so an answer that crossed a link never carries it. Set it with
+    /// [`Self::too_large_refusal`].
+    pub too_large: Option<TooLarge>,
+}
+
+/// Which fixed size limit a `TOO_LARGE` refusal broke (#148).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// An object id's raw bytes, over `MAX_OBJECT_ID`.
+    ObjectId,
+    /// A map key's or set member's bytes, over `MAX_KEY`.
+    Key,
+    /// One byte value of a put, over `MAX_VALUE`.
+    Value,
+    /// A whole byte write's upper-bound record size, over `MAX_WRITE`.
+    Write,
+    /// The ops of one change, or the puts of one transaction, over `MAX_OPS`.
+    Ops,
+    /// One blob chunk's bytes, over `rdb_value::blob::MAX_CHUNK`.
+    Chunk,
+}
+
+/// What a `TOO_LARGE` refusal found: the limit, the size the call carried and the most that
+/// limit allows. `size` is always above `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooLarge {
+    /// The limit broken.
+    pub limit: Limit,
+    /// The size the call carried, in the limit's unit (bytes, or ops for [`Limit::Ops`]).
+    pub size: usize,
+    /// The most the limit allows.
+    pub max: usize,
 }
 
 /// How the detail of a host fault ([`ApiError::host`]) starts. A `NotWired` error whose detail
@@ -139,7 +173,7 @@ impl ApiError {
     ///
     /// | kind | `retry` | `no_mutation` |
     /// |---|---|---|
-    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
+    /// | `ConditionFailed`, `InvalidArgument`, `TooLarge` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
     /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
     /// | `UploadChunkConflict` | `Reconcile` | `true` |
@@ -152,7 +186,7 @@ impl ApiError {
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
         let (retry, no_mutation) = match kind {
-            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument => {
+            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument | ErrorKind::TooLarge => {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
@@ -168,6 +202,7 @@ impl ApiError {
             no_mutation,
             detail: detail.into(),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -180,6 +215,7 @@ impl ApiError {
             no_mutation: error.proves_no_mutation(),
             detail: error.to_string(),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -187,6 +223,22 @@ impl ApiError {
     #[must_use]
     pub fn invalid(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidArgument, detail)
+    }
+
+    /// `TOO_LARGE` for a call over a fixed size limit, refused before anything was sent
+    /// (#148): `Definitive`, `no_mutation`, and [`Self::too_large`] set to `found`.
+    #[must_use]
+    pub fn too_large_refusal(found: TooLarge, detail: impl Into<String>) -> Self {
+        Self {
+            too_large: Some(found),
+            ..Self::new(ErrorKind::TooLarge, detail)
+        }
+    }
+
+    /// The size limit this error broke, when it is a `TOO_LARGE` the `Db` raised (#148).
+    #[must_use]
+    pub const fn too_large(&self) -> Option<TooLarge> {
+        self.too_large
     }
 
     /// A put refused before it was sent: this node has adopted no generation yet, so there is
@@ -204,6 +256,7 @@ impl ApiError {
                 partition.0, node.0
             ),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -224,6 +277,7 @@ impl ApiError {
                 node.0, node.0
             ),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -245,6 +299,7 @@ impl ApiError {
                 node.0
             ),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -270,6 +325,7 @@ impl ApiError {
                 node.0
             ),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -290,6 +346,7 @@ impl ApiError {
                 node.0, node.0
             ),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -302,6 +359,7 @@ impl ApiError {
             no_mutation: false,
             detail: format!("{HOST_FAULT}{detail}"),
             retry_after: None,
+            too_large: None,
         }
     }
 
@@ -562,6 +620,10 @@ const fn step_for(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'sta
              send again; call `Db::wait_durable` again"
         }
         ErrorKind::CorruptBlob => "write `Change::Clear` to the blob, then upload it again",
+        ErrorKind::TooLarge => {
+            "make it smaller: `ApiError::too_large` names the limit, the size and the maximum; \
+             the same request fails the same way"
+        }
     }
 }
 
@@ -702,6 +764,7 @@ mod tests {
             UploadChunkConflict,
             CorruptBlob,
             DurabilityUnconfirmed,
+            TooLarge,
         ];
         for kind in &all {
             match kind {
@@ -726,7 +789,8 @@ mod tests {
                 | Unavailable
                 | UploadChunkConflict
                 | CorruptBlob
-                | DurabilityUnconfirmed => {}
+                | DurabilityUnconfirmed
+                | TooLarge => {}
             }
         }
         all

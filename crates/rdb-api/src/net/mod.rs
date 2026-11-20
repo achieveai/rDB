@@ -124,7 +124,11 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
 /// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// `11` came with issue #148: the `TooLarge` error kind, which `WireApiError::kind` carries.
+/// Only the `Db` raises it, before it sends, so no node answers it today; the type changed all
+/// the same. `10` is held by #107, so the number taken at merge may move (lead ruling).
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1322,6 +1326,7 @@ fn undecodable_call(to: NodeId, error: &str) -> ApiError {
             to.0
         ),
         retry_after: None,
+        too_large: None,
     }
 }
 

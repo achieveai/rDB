@@ -84,7 +84,8 @@ pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest object id, in raw bytes, that any write or read through `Db` accepts (M9 S5). A
 /// raw `ClientCall` sent with `NodeHandle::send`, or a `TxnRequest` given to [`Db::resend`],
 /// is not checked (ADR-rdb-0013 decision 11). A longer one is
-/// `INVALID_ARGUMENT` before anything is compiled, sent or read, and its request id is used up.
+/// `TOO_LARGE` ([`Limit::ObjectId`]) before anything is compiled, sent or read, and its request
+/// id is used up.
 /// A read keeps this limit even if a later version lowers the write limit: data already written
 /// stays readable, so a lower write limit needs its own constant.
 pub const MAX_OBJECT_ID: usize = 1_024;
@@ -95,16 +96,41 @@ pub const MAX_OBJECT_ID: usize = 1_024;
 const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 
 /// The most ops one change carries, and the most puts one [`Db::txn`] takes (M9 S5): the
-/// kernel's own cap on writes in one request. A request over it is `INVALID_ARGUMENT` before
-/// anything is compiled or sent. A change's writes are capped separately, at compile: a map or
-/// set change also writes its root, so it takes at most 254 element changes.
+/// kernel's own cap on writes in one request. A request over it is `TOO_LARGE`
+/// ([`Limit::Ops`]) before anything is compiled or sent. A change's writes are capped
+/// separately, at compile: a map or set change also writes its root, so it takes at most 254
+/// element changes.
 pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
 
 /// The longest map key or set member, in bytes, that a write or a `Members` read's `after`
 /// accepts (M9 S5): a text key's UTF-8 length, or a byte key's length, so `é` counts 2. Other
-/// key types are short by their type. A longer one is `INVALID_ARGUMENT` before anything is
-/// compiled, sent or read.
+/// key types are short by their type. A longer one is `TOO_LARGE` ([`Limit::Key`]) before
+/// anything is compiled, sent or read.
 pub const MAX_KEY: usize = 1_024;
+
+/// The largest byte value one put carries (`put`, `put_in`, `put_as`, and each `TxnPut` of
+/// `txn` and `txn_as`), for any object id up to [`MAX_OBJECT_ID`] (#148). Fixed, so a caller
+/// can cut over on it: it does not move with the id. Equal to `rdb_value::blob::MAX_CHUNK`
+/// (1 MiB less 4 KiB). A larger value is `TOO_LARGE` ([`Limit::Value`]) before anything is
+/// compiled or sent, and its request id is used up.
+pub const MAX_VALUE: usize = 1_044_480;
+
+/// The largest record one atomic write ships: `MAX_ENVELOPE_BYTES` (1 MiB). A byte write
+/// (`put` and `txn` forms) is checked against it before it is sent, with the upper-bound sum
+/// `265 + for each put: value_len + id_len + zero_bytes_in_id + 71` (embed.md, "How big a
+/// transaction can be"), never below the exact record. Over it is `TOO_LARGE`
+/// ([`Limit::Write`]), with that sum as the size (#148).
+pub const MAX_WRITE: usize = rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+
+// Any one put of MAX_VALUE bytes, under any id the Db admits (all 0x00 counts twice), fits
+// MAX_WRITE by the upper-bound sum, so the value limit is never a lie.
+const _: () = assert!(WRITE_COST + MAX_VALUE + 2 * MAX_OBJECT_ID + PUT_COST <= MAX_WRITE);
+const _: () = assert!(MAX_VALUE == rdb_value::blob::MAX_CHUNK);
+
+/// The upper-bound sum's cost of a byte write, however many puts it has (embed.md).
+const WRITE_COST: usize = 265;
+/// The upper-bound sum's cost of each put besides its value, id and the id's zero bytes.
+const PUT_COST: usize = 71;
 
 /// The largest page one read asks for: the most members, or list items, a `Members`, `Items`
 /// or `ItemsAfter` look takes (M9 S5). A larger `limit` is `INVALID_ARGUMENT` before anything is
@@ -116,7 +142,7 @@ mod ack_floor;
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
-pub use error::ApiError;
+pub use error::{ApiError, Limit, TooLarge};
 
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
@@ -3273,6 +3299,12 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
+        if let Some(error) = byte_write_refusal(&[(object, value)], identity) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
         let put = PutOp {
             group,
             object: Bytes::copy_from_slice(object),
@@ -3354,6 +3386,7 @@ impl Db {
                 error: limit_refused(
                     identity,
                     "puts",
+                    Limit::Ops,
                     puts.len(),
                     MAX_OPS,
                     format!(
@@ -3362,6 +3395,13 @@ impl Db {
                         identity.request.0
                     ),
                 ),
+                request: None,
+            });
+        }
+        let bytes: Vec<_> = puts.iter().map(|put| (put.object, put.value)).collect();
+        if let Some(error) = byte_write_refusal(&bytes, identity) {
+            return Err(PutError {
+                error,
                 request: None,
             });
         }
@@ -4862,6 +4902,7 @@ impl Db {
                     node.0
                 ),
                 retry_after: None,
+                too_large: None,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -5800,6 +5841,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
                 no_mutation: true,
                 detail: "the read was refused".to_owned(),
                 retry_after: None,
+                too_large: None,
             }
         }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
@@ -5824,6 +5866,7 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
         retry_after: None,
+        too_large: None,
     }
 }
 
@@ -6362,6 +6405,7 @@ fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiErro
         no_mutation,
         detail: format!("{detail}; {}", error::REBUILD_STEP),
         retry_after: None,
+        too_large: None,
     }
 }
 
@@ -6640,7 +6684,7 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
     })
 }
 
-/// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
+/// The first limit `puts` breaks, as `TOO_LARGE` naming the put as `op <index>`, or
 /// `None` when every put is within every limit. `identity` is the one the refused request used up.
 fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> {
     let request = identity.request;
@@ -6649,6 +6693,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "object_id",
+                Limit::ObjectId,
                 put.object.len(),
                 MAX_OBJECT_ID,
                 format!(
@@ -6664,6 +6709,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "ops",
+                Limit::Ops,
                 ops,
                 MAX_OPS,
                 format!(
@@ -6671,6 +6717,23 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
                     request.0
                 ),
             ));
+        }
+        if let Change::Chunk { bytes, .. } = &put.change {
+            if bytes.len() > rdb_value::blob::MAX_CHUNK {
+                return Some(limit_refused(
+                    identity,
+                    "chunk",
+                    Limit::Chunk,
+                    bytes.len(),
+                    rdb_value::blob::MAX_CHUNK,
+                    format!(
+                        "op {index}: chunk {} bytes, over the {}-byte limit; request {} not sent",
+                        bytes.len(),
+                        rdb_value::blob::MAX_CHUNK,
+                        request.0
+                    ),
+                ));
+            }
         }
         let elems = match &put.change {
             Change::Map(elems) | Change::Set(elems) => elems.as_slice(),
@@ -6687,7 +6750,53 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
     })
 }
 
-/// `INVALID_ARGUMENT` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
+/// The first size limit a byte write breaks, or `None` (#148). `puts` are its (object id,
+/// value) pairs in order. An id over [`MAX_OBJECT_ID`] is left to [`write_refusal`], which
+/// names it first, as it always has. Then each value against [`MAX_VALUE`], naming the put as
+/// `op <index>`, then the upper-bound sum against [`MAX_WRITE`].
+fn byte_write_refusal(puts: &[(&[u8], &[u8])], identity: RequestIdentity) -> Option<ApiError> {
+    if puts.iter().any(|(object, _)| object.len() > MAX_OBJECT_ID) {
+        return None;
+    }
+    let request = identity.request.0;
+    if let Some((index, value)) = puts
+        .iter()
+        .map(|(_, value)| value.len())
+        .enumerate()
+        .find(|(_, value)| *value > MAX_VALUE)
+    {
+        return Some(limit_refused(
+            identity,
+            "value",
+            Limit::Value,
+            value,
+            MAX_VALUE,
+            format!(
+                "op {index}: value {value} bytes, over the {MAX_VALUE}-byte limit; request \
+                 {request} not sent"
+            ),
+        ));
+    }
+    let bound = puts.iter().fold(WRITE_COST, |sum, (object, value)| {
+        let zeros = object.iter().filter(|byte| **byte == 0).count();
+        sum + value.len() + object.len() + zeros + PUT_COST
+    });
+    (bound > MAX_WRITE).then(|| {
+        limit_refused(
+            identity,
+            "write",
+            Limit::Write,
+            bound,
+            MAX_WRITE,
+            format!(
+                "write {bound} bytes by the upper-bound sum, over the {MAX_WRITE}-byte limit for \
+                 the whole write; request {request} not sent"
+            ),
+        )
+    })
+}
+
+/// `TOO_LARGE` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
 /// the put, when there is one; `done` ends the detail: `request R not <done>`.
 fn key_refusal(
     key: &Value,
@@ -6701,6 +6810,7 @@ fn key_refusal(
         limit_refused(
             identity,
             "key",
+            Limit::Key,
             found,
             MAX_KEY,
             format!(
@@ -6750,9 +6860,9 @@ fn op_count(change: &Change) -> usize {
     }
 }
 
-/// The first limit a read `call` breaks, as `INVALID_ARGUMENT`, or `None` when it is within
-/// every limit. A call that is not a read is never refused here: [`Db::read_call`] sends reads
-/// only.
+/// The first limit a read `call` breaks, as `TOO_LARGE` (`INVALID_ARGUMENT` for a page), or
+/// `None` when it is within every limit. A call that is not a read is never refused here:
+/// [`Db::read_call`] sends reads only.
 fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     let (identity, object, look) = match call {
         ClientCall::Get {
@@ -6776,6 +6886,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         return Some(limit_refused(
             *identity,
             "object_id",
+            Limit::ObjectId,
             object.len(),
             MAX_OBJECT_ID,
             format!(
@@ -6794,16 +6905,12 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         Some(Look::Doc | Look::Range { .. }) | None => 0,
     };
     if page > MAX_PAGE {
-        return Some(limit_refused(
-            *identity,
-            "page",
-            page,
-            MAX_PAGE,
-            format!(
-                "page limit {page}, over {MAX_PAGE}; request {} not read",
-                request.0
-            ),
-        ));
+        // A count the read asks for, not a size it carries: `INVALID_ARGUMENT`, not `TOO_LARGE`.
+        log_limit_refused(*identity, "page", page, MAX_PAGE);
+        return Some(ApiError::invalid(format!(
+            "page limit {page}, over {MAX_PAGE}; request {} not read",
+            request.0
+        )));
     }
     match look {
         Some(Look::Members {
@@ -6820,16 +6927,31 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     }
 }
 
-/// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
-/// and `INVALID_ARGUMENT` with `detail`.
+/// A request over a size limit: one `limit_refused` line, which never carries the caller's
+/// bytes, and `TOO_LARGE` with `detail`, naming `typed` with `found` and `max` (#148). `limit`
+/// is the line's name for it.
 fn limit_refused(
     identity: RequestIdentity,
     limit: &'static str,
+    typed: Limit,
     found: usize,
     max: usize,
     detail: String,
 ) -> ApiError {
-    // `client` with `request` is the key a log query joins on: `request` alone is not unique.
+    log_limit_refused(identity, limit, found, max);
+    ApiError::too_large_refusal(
+        TooLarge {
+            limit: typed,
+            size: found,
+            max,
+        },
+        detail,
+    )
+}
+
+/// The `limit_refused` line. `client` with `request` is the key a log query joins on:
+/// `request` alone is not unique.
+fn log_limit_refused(identity: RequestIdentity, limit: &'static str, found: usize, max: usize) {
     tracing::info!(
         client = identity.client.0,
         request = identity.request.0,
@@ -6838,7 +6960,6 @@ fn limit_refused(
         max,
         "limit_refused"
     );
-    ApiError::invalid(detail)
 }
 
 /// The time a transaction's send waits: its deadline plus twice the host's waiter margin, so
@@ -9308,11 +9429,7 @@ mod tests {
         let oversized = db
             .put_as(app, b"a", &vec![b'z'; 1_048_536], None)
             .expect_err("past the envelope");
-        assert_eq!(
-            oversized.error.kind,
-            ErrorKind::InvalidArgument,
-            "{oversized:?}"
-        );
+        assert_eq!(oversized.error.kind, ErrorKind::TooLarge, "{oversized:?}");
         assert!(!oversized.error.no_mutation, "{oversized:?}");
 
         // `status 2`, then `retry 2`: still seq 3, never a second apply.
@@ -10007,11 +10124,26 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 S5: a request over a limit is `INVALID_ARGUMENT`, `Definitive`, `no_mutation`, with no
-    /// request, its detail ending `request R not sent` or `not read`, and nothing reaches the
-    /// owner. `R` is the id it used up.
+    /// M9 S5: a request over a size limit is `TOO_LARGE` (#148; `INVALID_ARGUMENT` before it),
+    /// `Definitive`, `no_mutation`, typed in `too_large`, with no request, its detail ending
+    /// `request R not sent` or `not read`, and nothing reaches the owner. `R` is the id it used
+    /// up.
     #[track_caller]
     fn refused_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert!(error.too_large.is_some(), "typed: {error:?}");
+        unsent_as(ErrorKind::TooLarge, error, detail, mailbox);
+    }
+
+    /// [`refused_unsent`] for a refusal that is no size: a page count or a deadline, which stay
+    /// `INVALID_ARGUMENT` and carry no `too_large`.
+    #[track_caller]
+    fn invalid_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert_eq!(error.too_large, None, "{error:?}");
+        unsent_as(ErrorKind::InvalidArgument, error, detail, mailbox);
+    }
+
+    #[track_caller]
+    fn unsent_as(kind: ErrorKind, error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
         assert_eq!(
             (
                 error.kind,
@@ -10019,12 +10151,7 @@ mod tests {
                 error.no_mutation,
                 error.detail.as_str()
             ),
-            (
-                ErrorKind::InvalidArgument,
-                RetryRule::Definitive,
-                true,
-                detail
-            ),
+            (kind, RetryRule::Definitive, true, detail),
         );
         assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
     }
@@ -10149,7 +10276,7 @@ mod tests {
                 refused.request.is_none()
             ),
             (
-                ErrorKind::InvalidArgument,
+                ErrorKind::TooLarge,
                 RetryRule::Definitive,
                 false,
                 format!(
@@ -10611,6 +10738,7 @@ mod tests {
             no_mutation: true,
             detail: "lease expired for partition 1".to_owned(),
             retry_after: None,
+            too_large: None,
         });
         assert!(
             refused.detail.ends_with(error::QUARANTINED_STEP)
@@ -11773,7 +11901,7 @@ mod tests {
         // The deadline comes before the count, and uses up no request id.
         let late = MAX_TXN_DEADLINE + Duration::from_millis(1);
         let txn = db.txn(&puts, late).expect_err("past the deadline");
-        refused_unsent(
+        invalid_unsent(
             &txn.error,
             &format!(
                 "deadline: {} ms is past the maximum of {} ms; nothing was sent",
@@ -11979,7 +12107,7 @@ mod tests {
         };
         for (request, look) in (1_u64..).zip(looks(MAX_PAGE + 1)) {
             let refused = db.read(b"l", look).expect_err("over the limit");
-            refused_unsent(
+            invalid_unsent(
                 &refused,
                 &format!("page limit 1001, over 1000; request {request} not read"),
                 &mailbox,
@@ -14862,11 +14990,7 @@ mod tests {
         let refused = db
             .put(&[0; MAX_OBJECT_ID + 1], b"1", None)
             .expect_err("over the limit");
-        assert_eq!(
-            refused.error.kind,
-            ErrorKind::InvalidArgument,
-            "{refused:?}"
-        );
+        assert_eq!(refused.error.kind, ErrorKind::TooLarge, "{refused:?}");
         let clients: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
             .filter(|line| line["@m"] == "limit_refused")

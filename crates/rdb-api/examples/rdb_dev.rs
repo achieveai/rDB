@@ -86,9 +86,11 @@
 //! ops, and a `txn` at most 255 puts. A map or set write also writes its root, so with distinct
 //! keys the compile's 255-write cap refuses it first, at 255 keys. `members` and `items` take
 //! `--limit` 1,000 at most, a count of items, not bytes. A text or byte map key or set member,
-//! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A request over a
-//! limit answers `INVALID_ARGUMENT`, and its detail ends `request R not sent` (a write) or
-//! `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
+//! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A `put` or `txn`
+//! value is at most 1,044,480 bytes (`MAX_VALUE`), a whole `put` or `txn` at most 1 MiB by the
+//! upper-bound sum (`MAX_WRITE`), and a `blob chunk` at most 1,044,480 bytes. A request over a
+//! size limit answers `TOO_LARGE`, a `--limit` over 1,000 `INVALID_ARGUMENT`, and the detail
+//! ends `request R not sent` (a write) or `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
 //! read prints no `request=` field, so its R is in the detail only.
 //!
 //! Any command answered with an error prints its `err` line, the run goes on to the next line,
@@ -7309,6 +7311,7 @@ mod tests {
             no_mutation,
             detail: "control store: list partitions/: x; nothing deleted".to_owned(),
             retry_after: None,
+            too_large: None,
         };
         assert_eq!(
             admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
@@ -7345,6 +7348,7 @@ mod tests {
                      delete may have applied; run it again to read where it stands"
                 .to_owned(),
             retry_after: None,
+            too_large: None,
         };
         let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
         assert_eq!(

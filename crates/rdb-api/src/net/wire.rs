@@ -1486,6 +1486,8 @@ impl From<WireApiError> for ApiError {
             no_mutation: error.no_mutation,
             detail: error.detail,
             retry_after: error.retry_after_millis.map(Duration::from_millis),
+            // Set only on a refusal the `Db` raises before it sends (#148), so never on the wire.
+            too_large: None,
         }
     }
 }

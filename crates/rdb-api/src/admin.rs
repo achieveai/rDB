@@ -3037,6 +3037,7 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
         no_mutation,
         detail: format!("control store: {detail}; {tail}"),
         retry_after: None,
+        too_large: None,
     }
 }
 
@@ -3301,6 +3302,7 @@ impl From<PromoteError> for ApiError {
             no_mutation,
             detail: error.to_string(),
             retry_after: None,
+            too_large: None,
         }
     }
 }

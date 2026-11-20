@@ -1430,7 +1430,12 @@ cited it. Marker moved below after this re-read, not before it.
 
 **Re-read (2026-11-12, dev-tail, PR #110 iteration 1), basis tree `618a021` stands; six entries restored.** The merge `b7b9889` moved this plan's marker to `618a021` and, in the same hunk, dropped six entries that its parents held below the old marker: `git diff b7b9889^1 b7b9889` on this file removes the lead's issue #79 entry and the two dev-tail issue #105 entries, and `git diff b7b9889^2 b7b9889` removes the same issue #79 entry and the three PR #104 source comparisons. They are restored above verbatim from those parents, in the order the foundation plan holds them, with the merge entry the other three plans carry. Re-read against the tree: `git rev-parse HEAD:crates/rdb-core/src/contracts` is `618a021`; `git diff --stat 629621d 618a021` touches only `authority.rs`, `event.rs` and `recovery.rs` (110 insertions, 1 deletion), and `git diff --stat 1d6140e 618a021` touches only `errors.rs` (7 insertions, 2 deletions), as the merge entry says. PR #110 iteration 1 changes no file under `contracts/`, so the basis does not move; no row's claim in this plan changes. Marker kept after this re-read.
 
-<!-- drift-basis: 618a021470f8b2d111c4abf863bedf78237bcee0 -->
+**Re-read (2026-11-19, t2-appapi, issue #148), basis moves tree `618a021` → tree `bcef9df`.**
+- `git diff 618a021 bcef9df` touches one file, `errors.rs`. It adds one variant, `ErrorKind::TooLarge`, last, so `ErrorKind` goes from 22 to 23 variants. It renames, removes and reorders nothing.
+- The `Db` raises `TooLarge` before anything is compiled or sent, and its doc says the kernel never raises it. So no `RdbError` variant carries it, no kernel `Ignored` or `Alert` reason names it, and it is not in the admission-reason subset.
+- Every row in this §15 that names `ErrorKind` was re-read against that: kernel-b's `Ignored`/`Alert` vocabulary rows, verification's row 9 (admission subset) and row 15 (`ClientOutcome::Error`), and kernel-a's `KernelEffect` rows. Each keeps its disposition. A row that quotes an `ErrorKind` count is a dated reading at its own basis and is left as it stands.
+
+<!-- drift-basis: bcef9df5ab5e1a4094c3242df4c2036319a0b225 -->
 
 
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
