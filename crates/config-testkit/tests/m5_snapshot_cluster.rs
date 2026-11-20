@@ -98,7 +98,7 @@ async fn m5_05_snapshot_id_unique_per_build_at_the_same_last_log_id() {
     let leader = cluster.leader().await;
 
     // The first build's id comes from `published_id`, not from the trigger's answer: the trigger
-    // stops waiting after the node's `write_timeout` (2 s, not scaled) and then answers
+    // stops waiting after the node's `write_timeout` (2 s times `RETCD_TEST_DEADLINE_SCALE`, #160) and then answers
     // `snapshot_id: None` while the build carries on (#29, ruling A-R203).
     let first_id = published_id(trigger_in_background(&cluster, leader)).await;
     let first_log_index = published_log_index(&cluster, leader, &first_id);
@@ -380,7 +380,7 @@ fn trigger_in_background(cluster: &Arc<Cluster>, id: NodeId) -> BackgroundBuild 
 
 /// The `snapshot_id` a background build published.
 ///
-/// The trigger stops waiting after the node's `write_timeout` (2 s in the testkit, not scaled)
+/// The trigger stops waiting after the node's `write_timeout` (2 s in the testkit, times `RETCD_TEST_DEADLINE_SCALE` since #160)
 /// and then answers `Started { snapshot_id: None, .. }` while the build carries on. A row that
 /// holds the build paused for longer than that on a loaded host gets that answer. So `None`
 /// is followed by a wait, under a scaled deadline, for the node's current snapshot to change
