@@ -7092,6 +7092,28 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
                 ));
             }
         }
+        // Q5 (PR #178 review r1, lead ruling): a document that is one byte string, the shape a
+        // byte put writes, keeps the byte put's value limit. Every other document shape keeps
+        // the owner's compile refusal.
+        if let Change::Doc(Delta(ops)) = &put.change {
+            if let [Op::Replace(Value::Bytes(bytes))] = ops.as_slice() {
+                if bytes.len() > MAX_VALUE {
+                    return Some(limit_refused(
+                        identity,
+                        "value",
+                        Limit::Value,
+                        bytes.len(),
+                        MAX_VALUE,
+                        format!(
+                            "op {index}: value {} bytes, over the {MAX_VALUE}-byte limit; \
+                             request {} not sent",
+                            bytes.len(),
+                            request.0
+                        ),
+                    ));
+                }
+            }
+        }
         let elems = match &put.change {
             Change::Map(elems) | Change::Set(elems) => elems.as_slice(),
             Change::Doc(_)

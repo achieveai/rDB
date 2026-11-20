@@ -188,3 +188,28 @@ fn sbx_148_d_chunk_at_max_chunk_minus_one_limit_and_plus_one() {
     assert_too_large(&refused.error, Limit::Chunk, MAX_CHUNK + 1, MAX_CHUNK);
     db.shutdown();
 }
+
+/// PR #178 review r1 Q5 (lead ruling): a `write_in` document that is one byte string, the shape
+/// a byte put writes, keeps the byte put's value limit: at `MAX_VALUE` it is written, one over
+/// it is `TOO_LARGE` with `Limit::Value` and nothing is written. Cut: drop the document check in
+/// `write_refusal`, and the 1,044,481-byte document is written and published, since it still
+/// fits the 1 MiB record. Integration (~1-2 s): one database open.
+#[config_log::retcd_test]
+fn sbx_148_e_a_byte_document_write_keeps_the_value_limit() {
+    use rdb_value::delta::{Delta, Op};
+    use rdb_value::value::Value;
+    let doc = |len: usize| Change::Doc(Delta(vec![Op::Replace(Value::Bytes(vec![5_u8; len]))]));
+    let (mut db, _kept) = open();
+    let written = db
+        .write_in(GROUP, b"d", doc(MAX_VALUE), None)
+        .unwrap_or_else(|refused| panic!("a document of {MAX_VALUE} bytes is written: {refused}"));
+    assert!(written.is_some(), "a new value is sent");
+    assert_eq!(stored(&db, b"d"), Some(MAX_VALUE), "read back");
+    let refused = db
+        .write_in(GROUP, b"e", doc(MAX_VALUE + 1), None)
+        .expect_err("over the limit");
+    assert_too_large(&refused.error, Limit::Value, MAX_VALUE + 1, MAX_VALUE);
+    assert!(refused.request.is_none(), "nothing was sent");
+    assert_eq!(stored(&db, b"e"), None, "nothing was written");
+    db.shutdown();
+}
