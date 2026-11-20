@@ -9015,3 +9015,277 @@ fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
         "node 3's engine proves copy 2 through the cutoff"
     );
 }
+
+/// Copy 1 of partition 1 placed on `PEER`, whose engine holds generation 1's canonical records
+/// 1..=3 ([`send_history`]): real `History` records, so a probe or a trim reads what is stored.
+/// [`with_survivor`]'s engine holds only `User` writes, so every probe above 0 there is
+/// `ProbeUnavailable` (issue #61 A6: a fixture property, not a sim defect).
+fn floored_survivor() -> (Dispatcher, rdb_sim::storage::history::CanonicalHistory) {
+    let prior = send_history(3);
+    let mut dispatcher = two_nodes();
+    for batch in prior.batches.clone() {
+        dispatcher.preload(PEER, batch).expect("a preload");
+    }
+    dispatcher
+        .place_survivor(PEER, PartitionId(1), placed_at_gen1(&prior))
+        .expect("a head the engine holds");
+    (dispatcher, prior)
+}
+
+/// F1's probe of copy 1 at `seq`, delivered on `NODE`: the event it is answered with, if any.
+fn probe_answer(dispatcher: &mut Dispatcher, seq: u64) -> Option<EventKind> {
+    let mut scheduler = Scheduler::new();
+    let probe = effect_from(
+        ModuleName::Recovery,
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt {
+            copy: CopyId(1),
+            seq: Seq(seq),
+        })),
+    );
+    deliver_on(dispatcher, &mut scheduler, NODE, probe).expect("a probe");
+    let answer = scheduler.pop().map(|event| event.kind);
+    assert!(scheduler.pop().is_none(), "one answer at most");
+    answer
+}
+
+/// Issue #61 A6 (design N1 rev 5e): below the holder's trim floor a live holder answers
+/// `ProbeUnavailable`, at and above it `ProbeAnswered` with the stored digest. Seq 0 is
+/// unavailable once the floor is above 0: the root record is gone too, as the host's
+/// `digest_at` answers `below_floor`. A trim below the floor is refused and changes nothing.
+/// Cuts: `history_at` ignores the floor, red (seq 1 answered); the root rule ignores the floor,
+/// red (seq 0 answered).
+#[retcd_test]
+fn t61_sim_probe_below_floor_is_unavailable() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    support::preamble();
+    let (mut dispatcher, prior) = floored_survivor();
+    let answered = |seq: u64| {
+        Some(EventKind::Kernel(KernelEvent::Recovery(
+            RecoveryEvent::ProbeAnswered {
+                copy: CopyId(1),
+                seq: Seq(seq),
+                digest: prior.digest(seq),
+            },
+        )))
+    };
+    let unavailable = |seq: u64| {
+        Some(EventKind::Kernel(KernelEvent::Recovery(
+            RecoveryEvent::ProbeUnavailable {
+                copy: CopyId(1),
+                seq: Seq(seq),
+            },
+        )))
+    };
+    for seq in 0..=3 {
+        assert_eq!(
+            probe_answer(&mut dispatcher, seq),
+            answered(seq),
+            "untrimmed control: seq {seq} is answered from the engine"
+        );
+    }
+
+    assert_eq!(
+        dispatcher.trim_history(PEER, PartitionId(1), Seq(2)),
+        Ok(1),
+        "one level cut"
+    );
+    let after = || [unavailable(0), unavailable(1), answered(2), answered(3)];
+    let observed: Vec<Option<EventKind>> = (0..=3)
+        .map(|seq| probe_answer(&mut dispatcher, seq))
+        .collect();
+    assert_eq!(
+        observed,
+        after(),
+        "below the floor unavailable, from it answered"
+    );
+
+    assert_eq!(
+        dispatcher.trim_history(PEER, PartitionId(1), Seq(1)),
+        Err(SimError::Config {
+            field: "history_trim_refused"
+        }),
+        "a floor never moves down"
+    );
+    let observed: Vec<Option<EventKind>> = (0..=3)
+        .map(|seq| probe_answer(&mut dispatcher, seq))
+        .collect();
+    assert_eq!(observed, after(), "the refused trim changed nothing");
+}
+
+/// What `PEER`'s engine shows of generation 1: its trim mark, and which seqs 0..=3 hold a
+/// `History` record (seq 0 never does: the root is not a record).
+fn floor_view(
+    dispatcher: &Dispatcher,
+) -> (
+    Option<(Generation, rdb_sim::storage::memory::TrimFloor)>,
+    Vec<bool>,
+) {
+    let engine = dispatcher.engine(PEER).expect("PEER's engine");
+    (
+        engine.floor(PartitionId(1), Generation(1)),
+        (0..=3)
+            .map(|seq| {
+                engine
+                    .history_at(PartitionId(1), Generation(1), Seq(seq))
+                    .is_some()
+            })
+            .collect(),
+    )
+}
+
+/// Crash `PEER` with `fault` and restart it under the next boot.
+fn crash_and_restart(dispatcher: &mut Dispatcher, fault: StorageFault) {
+    let mut scheduler = Scheduler::new();
+    dispatcher
+        .inject_storage(StorageOp::Crash { node: PEER, fault })
+        .expect("a planned crash");
+    let touch = store(StoreEffect::Commit(support::batch(1, 4, b"k", b"v")));
+    deliver_on(dispatcher, &mut scheduler, PEER, touch).expect("the crash is taken");
+    dispatcher
+        .restart(PEER, BootId(PEER_BOOT.0 + 1))
+        .expect("a restart");
+}
+
+/// Issue #61 A6 (design 3.4, M6; the twin of the host's staged trim): a trim survives a process
+/// crash exactly, mark and records alike. The host stages it unsynced, so a host crash before
+/// the next sync reopens untrimmed, every record back; after a sync it reopens trimmed.
+/// Cuts: the crash image drops the mark, red (records back after a process crash); a host crash
+/// keeps the unsynced mark, red (records stay gone).
+#[retcd_test]
+fn t61_sim_trim_restart_parity() {
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_sim::storage::memory::TrimFloor;
+    support::preamble();
+    let durable = |dispatcher: &mut Dispatcher| {
+        dispatcher
+            .preload_durable(PEER, PartitionId(1), Generation(1), DurableSeq(3))
+            .expect("a sync");
+    };
+    let (mut dispatcher, prior) = floored_survivor();
+    durable(&mut dispatcher);
+    let whole = (None, vec![false, true, true, true]);
+    assert_eq!(floor_view(&dispatcher), whole, "untrimmed control");
+    dispatcher
+        .trim_history(PEER, PartitionId(1), Seq(2))
+        .expect("a trim");
+    let trimmed = (
+        Some((
+            Generation(1),
+            TrimFloor {
+                seq: Seq(2),
+                root_base: Seq(0),
+                root_digest: prior.digest(0),
+            },
+        )),
+        vec![false, false, true, true],
+    );
+    assert_eq!(
+        floor_view(&dispatcher),
+        trimmed,
+        "trimmed from 2, root kept in the mark"
+    );
+
+    crash_and_restart(&mut dispatcher, StorageFault::ProcessCrash);
+    assert_eq!(
+        floor_view(&dispatcher),
+        trimmed,
+        "a process crash keeps the staged trim"
+    );
+
+    let (mut unsynced, _) = floored_survivor();
+    durable(&mut unsynced);
+    unsynced
+        .trim_history(PEER, PartitionId(1), Seq(2))
+        .expect("a trim");
+    crash_and_restart(&mut unsynced, StorageFault::HostCrash);
+    assert_eq!(
+        floor_view(&unsynced),
+        whole,
+        "a host crash before a sync loses the staged trim, and its records come back"
+    );
+
+    let (mut synced, _) = floored_survivor();
+    durable(&mut synced);
+    synced
+        .trim_history(PEER, PartitionId(1), Seq(2))
+        .expect("a trim");
+    durable(&mut synced);
+    crash_and_restart(&mut synced, StorageFault::HostCrash);
+    assert_eq!(
+        floor_view(&synced),
+        trimmed,
+        "a host crash after a sync keeps the trim"
+    );
+}
+
+/// Issue #61 A6, the engine twin of A1's chain walk and A2's `as_of_base` bound: a trimmed
+/// lineage cannot be inherited below its floor (the record at the base is gone), at the floor
+/// it can, and the child reads under the parent's mark through the link. The parent is then
+/// sealed by its child: its trim is refused, and the child's trim marks both levels, the parent
+/// at its cut `base + 1`.
+/// Cuts: the inherit bound removed, red (inherit at 1 accepted); the walk stops at the own level,
+/// red (generation 2 reads seq 1).
+#[retcd_test]
+fn t61_sim_floor_walks_the_link_and_bounds_inherit() {
+    use rdb_sim::storage::memory::{MemoryEngine, TrimFloor, TrimRefused};
+    support::preamble();
+    let (p, g1, g2) = (PartitionId(1), Generation(1), Generation(2));
+    let prior = send_history(3);
+    let mut engine = MemoryEngine::new(PEER);
+    for batch in prior.batches.clone() {
+        engine.commit(batch).expect("a commit");
+    }
+    let mark = |seq: u64| TrimFloor {
+        seq: Seq(seq),
+        root_base: Seq(0),
+        root_digest: prior.digest(0),
+    };
+    engine.trim_history(p, g1, mark(2)).expect("a trim");
+
+    assert_eq!(
+        engine.inherit(p, g1, g2, Seq(1)),
+        Err(SimError::Config {
+            field: "inherit_below_floor"
+        }),
+        "the record at base 1 is gone"
+    );
+    assert_eq!(engine.parent(p, g2), None, "nothing linked");
+    engine.inherit(p, g1, g2, Seq(2)).expect("at the floor");
+    assert_eq!(
+        engine.floor(p, g2),
+        Some((g1, mark(2))),
+        "read through the link"
+    );
+    assert!(
+        engine.history_at(p, g2, Seq(1)).is_none(),
+        "below the parent's mark"
+    );
+    assert!(
+        engine.history_at(p, g2, Seq(2)).is_some(),
+        "the record at the floor"
+    );
+
+    assert_eq!(
+        engine.trim_history(p, g1, mark(3)),
+        Err(TrimRefused::Sealed { child: g2 }),
+        "the parent is trimmed through its child"
+    );
+    let child = support::batch(2, 3, b"k", b"v");
+    engine.commit(child).expect("the child's own write");
+    assert_eq!(
+        engine.trim_history(p, g2, mark(3)),
+        Ok(2),
+        "both levels walked"
+    );
+    assert_eq!(
+        engine.floor(p, g2),
+        Some((g2, mark(3))),
+        "the child's own mark"
+    );
+    assert_eq!(
+        engine.floor(p, g1),
+        Some((g1, mark(3))),
+        "the parent cut at base + 1, its whole History gone"
+    );
+}
