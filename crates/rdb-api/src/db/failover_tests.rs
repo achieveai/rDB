@@ -111,6 +111,16 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
 /// setup takes, until the row lifts it; every other call passes, so it opens (PR #119 review).
 /// Ordinary callers pass `None` and start without faults.
 fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<NodeId>) -> Rig {
+    opened_timed(partitions, failovers, cut, Timeouts::default())
+}
+
+/// [`opened_cut`], with every process opened with `timeouts`.
+fn opened_timed(
+    partitions: u32,
+    failovers: [Option<Failover>; 3],
+    cut: Option<NodeId>,
+    timeouts: Timeouts,
+) -> Rig {
     let mut grant_cuts = BTreeMap::new();
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -177,6 +187,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
                             links: Some(links),
                             boot: Some(boot),
                             failover,
+                            timeouts,
                             ..config(dir.path())
                         },
                         control,
@@ -1674,4 +1685,132 @@ fn own81_sweep_restarts_before_freeze() {
 #[config_log::retcd_test]
 fn own81_sweep_restarts_after_freeze() {
     interrupted_sweep("own81_sweep_restarts_after_freeze", HoldAt::BeforeReply);
+}
+
+/// #107 across processes: three node processes, each with `Timeouts::live_readd` on. A copy's
+/// process is stopped (mute and cut-control, as `kill -STOP`) past `unreachable_drop_after`,
+/// so its owner drops it on the unreachable clock. Once it runs again (`kill -CONT`), the owner
+/// re-adds it at the boot it still runs: a commit pins it regular at that same boot, three
+/// regular copies, `Active`, and a write after that applies on it. No process restarted.
+/// Cut: `live_readd_duty` returns at once, red (never re-added).
+/// Integration (~20 s): the drop clock, the re-add's 5 s hold, the re-add and the promote.
+#[config_log::retcd_test]
+fn issue107_a_blipped_copy_process_rejoins_live_at_its_boot() {
+    const METHOD: &str = "issue107_a_blipped_copy_process_rejoins_live_at_its_boot";
+    let timeouts = Timeouts {
+        live_readd: true,
+        unreachable_drop_after: Duration::from_millis(
+            crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS,
+        ),
+        ..Timeouts::default()
+    };
+    let rig = opened_timed(1, [None, None, None], None, timeouts);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let owner = rig.owner(1);
+    let copy = ALL_NODES
+        .iter()
+        .copied()
+        .find(|node| *node != owner)
+        .expect("another node");
+    let at = |node: NodeId| usize::try_from(node.0 - 1).expect("a node index");
+    let boot = rig.procs[at(copy)].boot;
+    // The owner's pinned members: (node, role, boot).
+    let pinned = || {
+        rig.procs[at(owner)]
+            .db
+            .node_status_in(PartitionId(1))
+            .expect("partition 1")
+            .into_iter()
+            .find(|status| status.node == owner)
+            .map(|status| {
+                status
+                    .pinned
+                    .iter()
+                    .map(|member| (member.node, member.role, member.boot))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(pinned().len(), 3, "{:?}", pinned());
+
+    rig.stop(at(copy));
+    until(
+        "the owner committed without the stopped copy",
+        lifetimes(10),
+        || {
+            let members = pinned();
+            members.len() == 2 && members.iter().all(|(node, _, _)| *node != copy)
+        },
+    );
+    let dropped = logged(METHOD, "membership_drop_planned");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(
+        (
+            dropped[0]["node"].as_u64(),
+            dropped[0]["dropped"].as_u64(),
+            dropped[0]["clock"].as_str()
+        ),
+        (
+            Some(owner.0.into()),
+            Some(copy.0.into()),
+            Some("unreachable")
+        ),
+        "{dropped:?}"
+    );
+
+    rig.resume(at(copy));
+    until(
+        "the copy pinned regular again at its boot",
+        lifetimes(10),
+        || {
+            let members = pinned();
+            members.len() == 3
+                && members
+                    .iter()
+                    .all(|(_, role, _)| *role != rdb_core::contracts::ids::ReplicaRole::Shadow)
+                && members.iter().any(|(node, role, at_boot)| {
+                    *node == copy
+                        && *role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                        && *at_boot == boot
+                })
+        },
+    );
+    let readded = logged(METHOD, "live_readd_planned");
+    assert_eq!(readded.len(), 1, "{readded:?}");
+    assert_eq!(
+        (readded[0]["node"].as_u64(), readded[0]["readded"].as_u64()),
+        (Some(owner.0.into()), Some(copy.0.into())),
+        "{readded:?}"
+    );
+    let recovered = logged(METHOD, "recovered");
+    let last = recovered
+        .iter()
+        .rfind(|line| line["node"] == owner.0)
+        .expect("the owner logged its commits");
+    assert_eq!(last["mode"], "Active", "{last}");
+
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    let put = put_lands(&app, group_of(&app, 1), lifetimes(3));
+    until(
+        "the write applied on the re-added copy",
+        lifetimes(3),
+        || {
+            rig.procs[at(copy)]
+                .db
+                .node_status_in(PartitionId(1))
+                .expect("partition 1")
+                .into_iter()
+                .find(|status| status.node == copy)
+                .and_then(|status| status.holds)
+                .is_some_and(|holds| {
+                    holds.generation == put.generation && holds.applied >= put.seq.0
+                })
+        },
+    );
+    assert_eq!(
+        rig.procs[at(copy)].boot,
+        boot,
+        "the copy's process was never replaced"
+    );
 }
