@@ -65,6 +65,10 @@ use rdb_core::{
     recovery::{Recovery, RecoveryPhase},
     replication::{
         append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit, UNSOLICITED},
+        retention::{
+            cap_seq, retention_floor, RetentionDecision, RetentionHold, RetentionInput,
+            RetentionSamples, HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
+        },
         wire, Replication,
     },
     transaction::Transaction,
@@ -129,6 +133,16 @@ struct Watch {
     correlation: CorrelationId,
     /// The result, exactly as emitted.
     result: Box<RecoveryResult>,
+}
+
+/// The retention duty's configuration (issue #61 S3, design 3.2): the host's
+/// `DbConfig::history_keep` and `history_budget_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// How long History is kept at least, in milliseconds.
+    pub keep_millis: u64,
+    /// The hard cap on one lineage's History bytes. It overrides a lagging member and a pin.
+    pub budget_bytes: u64,
 }
 
 /// The lineage, epoch and membership pin a partition was last adopted at.
@@ -289,6 +303,13 @@ pub struct Dispatcher {
     /// call here ([`Self::snapshot_offer`]), so one is left open only when
     /// `SnapshotHooks::pages_held_from` stops it (S2-R2's twin). Process memory of the target.
     snapshot_installs: BTreeMap<(NodeId, PartitionId), (Generation, Seq, u64)>,
+    /// The applied head over time, per `(node, partition)`, for the retention duty's `keep`
+    /// (issue #61 S3, [`Self::retention_duty`]): the host's `RetentionSamples`. Process memory.
+    retention_samples: BTreeMap<(NodeId, PartitionId), RetentionSamples>,
+    /// Each copy the retention duty found behind its node's floor and has logged
+    /// `history_copy_behind_floor` for, until it is counted again: the alert is logged once.
+    /// Process memory.
+    behind_floor: BTreeSet<(NodeId, PartitionId, CopyId)>,
     /// The host's debug-only snapshot hooks, for unit rows only.
     #[cfg(test)]
     snapshot_hooks: SnapshotHooks,
@@ -438,6 +459,8 @@ impl Dispatcher {
             snapshot_transfers: BTreeMap::new(),
             snapshot_chunk_fault: None,
             snapshot_installs: BTreeMap::new(),
+            retention_samples: BTreeMap::new(),
+            behind_floor: BTreeSet::new(),
             #[cfg(test)]
             snapshot_hooks: SnapshotHooks::default(),
             committed: BTreeMap::new(),
@@ -879,6 +902,8 @@ impl Dispatcher {
         self.snapshot_transfers
             .retain(|(source, _, _), _| *source != node);
         self.snapshot_installs.retain(|(held, _), _| *held != node);
+        self.retention_samples.retain(|(held, _), _| *held != node);
+        self.behind_floor.retain(|(held, _, _)| *held != node);
         let to_node: Vec<_> = self
             .snapshot_transfers
             .iter()
@@ -3344,6 +3369,172 @@ impl Dispatcher {
             .map_err(|_| refused)
     }
 
+    /// One round of the retention duty for `node`'s `partition` at `now` (issue #61 S3, design
+    /// 3.1), the twin of the host's trim duty. It records the applied head in the node's
+    /// samples, reads what [`retention_floor`] needs from this node's engine and kernel, and when
+    /// the floor moves trims to it through [`Self::trim_history`]: the kernel's ladders first,
+    /// then the engine.
+    ///
+    /// * `prev`, `applied` and `own_durable` are the engine's, of its newest lineage of
+    ///   `partition`; `keep` comes from the samples, the cap from
+    ///   [`MemoryEngine::history_bytes`] through [`cap_seq`].
+    /// * On a primary, the counted copies are every other copy its tracker's active predicates
+    ///   name, at [`known`] durable. A secondary passes none.
+    /// * Each open snapshot transfer this node serves pins its `S`. A pin the cap overran is
+    ///   logged `history_budget_overran_pin` and its transfer ends (`budget_overran`), so the
+    ///   copy's next ask opens a new one.
+    /// * A copy behind the floor is logged `history_copy_behind_floor` once, until it is counted
+    ///   again.
+    /// * A hold ([`Self::retention_hold`]) trims nothing, logged `history_trim_held{reason}`.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `node` or `partition` when there is nothing to trim,
+    /// `tick_backwards` or `applied_backwards` when the samples refuse `now` or the head, and
+    /// whatever [`Self::trim_history`] refuses.
+    ///
+    /// [`known`]: rdb_core::replication::progress::ProgressTracker::known
+    pub fn retention_duty(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        now: Tick,
+        config: RetentionConfig,
+    ) -> Result<RetentionDecision, SimError> {
+        let engine = self
+            .engines
+            .get(&node)
+            .ok_or(SimError::Config { field: "node" })?;
+        let generation = engine
+            .lineages()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|((_, generation), _)| *generation)
+            .max()
+            .ok_or(SimError::Config { field: "partition" })?;
+        let prev = engine.floor_seq(partition, generation);
+        let applied = Seq(engine.buffered_applied(partition, generation).0);
+        let own_durable = engine.durable(partition, generation);
+        let cap = cap_seq(prev, applied, config.budget_bytes, |from| {
+            engine.history_bytes(partition, generation, from)
+        });
+        let samples = self.retention_samples.entry((node, partition)).or_default();
+        samples
+            .record(now, applied, config.keep_millis)
+            .map_err(|field| SimError::Config { field })?;
+        let keep = samples.keep_seq(now, config.keep_millis);
+        let copies = self.replication.primary(node, partition).map(|primary| {
+            let tracker = primary.tracker();
+            tracker
+                .peers()
+                .map(|(copy, _)| copy)
+                .filter(|copy| *copy != tracker.own())
+                .filter_map(|copy| tracker.known(copy).map(|known| (copy, known.durable)))
+                .collect()
+        });
+        let served: Vec<((NodeId, PartitionId, CopyId), Seq)> = self
+            .snapshot_transfers
+            .iter()
+            .filter(|((source, p, _), _)| *source == node && *p == partition)
+            .map(|(key, transfer)| (*key, transfer.at))
+            .collect();
+        let input = RetentionInput {
+            prev,
+            applied,
+            own_durable,
+            transfer_pins: served.iter().map(|(_, at)| *at).collect(),
+            copies,
+            keep,
+            cap,
+            hold: self.retention_hold(node, partition, generation),
+        };
+        let decision = retention_floor(&input);
+        let floor = match &decision {
+            RetentionDecision::Held(hold) => {
+                tracing::debug!(
+                    node = node.0,
+                    partition = partition.0,
+                    reason = hold.reason(),
+                    "history_trim_held"
+                );
+                return Ok(decision);
+            }
+            RetentionDecision::Floor(floor) => floor,
+        };
+        self.behind_floor.retain(|(held, p, copy)| {
+            *held != node || *p != partition || floor.behind.contains(copy)
+        });
+        for copy in &floor.behind {
+            if self.behind_floor.insert((node, partition, *copy)) {
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    floor = prev.0,
+                    "{HISTORY_COPY_BEHIND_FLOOR}"
+                );
+            }
+        }
+        for (key, at) in served.iter().filter(|(_, at)| *at < floor.floor) {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = key.2 .0,
+                pin = at.0,
+                floor = floor.floor.0,
+                "{HISTORY_BUDGET_OVERRAN_PIN}"
+            );
+            self.end_transfer(*key, "budget_overran", "snapshot_transfer_abandoned");
+        }
+        if floor.floor > prev {
+            self.trim_history(node, partition, floor.floor)?;
+        }
+        Ok(decision)
+    }
+
+    /// The no-trim gate the retention duty finds on `node`'s `partition` (design 3.1), the
+    /// first that holds, or `None`. One place, so a ruling on which gates count changes only
+    /// this.
+    ///
+    /// * `Installing`: the engine holds an unfinished install of `generation`, or the node
+    ///   holds an install open.
+    /// * `Recovering`: the node's F1 for the partition is in any phase but `Idle`, `Committed`
+    ///   or `Rebuilding`, so a blocked or quarantined recovery holds too.
+    /// * `LandingPending`: a member watch for the node and partition has not landed, fired or
+    ///   held.
+    ///
+    /// Not found here: `Staging` (the memory engine has no staged copy), and `InventoryPinned`
+    /// and `Grace`, which the simulator does not keep yet.
+    fn retention_hold(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<RetentionHold> {
+        let installing = self
+            .engines
+            .get(&node)
+            .is_some_and(|engine| engine.installing(partition, generation).is_some())
+            || self.snapshot_installs.contains_key(&(node, partition));
+        if installing {
+            return Some(RetentionHold::Installing);
+        }
+        let recovering = self.recovery.get(node, partition).is_some_and(|f1| {
+            !matches!(
+                f1.phase(),
+                RecoveryPhase::Idle | RecoveryPhase::Committed | RecoveryPhase::Rebuilding
+            )
+        });
+        if recovering {
+            return Some(RetentionHold::Recovering);
+        }
+        let landing = self
+            .watches
+            .values()
+            .chain(self.held.iter().map(|(_, watch)| watch))
+            .any(|watch| watch.member == node && watch.partition == partition);
+        landing.then_some(RetentionHold::LandingPending)
+    }
+
     /// Align `node`'s installed R1 sides of `partition` to its engine's trim floor in
     /// `generation`, the twin of the host's `align_ladders` after a `Recovered` (issue #61,
     /// design 3.4): a side R1 built from the result may hold the root or rungs the engine no
@@ -4896,6 +5087,8 @@ mod dormant_twin_tests {
     use crate::sim::scheduler::Scheduler;
     use crate::storage::history::canonical_history;
     use crate::storage::memory::MemoryEngine;
+    use rdb_core::contracts::time::Tick;
+    use rdb_core::replication::retention::{RetentionDecision, RetentionFloor, RetentionHold};
 
     const OWNER: NodeId = NodeId(1);
     const P: PartitionId = PartitionId(1);
@@ -4904,6 +5097,12 @@ mod dormant_twin_tests {
     /// Node 1 serving generation 1 of `P` at [`HEAD`] as copy 0's primary, its engine holding
     /// the same records, and the seed a catch-up routed through it carries.
     fn serving_owner() -> (Dispatcher, DormantSeed) {
+        owner_of(3, HEAD)
+    }
+
+    /// [`serving_owner`] with `copies` members (copy 0 the primary on node 1, copy `c` a
+    /// secondary on node `c + 1`) and its head at `head`. Nothing is synced.
+    fn owner_of(copies: u8, head: u64) -> (Dispatcher, DormantSeed) {
         let lineage = Lineage {
             partition: P,
             generation: Generation(1),
@@ -4918,19 +5117,20 @@ mod dormant_twin_tests {
         let config = PartitionConfig::new(
             P,
             ConfigVersion(1),
-            vec![
-                member(0, 1, ReplicaRole::Primary),
-                member(1, 2, ReplicaRole::RegularSecondary),
-                member(2, 3, ReplicaRole::RegularSecondary),
-            ],
+            (0..copies)
+                .map(|copy| match copy {
+                    0 => member(0, 1, ReplicaRole::Primary),
+                    _ => member(copy, u32::from(copy) + 1, ReplicaRole::RegularSecondary),
+                })
+                .collect(),
         );
-        let history = canonical_history(lineage, ConfigVersion(1), HEAD).expect("history");
+        let history = canonical_history(lineage, ConfigVersion(1), head).expect("history");
         let mut engine = MemoryEngine::new(OWNER);
         for batch in &history.batches {
             engine.commit(batch.clone()).expect("commit");
         }
         let mut ladder = DigestLadder::new();
-        for seq in 1..=HEAD {
+        for seq in 1..=head {
             ladder.insert(Seq(seq), history.digest(seq));
         }
         let mut dispatcher = Dispatcher::new();
@@ -4943,9 +5143,9 @@ mod dormant_twin_tests {
                 lineage,
                 history: ladder,
                 local: ReplicaProgress {
-                    received: ReceivedSeq(HEAD),
-                    buffered_applied: AppliedSeq(HEAD),
-                    durable: DurableSeq(HEAD),
+                    received: ReceivedSeq(head),
+                    buffered_applied: AppliedSeq(head),
+                    durable: DurableSeq(head),
                 },
             })
             .expect("node 1's tracker"),
@@ -5785,6 +5985,195 @@ mod dormant_twin_tests {
             scheduler.take_for(two, Tick(u64::MAX)).len(),
             1,
             "node 3's ACK is queued for node 2"
+        );
+    }
+
+    /// The retention duty's configuration in these rows: a 1 s window and no cap.
+    const RETAIN: super::RetentionConfig = super::RetentionConfig {
+        keep_millis: 1_000,
+        budget_bytes: u64::MAX,
+    };
+
+    /// Sync node 1's engine through `through` of generation 1.
+    fn sync_owner(dispatcher: &mut Dispatcher, through: u64) {
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .sync_wal_through(vec![CapturedPrefix {
+                partition: P,
+                generation: Generation(1),
+                through: AppliedSeq(through),
+            }])
+            .expect("flush");
+    }
+
+    /// A round that moved or kept the floor at `floor`, with no copy behind and no pin overrun.
+    fn floor_at(floor: u64) -> RetentionDecision {
+        RetentionDecision::Floor(RetentionFloor {
+            floor: Seq(floor),
+            behind: Vec::new(),
+            overran_pins: Vec::new(),
+        })
+    }
+
+    /// Node 1's primary ladder floor and its engine's floor.
+    fn floors(dispatcher: &Dispatcher) -> (Option<Seq>, Seq) {
+        let ladder = dispatcher
+            .replication
+            .primary(OWNER, P)
+            .and_then(|primary| primary.tracker().history().floor());
+        (
+            ladder,
+            dispatcher.engines[&OWNER].floor_seq(P, Generation(1)),
+        )
+    }
+
+    /// Issue #61 S3, the sim duty (design 3.1): a lone primary keeps its whole History until
+    /// `keep` is known, then one round trims its ladder (kernel first) and its engine to the
+    /// head it had applied a window ago. Cuts: the duty never trims, red at the second round;
+    /// `keep` left out of F, red at the first round. Unit, under a second.
+    #[test]
+    fn t61_sim_the_duty_trims_the_ladder_and_the_engine_to_keep() {
+        let (mut dispatcher, _) = owner_of(1, 10);
+        sync_owner(&mut dispatcher, 10);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(0), RETAIN),
+            Ok(floor_at(0)),
+            "no sample a window old yet: nothing trimmed"
+        );
+        assert_eq!(floors(&dispatcher), (Some(Seq(1)), Seq::ZERO));
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(floor_at(10)),
+            "the head applied a window ago"
+        );
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(10)), Seq(10)),
+            "ladder and engine trimmed to F"
+        );
+    }
+
+    /// Issue #61 S3-R1's shape in the simulator: one record every 100 ms for 6 s, a 1 s window
+    /// and a round after each write. The engine never holds more than the window's records past
+    /// its floor, the floor ends at the head a window ago, and the samples stay bounded by the
+    /// window, not the write count. Cuts: the duty never trims, red (60 rows held); samples
+    /// never pruned, red. Unit, under a second.
+    #[test]
+    fn t61_sim_the_duty_keeps_history_bounded_under_steady_writes() {
+        let lineage = Lineage {
+            partition: P,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+        };
+        let history = canonical_history(lineage, ConfigVersion(1), 60).expect("history");
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register_node(OWNER, BootId(1));
+        dispatcher.engines.insert(OWNER, MemoryEngine::new(OWNER));
+        let mut widest = 0;
+        for (seq, batch) in (1..).zip(&history.batches) {
+            dispatcher
+                .engines
+                .get_mut(&OWNER)
+                .expect("node 1's engine")
+                .commit(batch.clone())
+                .expect("commit");
+            sync_owner(&mut dispatcher, seq);
+            dispatcher
+                .retention_duty(OWNER, P, Tick(seq * 100), RETAIN)
+                .expect("a round");
+            let floor = dispatcher.engines[&OWNER].floor_seq(P, Generation(1));
+            widest = widest.max(seq - floor.0);
+        }
+        assert_eq!(
+            dispatcher.engines[&OWNER].floor_seq(P, Generation(1)),
+            Seq(50),
+            "the floor is the head a window ago"
+        );
+        assert_eq!(widest, 10, "never more than a window past the floor");
+        assert!(
+            dispatcher.retention_samples[&(OWNER, P)].len() <= 11,
+            "samples bounded by the window"
+        );
+    }
+
+    /// Issue #61 S3-R3 and the cap half of S3-R2 (design 3.1 to 3.3): copy 1 acked nothing, so
+    /// within budget it holds F at 0 whatever `keep` says. A budget below the History lets the
+    /// cap pass it, and from then on copy 1 is behind the floor: uncounted, so F moves to
+    /// `keep`, and named once. Cuts: `need` ignores member durable, red (F moves within
+    /// budget); the cap left out, red (F stays 0); a behind copy counted, red (F stays at the
+    /// cap). Unit, under a second.
+    #[test]
+    fn t61_sim_a_lagging_member_holds_the_floor_until_the_cap_passes_it() {
+        let (mut dispatcher, _) = owner_of(2, 10);
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), RETAIN)
+            .expect("a round");
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(floor_at(0)),
+            "copy 1 acked nothing: F holds"
+        );
+        let tight = super::RetentionConfig {
+            budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(7)),
+            ..RETAIN
+        };
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), tight),
+            Ok(floor_at(7)),
+            "the cap passes the lagging member"
+        );
+        assert_eq!(floors(&dispatcher), (Some(Seq(7)), Seq(7)));
+        let behind = RetentionDecision::Floor(RetentionFloor {
+            floor: Seq(10),
+            behind: vec![CopyId(1)],
+            overran_pins: Vec::new(),
+        });
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(3_000), tight),
+            Ok(behind.clone()),
+            "copy 1 is behind the floor, uncounted"
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(4_000), tight),
+            Ok(behind),
+            "still behind"
+        );
+        assert_eq!(
+            dispatcher.behind_floor.iter().collect::<Vec<_>>(),
+            vec![&(OWNER, P, CopyId(1))],
+            "named once"
+        );
+    }
+
+    /// Issue #61 S3, a no-trim gate (design 3.1): while node 1 holds an install open, a round
+    /// trims nothing, and once it closes the next round trims. Cut: the gate removed, red.
+    /// Unit, under a second.
+    #[test]
+    fn t61_sim_an_open_install_holds_the_duty() {
+        let (mut dispatcher, _) = owner_of(1, 10);
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), RETAIN)
+            .expect("a round");
+        dispatcher
+            .snapshot_installs
+            .insert((OWNER, P), (Generation(1), Seq(10), 0));
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(RetentionDecision::Held(RetentionHold::Installing))
+        );
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(1)), Seq::ZERO),
+            "nothing trimmed"
+        );
+        dispatcher.snapshot_installs.clear();
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
+            Ok(floor_at(10))
         );
     }
 }
