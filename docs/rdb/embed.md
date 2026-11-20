@@ -1558,3 +1558,76 @@ docker run --rm rdb-bf-node:dev help
   `crates/rdb-api/examples/rdb_node.rs`.
 - The build needs `build-essential` and `libclang-dev` in the builder stage and sets no
   `LIBCLANG_PATH`. See `docker/README.md` for a worked run.
+
+## 9. Change feed (read every committed change, in order)
+
+`Db::changes` lets your app read one partition's committed transactions in order. It is in
+process only for now (#87 slice 1): over the wire it is refused `INVALID_ARGUMENT`. Every write of
+your tenant comes back; a key-prefix filter is not offered yet.
+
+Two uses it is built for:
+
+- **Warm standby.** A process beside a secondary tails that node's copy (`Source::Node(n)`) and
+  lays the partition's files out from the journal as it goes, so a standby is ready without
+  asking the owner for anything.
+- **The compactor.** It reads the feed into packs and uploads each pack once it is durable (see
+  "Lasting effects" below).
+
+```rust
+use rdb_api::{FeedCursor, FeedPage, Source};
+
+let mut cursor = FeedCursor::START; // or the cursor you stored last time
+loop {
+    match db.changes(partition, cursor, 256, Source::Owner)? {
+        FeedPage::Records { records, next, more } => {
+            for record in &records {
+                apply_somewhere(record); // record.writes: group, object, key, value
+            }
+            store_with_your_effects(next); // the cursor, in the same write as the effect
+            cursor = next;
+            if !more {
+                std::thread::sleep(poll_interval); // nothing new yet
+            }
+        }
+        FeedPage::Behind { .. } => std::thread::sleep(poll_interval), // keep the cursor
+        FeedPage::Trimmed { .. } => rebuild_from_your_own_source(),
+        FeedPage::Rewound { to } => {
+            retract_everything_above(to.seq); // rDB lost those records
+            cursor = to;
+        }
+    }
+}
+```
+
+- **The cursor.** A `FeedCursor` is the last record you applied: the generation stamped in its
+  header, its `seq` and its digest. Store it with your effect, in one write, and pass it back
+  unchanged. `FeedCursor::START` reads from the first record.
+- **The answers.**
+  - `Records`: whole records after the cursor, and `next`. With `more` set a page cap stopped it
+    (256 records or 4 MiB, at least one record): call again at once.
+  - `Behind`: the copy you asked has not got that far yet, or not that generation. Keep the
+    cursor; wait, or ask another copy.
+  - `Trimmed`: the copy no longer holds the record you need. Rebuild from your own source.
+  - `Rewound`: **a promote cut records you have already applied.** Undo what you applied above
+    `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB has lost.
+  - `CORRUPT_HISTORY` error: the cursor's record has another digest on this copy. The two
+    histories diverged; stop and report it.
+- **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
+  reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
+  applied, which can be ahead of the owner's published position.
+- **The secondary's bound (R2).** A secondary serves only while its own read of
+  `partitions/{p}` in rEtcd began within the grant (`grant_millis`, 6 s by default), names the
+  generation it holds and pins it as a regular copy. Cut off from rEtcd, it stops within about
+  one grant, even while its old owner still talks to it. The first call to a secondary starts
+  that read and answers `UNAVAILABLE`: call again. A shadow, a copy left out, or a copy still
+  landing a new generation answers `UNAVAILABLE` too.
+- **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
+  may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
+  undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last
+  record before uploading it.
+- **One feed per partition.** A feed is one partition's order. Reading several partitions means
+  one cursor each, and there is no order between them.
+- **Tenants (Q3).** The feed returns only your tenant's writes, the tenant of the call's
+  identity, as every other call uses. A record with none of your writes is skipped, and `next`
+  still moves past it. **Over the wire a tenant is asserted by the caller, not proved** (#151
+  tracks binding it to a certificate), so do not rely on it as an access boundary yet.

@@ -418,6 +418,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Fault { .. }
         | Msg::Activated { .. }
         | Msg::OwnerLearned { .. }
+        | Msg::FeedRead { .. }
         | Msg::FenceBound { .. }
         | Msg::ReplanNote { .. }
         | Msg::Inject { .. }
@@ -444,6 +445,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
         Msg::OwnerLearned { .. } => "OwnerLearned",
+        Msg::FeedRead { .. } => "FeedRead",
         Msg::FenceBound { .. } => "FenceBound",
         Msg::ReplanNote { .. } => "ReplanNote",
         Msg::Inject { .. } => "Inject",
@@ -996,6 +998,14 @@ impl TryFrom<&ClientCall> for WireCall {
                 through: *through,
                 remaining_millis: *remaining_millis,
             },
+            // #87 slice 1: the feed is served in process only; its wire types are slice 2.
+            ClientCall::Changes { .. } => {
+                return Err(WireError::Value(
+                    "the change feed does not cross the wire yet (#87 slice 2); call a node in \
+                     this process"
+                        .to_owned(),
+                ))
+            }
         })
     }
 }
@@ -1780,6 +1790,13 @@ impl WireAnswer {
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
             Answer::Durable => Self::Durable,
+            // #87 slice 1: never asked over the wire (see `WireCall`'s conversion).
+            Answer::Changes(_) => Self::Error {
+                error: WireApiError::from(&ApiError::host(
+                    "a change feed page cannot cross the wire yet (#87 slice 2)",
+                )),
+                request: None,
+            },
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),

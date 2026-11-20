@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::GrantRecord;
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, INSTANCE_LEN};
+use rdb_core::authority::partition::{
+    PartitionLifecycle, PartitionRecord, RecordMember, INSTANCE_LEN,
+};
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, BlockReason, Boundary,
@@ -94,6 +96,7 @@ use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 use crate::clock::{ClockGuard, HostClock};
 use crate::control::ControlAdapter;
 use crate::db::ApiError;
+use crate::feed::{self, FeedCursor, FeedPage};
 use crate::ownership::{
     deactivating_lead_millis, ownership_due, ownership_step, Judged, OwnState, OwnerToken,
     OwnerViews, OwnershipEvent, Step, Subscriber,
@@ -483,6 +486,20 @@ pub enum Msg {
         /// The generation the record names, with `owner`. #90 (PR #104 review): a newer one ends
         /// this node's barriers below it.
         generation: Option<Generation>,
+    },
+    /// #87 (R2): what `partitions/{partition}` said when this node read it for the change feed
+    /// ([`ControlAdapter::read_partition_for_feed`]). A secondary serves the feed only while
+    /// such a read, begun at `started`, is fresh. Dropped unless `boot` is the node's own.
+    FeedRead {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// When the read began, on this node's clock.
+        started: Tick,
+        /// The generation the record names and the members it pins (`None` for a layout
+        /// that pins none), or why it could not be read.
+        read: Result<(Generation, Option<Vec<RecordMember>>), String>,
     },
     /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
     /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
@@ -924,6 +941,17 @@ pub enum ClientCall {
         /// How long the barrier may wait.
         remaining_millis: u64,
     },
+    /// #87: the committed transactions after `from`, read from this node's copy
+    /// ([`Answer::Changes`]). Answered in the step that takes it; the identity only names the
+    /// caller in logs, so it never queues behind a call.
+    Changes {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The cursor after the last record the caller has.
+        from: FeedCursor,
+        /// The most records to return, at most [`crate::feed::FEED_PAGE_RECORDS`].
+        max: u32,
+    },
 }
 
 /// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
@@ -1153,6 +1181,8 @@ pub enum Answer {
     TailForgotten(String),
     /// A [`ClientCall::WaitDurable`] was proved on every regular copy.
     Durable,
+    /// A [`ClientCall::Changes`] page.
+    Changes(FeedPage),
     /// The call failed.
     Error {
         /// Why.
@@ -2406,6 +2436,16 @@ struct Adopted {
     config_version: ConfigVersion,
 }
 
+/// #87 (R2): what a secondary knows of `partitions/{p}` for the change feed.
+#[derive(Debug, Default)]
+struct FeedFreshness {
+    /// The last read that answered: when it began, the generation the record names and the
+    /// members it pins.
+    read: Option<(Tick, Generation, Option<Vec<RecordMember>>)>,
+    /// A read is in flight.
+    in_flight: bool,
+}
+
 /// Where a completion goes: the partition and correlation of the effect that asked.
 #[derive(Debug, Clone, Copy)]
 struct Site {
@@ -2832,6 +2872,9 @@ struct Host {
     /// How many node fences this node has had: each one's owner reads carry it, so a read
     /// begun under an earlier fence, answering late, is dropped (critic-d3 A3).
     owner_fence: u64,
+    /// #87 (R2): per partition a change-feed call asked about, this node's last good read of
+    /// `partitions/{p}` and whether another is in flight.
+    feed_reads: BTreeMap<PartitionId, FeedFreshness>,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
     /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
@@ -3075,6 +3118,7 @@ impl Host {
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
             owner_after_fence: BTreeMap::new(),
+            feed_reads: BTreeMap::new(),
             owner_fence: 0,
             blamed: BTreeMap::new(),
             #[cfg(test)]
@@ -3373,6 +3417,7 @@ impl Host {
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
+            Msg::FeedRead { .. } => "feed_read".to_owned(),
             Msg::FenceBound { .. } => "fence_bound".to_owned(),
             Msg::ReplanNote { .. } => "replan_note".to_owned(),
             _ => "other".to_owned(),
@@ -3428,6 +3473,7 @@ impl Host {
             | Msg::Fault { boot, .. }
             | Msg::Activated { boot, .. }
             | Msg::OwnerLearned { boot, .. }
+            | Msg::FeedRead { boot, .. }
             | Msg::FenceBound { boot, .. }
             | Msg::ReplanNote { boot, .. }
                 if boot != self.boot =>
@@ -3512,6 +3558,15 @@ impl Host {
                         self.end_barriers_below(partition, generation);
                     }
                 }
+                Ok(())
+            }
+            Msg::FeedRead {
+                partition,
+                started,
+                read,
+                ..
+            } => {
+                self.feed_read(partition, started, read);
                 Ok(())
             }
             Msg::Inject {
@@ -14198,7 +14253,8 @@ impl Host {
             | ClientCall::Move { .. }
             | ClientCall::Rebuild { .. }
             | ClientCall::ForgetTail { .. }
-            | ClientCall::WaitDurable { .. } => None,
+            | ClientCall::WaitDurable { .. }
+            | ClientCall::Changes { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -14371,6 +14427,25 @@ impl Host {
                 let _ = reply.send(answer);
                 return Ok(());
             }
+            // #87: answered in this step from this node's own copy.
+            ClientCall::Changes {
+                identity,
+                from,
+                max,
+            } => {
+                let answer = match self
+                    .changes(partition, identity, from, max)
+                    .map_err(|detail| fail_waiter(&self.owner_views, &reply, detail))?
+                {
+                    Ok(page) => Answer::Changes(page),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
             // #90: recorded and left; nothing here waits, so a later write is never held.
             ClientCall::WaitDurable {
                 generation,
@@ -14533,6 +14608,323 @@ impl Host {
             group.0, right.0, partition.0
         );
         Some(error)
+    }
+
+    /// #87: the page of `partition`'s committed transactions after `from` this copy may serve
+    /// (design-87 section 2). The owner serves up to what P1 published; a regular secondary up to
+    /// what it applied, while its own read of `partitions/{p}` is fresh ([`Self::feed_fresh`]).
+    /// The cursor is checked against this copy's `Link` chain by [`feed::resume`]. Each record
+    /// is one `History` read through the chain. The outer error faults the node: a read failed
+    /// or a stored record does not decode.
+    fn changes(
+        &mut self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        from: FeedCursor,
+        max: u32,
+    ) -> Result<Result<FeedPage, ApiError>, Fault> {
+        let refused = |kind: ErrorKind, detail: String| {
+            let mut error = ApiError::new(kind, detail);
+            error.no_mutation = true;
+            Ok(Err(error))
+        };
+        if max == 0 {
+            return refused(
+                ErrorKind::InvalidArgument,
+                "max is 0: ask for at least one record".to_owned(),
+            );
+        }
+        let (node, p) = (self.node.0, partition.0);
+        let Some(result) = self.committed.get(&partition) else {
+            return refused(
+                ErrorKind::Unavailable,
+                format!("node {node} holds no generation of partition {p}"),
+            );
+        };
+        let newest = result.new_generation;
+        let role = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .map(|member| member.role);
+        if self.engine.staging(partition, newest).is_some() {
+            return refused(
+                ErrorKind::Unavailable,
+                format!(
+                    "node {node} is still copying generation {} of partition {p}",
+                    newest.0
+                ),
+            );
+        }
+        let mut chain = vec![feed::Level {
+            generation: newest,
+            exit: None,
+        }];
+        let mut level = newest;
+        while let Some(link) = self.engine.link(partition, level) {
+            chain.push(feed::Level {
+                generation: link.parent,
+                exit: Some(link.base),
+            });
+            level = link.parent;
+        }
+        let (source, cap) = if let Some(primary) = self.replication.primary(self.node, partition) {
+            if primary.tracker().lineage().generation != newest {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} is landing generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            }
+            // Never applied-but-unpublished (spec section 5.3). A new owner's published position
+            // may still name the generation it was promoted from, at or below the cutoff.
+            let published = self
+                .publication
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq));
+            let cap = published.and_then(|(generation, seq)| {
+                let at = chain
+                    .iter()
+                    .position(|level| level.generation == generation)?;
+                let exit = chain[1..=at].iter().filter_map(|level| level.exit).min();
+                Some(exit.map_or(seq, |exit| seq.min(exit)))
+            });
+            let Some(cap) = cap else {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} has published nothing on generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            };
+            ("owner", cap)
+        } else if let Some(receiver) = self.replication.receiver(self.node, partition) {
+            if role != Some(ReplicaRole::RegularSecondary) {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} holds no regular copy of partition {p} in generation {} ({})",
+                        newest.0,
+                        role.map_or("left out".to_owned(), |role| format!("{role:?}"))
+                    ),
+                );
+            }
+            if receiver.lineage().generation != newest {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} is landing generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            }
+            if let Some(why) = self.feed_fresh(partition, newest) {
+                tracing::info!(node, partition = p, why, "feed_secondary_refused");
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!("node {node}, partition {p}: {why}"),
+                );
+            }
+            (
+                "secondary",
+                Seq(self.engine.buffered_applied(partition, newest).0),
+            )
+        } else {
+            return refused(
+                ErrorKind::Unavailable,
+                format!("node {node} serves no copy of partition {p}"),
+            );
+        };
+        let engine = &self.engine;
+        let read = |seq: Seq| -> Result<Option<(ReplicationEnvelope, usize)>, Fault> {
+            let Some((_, _, record)) = engine
+                .get(partition, newest, Namespace::History, &seq.0.to_be_bytes())
+                .map_err(|fault| format!("feed: history read at seq {}: {fault:?}", seq.0))?
+            else {
+                return Ok(None);
+            };
+            let envelope = ReplicationEnvelope::decode(&record).map_err(|error| {
+                format!(
+                    "feed: the record at seq {} does not decode: {error:?}",
+                    seq.0
+                )
+            })?;
+            Ok(Some((envelope, record.len())))
+        };
+        let floor = engine
+            .history_floor(partition, newest)
+            .map_err(|fault| format!("feed: history floor: {fault:?}"))?;
+        let resumed = feed::resume(from, &chain, cap, floor, |seq| {
+            Ok::<_, Fault>(
+                read(seq)?
+                    .map(|(envelope, _)| (envelope.header.generation, envelope.record_digest)),
+            )
+        })?;
+        let after = match resumed {
+            feed::Resume::Serve(after) => after,
+            feed::Resume::Answer(page) => {
+                tracing::info!(
+                    node,
+                    partition = p,
+                    client = identity.client.0,
+                    source,
+                    from_generation = from.generation.0,
+                    from_seq = from.seq.0,
+                    cap = cap.0,
+                    floor = floor.0,
+                    answer = ?page,
+                    "feed_answered"
+                );
+                return Ok(Ok(page));
+            }
+            feed::Resume::Diverged { seq, held } => {
+                tracing::error!(
+                    node,
+                    partition = p,
+                    generation = from.generation.0,
+                    seq = seq.0,
+                    cursor_digest = %from.digest,
+                    held_digest = %held,
+                    "feed_cursor_diverged"
+                );
+                return refused(
+                    ErrorKind::CorruptHistory,
+                    format!(
+                        "the cursor's record at seq {} of generation {} has another digest on                          node {node}: the histories diverged",
+                        seq.0, from.generation.0
+                    ),
+                );
+            }
+        };
+        // A hole below the cap faults the node, as any history read that finds damage does; a
+        // key that does not parse is refused to the caller.
+        let page = feed::page(after, cap, max, |seq| {
+            let Some((envelope, bytes)) = read(seq).map_err(Err)? else {
+                return Err(Err(Fault::from(format!(
+                    "feed: no record at seq {} below the cap {} of generation {}",
+                    seq.0, cap.0, newest.0
+                ))));
+            };
+            let record = feed::record_of(&envelope, identity.tenant).map_err(Ok)?;
+            Ok(feed::Scanned {
+                at: FeedCursor::after(&envelope),
+                bytes,
+                record,
+            })
+        });
+        let page = match page {
+            Ok(page) => page,
+            Err(Ok(detail)) => return refused(ErrorKind::CorruptHistory, detail),
+            Err(Err(fault)) => return Err(fault),
+        };
+        if let FeedPage::Records {
+            records,
+            next,
+            more,
+        } = &page
+        {
+            tracing::debug!(
+                node,
+                partition = p,
+                client = identity.client.0,
+                source,
+                from_seq = from.seq.0,
+                records = records.len(),
+                next_generation = next.generation.0,
+                next_seq = next.seq.0,
+                more,
+                cap = cap.0,
+                "feed_page"
+            );
+        }
+        Ok(Ok(page))
+    }
+
+    /// #87 (R2): why this secondary may not serve `partition`'s feed in `newest`, or `None` when
+    /// it may. It may while its own read of `partitions/{p}`, begun within `grant_millis`, names
+    /// `newest` with this node pinned regular. A deposed owner cannot keep that read fresh: a
+    /// promote elsewhere commits a newer generation to the record. A read older than half the
+    /// grant starts the next one, at most one in flight per partition, and the call is
+    /// answered from the cache meanwhile. Partitions no feed call asks about are never read.
+    fn feed_fresh(&mut self, partition: PartitionId, newest: Generation) -> Option<String> {
+        let now = self.clock.now();
+        let grant = self.budgets.grant_millis;
+        let entry = self.feed_reads.entry(partition).or_default();
+        let age = entry
+            .read
+            .as_ref()
+            .map(|(started, _, _)| now.0.saturating_sub(started.0));
+        if age.is_none_or(|age| age >= grant / 2) && !entry.in_flight {
+            entry.in_flight = true;
+            self.control
+                .read_partition_for_feed(self.node, self.boot, partition, now);
+        }
+        let entry = &self.feed_reads[&partition];
+        let Some((_, generation, members)) = entry
+            .read
+            .as_ref()
+            .filter(|_| age.is_some_and(|age| age < grant))
+        else {
+            return Some(format!(
+                "no control read of partitions/{} within the grant ({grant} ms); one is under                  way, so call again",
+                partition.0
+            ));
+        };
+        if *generation != newest {
+            return Some(format!(
+                "the partition is at generation {}, not {} landed here",
+                generation.0, newest.0
+            ));
+        }
+        // A record of a layout that pins no members leaves the landed configuration as the only
+        // membership, which the caller checked.
+        if let Some(members) = members {
+            if !members.iter().any(|member| {
+                member.node == self.node && member.role == ReplicaRole::RegularSecondary
+            }) {
+                return Some(format!(
+                    "partitions/{} leaves node {} out of generation {} as a regular copy",
+                    partition.0, self.node.0, newest.0
+                ));
+            }
+        }
+        None
+    }
+
+    /// [`Msg::FeedRead`]: keep a read that answered, newest start first.
+    fn feed_read(
+        &mut self,
+        partition: PartitionId,
+        started: Tick,
+        read: Result<(Generation, Option<Vec<RecordMember>>), String>,
+    ) {
+        let entry = self.feed_reads.entry(partition).or_default();
+        entry.in_flight = false;
+        match read {
+            Ok((generation, members)) => {
+                tracing::debug!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    started = started.0,
+                    "feed_control_read"
+                );
+                if entry.read.as_ref().is_none_or(|(at, _, _)| *at <= started) {
+                    entry.read = Some((started, generation, members));
+                }
+            }
+            Err(error) => tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                %error,
+                "feed_control_read_failed"
+            ),
+        }
     }
 
     fn compile(
@@ -16012,6 +16404,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "fault",
         Msg::Activated { .. } => "activated",
         Msg::OwnerLearned { .. } => "owner_learned",
+        Msg::FeedRead { .. } => "feed_read",
         Msg::FenceBound { .. } => "fence_bound",
         Msg::ReplanNote { .. } => "replan_note",
         Msg::Inject { .. } => "inject",

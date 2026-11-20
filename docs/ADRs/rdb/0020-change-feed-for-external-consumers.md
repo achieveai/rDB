@@ -1,11 +1,29 @@
 # ADR-rdb-0020: A change feed for external apps — read every committed change, in order
 
-**Status:** Proposed. **Not scheduled. No code in M10.** A future item picks this up.
+**Status:** Accepted, option A (issue #87, 2026-11-19). Slice 1 is built: see the amendment
+below. Slice 2 (wire) is not; slice 4 (long-poll) stays deferred. The prefix filter (slice 3) is
+dropped from #87: shared config stays in rEtcd (lead, 2026-11-19).
 **Date:** 2026-10-23
 **Spec:** `docs/rdb/design-specification.md` §4.1, §4.3, §5.1–§5.3, §6.1, §6.3, §8.1, §8.4, §10.1, §11
 **Raised by:** Gautam, 2026-10-23: "whenever you make a write and change the data, we may want to
 create a log for that change in data … if some external application wants to consume this, and undo
 some of the changes rather than the database itself figuring all that thing out."
+
+**Amended 2026-11-19 (#87 slice 1).** What exists now, in process only:
+
+- `Db::changes(partition, from, max, source)` reads one partition's committed `History` after a
+  `FeedCursor` (the record's header stamp, its seq and its `record_digest`), from the owner
+  (`Source::Owner`) or from one node's copy (`Source::Node(n)`), which may be a regular secondary.
+- Answers: `Records { records, next, more }`, `Behind { head }`, `Trimmed { floor }` and
+  `Rewound { to }` (`crates/rdb-api/src/feed.rs`). The cursor is checked against the serving copy's
+  `Link` chain by `feed::resume`, using the lowest `Link.base` on the path from the cursor's level
+  (the effective exit), so a cut is reported even when no write followed it.
+- The owner serves up to its published position; a regular secondary up to what it applied, while
+  its own read of `partitions/{p}` is fresh (the R2 bound: started within `grant_millis`, naming
+  its generation and pinning it regular).
+- No key filter. Only `User` writes under the caller's tenant are returned (Q3); a record with
+  none is skipped and `next` moves past it. Over the wire a `Changes` call is
+  refused `INVALID_ARGUMENT` until slice 2.
 
 ## Context
 

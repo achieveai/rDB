@@ -109,6 +109,12 @@
 //! put <object> <value> [--if-version N]   write a byte string
 //! barrier [--group G] <generation> <seq> [<timeout-ms>]
 //!                                         `Db::wait_durable` on a put's position
+//! changes <partition> [--from G:S:HEX] [--at N] [--max K]
+//!                                         one page of the change feed (#87) after the
+//!                                         cursor (default the start), from the owner or node
+//!                                         N: `seq= gen= digest= writes=` per record, then
+//!                                         `next=G:S:HEX more=`; or one `behind`, `trimmed`
+//!                                         or `rewound to=G:S:HEX` line. In process only
 //! put --as <n> <object> <value> [--if-version N]
 //!                                         the same put under request id app_request_id(n),
 //!                                         your own number n below 2^63, used once; recorded
@@ -2029,6 +2035,8 @@ fn repl<'scope, 'env>(
                     .map(|ok| bad |= !ok)
             }
             ["barrier", ..] => Err(BARRIER_USAGE.to_owned()),
+            ["changes", partition, rest @ ..] => changes_line(db, partition, rest).map(|ok| bad |= !ok),
+            ["changes", ..] => Err(CHANGES_USAGE.to_owned()),
             ["client", "drop-reply"] => {
                 say(drop_reply_line(drop_reply));
                 drop_reply = true;
@@ -2937,10 +2945,10 @@ fn log_command(line: &str) {
 /// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
 /// object it writes or reads, when it names one. A line `split_words` refuses names no object.
 fn command_fields(line: &str) -> (&'static str, Option<String>) {
-    const VERBS: [&str; 28] = [
+    const VERBS: [&str; 29] = [
         "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
-        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
+        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier", "changes",
     ];
     const SUBVERBS: [&str; 28] = [
         "put --as",
@@ -4790,6 +4798,101 @@ fn barrier_line(
                 "durable generation={} seq={} millis={millis}",
                 position.0 .0, position.1 .0
             ));
+            Ok(true)
+        }
+        Err(error) => {
+            say(&format!("err {} ({})", error.name(), error.explain()));
+            Ok(false)
+        }
+    }
+}
+
+const CHANGES_USAGE: &str = "changes <partition> [--from G:S:HEX] [--at N] [--max K]";
+
+/// A cursor as `changes` prints it: `generation:seq:digest-hex`.
+fn cursor_text(cursor: &rdb_api::FeedCursor) -> String {
+    format!(
+        "{}:{}:{}",
+        cursor.generation.0,
+        cursor.seq.0,
+        cursor.digest.to_hex()
+    )
+}
+
+fn parse_cursor(text: &str) -> Result<rdb_api::FeedCursor, String> {
+    let bad = || format!("--from {text:?}: want G:S:HEX, as `next=` prints it");
+    let mut parts = text.split(':');
+    let (Some(generation), Some(seq), Some(digest), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    let digest: [u8; 32] = hex::decode(digest)
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(bad)?;
+    Ok(rdb_api::FeedCursor {
+        generation: rdb_api::Generation(generation.parse().map_err(|_| bad())?),
+        seq: rdb_api::Seq(seq.parse().map_err(|_| bad())?),
+        digest: rdb_core::contracts::digest::Digest(digest),
+    })
+}
+
+/// `changes`: one page of `Db::changes`, printed record by record. `false` when refused.
+fn changes_line(db: &Db, partition: &str, rest: &[&str]) -> Result<bool, String> {
+    let partition = rdb_api::PartitionId(
+        partition
+            .parse()
+            .map_err(|_| format!("{CHANGES_USAGE}: the partition is a number"))?,
+    );
+    let (mut from, mut source, mut max) = (
+        rdb_api::FeedCursor::START,
+        rdb_api::Source::Owner,
+        rdb_api::feed::FEED_PAGE_RECORDS,
+    );
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let value = words.next().ok_or_else(|| CHANGES_USAGE.to_owned())?;
+        match *word {
+            "--from" => from = parse_cursor(value)?,
+            "--at" => source = rdb_api::Source::Node(parse_node(value)?),
+            "--max" => max = value.parse().map_err(|_| CHANGES_USAGE.to_owned())?,
+            _ => return Err(CHANGES_USAGE.to_owned()),
+        }
+    }
+    match db.changes(partition, from, max, source) {
+        Ok(rdb_api::FeedPage::Records {
+            records,
+            next,
+            more,
+        }) => {
+            for record in &records {
+                let writes: Vec<String> = record
+                    .writes
+                    .iter()
+                    .map(|write| String::from_utf8_lossy(&write.object).into_owned())
+                    .collect();
+                say(&format!(
+                    "seq={} gen={} digest={} writes={}",
+                    record.at.seq.0,
+                    record.at.generation.0,
+                    record.at.digest.to_hex(),
+                    writes.join(",")
+                ));
+            }
+            say(&format!("next={} more={more}", cursor_text(&next)));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Behind { head }) => {
+            say(&format!("behind head={}", head.0));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Trimmed { floor }) => {
+            say(&format!("trimmed floor={}", floor.0));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Rewound { to }) => {
+            say(&format!("rewound to={}", cursor_text(&to)));
             Ok(true)
         }
         Err(error) => {
