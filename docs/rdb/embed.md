@@ -1031,7 +1031,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
-| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Writes return once the copy has caught up. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -1215,6 +1215,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   ("When writes pause"). How long that takes grows with the partition's size. `retry_after` is
   a fixed 5 s poll hint, not an estimate: rDB cannot yet count a partition's bytes cheaply
   enough to give one.
+- **The same pause follows `admin promote --drop`** when the copy left behind is behind the
+  trimmed history. Reads keep working through the rebuild. Once the copy has caught up, the
+  owner re-plans with it to take writes again. That re-plan fences the partition first, so a
+  read may get `LEASE_EXPIRED` (retry after recovery) for about 2 s. During the re-plan (about
+  a second), writes are refused with retryable, no-mutation errors (`UNAVAILABLE`,
+  `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED`); retry them.
 - **A move whose new copy makes no progress for 90 s is given up.** A move's new copy catches
   up one record per round trip. Copying a long history is progress, however long it takes.
   The clock counts only time in which the copy gets no closer to the head. That happens when

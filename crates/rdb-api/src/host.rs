@@ -2970,6 +2970,11 @@ struct Host {
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
+    /// Issue #61 R26 (b): per partition, the copy a `ReadOnly` commit left outside that R1 has
+    /// since caught up, with its node and the commit's generation. The repair re-plans with it
+    /// at the next check, and until then a refused write names it
+    /// ([`Self::rebuilding_read_only`]). Read only while the commit's generation is current.
+    caught_up_outside: BTreeMap<PartitionId, (Generation, CopyId, NodeId)>,
     /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
     /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
     /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
@@ -3242,6 +3247,7 @@ impl Host {
             #[cfg(test)]
             hold_repairs: false,
             repair_since: BTreeMap::new(),
+            caught_up_outside: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
@@ -5613,7 +5619,7 @@ impl Host {
             .range((partition, CopyId(0))..)
             .find(|((at, _), _)| *at == partition)
         else {
-            return refused;
+            return self.caught_up_read_only(partition, refused);
         };
         let millis = transfer.opened.millis_until(self.clock.now());
         refused.detail = format!(
@@ -5626,6 +5632,30 @@ impl Host {
             transfer.bytes as f64 / f64::from(1u32 << 20),
             millis / 1000,
             (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
+        refused
+    }
+
+    /// [`Self::rebuilding_read_only`] once the transfer has ended (issue #61 R26): a copy the
+    /// `ReadOnly` commit left outside is caught up, and writes wait for the owner's re-plan with
+    /// it ([`Self::repair_on_caught_up`]). Unchanged when none is, or for an older commit.
+    fn caught_up_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let current = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.new_generation);
+        let Some((_, copy, node)) = self
+            .caught_up_outside
+            .get(&partition)
+            .filter(|(generation, _, _)| Some(*generation) == current)
+        else {
+            return refused;
+        };
+        refused.detail = format!(
+            "{}: copy {} on node {} is caught up; writes resume when the owner re-plans with it",
+            refused.detail, copy.0, node.0,
         );
         let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
         refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
@@ -6844,6 +6874,7 @@ impl Host {
                     "caught_up",
                     "snapshot_transfer_released",
                 );
+                self.repair_on_caught_up(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -8740,6 +8771,50 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// Issue #61 R26 (b): `copy` caught up. When it is a member this node's `ReadOnly` commit
+    /// left outside and F1 armed no rebuild (a two-copy plan never arms one, arch-s2 R2-M2),
+    /// nothing else ends the window: the repair would first wait for the member's link to age
+    /// `resume_hold_millis`. A caught-up copy has just proved it answers, so that wait is
+    /// skipped: the next check probes it, and the one after re-plans (A-R350's probe still
+    /// applies). Logged `read_only_repair_on_caught_up`.
+    fn repair_on_caught_up(&mut self, partition: PartitionId, copy: CopyId) {
+        let Some((generation, node)) = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.copy == copy)
+                .map(|member| (committed.new_generation, member.node))
+        }) else {
+            return;
+        };
+        if !self.read_only_outside(partition).contains(&node) {
+            return;
+        }
+        let armed = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| f1.phase() == RecoveryPhase::Rebuilding);
+        if armed {
+            return;
+        }
+        let now = self.clock.now();
+        let aged = Tick(now.0.saturating_sub(self.budgets.resume_hold_millis));
+        let since = self.repair_since.entry(partition).or_insert(aged);
+        *since = (*since).min(aged);
+        self.caught_up_outside
+            .insert(partition, (generation, copy, node));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            copy = copy.0,
+            holder = node.0,
+            "read_only_repair_on_caught_up"
+        );
     }
 
     /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
