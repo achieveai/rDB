@@ -39,6 +39,8 @@ use rdb_storage::RocksEngine;
 pub use rdb_storage::StorageOptions;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
+use rdb_value::envelope::Kind as ObjectKind;
+use rdb_value::keys::Listed;
 use rdb_value::value::Value;
 use rdb_value::{Document, Expected};
 use tokio::runtime::Handle;
@@ -115,6 +117,11 @@ pub const MAX_KEY: usize = 1_024;
 /// compiled or sent, and its request id is used up.
 pub const MAX_VALUE: usize = 1_044_480;
 
+/// The longest object id a [`ScopedDb`] takes (#147): [`MAX_OBJECT_ID`] less the longest scope
+/// header and the 8-byte workspace group, the same for every scope. A longer one is `TOO_LARGE`
+/// ([`Limit::ObjectId`]) with this maximum, whatever the scope's own length.
+pub const MAX_SCOPED_ID: usize = MAX_OBJECT_ID - rdb_value::keys::MAX_SCOPE_HEADER;
+
 /// The largest record one atomic write ships: `MAX_ENVELOPE_BYTES` (1 MiB). A byte write
 /// (`put` and `txn` forms) is checked against it before it is sent, with the upper-bound sum
 /// `265 + for each put: value_len + id_len + zero_bytes_in_id + 71` (embed.md, "How big a
@@ -141,6 +148,8 @@ pub const MAX_PAGE: usize = 1_000;
 mod ack_floor;
 mod async_db;
 pub use async_db::{AsyncDb, TxnWrite};
+mod scoped;
+pub use scoped::{ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite};
 
 // `AsyncDb` hands an `Arc<Db>` to the blocking pool, so `Db` must be `Send + Sync` (#146).
 const _: () = {
@@ -430,6 +439,40 @@ pub struct ReadOk {
     /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
     /// `false` for every other read.
     pub recovery_mode: bool,
+}
+
+/// One object of an [`ObjectPage`] (#147).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    /// The object id, whole.
+    pub id: Bytes,
+    /// The root's version.
+    pub version: u64,
+    /// The object's kind: a document, a map, a set, a list or a blob.
+    pub kind: ObjectKind,
+}
+
+/// A page of [`Db::list_in`] (#147): objects with a root, in id order, from one view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPage {
+    /// The objects.
+    pub entries: Vec<ObjectEntry>,
+    /// The page is full: ask again with this as `after`. `None` when the range ended.
+    pub next: Option<Bytes>,
+    /// The storage generation of the view.
+    pub generation: Generation,
+    /// The position of the view.
+    pub at: Seq,
+}
+
+/// A [`Db::delete_prefix_in`] that stopped (#147): how many objects it emptied first, and why it
+/// stopped. Run it again to finish; it is not atomic.
+#[derive(Debug, Clone)]
+pub struct PrefixDeleteError {
+    /// Objects emptied before the error.
+    pub deleted: u64,
+    /// Why it stopped.
+    pub error: PutError,
 }
 
 /// A refused write, with the request so the caller can send it again (`retry`).
@@ -3940,6 +3983,194 @@ impl Db {
         self.status_at(self.partition_for(group), request, generation)
     }
 
+    /// Up to `limit` objects in group `group` whose id starts with `prefix`, in id order, after
+    /// object `after` when given (#147). Objects with no root, such as an unpublished upload's
+    /// chunks, are not listed. Each object costs the owner one seek, however many entries it
+    /// holds. Each page is read from its own view at the publication barrier; pages are not one
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_in`]. `INVALID_ARGUMENT` for a `limit` over [`MAX_PAGE`]; `TOO_LARGE`
+    /// for a `prefix` or `after` over [`MAX_OBJECT_ID`]; `CORRUPT_HISTORY` for a damaged key or
+    /// root in the range.
+    pub fn list_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ObjectPage, ApiError> {
+        let (objects, full, generation, at) = self.list_page(group, prefix, after, limit, false)?;
+        let entries: Vec<_> = objects
+            .into_iter()
+            .filter_map(|listed| {
+                listed.root.map(|(version, kind)| ObjectEntry {
+                    id: Bytes::from(listed.id),
+                    version,
+                    kind,
+                })
+            })
+            .collect();
+        let next = if full {
+            entries.last().map(|entry| entry.id.clone())
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            entries,
+            next,
+            generation,
+            at,
+        })
+    }
+
+    fn list_page(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        rootless: bool,
+    ) -> Result<(Vec<Listed>, bool, Generation, Seq), ApiError> {
+        let read = self.read_call(ClientCall::Get {
+            identity: self.identity(),
+            group,
+            object: Bytes::copy_from_slice(prefix),
+            look: Look::List {
+                after: after.map(Bytes::copy_from_slice),
+                limit,
+                rootless,
+            },
+        })?;
+        match read.seen {
+            Seen::Objects { objects, full } => Ok((objects, full, read.generation, read.at)),
+            other => Err(ApiError::host(&format!(
+                "a list was answered with {other:?}"
+            ))),
+        }
+    }
+
+    /// Delete every object in group `group` whose id starts with `prefix`, of every kind, and
+    /// every object with no root there, such as an unpublished upload's chunks (#147). Answers
+    /// how many objects it emptied.
+    ///
+    /// It walks the prefix a page at a time. Documents go up to [`MAX_OPS`] to a transaction,
+    /// each at the version listed; when one moved, the page is listed again, up to 3 times.
+    /// Every other object is deleted with [`Change::Delete`] until it answers `Ok(None)`.
+    /// `deadline` is each send's kernel deadline.
+    ///
+    /// **It is not atomic.** An error says how far it got, and running it again finishes the
+    /// job. An object created under the prefix after its page was read survives.
+    ///
+    /// # Errors
+    ///
+    /// [`PrefixDeleteError`]: the objects emptied so far, and the first refusal, a list's
+    /// included, as [`Self::list_in`] and [`Self::write_in`] give them.
+    pub fn delete_prefix_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        deadline: Duration,
+    ) -> Result<u64, PrefixDeleteError> {
+        let mut deleted = 0;
+        let stop = |deleted, error| PrefixDeleteError { deleted, error };
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let mut moved = 0;
+            let (objects, full) = loop {
+                let (objects, full, ..) = self
+                    .list_page(group, prefix, after.as_deref(), MAX_PAGE, true)
+                    .map_err(|error| {
+                        stop(
+                            deleted,
+                            PutError {
+                                error,
+                                request: None,
+                            },
+                        )
+                    })?;
+                let docs: Vec<_> = objects
+                    .iter()
+                    .filter_map(|listed| match listed.root {
+                        Some((version, ObjectKind::Document)) => Some((&listed.id, version)),
+                        _ => None,
+                    })
+                    .collect();
+                match self.delete_docs(group, &docs, deadline, &mut deleted) {
+                    Ok(()) => break (objects, full),
+                    Err(error) if error.error.kind == ErrorKind::ConditionFailed && moved < 3 => {
+                        moved += 1;
+                    }
+                    Err(error) => return Err(stop(deleted, error)),
+                }
+            };
+            for listed in &objects {
+                if matches!(listed.root, Some((_, ObjectKind::Document))) {
+                    continue;
+                }
+                let mut emptied = false;
+                loop {
+                    let put = PutOp {
+                        group,
+                        object: Bytes::copy_from_slice(&listed.id),
+                        change: Change::Delete,
+                        expect: None,
+                    };
+                    match self.changes(vec![put], deadline) {
+                        Ok(Some(_)) => emptied = true,
+                        Ok(None) => break,
+                        Err(error) => return Err(stop(deleted, error)),
+                    }
+                }
+                deleted += u64::from(emptied);
+            }
+            match objects.last() {
+                Some(last) if full => after = Some(last.id.clone()),
+                _ => return Ok(deleted),
+            }
+        }
+    }
+
+    /// Delete documents `docs`, each at its listed version, up to [`MAX_OPS`] to a transaction,
+    /// counting each transaction's documents into `deleted` once it is answered.
+    fn delete_docs(
+        &self,
+        group: AffinityId,
+        docs: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+        deleted: &mut u64,
+    ) -> Result<(), PutError> {
+        for batch in docs.chunks(MAX_OPS) {
+            let puts = batch
+                .iter()
+                .map(|(id, version)| PutOp {
+                    group,
+                    object: Bytes::copy_from_slice(id),
+                    change: Change::Delete,
+                    expect: Some(Expected::Version(*version)),
+                })
+                .collect();
+            if self.changes(puts, deadline)?.is_some() {
+                *deleted += batch.len() as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile and send `puts` as one transaction under a fresh write id, with kernel deadline
+    /// `deadline`.
+    fn changes(&self, puts: Vec<PutOp>, deadline: Duration) -> Result<Option<PutOk>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        self.compile_and_send(identity, puts, deadline, send_wait(deadline))
+    }
+
     fn status_at(
         &self,
         partition: PartitionId,
@@ -5717,7 +5948,11 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         }) => Some((version, Bytes::from(bytes))),
         // `get` looks with `Look::Doc`, so `Members` and `Items` are not expected here; either
         // way it is no byte string.
-        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) | Seen::Range { .. } => {
+        Seen::Doc(_)
+        | Seen::Members(_)
+        | Seen::Items(_)
+        | Seen::Range { .. }
+        | Seen::Objects { .. } => {
             return Err(ApiError::invalid(
                 "the object is not a byte string; read it with Db::read",
             ))
@@ -6750,7 +6985,8 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             | Change::Chunk { .. }
             | Change::Publish { .. }
             | Change::Gc { .. }
-            | Change::Clear => &[],
+            | Change::Clear
+            | Change::Delete => &[],
         };
         elems
             .iter()
@@ -6864,7 +7100,11 @@ fn op_count(change: &Change) -> usize {
         Change::Doc(delta) => delta.0.len(),
         Change::Map(ops) | Change::Set(ops) => ops.len(),
         Change::List(edits) => edits.len(),
-        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } | Change::Clear => 0,
+        Change::Chunk { .. }
+        | Change::Publish { .. }
+        | Change::Gc { .. }
+        | Change::Clear
+        | Change::Delete => 0,
     }
 }
 
@@ -6908,7 +7148,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         Some(
             Look::Members { limit, .. }
             | Look::Items { limit, .. }
-            | Look::ItemsAfter { limit, .. },
+            | Look::ItemsAfter { limit, .. }
+            | Look::List { limit, .. },
         ) => *limit,
         Some(Look::Doc | Look::Range { .. }) | None => 0,
     };
@@ -6924,6 +7165,22 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         Some(Look::Members {
             after: Some(after), ..
         }) => key_refusal(after, *identity, None, "read"),
+        Some(Look::List {
+            after: Some(after), ..
+        }) if after.len() > MAX_OBJECT_ID => Some(limit_refused(
+            *identity,
+            "object_id",
+            Limit::ObjectId,
+            after.len(),
+            MAX_OBJECT_ID,
+            format!(
+                "list after an id of {} bytes, over the {MAX_OBJECT_ID}-byte limit; request {} \
+                 not read",
+                after.len(),
+                request.0
+            ),
+        )),
+        Some(Look::List { .. }) => None,
         Some(
             Look::Members { after: None, .. }
             | Look::Doc

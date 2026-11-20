@@ -50,9 +50,10 @@ mod test_store;
 
 pub use db::{
     app_request_id, ApiError, AsyncDb, Db, DbConfig, GetOk, Limit, NodeAddresses, NotReady,
-    OpenError, PartitionReady, PutError, PutOk, ReadOk, StorageOptions, Timeouts, TooLarge, TxnPut,
-    TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE,
-    TENANT,
+    ObjectEntry, ObjectPage, OpenError, PartitionReady, PrefixDeleteError, PutError, PutOk, ReadOk,
+    ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite, StorageOptions, Timeouts,
+    TooLarge, TxnPut, TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_SCOPED_ID,
+    MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE, TENANT,
 };
 pub use host::{Change, ListEdit, Look, Seen};
 pub use ownership::{
@@ -60,6 +61,8 @@ pub use ownership::{
 };
 pub use planner::Failover;
 pub use rdb_core::partition_map::{affinity_hash, partition_of, MAX_PARTITIONS};
+pub use rdb_value::envelope::Kind as ObjectKind;
+pub use rdb_value::keys::{Listed, Scope, ScopeError};
 // The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone
 // (A-R190): request ids, generations, the status answer and the error kinds.
 pub use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};

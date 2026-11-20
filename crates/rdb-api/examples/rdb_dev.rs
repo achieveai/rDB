@@ -4254,6 +4254,20 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 ));
             }
         }
+        // `objects n=N full=F`, then one `  id=… version=V kind=K` line each (#147).
+        rdb_api::Seen::Objects { objects, full } => {
+            say(&format!("objects n={} full={full} {view}", objects.len()));
+            for listed in objects {
+                let root = listed.root.map_or_else(
+                    || "rootless".to_owned(),
+                    |(version, kind)| format!("version={version} kind={kind:?}"),
+                );
+                say(&format!(
+                    "  id={:?} {root}",
+                    String::from_utf8_lossy(&listed.id)
+                ));
+            }
+        }
         // `blob version=V size=S chunks=N upload=U`, then `bytes="..."` for a non-empty range.
         rdb_api::Seen::Range { blob, bytes } => {
             let m = &blob.manifest;

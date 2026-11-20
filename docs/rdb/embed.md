@@ -292,7 +292,8 @@ db.shutdown().await.ok();
 ```
 
 - The calls are `wait_ready`, `put`, `get`, `read`, `write`, `txn`, `txn_as`, `resend_within`,
-  `status`, `route` and `ownership_events`. Each names its group; each answers exactly what the
+  `status`, `route` and `ownership_events`. `scoped(scope)` gives a tenant's handle (see
+  [Scopes, groups, list and delete](#scopes-groups-list-and-delete)). Each names its group; each answers exactly what the
   sync `_in` call answers, with the same timeouts, errors and retry rules.
 - `txn` and `txn_as` take `Vec<TxnWrite>`, the owned form of `TxnPut`.
 - `status(group, request, generation)` is `status_in`. Ask with the write's generation: with
@@ -793,6 +794,95 @@ send a request to the right node.
 `rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
 `admin route G` prints `route group G partition P owner node N token G.E`.
+
+### Scopes, groups, list and delete
+
+Give request code a `ScopedDb`, never the `Db` (#147). A `ScopedDb` is one tenant's view: it
+reaches that tenant's data and nothing else, whatever partition the data shares.
+
+```rust,ignore
+let scope = Scope::new(b"acme", Some(b"tenant-42"))?;    // app, optional sub-tenant
+let tenant = async_db.scoped(scope);                     // hand this to request code
+tenant.put(workspace, Bytes::from_static(b"doc"), value, None).await?;
+let page = tenant.list(workspace, Bytes::new(), None, 100).await?;
+tenant.delete_prefix(workspace, Bytes::new(), deadline).await?;
+```
+
+- **A scope** is an app (1–64 bytes) and an optional sub-tenant (1–64 bytes). Any byte is
+  allowed. An empty part, or one over 64 bytes, is a `ScopeError`. A scope is a leaf: an
+  app-level handle sees none of its sub-tenants' data. Open one handle per (app, sub).
+- **A workspace** is a `u64` group inside a scope. Every call names one, and an object id inside
+  it. No call takes a key, an `AffinityId` or a raw `RequestId`.
+- The calls are `put`, `get`, `read`, `write`, `write_as`, `txn`, `txn_as`, `status`,
+  `status_of`, `resend_within`, `list` and `delete_prefix`. Each answers what its `Db` call
+  answers.
+
+**How it is stored.** These bytes are permanent (SBX ADR 0039): renaming an app means moving its
+data.
+
+```text
+S         = len(app) u8 | app | 0x00                          no sub-tenant
+S         = len(app) u8 | app | 0x01 | len(sub) u8 | sub      with a sub-tenant
+stored id = S || workspace u64 BE || id
+affinity  = first 8 bytes BE of SHA-256("RDBSCOPE1" || S || workspace BE)
+request   = APP_REQUEST_BIT | top-bit-cleared first 8 bytes BE of
+            SHA-256("RDBREQ1" || S || workspace BE || n BE)
+```
+
+- No `S || workspace` is a prefix of another, so no key of one (scope, workspace) is a key of
+  another. That is what isolates tenants. The affinity only places data: two workspaces that
+  land on one partition, or on one affinity, still share no key.
+- The affinity hashes the workspace, so one scope's workspaces spread over every partition.
+  Never place by tenant alone: one tenant would become one hot partition.
+- `write_as`, `txn_as` and `status` take the app's own request number `n`, per scope and
+  workspace. Two scopes using the same `n` never meet. A request id from two scopes collides
+  only on a 63-bit hash collision, about M²/2^64 for M live ids, and its effect is a status
+  answer, never a value.
+- `resend_within` and `status_of` take only a `ScopedSent`, which only a scope's own answers
+  carry. Another scope's token is `INVALID_ARGUMENT`, and nothing is sent. A scoped answer's
+  `PutOk.sent` holds no keys or values.
+
+**Id budget.** Every scoped id is at most `MAX_SCOPED_ID` = 885 bytes, in every scope: 1,024
+less the longest `S` (131 bytes) and the workspace (8). A longer id is `TOO_LARGE` with
+`TooLarge { limit: ObjectId, size, max: MAX_SCOPED_ID }`. The budget does not move with the
+scope's length.
+
+**List.** `list(workspace, prefix, after, limit)` returns up to `limit` (at most `MAX_PAGE`)
+objects whose id starts with `prefix`, after `after`: each `ObjectEntry { id, version, kind }`,
+with `id` inside the scope. `next` is the last id when the page is full; pass it as `after`.
+
+- An empty prefix lists the whole workspace. A workspace is the widest list: rDB keeps no list of
+  a scope's workspaces. Keep your own index of workspaces to offboard a whole tenant.
+- One object costs one seek, however many entries it holds. Records with no root, such as the
+  chunks of an upload never published, are not listed.
+- Each page is one read. Pages are not one snapshot.
+
+**Delete.** `write(workspace, id, Change::Delete, expect)` deletes any kind of object.
+
+- A document is one call. A larger map, set, list or blob is deleted in batches of up to 254
+  records: call again until `Ok(None)`. The root goes last, so a reader may see a map with
+  fewer entries, but a new object at that id never inherits old entries.
+- `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
+  `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
+- `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload
+  chunks with no root included, and returns how many. **It is not atomic.** On an error,
+  `PrefixDeleteError { deleted, error }` says how far it got; run it again to finish. An object
+  created under the prefix while it runs may survive.
+- Offboarding a tenant is one `delete_prefix(workspace, "")` per workspace in your index.
+
+**What a scope does not stop.**
+
+- A holder of the `Db` or the `AsyncDb` reaches every scope. In process, the boundary is the type
+  you hand to request code.
+- An app connected over a network link is not scoped by the node. **rDB's client and peer ports
+  must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
+  your gateway. A node-side check of the certificate's app against the id is owed (#154).
+- `route`, `ownership` and ownership events return partition and node facts only, never a
+  record.
+
+**Try it.** `cargo run -p rdb-api --example scoped_db` writes `doc` in four scopes whose names
+run into each other (`a`, `ab`, `a`+`b`, `a`+`c`) and prints each scope's value and list, then
+deletes one scope's workspace and lists again. Only that scope's list changes.
 
 ## 5. Reopening your folder
 

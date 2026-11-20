@@ -613,3 +613,101 @@ fn batch(
         faulting,
     ))
 }
+
+/// One batch of an ordinary delete of the object at `root`, of any kind (#147): no damage proof,
+/// and Clear's order, root last.
+///
+/// - Up to [`MAX_CLEAR_DELETES`] records other than the root, in key order, each at the version
+///   read, and each batch guarded by the root at the version read, or by its absence for an
+///   object with no root (the chunks of an upload never published).
+/// - The batch that leaves nothing else deletes the root, at its version.
+/// - `Ok(None)`: nothing is stored under the object. Call again until then.
+///
+/// With `expect`, the root must be at that version: every batch is a CAS.
+///
+/// # Errors
+/// [`ApplyError::VersionConflict`] when the root is at another version than `expect`, and
+/// [`ApplyError::ObjectAbsent`] when `expect` names a version and there is no root but other
+/// records are stored. [`Corrupt::VersionWithoutValue`] for a record with no version.
+pub fn delete_object(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    expect: Option<u64>,
+) -> Result<Option<Compiled>, ValueError> {
+    let root_version = snapshot.version(Namespace::User, root.as_bytes());
+    let prefix = root.object_prefix();
+    let mut mutations = Vec::new();
+    let mut from = prefix.to_vec();
+    let mut more = false;
+    'scan: loop {
+        let page = snapshot.scan(Namespace::User, &from, SCAN_PAGE);
+        let full = page.len() == SCAN_PAGE;
+        for (key, _) in page {
+            if !key.starts_with(prefix) {
+                break 'scan;
+            }
+            from = key.to_vec();
+            from.push(0x00);
+            if key.as_ref() == root.as_bytes() {
+                continue;
+            }
+            if mutations.len() == MAX_CLEAR_DELETES {
+                more = true;
+                break 'scan;
+            }
+            let version = snapshot
+                .version(Namespace::User, &key)
+                .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
+            mutations.push(Mutation::Delete {
+                key,
+                expected_version: Some(version),
+            });
+            if record_len(1, &mutations) > MAX_ENVELOPE_BYTES {
+                mutations.pop();
+                more = true;
+                break 'scan;
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    if mutations.is_empty() && root_version.is_none() {
+        return Ok(None);
+    }
+    match (expect, root_version) {
+        (Some(expected), Some(found)) if expected != found => {
+            return Err(ApplyError::VersionConflict { expected, found }.into());
+        }
+        (Some(_), None) => return Err(ApplyError::ObjectAbsent.into()),
+        _ => {}
+    }
+    if !more {
+        if let Some(version) = root_version {
+            mutations.push(Mutation::Delete {
+                key: root.to_bytes(),
+                expected_version: Some(version),
+            });
+            if record_len(0, &mutations) <= MAX_ENVELOPE_BYTES {
+                return Ok(Some(Compiled {
+                    mutations,
+                    conditions: Vec::new(),
+                }));
+            }
+            mutations.pop();
+        }
+    }
+    let guard = match root_version {
+        Some(version) => Condition::VersionEquals {
+            key: root.to_bytes(),
+            version,
+        },
+        None => Condition::Absent {
+            key: root.to_bytes(),
+        },
+    };
+    Ok(Some(Compiled {
+        mutations,
+        conditions: vec![guard],
+    }))
+}

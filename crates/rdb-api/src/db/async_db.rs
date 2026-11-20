@@ -69,7 +69,7 @@ pub struct TxnWrite {
 
 /// Run `call` on the current runtime's blocking pool and await it. A panic in the call is
 /// handed on to the awaiting task, as the sync call would have panicked in its caller.
-async fn blocking<T, F>(call: F) -> Result<T, String>
+pub(super) async fn blocking<T, F>(call: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -83,7 +83,7 @@ where
 }
 
 /// A put answer from [`blocking`]: a call that never ran sent nothing.
-fn put_answer<T>(answer: Result<Result<T, PutError>, String>) -> Result<T, PutError> {
+pub(super) fn put_answer<T>(answer: Result<Result<T, PutError>, String>) -> Result<T, PutError> {
     answer.unwrap_or_else(|detail| {
         Err(PutError {
             error: ApiError::host(&detail),
@@ -93,7 +93,7 @@ fn put_answer<T>(answer: Result<Result<T, PutError>, String>) -> Result<T, PutEr
 }
 
 /// A read answer from [`blocking`].
-fn read_answer<T>(answer: Result<Result<T, ApiError>, String>) -> Result<T, ApiError> {
+pub(super) fn read_answer<T>(answer: Result<Result<T, ApiError>, String>) -> Result<T, ApiError> {
     answer.unwrap_or_else(|detail| Err(ApiError::host(&detail)))
 }
 
@@ -108,6 +108,11 @@ impl AsyncDb {
     /// take a short lock or an atomic read only.
     #[must_use]
     pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The shared `Db`, for a [`super::ScopedDb`] made from this handle.
+    pub(super) const fn shared(&self) -> &Arc<Db> {
         &self.db
     }
 
