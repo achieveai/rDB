@@ -926,13 +926,16 @@ pub async fn read_nodes(
 /// it with `DbConfig::addresses` before it creates `nodes/` or writes anything.
 ///
 /// - No formation record: `None`; an undeclared database has no node records.
-/// - `node` not among the declared nodes: refused.
+/// - `node` neither in the formation record nor in a `nodes/` record: refused. A node added
+///   at runtime (#80 S4, `admin::add_node`) is in the records only, and is declared.
 /// - No `nodes/` record at all: an S1a store, refused with [`S1A_STORE`].
 /// - `node`'s record absent: refused.
 /// - `listen` must be its record's address, or the same port on the wildcard host (`0.0.0.0`,
 ///   `::`).
 /// - Every `peers` entry, this node's included, must be its node's record's address, and every
-///   declared node other than `node` must have one.
+///   recorded node with a **lower** id than `node` must have one: `node` dials those. A node
+///   with a higher id dials `node`, so it may be left out (#80 S4, ADR-rdb-0025): a node added
+///   after this one's `--peers` was written does not stop it starting.
 ///
 /// Each refusal that compares a value with a record names the record (`nodes/N`) and both
 /// values.
@@ -946,8 +949,19 @@ pub fn node_start_refusal(
 ) -> Option<String> {
     const NOTHING: &str = "nothing was started";
     let formation = formation?;
-    let declared = || formation.nodes.iter().map(|n| n.0).collect::<Vec<_>>();
-    if !formation.nodes.contains(&node) {
+    // #80 S4: the formation record's nodes and every node added since, which has a record.
+    let declared = || {
+        let mut all: Vec<u32> = formation
+            .nodes
+            .iter()
+            .chain(records.keys())
+            .map(|n| n.0)
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    };
+    if !formation.nodes.contains(&node) && !records.contains_key(&node) {
         return Some(format!(
             "node {} is not declared: the database declares nodes {:?}; {NOTHING}",
             node.0,
@@ -999,15 +1013,17 @@ pub fn node_start_refusal(
             ));
         }
     }
-    for declared_node in &formation.nodes {
-        if *declared_node != node && !peers.contains_key(declared_node) {
+    for declared_node in declared().into_iter().map(NodeId) {
+        if declared_node < node && !peers.contains_key(&declared_node) {
             let addr = records
-                .get(declared_node)
+                .get(&declared_node)
                 .map_or("no address", |record| record.addr.as_str());
             return Some(format!(
-                "no peer address for node {}, which {} records at {addr}; {NOTHING}",
+                "no peer address for node {}, which {} records at {addr}: node {} dials every \
+                 node with a lower id; {NOTHING}",
                 declared_node.0,
-                key(*declared_node)
+                key(declared_node),
+                node.0
             ));
         }
     }
@@ -4602,7 +4618,10 @@ async fn freeze(
     }
 }
 
+pub mod membership;
 pub(crate) mod rebuild;
+
+pub use membership::{add_node, AddNodeError};
 
 #[cfg(test)]
 mod tests {
