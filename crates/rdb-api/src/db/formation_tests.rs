@@ -153,6 +153,27 @@ fn open_node_with(
     app: Option<&str>,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
+    let (config, net) = node_config(cert_dir, node, dir, listener, addrs, timeouts, app);
+    let db = rt.block_on(Db::open_with(
+        config,
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))?;
+    Ok((db, net))
+}
+
+/// What [`open_node_with`] opens `node` with, and its started net, inside a runtime context:
+/// for a row that drives the open's future itself (#83 B2: an open dropped mid-write).
+fn node_config(
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
+    app: Option<&str>,
+) -> (DbConfig, Arc<Net>) {
     let boot = next_boot(dir).expect("a boot");
     let label = Label::Node(node);
     let links = Links::new();
@@ -171,24 +192,19 @@ fn open_node_with(
         Some(listener),
     )
     .expect("the node's net starts");
-    let db = rt.block_on(Db::open_with(
-        DbConfig {
-            local: vec![node],
-            links: Some(links),
-            boot: Some(boot),
-            timeouts,
-            addresses: Some(NodeAddresses {
-                listen: addrs[&node].clone(),
-                peers: addrs.clone(),
-                app: app.map(str::to_owned),
-            }),
-            ..config(dir)
-        },
-        Arc::clone(store),
-        rt.handle().clone(),
-        fast(),
-    ))?;
-    Ok((db, net))
+    let config = DbConfig {
+        local: vec![node],
+        links: Some(links),
+        boot: Some(boot),
+        timeouts,
+        addresses: Some(NodeAddresses {
+            listen: addrs[&node].clone(),
+            peers: addrs.clone(),
+            app: app.map(str::to_owned),
+        }),
+        ..config(dir)
+    };
+    (config, net)
 }
 
 /// Listeners for nodes 1 to `k`, node N on 127.0.0.N at a port from the test range, and the
@@ -3905,5 +3921,505 @@ fn own83_b2_3_an_app_address_is_refused_where_no_record_can_hold_it() {
             declared,
             "nothing was written"
         );
+    }
+}
+
+// ---- #83 B2, PR #159 review: the app-address write's fence, and its unknown outcomes ----
+
+/// What an [`AddrPuts`] store does to the next `nodes/` put.
+#[derive(Debug, Clone)]
+enum NodePut {
+    /// Through to the store.
+    Pass,
+    /// Kept to apply later ([`AddrPuts::deliver`]), answered `DeadlineExceededUnknownOutcome`
+    /// at once: a write sent whose reply was lost and which has not applied yet.
+    Late,
+    /// [`NodePut::Late`], and the next `nodes/` read fails: the read back fails.
+    LateUnread,
+    /// Kept to apply later, never answered: the caller's future is dropped there, as a
+    /// process stopped mid-write, after its marker and before the write applied.
+    Park,
+    /// Applied, answered `DeadlineExceededUnknownOutcome`.
+    AppliedLost,
+    /// These bytes written over the record first, then the put sent: it meets a record that
+    /// moved after the open read it.
+    Rival(Bytes),
+    /// These bytes written over the record first, the put not applied, answered
+    /// `DeadlineExceededUnknownOutcome`.
+    RivalLost(Bytes),
+}
+
+/// A memory store whose `nodes/` puts follow a script (#83 B2): each scripted put records
+/// whether the folder's pending marker was on disk when it arrived.
+struct AddrPuts {
+    inner: config_testkit::MemStore,
+    script: std::sync::Mutex<std::collections::VecDeque<NodePut>>,
+    kept: std::sync::Mutex<Vec<config_core::PutRequest>>,
+    failing_reads: std::sync::atomic::AtomicU32,
+    /// The marker a scripted put looks for, and what each one found.
+    marker: std::sync::Mutex<Option<PathBuf>>,
+    marked: std::sync::Mutex<Vec<bool>>,
+    /// The revision each rival write made.
+    rivals: std::sync::Mutex<Vec<u64>>,
+    parked: tokio::sync::Notify,
+}
+
+impl AddrPuts {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: config_testkit::MemStore::new(),
+            script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            kept: std::sync::Mutex::new(Vec::new()),
+            failing_reads: std::sync::atomic::AtomicU32::new(0),
+            marker: std::sync::Mutex::new(None),
+            marked: std::sync::Mutex::new(Vec::new()),
+            rivals: std::sync::Mutex::new(Vec::new()),
+            parked: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn next(&self, step: NodePut) {
+        self.script.lock().expect("script").push_back(step);
+    }
+
+    /// Apply every kept put now, as its late arrival: each one's outcome.
+    fn deliver(&self, rt: &tokio::runtime::Runtime) -> Vec<config_core::MutationOutcome> {
+        let kept: Vec<_> = self.kept.lock().expect("kept").drain(..).collect();
+        kept.into_iter()
+            .map(|put| {
+                rt.block_on(self.inner.put(put))
+                    .expect("applied or refused")
+                    .outcome
+            })
+            .collect()
+    }
+
+    fn keep(&self, request: config_core::PutRequest) {
+        self.kept.lock().expect("kept").push(request);
+    }
+
+    async fn overwrite(&self, key: &Bytes, value: Bytes) -> Result<(), config_core::ConfigError> {
+        self.inner
+            .put(config_core::PutRequest {
+                key: key.clone(),
+                value,
+                expected_mod_revision: None,
+                dedup: None,
+            })
+            .await
+            .map(|written| self.rivals.lock().expect("rivals").push(written.revision))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for AddrPuts {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        if request.key.starts_with(b"nodes/")
+            && self
+                .failing_reads
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(config_core::ConfigError::Unavailable {
+                reason: "AddrPuts: this read back is scripted to fail".to_owned(),
+            });
+        }
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        use config_core::ConfigError::DeadlineExceededUnknownOutcome as Unknown;
+        if !request.key.starts_with(b"nodes/") {
+            return self.inner.put(request).await;
+        }
+        let step = self
+            .script
+            .lock()
+            .expect("script")
+            .pop_front()
+            .unwrap_or(NodePut::Pass);
+        if let Some(marker) = self.marker.lock().expect("marker").as_ref() {
+            self.marked.lock().expect("marked").push(marker.exists());
+        }
+        tracing::info!(?step, "test_addr_put");
+        match step {
+            NodePut::Pass => self.inner.put(request).await,
+            NodePut::Late => {
+                self.keep(request);
+                Err(Unknown)
+            }
+            NodePut::LateUnread => {
+                self.keep(request);
+                self.failing_reads.store(1, Ordering::SeqCst);
+                Err(Unknown)
+            }
+            NodePut::Park => {
+                self.keep(request);
+                self.parked.notify_one();
+                std::future::pending().await
+            }
+            NodePut::AppliedLost => {
+                self.inner.put(request).await?;
+                Err(Unknown)
+            }
+            NodePut::Rival(value) => {
+                self.overwrite(&request.key, value).await?;
+                self.inner.put(request).await
+            }
+            NodePut::RivalLost(value) => {
+                self.overwrite(&request.key, value).await?;
+                Err(Unknown)
+            }
+        }
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// A declared three-node store behind an [`AddrPuts`], and node 1's folder, where node 1 has
+/// opened once with `first` and stopped: its record holds `first`. Only node 1 ever runs.
+struct Fence {
+    rig: Rig,
+    store: Arc<AddrPuts>,
+    dir: Folder,
+}
+
+impl Fence {
+    fn new(first: &str) -> Self {
+        let store = AddrPuts::new();
+        let rig = bare_rig_of(Arc::clone(&store) as Arc<dyn ConfigStore>, 3);
+        rig.declare_created();
+        let dir = folder();
+        *store.marker.lock().expect("marker") = Some(dir.0.join(APP_ADDR_PENDING_FILE));
+        let fence = Self { rig, store, dir };
+        fence.open(first).expect("the first open registers");
+        fence
+    }
+
+    /// Open node 1 on its folder with `app`; stopped again at once when it opens.
+    fn open(&self, app: &str) -> Result<(), OpenError> {
+        self.open_on(&self.rig.rt, app)
+    }
+
+    /// [`Fence::open`] on `rt`: a fresh one is a new process.
+    fn open_on(&self, rt: &tokio::runtime::Runtime, app: &str) -> Result<(), OpenError> {
+        let listener = self.rig.listen(rt, NodeId(1));
+        let (mut db, net) = open_node_with(
+            rt,
+            &self.rig.store,
+            &self.rig.cert_dir,
+            NodeId(1),
+            &self.dir.0,
+            listener,
+            &self.rig.addrs,
+            Timeouts::default(),
+            Some(app),
+        )?;
+        db.shutdown();
+        drop((db, net));
+        Ok(())
+    }
+
+    /// Node 1's record: its app address and mod revision.
+    fn record(&self) -> (Option<String>, u64) {
+        let (body, revision) = node_record(&self.rig, NodeId(1));
+        let (_, app) = NodeRecord::decode_with_app(&body).expect("node 1's record decodes");
+        (app, revision)
+    }
+
+    /// The record's bytes as node 1 writes them with `app`.
+    fn bytes_with(&self, app: &str) -> Bytes {
+        let (body, _) = node_record(&self.rig, NodeId(1));
+        NodeRecord::decode(&body)
+            .expect("node 1's record decodes")
+            .encode_with_app(app)
+    }
+
+    fn marked(&self) -> bool {
+        self.dir.0.join(APP_ADDR_PENDING_FILE).exists()
+    }
+
+    /// Whether every scripted put found the marker on disk when it arrived.
+    fn marker_before_every_put(&self) -> bool {
+        let marked = self.store.marked.lock().expect("marked");
+        !marked.is_empty() && marked.iter().all(|found| *found)
+    }
+}
+
+/// own83_b2_4 (#83 B2, PR #159 review, the fence): node 1's record holds A. An open with B sends
+/// its write at revision r, and the reply is lost before the write applies: refused, nothing
+/// started, the marker left. The retry with A finds the record already holding A, but the
+/// marker says a write may still apply at r, so it writes A again (the fence): the revision
+/// moves past r. The late write of B then arrives and is refused, and the record holds A. A
+/// further open with A, no marker now, writes nothing. Every scripted put found the marker on
+/// disk. The address carries a synthetic credential: no log line of the changed, fenced or
+/// unchanged registration holds it. Cut: the fence skipped (`held == app` returns before the
+/// marker is read), red at "B never replaces A" (the late write applies). Cut:
+/// `db_app_addr_registered` logs `app = %app`, red at the log check. Integration (~2 s): one
+/// node, opened four times.
+#[config_log::retcd_test]
+fn own83_b2_4_a_late_write_cannot_replace_a_successful_retry() {
+    const A: &str = "https://svc:pw-SYNTHETIC-51ce@gw-1.example:8443/sbx";
+    let fence = Fence::new(A);
+    let (held, r) = fence.record();
+    assert_eq!(held.as_deref(), Some(A));
+
+    fence.store.next(NodePut::Late);
+    let refused = fence
+        .open("gw-1.b:9443")
+        .expect_err("the outcome is unknown");
+    assert!(
+        refused.to_string().contains("has not applied yet")
+            && refused.to_string().contains("nothing was started"),
+        "{refused}"
+    );
+    assert!(fence.marked(), "the marker stays while the write may apply");
+    assert_eq!(fence.record(), (Some(A.to_owned()), r), "B has not applied");
+
+    fence.open(A).expect("the retry with A opens");
+    let (_, fenced) = fence.record();
+    let late = fence.store.deliver(&fence.rig.rt);
+    assert_eq!(fence.record().0.as_deref(), Some(A), "B never replaces A");
+    assert!(!fence.marked(), "the fence resolved the marker");
+    assert_eq!(
+        late,
+        [config_core::MutationOutcome::Conflict],
+        "the late write at r is refused"
+    );
+    assert!(fenced > r, "the retry wrote A again, past r");
+    assert_eq!(fence.record(), (Some(A.to_owned()), fenced));
+
+    fence.open(A).expect("an unchanged open");
+    assert_eq!(fence.record().1, fenced, "no marker: nothing written");
+    assert!(fence.marker_before_every_put());
+
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_b2_4_a_late_write_cannot_replace_a_successful_retry",
+    );
+    let registered: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_app_addr_registered")
+        .collect();
+    assert_eq!(
+        registered.len(),
+        3,
+        "first, fenced, unchanged: {registered:?}"
+    );
+    assert!(registered.iter().all(|line| line["app_len"] == A.len()));
+    for line in &lines {
+        assert!(!line.to_string().contains("pw-SYNTHETIC-51ce"), "{line}");
+    }
+}
+
+/// own83_b2_5 (#83 B2, PR #159 review, lead's crash row): the open with B is dropped after its
+/// marker is durable and before its write applies, as a crash there leaves it. The process
+/// starts again (a new runtime) and opens with A, which the record already holds: the marker
+/// makes it write A again. Then both the parked write at the old revision and a stale retry
+/// of B at that revision are refused, and the record holds A. Cut: the fence skipped, red at
+/// "B never replaces A". Cut: the marker written after the put is sent, red at "the marker
+/// was on disk". Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next() {
+    const A: &str = "gw-1.a:8443";
+    let fence = Fence::new(A);
+    let (_, r) = fence.record();
+    fence.store.next(NodePut::Park);
+    let rt = &fence.rig.rt;
+    let listener = fence.rig.listen(rt, NodeId(1));
+    {
+        let _entered = rt.enter();
+        let (config, net) = node_config(
+            &fence.rig.cert_dir,
+            NodeId(1),
+            &fence.dir.0,
+            listener,
+            &fence.rig.addrs,
+            Timeouts::default(),
+            Some("gw-1.b:9443"),
+        );
+        let store = Arc::clone(&fence.rig.store);
+        let dropped = rt.block_on(async {
+            tokio::select! {
+                opened = Db::open_with(config, store, rt.handle().clone(), fast()) => {
+                    Err(format!("the open finished: {:?}", opened.map(|_| ())))
+                }
+                () = fence.store.parked.notified() => Ok(()),
+            }
+        });
+        dropped.expect("the open is dropped at its write");
+        drop(net);
+    }
+    assert!(fence.marked(), "the marker outlives the dropped open");
+    assert!(
+        fence.marker_before_every_put(),
+        "the marker was on disk before the write went out"
+    );
+    assert_eq!(fence.record(), (Some(A.to_owned()), r));
+
+    let restarted = runtime();
+    fence.open_on(&restarted, A).expect("the restarted open");
+    let (_, fenced) = fence.record();
+
+    let stale = config_core::PutRequest {
+        key: Bytes::from(ControlKey::Node(NodeId(1)).encode()),
+        value: fence.bytes_with("gw-1.b:9443"),
+        expected_mod_revision: Some(r),
+        dedup: None,
+    };
+    fence.store.keep(stale);
+    let late = fence.store.deliver(rt);
+    assert_eq!(fence.record().0.as_deref(), Some(A), "B never replaces A");
+    assert_eq!(
+        late,
+        [
+            config_core::MutationOutcome::Conflict,
+            config_core::MutationOutcome::Conflict
+        ],
+        "the parked write and a stale retry, both at r"
+    );
+    assert!(fenced > r, "written again past r");
+    assert!(!fence.marked(), "the fence resolved the marker");
+    assert_eq!(fence.record(), (Some(A.to_owned()), fenced));
+}
+
+/// own83_b2_6 (#83 B2, PR #159 review, the unknown-outcome table): a registration write
+/// answered `DeadlineExceededUnknownOutcome` is read back. Applied, and the read back matches:
+/// the open goes on, the marker removed. Not applied, and a rival's bytes are there instead:
+/// refused, naming the rival's revision, the rival's record kept, the marker removed (no
+/// write at the old revision can apply). The read back fails, twice, on two opens: each is
+/// refused naming both the lost reply and the failed read, the marker kept, the record as it
+/// was. Then the store is healthy: the next open writes (the fence) and goes on. Cut: the read
+/// back's error dropped (`.ok()`, as before the review), red at "read back failed". Cut: the
+/// marker removed on a failed read back, red at "kept". Integration (~3 s): one node, six
+/// opens.
+#[config_log::retcd_test]
+fn own83_b2_6_an_unknown_registration_outcome_is_read_back() {
+    let fence = Fence::new("gw-1.a:8443");
+
+    fence.store.next(NodePut::AppliedLost);
+    let (_, r) = fence.record();
+    fence
+        .open("gw-1.b:9443")
+        .expect("applied: the open goes on");
+    let (held, applied) = fence.record();
+    assert_eq!(held.as_deref(), Some("gw-1.b:9443"));
+    assert!(applied > r);
+    assert!(!fence.marked(), "applied: resolved");
+
+    let rival = fence.bytes_with("gw-1.rival:1");
+    fence.store.next(NodePut::RivalLost(rival));
+    let refused = fence.open("gw-1.c:9443").expect_err("a rival wrote");
+    let (held, rivals) = fence.record();
+    assert!(
+        refused.to_string().contains("other bytes")
+            && refused.to_string().contains(&format!("revision {rivals}")),
+        "{refused}"
+    );
+    assert_eq!(held.as_deref(), Some("gw-1.rival:1"), "the rival's record");
+    assert!(!fence.marked(), "the record moved: resolved");
+
+    for attempt in 1..=2 {
+        fence.store.next(NodePut::LateUnread);
+        let refused = fence.open("gw-1.d:9443").expect_err("unknown");
+        let text = refused.to_string();
+        assert!(
+            text.contains("outcome is unknown")
+                && text.contains("read back failed")
+                && text.contains("scripted to fail"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: kept");
+        assert_eq!(
+            fence.record(),
+            (Some("gw-1.rival:1".to_owned()), rivals),
+            "{attempt}: as it was"
+        );
+    }
+    fence.open("gw-1.d:9443").expect("a healthy store");
+    let (held, recovered) = fence.record();
+    assert_eq!(held.as_deref(), Some("gw-1.d:9443"));
+    assert!(recovered > rivals);
+    assert!(!fence.marked());
+    // The two late writes were sent at the rival's revision, which has moved on.
+    assert_eq!(
+        fence.store.deliver(&fence.rig.rt),
+        [
+            config_core::MutationOutcome::Conflict,
+            config_core::MutationOutcome::Conflict
+        ]
+    );
+    assert_eq!(fence.record().0.as_deref(), Some("gw-1.d:9443"));
+}
+
+/// own83_b2_7 (#83 B2, PR #159 review, the revision race): the record changes after the open
+/// reads it and before its write. A rival address, and a rival write of exactly the bytes this
+/// open wants at a newer revision: each refuses the open, nothing started, the rival's bytes
+/// and revision kept, the marker removed. Cut: the put sent without `expected_mod_revision`,
+/// red at "the rival's record" (the open overwrites it). Cut: a conflict whose stored bytes
+/// equal this open's taken as success, red at the identical rival. Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_7_a_record_changed_mid_registration_refuses_the_open() {
+    let fence = Fence::new("gw-1.a:8443");
+    for (what, rival) in [
+        ("a rival address", fence.bytes_with("gw-1.rival:1")),
+        ("identical bytes", fence.bytes_with("gw-1.b:9443")),
+    ] {
+        fence.store.next(NodePut::Rival(rival.clone()));
+        let refused = fence.open("gw-1.b:9443").expect_err(what);
+        let text = refused.to_string();
+        assert!(
+            text.contains("changed after this open read it")
+                && text.contains("nothing was started"),
+            "{what}: {text}"
+        );
+        let (body, revision) = node_record(&fence.rig, NodeId(1));
+        assert_eq!(body, rival, "{what}: the rival's record");
+        let rival_at = fence.store.rivals.lock().expect("rivals").pop();
+        assert_eq!(Some(revision), rival_at, "{what}: the rival's revision");
+        assert!(!fence.marked(), "{what}: resolved");
     }
 }

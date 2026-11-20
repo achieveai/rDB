@@ -1,7 +1,9 @@
 //! The `nodes/{id}` record (#80 S1b, ADR-rdb-0023): where a declared data node listens and which
 //! machine it runs on.
 //!
-//! `admin::declare` writes one per declared node, create-only, and nothing updates it in place.
+//! `admin::declare` writes one per declared node, create-only. Its declared fields, the peer
+//! address and the machine, are never rewritten; since layout 2 the node itself may rewrite its
+//! own app address, and nothing else (#83 B2, below).
 //! A node process reads its own and every `--peers` entry's at start, and refuses to start when
 //! one disagrees with what it was given. The machine is an operator's label, checked at
 //! declaration for its form ([`machine_refusal`]) and for a clash (rdb-api's
@@ -119,15 +121,16 @@ impl std::fmt::Display for Host {
 
 /// The host of `addr`, a `host:port` a node is declared at, or why it is not one a peer can
 /// dial: no `:port`, a port that is not 1 to 65535 (0 is refused, since no peer can dial it and
-/// a record is never rewritten), an empty host, a bracketed host that is not an IPv6 address,
-/// an IPv6 address without brackets, or an unspecified, broadcast or multicast IP address
-/// (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, and their IPv4-mapped
-/// forms), which a peer on another machine cannot dial. The unspecified address is a
+/// a node's declared address is never rewritten), an empty host, a bracketed host that is not
+/// an IPv6 address, an IPv6 address without brackets, or an unspecified, broadcast or
+/// multicast IP address (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`, `ff00::/8`, and
+/// their IPv4-mapped forms), which a peer on another machine cannot dial. The unspecified address is a
 /// listener's wildcard, not a place to dial: `--listen 0.0.0.0` stays legal
 /// (`admin::node_start_refusal`), but a record holds an address peers dial.
 ///
 /// A host that is not an IP address must be a DNS host name, checked against a whitelist
-/// ([`name_refusal`]) rather than by listing bad hosts, since a record is never rewritten: only
+/// ([`name_refusal`]) rather than by listing bad hosts, since a declared address is never
+/// rewritten: only
 /// ASCII letters, digits, `-` and `.`; after one trailing dot is removed, 1 to 253 bytes of
 /// labels of 1 to 63 bytes each, none empty and none starting or ending with `-`; and the last
 /// label starts with a letter. That last rule refuses every numeric form a resolver may read
@@ -144,8 +147,8 @@ pub fn parse_addr(addr: &str) -> Result<Host, String> {
     match port.parse::<u16>() {
         Ok(0) => {
             return Err(format!(
-                "address {addr:?} has port 0, which no peer can dial; a node record is never \
-                 rewritten, so give the port it will listen on"
+                "address {addr:?} has port 0, which no peer can dial; a node's declared address \
+                 is never rewritten, so give the port it will listen on"
             ))
         }
         Ok(_) => {}
@@ -232,8 +235,8 @@ fn dialable(addr: &str, ip: IpAddr) -> Result<Host, String> {
     if undialable {
         return Err(format!(
             "address {addr:?} is an unspecified, broadcast or multicast address, which no peer \
-             can dial over TCP; a node record is never rewritten, so give the address the node \
-             listens on"
+             can dial over TCP; a node's declared address is never rewritten, so give the address \
+             the node listens on"
         ));
     }
     Ok(Host::Ip(ip))
@@ -401,6 +404,35 @@ mod tests {
         assert!(app_addr_refusal("").is_some());
         assert!(app_addr_refusal(&long).is_some());
         assert_eq!(app_addr_refusal(&long[1..]), None);
+    }
+
+    /// b2_2 (#83 B2, PR #159 review): the public cap is 512 **bytes**, pinned by literals so a
+    /// change of `MAX_APP_ADDR_LEN` alone goes red here: 1 and 512 bytes are taken, 0 and 513
+    /// refused. A multibyte UTF-8 address of 511 bytes, 256 characters, is taken; one more
+    /// two-byte character makes 513 bytes in 257 characters, refused: a check that counted
+    /// characters would take it. Cuts: `MAX_APP_ADDR_LEN` 513, red at "513 bytes"; the check
+    /// on `app.chars().count()`, red at "513 bytes in 257 characters". Unit.
+    #[test]
+    fn b2_2_the_app_address_cap_is_512_bytes() {
+        assert_eq!(MAX_APP_ADDR_LEN, 512);
+        assert_eq!(app_addr_refusal("a"), None, "1 byte");
+        assert_eq!(app_addr_refusal(&"a".repeat(512)), None, "512 bytes");
+        assert!(app_addr_refusal("").is_some(), "0 bytes");
+        assert!(app_addr_refusal(&"a".repeat(513)).is_some(), "513 bytes");
+
+        let under = format!("a{}", "\u{e9}".repeat(255));
+        assert_eq!((under.len(), under.chars().count()), (511, 256));
+        assert_eq!(
+            app_addr_refusal(&under),
+            None,
+            "511 bytes in 256 characters"
+        );
+        let over = format!("{under}\u{e9}");
+        assert_eq!((over.len(), over.chars().count()), (513, 257));
+        assert!(
+            app_addr_refusal(&over).is_some(),
+            "513 bytes in 257 characters"
+        );
     }
 
     /// #80 S1b row 4: layout 1's bytes are pinned as a literal, since every later build reads

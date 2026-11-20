@@ -277,6 +277,10 @@ pub struct DbConfig {
 }
 
 /// What [`DbConfig::addresses`] holds.
+///
+/// **Migration (#83 B2):** this struct gained [`Self::app`]. It is built by struct literal, so
+/// an existing `NodeAddresses { listen, peers }` no longer compiles: add `app: None`, which
+/// behaves exactly as before (nothing is written).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAddresses {
     /// The address the node's listener is bound to, `host:port`: its record's, or the same
@@ -287,10 +291,15 @@ pub struct NodeAddresses {
     /// left out.
     pub peers: BTreeMap<NodeId, String>,
     /// Where this node's app takes requests forwarded to it, opaque to rDB, 1 to
-    /// [`rdb_core::authority::node::MAX_APP_ADDR_LEN`] bytes (#83 B2). Each open writes it into
-    /// this node's `nodes/{id}` record (layout 2) before the node starts, so
-    /// [`Db::route`] names it for every partition the node owns. `None` keeps whatever the
-    /// record holds: an earlier boot's address, or none.
+    /// [`crate::MAX_APP_ADDR_LEN`] bytes (#83 B2). Each open given `Some` makes sure this
+    /// node's `nodes/{id}` record (layout 2) holds it before the node starts, so [`Db::route`]
+    /// names it for every partition the node owns. A record that already holds it is not
+    /// written, unless an earlier open's write of it may still be in flight: then the open
+    /// writes it again so the late one cannot apply (the folder's `app-addr-pending` file says
+    /// so). Only the app address is written; the declared address and machine never change.
+    ///
+    /// `None` keeps whatever the record holds: an earlier boot's address, or none. An address
+    /// cannot be cleared: `None` keeps it and an empty string is refused at open.
     pub app: Option<String>,
 }
 
@@ -677,10 +686,13 @@ struct Route {
     /// #83: what [`Db::route`] last read of each partition's record, and the stamp of the
     /// `partitions/` watches it was read under. Served while the stamp is current.
     answers: Mutex<BTreeMap<u32, (RouteInfo, RouteStamp)>>,
-    /// #83 B2: the app address each owner's `nodes/{id}` record held, and when it was read.
-    /// Served for [`APP_ADDR_REREAD_GAP`].
-    addrs: Mutex<BTreeMap<NodeId, (Option<String>, Instant)>>,
+    /// #83 B2: per owner node, the app address its `nodes/{id}` record held and when it was
+    /// read, served for [`APP_ADDR_REREAD_GAP`], behind that node's own refresh lock.
+    addrs: Mutex<BTreeMap<NodeId, Arc<Mutex<Option<AppAddrRead>>>>>,
 }
+
+/// One read of an owner's app address (#83 B2): what `nodes/{id}` held, and when it was read.
+type AppAddrRead = (Option<String>, Instant);
 
 /// How long [`Db::route`] serves an owner's app address before it reads `nodes/{id}` again
 /// (#83 B2). A node writes its address only at an open, so a restart that changes it is seen
@@ -846,24 +858,88 @@ async fn read_owner(
     Ok((record.owner, root.instance))
 }
 
-/// #83: `partition`'s owner and token as its `partitions/{p}` record names them.
+/// The file in a node process's folder that says an app-address write of this folder's node may
+/// still apply (#83 B2, PR #159 review): it holds the revision of `nodes/{id}` that write was
+/// sent at. Written durably before the write is sent, removed once the write's outcome is
+/// known. The only thing [`register_app_addr`] writes in the folder.
+pub(crate) const APP_ADDR_PENDING_FILE: &str = "app-addr-pending";
+
+/// The revision the folder's pending app-address write was sent at, if one may still apply.
+fn pending_app_addr(dir: &Path) -> Result<Option<u64>, OpenError> {
+    let file = dir.join(APP_ADDR_PENDING_FILE);
+    match std::fs::read_to_string(&file) {
+        Ok(text) => text.trim().parse::<u64>().map(Some).map_err(|error| {
+            OpenError::Config(format!(
+                "{} does not hold a revision ({error}); it says an earlier open's app-address \
+                 write may still apply. Nothing was started",
+                file.display()
+            ))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(OpenError::Io(error)),
+    }
+}
+
+/// Record durably that an app-address write sent at `revision` may still apply: the file is
+/// written beside, synced, renamed over, and its folder synced, all before the write is sent.
+fn mark_app_addr_pending(dir: &Path, revision: u64) -> Result<(), OpenError> {
+    use std::io::Write as _;
+    let staged = dir.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    {
+        let mut out = std::fs::File::create(&staged)?;
+        writeln!(out, "{revision}")?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&staged, dir.join(APP_ADDR_PENDING_FILE))?;
+    // The rename is a change of the folder: sync it too, or a crash can lose the marker after
+    // the write went out. Windows cannot open a folder as a file; there NTFS journals the
+    // rename itself.
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The pending app-address write's outcome is known: no write this folder sent can still apply.
+fn clear_app_addr_pending(dir: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(dir.join(APP_ADDR_PENDING_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpenError::Io(error)),
+    }
+}
+
 /// Write `app` into `node`'s `nodes/{id}` record, layout 2, at the revision it was read at
-/// (#83 B2): the declared fields as they are, only the app address new. A record that already
-/// holds `app` is not written, so a restart with the same address changes nothing. The only
-/// other writer is the declaration, create-only, so a record changed between the read and the
-/// write means another process claims this node. Logged `db_app_addr_registered{node, app,
-/// written}`.
+/// (#83 B2): the declared fields as they are, only the app address new. `dir` is the node
+/// process's folder.
+///
+/// A record that already holds `app` is not written, so a restart with the same address
+/// changes nothing, unless `dir` holds [`APP_ADDR_PENDING_FILE`]: an earlier open's write may
+/// then still apply at the revision it read, and replace this open's address after this open
+/// returned. So this open writes anyway, a fence: the revision moves on, and no write sent at
+/// an older one can apply (PR #159 review). The marker is written durably before every write
+/// and removed only once its outcome is known: applied, or the record moved on. A write whose
+/// outcome stays unknown, an open dropped mid-write, and a crash leave it, so the next open
+/// fences.
+///
+/// The only other writer is the declaration, create-only, so a record changed between the read
+/// and the write means another process claims this node, even when it wrote the same bytes:
+/// refused. Every refusal is before any host starts. Logged `db_app_addr_registered{node,
+/// app_len, written, fenced}`; the address itself is never logged, since an opaque address may
+/// carry a credential.
 async fn register_app_addr(
     store: &dyn ConfigStore,
+    dir: &Path,
     node: NodeId,
     app: &str,
 ) -> Result<(), OpenError> {
     let key = ControlKey::Node(node).encode();
-    let refused = |why: String| OpenError::Control(format!("{key}: {why}"));
-    let found = store
-        .get(config_core::GetRequest {
+    let refused = |why: String| OpenError::Control(format!("{key}: {why}; nothing was started"));
+    let read = || {
+        store.get(config_core::GetRequest {
             key: Bytes::from(key.clone()),
         })
+    };
+    let found = read()
         .await
         .map_err(|error| refused(format!("read before the app address is written: {error}")))?
         .record
@@ -871,44 +947,90 @@ async fn register_app_addr(
     let (record, held) = NodeRecord::decode_with_app(&found.value)
         .filter(|(record, _)| record.node == node)
         .ok_or_else(|| refused("not a node record this build reads".to_owned()))?;
-    if held.as_deref() == Some(app) {
+    let pending = pending_app_addr(dir)?;
+    let fenced = pending.is_some();
+    if held.as_deref() == Some(app) && !fenced {
         tracing::info!(
             node = node.0,
-            app,
+            app_len = app.len(),
             written = false,
+            fenced,
             "db_app_addr_registered"
         );
         return Ok(());
     }
+    let at = found.mod_revision;
+    mark_app_addr_pending(dir, at)?;
     let value = record.encode_with_app(app);
     let written = store
         .put(config_core::PutRequest {
             key: Bytes::from(key.clone()),
             value: value.clone(),
-            expected_mod_revision: Some(found.mod_revision),
+            expected_mod_revision: Some(at),
             dedup: None,
         })
         .await;
-    let applied = match written {
-        Ok(response) => response.outcome == config_core::MutationOutcome::Applied,
-        Err(config_core::ConfigError::DeadlineExceededUnknownOutcome) => store
-            .get(config_core::GetRequest {
-                key: Bytes::from(key.clone()),
-            })
-            .await
-            .ok()
-            .and_then(|read| read.record)
-            .is_some_and(|now| now.value == value),
-        Err(error) => return Err(refused(format!("the app address was not written: {error}"))),
-    };
-    if !applied {
-        return Err(refused(
-            "changed while this open wrote its app address: another process may claim this \
-             node; nothing was started"
-                .to_owned(),
-        ));
+    match written {
+        Ok(response) if response.outcome == config_core::MutationOutcome::Applied => {}
+        Ok(response) => {
+            // Refused at `at`: the record moved on, so no write sent at `at` can apply.
+            clear_app_addr_pending(dir)?;
+            return Err(refused(format!(
+                "changed after this open read it at revision {at} (the write answered {:?}): \
+                 another process may claim this node",
+                response.outcome
+            )));
+        }
+        Err(error) => {
+            // The write may still apply (`DeadlineExceededUnknownOutcome`), or another error
+            // says nothing certain: read back, and keep the marker unless the record moved.
+            let outcome = match read().await {
+                Err(read_error) => format!(
+                    "the write's outcome is unknown ({error}) and the read back failed \
+                     ({read_error}); the next open writes it again over any late one"
+                ),
+                Ok(now) => match now.record {
+                    Some(now) if now.mod_revision != at && now.value == value => {
+                        clear_app_addr_pending(dir)?;
+                        tracing::info!(
+                            node = node.0,
+                            app_len = app.len(),
+                            written = true,
+                            fenced,
+                            "db_app_addr_registered"
+                        );
+                        return Ok(());
+                    }
+                    Some(now) if now.mod_revision == at => format!(
+                        "the write's outcome is unknown ({error}) and it has not applied yet; \
+                         the next open writes it again over any late one"
+                    ),
+                    Some(now) => {
+                        clear_app_addr_pending(dir)?;
+                        format!(
+                            "the write's outcome was unknown ({error}), and the record now \
+                             holds other bytes at revision {}: another process may claim this \
+                             node",
+                            now.mod_revision
+                        )
+                    }
+                    None => {
+                        clear_app_addr_pending(dir)?;
+                        format!("the write's outcome was unknown ({error}), and the record is gone")
+                    }
+                },
+            };
+            return Err(refused(outcome));
+        }
     }
-    tracing::info!(node = node.0, app, written = true, "db_app_addr_registered");
+    clear_app_addr_pending(dir)?;
+    tracing::info!(
+        node = node.0,
+        app_len = app.len(),
+        written = true,
+        fenced,
+        "db_app_addr_registered"
+    );
     Ok(())
 }
 
@@ -1937,7 +2059,7 @@ impl Db {
         // #83 B2: after the engines' `LOCK`s, so of two opens of one folder only one writes,
         // and before any host starts, so no boot leads a partition before its address is in.
         if let (Some(app), [node]) = (app, config.local.as_slice()) {
-            register_app_addr(&*store, *node, app).await?;
+            register_app_addr(&*store, &config.dir, *node, app).await?;
         }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
@@ -2976,7 +3098,9 @@ impl Db {
     }
 
     /// The node this `Db` sends `partition`'s calls to, or `None` for a partition it does not
-    /// have.
+    /// have. Read from this `Db`'s own cache, not from rEtcd: during a move it can still name
+    /// the old owner after the control record names the new one, which [`Self::leader_of`]
+    /// reads.
     #[must_use]
     pub fn owner_of(&self, partition: PartitionId) -> Option<NodeId> {
         (1..=self.route.partitions())
@@ -4129,24 +4253,37 @@ impl Db {
     }
 
     /// Where `group`'s calls go (#83): its partition, the owner and token its `partitions/{p}`
-    /// record names, and the address that owner's `nodes/{id}` record names
-    /// ([`RouteInfo::owner_address`], slice B2). A hint for forwarding a request, never authority: the
-    /// owner can lose the partition the moment after, so act only through
+    /// record names, and the app address that owner's `nodes/{id}` record names
+    /// ([`RouteInfo::app_address`], slice B2). A hint for forwarding a request, never
+    /// authority: the owner can lose the partition the moment after, so act only through
     /// [`Self::still_owner`] on the owner and the destination's own token check.
     ///
-    /// Cached. A node this process runs watches `partitions/` for its own authority already, and
-    /// each change that watch delivers for a partition makes that partition's answer stale; the
-    /// end of any such watch makes every answer stale. Nothing new is watched. While no such
-    /// watch is open (an app-only `Db`, or every node here cut from rEtcd) nothing is cached and
-    /// each call reads the record. A stale answer is read again, within the read timeout.
-    /// Logged `db_route_read{partition, owner, generation, owner_epoch, owner_address, cached}`
-    /// on each read.
+    /// Two reads, each cached on its own:
+    ///
+    /// - The partition record. A node this process runs watches `partitions/` for its own
+    ///   authority already, and each change that watch delivers for a partition makes that
+    ///   partition's answer stale; the end of any such watch makes every answer stale. Nothing
+    ///   new is watched. While no such watch is open (an app-only `Db`, or every node here cut
+    ///   from rEtcd) nothing is cached and each call reads the record.
+    /// - The owner's app address, kept about one second per owner node and then read again,
+    ///   since nothing watches `nodes/`. A cached partition answer still needs this read once
+    ///   its second is up, and that read can be slow or fail. Concurrent callers for one owner
+    ///   share one read; other owners do not wait on it.
+    ///
+    /// Each read has its own read timeout ([`Timeouts::read`]), one after the other, so a call
+    /// that reads both can take up to two read timeouts; a caller that waited on another's
+    /// failed address read then reads itself, within one more. A failed read caches nothing.
+    /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
+    /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read;
+    /// the address itself is never logged, since it may carry a credential.
     ///
     /// # Errors
     ///
-    /// - `UNAVAILABLE` (retry `BoundedJitter`) when a record cannot be read in the read timeout,
-    ///   or the partition record is absent, and from a `Db` a crate test built by hand, which has
-    ///   no control store. A later call can succeed.
+    /// - `UNAVAILABLE` (retry `BoundedJitter`) when either record cannot be read within its read
+    ///   timeout, or the partition record is absent, and from a `Db` a crate test built by
+    ///   hand, which has no control store. This includes a cached owner whose address read
+    ///   fails: no answer is given without a current address. A later call can succeed. An
+    ///   absent `nodes/{id}` record is not an error: the address is `None`.
     /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
     ///   owner's node record does not decode: a newer build wrote it, so no retry succeeds until
     ///   this app runs a build that reads it. Logged `db_route_read_undecodable`.
@@ -4156,6 +4293,11 @@ impl Db {
 
     /// [`Self::route`] of a partition rather than a group (#83, SBX's `leader_of`): the owner,
     /// token and owner address that `partition`'s records name, cached the same way.
+    ///
+    /// Not [`Self::owner_of`]: this reads the control records, what rEtcd says the owner is now,
+    /// from any process. `owner_of` reads nothing; it names the node this `Db` sends the
+    /// partition's calls to, from its own cache, and during a move the two can differ until
+    /// this `Db` learns of the move.
     ///
     /// # Errors
     ///
@@ -4175,7 +4317,9 @@ impl Db {
 
     /// The partition `group` lives in (#83, SBX's `partition_of`): the key map over the
     /// partition count fixed when the database was formed (at most [`MAX_PARTITIONS`], 512).
-    /// Every group of one partition moves with it. Reads nothing.
+    /// Every group of one partition moves with it. Reads nothing. Valid while the database has
+    /// its original partitions: a partition that later splits can leave it naming the parent
+    /// of a group.
     #[must_use]
     pub fn partition_of(&self, group: AffinityId) -> PartitionId {
         self.partition_for(group)
@@ -4220,10 +4364,18 @@ impl Db {
     /// The app address `node`'s `nodes/{id}` record holds (#83 B2), kept for
     /// [`APP_ADDR_REREAD_GAP`]: a node writes it only at an open, so a restart that changes it
     /// is seen within the gap, and nothing watches `nodes/`.
+    ///
+    /// Refreshes of one node are coalesced (PR #159 review): each node has its own lock, held
+    /// across the read, so callers that find one node's answer expired wait for one read and
+    /// take its answer; callers for other nodes never wait on it. A failed read caches nothing,
+    /// so the next caller, a waiter included, reads again. Logged `db_route_app_addr_read{node,
+    /// app_len}`; the address itself is never logged, since it may carry a credential.
     fn app_address_of(&self, node: NodeId) -> Result<Option<String>, ApiError> {
-        if let Some((app, read_at)) = lock(&self.route.addrs).get(&node).cloned() {
+        let entry = Arc::clone(lock(&self.route.addrs).entry(node).or_default());
+        let mut entry = lock(&entry);
+        if let Some((app, read_at)) = entry.as_ref() {
             if read_at.elapsed() < APP_ADDR_REREAD_GAP {
-                return Ok(app);
+                return Ok(app.clone());
             }
         }
         let read_at = Instant::now();
@@ -4232,10 +4384,10 @@ impl Db {
         })?;
         tracing::info!(
             node = node.0,
-            app = app.as_deref().unwrap_or(""),
+            app_len = app.as_ref().map_or(0, String::len),
             "db_route_app_addr_read"
         );
-        lock(&self.route.addrs).insert(node, (app.clone(), read_at));
+        *entry = Some((app.clone(), read_at));
         Ok(app)
     }
 

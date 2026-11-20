@@ -726,6 +726,12 @@ impl Drop for RouteWatch {
 /// `partitions/{p}` names, and the app address that owner registered in its `nodes/{id}`
 /// record. A hint, never authority: act on a token only through [`crate::Db::still_owner`] on
 /// the owner, and the destination's own token check.
+///
+/// **Migration (#83 B2):** `RouteInfo` is no longer `Copy`, since it owns the address: a caller
+/// that used an answer after moving it needs `.clone()`. It can no longer be built by struct
+/// literal, or matched by an exhaustive pattern, outside this crate: match with `..`. Its
+/// equality now includes the address, so two answers with one owner and token but different
+/// addresses are not equal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteInfo {
     /// The group's partition.
