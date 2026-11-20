@@ -260,6 +260,183 @@ pub(crate) fn no_grant_grace(budgets: &Budgets) -> Duration {
     Duration::from_millis(budgets.grant_millis.saturating_mul(3))
 }
 
+/// #80 S3: the put timeout `rdb_dev probe-all --put-timeout-ms` runs with, which
+/// [`write_outage_bound`]'s retry term assumes. A probe on the 5 s default could hide a whole put
+/// timeout inside one in-flight put (critic S-8), so the probe runs on 1 s and the bound says so.
+pub const PROBE_PUT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// #80 S3: what one promote is expected to take once the planner starts it: the looks, the
+/// freeze, the expiry proof, the `Fencing` CAS and the new owner's first admit. An expected
+/// figure, not a code limit; the code's ceiling is [`OutageCeilings::promote_within`].
+pub const PROMOTE_BUDGET: Duration = Duration::from_secs(3);
+
+/// #80 S3: what the owner's re-plan without a dropped copy is expected to take, from the drop
+/// duty's decision to the commit that lets L1 admit again. Expected, not a code limit.
+pub const REPLAN_BUDGET: Duration = Duration::from_secs(2);
+
+/// #80 S3: the gap a probe waits after a failed put before it tries again, at most: its 200 ms
+/// cadence with 50 ms of scheduling slack. Added to the put timeout, it is the retry term.
+pub const RETRY_GAP: Duration = Duration::from_millis(250);
+
+/// The pass/fail bound on a partition's write outage after one host is lost, at the default
+/// timers (#80 ruling Q1).
+const ACCEPTANCE: Duration = Duration::from_secs(15);
+
+/// The figure stated for a silent copy (a pause, a hang, a network cut): about 17 s, measured and
+/// reported against, never pass/fail (owner ruling on B-1, option (a)). Above
+/// [`write_outage_bound`]'s 15.65 s term, which is the expected sum with no slack.
+const SILENT_STATED: Duration = Duration::from_secs(17);
+
+/// The loose hard ceiling on a silent copy's outage, so it cannot regress unseen (owner ruling on
+/// B-1, option (a)).
+const SILENT_CEILING: Duration = Duration::from_secs(25);
+
+/// A partition's relation to the host that was lost: which clock decides when it takes writes
+/// again (#80 S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OutageClass {
+    /// The lost host owned it: the planner fails it over once the owner's grant has run out.
+    Owner,
+    /// The lost host held a copy and its process ended, so its links closed (FIN): the owner's
+    /// unreachable clock drops the copy.
+    SecondaryKill,
+    /// The lost host held a copy and went silent with its links still open (a pause, a power
+    /// loss): L1 pauses writes first, so the owner's paused clock drops the copy (critic B-1).
+    SecondarySilent,
+}
+
+impl OutageClass {
+    /// Its word in logs and in `rdb_node`'s bound line.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::SecondaryKill => "secondary_kill",
+            Self::SecondarySilent => "secondary_silent",
+        }
+    }
+}
+
+/// The code limits two of [`write_outage_bound`]'s expected budgets stand in for (critic S-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutageCeilings {
+    /// How long the planner lets one promote run before giving it up: the heal window
+    /// (`Planner::promote_within`), 16.2 s at the spec defaults. [`PROMOTE_BUDGET`] is at most
+    /// this.
+    pub promote_within: Duration,
+    /// The probe's put timeout: a put in flight at the moment writes resume answers within
+    /// this. The retry term is at least this.
+    pub put: Duration,
+}
+
+/// The expected longest write outage of a partition after one host is lost, per class (#80 S3).
+/// From [`write_outage_bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutageBound {
+    /// [`OutageClass::Owner`].
+    pub owner: Duration,
+    /// [`OutageClass::SecondaryKill`].
+    pub secondary_kill: Duration,
+    /// [`OutageClass::SecondarySilent`].
+    pub secondary_silent: Duration,
+    /// The retry term each class ends with: the probe's put timeout and one [`RETRY_GAP`].
+    pub retry: Duration,
+    /// The code limits the expected budgets stand in for.
+    pub ceilings: OutageCeilings,
+}
+
+impl OutageBound {
+    /// The expected bound of one class.
+    #[must_use]
+    pub const fn of(&self, class: OutageClass) -> Duration {
+        match class {
+            OutageClass::Owner => self.owner,
+            OutageClass::SecondaryKill => self.secondary_kill,
+            OutageClass::SecondarySilent => self.secondary_silent,
+        }
+    }
+
+    /// The pass/fail bound and the classes it gates; any other class is measured and reported
+    /// only.
+    ///
+    /// **Where the owner's B-1 ruling lands**, with [`Self::silent`]. The ruling is option (a):
+    /// 15 s (ruling Q1) is pass/fail for a kill, the owner and kill-copy classes; the silent
+    /// class is measured and reported against [`Self::silent`]. No timer default changes.
+    #[must_use]
+    pub const fn acceptance(&self) -> (Duration, &'static [OutageClass]) {
+        (
+            ACCEPTANCE,
+            &[OutageClass::Owner, OutageClass::SecondaryKill],
+        )
+    }
+
+    /// The silent class's stated figure, about 17 s, which a measured time is reported against
+    /// and never failed on, and its loose hard ceiling, 25 s, which fails (owner ruling on B-1,
+    /// option (a)). Fixed figures, not sums: [`Self::secondary_silent`] is the expected sum.
+    #[must_use]
+    pub const fn silent(&self) -> (Duration, Duration) {
+        (SILENT_STATED, SILENT_CEILING)
+    }
+}
+
+/// The expected longest write outage per [`OutageClass`] after one host is lost, for nodes on
+/// `budgets`, `timeouts` and `failover`, measured by a probe whose puts time out after `put`
+/// (#80 S3; [`PROBE_PUT_TIMEOUT`] for `rdb_dev probe-all`). Pure. Every term is named so a slow
+/// run says which one it overran:
+///
+/// - **owner:** the dead owner's grant runs out (`grant_millis`) and is proven past on the
+///   planner's clock (2 epsilon and delta); the next sweep (`poll`) looks at the owner and waits
+///   out its read timeout (`Timeouts::read`); the promote ([`PROMOTE_BUDGET`]); then the retry.
+///   12.05 s at the defaults with a 1 s put.
+/// - **secondary_kill:** the owner's unreachable clock (`Timeouts::unreachable_drop_after`)
+///   and one drop check (`host::DROP_CHECK_EVERY_MILLIS`); the re-plan ([`REPLAN_BUDGET`]); then
+///   the retry. 13.45 s.
+/// - **secondary_silent:** L1 pauses once the copy's ack is `pause_age_millis` old; the next drop
+///   check starts the paused clock (`host::PEER_DROP_AFTER_MILLIS`), and the check after it
+///   fires; the re-plan; then the retry. 15.65 s (critic B-1).
+///
+/// The retry is `put` plus one [`RETRY_GAP`]: a put sent just before writes resume may run out
+/// its timeout, and the next is sent one gap later.
+#[must_use]
+pub fn write_outage_bound(
+    budgets: &Budgets,
+    timeouts: &crate::db::Timeouts,
+    failover: &Failover,
+    put: Duration,
+) -> OutageBound {
+    let ms = Duration::from_millis;
+    let drop_check = ms(crate::host::DROP_CHECK_EVERY_MILLIS);
+    let retry = put.saturating_add(RETRY_GAP);
+    let owner = ms(budgets.grant_millis)
+        .saturating_add(ms(budgets.clock_error_millis.saturating_mul(2)))
+        .saturating_add(ms(budgets.dispatch_margin_millis))
+        .saturating_add(failover.poll)
+        .saturating_add(timeouts.read)
+        .saturating_add(PROMOTE_BUDGET)
+        .saturating_add(retry);
+    let secondary_kill = timeouts
+        .unreachable_drop_after
+        .saturating_add(drop_check)
+        .saturating_add(REPLAN_BUDGET)
+        .saturating_add(retry);
+    let secondary_silent = ms(budgets.pause_age_millis)
+        .saturating_add(drop_check)
+        .saturating_add(ms(crate::host::PEER_DROP_AFTER_MILLIS))
+        .saturating_add(drop_check)
+        .saturating_add(REPLAN_BUDGET)
+        .saturating_add(retry);
+    OutageBound {
+        owner,
+        secondary_kill,
+        secondary_silent,
+        retry,
+        ceilings: OutageCeilings {
+            promote_within: crate::db::heal_within(budgets),
+            put,
+        },
+    }
+}
+
 /// What the planner judged a node owning partitions to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {

@@ -80,7 +80,13 @@
 //!   1000), that answers no look, and whose grant has run out; or of a node whose grant is
 //!   frozen. At most `--failover-max-concurrent` (default 16, least 1) promotes run at once.
 //!   Off by default. Either knob without `--failover` is refused, and so is `--failover` with
-//!   `--form` or `--gen-certs`: neither runs a planner.
+//!   `--form` or `--gen-certs`: neither runs a planner. With `--failover`, after `rdb_node open`
+//!   it prints the write-outage bound once (#80 S3, `planner::write_outage_bound`):
+//!   `rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 kill_ms=13450
+//!   silent_ms=15650 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200` at
+//!   the defaults. `bound_ms` is pass/fail for the classes in `gates` (a kill). A silent copy is
+//!   reported against `silent_stated_ms` and fails only above `silent_ceiling_ms`. The `_ms`
+//!   terms are expected outages, for a probe whose puts time out after 1 s.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -482,6 +488,51 @@ fn watch_clock_step(file: PathBuf, links: Arc<Links>) {
         }
         std::thread::sleep(Duration::from_millis(20));
     });
+}
+
+/// A node process's `DbConfig::timeouts`: `--unreachable-drop-after-ms` and `--live-readd` over
+/// the defaults.
+fn timeouts(args: &Args) -> Timeouts {
+    Timeouts {
+        unreachable_drop_after: args.unreachable_drop_after_ms.map_or(
+            Timeouts::default().unreachable_drop_after,
+            Duration::from_millis,
+        ),
+        live_readd: args.live_readd,
+        ..Timeouts::default()
+    }
+}
+
+/// #80 S3: with `--failover`, the line that states this node's write-outage bound, so a script
+/// reads it and never recomputes it: `rdb_node failover bound_ms=B gates=C,.. owner_ms=O
+/// kill_ms=K silent_ms=S promote_ceiling_ms=P`. `bound_ms` and `gates` are
+/// `OutageBound::acceptance`; the rest are `planner::write_outage_bound`'s terms on the spec
+/// budgets a node process opens on, this process's timeouts and planner, and the put timeout
+/// `rdb_dev probe-all` runs with. `None` without `--failover`.
+fn failover_bound_line(args: &Args) -> Option<String> {
+    let failover = failover(args)?;
+    let bound = rdb_api::write_outage_bound(
+        &rdb_core::contracts::event::Budgets::SPEC_DEFAULTS,
+        &timeouts(args),
+        &failover,
+        rdb_api::planner::PROBE_PUT_TIMEOUT,
+    );
+    let ms = |d: Duration| d.as_millis();
+    let (limit, gates) = bound.acceptance();
+    let (stated, ceiling) = bound.silent();
+    let gates: Vec<&str> = gates.iter().map(|class| class.word()).collect();
+    Some(format!(
+        "rdb_node failover bound_ms={} gates={} owner_ms={} kill_ms={} silent_ms={} \
+         silent_stated_ms={} silent_ceiling_ms={} promote_ceiling_ms={}",
+        ms(limit),
+        gates.join(","),
+        ms(bound.owner),
+        ms(bound.secondary_kill),
+        ms(bound.secondary_silent),
+        ms(stated),
+        ms(ceiling),
+        ms(bound.ceilings.promote_within),
+    ))
 }
 
 /// `DbConfig::failover` from `--failover` and its knobs; `None` without `--failover`.
@@ -1047,14 +1098,7 @@ fn serve_on_ready(
         ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
-        timeouts: Timeouts {
-            unreachable_drop_after: args.unreachable_drop_after_ms.map_or(
-                Timeouts::default().unreachable_drop_after,
-                Duration::from_millis,
-            ),
-            live_readd: args.live_readd,
-            ..Timeouts::default()
-        },
+        timeouts: timeouts(args),
         dedup_cap: None,
         dedup_retention: None,
         local: vec![node],
@@ -1073,6 +1117,10 @@ fn serve_on_ready(
         .block_on(Db::open(config, store, rt.handle().clone()))
         .map_err(|e| format!("open {} as node {}: {e}", dir.display(), node.0))?;
     println!("rdb_node open node={}", node.0);
+    if let Some(line) = failover_bound_line(args) {
+        tracing::info!(node = node.0, %line, "rdb_node_failover_bound");
+        println!("{line}");
+    }
     let within = Duration::from_secs(args.ready_secs.unwrap_or(60));
     let waited = std::time::Instant::now();
     // A missed deadline is a line, not a stop (tester-s2 `lr up` race, A-R271): only a time-out
@@ -1153,6 +1201,35 @@ mod tests {
 
     fn parsed(argv: &[&str]) -> Result<super::Args, String> {
         parse(argv.iter().map(|a| (*a).to_owned()))
+    }
+
+    /// #80 S3 T1: `--failover` states its write-outage bound in one line, the values of
+    /// `planner::write_outage_bound` at the spec budgets and the probe's 1 s put, so a script
+    /// reads the bound and never recomputes it. A node's own `--unreachable-drop-after-ms` moves
+    /// the kill-copy term and nothing else; without `--failover` there is no line. Unit.
+    /// Cut: `failover_bound_line` passes `Timeouts::default()` instead of the node's own; the
+    /// 5 s drop clock still prints `kill_ms=13450`, red, observed 2026-11-20.
+    #[test]
+    fn s80s3_failover_prints_its_outage_bound_and_without_it_nothing() {
+        let line = |argv: &[&str]| super::failover_bound_line(&parsed(argv).expect("parses"));
+        let node = ["--node", "1", "--failover"];
+        assert_eq!(
+            line(&node).as_deref(),
+            Some(
+                "rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 \
+                 kill_ms=13450 silent_ms=15650 \
+                 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200"
+            )
+        );
+        assert_eq!(
+            line(&[&node[..], &["--unreachable-drop-after-ms", "5000"]].concat()).as_deref(),
+            Some(
+                "rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 \
+                 kill_ms=8450 silent_ms=15650 \
+                 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200"
+            )
+        );
+        assert_eq!(line(&["--node", "1"]), None);
     }
 
     /// #80 S1a: `--declare` runs no planner either, so `--failover` with it is refused; plain

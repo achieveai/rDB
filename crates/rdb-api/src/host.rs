@@ -275,7 +275,7 @@ pub const WARM_RUNGS: u64 = 1_000;
 pub const MOVE_CATCH_UP_MILLIS: u64 = 90_000;
 
 /// How often the owner checks whether a copy has held writes up for [`PEER_DROP_AFTER_MILLIS`].
-const DROP_CHECK_EVERY_MILLIS: u64 = 200;
+pub(crate) const DROP_CHECK_EVERY_MILLIS: u64 = 200;
 
 /// `inventory_failed` reasons a normal join can give: a copy that missed the anchor's generation
 /// or holds a different head than it asks for (#101). They log at Info; any other reason means
