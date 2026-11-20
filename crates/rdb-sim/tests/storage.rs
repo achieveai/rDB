@@ -9,7 +9,7 @@
 //! | M7F-44 | a snapshot taken before a multi-write batch never sees any of it, and one taken after sees all of it, across two namespaces and a delete |
 //! | M7F-45 | every crash boundary lands on a batch boundary: both crash kinds, every key of a surviving batch readable and every key of a lost one gone |
 //! | M7F-46 | `sync_wal_through` answers `min(captured, applied, short_flush)` — a commit that arrived after the capture is never covered by it |
-//! | t61 A9a | the snapshot install twins (issue #61 S2): `install_begin` wipes every level and the tail release in one step; `install_finish` reads as a lineage trimmed at its barrier, moves no durable mark, and survives a host crash; an installing lineage refuses commit and inherit and is cleared at open; a host crash before a sync covers the begin brings the old copy back |
+//! | t61 A9a | the snapshot install twins (issue #61 S2): `install_begin` wipes every level in one step; `install_finish` reads as a lineage trimmed at its barrier, moves no durable mark, and survives a host crash; an installing lineage refuses commit and inherit and is cleared at open; a host crash before a sync covers the begin brings the old copy back |
 //!
 //! Log fields are sequences and counts; never a key or value byte.
 
@@ -803,9 +803,8 @@ fn m7f_46_sync_wal_through_answers_under_the_write_order() {
 
 const INSTALL_AT: u64 = 4;
 
-/// Generation 1 committed through 3, generation 2 inherited from it at 2 and committed at 3,
-/// and a tail release on generation 1 through 2.
-fn engine_with_two_levels_and_a_tail_release() -> MemoryEngine {
+/// Generation 1 committed through 3, and generation 2 inherited from it at 2 and committed at 3.
+fn engine_with_two_levels() -> MemoryEngine {
     let mut engine = MemoryEngine::new(NODE);
     for seq in 1..=3 {
         engine
@@ -818,9 +817,6 @@ fn engine_with_two_levels_and_a_tail_release() -> MemoryEngine {
     engine
         .commit(support::batch(2, 3, b"j", b"w"))
         .expect("commit");
-    engine
-        .put_tail_release(PARTITION, Generation(1), Seq(2))
-        .expect("tail release");
     engine
 }
 
@@ -853,14 +849,10 @@ fn chunk_entry(key: &'static [u8], value: &'static [u8], version: Version) -> In
 }
 
 #[retcd_test]
-fn t61_sim_install_begin_wipes_every_level_and_tail_release() {
+fn t61_sim_install_begin_wipes_every_level() {
     support::preamble();
-    let mut engine = engine_with_two_levels_and_a_tail_release();
-    // Control: both levels and the release are there to be wiped.
-    assert_eq!(
-        engine.tail_release(PARTITION),
-        Some((Generation(1), Seq(2)))
-    );
+    let mut engine = engine_with_two_levels();
+    // Control: both levels are there to be wiped.
     assert_eq!(
         engine.buffered_applied(PARTITION, Generation(2)),
         AppliedSeq(3)
@@ -875,10 +867,6 @@ fn t61_sim_install_begin_wipes_every_level_and_tail_release() {
         })
     );
     assert_eq!(
-        engine.tail_release(PARTITION),
-        Some((Generation(1), Seq(2)))
-    );
-    assert_eq!(
         engine.buffered_applied(PARTITION, Generation(1)),
         AppliedSeq(3)
     );
@@ -886,11 +874,6 @@ fn t61_sim_install_begin_wipes_every_level_and_tail_release() {
     engine
         .install_begin(PARTITION, Generation(3), Seq(INSTALL_AT))
         .expect("begin");
-    assert_eq!(
-        engine.tail_release(PARTITION),
-        None,
-        "the tail release is wiped"
-    );
     for level in [Generation(1), Generation(2)] {
         assert_eq!(engine.buffered_applied(PARTITION, level), AppliedSeq(0));
         assert_eq!(engine.parent(PARTITION, level), None);
@@ -908,7 +891,7 @@ fn t61_sim_install_begin_wipes_every_level_and_tail_release() {
 #[retcd_test]
 fn t61_sim_install_finish_reads_trimmed_moves_no_durable_and_survives_a_host_crash() {
     support::preamble();
-    let mut engine = engine_with_two_levels_and_a_tail_release();
+    let mut engine = engine_with_two_levels();
     let (g, at) = (Generation(3), Seq(INSTALL_AT));
     engine.install_begin(PARTITION, g, at).expect("begin");
 
@@ -1014,7 +997,7 @@ fn t61_sim_install_finish_reads_trimmed_moves_no_durable_and_survives_a_host_cra
 #[retcd_test]
 fn t61_sim_an_installing_lineage_refuses_commit_and_inherit_and_is_cleared_at_open() {
     support::preamble();
-    let mut engine = engine_with_two_levels_and_a_tail_release();
+    let mut engine = engine_with_two_levels();
     let (g, at) = (Generation(3), Seq(INSTALL_AT));
     engine.install_begin(PARTITION, g, at).expect("begin");
     engine
@@ -1050,7 +1033,6 @@ fn t61_sim_an_installing_lineage_refuses_commit_and_inherit_and_is_cleared_at_op
     assert_eq!(reopened.installing(PARTITION, g), None);
     assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
     assert_eq!(reopened.buffered_applied(PARTITION, g), AppliedSeq(0));
-    assert_eq!(reopened.tail_release(PARTITION), None);
     let mut reopened = reopened;
     assert_eq!(
         reopened.commit(support::batch(3, 1, b"k", b"x")),
@@ -1062,7 +1044,7 @@ fn t61_sim_an_installing_lineage_refuses_commit_and_inherit_and_is_cleared_at_op
 #[retcd_test]
 fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
     support::preamble();
-    let mut engine = engine_with_two_levels_and_a_tail_release();
+    let mut engine = engine_with_two_levels();
     let synced = engine
         .sync_wal_through(
             [Generation(1), Generation(2)]
@@ -1096,10 +1078,6 @@ fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
         Some(Generation(1))
     );
     assert_eq!(reopened.base(PARTITION, Generation(2)), Seq(2));
-    assert_eq!(
-        reopened.tail_release(PARTITION),
-        Some((Generation(1), Seq(2)))
-    );
     let view = reopened.snapshot(PARTITION, Generation(2), SnapshotHandle(1));
     assert_eq!(
         view.get(Namespace::User, b"k"),
@@ -1121,6 +1099,5 @@ fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
     for level in [Generation(1), Generation(2), g] {
         assert_eq!(reopened.buffered_applied(PARTITION, level), AppliedSeq(0));
     }
-    assert_eq!(reopened.tail_release(PARTITION), None);
     assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
 }

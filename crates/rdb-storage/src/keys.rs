@@ -19,11 +19,10 @@
 //!   on a parent, `sealed` (the child generation, u64 BE); on a child mid full copy, `copying`
 //!   (parent and base, 16 bytes); on a trimmed lineage, `trim_floor` ([`TrimFloor`], 48 bytes,
 //!   issue #61); on a lineage mid snapshot install, `installing` (generation and barrier seq,
-//!   16 bytes, issue #61); on a lineage whose held tail was released, `tail_release` (the seq
-//!   released through, u64 BE, issue #61). A lineage with no parent has no
-//!   `parent` record, never "parent 0": generation 0 is legal (ADR-rdb-0010 decision 11). The
-//!   engine-wide format marker is the key `format`, which is shorter than the 13-byte lineage
-//!   prefix and so can never be mistaken for a lineage key. The engine-wide instance marker
+//!   16 bytes, issue #61). A lineage with no parent has no `parent` record, never "parent 0":
+//!   generation 0 is legal (ADR-rdb-0010 decision 11). The engine-wide format marker is the key
+//!   `format`, which is shorter than the 13-byte lineage prefix and so can never be mistaken for
+//!   a lineage key. The engine-wide instance marker
 //!   (M10) is the key `instance`, 16 bytes, written once by `bind_instance`; absent means
 //!   unbound. It is short for the same reason, so a format-1 build from before M10 skips it,
 //!   and it needed no format bump. Each partition's publish marks (M10 S1-6, A-R183) are the
@@ -140,12 +139,6 @@ impl TrimFloor {
 /// [`crate::RocksEngine::install_begin`], deleted by `install_finish`, and cleared with the
 /// lineage at a read-write open. A build from before it refuses the name at open.
 pub(crate) const INSTALLING_KEY: &[u8] = b"installing";
-
-/// Engine-private record: the seq through which lineage `(p, g)`'s held tail was released by
-/// the host (issue #61, design rev 5c), u64 BE. Written synced by
-/// [`crate::RocksEngine::put_tail_release`]; [`crate::RocksEngine::install_begin`] deletes it
-/// with the rest of the lineage. A build from before it refuses the name at open.
-pub(crate) const TAIL_RELEASE_KEY: &[u8] = b"tail_release";
 
 /// The key range `[start, end)` holding every key lineage `(partition, generation)` has under
 /// ns byte `ns`. Both bounds are longer than every engine-wide key and share its first 12 bytes

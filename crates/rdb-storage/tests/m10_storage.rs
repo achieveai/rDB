@@ -1948,15 +1948,15 @@ fn t61_install_crash_mid_chunks_clears_at_open() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// `install_begin` is one batch (design rev 5b): the old levels, their engine records and the
-/// `tail_release` mark go in the same write that marks the lineage installing. Cut before the
-/// batch (fault point `install-begin`): every level, the release mark and the keys stay, through
-/// a reopen, and nothing is installing. Cut after it: only the `installing` record of the
-/// partition is on disk, and the open clears it. Another partition is untouched. Red if the
-/// wipe misses the private prefix (the release mark survives) or is a write of its own.
+/// `install_begin` is one batch (design rev 5b): the old levels and their engine records go in
+/// the same write that marks the lineage installing. Cut before the batch (fault point
+/// `install-begin`): every level and the keys stay, through a reopen, and nothing is
+/// installing. Cut after it: only the `installing` record of the partition is on disk, and the
+/// open clears it. Another partition is untouched. Red if the wipe misses the private prefix
+/// (an old level's engine records survive) or is a write of its own.
 #[cfg(debug_assertions)]
 #[retcd_test]
-fn t61_install_begin_is_one_batch_with_the_release_mark() {
+fn t61_install_begin_is_one_batch() {
     use rdb_storage::{InjectedFault, InstallError};
 
     let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
@@ -1964,9 +1964,6 @@ fn t61_install_begin_is_one_batch_with_the_release_mark() {
     let db = dir.join("db");
     let mut engine = RocksEngine::open(&db).expect("open");
     t61_two_levels(&mut engine);
-    engine
-        .put_tail_release(P61, g2, Seq(12))
-        .expect("release the tail");
     write_partition(&mut engine, PartitionId(2), 3);
     drop(engine);
     let before = dump(&db).expect("dump");
@@ -1980,7 +1977,6 @@ fn t61_install_begin_is_one_batch_with_the_release_mark() {
     );
     for round in ["cut before", "reopened"] {
         assert_eq!(engine.generations(P61), vec![g1, g2], "{round}");
-        assert_eq!(engine.tail_release(P61), Some((g2, Seq(12))), "{round}");
         assert_eq!(engine.installing(P61, g3), None, "{round}");
         assert_eq!(
             t61_seen(&engine, g2, 1..=15),
@@ -1998,13 +1994,12 @@ fn t61_install_begin_is_one_batch_with_the_release_mark() {
 
     engine.install_begin(P61, g3, Seq(15)).expect("begin");
     assert_eq!(engine.generations(P61), vec![g3], "cut after");
-    assert_eq!(engine.tail_release(P61), None, "cut after");
     assert_eq!(engine.installing(P61, g3), Some((g3, Seq(15))), "cut after");
     drop(engine);
     assert_eq!(
         t61_partition_records(&db, P61),
         vec!["metadata p=1 g=3 engine.installing=generation:3 at:15".to_owned()],
-        "cut after: no level, engine record or release mark of the old lineages survives"
+        "cut after: no level or engine record of the old lineages survives"
     );
     let engine = RocksEngine::open(&db).expect("the open clears the install");
     assert_eq!(engine.generations(P61), Vec::<Generation>::new());
@@ -2015,78 +2010,6 @@ fn t61_install_begin_is_one_batch_with_the_release_mark() {
     );
     drop(engine);
     assert_eq!(t61_partition_records(&db, P61), Vec::<String>::new());
-    std::fs::remove_dir_all(&dir).expect("remove the test directory");
-}
-
-/// The host's `tail_release` mark (design rev 5c) is a synced lineage record: it survives a
-/// reopen, `dump` names it, the newest lineage holding one answers, and a lineage the engine
-/// does not hold is refused. A finished install leaves none, through a reopen. Red if the mark
-/// is not restored at open, or the install keeps the old lineage's mark.
-#[retcd_test]
-fn t61_tail_release_survives_reopen_and_is_cleared_by_install_begin() {
-    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
-    let dir = data_dir("t61-tail-release");
-    let db = dir.join("db");
-    let mut engine = RocksEngine::open(&db).expect("open");
-    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
-    assert_eq!(engine.tail_release(P61), None);
-    assert_eq!(
-        engine.put_tail_release(P61, g2, Seq(4)),
-        Err(StorageFault::WriteFailed),
-        "no such lineage"
-    );
-    engine.put_tail_release(P61, g1, Seq(7)).expect("release");
-    drop(engine);
-    let mut engine = RocksEngine::open(&db).expect("reopen");
-    assert_eq!(
-        engine.tail_release(P61),
-        Some((g1, Seq(7))),
-        "restored at open"
-    );
-    assert!(
-        t61_partition_records(&db, P61)
-            .contains(&"metadata p=1 g=1 engine.tail_release=7".to_owned()),
-        "dump names it"
-    );
-    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
-    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 12);
-    engine
-        .put_tail_release(P61, g2, Seq(11))
-        .expect("release g2");
-    assert_eq!(
-        engine.tail_release(P61),
-        Some((g2, Seq(11))),
-        "the newest lineage answers"
-    );
-
-    let mut source = RocksEngine::open(dir.join("source")).expect("open source");
-    let h2 = t61_two_levels(&mut source);
-    let view = source.snapshot(P61, g2, SnapshotHandle(1)).expect("view");
-    let barrier = source
-        .history_at(P61, g2, Seq(15))
-        .expect("read")
-        .expect("15")
-        .0;
-    engine.install_begin(P61, g3, Seq(15)).expect("begin");
-    for page in t61_pages(&view, 1000) {
-        engine
-            .install_chunk(P61, g3, Seq(15), &page)
-            .expect("chunk");
-    }
-    engine
-        .install_finish(P61, g3, Seq(15), &barrier, (Seq::ZERO, Digest::ROOT))
-        .expect("finish");
-    assert_eq!(engine.tail_release(P61), None, "installed");
-    drop(engine);
-    let engine = RocksEngine::open(&db).expect("reopen");
-    assert_eq!(engine.tail_release(P61), None, "reopened");
-    assert_eq!(
-        verify_lineage(&engine, P61, g3)
-            .expect("verifies")
-            .head_digest,
-        h2.digest(15)
-    );
-    drop((view, source, engine));
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 

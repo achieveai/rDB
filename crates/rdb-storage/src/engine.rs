@@ -48,8 +48,8 @@ use crate::keys::{
     ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
     Link, PublishMark, TrimFloor, APPLIED_KEY, CF_HISTORY, CF_METADATA, COLUMN_FAMILIES,
     COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTALLING_KEY, INSTANCE_KEY,
-    INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TAIL_RELEASE_KEY,
-    TRIM_FLOOR_KEY, TRIM_FLOOR_LEN,
+    INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TRIM_FLOOR_KEY,
+    TRIM_FLOOR_LEN,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -348,9 +348,6 @@ pub(crate) struct Marks {
     /// Set on a lineage mid snapshot install: its `installing` record, `(generation, at)`
     /// (issue #61). A read-write open clears such a lineage.
     pub(crate) installing: Option<(Generation, Seq)>,
-    /// Set on a lineage whose held tail the host released: its `tail_release` record, the seq
-    /// released through (issue #61, design rev 5c).
-    pub(crate) tail_release: Option<Seq>,
 }
 
 /// One core set's data engine on RocksDB.
@@ -796,7 +793,6 @@ impl RocksEngine {
                 staging = ?marks.staging,
                 floor = marks.floor.map(|floor| floor.seq.0),
                 installing = ?marks.installing.map(|(_, at)| at.0),
-                tail_release = marks.tail_release.map(|through| through.0),
                 "lineage_restored"
             );
         }
@@ -1087,58 +1083,6 @@ impl RocksEngine {
         self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
         self.synced_seq = Some(self.db.latest_sequence_number());
         Ok(())
-    }
-
-    /// Record that lineage `(partition, generation)`'s held tail was released through `through`
-    /// (issue #61, design rev 5c), with a synced write, before this returns `Ok`: the host
-    /// answers the inventory only after. A lineage private record, so `install_begin` deletes it
-    /// with the lineage and a build from before it refuses the copy at open. Logs
-    /// `tail_release_written`. Fault point [`InjectedFault::SyncedPut`].
-    ///
-    /// # Errors
-    ///
-    /// [`StorageFault::WriteFailed`] when the engine holds no such lineage or RocksDB refuses
-    /// the write; the record held before stays.
-    pub fn put_tail_release(
-        &mut self,
-        partition: PartitionId,
-        generation: Generation,
-        through: Seq,
-    ) -> Result<(), StorageFault> {
-        let (p, g) = (partition.0, generation.0);
-        if !self.lineages.contains_key(&(partition, generation)) {
-            tracing::error!(
-                target: LOG_TARGET, partition = p, generation = g, through = through.0,
-                "tail_release_unknown_lineage"
-            );
-            return Err(StorageFault::WriteFailed);
-        }
-        let key = private_key(partition, generation, TAIL_RELEASE_KEY);
-        if let Err(e) = self.put_metadata_synced(&key, &through.0.to_be_bytes()) {
-            tracing::error!(
-                target: LOG_TARGET, partition = p, generation = g, through = through.0,
-                error = %e, "tail_release_write_failed"
-            );
-            return Err(StorageFault::WriteFailed);
-        }
-        if let Some(marks) = self.lineages.get_mut(&(partition, generation)) {
-            marks.tail_release = Some(through);
-        }
-        tracing::info!(
-            target: LOG_TARGET, partition = p, generation = g, through = through.0,
-            "tail_release_written"
-        );
-        Ok(())
-    }
-
-    /// The newest `tail_release` record over `partition`'s lineages: the generation that holds
-    /// it and the seq released through. `None` when no lineage of the partition holds one.
-    #[must_use]
-    pub fn tail_release(&self, partition: PartitionId) -> Option<(Generation, Seq)> {
-        self.lineages
-            .range((partition, Generation(0))..=(partition, Generation(u64::MAX)))
-            .rev()
-            .find_map(|(&(_, generation), marks)| marks.tail_release.map(|t| (generation, t)))
     }
 
     /// Replace `partition`'s publish marks with `marks`, with a synced write, before this
@@ -2881,11 +2825,6 @@ fn restore_lineages(
                     decode_copying(&value)
                         .ok_or_else(|| corrupt("installing record did not decode"))?,
                 );
-            }
-            TAIL_RELEASE_KEY => {
-                sized("tail_release", 8)?;
-                marks.tail_release = Some(Seq(decode_mark(&value)
-                    .ok_or_else(|| corrupt("tail_release record did not decode"))?));
             }
             COPYING_KEY => {
                 sized("copying", 16)?;
