@@ -7,9 +7,132 @@ use crate::feed::{FeedRecord, FEED_PAGE_RECORDS};
 use crate::net::faults::{CutStore, Faults};
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::envelope::ReplicationEnvelope;
+use rdb_core::contracts::storage::Namespace;
+
+use super::error::FEED_HISTORY_STEP;
 
 fn store() -> Arc<dyn ConfigStore> {
     Arc::new(config_testkit::MemStore::new())
+}
+
+/// Review r1: a store whose reads of `partitions/1` wait while it is closed, so a secondary's
+/// feed control read can be held as long as a row needs. It counts the reads it held. Every
+/// other call goes straight through.
+struct GatedStore {
+    inner: Arc<dyn ConfigStore>,
+    key: Bytes,
+    closed: AtomicBool,
+    held: AtomicU64,
+}
+
+impl GatedStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: store(),
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            closed: AtomicBool::new(false),
+            held: AtomicU64::new(0),
+        })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn open(&self) {
+        self.closed.store(false, Ordering::SeqCst);
+    }
+
+    /// Reads of `partitions/1` that met the gate closed.
+    fn held(&self) -> u64 {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for GatedStore {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        if request.key == self.key && self.closed.load(Ordering::SeqCst) {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            while self.closed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.put(request).await
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+}
+
+/// `n` feed calls to `node` from `START`, each on its own thread, started together.
+fn calls_together(
+    db: &Arc<Db>,
+    node: NodeId,
+    n: usize,
+) -> Vec<std::thread::JoinHandle<(Result<FeedPage, ApiError>, Duration)>> {
+    (0..n)
+        .map(|_| {
+            let db = Arc::clone(db);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let answer = db.changes(PARTITION, FeedCursor::START, 10, Source::Node(node));
+                (answer, started.elapsed())
+            })
+        })
+        .collect()
+}
+
+/// Wait until `store` has held `n` reads.
+fn until_held(store: &GatedStore, n: u64) {
+    let deadline = Instant::now() + patience();
+    while store.held() < n {
+        assert!(
+            Instant::now() < deadline,
+            "{} reads held, not {n}",
+            store.held()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn opened(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>) -> Db {
@@ -1089,4 +1212,79 @@ fn f87_2_replay_from_start_rebuilds_user_state() {
     }
     assert_eq!(state, owner, "the replayed state is the owner's");
     assert_eq!(state.get(b"a".as_slice()), Some(&b"v4".to_vec()));
+}
+
+/// Review r1: stored damage a feed read meets faults the node, as before, and every caller it
+/// answers hears `CORRUPT_HISTORY` with the feed's step, never a generic host fault or a call
+/// dropped unanswered. The owner's record with a broken frame (the read itself fails
+/// `Corrupt`): typed. Then node 2's record cut one byte short (the envelope does not decode),
+/// with two callers parked on one held control read: when the read lands, the first answer
+/// faults the node, and the second caller hears the same typed fault.
+/// Cuts: `feed_damage` returning `Fault::from` (untyped), red (caller 0: the generic host
+/// fault, `UNAVAILABLE`); `answer_feed_waiters` dropping the rest at the fault (the old `?`),
+/// red (caller 1: "node 2 dropped the feed call unanswered"); no `feed_reads` drain in
+/// `Host::set_fault`, red (caller 1: the same).
+/// Integration (~3 s): a fresh open.
+#[config_log::retcd_test]
+fn f87_2_damaged_history_answers_every_feed_caller_corrupt_history() {
+    let rt = runtime();
+    let gated = GatedStore::new();
+    let store: Arc<dyn ConfigStore> = Arc::clone(&gated) as Arc<dyn ConfigStore>;
+    let dir = config_testkit::fs::temp_dir();
+    let db = Arc::new(opened(&rt, dir.path(), &store));
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    let typed = |who: &str, error: &ApiError| {
+        assert_eq!(error.kind, ErrorKind::CorruptHistory, "{who}: {error:?}");
+        assert!(
+            error.detail.ends_with(FEED_HISTORY_STEP),
+            "{who}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string().matches("next:").count(),
+            1,
+            "{who}: {error}"
+        );
+    };
+    let key = k1.seq.0.to_be_bytes();
+    db.damage_record_as(
+        NodeId(2),
+        k1.generation,
+        Namespace::History,
+        &key,
+        rdb_storage::RecordDamage::Truncate,
+    )
+    .expect("node 2's record cut short");
+    gated.close();
+    let callers = calls_together(&db, NodeId(2), 2);
+    until_held(&gated, 1);
+    // Both calls reach node 2 within microseconds of their threads starting; the held read
+    // keeps them parked (`feed_waits_for_control_read`, debug) for as long as this lasts.
+    std::thread::sleep(Duration::from_millis(200));
+    gated.open();
+    for (index, caller) in callers.into_iter().enumerate() {
+        let (answer, _) = caller.join().expect("the caller");
+        typed(
+            &format!("node 2, caller {index}"),
+            &answer.expect_err("damaged"),
+        );
+    }
+    assert_eq!(gated.held(), 1, "one shared read");
+    db.damage_record_as(
+        NodeId(1),
+        k1.generation,
+        Namespace::History,
+        &key,
+        rdb_storage::RecordDamage::Frame,
+    )
+    .expect("node 1's frame broken");
+    let error = db
+        .changes(PARTITION, FeedCursor::START, 10, Source::Owner)
+        .expect_err("damaged");
+    typed("node 1", &error);
 }

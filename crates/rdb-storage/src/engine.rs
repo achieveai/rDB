@@ -231,6 +231,20 @@ pub enum OpenError {
     },
 }
 
+/// **Dev tool only**: how [`RocksEngine::damage_record_as`] (debug builds only) damages one
+/// stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDamage {
+    /// Flip every bit of the value's last byte; the frame and version stay
+    /// ([`RocksEngine::damage_record`]).
+    LastByte,
+    /// Drop the value's last byte; the frame and version stay, so a `History` record's
+    /// envelope no longer decodes (its body is one byte short).
+    Truncate,
+    /// Set the frame's kind byte to one no build writes, so the read itself fails `Corrupt`.
+    Frame,
+}
+
 /// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DamageRefused {
@@ -1235,6 +1249,24 @@ impl RocksEngine {
         ns: Namespace,
         key: &[u8],
     ) -> Result<(), DamageRefused> {
+        self.damage_record_as(partition, generation, ns, key, RecordDamage::LastByte)
+    }
+
+    /// **Dev tool only**: [`Self::damage_record`] with the damage `how` names. Same guards, same
+    /// synced write, same log line (with `how`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`].
+    #[cfg(debug_assertions)]
+    pub fn damage_record_as(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+        how: RecordDamage,
+    ) -> Result<(), DamageRefused> {
         let raw = encode_key(partition, generation, ns, key);
         let cf = self.cf(keys::cf_for(ns));
         let found = self
@@ -1249,7 +1281,13 @@ impl RocksEngine {
             return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
         }
         let last = value.len() - 1;
-        value[last] ^= 0xFF;
+        match how {
+            RecordDamage::LastByte => value[last] ^= 0xFF,
+            RecordDamage::Truncate => {
+                value.pop();
+            }
+            RecordDamage::Frame => value[0] = 0xEE,
+        }
         // A synced write, debug builds only: named like every other, so one made while a sync
         // runs is loud (critic-f4 A5).
         self.note_synced_write("damage");
@@ -1270,6 +1308,7 @@ impl RocksEngine {
             ns = ?ns,
             key_hex = %hex(&raw),
             offset = last,
+            how = ?how,
             "record_damaged"
         );
         Ok(())

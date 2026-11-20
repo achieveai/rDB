@@ -695,6 +695,8 @@ pub enum Msg {
         ns: Namespace,
         /// The key in `ns`, as stored: a `History` record's is its seq, u64 big-endian.
         key: Vec<u8>,
+        /// How ([`RocksEngine::damage_record_as`]).
+        how: rdb_storage::RecordDamage,
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
     },
@@ -3936,9 +3938,12 @@ impl Host {
                 generation,
                 ns,
                 key,
+                how,
                 reply,
             } => {
-                let answer = self.engine.damage_record(partition, generation, ns, &key);
+                let answer = self
+                    .engine
+                    .damage_record_as(partition, generation, ns, &key, how);
                 tracing::warn!(
                     node = self.node.0,
                     partition = partition.0,
@@ -4053,6 +4058,22 @@ impl Host {
                     "queued_failed_by_fault"
                 );
                 let _ = client.reply.send(Answer::Error {
+                    error: fault.error(),
+                    request: None,
+                });
+            }
+        }
+        // #87 review r1: feed calls parked on a control read, answered now rather than at their
+        // `until`, which a faulted node never reaches.
+        for (partition, entry) in &mut self.feed_reads {
+            for waiter in std::mem::take(&mut entry.waiting) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    client = waiter.identity.client.0,
+                    "feed_waiter_failed_by_fault"
+                );
+                let _ = waiter.reply.send(Answer::Error {
                     error: fault.error(),
                     request: None,
                 });
@@ -15042,24 +15063,29 @@ impl Host {
             return no_copy("it serves none".to_owned());
         };
         let engine = &self.engine;
+        // Stored damage faults the node as any history read that finds it does, typed
+        // `CORRUPT_HISTORY` with the feed's step, so every caller answered with the fault knows
+        // to read another copy (review r1). Any other storage fault stays a generic host fault.
         let read = |seq: Seq| -> Result<Option<(ReplicationEnvelope, usize)>, Fault> {
             let Some((_, _, record)) = engine
                 .get(partition, newest, Namespace::History, &seq.0.to_be_bytes())
-                .map_err(|fault| format!("feed: history read at seq {}: {fault:?}", seq.0))?
+                .map_err(|fault| {
+                    feed_storage_fault(format!("feed: history read at seq {}", seq.0), fault)
+                })?
             else {
                 return Ok(None);
             };
             let envelope = ReplicationEnvelope::decode(&record).map_err(|error| {
-                format!(
+                feed_damage(format!(
                     "feed: the record at seq {} does not decode: {error:?}",
                     seq.0
-                )
+                ))
             })?;
             Ok(Some((envelope, record.len())))
         };
         let floor = engine
             .history_floor(partition, newest)
-            .map_err(|fault| format!("feed: history floor: {fault:?}"))?;
+            .map_err(|fault| feed_storage_fault("feed: history floor".to_owned(), fault))?;
         let resumed = feed::resume(from, &chain, cap, floor, |seq| {
             Ok::<_, Fault>(
                 read(seq)?
@@ -15113,7 +15139,7 @@ impl Host {
         // key that does not parse is refused to the caller.
         let page = feed::page(after, cap, max, |seq| {
             let Some((envelope, bytes)) = read(seq).map_err(Err)? else {
-                return Err(Err(Fault::from(format!(
+                return Err(Err(feed_damage(format!(
                     "feed: no record at seq {} below the cap {} of generation {}",
                     seq.0, cap.0, newest.0
                 ))));
@@ -15197,7 +15223,9 @@ impl Host {
         Ok(())
     }
 
-    /// Answer every feed call waiting on `partition`'s control read, without waiting again.
+    /// Answer every feed call waiting on `partition`'s control read, without waiting again. A
+    /// fault answering one puts the rest back in [`FeedFreshness::waiting`], where the caller's
+    /// [`Self::set_fault`] answers them with that fault (review r1): none is dropped unanswered.
     fn answer_feed_waiters(
         &mut self,
         partition: PartitionId,
@@ -15210,8 +15238,16 @@ impl Host {
             .into_iter()
             .partition(&due);
         entry.waiting = keep;
-        for waiter in answer {
-            self.answer_feed(partition, waiter, false)?;
+        let mut answer = answer.into_iter();
+        while let Some(waiter) = answer.next() {
+            if let Err(fault) = self.answer_feed(partition, waiter, false) {
+                self.feed_reads
+                    .entry(partition)
+                    .or_default()
+                    .waiting
+                    .extend(answer);
+                return Err(fault);
+            }
         }
         Ok(())
     }
@@ -16300,10 +16336,6 @@ fn unsupported(node: NodeId, kind: &str) -> Fault {
     format!("host_unsupported: {kind}").into()
 }
 
-/// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
-/// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
-/// `fault`, for the node. `owner_views` is revoked first, as `set_fault` does, so a waiter that
-/// reads the fault and then asks `still_owner` reads false (#84 review).
 /// #87: the feed refusal of a copy that holds no current copy of `partition`: left out of the
 /// generation `partitions/{p}` names, or never a member. `UNAVAILABLE`, as ADR-rdb-0020 names a
 /// copy that cannot serve, with rule `Definitive`: this copy answers the same until it is a
@@ -16327,6 +16359,30 @@ fn feed_no_copy(node: NodeId, partition: PartitionId, why: &str) -> ApiError {
     error
 }
 
+/// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`, its
+/// detail ending with the feed's step ([`FEED_HISTORY_STEP`]), so a caller answered with
+/// [`Fault::error`] reads another copy or rebuilds.
+fn feed_damage(detail: String) -> Fault {
+    Fault {
+        damage: Some(ErrorKind::CorruptHistory),
+        detail: format!("{detail}; next: {FEED_HISTORY_STEP}"),
+    }
+}
+
+/// #87 review r1: a storage fault a feed read met. `Corrupt` is stored damage
+/// ([`feed_damage`]); any other is a generic host fault, as before.
+fn feed_storage_fault(what: String, fault: StorageFault) -> Fault {
+    if fault == StorageFault::Corrupt {
+        feed_damage(format!("{what}: {fault:?}"))
+    } else {
+        Fault::from(format!("{what}: {fault:?}"))
+    }
+}
+
+/// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
+/// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
+/// `fault`, for the node. `owner_views` is revoked first, as `set_fault` does, so a waiter that
+/// reads the fault and then asks `still_owner` reads false (#84 review).
 fn fail_waiter(owner_views: &OwnerViews, reply: &Sender<Answer>, fault: impl Into<Fault>) -> Fault {
     owner_views.revoke();
     let fault = fault.into();

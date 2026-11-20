@@ -3285,7 +3285,10 @@ impl Db {
     /// An owner whose grant no longer admits, such as one a promote left out, answers as a write
     /// would: `LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner.
     /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the
-    /// same lineage. `INVALID_ARGUMENT` for `max` 0 or a partition this database does not have.
+    /// same lineage (or the cursor is from another partition's history), and when the copy's
+    /// own history is damaged: then the node faults, and every caller waiting on it hears the
+    /// same error. Both say to read another copy or rebuild. `INVALID_ARGUMENT` for `max` 0 or
+    /// a partition this database does not have.
     pub fn changes(
         &self,
         partition: PartitionId,
@@ -4295,6 +4298,30 @@ impl Db {
         ns: rdb_core::contracts::storage::Namespace,
         key: &[u8],
     ) -> Result<(), String> {
+        self.damage_record_as(
+            node,
+            generation,
+            ns,
+            key,
+            rdb_storage::RecordDamage::LastByte,
+        )
+    }
+
+    /// **Dev tool only**, debug builds: [`Self::damage_record`] with the damage `how` names
+    /// ([`rdb_storage::RocksEngine::damage_record_as`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`].
+    #[cfg(debug_assertions)]
+    pub fn damage_record_as(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+        how: rdb_storage::RecordDamage,
+    ) -> Result<(), String> {
         if let Some(error) = self.refuse_groupless("damage_record", "it runs on partition 1 only") {
             return Err(error.detail);
         }
@@ -4304,6 +4331,7 @@ impl Db {
             generation,
             ns,
             key: key.to_vec(),
+            how,
             reply,
         };
         let sent = lock(&self.nodes)

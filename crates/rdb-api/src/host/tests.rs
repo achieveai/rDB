@@ -7464,3 +7464,38 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
     }
     assert!(host.fault.is_none(), "{:?}", host.fault);
 }
+
+/// #87 review r1: a feed read's storage fault is typed only when it is stored damage.
+/// `Corrupt` is `CORRUPT_HISTORY` ending with the feed's step; any other storage fault stays the
+/// generic host fault ([`ApiError::host`]: `UNAVAILABLE`, `NotWired`). The real damage paths
+/// (a broken frame, an envelope that does not decode) are
+/// `f87_2_damaged_history_answers_every_feed_caller_corrupt_history`.
+/// Cut: `feed_storage_fault` typing every fault, red (`WriteFailed` typed).
+/// Unit (~1 ms).
+#[test]
+fn f87_2_a_feed_storage_fault_is_typed_only_when_it_is_damage() {
+    let damage = feed_storage_fault("feed: history floor".to_owned(), StorageFault::Corrupt);
+    let error = damage.error();
+    assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_HISTORY_STEP),
+        "{error:?}"
+    );
+    for fault in [
+        StorageFault::WriteFailed,
+        StorageFault::FlushFailed,
+        StorageFault::ProcessCrash,
+        StorageFault::HostCrash,
+    ] {
+        let error = feed_storage_fault("feed: history floor".to_owned(), fault).error();
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Unavailable, RetryRule::NotWired),
+            "{fault:?}: {error:?}"
+        );
+        assert!(
+            !error.detail.contains(crate::db::error::FEED_HISTORY_STEP),
+            "{fault:?}: {error:?}"
+        );
+    }
+}
