@@ -141,7 +141,9 @@ pub enum Resume {
 
 /// Check `cursor` against a copy's `chain` (design-87 §2). `cap` is the highest seq the copy
 /// may serve, `floor` the lowest it holds, and `lookup(seq)` the stamp and digest of the record
-/// at `seq` read through the chain from its newest level.
+/// at `seq` read through the chain from its newest level. A cursor whose exact stamp and digest
+/// this copy serves at its seq is kept, whichever level holds it; only then do the chain's
+/// exits judge it.
 ///
 /// # Errors
 ///
@@ -172,20 +174,28 @@ pub fn resume<E>(
     let newest = chain
         .first()
         .map_or(Generation(0), |level| level.generation);
-    let Some(at) = chain
+    let at = chain
         .iter()
-        .position(|level| level.generation == cursor.generation)
-    else {
-        // A newer stamp: this copy is stale, and its chain cannot judge the cursor (M1).
-        if cursor.generation > newest {
-            return Ok(Resume::Answer(FeedPage::Behind { head: cap }));
-        }
-        // A tail adopted under #105 keeps its stamp on a level of another generation. Equal
-        // digest at equal seq is equal prefix wherever the record sits.
-        if cursor.seq <= cap && lookup(cursor.seq)? == Some((cursor.generation, cursor.digest)) {
-            return Ok(Resume::Serve(cursor));
-        }
-        // A fork this copy cannot locate: rewinding further than needed costs only replay (M2).
+        .position(|level| level.generation == cursor.generation);
+    // A newer stamp: this copy is stale, and its chain cannot judge the cursor (M1).
+    if at.is_none() && cursor.generation > newest {
+        return Ok(Resume::Answer(FeedPage::Behind { head: cap }));
+    }
+    // The record at the cursor's seq as this copy serves it, read once.
+    let held = if cursor.seq <= cap {
+        Some(lookup(cursor.seq)?)
+    } else {
+        None
+    };
+    // Equal stamp and digest at equal seq is equal prefix wherever the record sits: a tail
+    // adopted under #105 keeps its stamp on a level of another generation, and a copy that
+    // linked below a kept record catches it up with its old stamp onto its newest level, above
+    // that stamp's exit (PR #170 review r1). Only a record this copy may serve counts.
+    if held == Some(Some((cursor.generation, cursor.digest))) {
+        return Ok(Resume::Serve(cursor));
+    }
+    // A fork this copy cannot locate: rewinding further than needed costs only replay (M2).
+    let Some(at) = at else {
         return Ok(start());
     };
     // The effective exit: the lowest cutoff on the path from the stamp's level up to the
@@ -211,10 +221,10 @@ pub fn resume<E>(
             None => FeedPage::Trimmed { floor },
         }));
     }
-    if cursor.seq > cap {
+    let Some(held) = held else {
         return Ok(Resume::Answer(FeedPage::Behind { head: cap }));
-    }
-    Ok(match lookup(cursor.seq)? {
+    };
+    Ok(match held {
         None => Resume::Answer(FeedPage::Trimmed { floor }),
         Some((_, held)) if held != cursor.digest => Resume::Diverged {
             seq: cursor.seq,

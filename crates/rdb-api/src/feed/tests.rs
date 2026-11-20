@@ -153,6 +153,75 @@ fn f87_1_resume_cursor_into_an_adopted_tail_matches_by_digest() {
     );
 }
 
+/// Review r1 (PR #170): a copy linked generation 2 at seq 1, then caught up the kept seq 2 with
+/// its old stamp 1 onto its generation-2 level. A consumer reading one record per call (`max`
+/// 1) from `START` keeps the cursor `(1, 2)`, which passes generation 1's exit (1). Its exact
+/// stamp and digest are visible at seq 2 within the cap, so the cursor is kept and the walk
+/// reaches the cap with every record once. A consumer reopened with the saved cursor is served
+/// too. Guards kept: the same seq holding another record (a real cut) is `Rewound`, and a cursor
+/// past the cap is never served.
+/// Cut: drop the visible-match check ahead of the exit (as at 3dc6d66), red: 9 `Rewound` to
+/// `(1, 1)` in 20 calls, the walk never past seq 2.
+#[test]
+fn f87_1_resume_a_kept_record_caught_up_above_the_link_base_is_served_with_max_1() {
+    let chain = [level(2, None), level(1, Some(1))];
+    let copy = held().with(1, 1, 2).with(2, 3, 4);
+    let read = |seq: Seq| {
+        let stamp = copy.0[&seq.0];
+        let at = at(stamp, seq.0);
+        Ok::<_, Infallible>(Scanned {
+            at,
+            bytes: 10,
+            record: Some(FeedRecord {
+                at,
+                ..record(seq.0)
+            }),
+        })
+    };
+    let (mut cursor, mut got, mut rewinds) = (FeedCursor::START, Vec::new(), 0);
+    for _ in 0..20 {
+        if cursor.seq.0 == 4 {
+            break;
+        }
+        match check(cursor, &chain, 4, 1, &copy) {
+            Resume::Serve(after) => {
+                let Ok(FeedPage::Records { records, next, .. }) = page(after, Seq(4), 1, read)
+                else {
+                    panic!("a page of records");
+                };
+                got.extend(records.iter().map(|record| record.at));
+                cursor = next;
+            }
+            Resume::Answer(FeedPage::Rewound { to }) => {
+                rewinds += 1;
+                cursor = to;
+            }
+            other => panic!("at {cursor:?}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        (got, cursor, rewinds),
+        (vec![at(1, 1), at(1, 2), at(2, 3), at(2, 4)], at(2, 4), 0),
+        "max-1 walk over the caught-up record"
+    );
+    assert_eq!(
+        check(at(1, 2), &chain, 4, 1, &copy),
+        Resume::Serve(at(1, 2)),
+        "reopened with the saved cursor"
+    );
+    let cut = held().with(1, 1, 1).with(2, 2, 4);
+    assert_eq!(
+        check(at(1, 2), &chain, 4, 1, &cut),
+        Resume::Answer(FeedPage::Rewound { to: at(1, 1) }),
+        "seq 2 holds another record: a real cut"
+    );
+    assert_eq!(
+        check(at(1, 2), &chain, 1, 1, &copy),
+        Resume::Answer(FeedPage::Rewound { to: at(1, 1) }),
+        "never served past the cap"
+    );
+}
+
 /// The plain branches: `START` serves from 1 (or is `Trimmed` above floor 1), a cursor past the
 /// cap is `Behind`, a held record with another digest is divergence, a missing one `Trimmed`,
 /// and a match serves. Cut: skip the digest comparison, red (served).
