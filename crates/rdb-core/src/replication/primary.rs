@@ -252,6 +252,17 @@ impl Primary {
         self.tracker.restore_history(rungs)
     }
 
+    /// Trim the tracker's ladder to the host's History floor (issue #61): see
+    /// [`ProgressTracker::trim_history`]. A cursor reads the ladder as an argument, so it sees
+    /// the floor on its next outcome.
+    ///
+    /// # Errors
+    ///
+    /// What [`ProgressTracker::trim_history`] refuses.
+    pub fn trim_history(&mut self, seq: Seq, digest: Digest) -> Result<(), RdbError> {
+        self.tracker.trim_history(seq, digest)
+    }
+
     /// The keepalive version armed now, while admission is rejected.
     #[must_use]
     pub const fn keepalive(&self) -> Option<TimerVersion> {

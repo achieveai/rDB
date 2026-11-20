@@ -7602,3 +7602,88 @@ fn m10_r197_c4_a_kept_copy_s_received_is_clamped_to_its_applied_head() {
         Some(progress(HEAD, HEAD, HEAD))
     );
 }
+
+// --- issue #61: the ladder floor -----------------------------------------------------------
+
+/// Issue #61 A3 (history-trim design §0, §1b): the host trims the primary's ladder to the
+/// History floor before it trims the engine. The tracker vouches for 5..=12; trimmed to 8, an
+/// ACK at 6 — which counted before the trim — is unverifiable and asks for a snapshot, the only
+/// answer an engine below its floor has, and changes nothing. Never divergence: absence is not
+/// proof.
+/// Cut: `DigestLadder::trim_below` keeps every rung (a no-op), red (B's ACK at 6 counts).
+#[retcd_test]
+fn t61_ack_below_floor_is_unverifiable_and_asks_snapshot() {
+    let mut untrimmed = tracker();
+    assert_eq!(
+        deliver(&mut untrimmed, &b(6, 6, 6)),
+        vec![peer_progress(B, 6)],
+        "control: 6 counts before the trim"
+    );
+
+    let mut tracker = tracker();
+    assert_eq!(tracker.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(tracker.history().floor(), Some(Seq(8)));
+    assert_eq!(tracker.history().digest_at(Seq(7)), None);
+    for ack in [b(6, 6, 6), forked(b(7, 7, 7))] {
+        let before = tracker.clone();
+        assert_eq!(
+            deliver(&mut tracker, &ack),
+            vec![
+                rejected(AckRejectReason::Unverifiable),
+                kernel(KernelEffect::SnapshotCatchupRequired {
+                    copy: COPY_B,
+                    barrier: Seq(HEAD),
+                }),
+            ],
+            "{ack:?}"
+        );
+        assert_eq!(tracker, before, "a dropped ACK changes nothing");
+        assert!(!tracker.is_diverged(COPY_B), "absence is not divergence");
+    }
+}
+
+/// Issue #61 A3: an ACK at the floor itself counts, because History keeps the record at the
+/// floor and the ladder keeps its rung (design §0, "`seq` included"). Twice: a dense ladder
+/// trimmed to 8 keeps its rung at 8, and a ladder that held only the root and its head (what
+/// `Recovered` builds) gets the floor rung from the host's digest. A trim above the head, or one
+/// whose digest contradicts the rung held, is refused and changes nothing.
+/// Cuts: `trim_below` drops the rung at `seq` too (`>` for `>=`), red (the ladder's floor is 9);
+/// `trim_history` skips writing the floor rung, red (the sparse ladder's ACK at 8 is
+/// unverifiable).
+#[retcd_test]
+fn t61_ack_at_floor_counts() {
+    let mut ladder = ladder(5);
+    ladder.trim_below(Seq(8));
+    assert_eq!(ladder.floor(), Some(Seq(8)), "the rung at the floor stays");
+    assert_eq!(ladder.len(), (8..=HEAD).count());
+
+    let mut dense = tracker();
+    assert_eq!(dense.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(dense.history().floor(), Some(Seq(8)));
+    assert_eq!(deliver(&mut dense, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+
+    let mut sparse_history = DigestLadder::new();
+    sparse_history.insert(Seq::ZERO, Digest::ROOT);
+    sparse_history.insert(Seq(HEAD), d(HEAD));
+    let mut sparse = ProgressTracker::new(TrackerInit {
+        history: sparse_history,
+        ..init(config())
+    })
+    .expect("a root-and-head tracker");
+    assert_eq!(sparse.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(sparse.history().floor(), Some(Seq(8)), "(0, ROOT) is gone");
+    assert_eq!(sparse.history().len(), 2, "the floor and the head");
+    assert_eq!(deliver(&mut sparse, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+
+    let invalid = |field| Err(RdbError::InvalidArgument { field });
+    for (name, seq, digest, field) in [
+        ("above the head", Seq(HEAD + 1), d(HEAD + 1), "seq"),
+        ("contradicts the rung held", Seq(9), d(10), "digest"),
+        ("not the root at 0", Seq::ZERO, d(0), "digest"),
+    ] {
+        let mut refused = tracker();
+        let before = refused.clone();
+        assert_eq!(refused.trim_history(seq, digest), invalid(field), "{name}");
+        assert_eq!(refused, before, "{name}: nothing changes");
+    }
+}
