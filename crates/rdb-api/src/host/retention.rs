@@ -1,0 +1,379 @@
+//! Issue #61 S3 (design section 3.1, PR-B): the History retention duty. Once a
+//! [`RETENTION_DUTY_MILLIS`], each partition this node holds gets one round: the host gathers
+//! what [`retention_floor`] reads from its engine and kernel, and when the floor moves it trims
+//! there through `Host::trim_history_through` (R1's ladders, then the engine, then the kept
+//! ladders). The simulator's twin is `rdb_sim`'s `Dispatcher::retention_duty`; both call the
+//! same pure function.
+//!
+//! * `prev`, `applied` and `own_durable` are the engine's, of the partition's newest lineage.
+//!   `keep` comes from this node's [`RetentionSamples`], the cap from
+//!   [`RocksEngine::history_bytes`] through [`cap_seq`].
+//! * On a primary the copies are every other copy its tracker names, at `known` durable; a
+//!   secondary passes none.
+//! * Each snapshot transfer this node serves pins its `S`. A pin the cap overran is logged
+//!   [`HISTORY_BUDGET_OVERRAN_PIN`] and its transfer ends `budget_overran`, so R1's next ask
+//!   opens a new one.
+//! * A copy behind the floor is logged [`HISTORY_COPY_BEHIND_FLOOR`] once, until it is counted
+//!   again.
+//! * A hold ([`Host::retention_hold`]) trims nothing (`history_trim_held{reason}`). An inventory
+//!   pin and a grace are released first when they no longer hold. Under grace the cap still
+//!   trims (lead ruling R23).
+//! * Grace begins when a `Recovered` leaves this node a primary (`history_grace_begun`) and ends
+//!   `history_grace_ended{why}`: `acked`, `expired`, `no_primary`, or `superseded` when a newer
+//!   generation's `Recovered` begins a fresh one (lead ruling R24: one grace per generation).
+//! * The samples are kept per generation: a newer one starts them afresh
+//!   (`retention_samples_reset`), since its head may sit below the old one's.
+
+use super::*;
+use rdb_core::replication::retention::{
+    cap_seq, retention_floor, RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
+    HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
+};
+
+/// How often the retention duty runs.
+pub(crate) const RETENTION_DUTY_MILLIS: u64 = 1_000;
+
+/// The spec's `history_keep`: 30 minutes of History is kept at least (design 3.2).
+pub(crate) const HISTORY_KEEP_MILLIS: u64 = 30 * 60 * 1_000;
+
+/// The spec's `history_budget_bytes`: 20 GiB, a hard cap (design 3.2, owner ruling Q1(a)).
+pub(crate) const HISTORY_BUDGET_BYTES: u64 = 20 << 30;
+
+/// A node's History retention settings ([`crate::DbConfig::history_keep`],
+/// [`crate::DbConfig::history_budget_bytes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryRetention {
+    /// History applied within this long is kept at least.
+    pub(crate) keep_millis: u64,
+    /// The History each copy of a partition keeps at most, in bytes.
+    pub(crate) budget_bytes: u64,
+}
+
+impl HistoryRetention {
+    /// The spec's defaults.
+    pub(crate) const DEFAULT: Self = Self {
+        keep_millis: HISTORY_KEEP_MILLIS,
+        budget_bytes: HISTORY_BUDGET_BYTES,
+    };
+}
+
+/// One partition's retention state on this node, kept between rounds. Process memory: a
+/// restart starts it afresh.
+#[derive(Debug, Default)]
+pub(crate) struct RetentionState {
+    /// The applied head over time, of the generation named.
+    pub(crate) samples: Option<(Generation, RetentionSamples)>,
+    /// The copies logged behind the floor and not counted again since.
+    pub(crate) behind: BTreeSet<CopyId>,
+    /// The open grace: the generation whose `Recovered` began it, and when.
+    pub(crate) grace: Option<(Generation, Tick)>,
+}
+
+impl Host {
+    /// Every partition this node holds gets one retention round. A round that cannot run is
+    /// logged `history_retention_failed{reason}` and the others go on.
+    pub(super) fn retention_duty(&mut self, now: Tick) {
+        let mut newest: BTreeMap<PartitionId, Generation> = BTreeMap::new();
+        for (partition, generation) in self.engine.lineages() {
+            let at = newest.entry(partition).or_insert(generation);
+            *at = (*at).max(generation);
+        }
+        self.retention
+            .retain(|partition, _| newest.contains_key(partition));
+        for partition in newest.into_keys() {
+            if let Err(reason) = self.retention_round(partition, now) {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    reason,
+                    "history_retention_failed"
+                );
+            }
+        }
+    }
+
+    /// One retention round for `partition` at `now` (module docs).
+    ///
+    /// # Errors
+    ///
+    /// `no_lineage` when this node holds none of the partition; the samples' refusal
+    /// (`tick_backwards`, `applied_backwards`) within one generation, with nothing trimmed;
+    /// and `Host::trim_history_through`'s refusal of the floor.
+    pub(crate) fn retention_round(
+        &mut self,
+        partition: PartitionId,
+        now: Tick,
+    ) -> Result<RetentionDecision, String> {
+        let generation = self.newest_held(partition).ok_or("no_lineage")?;
+        let prev = self.engine.floor_seq(partition, generation);
+        let applied = Seq(self.engine.buffered_applied(partition, generation).0);
+        let own_durable = self.engine.durable(partition, generation);
+        let settings = self.history_retention;
+        let engine = &self.engine;
+        let cap = cap_seq(prev, applied, settings.budget_bytes, |from| {
+            engine.history_bytes(partition, generation, from)
+        });
+        let keep = self.retention_keep(partition, generation, applied, now)?;
+        self.release_inventory_pin(partition, now);
+        self.release_grace(partition, now);
+        let copies = self
+            .replication
+            .primary(self.node, partition)
+            .map(|primary| {
+                let tracker = primary.tracker();
+                tracker
+                    .peers()
+                    .map(|(copy, _)| copy)
+                    .filter(|copy| *copy != tracker.own())
+                    .filter_map(|copy| tracker.known(copy).map(|known| (copy, known.durable)))
+                    .collect()
+            });
+        let served: Vec<(CopyId, Seq)> = self
+            .transfers
+            .iter()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|((_, copy), transfer)| (*copy, transfer.at))
+            .collect();
+        let input = RetentionInput {
+            prev,
+            applied,
+            own_durable,
+            transfer_pins: served.iter().map(|(_, at)| *at).collect(),
+            copies,
+            keep,
+            cap,
+            hold: self.retention_hold(partition, generation),
+        };
+        let decision = retention_floor(&input);
+        let floor = match &decision {
+            RetentionDecision::Held(hold) => {
+                tracing::debug!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    reason = hold.reason(),
+                    "history_trim_held"
+                );
+                return Ok(decision);
+            }
+            RetentionDecision::Floor(floor) => floor,
+        };
+        let state = self.retention.entry(partition).or_default();
+        state.behind.retain(|copy| floor.behind.contains(copy));
+        for copy in &floor.behind {
+            if state.behind.insert(*copy) {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    floor = floor.floor.0,
+                    "{HISTORY_COPY_BEHIND_FLOOR}"
+                );
+            }
+        }
+        for (copy, at) in served.iter().filter(|(_, at)| *at < floor.floor) {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = copy.0,
+                pin = at.0,
+                floor = floor.floor.0,
+                "{HISTORY_BUDGET_OVERRAN_PIN}"
+            );
+            self.end_transfer(
+                partition,
+                *copy,
+                "budget_overran",
+                "snapshot_transfer_abandoned",
+            );
+        }
+        if floor.floor > prev {
+            self.trim_history_through(partition, floor.floor)?;
+        }
+        Ok(decision)
+    }
+
+    /// Record `applied` in `partition`'s samples of `generation` and answer `keep`. A newer
+    /// generation than the samples' starts them afresh, logged `retention_samples_reset`.
+    fn retention_keep(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        applied: Seq,
+        now: Tick,
+    ) -> Result<Seq, String> {
+        let keep_millis = self.history_retention.keep_millis;
+        let node = self.node.0;
+        let state = self.retention.entry(partition).or_default();
+        match &state.samples {
+            Some((held, _)) if *held == generation => {}
+            held => {
+                if let Some((from, _)) = held {
+                    tracing::info!(
+                        node,
+                        partition = partition.0,
+                        from_gen = from.0,
+                        to_gen = generation.0,
+                        "retention_samples_reset"
+                    );
+                }
+                state.samples = Some((generation, RetentionSamples::new()));
+            }
+        }
+        let (_, samples) = state.samples.as_mut().ok_or("no_samples")?;
+        samples.record(now, applied, keep_millis)?;
+        Ok(samples.keep_seq(now, keep_millis))
+    }
+
+    /// The no-trim gate the duty finds on `partition`, the first that holds, or `None` (design
+    /// 3.1, "No trim while"; the simulator's `retention_hold` is its twin).
+    ///
+    /// * `Staging` / `Installing`: the newest lineage is mid copy or mid install, or this node
+    ///   holds an install of the partition open.
+    /// * `Recovering`: F1 here is in any phase but `Idle`, `Committed` or `Rebuilding`.
+    /// * `LandingPending`: a landing of the partition is queued, or its link sync is awaited.
+    /// * `InventoryPinned`: this node answered an inventory and holds its pin.
+    /// * `Grace`, last, because the cap passes it and no other (lead ruling R23).
+    pub(super) fn retention_hold(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<RetentionHold> {
+        if self.engine.staging(partition, generation).is_some() {
+            return Some(RetentionHold::Staging);
+        }
+        if self.engine.installing(partition, generation).is_some()
+            || self.installs.contains_key(&partition)
+        {
+            return Some(RetentionHold::Installing);
+        }
+        let recovering = self.recoveries.get(&partition).is_some_and(|f1| {
+            !matches!(
+                f1.phase(),
+                RecoveryPhase::Idle | RecoveryPhase::Committed | RecoveryPhase::Rebuilding
+            )
+        });
+        if recovering {
+            return Some(RetentionHold::Recovering);
+        }
+        let landing = self.delayed.values().any(
+            |item| matches!(item, Delayed::Landing { site, .. } if site.partition == partition),
+        ) || self.link_pending.keys().any(|(p, _)| *p == partition);
+        if landing {
+            return Some(RetentionHold::LandingPending);
+        }
+        if self.inventory_pins.contains_key(&partition) {
+            return Some(RetentionHold::InventoryPinned);
+        }
+        self.retention
+            .get(&partition)
+            .and_then(|state| state.grace)
+            .map(|_| RetentionHold::Grace)
+    }
+
+    /// Drop `partition`'s inventory pin when it no longer holds at `now`: silently once this
+    /// node has landed a newer generation, logged `inventory_pin_expired` once
+    /// `inventory_pin_millis` has passed. Answers whether it is still held.
+    pub(super) fn release_inventory_pin(&mut self, partition: PartitionId, now: Tick) -> bool {
+        let Some(pin) = self.inventory_pins.get(&partition).copied() else {
+            return false;
+        };
+        let landed_past = self
+            .landed
+            .iter()
+            .any(|(p, g)| *p == partition && *g > pin.generation);
+        if landed_past {
+            self.inventory_pins.remove(&partition);
+            return false;
+        }
+        if now >= pin.since.plus_millis(self.inventory_pin_millis) {
+            self.inventory_pins.remove(&partition);
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = pin.generation.0,
+                millis = self.inventory_pin_millis,
+                "inventory_pin_expired"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// A `Recovered` of `generation` stepped into R1 here: when it leaves this node a primary,
+    /// its window waits for its copies' acks (design 3.1 m2). A repeat in the open grace's
+    /// generation keeps its start (lead ruling R24); a newer generation ends the open one
+    /// `superseded` and begins afresh.
+    pub(super) fn begin_grace(&mut self, partition: PartitionId, generation: Generation) {
+        if self.replication.primary(self.node, partition).is_none() {
+            return;
+        }
+        let now = self.clock.now();
+        let node = self.node.0;
+        let state = self.retention.entry(partition).or_default();
+        let open = state.grace.map(|(held, _)| held);
+        if open == Some(generation) {
+            return;
+        }
+        if let Some(held) = open {
+            tracing::info!(
+                node,
+                partition = partition.0,
+                generation = held.0,
+                why = "superseded",
+                "history_grace_ended"
+            );
+        }
+        state.grace = Some((generation, now));
+        tracing::info!(
+            node,
+            partition = partition.0,
+            generation = generation.0,
+            "history_grace_begun"
+        );
+    }
+
+    /// End `partition`'s grace when it no longer holds at `now` (lead ruling R23), logged
+    /// `history_grace_ended{why}`: `acked` once every other copy the tracker names has an
+    /// admitted ack (its last admitted ACK's `received` above 0), `expired` after
+    /// `max(history_keep, inventory_pin_millis)`, `no_primary` when this node holds no primary.
+    fn release_grace(&mut self, partition: PartitionId, now: Tick) {
+        let Some((generation, since)) =
+            self.retention.get(&partition).and_then(|state| state.grace)
+        else {
+            return;
+        };
+        let wait = self
+            .history_retention
+            .keep_millis
+            .max(self.inventory_pin_millis);
+        let why = match self.replication.primary(self.node, partition) {
+            None => Some("no_primary"),
+            Some(primary) => {
+                let tracker = primary.tracker();
+                let acked = tracker
+                    .peers()
+                    .filter(|(copy, _)| *copy != tracker.own())
+                    .all(|(_, peer)| peer.progress.received.0 > 0);
+                if acked {
+                    Some("acked")
+                } else if now >= since.plus_millis(wait) {
+                    Some("expired")
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(why) = why {
+            if let Some(state) = self.retention.get_mut(&partition) {
+                state.grace = None;
+            }
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                why,
+                "history_grace_ended"
+            );
+        }
+    }
+}

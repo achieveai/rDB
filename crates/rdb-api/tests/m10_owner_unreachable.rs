@@ -30,6 +30,8 @@ fn an_app_whose_owner_has_stopped_is_told_a_retry_can_help() {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local,
         links,
         client,

@@ -1,0 +1,371 @@
+//! Issue #61 S3 (PR-B) host rows: the History retention duty (`host::retention`).
+
+use super::catchup_tests::{regular_rejoin, restart_three};
+use super::trio::{current_thread, host_over, logged, write_chain, Trio};
+use super::*;
+use rdb_core::replication::retention::{RetentionDecision, RetentionHold};
+
+const P: PartitionId = PartitionId(1);
+
+/// Stage a trim of partition 1's `generation` to `seq`, its mark rooted at `(0, ROOT)`, so the
+/// host knows the lineage's root without a commit.
+fn trimmed_to(engine: &mut RocksEngine, generation: Generation, seq: u64) {
+    engine
+        .stage_trim_history(
+            P,
+            generation,
+            TrimFloor {
+                seq: Seq(seq),
+                root_base: Seq::ZERO,
+                root_digest: Digest::ROOT,
+            },
+        )
+        .expect("the trim is staged");
+}
+
+/// Sync partition 1's `generation` through `through`, so the engine's `durable` reaches it.
+fn synced(engine: &mut RocksEngine, generation: Generation, through: u64) {
+    engine
+        .sync_wal_through(vec![CapturedPrefix {
+            partition: P,
+            generation,
+            through: AppliedSeq(through),
+        }])
+        .expect("the sync");
+}
+
+/// Issue #61 S3 (design 3.1, 3.5): on a node holding no R1 side, the duty keeps `history_keep`
+/// of History and trims the rest, and holds while the boot inventory pin does. Generation 1
+/// holds seqs 1-6, trimmed to 1 and synced. With `history_keep` = 1 s and no byte cap:
+///
+/// Times are from the host clock's start.
+///
+/// 1. At 10 s the boot pin holds the round (`InventoryPinned`) and the floor stays 1.
+/// 2. With the pin window at 0, the round at 10.5 s drops the pin (`inventory_pin_expired`);
+///    no sample is 1 s old yet, so `keep` is 0 and the floor stays 1.
+/// 3. At 11.5 s the first sample (10 s, head 6) is a window old: the floor moves to 6 in the
+///    engine, and `host_history_trimmed` is logged once.
+///
+/// Issue #149: the ladder duty first warms node 2's inventory ladder, reported as
+/// `IndexLengths::inventory_rungs`; after step 3 it holds the floor's rung only, and the block
+/// cache's usage is reported.
+///
+/// Cuts: the inventory-pin gate off, red (step 1 trims); `keep` ignored, red (step 2 trims);
+/// the kept ladders left untrimmed, red (every rung stays).
+/// Unit.
+#[config_log::retcd_test]
+fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
+    const METHOD: &str = "t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 6);
+        trimmed_to(&mut engine, Generation(1), 1);
+        synced(&mut engine, Generation(1), 6);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    host.history_retention = HistoryRetention {
+        keep_millis: 1_000,
+        budget_bytes: u64::MAX,
+    };
+    host.ladder_duty();
+    let lengths = host.status(P).lengths.expect("node 2's lengths");
+    assert!(
+        lengths.inventory_rungs > 1,
+        "the warmed ladder: {lengths:?}"
+    );
+    let base = host.clock.now();
+    let at = |millis: u64| base.plus_millis(millis);
+    assert_eq!(
+        host.retention_round(P, at(10_000)),
+        Ok(RetentionDecision::Held(RetentionHold::InventoryPinned)),
+        "the boot pin holds the first round"
+    );
+    assert_eq!(host.engine.floor_seq(P, Generation(1)), Seq(1));
+    host.inventory_pin_millis = 0;
+    let round = host.retention_round(P, at(10_500));
+    assert!(
+        matches!(&round, Ok(RetentionDecision::Floor(f)) if f.floor == Seq(1)),
+        "no sample is a window old yet: {round:?}"
+    );
+    assert_eq!(host.engine.floor_seq(P, Generation(1)), Seq(1));
+    let round = host.retention_round(P, at(11_500));
+    assert!(
+        matches!(&round, Ok(RetentionDecision::Floor(f)) if f.floor == Seq(6)),
+        "the window has passed the head: {round:?}"
+    );
+    assert_eq!(host.engine.floor_seq(P, Generation(1)), Seq(6));
+    let lengths = host.status(P).lengths.expect("node 2's lengths");
+    assert_eq!(
+        (lengths.history_floor, lengths.inventory_rungs),
+        (6, 1),
+        "the trim bounds the kept ladder to the floor: {lengths:?}"
+    );
+    assert!(lengths.block_cache_bytes.is_some(), "{lengths:?}");
+    assert_eq!(logged!(METHOD, "inventory_pin_expired").len(), 1);
+    assert_eq!(logged!(METHOD, "host_history_trimmed").len(), 1);
+}
+
+/// Issue #61 S3 (lead note a): a newer generation starts the samples afresh, logged
+/// `retention_samples_reset{from_gen, to_gen}`, so a head below the old generation's is not
+/// refused `applied_backwards`. Generation 1 holds seqs 1-6; a round samples head 6. Then the
+/// engine gains generation 2 holding seqs 1-3, and the next round samples head 3 without
+/// error. A third round in generation 2 logs no second reset.
+///
+/// Cut: no reset, red (the second round fails `applied_backwards`). Unit.
+#[config_log::retcd_test]
+fn t61_s3_a_newer_generation_resets_the_retention_samples() {
+    const METHOD: &str = "t61_s3_a_newer_generation_resets_the_retention_samples";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 6);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    host.inventory_pin_millis = 0;
+    let base = host.clock.now();
+    let round = host.retention_round(P, base.plus_millis(1_000));
+    assert!(round.is_ok(), "generation 1: {round:?}");
+    write_chain(&mut host.engine, Generation(2), 3);
+    let round = host.retention_round(P, base.plus_millis(2_000));
+    assert!(round.is_ok(), "generation 2: {round:?}");
+    let round = host.retention_round(P, base.plus_millis(3_000));
+    assert!(round.is_ok(), "generation 2 again: {round:?}");
+    let resets = logged!(METHOD, "retention_samples_reset");
+    assert_eq!(resets.len(), 1, "{resets:?}");
+    assert_eq!(resets[0]["from_gen"], 1);
+    assert_eq!(resets[0]["to_gen"], 2);
+}
+
+/// The open grace of `host`'s partition 1, its generation.
+fn grace_of(host: &Host) -> Option<Generation> {
+    host.retention
+        .get(&P)
+        .and_then(|state| state.grace)
+        .map(|(generation, _)| generation)
+}
+
+/// [`regular_rejoin`], and the retention duty never runs by itself: the row calls each round,
+/// so nothing ends a grace between its steps.
+fn no_duty(host: &mut Host) {
+    regular_rejoin(host);
+    host.next_retention = Tick(u64::MAX);
+}
+
+/// Step the trio, and run one retention round on node 1 after each step, until `done` holds
+/// for node 1's host. Each round must be answered.
+fn rounds_until(trio: &mut Trio, what: &str, done: impl Fn(&Host) -> bool) {
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+    loop {
+        trio.step();
+        let now = trio.clock.now();
+        let round = trio.nodes[0].0.retention_round(P, now);
+        assert!(round.is_ok(), "{what}: {round:?}");
+        if done(&trio.nodes[0].0) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "not within patience: {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Issue #61 S3 (design 3.1 m2, lead rulings R23 and R24): grace on the host. Bootstrap's
+/// `Recovered` leaves node 1 a primary, so it begins a grace in generation 1
+/// (`history_grace_begun`). Node 3 restarts and the owner re-plans: the new generation's
+/// `Recovered` ends the open grace `superseded` (generation 1) and begins one in generation 2.
+/// Node 2 and node 3 hold no primary and begin none. Then node 1's retention rounds end the
+/// generation-2 grace `acked` once both secondaries have an admitted ack.
+///
+/// Cuts: no grace begun at `Recovered`, red (no `history_grace_begun`); a newer generation's
+/// `Recovered` keeps the open grace, red (no `superseded`, grace stays in generation 1); the
+/// ack check dropped, red (the grace never ends `acked`).
+/// Integration (~4 s): bootstrap's discovery window, node 3's restart and the re-plan.
+#[config_log::retcd_test]
+fn t61_s3_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one() {
+    const METHOD: &str =
+        "t61_s3_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), no_duty);
+    trio.bootstrap();
+    trio.ready();
+    let first = trio.status(0).recovered.expect("bootstrap committed");
+    assert_eq!(grace_of(&trio.nodes[0].0), Some(first), "node 1's grace");
+    restart_three(&mut trio, dir.path(), no_duty);
+    let second = trio.until("node 1 commits the re-plan", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&P)?;
+        (committed.new_generation > first).then_some(committed.new_generation)
+    });
+    trio.until("node 1's grace is in the new generation", |trio| {
+        (grace_of(&trio.nodes[0].0) == Some(second)).then_some(())
+    });
+    rounds_until(
+        &mut trio,
+        "node 1's retention round ends the grace",
+        |host| grace_of(host).is_none(),
+    );
+    let begun: Vec<_> = logged!(METHOD, "history_grace_begun")
+        .into_iter()
+        .map(|line| (line["node"].clone(), line["generation"].clone()))
+        .collect();
+    assert_eq!(
+        begun,
+        [(1.into(), first.0.into()), (1.into(), second.0.into())],
+        "one grace per generation, on node 1 only"
+    );
+    let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
+        .into_iter()
+        .map(|line| (line["generation"].clone(), line["why"].clone()))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            (first.0.into(), "superseded".into()),
+            (second.0.into(), "acked".into())
+        ]
+    );
+}
+
+/// Node 1's round on partition 1 at the trio's clock, which must be answered with a floor.
+fn floor_round(trio: &mut Trio, what: &str) -> rdb_core::replication::retention::RetentionFloor {
+    let now = trio.clock.now();
+    match trio.nodes[0].0.retention_round(P, now) {
+        Ok(RetentionDecision::Floor(floor)) => floor,
+        other => panic!("{what}: {other:?}"),
+    }
+}
+
+/// Issue #61 S3-R2 and S3-R4 (design 3.1, lead ruling R23): the byte cap passes a lagging copy
+/// and an open transfer's pin. Node 3 applies the trio's first three puts, node 1 trims to that
+/// head `H` and node 3's links are held. A `SnapshotCatchupRequired` opens a transfer at `H`
+/// and three more puts land, to `P`. With `history_budget_bytes` = 0 (only the head record
+/// fits) and a `history_keep` no sample reaches:
+///
+/// 1. The first round trims past `H`: the pin is reported `history_budget_overran_pin{pin = H}`
+///    and its transfer ended `snapshot_transfer_abandoned{why = budget_overran}`.
+/// 2. The next round finds copy 3 below the floor: `history_copy_behind_floor` once, and once
+///    only over a third round.
+/// 3. Healed, node 3 comes back past the trim by a snapshot and applies `P`.
+///
+/// Cuts: overran pins left open, red (the trim is refused `transfer_pinned`); the behind warning
+/// on every round, red (two warnings). Integration (~4 s): bootstrap, a hold and a heal.
+#[config_log::retcd_test]
+fn t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer() {
+    const METHOD: &str = "t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        no_duty(host);
+        host.inventory_pin_millis = 0;
+    });
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    rounds_until(&mut trio, "node 1's grace ends", |host| {
+        grace_of(host).is_none()
+    });
+    assert_eq!(
+        trio.nodes[0].0.trim_history_through(P, Seq(head)),
+        Ok(Seq(head)),
+        "node 1 trimmed to H"
+    );
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), P)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    let site = Site {
+        partition: P,
+        correlation: CorrelationId(u64::MAX),
+    };
+    let host = &mut trio.nodes[0].0;
+    assert_eq!(
+        host.kernel(
+            ModuleName::Replication,
+            &KernelEffect::SnapshotCatchupRequired {
+                copy: three,
+                barrier: Seq(head),
+            },
+            site,
+            &[],
+            &StepFences::default(),
+        ),
+        Ok(())
+    );
+    assert!(
+        host.transfers.contains_key(&(P, three)),
+        "a transfer opened"
+    );
+    for request in 4..=6 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let past = trio.head().expect("node 1 holds a head");
+    trio.until("node 1 is durable through P", |trio| {
+        let host = &trio.nodes[0].0;
+        let generation = host.newest_held(P)?;
+        (host.engine.durable(P, generation).0 >= past).then_some(())
+    });
+    trio.nodes[0].0.history_retention = HistoryRetention {
+        keep_millis: u64::MAX,
+        budget_bytes: 0,
+    };
+    let first = floor_round(&mut trio, "the capped round");
+    assert_eq!(
+        (first.floor, first.overran_pins.clone()),
+        (Seq(past), vec![Seq(head)]),
+        "the cap keeps only the head and passes the pin"
+    );
+    assert!(
+        !trio.nodes[0].0.transfers.contains_key(&(P, three)),
+        "the overran transfer ended"
+    );
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    assert_eq!(trio.nodes[0].0.engine.floor_seq(P, generation), Seq(past));
+    let second = floor_round(&mut trio, "the round after");
+    assert_eq!(second.behind, vec![three], "copy 3 is below the floor");
+    let third = floor_round(&mut trio, "a third round");
+    assert_eq!(third.behind, vec![three], "copy 3 is still below");
+    let overran = logged!(METHOD, "history_budget_overran_pin");
+    assert_eq!(overran.len(), 1, "{overran:?}");
+    assert_eq!(
+        (&overran[0]["copy"], &overran[0]["pin"]),
+        (&serde_json::json!(three.0), &serde_json::json!(head))
+    );
+    let abandoned = logged!(METHOD, "snapshot_transfer_abandoned");
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["why"], "budget_overran");
+    let behind = logged!(METHOD, "history_copy_behind_floor");
+    assert_eq!(behind.len(), 1, "warned once: {behind:?}");
+    assert_eq!(behind[0]["copy"], three.0);
+    trio.links.heal_all();
+    trio.until("node 3 applies P after the heal", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= past)
+            .then_some(())
+    });
+}

@@ -1783,7 +1783,11 @@ fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
 
 /// Node 3's process starts again, as `Db::restart_node` restarts one: a new host on its own
 /// engine at the next boot, and nodes 1 and 2 told the new boot (`PeerBooted`). Its links heal.
-fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host)) -> BootId {
+pub(super) fn restart_three(
+    trio: &mut Trio,
+    dir: &std::path::Path,
+    tune: impl Fn(&mut Host),
+) -> BootId {
     let (old, _, _) = trio.nodes.remove(2);
     let boot = BootId(old.boot.0 + 1);
     let control = Arc::clone(&old.control);
@@ -1818,7 +1822,7 @@ fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host
 /// [`Trio::fast_pause`] on the regular rejoin path: D9 (A-R398) pins a copy restarted from an
 /// `Active` commit as a shadow, and the rows below are for F1's routed catch-up, which every
 /// other restart still takes.
-fn regular_rejoin(host: &mut Host) {
+pub(super) fn regular_rejoin(host: &mut Host) {
     Trio::fast_pause(host);
     host.restart_shadow = false;
 }

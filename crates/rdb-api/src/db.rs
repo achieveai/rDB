@@ -211,6 +211,19 @@ pub struct DbConfig {
     /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
     /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
+    /// How long each copy keeps the History it applied, at least (issue #61, design 3.2). `None`
+    /// is 30 minutes. A copy down for longer than this may find its primary has trimmed past
+    /// it, and is then rebuilt from a snapshot instead of walking the History it missed.
+    ///
+    /// A copy keeps more than this while something still needs it: another copy that has not
+    /// acknowledged it, a snapshot transfer, a recovery, or an answered inventory (at most 10
+    /// minutes). [`Self::history_budget_bytes`] caps it all.
+    pub history_keep: Option<Duration>,
+    /// The most History each copy of a partition keeps, in bytes (issue #61, design 3.2). `None`
+    /// is 20 GiB. A hard cap: it trims past a copy that has not acknowledged and past a snapshot
+    /// transfer, which then starts again (`history_budget_overran_pin`). It does not trim past
+    /// an answered inventory, so disk can pass it for at most 10 minutes of writes.
+    pub history_budget_bytes: Option<u64>,
     /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
     /// one-process database: all three copies here. Some of them is a node process
     /// (`rdb_node`). Empty is an app: it holds no copy, runs no node and claims no folder, and
@@ -1455,12 +1468,24 @@ struct Respawn {
     boots: Option<PathBuf>,
     /// The open's storage options, so a restarted node keeps them (A-R253).
     storage: StorageOptions,
+    /// The open's History retention, so a restarted node keeps it (issue #61).
+    retention: host::HistoryRetention,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The open's History retention (issue #61): [`DbConfig::history_keep`] and
+/// [`DbConfig::history_budget_bytes`], or the spec's defaults.
+fn history_retention(config: &DbConfig) -> host::HistoryRetention {
+    let default = host::HistoryRetention::DEFAULT;
+    host::HistoryRetention {
+        keep_millis: config.history_keep.map_or(default.keep_millis, millis_of),
+        budget_bytes: config.history_budget_bytes.unwrap_or(default.budget_bytes),
+    }
 }
 
 /// The `db_open` line. #107 review: `live_readd` is a field only when the setting is on (a
@@ -1543,6 +1568,7 @@ impl Db {
         };
         let unreachable_drop_after_millis = millis_of(config.timeouts.unreachable_drop_after);
         let live_readd = config.timeouts.live_readd;
+        let retention = history_retention(&config);
         log_open(&limits, &budgets, unreachable_drop_after_millis, live_readd);
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
@@ -1552,6 +1578,7 @@ impl Db {
             live_readd,
             boots: config.boot.map(|_| config.dir.clone()),
             storage: config.storage,
+            retention,
         };
         let mut db = Self::open_spawning(
             config,
@@ -1572,6 +1599,7 @@ impl Db {
                     boot,
                     partitions,
                     nodes,
+                    retention,
                 )
             },
         )
@@ -4728,6 +4756,7 @@ impl Db {
                 live_readd: false,
                 boots: None,
                 storage: StorageOptions::default(),
+                retention: host::HistoryRetention::DEFAULT,
             }),
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.clone(), links),
@@ -4768,6 +4797,7 @@ impl Db {
                 live_readd: config.timeouts.live_readd,
                 boots: None,
                 storage: config.storage,
+                retention: history_retention(config),
             }),
             links,
             control,
@@ -4796,6 +4826,7 @@ impl Db {
                 config.storage,
                 1,
                 ALL_NODES.into(),
+                history_retention(config),
             )
             .map_err(OpenError::Node)?;
             lock(&db.nodes).push(handle);
@@ -5110,6 +5141,7 @@ impl Db {
                 respawn.storage,
                 self.route.partitions(),
                 Arc::clone(&self.opened.nodes),
+                respawn.retention,
             )
         };
         match started {
@@ -5258,6 +5290,7 @@ impl Db {
             boot,
             self.route.partitions(),
             Arc::clone(&self.opened.nodes),
+            respawn.retention,
         )
     }
 
@@ -7248,6 +7281,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -7291,6 +7326,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -7387,6 +7424,8 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -7523,6 +7562,8 @@ mod tests {
             },
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -8130,6 +8171,7 @@ mod tests {
                 boot,
                 partitions,
                 nodes,
+                host::HistoryRetention::DEFAULT,
             )
         };
 
@@ -8245,6 +8287,7 @@ mod tests {
                                 boot,
                                 partitions,
                                 nodes,
+                                host::HistoryRetention::DEFAULT,
                             )?;
                             if node == NodeId(3) {
                                 race.wait("the loser returns while these nodes run", other, |s| {
@@ -9830,6 +9873,8 @@ mod tests {
         let above = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -9874,6 +9919,8 @@ mod tests {
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,
@@ -9904,6 +9951,8 @@ mod tests {
             // This row pins how the cap fills: the ack floor would empty it (A-R252).
             ack_floor: false,
             dedup_retention: Some(Duration::from_millis(300)),
+            history_keep: None,
+            history_budget_bytes: None,
             ..config(dir.path())
         };
         let mut db = rt
@@ -13598,6 +13647,8 @@ mod tests {
                     // This row pins how the cap fills: the ack floor would empty it (A-R252).
                     ack_floor: false,
                     dedup_retention: Some(Duration::from_millis(300)),
+                    history_keep: None,
+                    history_budget_bytes: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),
@@ -13674,6 +13725,8 @@ mod tests {
                     // This row pins how the cap fills: the ack floor would empty it (A-R252).
                     ack_floor: false,
                     dedup_retention: Some(retention),
+                    history_keep: None,
+                    history_budget_bytes: None,
                     local: ALL_NODES.to_vec(),
                     links: None,
                     client: DEFAULT_CLIENT,
@@ -13781,6 +13834,8 @@ mod tests {
                     // This row pins how the cap fills: the ack floor would empty it (A-R252).
                     ack_floor: false,
                     dedup_retention: Some(retention),
+                    history_keep: None,
+                    history_budget_bytes: None,
                     local: ALL_NODES.to_vec(),
                     links: None,
                     client: DEFAULT_CLIENT,
@@ -14086,6 +14141,8 @@ mod tests {
                 DbConfig {
                     dedup_cap: Some(5),
                     dedup_retention: Some(Duration::from_millis(300)),
+                    history_keep: None,
+                    history_budget_bytes: None,
                     ..config(dir.path())
                 },
                 Arc::clone(&store),

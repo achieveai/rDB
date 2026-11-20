@@ -2178,6 +2178,8 @@ fn db_config(dir: &FsPath) -> crate::db::DbConfig {
         timeouts: crate::Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: crate::db::ALL_NODES.to_vec(),
         links: None,
         client: crate::db::DEFAULT_CLIENT,

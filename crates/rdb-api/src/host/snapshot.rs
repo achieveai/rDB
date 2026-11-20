@@ -617,9 +617,7 @@ impl Host {
     }
 
     /// The lowest `S` of a transfer this node serves for `partition`: a trim must not pass it
-    /// (design section 3.1, the transfer pin). Debug only: the debug trim is its one reader
-    /// until the trim duty lands.
-    #[cfg(debug_assertions)]
+    /// (design section 3.1, the transfer pin).
     pub(super) fn transfer_pin(&self, partition: PartitionId) -> Option<Seq> {
         self.transfers
             .iter()
