@@ -4127,6 +4127,11 @@ impl ConfigStore for AddrPuts {
 
 /// A declared three-node store behind an [`AddrPuts`], and node 1's folder, where node 1 has
 /// opened once with `first` and stopped: its record holds `first`. Only node 1 ever runs.
+///
+/// Each open counts the calls to its `open_spawning` spawn, one per host started (PR #159
+/// review r2): a refused open must have made none, and an open that succeeds at least one, the
+/// control that the count sees a start at all. [`Fence::open_on`] asserts both, so every
+/// refusal a row meets is checked to be before any host starts.
 struct Fence {
     rig: Rig,
     store: Arc<AddrPuts>,
@@ -4147,26 +4152,63 @@ impl Fence {
 
     /// Open node 1 on its folder with `app`; stopped again at once when it opens.
     fn open(&self, app: &str) -> Result<(), OpenError> {
-        self.open_on(&self.rig.rt, app)
+        self.open_on(&self.rig.rt, Some(app))
     }
 
-    /// [`Fence::open`] on `rt`: a fresh one is a new process.
-    fn open_on(&self, rt: &tokio::runtime::Runtime, app: &str) -> Result<(), OpenError> {
+    /// [`Fence::open`] on `rt` with `app`, or with no app address: a fresh runtime is a new
+    /// process. Opened through `open_spawning`, whose spawn is counted: refused, no host
+    /// started; opened, at least one did.
+    fn open_on(&self, rt: &tokio::runtime::Runtime, app: Option<&str>) -> Result<(), OpenError> {
         let listener = self.rig.listen(rt, NodeId(1));
-        let (mut db, net) = open_node_with(
-            rt,
-            &self.rig.store,
+        let _entered = rt.enter();
+        let (config, net) = node_config(
             &self.rig.cert_dir,
             NodeId(1),
             &self.dir.0,
             listener,
             &self.rig.addrs,
             Timeouts::default(),
-            Some(app),
-        )?;
-        db.shutdown();
-        drop((db, net));
-        Ok(())
+            app,
+        );
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&starts);
+        let spawn = move |node, engine, links, control, clock, boot, partitions, nodes| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            host::spawn_on(
+                node,
+                engine,
+                links,
+                control,
+                clock,
+                fast(),
+                Limits::default(),
+                host::UNREACHABLE_DROP_AFTER_MILLIS,
+                false,
+                boot,
+                partitions,
+                nodes,
+            )
+        };
+        let opened = rt.block_on(Db::open_spawning(
+            config,
+            Arc::clone(&self.rig.store),
+            rt.handle().clone(),
+            fast(),
+            spawn,
+        ));
+        let starts = starts.load(Ordering::SeqCst);
+        match opened {
+            Ok(mut db) => {
+                assert!(starts > 0, "the control: an open that succeeds starts its host");
+                db.shutdown();
+                drop((db, net));
+                Ok(())
+            }
+            Err(refused) => {
+                assert_eq!(starts, 0, "refused before any host starts: {refused}");
+                Err(refused)
+            }
+        }
     }
 
     /// Node 1's record: its app address and mod revision.
@@ -4196,8 +4238,8 @@ impl Fence {
 }
 
 /// own83_b2_4 (#83 B2, PR #159 review, the fence): node 1's record holds A. An open with B sends
-/// its write at revision r, and the reply is lost before the write applies: refused, nothing
-/// started, the marker left. The retry with A finds the record already holding A, but the
+/// its write at revision r, and the reply is lost before the write applies: refused, no host
+/// started (its spawn counted zero, [`Fence`]), the marker left. The retry with A finds the record already holding A, but the
 /// marker says a write may still apply at r, so it writes A again (the fence): the revision
 /// moves past r. The late write of B then arrives and is refused, and the record holds A. A
 /// further open with A, no marker now, writes nothing. Every scripted put found the marker on
@@ -4307,7 +4349,7 @@ fn own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next() {
     assert_eq!(fence.record(), (Some(A.to_owned()), r));
 
     let restarted = runtime();
-    fence.open_on(&restarted, A).expect("the restarted open");
+    fence.open_on(&restarted, Some(A)).expect("the restarted open");
     let (_, fenced) = fence.record();
 
     let stale = config_core::PutRequest {
@@ -4338,7 +4380,7 @@ fn own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next() {
 /// refused, naming the rival's revision, the rival's record kept, the marker removed (no
 /// write at the old revision can apply). The read back fails, twice, on two opens: each is
 /// refused naming both the lost reply and the failed read, the marker kept, the record as it
-/// was. Then the store is healthy: the next open writes (the fence) and goes on. Cut: the read
+/// was. Every refusal starts no host (its spawn counted zero, [`Fence`]). Then the store is healthy: the next open writes (the fence) and goes on. Cut: the read
 /// back's error dropped (`.ok()`, as before the review), red at "read back failed". Cut: the
 /// marker removed on a failed read back, red at "kept". Integration (~3 s): one node, six
 /// opens.
@@ -4403,8 +4445,8 @@ fn own83_b2_6_an_unknown_registration_outcome_is_read_back() {
 
 /// own83_b2_7 (#83 B2, PR #159 review, the revision race): the record changes after the open
 /// reads it and before its write. A rival address, and a rival write of exactly the bytes this
-/// open wants at a newer revision: each refuses the open, nothing started, the rival's bytes
-/// and revision kept, the marker removed. Cut: the put sent without `expected_mod_revision`,
+/// open wants at a newer revision: each refuses the open, no host started (its spawn counted
+/// zero, [`Fence`]), the rival's bytes and revision kept, the marker removed. Cut: the put sent without `expected_mod_revision`,
 /// red at "the rival's record" (the open overwrites it). Cut: a conflict whose stored bytes
 /// equal this open's taken as success, red at the identical rival. Integration (~2 s).
 #[config_log::retcd_test]
