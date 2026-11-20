@@ -2305,11 +2305,25 @@ impl FaultInjector for TwoInstalls {
 /// out during install 2 and the build spent an attempt; with every attempt spent it returns the
 /// error OpenRaft turns into a fatal one. The row requires that **no** attempt is spent: whether
 /// a clock that is still wrong spends all three depends on how long a capture takes. The holds
-/// are real time because the patience is a clock: this row takes about 2 s by design.
+/// are real time because the patience is a clock: this row takes about 2 s by design, times
+/// `RETCD_TEST_DEADLINE_SCALE`.
+///
+/// Both are scaled by `RETCD_TEST_DEADLINE_SCALE`, read the same way as
+/// `config_testkit::poll::deadline_scale` (this crate cannot depend on the testkit). The slack
+/// between one hold and the patience is what a loaded host has to stay inside: at 500 ms
+/// unscaled, a gate at load 22 held the row's own thread long enough that install 1 alone
+/// outlasted the patience and an attempt was spent (issue #167). Scaling keeps the shape the
+/// row proves (each hold is under the patience, the two together are over it) and gives the
+/// gate's scale 3 a 1.5 s slack.
 #[retcd_test]
 async fn q_r1_the_install_patience_restarts_for_each_new_install() {
-    const PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
-    const HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
+    let scale: u32 = std::env::var("RETCD_TEST_DEADLINE_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let patience = std::time::Duration::from_millis(1500) * scale;
+    let hold = std::time::Duration::from_millis(1000) * scale;
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     {
@@ -2331,7 +2345,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
             capture: Handshake::new(),
         });
         let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
-        dst.set_install_patience(PATIENCE);
+        dst.set_install_patience(patience);
         seed(&dst, 3).await;
 
         let install_one = {
@@ -2347,7 +2361,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
         // the installed state, publishes, and never captures again (a slow start on a loaded
         // host did that once).
         wait_reached(race.clone(), |r| &r.first_capture).await;
-        tokio::time::sleep(HOLD).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
+        tokio::time::sleep(hold).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
         race.first.release();
         install_one
             .await
@@ -2363,7 +2377,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
         };
         wait_reached(race.clone(), |r| &r.second).await;
         race.capture.release();
-        tokio::time::sleep(HOLD).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
+        tokio::time::sleep(hold).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
         race.second.release();
         install_two
             .await
