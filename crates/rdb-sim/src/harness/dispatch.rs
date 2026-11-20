@@ -83,7 +83,7 @@ use crate::sim::control::{ControlOp, ControlStore};
 use crate::sim::network::{Fate, LinkState, Network, NetworkOp};
 use crate::sim::scheduler::Scheduler;
 use crate::storage::crash_image::CrashImage;
-use crate::storage::memory::MemoryEngine;
+use crate::storage::memory::{MemoryEngine, TrimFloor};
 use crate::storage::snapshot::MemorySnapshot;
 use crate::storage::StorageOp;
 
@@ -1239,6 +1239,9 @@ impl Dispatcher {
             watched.push(*to);
         }
         let effects = self.module_mut(module).step(&ctx, event)?;
+        if let EventKind::Kernel(KernelEvent::Recovered(result)) = &event.kind {
+            self.align_ladders(node, partition, result.new_generation);
+        }
         // A catch-up with no source after the step and no `CopyCaughtUp` among its effects will
         // never be answered: R1 refused to start it (tester-kb-r1 A4, S2), or its cursor stopped
         // or R1 dropped it (A3). Forget its asker, or a later `CopyCaughtUp` from this node would
@@ -1973,6 +1976,26 @@ impl Dispatcher {
         {
             return Ok(());
         }
+        // The twin of the host's A5 refusal (issue #61, design N4): a trimmed engine cannot
+        // refill the ladder from 0, and the snapshot transfer that serves it lands in A9. Named,
+        // and nothing below the floor is read.
+        let floor = self
+            .engines
+            .get(&node)
+            .map_or(Seq::ZERO, |engine| engine.floor_seq(partition, generation));
+        if floor > Seq::ZERO {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                generation = generation.0,
+                floor = floor.0,
+                reason = "below_floor",
+                "snapshot_catchup_unservable"
+            );
+            return Ok(());
+        }
         if self
             .primary_ladders
             .contains(&(node, partition, generation))
@@ -2565,6 +2588,9 @@ impl Dispatcher {
                 });
             match built {
                 Ok(rungs) => {
+                    // A restore merges into what the receiver held, the root included; the
+                    // host's `align_ladders` drops what lies below the engine's floor (#61).
+                    self.align_ladders(node, partition, seed.lineage.generation);
                     self.ladders.insert((node, partition));
                     tracing::info!(
                         node = node.0,
@@ -2632,13 +2658,144 @@ impl Dispatcher {
     ) -> Result<Vec<(Seq, Digest)>, &'static str> {
         let engine = self.engines.get(&node).ok_or("seed_generation_absent")?;
         let head = engine.buffered_applied(partition, generation).0;
-        (0..=head)
+        // Dense from the engine's trim floor (issue #61): nothing below it is held.
+        let floor = engine.floor_seq(partition, generation).0;
+        (floor..=head)
             .map(|seq| {
                 stored_digest(engine, (node, partition, generation), Seq(seq))
                     .map(|digest| (Seq(seq), digest))
                     .ok_or("no_record")
             })
             .collect()
+    }
+
+    /// Trim `node`'s History of `partition` through its newest lineage to `through`, the twin
+    /// of the host's debug `Msg::TrimHistory` (issue #61): the kernel's ladders first
+    /// ([`Replication::trim_history`], when a side is installed), then the engine
+    /// ([`MemoryEngine::trim_history`]). The mark's root is the one the lineage already reads
+    /// under, else its own base and the digest there. Returns the levels the engine cut.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `node` or `partition` when there is nothing to trim,
+    /// `trim_history_digest` when the record at `through` or at the root cannot be read,
+    /// `trim_history_kernel` when R1 refuses (nothing changed), and `history_trim_refused` when
+    /// the engine refuses (logged with its reason; the kernel is then already trimmed, the safe
+    /// direction: it answers `NotRetained` for records the engine still holds).
+    pub fn trim_history(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        through: Seq,
+    ) -> Result<usize, SimError> {
+        let engine = self
+            .engines
+            .get(&node)
+            .ok_or(SimError::Config { field: "node" })?;
+        let generation = engine
+            .lineages()
+            .filter(|((p, _), _)| *p == partition)
+            .map(|((_, generation), _)| *generation)
+            .max()
+            .ok_or(SimError::Config { field: "partition" })?;
+        let refused = SimError::Config {
+            field: "history_trim_refused",
+        };
+        // A floor never moves down: the engine names that refusal, before any read of a record
+        // the trim already removed.
+        if let Some((_, held)) = engine
+            .floor(partition, generation)
+            .filter(|(_, held)| through < held.seq)
+        {
+            let mark = TrimFloor {
+                seq: through,
+                ..held
+            };
+            self.engine_mut(node)
+                .trim_history(partition, generation, mark)
+                .map_err(|_| refused.clone())?;
+            return Err(refused);
+        }
+        let unreadable = SimError::Config {
+            field: "trim_history_digest",
+        };
+        let digest = stored_digest(engine, (node, partition, generation), through)
+            .ok_or(unreadable.clone())?;
+        let (root_base, root_digest) = match engine.floor(partition, generation) {
+            Some((_, held)) => (held.root_base, held.root_digest),
+            None => {
+                let base = engine.base(partition, generation);
+                let at =
+                    stored_digest(engine, (node, partition, generation), base).ok_or(unreadable)?;
+                (base, at)
+            }
+        };
+        let installed = self.replication.primary(node, partition).is_some()
+            || self.replication.receiver(node, partition).is_some();
+        if installed {
+            self.replication
+                .trim_history(node, partition, through, digest)
+                .map_err(|_| SimError::Config {
+                    field: "trim_history_kernel",
+                })?;
+        }
+        self.engine_mut(node)
+            .trim_history(
+                partition,
+                generation,
+                TrimFloor {
+                    seq: through,
+                    root_base,
+                    root_digest,
+                },
+            )
+            .map_err(|_| refused)
+    }
+
+    /// Align `node`'s installed R1 sides of `partition` to its engine's trim floor in
+    /// `generation`, the twin of the host's `align_ladders` after a `Recovered` (issue #61,
+    /// design 3.4): a side R1 built from the result may hold the root or rungs the engine no
+    /// longer has. Nothing to do on an untrimmed engine. A side anchored below the floor (the
+    /// root, S1-R5) cannot take it yet and is left for the record walk, logged
+    /// `ladder_align_deferred`.
+    fn align_ladders(&mut self, node: NodeId, partition: PartitionId, generation: Generation) {
+        let Some(engine) = self.engines.get(&node) else {
+            return;
+        };
+        let floor = engine.floor_seq(partition, generation);
+        if floor == Seq::ZERO {
+            return;
+        }
+        let Some(digest) = stored_digest(engine, (node, partition, generation), floor) else {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                floor = floor.0,
+                "ladder_align_unreadable"
+            );
+            return;
+        };
+        match self
+            .replication
+            .trim_history(node, partition, floor, digest)
+        {
+            Ok(()) => tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                floor = floor.0,
+                "ladder_aligned"
+            ),
+            Err(refused) => tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                floor = floor.0,
+                error = %refused,
+                "ladder_align_deferred"
+            ),
+        }
     }
 
     /// Route one copy's inventory answer to the asking F1: what its holder reports for it today
@@ -3692,6 +3849,20 @@ fn stored_digest(
     seq: Seq,
 ) -> Option<rdb_core::contracts::digest::Digest> {
     let Some((record, progress)) = engine.history_at(partition, generation, seq) else {
+        // Below the trim floor the record is gone, the root's too (issue #61): the host's
+        // `digest_at` answers `below_floor`, never `ROOT`, once the floor is above 0.
+        let floor = engine.floor_seq(partition, generation);
+        if seq < floor {
+            tracing::info!(
+                node = holder.0,
+                partition = partition.0,
+                generation = generation.0,
+                seq = seq.0,
+                floor = floor.0,
+                "no digest below the trim floor"
+            );
+            return None;
+        }
         // Seq 0 holds no record: every lineage starts at the root (M9 S0 D2 ruling, rule 3).
         // Only seq 0; a missing record at any other cutoff is still withheld (M7B-137).
         if seq == Seq::ZERO {
@@ -4165,11 +4336,16 @@ mod dormant_twin_tests {
     /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
     /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
     /// (issue #105 unit 2, architect section 14). No receiver is held.
-    fn stood_down_owner() -> (Dispatcher, DormantSeed) {
+    ///
+    /// With `floor`, node 1's engine is trimmed there before the `Recovered`, which is stepped
+    /// through [`Dispatcher::step`], so the harness's ladder alignment runs (issue #61).
+    fn stood_down_owner(floor: Option<u64>) -> (Dispatcher, DormantSeed) {
         use rdb_core::contracts::authority::{
             AuthorityEvent, AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
         };
-        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module, StepCtx};
+        use rdb_core::contracts::event::{
+            Budgets, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
+        };
         use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
         use rdb_core::contracts::recovery::{
             CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult,
@@ -4280,18 +4456,35 @@ mod dormant_twin_tests {
             correlation: CorrelationId(1),
             kind,
         };
-        for kind in [
-            EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
-            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(view(
-                2,
-                DenyReason::EpochRevoked,
-            )))),
-        ] {
+        if let Some(floor) = floor {
+            let mark = crate::storage::memory::TrimFloor {
+                seq: Seq(floor),
+                root_base: Seq::ZERO,
+                root_digest: Digest::ROOT,
+            };
             dispatcher
-                .replication
-                .step(&ctx, &on_owner(kind))
-                .expect("R1 answers its own event");
+                .engines
+                .get_mut(&OWNER)
+                .expect("node 1's engine")
+                .trim_history(P, lineage.generation, mark)
+                .expect("a trim");
         }
+        Dispatcher::step(
+            &mut dispatcher,
+            ModuleName::Replication,
+            &ctx,
+            &on_owner(EventKind::Kernel(KernelEvent::Recovered(Box::new(result)))),
+        )
+        .expect("R1 answers its own event");
+        dispatcher
+            .replication
+            .step(
+                &ctx,
+                &on_owner(EventKind::Kernel(KernelEvent::Authority(
+                    AuthorityEvent::View(view(2, DenyReason::EpochRevoked)),
+                ))),
+            )
+            .expect("R1 answers its own event");
         let tracker = dispatcher
             .replication
             .primary(OWNER, P)
@@ -4310,7 +4503,7 @@ mod dormant_twin_tests {
     /// install, or not at all, no plan, red. Unit, under a second.
     #[test]
     fn beside_a_stood_down_primary_a_target_restore_installs_a_receiver_holding_the_plan() {
-        let (mut dispatcher, mut seed) = stood_down_owner();
+        let (mut dispatcher, mut seed) = stood_down_owner(None);
         seed.cutoff = (Seq(HEAD + 1), Digest::ROOT);
         dispatcher.restore_dormant(OWNER, P, &seed, false);
         let receiver = dispatcher
@@ -4325,6 +4518,96 @@ mod dormant_twin_tests {
             (plan.lineage, plan.revision, plan.cutoff),
             (seed.lineage, seed.revision, seed.cutoff),
             "the plan carries the seed's lineage, revision and cutoff"
+        );
+    }
+
+    /// Issue #61 A6, the twin of the host's floor-aware readers (A5): after a trim on node 1
+    /// the primary's ladder starts at the floor (kernel first), a source restore builds the
+    /// dormant receiver's ladder from the engine's floor, not from 0, and a snapshot catch-up is
+    /// refused `below_floor` without refilling the primary from the engine (design N4).
+    /// Cuts: `dormant_rungs` from 0, red (`no_record`, no ladder); the snapshot refusal removed,
+    /// red (the primary is refilled). Unit, under a second.
+    #[test]
+    fn t61_sim_restore_and_snapshot_catchup_respect_the_floor() {
+        let (mut dispatcher, seed) = serving_owner();
+        assert_eq!(
+            dispatcher.trim_history(OWNER, P, Seq(2)),
+            Ok(1),
+            "node 1 trims"
+        );
+        let floor_of_primary = |dispatcher: &Dispatcher| {
+            dispatcher
+                .replication
+                .primary(OWNER, P)
+                .expect("the primary")
+                .tracker()
+                .history()
+                .floor()
+        };
+        assert_eq!(
+            floor_of_primary(&dispatcher),
+            Some(Seq(2)),
+            "the kernel first"
+        );
+
+        dispatcher.restore_dormant(OWNER, P, &seed, true);
+        let receiver = dispatcher
+            .replication
+            .receiver(OWNER, P)
+            .expect("a source restore installs the dormant receiver");
+        assert_eq!(
+            receiver.history().floor(),
+            Some(Seq(2)),
+            "its ladder starts at the engine's floor"
+        );
+        assert!(
+            dispatcher.ladders.contains(&(OWNER, P)),
+            "the ladder is built"
+        );
+
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(1))
+            .expect("a refusal is not a harness fault");
+        assert!(
+            !dispatcher
+                .primary_ladders
+                .contains(&(OWNER, P, Generation(1))),
+            "the primary is not refilled from the engine"
+        );
+        assert_eq!(
+            floor_of_primary(&dispatcher),
+            Some(Seq(2)),
+            "nothing below the floor read"
+        );
+    }
+
+    /// Issue #61 A6, the twin of the host's `align_ladders` after `Recovered` (design 3.4): R1
+    /// builds the recovered primary's ladder from the result, and the harness then trims it to
+    /// the engine's floor in the same step. Without a floor nothing changes.
+    /// Cut: the alignment after `Recovered` removed, red (the ladder still starts below 2).
+    /// Unit, under a second.
+    #[test]
+    fn t61_sim_recovered_ladder_is_aligned_to_the_engine_floor() {
+        let floor = |dispatcher: &Dispatcher| {
+            dispatcher
+                .replication
+                .primary(OWNER, P)
+                .expect("the recovered primary")
+                .tracker()
+                .history()
+                .floor()
+        };
+        let (untrimmed, _) = stood_down_owner(None);
+        assert!(
+            floor(&untrimmed) < Some(Seq(2)),
+            "control: R1's own ladder starts below 2, {:?}",
+            floor(&untrimmed)
+        );
+        let (trimmed, _) = stood_down_owner(Some(2));
+        assert_eq!(
+            floor(&trimmed),
+            Some(Seq(2)),
+            "aligned to the engine's floor"
         );
     }
 }

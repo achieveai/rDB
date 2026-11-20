@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
     AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, Seq, SnapshotHandle,
 };
@@ -45,6 +46,68 @@ pub(crate) struct Lineage {
     pub(crate) parent: Option<Generation>,
     /// Every committed batch, in commit order. What a crash image replays.
     pub(crate) batches: Vec<Batch>,
+    /// This level's trim mark (issue #61), the twin of `rdb-storage`'s `trim_floor` record:
+    /// written by a trim of this lineage or of a child that cut it. [`MemoryEngine::floor`]
+    /// takes the highest mark that cuts what a lineage reads.
+    pub(crate) floor: Option<TrimFloor>,
+    /// The mark a completed sync covered. The host stages a trim unsynced, so a host crash
+    /// before the next WAL sync reopens with the older mark and its rows back
+    /// ([`crate::storage::crash_image::CrashImage`]).
+    pub(crate) floor_synced: Option<TrimFloor>,
+}
+
+/// A lineage's trim floor (issue #61), the twin of `rdb_storage::TrimFloor`: History holds
+/// `seq..=applied`, the record **at** `seq` included, and nothing below. Before the trim the
+/// copy checked that it descends from `(root_base, root_digest)`; the engine stores that root as
+/// given and never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimFloor {
+    /// The lowest seq whose History record this lineage keeps.
+    pub seq: Seq,
+    /// The base of the root this copy proved it descends from.
+    pub root_base: Seq,
+    /// The record digest at [`Self::root_base`] ([`Digest::ROOT`] at 0).
+    pub root_digest: Digest,
+}
+
+/// Why [`MemoryEngine::trim_history`] refused, the twin of `rdb_storage::TrimRefused` (the sim
+/// has no staged copy, so no `Staging`). Nothing was written in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimRefused {
+    /// The engine holds no such lineage.
+    UnknownLineage,
+    /// A child inherited the lineage: its History is trimmed through the child's walk.
+    Sealed {
+        /// The child generation.
+        child: Generation,
+    },
+    /// The floor is above the lineage's applied watermark: the record at it does not exist.
+    AboveApplied {
+        /// The floor asked for.
+        floor: Seq,
+        /// The lineage's applied watermark.
+        applied: AppliedSeq,
+    },
+    /// The floor is below the one the lineage already reads under: a floor never moves down.
+    BelowFloor {
+        /// The floor asked for.
+        floor: Seq,
+        /// [`MemoryEngine::floor_seq`] now.
+        current: Seq,
+    },
+}
+
+impl TrimRefused {
+    /// The `reason` field `history_trim_refused` carries, as the host names it.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownLineage => "unknown_lineage",
+            Self::Sealed { .. } => "sealed",
+            Self::AboveApplied { .. } => "above_applied",
+            Self::BelowFloor { .. } => "below_floor",
+        }
+    }
 }
 
 /// One core set's data engine.
@@ -229,6 +292,11 @@ impl MemoryEngine {
             _ => None,
         };
         self.take_at_rest();
+        // A sync that runs covers every write staged before it, the trim marks included
+        // (issue #61): the host's WAL sync is one log for the whole engine.
+        for lineage in self.lineages.values_mut() {
+            lineage.floor_synced = lineage.floor;
+        }
         let mut durable = Vec::with_capacity(captured.len());
         for capture in captured {
             // A lineage this engine was never given holds nothing: its durable prefix is the
@@ -484,7 +552,8 @@ impl MemoryEngine {
     /// this lineage's own batches, the latest to write that key. A latest write that deletes the
     /// key is final: the record is gone, and an older write of it does not show through (lead
     /// ruling B-R58d; [`StorageOp::LoseRecord`] relies on it). `None` when nothing the lineage
-    /// shows holds it.
+    /// shows holds it, and below the lineage's trim floor ([`Self::floor_seq`], issue #61):
+    /// the trim deleted those records.
     #[must_use]
     pub fn history_at(
         &self,
@@ -492,8 +561,149 @@ impl MemoryEngine {
         generation: Generation,
         seq: Seq,
     ) -> Option<(Bytes, Option<Bytes>)> {
+        if seq < self.floor_seq(partition, generation) {
+            return None;
+        }
         self.history_batch(partition, generation, seq)
             .and_then(|batch| history_writes(batch, seq))
+    }
+
+    /// The trim mark lineage `(partition, generation)` reads under, with the generation whose
+    /// level holds it (issue #61), the twin of `RocksEngine::floor`: the **highest** mark that
+    /// cuts what the lineage reads. A level's mark counts only while it is at most one past the
+    /// last seq the lineage reads there: `applied + 1` on its own level, `base + 1` through a
+    /// link, the smallest along the path. `None` when no level holds one.
+    #[must_use]
+    pub fn floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, TrimFloor)> {
+        let mut best: Option<(Generation, TrimFloor)> = None;
+        let mut level = generation;
+        let mut top = self
+            .buffered_applied(partition, generation)
+            .0
+            .saturating_add(1);
+        loop {
+            let Some(lineage) = self.lineage(partition, level) else {
+                return best;
+            };
+            if let Some(floor) = lineage.floor.filter(|floor| floor.seq.0 <= top) {
+                if best.is_none_or(|(_, held)| floor.seq > held.seq) {
+                    best = Some((level, floor));
+                }
+            }
+            let Some(parent) = lineage.parent else {
+                return best;
+            };
+            top = top.min(lineage.base.0.saturating_add(1));
+            level = parent;
+        }
+    }
+
+    /// The lowest seq whose History record the lineage keeps: [`Self::floor`]'s seq, or
+    /// [`Seq::ZERO`] when it was never trimmed.
+    #[must_use]
+    pub fn floor_seq(&self, partition: PartitionId, generation: Generation) -> Seq {
+        self.floor(partition, generation)
+            .map_or(Seq::ZERO, |(_, floor)| floor.seq)
+    }
+
+    /// Trim lineage `(partition, generation)`'s History below `floor.seq`, the twin of
+    /// `RocksEngine::stage_trim_history` (issue #61). Staged unsynced: a host crash before the
+    /// next sync loses it ([`Lineage::floor_synced`]).
+    ///
+    /// The walk follows the chain: the own level is cut at `floor.seq`, a level reached through
+    /// links at bases `b1, b2, ..` at `min(floor, b1+1, b2+1, ..)`, and each level cut is marked
+    /// at its cut with `floor`'s root, unless it already holds a higher mark. A parent's records
+    /// above the base are never touched. The records are not removed from the batches a crash
+    /// image replays: the mark bounds every read ([`Self::history_at`]), which is what the host's
+    /// range delete makes true. Returns how many levels the walk visited. Logs
+    /// `history_trimmed{levels, from, to}` or `history_trim_refused{reason}`.
+    ///
+    /// # Errors
+    ///
+    /// A [`TrimRefused`] naming why; nothing is written in any case.
+    pub fn trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) -> Result<usize, TrimRefused> {
+        let current = self.floor_seq(partition, generation);
+        let result = self.cut_history(partition, generation, floor, current);
+        let (p, g, to) = (partition.0, generation.0, floor.seq.0);
+        match result {
+            Ok(levels) => tracing::info!(
+                node = self.node.0,
+                partition = p,
+                generation = g,
+                levels,
+                from = current.0,
+                to,
+                "history_trimmed"
+            ),
+            Err(refused) => tracing::warn!(
+                node = self.node.0,
+                partition = p,
+                generation = g,
+                from = current.0,
+                to,
+                reason = refused.reason(),
+                "history_trim_refused"
+            ),
+        }
+        result
+    }
+
+    fn cut_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+        current: Seq,
+    ) -> Result<usize, TrimRefused> {
+        let applied = self
+            .lineage(partition, generation)
+            .ok_or(TrimRefused::UnknownLineage)?
+            .applied;
+        if let Some((&(_, child), _)) = self
+            .lineages
+            .iter()
+            .find(|(&(p, _), lineage)| p == partition && lineage.parent == Some(generation))
+        {
+            return Err(TrimRefused::Sealed { child });
+        }
+        if floor.seq.0 > applied.0 {
+            return Err(TrimRefused::AboveApplied {
+                floor: floor.seq,
+                applied,
+            });
+        }
+        if floor.seq < current {
+            return Err(TrimRefused::BelowFloor {
+                floor: floor.seq,
+                current,
+            });
+        }
+        let (mut level, mut end, mut levels) = (generation, floor.seq.0, 0_usize);
+        loop {
+            levels += 1;
+            let lineage = self.lineages.entry((partition, level)).or_default();
+            if lineage.floor.is_none_or(|held| held.seq.0 < end) {
+                lineage.floor = Some(TrimFloor {
+                    seq: Seq(end),
+                    ..floor
+                });
+            }
+            let Some(parent) = lineage.parent else {
+                break;
+            };
+            end = end.min(lineage.base.0.saturating_add(1));
+            level = parent;
+        }
+        Ok(levels)
     }
 
     /// The latest batch to write the `History` key at `seq`, set or deleted, in the lineage
@@ -621,7 +831,8 @@ impl MemoryEngine {
     /// # Errors
     ///
     /// [`SimError::Config`] naming `inherit` when `from` is not an earlier generation than `to`,
-    /// or when `to` already descends from a different generation.
+    /// or when `to` already descends from a different generation; naming `inherit_below_floor`
+    /// when the base is above zero and below `from`'s trim floor (issue #61).
     pub fn inherit(
         &mut self,
         partition: PartitionId,
@@ -641,7 +852,25 @@ impl MemoryEngine {
             return Err(refused);
         }
         let held = self.buffered_applied(partition, from);
-        self.restore_base(partition, to, from, Seq(through.0.min(held.0)));
+        let base = Seq(through.0.min(held.0));
+        // The twin of `as_of_base`'s floor bound (issue #61, A2): the record at a base below
+        // `from`'s trim floor is gone, so nothing can be read as of it.
+        let floor = self.floor_seq(partition, from);
+        if base.0 > 0 && base < floor {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                base = base.0,
+                floor = floor.0,
+                "inherit_below_floor"
+            );
+            return Err(SimError::Config {
+                field: "inherit_below_floor",
+            });
+        }
+        self.restore_base(partition, to, from, base);
         Ok(())
     }
 
@@ -678,6 +907,20 @@ impl MemoryEngine {
     /// Every lineage, in `(partition, generation)` order.
     pub(crate) fn lineages(&self) -> impl Iterator<Item = (&(PartitionId, Generation), &Lineage)> {
         self.lineages.iter()
+    }
+
+    /// Restore a lineage's trim mark from a crash image ([`CrashImage::reopen`]), as synced.
+    ///
+    /// [`CrashImage::reopen`]: crate::storage::crash_image::CrashImage::reopen
+    pub(crate) fn restore_floor(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) {
+        let lineage = self.lineages.entry((partition, generation)).or_default();
+        lineage.floor = Some(floor);
+        lineage.floor_synced = Some(floor);
     }
 
     /// Restore a lineage's durable watermark from a crash image. `pub(crate)` on purpose: the

@@ -23,7 +23,7 @@ use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, Parti
 use rdb_core::contracts::storage::{Batch, StorageFault};
 
 use crate::error::SimError;
-use crate::storage::memory::MemoryEngine;
+use crate::storage::memory::{MemoryEngine, TrimFloor};
 
 /// What one lineage came back with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -55,6 +55,10 @@ pub struct CrashImage {
     /// predecessor had synced, because the base is the predecessor's batches and only those
     /// survive to be replayed.
     bases: Vec<(PartitionId, Generation, Generation, Seq)>,
+    /// Each lineage's surviving trim mark (issue #61): the staged one after a process crash, and
+    /// only the one a sync covered after a host crash, as the host's unsynced trim batch is
+    /// lost with the WAL tail.
+    floors: Vec<(PartitionId, Generation, TrimFloor)>,
 }
 
 impl CrashImage {
@@ -69,6 +73,7 @@ impl CrashImage {
         let mut surviving = Vec::new();
         let mut batches = Vec::new();
         let mut bases = Vec::new();
+        let mut floors = Vec::new();
         for ((partition, generation), lineage) in engine.lineages() {
             let applied = match fault {
                 StorageFault::ProcessCrash => lineage.applied,
@@ -88,6 +93,13 @@ impl CrashImage {
                 };
                 bases.push((*partition, *generation, parent, base));
             }
+            let floor = match fault {
+                StorageFault::HostCrash => lineage.floor_synced,
+                _ => lineage.floor,
+            };
+            if let Some(floor) = floor {
+                floors.push((*partition, *generation, floor));
+            }
             surviving.push(SurvivingPrefix {
                 partition: *partition,
                 generation: *generation,
@@ -106,6 +118,7 @@ impl CrashImage {
             surviving,
             batches,
             bases,
+            floors,
         })
     }
 
@@ -127,6 +140,9 @@ impl CrashImage {
         }
         for prefix in &self.surviving {
             engine.restore_durable(prefix.partition, prefix.generation, prefix.durable);
+        }
+        for (partition, generation, floor) in &self.floors {
+            engine.restore_floor(*partition, *generation, *floor);
         }
         engine
     }
