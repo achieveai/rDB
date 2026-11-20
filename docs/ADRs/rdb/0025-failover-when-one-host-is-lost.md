@@ -98,11 +98,16 @@ time. Add them here as Decision items 6 onward. -->
   - **Two copies of one partition down: no promote, by design.** With fewer than two answering
     regular copies besides the dead owner, the survivor may lack acknowledged writes. The
     planner writes nothing and logs `planner_no_eligible_copy` with reason `lone_survivor`
-    (`choose_target`). The other partitions keep failing over. Row R5.
-  - **#169: a restarted owner's recovery waits for every copy.** An owner that restarts while
-    one of its copies is still down does not take its partitions back, though 2 of 3 copies are
-    up. It does once the down copy returns. t3 is fixing it.
-  - **#177: a copy restarted while its owner is dead never rejoins.**
+    (`choose_target`). The other partitions keep failing over. Row R5. When writes return
+    depends on which copy comes back:
+    - The owner is alive and a copy returns: the owner rejoins it, and writes return.
+    - The owner is dead and the owner returns: blocked until its other copy is back too
+      (#169).
+    - The owner is dead and a non-owner copy returns: it is not rejoined, and the partition
+      stays down until the owner returns (#177).
+  - **#169: a restarted owner's recovery waits for every copy.** The second case above. t3 is
+    fixing it.
+  - **#177: a copy restarted while its owner is dead never rejoins.** The third case above.
   - **#168: a hung node that resumed stays frozen until it is restarted.** The planner froze
     its grant while it was silent. The same process cannot lead again. The remedy for an
     embedder: poll `Db::restart_wanted()`. On `Some(RestartReason::ReplaceStopped)`, restart

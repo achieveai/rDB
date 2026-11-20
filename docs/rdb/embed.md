@@ -504,11 +504,15 @@ what the lost host was to it. These are the expected times at the default settin
 **Limits in this release.**
 
 - **Two copies of one partition down: that partition stops taking writes.** The one copy
-  left may be missing acknowledged writes, so it is never promoted. Writes return when a
-  second copy is back. Other partitions fail over as usual.
-- **An owner restarted while one of its copies is still down does not take writes** until
-  that copy is back too, though 2 of 3 copies are up (#169, being fixed).
-- **A copy restarted while its owner is dead never rejoins** (#177).
+  left may be missing acknowledged writes, so it is never promoted. Other partitions fail
+  over as usual. When writes return depends on which copy comes back:
+  - The owner is alive and a copy returns: the owner adds it back, and writes return.
+  - The owner is dead and the owner returns: writes stay stopped until its other copy is
+    back too (#169, being fixed).
+  - The owner is dead and a copy that is not the owner returns: it is not added back. The
+    partition stays stopped until the owner returns (#177).
+- **#169:** the second case above.
+- **#177:** the third case above.
 - **A hung node that wakes up stays frozen until it is restarted** (#168). See above.
 - If a host hangs while it is the last reachable copy of a partition, and the partition's
   other copies are also down, restarting that host does not bring the partition back; it
