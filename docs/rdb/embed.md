@@ -395,6 +395,10 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
   partition's primary and the work it guards (for SBX, its sandbox) live together. If the node
   stops, that work stops with it and is moved elsewhere with the partition. An effect made by
   another process or machine is not covered by `still_owner`, only by the destination's fence.
+- From **any** process, `db.route(group).token` (or `db.leader_of(partition).token`) is the
+  token the partition's record names now: the one its owner stamps (#84). Use it to see that a
+  new owner took over (its token is higher), or to check what a destination holds. It is a hint
+  read from rEtcd, never ownership: only `still_owner`, in the owner's process, says you may act.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
 
 **What `still_owner` promises.** It mirrors admission check 6 (the grant's horizon and the
