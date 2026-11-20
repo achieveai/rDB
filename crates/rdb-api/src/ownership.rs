@@ -748,11 +748,17 @@ pub struct RouteInfo {
 impl RouteInfo {
     /// Where the owner's app takes forwarded requests: the address the owner's node wrote into
     /// its `nodes/{id}` record at open ([`crate::NodeAddresses::app`]), opaque to rDB (#83 B2).
-    /// `None` when the owner registered none, or the database was formed in one process
-    /// (`rdb_node --form`), which has no `nodes/` records. A read that succeeds is kept for a
-    /// second, so successful reads come at most once a second per owner, and an owner
-    /// restarted with a new address is seen within about a second. A failed read keeps
-    /// nothing: the call is `UNAVAILABLE`, and the next call reads again at once.
+    /// A read that succeeds is kept for a second, so successful reads come at most once a
+    /// second per owner, and an owner restarted with a new address is seen within about a
+    /// second.
+    ///
+    /// After a read that fails or does not answer in time, this is the last address a read of
+    /// that owner returned in this `Db`, whatever its age, so it may be stale; the call still
+    /// succeeds, and the next one reads again at once (SBX answer, 2026-11-20). `None` means
+    /// no address is stored (the owner registered none, or the database was formed by
+    /// `rdb_node --form`, which has no `nodes/` records), or no read of that owner has
+    /// succeeded yet. A stale address is safe because the sender checks the receiver's TLS
+    /// identity against [`Self::owner`] before it sends anything.
     #[must_use]
     pub fn app_address(&self) -> Option<&str> {
         self.owner_address.as_deref()

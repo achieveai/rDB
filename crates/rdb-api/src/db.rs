@@ -695,8 +695,9 @@ struct Route {
 #[derive(Default)]
 struct AddrSlot {
     /// The last read that succeeded: what `nodes/{id}` held, and when that read began. Served
-    /// for [`APP_ADDR_REREAD_GAP`] from then. A failed read leaves it as it was, and does not
-    /// serve it past its gap.
+    /// for [`APP_ADDR_REREAD_GAP`] from then. A failed read leaves it as it was, stamp
+    /// included, and [`Db::route`] answers it past its gap in place of the failed read (SBX
+    /// answer, 2026-11-20).
     good: Option<(Option<String>, Instant)>,
     /// The read in flight, which callers that find `good` expired wait for.
     reading: Option<Arc<AddrRead>>,
@@ -4425,11 +4426,18 @@ impl Db {
     ///   new is watched. While no such watch is open (an app-only `Db`, or every node here cut
     ///   from rEtcd) nothing is cached and each call reads the record.
     /// - The owner's app address, kept one second per owner node after a read that succeeds,
-    ///   then read again, since nothing watches `nodes/`. A failed read keeps nothing, so the
-    ///   next call reads again at once. A cached partition answer still needs this read once
-    ///   its second is up, and that read can be slow or fail. Calls that need one owner's
-    ///   address while it is being read wait for that read and take its answer, success or
-    ///   failure; other owners do not wait on it.
+    ///   then read again, since nothing watches `nodes/`. A cached partition answer still needs
+    ///   this read once its second is up, and that read can be slow or fail. Calls that need
+    ///   one owner's address while it is being read wait for that read and take its answer,
+    ///   success or failure; other owners do not wait on it.
+    ///
+    /// **A failed address read does not fail the call** (SBX answer, 2026-11-20). When the
+    /// owner's `nodes/{id}` read fails or does not answer in time, the answer names the owner
+    /// and token with the last address a read of that owner returned in this `Db`, whatever
+    /// its age, so it may be stale; or `None` if no read of that owner has succeeded yet. That
+    /// is safe because the address is only a dial hint: the sender checks the receiver's TLS
+    /// identity against the owner before it sends anything ([`RouteInfo::app_address`]). The
+    /// failure refreshes nothing, so the next call reads again at once.
     ///
     /// A call takes at most two read timeouts ([`Timeouts::read`]) in all, however many calls
     /// run at once: one for the partition record, and one for the owner's address, waiting
@@ -4438,17 +4446,18 @@ impl Db {
     /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
     /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read
     /// that succeeds; `db_route_read_failed{what, detail}` (warn) when a read fails or does not
-    /// answer in time, and `db_route_read_undecodable{what, detail}` (warn) for a record this
-    /// build cannot decode. The address itself is never logged, since it may carry a
-    /// credential.
+    /// answer in time, then `db_route_app_addr_unreadable{node, reason, served}` (warn) when
+    /// that read was the address's (`served` is `last_good` or `none`); and
+    /// `db_route_read_undecodable{what, detail}` (warn) for a record this build cannot decode.
+    /// The address itself is never logged, since it may carry a credential.
     ///
     /// # Errors
     ///
-    /// - `UNAVAILABLE` (retry `BoundedJitter`) in three cases: either record cannot be read, or
-    ///   is not read in time; the partition record is absent; or the `Db` is one a crate test
-    ///   built without a control store. The first includes a cached owner whose address read
-    ///   fails: no answer is given without a current address. A later call can succeed. An
-    ///   absent `nodes/{id}` record is not an error: the address is `None`.
+    /// - `UNAVAILABLE` (retry `BoundedJitter`) in three cases: the partition record cannot be
+    ///   read, or is not read in time; it is absent; or the `Db` is one a crate test built
+    ///   without a control store. A later call can succeed. The owner's address read is never
+    ///   `UNAVAILABLE`: one that fails answers the last good address (above), and an absent
+    ///   `nodes/{id}` record answers `None`.
     /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
     ///   owner's node record does not decode: a newer build may have written it, or it is
     ///   damaged; no retry succeeds. Logged `db_route_read_undecodable`.
@@ -4494,8 +4503,45 @@ impl Db {
 
     fn route_partition(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
         let mut info = self.route_record(partition)?;
-        info.owner_address = self.app_address_of(info.owner)?;
+        info.owner_address = self.owner_address(info.owner)?;
         Ok(info)
+    }
+
+    /// `node`'s app address for a route answer (#83 B2, SBX answer, 2026-11-20): a read that
+    /// fails or does not answer in time is not an error. The answer then names the last
+    /// address a read of `node` returned in this `Db`, whatever its age, or none if no read of
+    /// it has succeeded yet. That may be stale, which is safe because the sender checks the
+    /// receiver's TLS identity before it sends anything. The failure refreshes nothing, so the
+    /// next call reads again. Logged `db_route_app_addr_unreadable{node, reason, served}`
+    /// (warn): `reason` the error kind or `timeout`, `served` `last_good` or `none`, never the
+    /// address. A record this build cannot decode stays `INCOMPATIBLE_VERSION` (#135): no
+    /// later read can fix it.
+    fn owner_address(&self, node: NodeId) -> Result<Option<String>, ApiError> {
+        let started = Instant::now();
+        match self.app_address_of(node) {
+            Ok(app) => Ok(app),
+            Err(refused) if refused.kind == ErrorKind::IncompatibleVersion => Err(refused),
+            Err(refused) => {
+                // The whole budget spent is a timeout, waiting for another call's read
+                // included; anything sooner is the store's answer.
+                let reason = if started.elapsed() >= self.timeouts.read {
+                    "timeout".to_owned()
+                } else {
+                    format!("{:?}", refused.kind)
+                };
+                let last_good = lock(&self.route.addrs)
+                    .get(&node)
+                    .and_then(|slot| slot.good.as_ref())
+                    .map(|(app, _)| app.clone());
+                let served = if last_good.is_some() {
+                    "last_good"
+                } else {
+                    "none"
+                };
+                tracing::warn!(node = node.0, %reason, served, "db_route_app_addr_unreadable");
+                Ok(last_good.flatten())
+            }
+        }
     }
 
     /// `partition`'s owner and token, from the cache while its stamp is current, else read
@@ -4543,8 +4589,8 @@ impl Db {
     /// nodes never wait on this one's read. Logged `db_route_app_addr_read{node, app_len}`;
     /// the address itself is never logged, since it may carry a credential.
     ///
-    /// A failed read is `UNAVAILABLE` today, even with an earlier good read kept in `good`;
-    /// answering that one past its gap instead would be a change at the `Err` arms here.
+    /// A failed read is `UNAVAILABLE` here; [`Self::owner_address`] answers the last good
+    /// read (`good`) in its place, past its gap, without refreshing its stamp.
     fn app_address_of(&self, node: NodeId) -> Result<Option<String>, ApiError> {
         let deadline = Instant::now() + self.timeouts.read;
         let key = ControlKey::Node(node).encode();

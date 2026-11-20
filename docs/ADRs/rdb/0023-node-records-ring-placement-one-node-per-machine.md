@@ -175,8 +175,10 @@
      and one whose outcome is unknown (its reply was lost). Both happen only during a
      declaration not yet formed, before any node can register an address (a node registers
      only once the formation record exists), so it only meets layout 1. `Db::route` returns the address as
-     `RouteInfo::app_address`. A read that succeeds is kept for a second per owner; a failed
-     read keeps nothing, so the next call reads again.
+     `RouteInfo::app_address`. A read that succeeds is kept for a second per owner. A failed
+     read does not fail the route (SBX answer, 2026-11-20): it answers the last address a
+     read of that owner returned, however old, or none if none succeeded, and refreshes
+     nothing, so the next call reads again.
    - **What this amends.** Decision 1's "nothing updates one in place" now means: nothing
      updates the declared address or machine; the node itself may update its app address.
    - **No rollback after node layout 2.** A build before node layout 2 (S1b) cannot decode a
@@ -284,7 +286,8 @@ every rig open passes the address check it would meet in use.
   `own83_25_a_changed_app_address_is_seen_within_the_gap` to
   `own83_30_no_log_line_holds_an_app_address`,
   `own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout`,
-  `own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters`; `rdb_node`'s
+  `own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters`,
+  `own83_33_a_failed_first_address_read_gives_no_address_and_recovers`; `rdb_node`'s
   `own83_b2_app_addr_parses_and_form_refuses_it`; `rdb_dev`'s
   `route_line_names_the_owners_app_address_on_one_line`.
 

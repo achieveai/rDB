@@ -3120,16 +3120,17 @@ fn own83_27_a_failed_partition_read_is_unavailable_and_recovers() {
     db.shutdown();
 }
 
-/// own83_28 (#83 B2, PR #159 review): a cached owner still reads its app address once the
-/// second is up, and that read can fail. The owner moved to a new address; after the second,
-/// two calls whose `nodes/1` read fails answer `UNAVAILABLE` (retry `BoundedJitter`), not the
-/// stale address and not `None`, with no `partitions/` read (the owner is cached) and nothing
-/// cached (each call reads `nodes/1` again). Then the store answers and the next call names the
-/// new address. An absent record is a different input, `None`, which `own83_26` pins. Cut:
-/// `app_address_of` serving the expired entry on a failed read, red at the first failure.
-/// Unit (~1.1 s: the second is wall time).
+/// own83_28 (#83 B2, PR #159 review; SBX answer, 2026-11-20): a cached owner still reads its
+/// app address once the second is up, and that read can fail. The owner moved to a new
+/// address; after the second, two calls whose `nodes/1` read fails succeed with the owner, its
+/// token and the last good address, the stale one, with no `partitions/` read (the owner is
+/// cached) and nothing refreshed (each call reads `nodes/1` again). Each failure is logged
+/// `db_route_app_addr_unreadable` with `served: last_good`. Then the store answers and the next
+/// call names the new address. Cuts: the failed read answering `None`, red at the first
+/// failure ("the last good address"); the failure refreshing the stamp, red at the second
+/// ("read again, nothing refreshed"). Unit (~1.1 s: the second is wall time).
 #[config_log::retcd_test]
-fn own83_28_a_failed_address_read_of_a_cached_owner_is_unavailable_and_recovers() {
+fn own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_recovers() {
     let rt = runtime();
     let (mut db, store, _) = route_db(&rt);
     write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
@@ -3146,12 +3147,36 @@ fn own83_28_a_failed_address_read_of_a_cached_owner_is_unavailable_and_recovers(
     );
     store.fail_node_gets.store(2, Ordering::SeqCst);
     for attempt in 1..=2 {
-        let refused = db.route(G1).expect_err("the address read fails");
-        assert!(retryable_unavailable(&refused), "{attempt}: {refused}");
+        let served = db.route(G1).expect("a failed address read still answers");
+        assert_eq!(
+            (served.owner, served.token, served.app_address()),
+            (NodeId(1), token_at(1), Some("gw-1:8443")),
+            "{attempt}: the owner and token, with the last good address"
+        );
         assert_eq!(
             store.node_reads.load(Ordering::SeqCst),
             node_reads + attempt,
-            "{attempt}: read again, nothing cached"
+            "{attempt}: read again, nothing refreshed"
+        );
+    }
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_recovers",
+    );
+    let unreadable: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+    for line in &unreadable {
+        assert_eq!(
+            (&line["node"], &line["served"], &line["reason"]),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!("last_good"),
+                &serde_json::json!("Unavailable")
+            ),
+            "{line}"
         );
     }
     let route = db.route(G1).expect("the store answers again");
@@ -3237,12 +3262,13 @@ fn route_db_expired(
 
 /// own83_31 (#83 B2, PR #159 review r2, T27): waiting for another caller's address read is
 /// inside the one read timeout a call has for the address, not added to it. Node 1's read is
-/// held past the read timeout (1 s); four callers route at once, twice: each is `UNAVAILABLE`
-/// (retry `BoundedJitter`) within 1.75 s of its own start, under two read timeouts, where
-/// queueing read after read took one more timeout per caller ahead. Then the hold is lifted and
-/// the next call names the new address. Cut: a waiter whose shared read failed reads again
-/// itself, red at the bound (the second caller ~2 s). Unit (~3.2 s: the second, and two held
-/// rounds of one read timeout).
+/// held past the read timeout (1 s); four callers route at once, twice: each answers within
+/// 1.75 s of its own start, under two read timeouts, where queueing read after read took one
+/// more timeout per caller ahead. Each answer names the last good address, `gw-1:8443`, since
+/// the read timed out (SBX answer, 2026-11-20). Then the hold is lifted and the next call names
+/// the new address. Cut: a waiter whose shared read failed reads again itself, red at the bound
+/// (the second caller ~2 s). Unit (~3.2 s: the second, and two held rounds of one read
+/// timeout).
 #[config_log::retcd_test]
 fn own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout() {
     const READ: Duration = Duration::from_secs(1);
@@ -3266,8 +3292,14 @@ fn own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout() {
                 .collect()
         });
         for (answer, took) in &answers {
-            let refused = answer.as_ref().expect_err("held past the read timeout");
-            assert!(retryable_unavailable(refused), "{round}: {refused}");
+            let served = answer
+                .as_ref()
+                .expect("a timed-out address read still answers");
+            assert_eq!(
+                (served.owner, served.app_address()),
+                (NodeId(1), Some("gw-1:8443")),
+                "{round}: the last good address"
+            );
             assert!(
                 *took < bound,
                 "{round}: a caller took {took:?}, over one read timeout and its slack"
@@ -3287,8 +3319,9 @@ fn own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout() {
 /// (the read timeout is 3 s); every later `nodes/` read is then scripted to fail, and the held
 /// read is let go. All four name the new address, after one read. A call after that finds the
 /// answer stamped more than a second ago, so it reads again (the pre-read stamp stays the
-/// cache's), and that read fails: `UNAVAILABLE`. Cut: a waiter ignores the shared success and
-/// looks at the cache again, red at "shared" (it reads, and fails). Unit (~2.6 s).
+/// cache's), and that read fails: the call answers the shared read's address as the last good
+/// one (SBX answer, 2026-11-20). Cut: a waiter ignores the shared success and looks at the
+/// cache again, red at "one read for the four" (each reads). Unit (~2.6 s).
 #[config_log::retcd_test]
 fn own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters() {
     let rt = runtime();
@@ -3319,9 +3352,50 @@ fn own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters() {
     assert_eq!(node_reads(), before + 1, "one read for the four");
     let later = db
         .route(G1)
-        .expect_err("a later call reads again, and that read fails");
-    assert!(retryable_unavailable(&later), "{later}");
+        .expect("a later call reads again, and that read fails");
+    assert_eq!(later.app_address(), Some("gw-1:9443"), "the last good");
     assert_eq!(node_reads(), before + 2, "the pre-read stamp has expired");
+    db.shutdown();
+}
+
+/// own83_33 (#83 B2, SBX answer, 2026-11-20): an owner whose address no read of this `Db` has
+/// returned yet, and whose read fails, gives the owner and token with no address, twice, each
+/// call reading `nodes/1` again, and logged `db_route_app_addr_unreadable` with `served: none`.
+/// The next read that succeeds names the address. Cut: the error returned again, red at the
+/// first failure (as are own83_31 and own83_32). Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    store.fail_node_gets.store(2, Ordering::SeqCst);
+    for attempt in 1..=2 {
+        let served = db.route(G1).expect("a failed address read still answers");
+        assert_eq!(
+            (served.owner, served.token, served.app_address()),
+            (NodeId(1), token_at(1), None),
+            "{attempt}: no read has succeeded"
+        );
+        assert_eq!(
+            store.node_reads.load(Ordering::SeqCst),
+            attempt,
+            "{attempt}: read again"
+        );
+    }
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_33_a_failed_first_address_read_gives_no_address_and_recovers",
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["@m"] == "db_route_app_addr_unreadable" && line["served"] == "none")
+            .count(),
+        2
+    );
+    let route = db.route(G1).expect("the store answers again");
+    assert_eq!(route.app_address(), Some("gw-1:8443"), "recovered");
     db.shutdown();
 }
 

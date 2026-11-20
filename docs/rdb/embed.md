@@ -795,18 +795,26 @@ record. Use it to send a request to the right node.
   delayed write of an earlier open of this node can change it, and the open cannot tell
   which.
 - It is `None` when the owner registered none, or on a database made by `rdb_node --form`,
-  which has no `nodes/` records. An app address on such a database is refused at open, and
+  which has no `nodes/` records, or when no read of that owner's record has succeeded yet in
+  this `Db` (below). An app address on such a database is refused at open, and
   `rdb_node --form --app-addr` is refused while parsing.
 - `route` keeps an owner's address for a second after a read that succeeds, then reads it
-  again, so a node restarted with a new address is seen within about a second. A read that
-  fails keeps nothing, so the next call reads again at once. Calls that need the same
-  owner's address while it is being read wait for that read and take its answer, success or
-  failure.
+  again, so a node restarted with a new address is seen within about a second. Calls that
+  need the same owner's address while it is being read wait for that read and take its
+  answer, success or failure.
+- **A failed address read does not fail `route` or `leader_of`** (SBX answer, 2026-11-20).
+  When the owner's `nodes/{id}` read fails or does not answer in time, the answer still names
+  the owner and token, with the last address a read of that owner returned in this `Db`,
+  however old, or `None` if no read of it has succeeded yet. So the address can be stale.
+  That is safe because the sender checks the receiver's TLS identity before it sends
+  anything (below). The failure refreshes nothing, so the next call reads again at once. It
+  is logged `db_route_app_addr_unreadable{node, reason, served}` (warn), where `served` is
+  `last_good` or `none`.
 - **How long a call can take.** At most two read timeouts (`Timeouts::read`) in all, however
   many calls run at once: one for the partition's record and one for the owner's address,
   waiting for another call's read of it included. A cached owner still needs its address
-  read once its second is up, and that read can be slow or fail too: the call is then
-  `UNAVAILABLE`, not an answer without the address.
+  read once its second is up, and that read can be slow or fail too: the call then answers
+  as above, with the last good address.
 - `db.partition_of(group)` names the group's partition without reading anything. The count is
   fixed when the database is formed (at most 512), by its declaration or by `rdb_node --form`, so a group stays in its partition, and
   every group of a partition moves with it, while the database has its original partitions:
@@ -821,8 +829,9 @@ record. Use it to send a request to the right node.
   build may have written it, or it is damaged, and a retry cannot help. Run the build the
   nodes run, or a newer one. If the nodes' own build cannot read it either, it is damaged:
   stop sending that partition's calls, keep the store as it is, never edit the record by
-  hand, and report it with the message. A record that cannot be read right now is
-  `UNAVAILABLE`, and a later call can succeed.
+  hand, and report it with the message. A partition record that cannot be read right now
+  is `UNAVAILABLE`, and a later call can succeed; an owner's record that cannot be read right
+  now is not an error (above).
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.
