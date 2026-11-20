@@ -691,18 +691,8 @@ impl ConfigStore for PutAfterGet {
 pub(crate) enum ListFaultMode {
     /// Read, and answer with `truncated` set.
     Truncate,
-    /// Never answer. Each dropped list adds one to the count: a caller that gives up on a list
-    /// it spawned must abort it, or the count stays where it was (PR #171 review).
-    Never(std::sync::Arc<std::sync::atomic::AtomicUsize>),
-}
-
-/// Adds one to its count when the list future holding it is dropped.
-struct CountDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl Drop for CountDrop {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
+    /// Never answer.
+    Never,
 }
 
 /// Any control store whose every list is faulted by `mode`. Every other call passes.
@@ -733,8 +723,7 @@ impl ConfigStore for ListFault {
                 listed.truncated = true;
                 Ok(listed)
             }
-            ListFaultMode::Never(drops) => {
-                let _counted = CountDrop(std::sync::Arc::clone(drops));
+            ListFaultMode::Never => {
                 std::future::pending::<Result<ListResponse, ConfigError>>().await
             }
         }

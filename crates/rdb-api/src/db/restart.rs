@@ -155,37 +155,42 @@ mod tests {
 
     /// PR #171 review (item 7): a control store whose `partitions/` list never answers. Each of
     /// three polls gives up at the read timeout, says `db_restart_check_unread`, answers "owns
-    /// some", and aborts its read, so all three pending reads are dropped: no task is left per
-    /// poll. Unit (in-memory store, no sockets).
-    /// Cut: no `abort` after the timeout; no read is dropped, red at "every pending read is
-    /// dropped".
+    /// some", and aborts its read, so each pending read is dropped before the next poll: no
+    /// task is left per poll. The witness is the store's `Arc` count: each spawned read holds
+    /// its own clone from the spawn on, so it is released when the read is dropped, whether
+    /// the abort lands before the read's first poll or after it. Unit (in-memory store, no
+    /// sockets).
+    /// Cut: no `abort` after the timeout; the first read keeps its clone, red at "its pending
+    /// read is dropped".
     #[config_log::retcd_test]
     fn own81_v10_a_restart_check_that_never_answers_leaves_no_task() {
         const METHOD: &str = "own81_v10_a_restart_check_that_never_answers_leaves_no_task";
         let rt = crate::db::reopen_tests::runtime();
-        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let store: Arc<dyn ConfigStore> = crate::test_store::ListFault::new(
             Arc::new(config_testkit::MemStore::new()),
-            crate::test_store::ListFaultMode::Never(Arc::clone(&drops)),
+            crate::test_store::ListFaultMode::Never,
         );
-        for _ in 0..3 {
+        let baseline = Arc::strong_count(&store);
+        for poll in 1..=3 {
             assert!(!owns_none_within(
                 rt.handle(),
                 Arc::clone(&store),
                 vec![NodeId(1)],
                 WITHIN
             ));
+            let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+            while Arc::strong_count(&store) > baseline {
+                assert!(
+                    Instant::now() < deadline,
+                    "poll {poll}: its pending read is dropped: the store is held {} times, {} by \
+                     the row",
+                    Arc::strong_count(&store),
+                    baseline
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         assert_eq!(unread(METHOD).len(), 3);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while drops.load(std::sync::atomic::Ordering::SeqCst) < 3 {
-            assert!(
-                Instant::now() < deadline,
-                "every pending read is dropped: {} of 3",
-                drops.load(std::sync::atomic::Ordering::SeqCst)
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     /// `restart_wanted`'s last step for a faulted host, which is due at once whatever the hold:
@@ -260,9 +265,7 @@ mod tests {
         const METHOD: &str = "own81_v10_a_restart_check_that_times_out_keeps_the_node_up";
         let store = crate::test_store::ListFault::new(
             Arc::new(config_testkit::MemStore::new()),
-            crate::test_store::ListFaultMode::Never(Arc::new(std::sync::atomic::AtomicUsize::new(
-                0,
-            ))),
+            crate::test_store::ListFaultMode::Never,
         );
         assert_eq!(faulted_host_restart(store), None);
         assert_eq!(unread(METHOD).len(), 1);
