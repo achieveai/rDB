@@ -5190,30 +5190,19 @@ mod dormant_twin_tests {
         );
     }
 
-    /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
-    /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
-    /// (issue #105 unit 2, architect section 14). No receiver is held.
-    ///
-    /// With `floor`, node 1's engine is trimmed there before the `Recovered`, which is stepped
-    /// through [`Dispatcher::step`], so the harness's ladder alignment runs (issue #61).
-    fn stood_down_owner(floor: Option<u64>) -> (Dispatcher, DormantSeed) {
+    /// The `RecoveryResult` that recovers `seed`'s lineage at [`HEAD`] on node 1, read-only,
+    /// proved by copy 0 alone.
+    fn recovered_result(seed: &DormantSeed) -> rdb_core::contracts::recovery::RecoveryResult {
         use rdb_core::contracts::authority::{
-            AuthorityEvent, AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
+            AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
         };
-        use rdb_core::contracts::event::{
-            Budgets, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
-        };
-        use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
+        use rdb_core::contracts::ids::{AuthorityGeneration, GrantId};
         use rdb_core::contracts::recovery::{
             CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult,
             RetainedStatusMap, SelectedLineage, TailLedger,
         };
-        use rdb_core::contracts::time::{ControlTime, Tick};
+        use rdb_core::contracts::time::Tick;
 
-        use crate::storage::snapshot::EmptySnapshot;
-
-        let (mut dispatcher, seed) = serving_owner();
-        dispatcher.replication.forget_node(OWNER);
         let lineage = seed.lineage;
         let cutoff = Seq(HEAD);
         let cutoff_digest = canonical_history(lineage, ConfigVersion(1), HEAD)
@@ -5229,7 +5218,7 @@ mod dormant_twin_tests {
             valid_through_tick: Tick(u64::MAX),
             past_horizon,
         };
-        let result = RecoveryResult {
+        RecoveryResult {
             fenced_prior: FencingProof {
                 partition: P,
                 prior_generation: Generation(0),
@@ -5284,7 +5273,39 @@ mod dormant_twin_tests {
                 uncertain: false,
             },
             ledger: TailLedger::unknown(),
+        }
+    }
+
+    /// Node 1 holding generation 1 of `P` to [`HEAD`] in its engine, its primary built by a
+    /// `ReadOnly` `Recovered` at cutoff [`HEAD`] and then stood down by A1 revoking its epoch
+    /// (issue #105 unit 2, architect section 14). No receiver is held.
+    ///
+    /// With `floor`, node 1's engine is trimmed there before the `Recovered`, which is stepped
+    /// through [`Dispatcher::step`], so the harness's ladder alignment runs (issue #61).
+    fn stood_down_owner(floor: Option<u64>) -> (Dispatcher, DormantSeed) {
+        use rdb_core::contracts::authority::{AuthorityEvent, AuthorityView, DenyReason};
+        use rdb_core::contracts::event::{
+            Budgets, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
         };
+        use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
+        use rdb_core::contracts::time::{ControlTime, Tick};
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let (mut dispatcher, seed) = serving_owner();
+        dispatcher.replication.forget_node(OWNER);
+        let lineage = seed.lineage;
+        let view = |authority_seq, past_horizon| AuthorityView {
+            lineage,
+            grant_id: GrantId(1),
+            boot_id: BootId(1),
+            authority_generation: AuthorityGeneration(1),
+            config_version: ConfigVersion(1),
+            authority_seq,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon,
+        };
+        let result = recovered_result(&seed);
         let snapshot = EmptySnapshot::new();
         let budgets = Budgets::SPEC_DEFAULTS;
         let ctx = StepCtx {
@@ -6171,6 +6192,184 @@ mod dormant_twin_tests {
             "nothing trimmed"
         );
         dispatcher.snapshot_installs.clear();
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
+            Ok(floor_at(10))
+        );
+    }
+
+    /// Fence node 1's F1 for `P` on `seed`'s lineage: placement's plan, then the proof, stepped
+    /// straight into the hosted F1, so its phase leaves `Idle`.
+    fn fence_owner(dispatcher: &mut Dispatcher, seed: &DormantSeed) {
+        use rdb_core::contracts::authority::{AuthorityView, DenyReason, FencingProof, Revocation};
+        use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, Module, StepCtx};
+        use rdb_core::contracts::ids::{AuthorityGeneration, CorrelationId, EventId, GrantId};
+        use rdb_core::contracts::recovery::{
+            Candidate, LineageAnchor, PriorRecord, RecoveryEvent, RecoveryPlan, TailRelease,
+        };
+        use rdb_core::contracts::time::ControlTime;
+
+        use crate::storage::snapshot::EmptySnapshot;
+
+        let plan = RecoveryPlan {
+            anchor: LineageAnchor {
+                lineage: seed.lineage,
+                base_seq: Seq::ZERO,
+                base_digest: Digest::ROOT,
+            },
+            config: seed.config.clone(),
+            candidates: seed
+                .config
+                .members
+                .iter()
+                .map(|member| Candidate {
+                    copy: member.copy,
+                    primary_eligible: true,
+                    healthy: true,
+                    within_capacity: true,
+                    has_valid_grant: true,
+                })
+                .collect(),
+            rebuild_required: std::collections::BTreeSet::new(),
+            authority_view: AuthorityView {
+                lineage: seed.lineage,
+                grant_id: GrantId(1),
+                boot_id: BootId(1),
+                authority_generation: AuthorityGeneration(1),
+                config_version: ConfigVersion(1),
+                authority_seq: 1,
+                valid_through_tick: Tick(u64::MAX),
+                past_horizon: DenyReason::NoGrant,
+            },
+            retention_millis: 1_000,
+            must_hold: std::collections::BTreeSet::new(),
+            prior: PriorRecord::fresh(),
+            release: TailRelease::default(),
+        };
+        let proof = FencingProof {
+            partition: P,
+            prior_generation: seed.lineage.generation,
+            prior_owner_epoch: seed.lineage.owner_epoch,
+            prior_grant_id: GrantId(1),
+            prior_boot_id: BootId(1),
+            revocation: Revocation::DurableDrain {
+                ack_revision: Revision(1),
+            },
+            control_revision: Revision(1),
+            decision_tick: Tick(1),
+        };
+        let snapshot = EmptySnapshot::new();
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let ctx = StepCtx {
+            now: Tick(1),
+            control_time: ControlTime {
+                estimate: Tick(1),
+                error_millis: 10,
+                bound_established: true,
+                sampled_at: Tick(1),
+            },
+            node: OWNER,
+            boot: BootId(1),
+            partition: P,
+            generation: seed.lineage.generation,
+            owner_epoch: seed.lineage.owner_epoch,
+            config_version: ConfigVersion(1),
+            snapshot: &snapshot,
+            budgets: &budgets,
+        };
+        for (id, event) in [
+            RecoveryEvent::Plan(Box::new(plan)),
+            RecoveryEvent::FenceProven(Box::new(proof)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = Event {
+                id: EventId(id as u64 + 1),
+                at: Tick(1),
+                node: OWNER,
+                boot: BootId(1),
+                partition: P,
+                correlation: CorrelationId(1),
+                kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+            };
+            dispatcher
+                .recovery
+                .step(&ctx, &event)
+                .expect("F1 answers its own event");
+        }
+    }
+
+    /// Issue #61 S3, a no-trim gate (design 3.1: "F1 on this node runs a recovery for p"): with
+    /// node 1's F1 fenced and not yet committed, a round trims nothing; once that F1 is gone
+    /// (a restart forgets it), the next round trims. Cut: the gate removed, red. Unit, under a
+    /// second.
+    #[test]
+    fn t61_sim_a_running_recovery_holds_the_duty() {
+        let (mut dispatcher, seed) = owner_of(1, 10);
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), RETAIN)
+            .expect("a round");
+        fence_owner(&mut dispatcher, &seed);
+        let phase = dispatcher
+            .recovery
+            .get(OWNER, P)
+            .map(rdb_core::recovery::Recovery::phase);
+        assert!(
+            phase
+                .as_ref()
+                .is_some_and(|phase| *phase != super::RecoveryPhase::Idle),
+            "F1 is running: {phase:?}"
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(RetentionDecision::Held(RetentionHold::Recovering))
+        );
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(1)), Seq::ZERO),
+            "nothing trimmed"
+        );
+        dispatcher.recovery.forget_node(OWNER);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
+            Ok(floor_at(10))
+        );
+    }
+
+    /// Issue #61 S3, a no-trim gate (design 3.1: "a landing is pending"): while a `Recovered`
+    /// for node 1 and `P` waits in a member watch, a round trims nothing; once it is gone, the
+    /// next round trims. Cut: the gate removed, red. Unit, under a second.
+    #[test]
+    fn t61_sim_a_pending_landing_holds_the_duty() {
+        use rdb_core::contracts::ids::CorrelationId;
+
+        let (mut dispatcher, seed) = owner_of(1, 10);
+        sync_owner(&mut dispatcher, 10);
+        dispatcher
+            .retention_duty(OWNER, P, Tick(0), RETAIN)
+            .expect("a round");
+        dispatcher.watches.insert(
+            (Tick(5_000), 0),
+            super::Watch {
+                member: OWNER,
+                emitter: OWNER,
+                partition: P,
+                correlation: CorrelationId(1),
+                result: Box::new(recovered_result(&seed)),
+            },
+        );
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN),
+            Ok(RetentionDecision::Held(RetentionHold::LandingPending))
+        );
+        assert_eq!(
+            floors(&dispatcher),
+            (Some(Seq(1)), Seq::ZERO),
+            "nothing trimmed"
+        );
+        dispatcher.watches.clear();
         assert_eq!(
             dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN),
             Ok(floor_at(10))
