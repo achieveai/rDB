@@ -835,6 +835,19 @@ record. Use it to send a request to the right node.
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.
+
+**The app address is only a dial hint** (SBX answer, 2026-11-20). The SBX gateway consumes
+`route.app_address()` to forward a request to the owner's gateway. rDB does not bind the
+address to the node, so the address alone proves nothing:
+
+- rDB runs embedded in the app's process only. Its ports must not be reachable from sandbox
+  or app networks.
+- A gateway forwards to another gateway over its own mutual TLS, on the private network.
+- **The sender** checks the receiver's TLS certificate identity against the route's owner
+  node id (`route.owner`) before it sends any data or credentials. A wrong or stale address
+  then fails the handshake, and nothing is sent.
+- **The receiver** checks `db.still_owner(partition, token)` (#84) before it accepts
+  forwarded data, so a request that reaches a former owner is refused.
 - A node's `Db` keeps the partition answer while its control watch is open, until the watch
   delivers a change to that partition or ends. It opens no new watch. An app-only `Db` (no
   local node) reads rEtcd on every call.

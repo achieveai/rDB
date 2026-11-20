@@ -759,6 +759,14 @@ impl RouteInfo {
     /// `rdb_node --form`, which has no `nodes/` records), or no read of that owner has
     /// succeeded yet. A stale address is safe because the sender checks the receiver's TLS
     /// identity against [`Self::owner`] before it sends anything.
+    ///
+    /// **Only a dial hint** (SBX answer, 2026-11-20). rDB does not bind the address to the
+    /// node. rDB runs embedded in-process only, and its ports must not be reachable from
+    /// sandbox or app networks; gateways forward over their own mTLS on the private network.
+    /// The sender checks the receiver's TLS identity against [`Self::owner`] before sending any
+    /// data or credentials, so a wrong or stale address fails the handshake; the receiver
+    /// checks [`crate::Db::still_owner`] with [`Self::token`] before accepting forwarded data.
+    /// See `docs/rdb/embed.md`, "Which node owns a group".
     #[must_use]
     pub fn app_address(&self) -> Option<&str> {
         self.owner_address.as_deref()
