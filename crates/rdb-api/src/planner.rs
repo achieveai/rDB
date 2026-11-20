@@ -31,7 +31,7 @@ use bytes::Bytes;
 use config_core::{ConfigError, ConfigStore, GetRequest, ListRequest, MutationOutcome, PutRequest};
 use futures::StreamExt;
 use rdb_core::authority::clock::{e_new, expiry_proven, utc_ok, ClockView};
-use rdb_core::authority::grant::GrantRecord;
+use rdb_core::authority::grant::{clear_frozen_verdict, GrantRecord};
 use rdb_core::authority::partition::{PartitionRecord, RecordMember};
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::event::Budgets;
@@ -583,6 +583,11 @@ impl Planner {
             .filter(|(_, record)| record.frozen)
             .map(|(node, _)| *node)
             .collect();
+        // #81 X2: a frozen grant of a node that owns nothing is a candidate for the clear.
+        let records: Vec<PartitionRecord> = partitions.iter().map(|entry| entry.0).collect();
+        for node in frozen.iter().filter(|node| !owned.contains_key(node)) {
+            self.clear_frozen(*node, &records).await;
+        }
         let mut todo = Vec::new();
         for (owner, records) in owned {
             // A planner does not judge its own node while that node's grant stands: its own
@@ -880,6 +885,76 @@ impl Planner {
             );
         }
         Ok((to, answer))
+    }
+
+    /// #81 X2 (owner answer (a) on #81, 2026-11-19): delete `grants/{node}` when it is a frozen
+    /// record of a boot that is gone and the node owns nothing ([`clear_frozen_verdict`]), so
+    /// the node's new boot can be chosen and promoted again. Run by [`Self::sweep`] only, so
+    /// only while this planner holds `planner/grant`. The record is read again here and deleted
+    /// at that read's `mod_revision`: a renewal or a fresh freeze in between makes the delete
+    /// a conflict, and nothing is cleared.
+    async fn clear_frozen(&self, node: NodeId, partitions: &[PartitionRecord]) {
+        let key = ControlKey::Grant(node).encode();
+        let found = match self
+            .store
+            .get(GetRequest {
+                key: Bytes::from(key.clone()),
+            })
+            .await
+        {
+            Ok(read) => read.record,
+            Err(error) => {
+                tracing::warn!(node = node.0, %error, "planner_frozen_grant_unread");
+                return;
+            }
+        };
+        let Some(found) = found else { return };
+        let Some(record) = GrantRecord::decode(&found.value) else {
+            tracing::warn!(
+                node = node.0,
+                revision = found.mod_revision,
+                "planner_frozen_grant_undecodable"
+            );
+            return;
+        };
+        let live = self.links.boot_of(node);
+        let now = self.clock.now();
+        let sample = self.clock.sample(now, &self.budgets);
+        if let Err(refusal) =
+            clear_frozen_verdict(node, &record, live, partitions, sample, now, &self.budgets)
+        {
+            tracing::debug!(
+                node = node.0,
+                record_boot = record.boot.0,
+                live_boot = live.map(|boot| boot.0),
+                ?refusal,
+                "planner_frozen_grant_kept"
+            );
+            return;
+        }
+        match admin::delete_grant_at(&*self.store, node, found.mod_revision).await {
+            Ok(admin::Clearance::Cleared(at)) => tracing::info!(
+                node = node.0,
+                record_boot = record.boot.0,
+                live_boot = live.map(|boot| boot.0),
+                revision = found.mod_revision,
+                cleared_at = ?at,
+                "planner_frozen_grant_cleared"
+            ),
+            // Moved or gone since the read (a new freeze, a takeover): the next sweep reads again.
+            Ok(clearance) => tracing::debug!(
+                node = node.0,
+                revision = found.mod_revision,
+                ?clearance,
+                "planner_frozen_grant_not_cleared"
+            ),
+            Err(error) => tracing::warn!(
+                node = node.0,
+                revision = found.mod_revision,
+                %error,
+                "planner_frozen_grant_clear_failed"
+            ),
+        }
     }
 
     async fn grants(&self) -> Result<BTreeMap<NodeId, GrantRecord>, Unread> {

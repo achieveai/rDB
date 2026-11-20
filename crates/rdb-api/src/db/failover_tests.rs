@@ -6,7 +6,7 @@
 //! `cut-control` together: its links read nothing and write nothing, probes included, and its
 //! grant stops renewing. A stop is a pause, as `resume` shows. An exit is `Net::shutdown` (or
 //! dropping the last `Arc<Net>`): it ends every link, accepted ones too, and stops listening
-//! (`own81_net_shutdown_leaves_no_link_answering`).
+//! (`own81_net_shutdown_leaves_no_link_answering`); [`Rig::restart`] uses it.
 
 use super::reopen_tests::{config, fast, open_app, runtime};
 use super::*;
@@ -29,6 +29,8 @@ struct Rig {
     store: Arc<dyn ConfigStore>,
     _dirs: Vec<Box<dyn std::any::Any>>,
     cert_dir: std::path::PathBuf,
+    /// The database folder every process opens (`nodes/{n}` each), for [`Rig::restart`].
+    dir: std::path::PathBuf,
     addrs: BTreeMap<NodeId, String>,
     procs: Vec<Proc>,
     partitions: u32,
@@ -141,56 +143,29 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
             .zip(failovers)
             .map(|((node, listener), failover)| {
                 let node = *node;
-                let boot = next_boot(dir.path()).expect("a boot");
-                let label = Label::Node(node);
-                let links = Links::new();
-                let faults = Faults::new();
-                let net = Net::start(
-                    NetConfig {
-                        tls: certs::load(cert_dir.path(), &label).expect("node certs"),
-                        label,
-                        boot,
-                        peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
-                        dial: NetConfig::dial_lower(node, &addrs),
-                        protocol_version: PROTOCOL_VERSION,
-                        admin_apps: BTreeSet::new(),
-                        faults: Arc::clone(&faults),
+                let grant_cuts = &mut grant_cuts;
+                start_proc(
+                    &rt,
+                    dir.path(),
+                    cert_dir.path(),
+                    &addrs,
+                    &store,
+                    node,
+                    listener,
+                    failover,
+                    |control| {
+                        if cut != Some(node) {
+                            return control;
+                        }
+                        let grant_cut = PrefixCut::new(
+                            control,
+                            &ControlKey::Grant(node).encode(),
+                            CutCalls::Writes,
+                        );
+                        grant_cuts.insert(node, Arc::clone(&grant_cut));
+                        grant_cut
                     },
-                    &links,
-                    Some(listener),
                 )
-                .expect("the node's net starts");
-                let mut control: Arc<dyn ConfigStore> =
-                    CutStore::new(Arc::clone(&store), Arc::clone(&faults));
-                if cut == Some(node) {
-                    let grant_cut = PrefixCut::new(
-                        control,
-                        &ControlKey::Grant(node).encode(),
-                        CutCalls::Writes,
-                    );
-                    grant_cuts.insert(node, Arc::clone(&grant_cut));
-                    control = grant_cut;
-                }
-                let db = rt
-                    .block_on(Db::open_with(
-                        DbConfig {
-                            local: vec![node],
-                            links: Some(links),
-                            boot: Some(boot),
-                            failover,
-                            ..config(dir.path())
-                        },
-                        control,
-                        rt.handle().clone(),
-                        budgets(),
-                    ))
-                    .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
-                Proc {
-                    db,
-                    net,
-                    faults,
-                    boot,
-                }
             })
             .collect()
     };
@@ -198,6 +173,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         rt,
         store,
         cert_dir: cert_dir.path().to_path_buf(),
+        dir: dir.path().to_path_buf(),
         _dirs: vec![Box::new(dir), Box::new(cert_dir)],
         addrs,
         procs,
@@ -205,6 +181,121 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         grant_cuts,
     };
     rig
+}
+
+/// Start node `node`'s process on `listener`, at the next boot of `dir`: its `Net` and its
+/// `Db`, the `Db` reaching `store` through a [`CutStore`] on the process's own faults, and
+/// `wrap` around that (a row's extra cut).
+#[allow(clippy::too_many_arguments)]
+fn start_proc(
+    rt: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+    cert_dir: &std::path::Path,
+    addrs: &BTreeMap<NodeId, String>,
+    store: &Arc<dyn ConfigStore>,
+    node: NodeId,
+    listener: tokio::net::TcpListener,
+    failover: Option<Failover>,
+    wrap: impl FnOnce(Arc<dyn ConfigStore>) -> Arc<dyn ConfigStore>,
+) -> Proc {
+    let _entered = rt.enter();
+    let boot = next_boot(dir).expect("a boot");
+    let label = Label::Node(node);
+    let links = Links::new();
+    let faults = Faults::new();
+    let net = Net::start(
+        NetConfig {
+            tls: certs::load(cert_dir, &label).expect("node certs"),
+            label,
+            boot,
+            peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
+            dial: NetConfig::dial_lower(node, addrs),
+            protocol_version: PROTOCOL_VERSION,
+            admin_apps: BTreeSet::new(),
+            faults: Arc::clone(&faults),
+        },
+        &links,
+        Some(listener),
+    )
+    .expect("the node's net starts");
+    let control = wrap(CutStore::new(Arc::clone(store), Arc::clone(&faults)));
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![node],
+                links: Some(links),
+                boot: Some(boot),
+                failover,
+                ..config(dir)
+            },
+            control,
+            rt.handle().clone(),
+            budgets(),
+        ))
+        .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
+    Proc {
+        db,
+        net,
+        faults,
+        boot,
+    }
+}
+
+impl Rig {
+    /// Stop process `i` for good, as a crash and a supervisor's start would, and start node
+    /// `i + 1` again on its folder and address at a new boot, running `failover`.
+    fn restart(&mut self, i: usize, failover: Option<Failover>) {
+        let node = ALL_NODES[i];
+        // `Db::shutdown` leaves the links up; `Net::shutdown` ends them, as the process's exit
+        // would, so the peers meet the new boot when it dials or is dialled.
+        self.procs[i].db.shutdown();
+        self.procs[i].net.shutdown();
+        drop(self.procs.remove(i));
+        let listener = self.rt.block_on(async {
+            let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+            loop {
+                match tokio::net::TcpListener::bind(&self.addrs[&node]).await {
+                    Ok(listener) => break listener,
+                    Err(e) if Instant::now() < deadline => {
+                        tracing::debug!(error = %e, "own81_restart_bind_retry");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(e) => panic!("node {}'s address again: {e}", node.0),
+                }
+            }
+        });
+        let proc = start_proc(
+            &self.rt,
+            &self.dir,
+            &self.cert_dir,
+            &self.addrs,
+            &self.store,
+            node,
+            listener,
+            failover,
+            |control| control,
+        );
+        self.procs.insert(i, proc);
+        self.procs[i]
+            .db
+            .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the restarted process is ready");
+    }
+
+    /// The members `partitions/{partition}` pins.
+    fn members(&self, partition: u32) -> Vec<rdb_core::authority::partition::RecordMember> {
+        let key = ControlKey::Partition(PartitionId(partition)).encode();
+        self.rt
+            .block_on(self.store.get(config_core::GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("the store answers")
+            .record
+            .and_then(|found| {
+                rdb_core::authority::partition::RecordMember::decode_all(&found.value)
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Rig {
@@ -1757,4 +1848,100 @@ fn own81_net_shutdown_leaves_no_link_answering() {
         rig.procs[1].net.connection(NodeId(2)).is_none()
             && !rig.procs[1].net.heard_within(NodeId(2), Duration::from_secs(1))
     });
+}
+
+/// #81 X2 (owner answer (a), 2026-11-19): a second failover after the first owner returns.
+/// Node 1 stops and partition 1 moves to node 2 or 3, freezing `grants/1`. Node 1 restarts at a
+/// new boot (`Rig::restart`), as its supervisor does on exit 75. The new owner re-adds it as a
+/// regular copy, and the planner deletes the frozen `grants/1` of the gone boot
+/// (`planner_frozen_grant_cleared`). Then the new owner stops, and partition 1 moves again with
+/// no operator: two copies are eligible, node 1 among them, so no `lone_survivor` and no
+/// `TargetFrozen`. A node 1 chosen holds a grant of its own new boot.
+/// Integration (~40 s): two grant lapses, a restart and a re-add.
+/// Cut: `sweep` skips the `clear_frozen` pass; `grants/1` stays frozen, red at "the frozen
+/// grants/1 is cleared" (and, past that wait, the second failure ends `lone_survivor`).
+#[config_log::retcd_test]
+fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
+    const METHOD: &str = "own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy";
+    let mut rig = rig(1, Some(failover()));
+    until("a planner holds its grant", lifetimes(7), || {
+        rig.planner_grant().is_some()
+    });
+    rig.stop(0);
+    until("partition 1 moves and serves", lifetimes(20), || {
+        let record = rig.record(1);
+        record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
+    });
+    let first = rig.record(1);
+    let new_owner = first.owner;
+    assert!(rig.grants()[&NodeId(1)].frozen, "the promote froze grants/1");
+    let old_boot = rig.procs[0].boot;
+
+    rig.restart(0, Some(failover()));
+    let boot = rig.procs[0].boot;
+    assert!(boot > old_boot, "a new boot: {old_boot:?} -> {boot:?}");
+    until("node 1 is a regular copy again", lifetimes(20), || {
+        rig.members(1).iter().any(|member| {
+            member.node == NodeId(1) && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+        })
+    });
+    until("the frozen grants/1 is cleared", lifetimes(10), || {
+        rig.grants().get(&NodeId(1)).is_none_or(|grant| !grant.frozen)
+    });
+    let cleared = logged_at_least(METHOD, "planner_frozen_grant_cleared", 1);
+    assert!(
+        cleared
+            .iter()
+            .any(|line| line["node"] == 1 && line["record_boot"] == old_boot.0),
+        "{cleared:?}"
+    );
+    rig.wait_for_owner_grants();
+
+    let refused_before = logged(METHOD, "planner_no_eligible_copy").len();
+    let failed_before = logged(METHOD, "planner_promote_failed").len();
+    rig.stop(new_owner.0 as usize - 1);
+    until("partition 1 moves again and serves", lifetimes(20), || {
+        let record = rig.record(1);
+        record.owner != new_owner && record.lifecycle == PartitionLifecycle::Serving
+    });
+    let second = rig.record(1);
+    assert!(
+        second.generation > first.generation,
+        "a second promotion: {first:?} -> {second:?}"
+    );
+    let refused = logged(METHOD, "planner_no_eligible_copy");
+    assert_eq!(
+        refused.len(),
+        refused_before,
+        "no lone_survivor after the return: {refused:?}"
+    );
+    let failed = logged(METHOD, "planner_promote_failed");
+    assert!(
+        failed[failed_before..]
+            .iter()
+            .all(|line| !line["error"].as_str().unwrap_or("").contains("frozen")),
+        "no TargetFrozen: {failed:?}"
+    );
+    let decided: Vec<_> = logged(METHOD, "planner_promote_decision")
+        .into_iter()
+        .filter(|line| line["dead"] == new_owner.0)
+        .collect();
+    assert!(
+        // `answering` is logged with `?`, as `[1, 3]`.
+        decided.iter().any(|line| line["answering"]
+            .as_str()
+            .is_some_and(|nodes| nodes
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(", ")
+                .any(|node| node == "1"))),
+        "node 1 answered the look as a candidate: {decided:?}"
+    );
+    if second.owner == NodeId(1) {
+        until("node 1 holds a grant of its new boot", lifetimes(5), || {
+            rig.grants()
+                .get(&NodeId(1))
+                .is_some_and(|grant| grant.boot == boot && !grant.frozen)
+        });
+    }
+    println!("own81_x2 first={first:?} second={second:?}");
 }
