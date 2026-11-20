@@ -17,6 +17,10 @@
 //!   reach the transfer, and an offer to a node that is down is lost (`snapshot_send_failed`)
 //!   until that node's restart ends the transfer.
 //! - No idle abandonment (`SNAPSHOT_IDLE_MILLIS`): no sim transfer waits on a pull.
+//! - An install is left open only by a unit row's private hook (the host's debug
+//!   `snapshot_pages_held_from`, S2-R2's twin). An offer that passes the check replaces it,
+//!   `snapshot_install_replaced`, as on the host; when a new offer can reach it is the source's
+//!   rule (R13: the transfer ended, or a new generation).
 //! - A target's restart ends its transfers at the restart; the host ends them when the source
 //!   hears `PeerBooted`, which the simulator has no message for.
 //! - Each page entry's generation is the offered one: the memory engine keeps no level per

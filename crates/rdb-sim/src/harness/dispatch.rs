@@ -282,6 +282,14 @@ pub struct Dispatcher {
     /// byte of its first entry's value flipped after its chain is computed
     /// ([`Self::fault_snapshot_chunk`]).
     snapshot_chunk_fault: Option<u64>,
+    /// Each install a target holds open, by `(target, partition)`: the offer's generation, `S`
+    /// and the pages written. The host's `installs`, reduced to what a replacement logs. An install runs in one
+    /// call here ([`Self::snapshot_offer`]), so one is left open only when
+    /// `SnapshotHooks::pages_held_from` stops it (S2-R2's twin). Process memory of the target.
+    snapshot_installs: BTreeMap<(NodeId, PartitionId), (Generation, Seq, u64)>,
+    /// The host's debug-only snapshot hooks, for unit rows only.
+    #[cfg(test)]
+    snapshot_hooks: SnapshotHooks,
     /// The last `RecoveryResult` each F1 emitted, by the emitter's `(node, partition)`: what a
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
@@ -427,6 +435,9 @@ impl Dispatcher {
             snapshots_served: BTreeMap::new(),
             snapshot_transfers: BTreeMap::new(),
             snapshot_chunk_fault: None,
+            snapshot_installs: BTreeMap::new(),
+            #[cfg(test)]
+            snapshot_hooks: SnapshotHooks::default(),
             committed: BTreeMap::new(),
             transfer_plans: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -865,6 +876,7 @@ impl Dispatcher {
         // message, so they end here.
         self.snapshot_transfers
             .retain(|(source, _, _), _| *source != node);
+        self.snapshot_installs.retain(|(held, _), _| *held != node);
         let to_node: Vec<_> = self
             .snapshot_transfers
             .iter()
@@ -2244,6 +2256,18 @@ impl Dispatcher {
             self.offer_refused_heard(source, offer, to, reason);
             return Ok(());
         }
+        // The host's target replaces an open install with any offer that passes the check. The
+        // replacement rule (R13) is the source's: a new offer reaches an open install only after
+        // its transfer ended, or from a new generation ([`Self::snapshot_catchup`]).
+        if let Some((_, replaced_at, _)) = self.snapshot_installs.remove(&(to, partition)) {
+            tracing::info!(
+                node = to.0,
+                partition = partition.0,
+                replaced_at = replaced_at.0,
+                at = offer.at.0,
+                "snapshot_install_replaced"
+            );
+        }
         let barrier = ReplicationEnvelope::decode(&offer.barrier)
             .map(|envelope| envelope.record_digest)
             .map_err(|_| SimError::Config {
@@ -2261,24 +2285,25 @@ impl Dispatcher {
         let (generation, at) = (offer.lineage.generation, offer.at);
         let (mut chain, mut after) = (barrier, None);
         let (mut begun, mut entries, mut chunks) = (false, 0_u64, 0_u64);
+        let page_keys = self.snapshot_page_keys();
         loop {
+            if self.snapshot_pull_held(offer, chunks) {
+                self.snapshot_installs
+                    .insert((to, partition), (generation, at, chunks));
+                return Ok(());
+            }
             // The source's page, answering the pull `(after, chain)`.
             let page: Vec<ChunkEntry> =
                 self.engines
                     .get(&offer.from)
                     .map_or_else(Vec::new, |engine| {
                         engine
-                            .entries_after(
-                                partition,
-                                generation,
-                                after.as_ref(),
-                                SNAPSHOT_PAGE_KEYS,
-                            )
+                            .entries_after(partition, generation, after.as_ref(), page_keys)
                             .into_iter()
                             .map(|(ns, key, value, version)| (ns, key, value, version, generation))
                             .collect()
                     });
-            let done = page.len() < SNAPSHOT_PAGE_KEYS;
+            let done = page.len() < page_keys;
             let sent = chunk_chain(chain, &page);
             let page = self.snapshot_chunk_corrupted(chunks, page);
             // The target's side of the page.
@@ -2516,6 +2541,44 @@ impl Dispatcher {
             (to, partition, CorrelationId(0)),
             scheduler,
         )
+    }
+
+    /// Keys per page: [`SNAPSHOT_PAGE_KEYS`], or a unit row's `SnapshotHooks::page_keys`
+    /// (the host's `snapshot_page_keys`).
+    fn snapshot_page_keys(&self) -> usize {
+        #[cfg(test)]
+        if let Some(keys) = self.snapshot_hooks.page_keys {
+            return keys;
+        }
+        SNAPSHOT_PAGE_KEYS
+    }
+
+    /// S2-R2's hook, the host's debug `snapshot_pages_held_from`: the source does not answer
+    /// the pull for page `page` or later, logged `snapshot_pull_held{node, page}` on the
+    /// source. The install stays open on the target. Never outside a unit row.
+    #[cfg(test)]
+    fn snapshot_pull_held(&self, offer: &SnapshotOffer, page: u64) -> bool {
+        let held = self
+            .snapshot_hooks
+            .pages_held_from
+            .is_some_and(|from| page >= from);
+        if held {
+            tracing::info!(
+                node = offer.from.0,
+                partition = offer.lineage.partition.0,
+                copy = offer.copy.0,
+                page,
+                "snapshot_pull_held"
+            );
+        }
+        held
+    }
+
+    /// [`Self::snapshot_pull_held`] outside a unit row: no page is held.
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    const fn snapshot_pull_held(&self, _offer: &SnapshotOffer, _page: u64) -> bool {
+        false
     }
 
     /// S2-R3's hook: page `index` with one byte of its first entry's value flipped, when
@@ -4369,6 +4432,18 @@ impl DormantSeed {
     }
 }
 
+/// The host's debug-only snapshot hooks (issue #61 S2-R2), set by unit rows on a private field:
+/// no public surface.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SnapshotHooks {
+    /// The host's `snapshot_page_keys`: keys per page, [`SNAPSHOT_PAGE_KEYS`] when `None`.
+    page_keys: Option<usize>,
+    /// The host's `snapshot_pages_held_from`: the source holds the pull for this page and
+    /// every later one.
+    pages_held_from: Option<u64>,
+}
+
 /// The root a snapshot of `generation` carries, the host's `transfer_root`: the trim mark's root
 /// when the mark is this lineage's own, else the lineage's link base and the digest there, else
 /// `(0, ROOT)`. `None` when the record at the link base cannot be read.
@@ -5334,6 +5409,246 @@ mod dormant_twin_tests {
             floor(&trimmed),
             Some(Seq(2)),
             "aligned to the engine's floor"
+        );
+    }
+
+    /// Every line of `message` this unit row logged.
+    fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line.get("@m").and_then(serde_json::Value::as_str) == Some(message))
+            .collect()
+    }
+
+    /// Issue #61 S2-R4 (A9b2), the simulator's twin of the host row
+    /// `drop_tests::t61_s2_r2_a_source_lost_mid_transfer_is_replaced_by_the_new_primary`.
+    /// Parity is by matching assertions: this row does not run the host (lead, 2026-11-20).
+    ///
+    /// **The world.** Node 1 serves generation 1 through [`HEAD`] as copy 0's primary; node 3,
+    /// copy 2, is empty with a live receiver. Pages hold one key, and node 1 holds the pull for
+    /// page 2 (the host's `snapshot_pages_held_from`, a private unit hook here). Node 3 asks;
+    /// node 1 refills its thin ladder, opens a transfer and offers it; node 3 writes two pages
+    /// and waits. A newer barrier from node 1 is dropped in flight. Node 1 dies; node 2 is
+    /// named primary of generation 2 with `fresh_primary`'s `{(0, ROOT), cutoff}` and node 3
+    /// adopts it. Node 3 asks node 2, which refills, opens a transfer at its own `S`, and node 3
+    /// replaces its open install with it and installs.
+    ///
+    /// **Shared with the host row**, in its order: two pages written before the source died;
+    /// one `snapshot_transfer_installed`, at or above the floor; two `snapshot_install_begun`
+    /// (node 1's install, then node 2's); `snapshot_transfer_opened` for node 3's copy by node
+    /// 1 then node 2; one `snapshot_install_replaced`; no `snapshot_install_refused` or
+    /// `snapshot_reseed_ack_withheld`. The lead's note on that world: node 2's ladder is
+    /// refilled before its transfer opens (`snapshot_catchup_served{how = "ladder"}` first).
+    ///
+    /// **Differs.** The host's `snapshot_transfer_released{why = caught_up}` needs node 3's ACK
+    /// stepped through node 2's R1. Here the ACK is asserted queued for node 2; the release on
+    /// `CopyCaughtUp` is pinned by m10's
+    /// `t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head`.
+    /// The promote is by hand (the simulator has one F1-led recovery, M7V-47), and node 1's
+    /// death is its process memory dropped ([`Dispatcher::rebuild_kernels`]). Added here, the
+    /// lead's R13 condition: the newer barrier during the hold logs
+    /// `snapshot_catchup_in_flight` and replaces nothing.
+    ///
+    /// Cuts: replace on any offer (the in-flight check dropped), red (no
+    /// `snapshot_catchup_in_flight`: the newer barrier opens a second transfer); the
+    /// replacement removed, red (no `snapshot_install_replaced`).
+    /// Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s2_r4_a_source_lost_mid_transfer_is_replaced_by_the_new_primary() {
+        use rdb_core::contracts::time::Tick;
+        use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+
+        const METHOD: &str =
+            "t61_sim_s2_r4_a_source_lost_mid_transfer_is_replaced_by_the_new_primary";
+        let (mut dispatcher, seed) = serving_owner();
+        let mut scheduler = Scheduler::new();
+        let (two, three) = (NodeId(2), NodeId(3));
+        let receiver = |config: &PartitionConfig, lineage: Lineage| {
+            AppendReceiver::new(ReceiverInit {
+                config: config.clone(),
+                own: CopyId(2),
+                lineage,
+                head: Head {
+                    seq: Seq::ZERO,
+                    digest: Digest::ROOT,
+                },
+                durable: DurableSeq(0),
+            })
+            .expect("node 3's receiver")
+        };
+        let synced = |dispatcher: &mut Dispatcher, node: NodeId, generation, through| {
+            dispatcher
+                .engines
+                .get_mut(&node)
+                .expect("an engine")
+                .sync_wal_through(vec![CapturedPrefix {
+                    partition: P,
+                    generation,
+                    through: AppliedSeq(through),
+                }])
+                .expect("synced");
+        };
+        for node in [two, three] {
+            dispatcher.register_node(node, BootId(1));
+        }
+        dispatcher.engines.insert(three, MemoryEngine::new(three));
+        dispatcher
+            .replication
+            .install_receiver(receiver(&seed.config, seed.lineage));
+        synced(&mut dispatcher, OWNER, Generation(1), HEAD);
+        dispatcher.snapshot_hooks.page_keys = Some(1);
+        dispatcher.snapshot_hooks.pages_held_from = Some(2);
+
+        // Node 3 asks node 1: a refill, then the transfer, offered at once and held at page 2.
+        for _ in 0..2 {
+            dispatcher
+                .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD), &mut scheduler)
+                .expect("served");
+        }
+        assert_eq!(
+            dispatcher.snapshot_installs.get(&(three, P)).copied(),
+            Some((Generation(1), Seq(HEAD), 2)),
+            "node 3 wrote two pages before node 1 died"
+        );
+        // R13: a newer barrier from the same source does not replace the open install.
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD + 1), &mut scheduler)
+            .expect("in flight");
+        assert_eq!(logged(METHOD, "snapshot_catchup_in_flight").len(), 1);
+
+        // Node 1 dies; node 2 is named primary of generation 2 and node 3 adopts it.
+        dispatcher.rebuild_kernels(OWNER);
+        dispatcher.snapshot_hooks.pages_held_from = None;
+        let lineage = Lineage {
+            partition: P,
+            generation: Generation(2),
+            owner_epoch: OwnerEpoch(2),
+        };
+        let member = |copy: u8, node: u32, role| Member {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            boot: BootId(1),
+            role,
+        };
+        let config = PartitionConfig::new(
+            P,
+            ConfigVersion(2),
+            vec![
+                member(0, 1, ReplicaRole::RegularSecondary),
+                member(1, 2, ReplicaRole::Primary),
+                member(2, 3, ReplicaRole::RegularSecondary),
+            ],
+        );
+        let cutoff = HEAD + 1;
+        let history = canonical_history(lineage, ConfigVersion(2), cutoff).expect("history");
+        let mut engine = MemoryEngine::new(two);
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit");
+        }
+        dispatcher.engines.insert(two, engine);
+        synced(&mut dispatcher, two, Generation(2), cutoff);
+        let mut ladder = DigestLadder::new();
+        ladder.insert(Seq::ZERO, Digest::ROOT);
+        ladder.insert(Seq(cutoff), history.digest(cutoff));
+        dispatcher.replication.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: config.clone(),
+                own: CopyId(1),
+                lineage,
+                history: ladder,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(cutoff),
+                    buffered_applied: AppliedSeq(cutoff),
+                    durable: DurableSeq(cutoff),
+                },
+            })
+            .expect("node 2's tracker"),
+        );
+        dispatcher
+            .replication
+            .install_receiver(receiver(&config, lineage));
+
+        // Node 3 asks node 2: a refill of its fresh ladder, then a transfer at its own `S`.
+        for _ in 0..2 {
+            dispatcher
+                .snapshot_catchup(two, P, CopyId(2), Seq(cutoff), &mut scheduler)
+                .expect("served");
+        }
+
+        let served: Vec<_> = logged(METHOD, "snapshot_catchup_served")
+            .iter()
+            .map(|line| {
+                (
+                    line["node"].as_u64(),
+                    line["how"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(
+            served,
+            vec![
+                (Some(1), Some("ladder".to_owned())),
+                (Some(2), Some("ladder".to_owned()))
+            ],
+            "each primary refills its thin ladder before it opens a transfer"
+        );
+        let opened: Vec<_> = logged(METHOD, "snapshot_transfer_opened")
+            .iter()
+            .filter(|line| line["to"] == 3)
+            .map(|line| line["node"].as_u64())
+            .collect();
+        assert_eq!(
+            opened,
+            vec![Some(1), Some(2)],
+            "re-offered by the new primary"
+        );
+        assert_eq!(logged(METHOD, "snapshot_pull_held").len(), 1);
+        let begun = logged(METHOD, "snapshot_install_begun");
+        assert_eq!(begun.len(), 2, "node 1's install, then node 2's: {begun:?}");
+        let replaced = logged(METHOD, "snapshot_install_replaced");
+        assert_eq!(
+            replaced.len(),
+            1,
+            "node 2's offer replaced node 1's install: {replaced:?}"
+        );
+        let installed = logged(METHOD, "snapshot_transfer_installed");
+        assert_eq!(installed.len(), 1, "{installed:?}");
+        assert_eq!(
+            (installed[0]["from"].as_u64(), installed[0]["at"].as_u64()),
+            (Some(2), Some(cutoff)),
+            "{installed:?}"
+        );
+        for refused in ["snapshot_install_refused", "snapshot_reseed_ack_withheld"] {
+            let lines = logged(METHOD, refused);
+            assert!(lines.is_empty(), "{refused}: {lines:?}");
+        }
+
+        // The end state: node 3 holds generation 2 at `S`, nothing of node 1's install, a live
+        // receiver there, and its ACK is on its way to node 2.
+        let node_3 = &dispatcher.engines[&three];
+        assert_eq!(
+            (
+                node_3.buffered_applied(P, Generation(2)),
+                node_3.installing(P, Generation(2)),
+                node_3.installing(P, Generation(1)),
+                node_3.buffered_applied(P, Generation(1)),
+            ),
+            (AppliedSeq(cutoff), None, None, AppliedSeq(0)),
+            "node 3 switched to node 2's install"
+        );
+        let held = dispatcher
+            .replication
+            .receiver(three, P)
+            .map(|receiver| (receiver.lineage(), receiver.applied_head().seq));
+        assert_eq!(held, Some((lineage, Seq(cutoff))), "re-seeded at S");
+        assert!(
+            dispatcher.snapshot_installs.is_empty(),
+            "no install left open"
+        );
+        assert_eq!(
+            scheduler.take_for(two, Tick(u64::MAX)).len(),
+            1,
+            "node 3's ACK is queued for node 2"
         );
     }
 }
