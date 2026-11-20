@@ -32,6 +32,9 @@ tokio-stream = { workspace = true }
 # `CutStore` implements `config_core::ConfigStore`, an `async_trait` trait.
 async-trait = { workspace = true }
 rcgen = { workspace = true }
+# #80 S2: `certs::load_control` reads the cluster id from the client certificate's SAN, which
+# needs its DER. The version config-grpc already reads PEM with; not a new vendor.
+rustls-pemfile = "2"
 
 [dev-dependencies]
 # `rdb_dev` starts three in-process rEtcd voters on RocksDB.
@@ -54,6 +57,9 @@ sha2 = { workspace = true }
 rocksdb = { workspace = true }
 # Row 13j reads the `@t` of a log line, to place a peer's clock at the first admission.
 chrono = { workspace = true }
+# #80 S2: row s2_gen_certs_* reads a voter certificate's DNS and IP SANs. Already the workspace's
+# certificate parser (config-grpc).
+x509-parser = { workspace = true }
 
 [build-dependencies]
 protox = { workspace = true }

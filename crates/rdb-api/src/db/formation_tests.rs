@@ -7,7 +7,7 @@ use super::reopen_tests::{config, fast, runtime};
 use super::*;
 use crate::net::faults::Faults;
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
-use crate::test_store::{HoldAt, PutHold, Script, Scripted};
+use crate::test_store::{HoldAt, PutHold, Script, Scripted, TlsReported};
 
 /// The partition count the rows declare: more than one per node, so each owner forms several.
 const PARTITIONS: u32 = 8;
@@ -3071,7 +3071,8 @@ fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
             assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
         }
     }
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    // #80 S2: `[::2]` is not a loopback IP, so the declaration needs a TLS control store.
+    let store: Arc<dyn ConfigStore> = TlsReported::new(Arc::new(config_testkit::MemStore::new()));
     let declared = rt.block_on(admin::declare(
         &store,
         &pair("[::1]:7100", "[::2]:7100", None),
@@ -3122,7 +3123,10 @@ fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
         ("[::]:7100", "an unspecified", "[::3]:7100"),
         ("[::ffff:0.0.0.0]:7100", "an unspecified", "127.0.0.3:7100"),
     ] {
-        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        // #80 S2: a TLS control store, since a corrected `[::3]` is not a loopback IP. Every
+        // refusal here comes before the control-TLS check.
+        let store: Arc<dyn ConfigStore> =
+            TlsReported::new(Arc::new(config_testkit::MemStore::new()));
         let refused = rt.block_on(admin::declare(&store, &with_node(3, bad, None)));
         assert!(
             matches!(&refused, Err(admin::DeclareError::Refused(text))
@@ -3151,7 +3155,9 @@ fn s1b_declare_refuses_an_undialable_address_then_takes_the_corrected_one() {
 #[config_log::retcd_test]
 fn s1b_declare_refuses_a_host_or_label_outside_the_whitelist() {
     let rt = runtime();
-    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    // #80 S2: a TLS control store, since the accepted `db-c.example` is a host name. Every
+    // refusal here comes before the control-TLS check.
+    let store: Arc<dyn ConfigStore> = TlsReported::new(Arc::new(config_testkit::MemStore::new()));
     let hosts = [
         "db c.example:7100",
         "db\tc.example:7100",
@@ -3768,4 +3774,382 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
         "{again:?}"
     );
     assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
+}
+
+/// The rEtcd cluster the #80 S2 control-TLS rows run against.
+const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
+
+/// A three-voter rEtcd serving both planes under mutual TLS, on `rt` (#80 S2): its static
+/// policy grants only the shared rDB client ([`certs::CONTROL_CLIENT`]) read and write on every
+/// key, so rDB's control traffic (CAS, list, watch) is held to a real principal. Returned with
+/// a client built from files in the `--control-tls` layout by [`certs::load_control`], with
+/// the cluster id read from its certificate; its endpoints list the followers first, so its
+/// first call meets a follower and must follow an authenticated leader hint. The `Box` keeps
+/// the certificate folder.
+fn mtls_control(
+    rt: &tokio::runtime::Runtime,
+    seed: u64,
+) -> (
+    config_testkit::Cluster,
+    config_client::GrpcClient,
+    Box<dyn std::any::Any>,
+) {
+    let policy = format!(
+        "[[grant]]\nprincipal = \"{}\"\nprefix = \"\"\naccess = [\"read\", \"write\"]\n",
+        certs::CONTROL_CLIENT
+    );
+    let cluster = rt.block_on(
+        config_testkit::Cluster::builder()
+            .nodes(3)
+            .cluster_id(S2_CLUSTER)
+            .storage(config_testkit::cluster::StorageKind::Ephemeral)
+            .mutual_tls(seed)
+            .authz(config_testkit::cluster::AuthzKind::Static(policy))
+            .start(),
+    );
+    let leader = rt.block_on(cluster.leader());
+    let dir = config_testkit::fs::temp_dir();
+    let pair = cluster
+        .fixture()
+        .issue(config_testkit::CertProfile::client(certs::CONTROL_CLIENT));
+    for (name, text) in [
+        ("ca.pem", &pair.ca_pem),
+        ("client.pem", &pair.cert_pem),
+        ("client.key", &pair.key_pem),
+    ] {
+        std::fs::write(dir.path().join(name), text).expect("a control certificate file");
+    }
+    let control = certs::load_control(dir.path()).expect("the control folder loads");
+    assert_eq!(
+        control.cluster, S2_CLUSTER,
+        "the cluster id comes from client.pem"
+    );
+    let mut endpoints: Vec<String> = cluster
+        .followers()
+        .into_iter()
+        .map(|id| cluster.client_endpoint(id))
+        .collect();
+    endpoints.push(cluster.client_endpoint(leader));
+    let _entered = rt.enter();
+    let client = config_client::GrpcClient::connect(
+        endpoints,
+        config_client::GrpcClientOptions {
+            tls: config_client::TlsMode::MutualTls(control.mtls),
+            ..config_client::GrpcClientOptions::default()
+        },
+    )
+    .expect("a control client")
+    .with_cluster_id(control.cluster);
+    (cluster, client, Box::new(dir))
+}
+
+/// Put `k<p>` in every partition through its owner and read it back (#80 S2): each partition
+/// takes writes.
+fn writes_in_every_partition(rig: &Rig, round: &str) {
+    for partition in 1..=PARTITIONS {
+        let owner = NodeId(ring(rig.k, partition).primary);
+        let db = rig.of(owner);
+        let group = group_of(db, partition);
+        let key = format!("{round}-k{partition}");
+        let put = put_lands(db, group, key.as_bytes(), b"v");
+        assert_eq!(put.partition, PartitionId(partition), "{put:?}");
+        let got = db.get_in(group, key.as_bytes()).expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"v"[..]),
+            "{round}: {got:?}"
+        );
+    }
+}
+
+/// A rig of nodes 1 to 3 on 127.0.0.1 to .3, declared and opened over [`mtls_control`]'s
+/// client, every node ready; with the rEtcd cluster and the client.
+fn mtls_rig(
+    seed: u64,
+) -> (
+    Rig,
+    config_testkit::Cluster,
+    config_client::GrpcClient,
+    Box<dyn std::any::Any>,
+) {
+    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let (cluster, client, certs) = mtls_control(&rig.rt, seed);
+    assert_eq!(
+        client.capabilities().transport_security,
+        config_core::TransportSecurity::MutualTls,
+        "the control store reports mutual TLS"
+    );
+    rig.store = Arc::new(client.clone());
+    rig.declare_created();
+    rig.open_all(fresh_dirs());
+    rig.wait_ready();
+    (rig, cluster, client, certs)
+}
+
+/// #80 S2 SC1 (AC1, ADR-rdb-0024): a database declared over a mutual-TLS control link, from a
+/// `--control-tls` folder read by `certs::load_control`, forms: three node processes become
+/// ready, and every partition takes a put and reads it back. rEtcd's static policy grants only
+/// the shared `rdb` client, so the declaration's CAS writes, the opens' lists and the hosts'
+/// watches all pass as that principal. The control client starts at a follower, so the cluster
+/// id taken from the certificate is what lets it follow the leader hint. Integration (~5 s): a
+/// 3-voter TLS rEtcd and one formation of 8 partitions.
+/// Cut: the client is built with `TlsMode::Insecure`: it reports `Insecure`, red at the
+/// transport-security assertion (observed 2026-11-19).
+#[config_log::retcd_test]
+fn s2_declared_database_forms_and_writes_over_mtls_control() {
+    let (mut rig, cluster, client, _certs) = mtls_rig(801);
+    writes_in_every_partition(&rig, "s2-1");
+    assert!(
+        client.stats().hint_follows >= 1,
+        "a leader hint was followed: {:?}",
+        client.stats()
+    );
+    rig.shutdown_all();
+    rig.rt.block_on(cluster.shutdown());
+}
+
+/// #80 S2 SC2 (AC4): with the database of SC1 running, the voter leader stops; every partition
+/// still takes writes within the put budget, the client following the new leader's hint under
+/// mutual TLS. No `hint_identity_unverified` is logged. Integration (~8 s).
+/// Cut 1: `mtls_control` drops `.with_cluster_id`: hints are refused unfollowed
+/// (`hint_identity_unverified`) and the client, starting at a follower, never reaches the
+/// leader: red at the declaration. Observed 2026-11-19: `NotLeader` with an unfollowed hint.
+/// Review r1: after the stop, a fresh control sentinel (not an rDB key) is put create-only and
+/// read back exactly, so a control plane that takes no mutation after the stop is red even
+/// when the data plane writes on grants it holds. Cut 2: config-grpc's `put` handler refuses
+/// every put on a voter other than the first that took one (a new leader takes no control
+/// mutation): the sentinel put fails `DeadlineExceededUnknownOutcome`, red (observed
+/// 2026-11-19).
+#[config_log::retcd_test]
+fn s2_control_writes_go_on_after_the_voter_leader_stops() {
+    let (mut rig, cluster, client, _certs) = mtls_rig(802);
+    writes_in_every_partition(&rig, "before");
+    let leader = rig.rt.block_on(cluster.leader());
+    rig.rt.block_on(cluster.stop_node(leader));
+    let follows = client.stats().hint_follows;
+    // The voters elect a new leader first: a call made while none leads is `Unavailable`
+    // (observed in review r1's first run), which no client can answer before an election.
+    let after = rig.rt.block_on(cluster.leader());
+    // Review r1: a control mutation made after the leader stopped, not one the data plane can
+    // finish on grants it already holds. Create-only, so it is fresh, and read back exactly;
+    // the client last talked to the stopped leader, so it must follow the new one's hint.
+    let key = bytes::Bytes::from(format!("s2-sentinel/after-leader-{}-stopped", leader.0));
+    let value = bytes::Bytes::from(format!("sentinel stopped={} seed=802", leader.0));
+    rig.rt
+        .block_on(client.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: Some(0),
+            ..config_core::PutRequest::default()
+        }))
+        .expect("a fresh control put after the leader stopped");
+    let read = rig
+        .rt
+        .block_on(client.get(config_core::GetRequest { key: key.clone() }))
+        .expect("the control sentinel reads back");
+    assert_eq!(
+        read.record.map(|record| (record.key, record.value)),
+        Some((key, value)),
+        "the sentinel reads back exactly"
+    );
+    writes_in_every_partition(&rig, "after");
+    assert_ne!(after, leader, "a new voter leads");
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "s2_control_writes_go_on_after_the_voter_leader_stops",
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_string().contains("hint_identity_unverified")),
+        "no unverified hint"
+    );
+    tracing::info!(
+        stopped = leader.0,
+        new_leader = after.0,
+        follows_before = follows,
+        follows_after = client.stats().hint_follows,
+        "s2_voter_leader_stopped"
+    );
+    rig.shutdown_all();
+    rig.rt.block_on(cluster.shutdown());
+}
+
+/// The rig's 3-node declaration with its nodes at `hosts`, port 7100.
+fn declaration_on(hosts: [&str; 3]) -> admin::Declaration {
+    declaration_at(
+        &(1..=3)
+            .zip(hosts)
+            .map(|(n, host)| (NodeId(n), format!("{host}:7100")))
+            .collect(),
+        PARTITIONS,
+    )
+}
+
+/// #80 S2 SC3 (ruling 1, AC2, AC3): a declaration whose nodes are not all on loopback IPs is
+/// refused over a plaintext control store, naming the first such node, its address and
+/// `--control-tls`, and nothing is written: private IPs, a host name among loopback IPs, and
+/// `localhost` (a name says nothing about where it resolves). The same declarations over a
+/// store that reports mutual TLS are written, and 127.0.0.1 to .3 over the plaintext store are
+/// written too. Unit (<100 ms, an in-memory store).
+/// Cut: `declare` skips `control_tls_refusal`: the first case is written, red.
+#[config_log::retcd_test]
+fn s2_declare_refuses_plaintext_control_for_nodes_on_other_machines() {
+    let rt = runtime();
+    for (what, hosts, names) in [
+        (
+            "private IPs",
+            ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+            "node 1's address 10.0.0.1:7100",
+        ),
+        (
+            "a name among loopback IPs",
+            ["127.0.0.1", "db-2.example", "127.0.0.3"],
+            "node 2's address db-2.example:7100",
+        ),
+        (
+            "localhost",
+            ["127.0.0.1", "127.0.0.2", "localhost"],
+            "node 3's address localhost:7100",
+        ),
+        (
+            "a private IP between loopback IPs",
+            ["127.0.0.1", "10.0.0.2", "127.0.0.3"],
+            "node 2's address 10.0.0.2:7100",
+        ),
+        (
+            "an uppercase name after a loopback IP",
+            ["127.0.0.1", "DB-2.Example", "127.0.0.3"],
+            "node 2's address DB-2.Example:7100",
+        ),
+    ] {
+        let declared = declaration_on(hosts);
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let refused = rt.block_on(admin::declare(&store, &declared));
+        assert!(
+            matches!(&refused, Err(admin::DeclareError::Refused(text))
+                if text.contains(names) && text.contains("not TLS")
+                    && text.contains("--control-tls") && text.contains("nothing was written")),
+            "{what}: {refused:?}"
+        );
+        assert!(snapshot(&rt, &*store).is_empty(), "{what}: nothing written");
+        let tls: Arc<dyn ConfigStore> = TlsReported::new(Arc::new(config_testkit::MemStore::new()));
+        assert!(
+            matches!(
+                rt.block_on(admin::declare(&tls, &declared)),
+                Ok(admin::Declared::Created(_))
+            ),
+            "{what}: written over a TLS store"
+        );
+    }
+    for hosts in [
+        ["127.0.0.1", "127.0.0.2", "[::1]"],
+        ["127.0.0.2", "127.0.0.3", "[::ffff:127.0.0.1]"],
+    ] {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let declared = rt.block_on(admin::declare(&store, &declaration_on(hosts)));
+        assert!(
+            matches!(declared, Ok(admin::Declared::Created(_))),
+            "{hosts:?}: loopback IPs need no TLS: {declared:?}"
+        );
+    }
+}
+
+/// #80 S2 SC4 (ruling 1, AC2, AC6): a database declared at 10.0.0.1 to .3 (over a store that
+/// reports mutual TLS) is refused when node 1 opens it over the same records with a plaintext
+/// store: `OpenError::Config` naming node 1's address and `--control-tls`, nothing written, no
+/// `nodes/` folder. Over the TLS-reporting store the same open passes the check and opens.
+/// Unit (<1 s, an in-memory store, no net).
+/// Cut: `declared_open_refusal` skips `control_tls_refusal`: the plaintext open opens, red.
+#[config_log::retcd_test]
+fn s2_open_of_a_declared_database_refuses_plaintext_control() {
+    let rt = runtime();
+    let memory = Arc::new(config_testkit::MemStore::new());
+    let plain: Arc<dyn ConfigStore> = memory.clone();
+    let tls: Arc<dyn ConfigStore> = TlsReported::new(memory);
+    let hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"];
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(&tls, &declaration_on(hosts)))
+    else {
+        panic!("declared over TLS");
+    };
+    let addresses = NodeAddresses {
+        listen: "10.0.0.1:7100".to_owned(),
+        peers: (1..=3)
+            .zip(hosts)
+            .map(|(n, host)| (NodeId(n), format!("{host}:7100")))
+            .collect(),
+    };
+    let dir = config_testkit::fs::temp_dir();
+    let before = snapshot(&rt, &*plain);
+    let refused = open_declared_one(&rt, &plain, dir.path(), Some(addresses.clone()))
+        .map(|mut db| db.shutdown())
+        .expect_err("a plaintext open of a database on other machines is refused");
+    let text = refused.to_string();
+    assert!(matches!(refused, OpenError::Config(_)), "{text}");
+    for name in [
+        "node 1's address 10.0.0.1:7100",
+        "not TLS",
+        "--control-tls",
+        "nothing but its folder was created",
+    ] {
+        assert!(text.contains(name), "{name:?} in {text}");
+    }
+    assert_eq!(snapshot(&rt, &*plain), before, "nothing written");
+    assert!(!dir.path().join("nodes").exists(), "no nodes/ folder");
+    let mut db = open_declared_one(&rt, &tls, dir.path(), Some(addresses))
+        .unwrap_or_else(|e| panic!("over a TLS store node 1 opens: {e}"));
+    db.shutdown();
+}
+
+/// #80 S2 review r1, owner answer 1: an app-only open (`DbConfig::local` empty) of a database
+/// declared on other machines, over a plaintext store, is refused by the same `nodes/` rule,
+/// naming node 1 and `--control-tls`, before it reads the owner or counts an open: the store
+/// is unchanged. Over a TLS store the open passes that check (it is then refused for another
+/// reason: no node has formed partition 1). Unit (an in-memory store).
+/// Cut: `open_app` skips `control_tls_refusal`: the plaintext open is refused for the
+/// unformed partition instead, red.
+#[config_log::retcd_test]
+fn s2_app_open_of_a_declared_database_refuses_plaintext_control() {
+    let rt = runtime();
+    let memory = Arc::new(config_testkit::MemStore::new());
+    let plain: Arc<dyn ConfigStore> = memory.clone();
+    let tls: Arc<dyn ConfigStore> = TlsReported::new(memory);
+    let Ok(admin::Declared::Created(_)) = rt.block_on(admin::declare(
+        &tls,
+        &declaration_on(["10.0.0.1", "10.0.0.2", "10.0.0.3"]),
+    )) else {
+        panic!("declared over TLS");
+    };
+    let open_app = |store: &Arc<dyn ConfigStore>| {
+        let dir = config_testkit::fs::temp_dir();
+        rt.block_on(Db::open_with(
+            DbConfig {
+                local: Vec::new(),
+                links: Some(Arc::new(crate::transport::Links::default())),
+                ..config(dir.path())
+            },
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .map(|mut db| db.shutdown())
+    };
+    let before = snapshot(&rt, &*plain);
+    let refused = open_app(&plain).expect_err("a plaintext app open is refused");
+    let text = refused.to_string();
+    assert!(matches!(refused, OpenError::Config(_)), "{text}");
+    for name in [
+        "node 1's address 10.0.0.1:7100",
+        "not TLS",
+        "--control-tls",
+        "nothing was written",
+    ] {
+        assert!(text.contains(name), "{name:?} in {text}");
+    }
+    assert_eq!(snapshot(&rt, &*plain), before, "nothing written");
+    let over_tls = open_app(&tls).expect_err("no node formed partition 1 yet");
+    assert!(
+        !over_tls.to_string().contains("not TLS"),
+        "over TLS the app open passes the TLS check: {over_tls}"
+    );
 }
