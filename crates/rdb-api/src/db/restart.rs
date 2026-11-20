@@ -328,7 +328,7 @@ mod tests {
     /// made while nothing else is due. Unit.
     /// Cut: drop the hold (due as soon as `stopped_since` is set); the 4.9 s case is red.
     /// Cut: drop the owns-none guard (`Some(reason)` without asking); the owning cases are red.
-    #[test]
+    #[config_log::retcd_test]
     fn own81_v10_restart_due_holds_five_seconds_and_needs_no_partition_owned() {
         let at = Instant::now();
         let since = Some(at);
@@ -360,7 +360,7 @@ mod tests {
     /// V10b (#81, lead ruling): a faulted host is due at once, with no hold, and only when it
     /// owns no partition. Unit.
     /// Cut: drop the owns-none guard; the owning case is red.
-    #[test]
+    #[config_log::retcd_test]
     fn own81_v10b_a_faulted_host_owning_nothing_is_due_at_once() {
         let at = Instant::now();
         assert_eq!(

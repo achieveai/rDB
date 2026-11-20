@@ -1995,7 +1995,7 @@ mod tests {
     /// #81 D1 (ADR-0019: off by default): a node process started without `--failover` runs no
     /// planner (`DbConfig::failover` is `None`); with it, the library's defaults. Unit.
     /// Cut: `failover` answers `Some` whatever `--failover` says; the first assertion is red.
-    #[test]
+    #[config_log::retcd_test]
     fn own81_d1_no_failover_flag_runs_no_planner() {
         let plain = parsed(&["--node", "1"]).expect("parses");
         assert_eq!(super::failover(&plain), None, "no --failover, no planner");
