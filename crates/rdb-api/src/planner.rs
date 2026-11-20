@@ -264,6 +264,24 @@ pub(crate) fn no_grant_grace(budgets: &Budgets) -> Duration {
     Duration::from_millis(budgets.grant_millis.saturating_mul(3))
 }
 
+/// Run `planner` to its end; a panic in it is logged as `planner_panicked` (#127), not only
+/// printed to stderr by the default hook, where no JSONL line records it.
+pub(crate) async fn panics_logged(node: NodeId, planner: impl std::future::Future<Output = ()>) {
+    use futures::FutureExt;
+    if let Err(panic) = std::panic::AssertUnwindSafe(planner).catch_unwind().await {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".to_owned());
+        tracing::error!(
+            node = node.0,
+            panic = %message,
+            "planner_panicked"
+        );
+    }
+}
+
 /// What the planner judged a node owning partitions to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
@@ -341,6 +359,14 @@ pub(crate) struct Planner {
 
 impl Planner {
     /// Hold the grant and sweep, every [`Failover::poll`], until the task is aborted.
+    /// [`Self::run`], logging a panic as `planner_panicked` (error, with its message) instead of
+    /// leaving it to stderr (#127). The planner then stops: its grant lapses and another
+    /// node's planner takes over after the expiry, as when the process stops.
+    pub(crate) async fn run_logged(self) {
+        let node = self.node;
+        panics_logged(node, self.run()).await;
+    }
+
     pub(crate) async fn run(self) {
         tracing::info!(
             node = self.node.0,

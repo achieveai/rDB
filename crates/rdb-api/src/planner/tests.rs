@@ -1201,3 +1201,27 @@ fn own81_bad_partition_entry_warns_once() {
         "partition_entry_undecodable",
     );
 }
+
+/// #127: a panic in the planner is logged as `planner_panicked` at error, naming the node and
+/// the panic's message, for a `&str` panic and a formatted one. A planner that ends normally
+/// logs nothing.
+/// Cut: `panics_logged` awaits the future with no `catch_unwind`; the panic escapes the row, red.
+#[config_log::retcd_test]
+fn i127_a_planner_panic_is_logged() {
+    const METHOD: &str = "i127_a_planner_panic_is_logged";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    rt.block_on(panics_logged(NodeId(2), async { panic!("i127 static") }));
+    rt.block_on(panics_logged(NodeId(3), async {
+        panic!("i127 formatted {}", 7)
+    }));
+    rt.block_on(panics_logged(NodeId(4), async {}));
+    let lines = messages(METHOD, "planner_panicked");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["@l"], "Error", "{lines:?}");
+    assert_eq!(lines[0]["node"], 2, "{lines:?}");
+    assert_eq!(lines[0]["panic"], "i127 static", "{lines:?}");
+    assert_eq!(lines[1]["node"], 3, "{lines:?}");
+    assert_eq!(lines[1]["panic"], "i127 formatted 7", "{lines:?}");
+}

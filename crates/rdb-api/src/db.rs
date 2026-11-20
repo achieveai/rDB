@@ -1583,7 +1583,7 @@ impl Db {
             .clone()
             .expect("an open with a node has a control store");
         self.opened.planner_task = Some(rt.spawn(tracing::Instrument::instrument(
-            planner.run(),
+            planner.run_logged(),
             tracing::Span::current(),
         )));
     }
