@@ -378,6 +378,23 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
 
+**Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
+partitions were all promoted away while it was stopped comes back with a frozen grant, and
+nothing at that boot lifts it. `rdb_node` checks for that about once a second. It exits **75**
+(`EX_TEMPFAIL`) when its own `NodeStatus` has shown `replace_stopped` for 5 s, or its host has
+faulted (`fault` is set), **and** no `partitions/` record in the control store names it owner,
+in any lifecycle. A failed read of the control store keeps it up. Before it exits it prints
+`rdb_node restart-wanted node=N reason=R` (`replace_stopped` or `host_faulted`) and logs
+`rdb_node_restart_wanted`, then shuts down and prints `rdb_node stopped node=N` as usual.
+
+- **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
+  flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
+  other non-zero exit as a failure to report, not a restart to loop on.
+- `lr` supervises nothing. `lr status` shows such a node as `exited 75: restart wanted`, and
+  `lr start N` is the restart.
+- An embedder that runs `Db` itself, not `rdb_node`, makes the same check: `db.node_status()`
+  for its node, and a list of `partitions/`.
+
 ### Fencing your own side effects
 
 Your app may do things outside rDB for a partition it leads: start a container, upload a
