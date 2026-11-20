@@ -361,13 +361,12 @@ impl ControlAdapter {
                 {
                     Ok(read) => match read.record {
                         Some(found) => PartitionRecord::decode(&found.value)
-                            .map(|record| {
-                                (
-                                    record.generation,
-                                    rdb_core::authority::partition::RecordMember::decode_all(
-                                        &found.value,
-                                    ),
-                                )
+                            .map(|record| crate::host::FeedControlRead {
+                                generation: record.generation,
+                                owner: record.owner,
+                                members: rdb_core::authority::partition::RecordMember::decode_all(
+                                    &found.value,
+                                ),
                             })
                             .ok_or_else(|| "the record does not decode".to_owned()),
                         None => Err("no record".to_owned()),

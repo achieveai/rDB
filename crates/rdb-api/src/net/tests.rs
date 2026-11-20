@@ -3227,9 +3227,9 @@ async fn an_accepted_socket_has_nodelay_set() {
 /// Issue #87 slice 2, design S-D from any host: an app that holds no copy, linked over mutual
 /// TLS as `gw` (not an admin app), reads node 2's feed through `Db::changes` with
 /// `Source::Node(2)`. Node 2 is a secondary in another process. It answers the owner's puts in
-/// order, with their object ids and request ids, until node 2's first fresh read it is refused
-/// `UNAVAILABLE` claiming no mutation. Node 4, a spare process that holds no copy, answers
-/// `UNAVAILABLE`, claiming no mutation.
+/// order, with their object ids and request ids; a refusal is `UNAVAILABLE` claiming no
+/// mutation. Node 4, a spare process that holds no copy, answers `UNAVAILABLE` with rule
+/// `Definitive` and the step to read another copy, claiming no mutation.
 /// Cut: `sender_refused` treats `Changes` as admin-only, red (`gw` is refused).
 /// Integration (~10 s): a formation, four node opens, the app's open, real TLS on loopback.
 #[config_log::retcd_test]
@@ -3372,6 +3372,18 @@ fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
     );
     assert!(error.no_mutation, "{error:?}");
     assert!(error.to_string().contains("node 4"), "{error}");
+    // Definitive over the wire too: the app switches source rather than calling node 4 again.
+    assert_eq!(
+        error.retry,
+        rdb_core::contracts::errors::RetryRule::Definitive,
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read from the owner or another member"),
+        "{error}"
+    );
 
     app.shutdown();
     drop(app_net);

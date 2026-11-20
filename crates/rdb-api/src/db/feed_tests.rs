@@ -728,6 +728,174 @@ fn f87_1_left_out_owner_refuses() {
     }
 }
 
+/// A consumer that polls slower than the grant, as a warm standby does. Every call is answered
+/// with a page, the first one included: the call waits for the control read it starts.
+/// Before the fix each call started a read and was refused "call again" at once, and the read
+/// it started was older than the grant by the next call, so it never served (#87 lr walk, s2d).
+/// Cut: `Host::changes` answers a call whose read is in flight at once ("call again") instead of
+/// parking it in `FeedFreshness::waiting`, red (the first call is refused).
+/// Integration (~8 s): three 2.25 s gaps.
+#[config_log::retcd_test]
+fn f87_2_a_slow_consumer_at_a_fresh_member_is_served_every_call() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let budgets = short_grant();
+    let db = opened_with(&rt, dir.path(), &store, budgets);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    let two = Source::Node(NodeId(2));
+    for call in 0..4 {
+        match db.changes(PARTITION, FeedCursor::START, 10, two) {
+            Ok(FeedPage::Records { records, .. }) => {
+                assert_eq!(seqs(&records).last(), Some(&k1.seq.0), "call {call}");
+            }
+            other => panic!("call {call} to node 2, a fresh member: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(budgets.grant_millis * 3 / 2));
+    }
+}
+
+/// #87 lr walk (s2d): a regular copy cut off from its owner past the drop clock is left out of
+/// the next generation. Polled slower than the grant, its feed serves while `partitions/1` still
+/// pins it, then answers a definitive refusal: `UNAVAILABLE` with `Definitive`, naming the
+/// generation that left it out and the owner, with the step to read another copy. It never
+/// answers "call again", and the refusal comes within a few grants of the drop.
+/// Cut: `Host::feed_fresh` treats a record that leaves this node out of a newer generation as
+/// "still landing" (`BoundedJitter`), red (no definitive answer).
+/// Integration (~12 s): a 2 s drop clock, 2.25 s gaps.
+#[config_log::retcd_test]
+fn f87_2_a_copy_left_out_while_held_answers_definitively_within_a_bound() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let budgets = short_grant();
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                timeouts: Timeouts {
+                    unreachable_drop_after: Duration::from_secs(2),
+                    ..Timeouts::default()
+                },
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            budgets,
+        ))
+        .expect("the open");
+    db.wait_ready(patience()).expect("ready");
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    db.links().hold(NodeId(1), NodeId(3));
+    db.links().hold(NodeId(2), NodeId(3));
+    let held = Instant::now();
+    let three = Source::Node(NodeId(3));
+    let gap = Duration::from_millis(budgets.grant_millis * 3 / 2);
+    let (mut served, mut dropped_at) = (0_u32, None);
+    let refused = loop {
+        if dropped_at.is_none()
+            && db
+                .pinned_members()
+                .is_ok_and(|(_, pinned)| pinned.iter().all(|member| member.node != NodeId(3)))
+        {
+            dropped_at = Some(Instant::now());
+        }
+        match db.changes(PARTITION, FeedCursor::START, 10, three) {
+            Ok(FeedPage::Records { .. }) => served += 1,
+            Ok(other) => panic!("node 3 while held: {other:?}"),
+            Err(error) if error.retry == RetryRule::Definitive => break error,
+            Err(error) => panic!(
+                "node 3 after {:?} held, {served} served: not definitive: {error}",
+                held.elapsed()
+            ),
+        }
+        assert!(
+            held.elapsed() < patience(),
+            "node 3 never refused definitively; {served} served"
+        );
+        std::thread::sleep(gap);
+    };
+    let dropped_at = dropped_at.unwrap_or_else(Instant::now);
+    let bound = crate::host::test_patience(Duration::from_millis(3 * budgets.grant_millis) + gap);
+    assert!(
+        dropped_at.elapsed() < bound,
+        "refused {:?} after the drop was seen",
+        dropped_at.elapsed()
+    );
+    assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
+    assert!(refused.no_mutation, "{refused:?}");
+    let text = refused.to_string();
+    assert!(
+        text.contains("node 3 holds no current copy of partition 1")
+            && text.contains("left out at generation")
+            && text.contains("owner node 1")
+            && text.contains("read from the owner or another member"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("call again") && !text.contains("wait a few seconds"),
+        "{text}"
+    );
+    // Definitive means it stays so: the next call, a gap later, answers the same.
+    std::thread::sleep(gap);
+    let again = db
+        .changes(PARTITION, FeedCursor::START, 10, three)
+        .expect_err("still left out");
+    assert_eq!(again.retry, RetryRule::Definitive, "{again:?}");
+    db.links().heal(NodeId(1), NodeId(3));
+    db.links().heal(NodeId(2), NodeId(3));
+}
+
+/// A feed cursor whose digest is not the copy's record is `CORRUPT_HISTORY`, and its step is
+/// the feed's own: read another copy or rebuild from your own source, never the map-entry step
+/// "write over its key", which a feed caller cannot act on.
+/// Cut: `Host::changes` refuses a diverged cursor without `FEED_HISTORY_STEP`, red (the kind's
+/// generic step).
+/// Integration (~2 s): a fresh open.
+#[config_log::retcd_test]
+fn f87_2_a_diverged_feed_cursor_says_to_read_another_copy() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let one = db.put(b"x", b"v", None).expect("x");
+    let two = db.put(b"y", b"v", None).expect("y");
+    let (records, _) = tail(&db, FeedCursor::START, Source::Owner, two.seq);
+    assert_eq!(seqs(&records), vec![one.seq.0, two.seq.0]);
+    let forged = FeedCursor {
+        digest: records[0].at.digest,
+        ..records[1].at
+    };
+    for source in [Source::Owner, Source::Node(NodeId(2))] {
+        let deadline = Instant::now() + patience();
+        let error = loop {
+            match db.changes(PARTITION, forged, 10, source) {
+                Err(error) if error.kind == ErrorKind::CorruptHistory => break error,
+                other => assert!(Instant::now() < deadline, "{source:?}: {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("read from another copy (the owner or another member)")
+                && text.contains("rebuild from your own source"),
+            "{source:?}: {text}"
+        );
+        assert!(!text.contains("write over its key"), "{source:?}: {text}");
+    }
+}
+
 /// M6, measured not asserted: write latency at 100 writes/s with no consumer, then with one
 /// consumer tailing each copy (owner, node 2, node 3) every 10 ms. Prints p50/p99/max for each.
 /// Run by hand: `cargo test -p rdb-api --lib -- --ignored f87_1_measure --nocapture`.

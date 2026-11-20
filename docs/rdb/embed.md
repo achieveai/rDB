@@ -1622,17 +1622,26 @@ loop {
   - `Trimmed`: the copy no longer holds the record you need. Rebuild from your own source.
   - `Rewound`: **a promote cut records you have already applied.** Undo what you applied above
     `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB has lost.
-  - `CORRUPT_HISTORY` error: the cursor's record has another digest on this copy. The two
-    histories diverged; stop and report it.
+  - `CORRUPT_HISTORY` error: the cursor's record has another digest on this copy, or a record
+    there does not parse. The history at this copy is unreadable from this cursor: read from
+    another copy (the owner or another member), or rebuild from your own source, and report
+    it.
 - **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
   reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
   applied, which can be ahead of the owner's published position.
 - **The secondary's bound (R2).** A secondary serves only while its own read of
   `partitions/{p}` in rEtcd began within the grant (`grant_millis`, 6 s by default), names the
   generation it holds and pins it as a regular copy. Cut off from rEtcd, it stops within about
-  one grant, even while its old owner still talks to it. The first call to a secondary starts
-  that read and answers `UNAVAILABLE`: call again. A shadow, a secondary left out, or a copy still
-  landing a new generation answers `UNAVAILABLE` too. An owner whose grant does not admit answers
+  one grant, even while its old owner still talks to it. A call that finds no read within the
+  grant starts one and waits for it, up to half a second, so a consumer that polls less often
+  than once a grant is still served; only if rEtcd does not answer in that time is it refused
+  `UNAVAILABLE`: call again. A shadow, or a copy still landing a new generation, answers
+  `UNAVAILABLE` too: call again.
+- **A copy that holds no current copy says so, for good.** A node that `partitions/{p}` leaves
+  out (dropped while it was cut off from the owner, say) or that never held the partition
+  answers `UNAVAILABLE` with rule `Definitive`, naming the generation that left it out and the
+  owner: "read from the owner or another member". Switch source; calling that node again
+  answers the same until it is a member again. An owner whose grant does not admit answers
   as a write would, `LEASE_EXPIRED` or `NOT_PRIMARY`. Right after a promote the new owner
   answers `LEASE_EXPIRED` until it holds its grant: call again. An old owner the promote left
   out keeps answering so: ask the new owner, or another copy.

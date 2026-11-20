@@ -30,6 +30,14 @@ some of the changes rather than the database itself figuring all that thing out.
 authenticated app may call it. `Source::Node(n)` reaches node `n` over the links from any host; a
 node with no copy answers `UNAVAILABLE`.
 
+**Amended 2026-11-20 (#87, lr walk).** A secondary's feed call that finds no control read within
+the grant waits for the one it starts (at most 500 ms) instead of answering "call again": before,
+a consumer polling less often than once a grant was refused at every call. A copy that
+`partitions/{p}` leaves out, or that holds no generation, answers `UNAVAILABLE` with rule
+`Definitive` and the step "read from the owner or another member". The kind stays the one this
+ADR names; the rule says switch source, not retry here. A feed's `CORRUPT_HISTORY` carries the
+feed's own step: read another copy, or rebuild from your own source.
+
 ## Context
 
 ### The ask
