@@ -888,6 +888,9 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 - An app connected over a network link is not scoped by the node. **rDB's client and peer ports
   must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
   your gateway. A node-side check of the certificate's app against the id is owed (#154).
+  rDB ships no deployment config, so until #154 that boundary is the embedder's network policy.
+  For SBX (checked 2026-11-20): rDB is embedded in-process only, its ports are firewalled from
+  the sandbox and app networks, and gateways talk to each other over their own mTLS.
 - `route`, `ownership` and ownership events return partition and node facts only, never a
   record.
 
@@ -1578,6 +1581,11 @@ A refused call (`put`, `get`, `read`, `write`, `status`) returns `ApiError`. Its
 alone, and `ApiError::explain()` gives the detail with it. For example, a refusal while the
 database is not serving says `UNAVAILABLE (...; next: the database is not serving right now:
 wait a few seconds and try again; ...)`.
+
+`ApiError`'s fields stay public to read, but it has a private one too (#134), so code outside
+`rdb_api` cannot build one with a struct literal. Build one with its constructors:
+`ApiError::new(kind, detail)`, `ApiError::invalid(detail)` or `ApiError::from_kernel(&error)`,
+then `with_retry_after` when needed. SBX had no such literal (checked 2026-11-20).
 
 **Refused for good.** No open of this folder, against this rEtcd, will ever succeed. Retrying
 does not help; the "what to do" column does.

@@ -2622,7 +2622,7 @@ enum PendingKind {
 /// Why a node faulted, typed (A-R178): every waiter is refused with [`Fault::error`], and every
 /// call after with [`Fault::refusal`]. A view that read stored damage refuses as
 /// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
-/// fault is [`ApiError::host`].
+/// fault is [`ApiError::owner_fault`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fault {
     /// The kind of stored damage the node read, when that is why it faulted.
@@ -2648,7 +2648,8 @@ impl Fault {
     }
 }
 
-/// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
+/// A fault that names no stored damage: [`ApiError::owner_fault`] (#134; `ApiError::host`
+/// before it, as before A-R178).
 impl From<String> for Fault {
     fn from(detail: String) -> Self {
         Self {

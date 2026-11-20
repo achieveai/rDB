@@ -746,3 +746,23 @@ fn sbx_147_q_delete_prefix_finishes_every_write_id_it_takes() {
         }
     });
 }
+
+/// PR #178 review r1 T14: a stopped delete prefix prints, with how far it got, and is an
+/// `Error` whose source is the refusal. Cut: drop the `Display` impl (or the `Error` impl):
+/// the row does not compile.
+#[config_log::retcd_test]
+fn sbx_147_r_a_stopped_delete_prefix_prints_and_is_an_error() {
+    let stopped = rdb_api::PrefixDeleteError {
+        deleted: 3,
+        error: rdb_api::PutError {
+            error: rdb_api::ApiError::invalid("a refusal"),
+            request: None,
+        },
+    };
+    let text = stopped.to_string();
+    assert!(text.starts_with("INVALID_ARGUMENT"), "{text}");
+    assert!(text.contains("after 3 deleted"), "{text}");
+    let boxed: Box<dyn std::error::Error> = Box::new(stopped);
+    let source = boxed.source().expect("the refusal is the source");
+    assert!(source.to_string().contains("a refusal"), "{source}");
+}

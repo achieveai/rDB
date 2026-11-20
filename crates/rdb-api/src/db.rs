@@ -475,6 +475,22 @@ pub struct PrefixDeleteError {
     pub error: PutError,
 }
 
+impl std::fmt::Display for PrefixDeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (after {} deleted; run the delete again to finish)",
+            self.error, self.deleted
+        )
+    }
+}
+
+impl std::error::Error for PrefixDeleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error.error)
+    }
+}
+
 /// A refused write, with the request so the caller can send it again (`retry`).
 #[derive(Debug, Clone)]
 pub struct PutError {
