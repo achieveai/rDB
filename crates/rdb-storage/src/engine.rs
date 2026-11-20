@@ -1882,7 +1882,11 @@ impl RocksEngine {
             let Some(marks) = self.lineages.get(&(partition, level)) else {
                 return best;
             };
+            // No row reaches the filter: a parent mark above `base + 1` needs a child inherited
+            // below the parent's floor, which A2's `below_floor` refuses. Defence only.
             if let Some(floor) = marks.floor.filter(|floor| floor.seq.0 <= top) {
+                // No row reaches "highest" over "first": in one chain a level's own mark is
+                // always at least its parent's, so the two agree. Defence only.
                 if best.is_none_or(|(_, held)| floor.seq > held.seq) {
                     best = Some((level, floor));
                 }
@@ -1997,6 +2001,8 @@ impl RocksEngine {
                 .lineages
                 .get(&(partition, level))
                 .and_then(|marks| marks.floor);
+            // No row reaches a held mark above `end`: it needs a parent marked above the child's
+            // `base + 1`, which A2's `below_floor` refuses. Defence only: a mark never goes down.
             if held.is_none_or(|held| held.seq.0 < end) {
                 let mark = TrimFloor {
                     seq: Seq(end),
