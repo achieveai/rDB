@@ -392,10 +392,36 @@ fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// B1's allowance for one wave of promotes (`max_concurrent` at once): two looks, the
+/// `Fencing` write, the target's landing and the `Serving` commit, stretched by
+/// `RETCD_TEST_DEADLINE_SCALE` as a wait. Measured on this rig: see [`b1_bound`].
+const T_PROMOTE: Duration = Duration::from_secs(2);
+
+/// B1's stated upper bound on the time from a stop to the last of `moving` partitions moved,
+/// under the rig's [`budgets`] and `failover`:
+/// `max(G + eps + delta, silent_after) + 2 * poll + look_within + T_promote * ceil(moving / max_concurrent)`.
+/// The stopped owner's grant and the planner grant (when the stopped node held it) both run out
+/// by `G + eps + delta` after the stop, since both were renewed before it; the judge also wants
+/// `silent_after` of link silence. One poll for a running planner to take `planner/grant`, one
+/// for its next sweep; the sweep's look at the dead owner waits `look_within`, the read
+/// timeout; then the promotes run `max_concurrent` at a time.
+fn b1_bound(moving: usize, failover: &Failover) -> Duration {
+    let b = budgets();
+    let expired = Duration::from_millis(b.grant_millis + b.clock_error_millis + b.dispatch_margin_millis)
+        .max(failover.silent_after);
+    let waves = u32::try_from(moving.div_ceil(failover.max_concurrent)).expect("few waves");
+    let look_within = Timeouts::default().read;
+    expired
+        + failover.poll * 2
+        + look_within
+        + crate::host::test_patience(T_PROMOTE) * waves
+}
+
 /// V7 and B1: stop node 1's process for longer than G. Every partition it owned moves to a
-/// node that runs, nothing else moves, and a put lands on each moved partition through an
-/// app linked to the two that run. Returns the time from the stop to the last move.
-fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duration {
+/// node that runs, within [`b1_bound`], nothing else moves, and a put lands on each moved
+/// partition through an app linked to the two that run. Prints and logs the time from the stop
+/// to the last move.
+fn stopped_owner_every_partition_moves(method: &str, partitions: u32) {
     let rig = rig(partitions, Some(failover()));
     let dead = NodeId(1);
     let moving = rig.owned_by(dead);
@@ -412,14 +438,33 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
     // own grant, so this is 0 in a passing run. Counted anyway so that only alerts after the
     // stop count against the running nodes.
     let setup_alerts = logged(method, "planner_owner_alive_not_serving").len();
+    let bound = b1_bound(moving.len(), &failover());
     let stopped = Instant::now();
     rig.stop(0);
+    // The wait outlasts the bound, so a slow move fails on the bound, with its time.
     until(
         "every partition of node 1 moves",
-        Duration::from_secs(60),
+        Duration::from_secs(60).max(bound),
         || moving.iter().all(|p| rig.owner(*p) != dead),
     );
     let took = stopped.elapsed();
+    println!(
+        "own81_b1 partitions={partitions} moved={} time_to_new_primary_ms={} bound_ms={}",
+        moving.len(),
+        took.as_millis(),
+        bound.as_millis()
+    );
+    let floor =
+        budgets().grant_millis + budgets().clock_error_millis + budgets().dispatch_margin_millis;
+    assert!(
+        took >= Duration::from_millis(floor),
+        "moved {took:?} after the stop, before the grant could have run out ({floor} ms)"
+    );
+    assert!(
+        took <= bound,
+        "{} partitions moved {took:?} after the stop, past B1's bound {bound:?}",
+        moving.len()
+    );
 
     for p in &moving {
         let record = rig.record(*p);
@@ -466,29 +511,29 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
         partitions,
         moved = moving.len(),
         took_ms = took.as_millis(),
+        bound_ms = bound.as_millis(),
         "own81_b1_time_to_new_primary"
     );
-    took
 }
 
 /// V7 and B1 at a small count: 6 partitions, node 1 owns 2. Integration (~10 s): waits out a
-/// 3 s grant, its margins, a look and the promotes. The same row at 512 is the lead's to
-/// schedule on a quiet host: `stopped_owner_every_partition_moves(METHOD, 512)`.
+/// 3 s grant, its margins, a look and the promotes, then asserts B1's bound ([`b1_bound`]).
 /// Cut: `judge` answers `Alive` for an expired grant; nothing moves, red at the first wait.
 #[config_log::retcd_test]
 fn own81_v7_b1_a_stopped_owner_has_every_partition_moved() {
     const METHOD: &str = "own81_v7_b1_a_stopped_owner_has_every_partition_moved";
-    let took = stopped_owner_every_partition_moves(METHOD, 6);
-    println!(
-        "own81_b1 partitions=6 time_to_new_primary_ms={}",
-        took.as_millis()
-    );
-    let bound =
-        budgets().grant_millis + budgets().clock_error_millis + budgets().dispatch_margin_millis;
-    assert!(
-        took >= Duration::from_millis(bound),
-        "moved {took:?} after the stop, before the grant could have run out ({bound} ms)"
-    );
+    stopped_owner_every_partition_moves(METHOD, 6);
+}
+
+/// B1 at 512 partitions (acceptance: "within a stated bound"), node 1 owns about a third. The
+/// same helper and bound as the 6-partition row; the measured time is printed and logged
+/// (`own81_b1_time_to_new_primary`). Run alone, by hand, on a quiet host:
+/// `cargo test -p rdb-api --lib -- --ignored --nocapture own81_b1_512`.
+#[config_log::retcd_test]
+#[ignore = "perf: 512 partitions, run alone by hand"]
+fn own81_b1_512_partitions_a_stopped_owner_has_every_partition_moved() {
+    const METHOD: &str = "own81_b1_512_partitions_a_stopped_owner_has_every_partition_moved";
+    stopped_owner_every_partition_moves(METHOD, 512);
 }
 
 /// S1 and C4: after the failover, node 1's process resumes. A put sent to it answers
