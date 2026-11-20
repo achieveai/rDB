@@ -861,23 +861,60 @@ async fn read_owner(
 /// The file in a node process's folder that says an app-address write of this folder's node may
 /// still apply (#83 B2, PR #159 review): it holds the revision of `nodes/{id}` that write was
 /// sent at. Written durably before the write is sent, removed once the write's outcome is
-/// known. The only thing [`register_app_addr`] writes in the folder.
+/// known. It is staged first as `app-addr-pending.new`, then renamed over: a crash before the
+/// rename can leave that staged file behind, and the next write overwrites it. Leave both
+/// files alone; [`register_app_addr`] settles them. These are the only files it writes in the
+/// folder.
 pub(crate) const APP_ADDR_PENDING_FILE: &str = "app-addr-pending";
 
-/// The revision the folder's pending app-address write was sent at, if one may still apply.
-fn pending_app_addr(dir: &Path) -> Result<Option<u64>, OpenError> {
+/// Whether the folder says an app-address write of its node may still apply (PR #159 review
+/// r2). Presence is what counts: a marker whose text is damaged still says so, so it fences
+/// like any other. A marker that is there and cannot be read refuses the open, naming a step
+/// that keeps the marker, since this open cannot tell what it says.
+fn pending_app_addr(dir: &Path) -> Result<bool, OpenError> {
     let file = dir.join(APP_ADDR_PENDING_FILE);
-    match std::fs::read_to_string(&file) {
-        Ok(text) => text.trim().parse::<u64>().map(Some).map_err(|error| {
-            OpenError::Config(format!(
-                "{} does not hold a revision ({error}); it says an earlier open's app-address \
-                 write may still apply. Nothing was started",
-                file.display()
-            ))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(OpenError::Io(error)),
+    match std::fs::read(&file) {
+        Ok(text) => {
+            if std::str::from_utf8(&text)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .is_none()
+            {
+                tracing::warn!(
+                    file = %file.display(),
+                    "db_app_addr_pending_unparsed"
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OpenError::Config(format!(
+            "{} is there but could not be read ({error}): it may say that an earlier open's \
+             app-address write may still apply, and this open cannot tell. Leave it and \
+             {APP_ADDR_PENDING_FILE}.new in place, make it readable by this process, then open \
+             this node again with the app address it should hold. Nothing was started",
+            file.display()
+        ))),
     }
+}
+
+/// Refuse an open given no app address while the folder says an app-address write may still
+/// apply (PR #159 review r2). Such an open writes nothing, so it cannot fence: the earlier
+/// write could still replace the stored address after this open returned. An open given the
+/// address the node should hold settles it, and later opens can then leave it out.
+fn app_addr_settled(dir: &Path) -> Result<(), OpenError> {
+    if !pending_app_addr(dir)? {
+        return Ok(());
+    }
+    Err(OpenError::Config(format!(
+        "{} says an earlier open's write of this node's app address may still apply, and this \
+         open was given no app address, so it cannot settle that write: it could replace the \
+         stored address after this open returned. Open this node again with the app address it \
+         should hold (NodeAddresses::app, or rdb_node --app-addr); that open settles it, and \
+         later opens may leave the address out. Leave {APP_ADDR_PENDING_FILE} and \
+         {APP_ADDR_PENDING_FILE}.new in place. Nothing was started",
+        dir.join(APP_ADDR_PENDING_FILE).display()
+    )))
 }
 
 /// Record durably that an app-address write sent at `revision` may still apply: the file is
@@ -913,24 +950,28 @@ fn clear_app_addr_pending(dir: &Path) -> Result<(), OpenError> {
 /// process's folder.
 ///
 /// A record that already holds `app` is not written, so a restart with the same address
-/// changes nothing, unless `dir` holds [`APP_ADDR_PENDING_FILE`]: an earlier open's write may
-/// then still apply at the revision it read, and replace this open's address after this open
-/// returned. So this open writes anyway, a fence: the revision moves on, and no write sent at
-/// an older one can apply (PR #159 review). The marker is written durably before every write
+/// changes nothing, unless an earlier open's write may still apply at the revision it read, and
+/// replace this open's address after this open returned. Two things say it may: `dir` holds
+/// [`APP_ADDR_PENDING_FILE`] (present at all, whatever its text), or `new_folder`, this node's
+/// folder had no data before this open (new or emptied), so a marker an earlier folder held is
+/// gone. Then this open writes anyway, a fence: the revision moves on, and no write sent at an
+/// older one can apply (PR #159 review, r2). The marker is written durably before every write
 /// and removed only once its outcome is known: applied, or the record moved on. A write whose
 /// outcome stays unknown, an open dropped mid-write, and a crash leave it, so the next open
 /// fences.
 ///
-/// The only other writer is the declaration, create-only, so a record changed between the read
-/// and the write means another process claims this node, even when it wrote the same bytes:
-/// refused. Every refusal is before any host starts. Logged `db_app_addr_registered{node,
-/// app_len, written, fenced}`; the address itself is never logged, since an opaque address may
-/// carry a credential.
+/// The record has three writers: the declaration, create-only; another process that claims
+/// this node; and an earlier open of this node, whose delayed write can land between this
+/// open's read and its write. A record changed in between is refused, even when it holds the
+/// same bytes, since this open cannot tell which of them wrote it. Every refusal is before any
+/// host starts. Logged `db_app_addr_registered{node, app_len, written, fenced}`; the address
+/// itself is never logged, since an opaque address may carry a credential.
 async fn register_app_addr(
     store: &dyn ConfigStore,
     dir: &Path,
     node: NodeId,
     app: &str,
+    new_folder: bool,
 ) -> Result<(), OpenError> {
     let key = ControlKey::Node(node).encode();
     let refused = |why: String| OpenError::Control(format!("{key}: {why}; nothing was started"));
@@ -947,8 +988,7 @@ async fn register_app_addr(
     let (record, held) = NodeRecord::decode_with_app(&found.value)
         .filter(|(record, _)| record.node == node)
         .ok_or_else(|| refused("not a node record this build reads".to_owned()))?;
-    let pending = pending_app_addr(dir)?;
-    let fenced = pending.is_some();
+    let fenced = pending_app_addr(dir)? || new_folder;
     if held.as_deref() == Some(app) && !fenced {
         tracing::info!(
             node = node.0,
@@ -2016,6 +2056,12 @@ impl Db {
                 formed_member(&store, &missing, false).await?;
             }
         }
+        // #83 B2, PR #159 review r2: a node folder with no data yet holds no marker, whatever
+        // an earlier folder of this node left in flight, so its registration fences.
+        let new_folder = match config.local.as_slice() {
+            [node] => !nodes_dir.join(node.0.to_string()).join("CURRENT").exists(),
+            _ => false,
+        };
         let created = match std::fs::create_dir(&nodes_dir) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -2076,8 +2122,13 @@ impl Db {
         }
         // #83 B2: after the engines' `LOCK`s, so of two opens of one folder only one writes,
         // and before any host starts, so no boot leads a partition before its address is in.
-        if let (Some(app), [node]) = (app, config.local.as_slice()) {
-            register_app_addr(&*store, &config.dir, *node, app).await?;
+        // An open given no address writes none, so it is refused while a write may be pending.
+        match (app, config.local.as_slice()) {
+            (Some(app), [node]) => {
+                register_app_addr(&*store, &config.dir, *node, app, new_folder).await?;
+            }
+            (None, _) => app_addr_settled(&config.dir)?,
+            (Some(_), _) => {}
         }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {

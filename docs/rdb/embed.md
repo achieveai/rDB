@@ -767,20 +767,31 @@ record. Use it to send a request to the right node.
 - Each open given an app address makes sure the node's record holds it before the node
   starts, so a node never leads a partition before its address is there. A record that
   already holds it is not written again, unless an earlier open's write may still be in
-  flight (below). An open with no app address keeps the one stored before. **An address
+  flight (below). An open with no app address keeps the one stored before, unless such a
+  write may still be in flight: then it is refused (below). **An address
   cannot be cleared:** no app address keeps it, and an empty one is refused. Only the app
   address is written; the node's declared address and machine never change.
 - **A write whose answer was lost.** Before it writes, the open puts a small file,
-  `app-addr-pending`, in its folder. The file stays while the write's outcome is unknown: its
-  answer was lost and the read back failed or showed no change, the open was dropped, or the
-  process crashed. Such an open is refused, saying so, and nothing is started. The next open
-  that finds the file writes its address even if the record already holds it, so the old
-  write can no longer apply and never replaces the address of an open that succeeded. Leave
-  the file alone. It is the only file this writes in the folder, besides what an open
-  already creates.
+  `app-addr-pending`, in its folder. It writes `app-addr-pending.new` first, then renames it;
+  a crash before the rename can leave `app-addr-pending.new` behind, and the next write
+  overwrites it. The file stays while the write's outcome is unknown: its answer was lost
+  and the read back failed or showed no change, the open was dropped, or the process
+  crashed. Such an open is refused, saying so, and nothing is started. The next open that
+  finds the file writes its address even if the record already holds it, so the old write
+  can no longer apply and never replaces the address of an open that succeeded.
+  - The file counts by being there: one whose text is damaged works the same. One that is
+    there but cannot be read refuses the open; make it readable and open again.
+  - An open with no app address cannot write, so while the file is there it is refused.
+    Open the node again with the address it should hold; that settles it, and later opens
+    can leave the address out.
+  - A node folder with no data yet, new or emptied to rejoin, has lost any such file, so its
+    first open writes its address even if the record already holds it.
+  - **Leave both files alone.** They are the only files this writes in the folder, besides
+    what an open already creates.
 - An open is also refused, with nothing started, when the record changed after it read it,
-  even to the same bytes: only the declaration and the node itself write it, so another
-  process may claim the node.
+  even to the same bytes. The declaration, another process that claims the node, or a
+  delayed write of an earlier open of this node can change it, and the open cannot tell
+  which.
 - It is `None` when the owner registered none, or on a database made by `rdb_node --form`,
   which has no `nodes/` records. An app address on such a database is refused at open, and
   `rdb_node --form --app-addr` is refused while parsing.

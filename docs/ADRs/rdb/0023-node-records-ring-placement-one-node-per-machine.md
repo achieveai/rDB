@@ -136,26 +136,35 @@
      it, and no earlier write may still be in flight (below), nothing is written, so a
      restart with the same address changes nothing. Otherwise it puts node layout 2 at the
      revision it read: node, declared address and machine as they are. An open with no app
-     address writes nothing and keeps the stored one. An address cannot be cleared: `None`
-     keeps it, and an empty string is refused. An app address on an undeclared open is
+     address writes nothing and keeps the stored one, unless an earlier write may still be in
+     flight (below): then it is refused, before any host starts, with the step to open again
+     with the address the node should hold. An address cannot be cleared: `None` keeps it,
+     and an empty string is refused. An app address on an undeclared open is
      refused, and so is `rdb_node --app-addr` with `--form`, `--declare` or `--gen-certs`.
-   - **A changed record refuses the open.** Only the declaration, create-only, also writes the
-     record, so a record that changed between the read and the put means another process
-     claims the node: refused, nothing started, even when the other write holds exactly this
-     open's bytes.
+   - **A changed record refuses the open.** Three writers can change the record between the
+     read and the put: the declaration (create-only), another process that claims the node,
+     and an earlier open of this same node, whose delayed put lands late. The open cannot tell
+     which one wrote, so it refuses, nothing started, even when the other write holds exactly
+     this open's bytes.
    - **The fence (PR #159 review).** A put whose reply is lost may still apply later, at the
      revision it was sent at. Before every put, the open writes a marker file,
-     `app-addr-pending`, holding that revision, into the node process's folder, synced and
-     renamed into place; on Unix its folder is synced too (Windows cannot sync a folder; the
-     rename is still atomic). It removes the marker once the outcome is known: the put applied
+     `app-addr-pending`, holding that revision, into the node process's folder: it writes
+     `app-addr-pending.new`, syncs it and renames it into place; on Unix its folder is synced
+     too (Windows cannot sync a folder; the rename is still atomic). A crash before the rename
+     can leave `app-addr-pending.new` behind; the next put overwrites it. Leave both files
+     alone. It removes the marker once the outcome is known: the put applied
      (or a read back shows its bytes at a newer revision), or the record moved past that
      revision. A lost reply whose read back shows no change, a failed read back, an open
      dropped mid-put and a crash leave it. The next open that finds the marker writes even
      when the record already holds its address: the revision moves on, so no put sent at the
      old revision can apply after the open returned, and an address the open registered is
-     never replaced by a late one. Each refusal says whether the outcome is known and keeps
-     the store error. The marker is the only file this writes in the folder, besides what an
-     open already creates.
+     never replaced by a late one. The marker's presence is what counts: one whose text is
+     damaged fences the same, and one that is there but cannot be read refuses the open with
+     a step that keeps it. A node folder with no data yet (new, or emptied to rejoin) has lost
+     any marker an earlier folder held, so its open fences too. An open given no app address
+     cannot fence, so the marker refuses it (above). Each refusal says whether the outcome is
+     known and keeps the store error. The two marker files are the only files this writes in
+     the folder, besides what an open already creates.
    - **Reads and checks.** `NodeRecord::decode` reads both node layouts as the declared fields
      alone, and `NodeRecord::decode_with_app` also returns the app address. The declared
      fields are what every check compares: the start check decodes them; declaring a formed
@@ -260,7 +269,10 @@ every rig open passes the address check it would meet in use.
   and the fence: `own83_b2_4_a_late_write_cannot_replace_a_successful_retry`,
   `own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next`,
   `own83_b2_6_an_unknown_registration_outcome_is_read_back`,
-  `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`;
+  `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`,
+  `own83_b2_8_a_no_address_restart_is_refused_while_a_write_may_apply`,
+  `own83_b2_9_an_emptied_folder_fences_an_equal_address_rejoin`,
+  `own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses`;
   `crates/rdb-api/src/db/partition_tests.rs`:
   `own83_25_a_changed_app_address_is_seen_within_the_gap` to
   `own83_30_no_log_line_holds_an_app_address`; `rdb_node`'s

@@ -4199,7 +4199,10 @@ impl Fence {
         let starts = starts.load(Ordering::SeqCst);
         match opened {
             Ok(mut db) => {
-                assert!(starts > 0, "the control: an open that succeeds starts its host");
+                assert!(
+                    starts > 0,
+                    "the control: an open that succeeds starts its host"
+                );
                 db.shutdown();
                 drop((db, net));
                 Ok(())
@@ -4349,7 +4352,9 @@ fn own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next() {
     assert_eq!(fence.record(), (Some(A.to_owned()), r));
 
     let restarted = runtime();
-    fence.open_on(&restarted, Some(A)).expect("the restarted open");
+    fence
+        .open_on(&restarted, Some(A))
+        .expect("the restarted open");
     let (_, fenced) = fence.record();
 
     let stale = config_core::PutRequest {
@@ -4470,6 +4475,151 @@ fn own83_b2_7_a_record_changed_mid_registration_refuses_the_open() {
         assert_eq!(Some(revision), rival_at, "{what}: the rival's revision");
         assert!(!fence.marked(), "{what}: resolved");
     }
+}
+
+/// Node 1's record holds A, and an open with B sent its write at revision r, whose reply was
+/// lost before it applied: refused, the marker left, the write of B still to arrive (#83 B2,
+/// PR #159 review r2). Returns the fence and r.
+fn fence_with_late_b(a: &str) -> (Fence, u64) {
+    let fence = Fence::new(a);
+    let (_, r) = fence.record();
+    fence.store.next(NodePut::Late);
+    let refused = fence
+        .open("gw-1.b:9443")
+        .expect_err("the outcome is unknown");
+    assert!(
+        refused.to_string().contains("has not applied yet"),
+        "{refused}"
+    );
+    assert!(fence.marked(), "the marker stays while B may apply");
+    assert_eq!(fence.record(), (Some(a.to_owned()), r), "B has not applied");
+    (fence, r)
+}
+
+/// The late write of B arrives: refused at r, and the record still holds A.
+fn late_b_is_refused(fence: &Fence, a: &str, r: u64) {
+    let (_, fenced) = fence.record();
+    assert!(fenced > r, "the recovery wrote A again, past r");
+    assert_eq!(
+        fence.store.deliver(&fence.rig.rt),
+        [config_core::MutationOutcome::Conflict],
+        "the late write at r is refused"
+    );
+    assert_eq!(
+        fence.record(),
+        (Some(a.to_owned()), fenced),
+        "B never replaces A"
+    );
+    assert!(!fence.marked(), "the fence resolved the marker");
+}
+
+/// own83_b2_8 (#83 B2, PR #159 review r2, T1): a restart given no app address, while B's write
+/// may still apply, is refused before any host starts, naming the step: open again with the
+/// address the node should hold. It writes nothing and keeps the marker, since an open without
+/// an address cannot fence. The open with A then settles it: it writes A again, and the late B
+/// is refused. A later open with no address opens and writes nothing. Cut: `app_addr_settled`
+/// skipped (the `None` arm does nothing), red at "a no-address open while B may apply" (it
+/// opens). Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_8_a_no_address_restart_is_refused_while_a_write_may_apply() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let rt = &fence.rig.rt;
+    for attempt in 1..=2 {
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("a no-address open while B may apply");
+        let text = refused.to_string();
+        assert!(
+            text.contains("was given no app address")
+                && text.contains("Open this node again with the app address it should hold")
+                && text.contains("Leave app-addr-pending and app-addr-pending.new in place")
+                && text.contains("Nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: the marker is kept");
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    fence.open(A).expect("the explicit-address open settles it");
+    late_b_is_refused(&fence, A, r);
+    let (_, settled) = fence.record();
+    fence
+        .open_on(rt, None)
+        .expect("settled: a no-address open opens");
+    assert_eq!(
+        fence.record(),
+        (Some(A.to_owned()), settled),
+        "and writes nothing"
+    );
+}
+
+/// own83_b2_9 (#83 B2, PR #159 review r2, T28): B's write may still apply, and node 1's folder
+/// is then emptied, its marker with it, as an operator empties a node's folder for it to
+/// rejoin. The open with A on the empty folder finds the record holding A and no marker, but
+/// the folder had no data, so it writes A again (the fence), and the late B is refused. A
+/// restart on that folder, now holding data, writes nothing. Cut: `new_folder` ignored
+/// (`fenced` from the marker only), red at "the recovery wrote A again" (no write, and the late
+/// B then applies). Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_9_an_emptied_folder_fences_an_equal_address_rejoin() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    assert!(!fence.marked());
+    fence.open(A).expect("the rejoin with A opens");
+    late_b_is_refused(&fence, A, r);
+    let (_, rejoined) = fence.record();
+    fence.open(A).expect("a restart on the rejoined folder");
+    assert_eq!(
+        fence.record().1,
+        rejoined,
+        "data and no marker: nothing written"
+    );
+}
+
+/// own83_b2_10 (#83 B2, PR #159 review r2, T32): the marker's presence is what fences. With B's
+/// write pending, the marker's text is damaged: the open with A still writes A again, and the
+/// late B is refused. A marker that is there but cannot be read (a folder in its place, so the
+/// read fails for an I/O reason) refuses opens with an address and without one, before any
+/// host starts, naming a step that keeps the marker; the marker stays. Made readable again,
+/// the open with A goes on and resolves it. Cut: a damaged marker refused as before r2 (`Ok`
+/// only for a parsed revision), red at "a damaged marker fences". Cut: the I/O arm answers
+/// `Ok(false)`, red at "an unreadable marker" (the open goes on). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let marker = fence.dir.0.join(APP_ADDR_PENDING_FILE);
+    std::fs::write(&marker, b"\xff not a revision\n").expect("the marker is damaged");
+    fence.open(A).expect("a damaged marker fences");
+    late_b_is_refused(&fence, A, r);
+
+    let (_, before) = fence.record();
+    std::fs::create_dir(&marker).expect("a folder where the marker is");
+    for app in [Some(A), None] {
+        let refused = fence
+            .open_on(&fence.rig.rt, app)
+            .expect_err("an unreadable marker");
+        let text = refused.to_string();
+        assert!(
+            text.contains("is there but could not be read")
+                && text.contains("Leave it and app-addr-pending.new in place")
+                && text.contains("Nothing was started"),
+            "{app:?}: {text}"
+        );
+        assert!(marker.is_dir(), "{app:?}: the marker is kept");
+        assert_eq!(fence.record().1, before, "{app:?}: nothing written");
+    }
+    std::fs::remove_dir(&marker).expect("the folder is removed");
+    std::fs::write(&marker, format!("{before}\n")).expect("a readable marker");
+    fence.open(A).expect("readable: the open goes on");
+    assert!(fence.record().1 > before, "it fenced");
+    assert!(!fence.marked(), "and resolved the marker");
 }
 
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
