@@ -9545,11 +9545,13 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
-                let pulled = self
-                    .transfers
-                    .get(&(partition, shadow.copy))
-                    .filter(|transfer| transfer.node == shadow.node)
-                    .map_or(0, |transfer| transfer.pulled);
+                let pulled = Self::transfer_pulled(
+                    self.transfers
+                        .iter()
+                        .map(|(key, transfer)| (*key, transfer.node, transfer.pulled)),
+                    (partition, shadow.copy),
+                    shadow.node,
+                );
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
@@ -9582,6 +9584,20 @@ impl Host {
             cause: None,
         };
         self.start_revoke(partition, epoch, replan);
+    }
+
+    /// Issue #61 (design M5): the entries this owner's snapshot transfer to copy `at` on `node`
+    /// has served, 0 with no such transfer or one to another node. Over `(key, node, pulled)`
+    /// projections of the transfers, so a unit row needs no snapshot.
+    fn transfer_pulled(
+        transfers: impl IntoIterator<Item = ((PartitionId, CopyId), NodeId, u64)>,
+        at: (PartitionId, CopyId),
+        node: NodeId,
+    ) -> u64 {
+        transfers
+            .into_iter()
+            .find(|(key, to, _)| *key == at && *to == node)
+            .map_or(0, |(_, _, pulled)| pulled)
     }
 
     /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records

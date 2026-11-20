@@ -5331,6 +5331,32 @@ fn t61_s2_r6_a_snapshot_transfer_serving_entries_is_move_progress() {
     );
 }
 
+/// Issue #61 S2-R6 (design M5), the count `shadow_duty` gives `move_lag_duty`: the entries the
+/// owner's transfer to the shadow's copy has served when that transfer is to the shadow's
+/// node, else 0 (a transfer to another node, or none).
+/// Cut: `transfer_pulled` returns 0, red (the matching transfer reads 0).
+#[test]
+fn t61_s2_r6_b_the_move_clock_reads_the_transfer_to_the_shadow() {
+    let (p, two, three) = (PartitionId(1), CopyId(2), CopyId(3));
+    let transfers = [((p, two), NodeId(4), 80), ((p, three), NodeId(3), 50)];
+    assert_eq!(
+        Host::transfer_pulled(transfers, (p, two), NodeId(4)),
+        80,
+        "to the shadow"
+    );
+    assert_eq!(
+        Host::transfer_pulled(transfers, (p, two), NodeId(5)),
+        0,
+        "to another node"
+    );
+    assert_eq!(
+        Host::transfer_pulled(transfers, (PartitionId(2), two), NodeId(4)),
+        0,
+        "no transfer for this partition"
+    );
+    assert_eq!(Host::transfer_pulled([], (p, two), NodeId(4)), 0, "none");
+}
+
 /// Critic-s1c R1 (ruling A-R464), the re-plan return: a duty that runs while a re-plan is
 /// running cannot judge the shadow, so it puts the catch-up clock back with its start kept,
 /// and the next duty past the deadline still gives the move up.
