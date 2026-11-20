@@ -568,15 +568,7 @@ fn run(
             } else {
                 serve(&args, &rt)
             };
-            match result {
-                Ok(Served::Stopped) => ExitCode::SUCCESS,
-                Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
-                Err(message) => {
-                    tracing::error!(%message, "rdb_node_failed");
-                    eprintln!("rdb_node: {message}");
-                    ExitCode::from(1)
-                }
-            }
+            exit_code(result)
         }
         Err(e) => {
             eprintln!("rdb_node: runtime: {e}");
@@ -585,6 +577,20 @@ fn run(
     };
     drop(guard);
     code
+}
+
+/// The exit code for how a run ended: 0 at the stop file, [`RESTART_EXIT`] when it asks its
+/// supervisor for a restart (V10, #81), 1 on a failure, which is logged and printed.
+fn exit_code(result: Result<Served, String>) -> ExitCode {
+    match result {
+        Ok(Served::Stopped) => ExitCode::SUCCESS,
+        Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
+        Err(message) => {
+            tracing::error!(%message, "rdb_node_failed");
+            eprintln!("rdb_node: {message}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn gen_certs(args: &Args) -> ExitCode {
@@ -1962,6 +1968,27 @@ mod tests {
             started.elapsed() < OWNERSHIP_POLL * 50,
             "joined after {:?}",
             started.elapsed()
+        );
+    }
+
+    /// V10 (#81), PR #171 review: `run` maps how the serve ended to the exit code, and a serve
+    /// that asks for a restart exits 75 (`EX_TEMPFAIL`), whichever reason it gave; a stop file
+    /// exits 0 and a failure 1. `run` calls this mapping on every outcome. Unit.
+    /// Cut: map `Restart` to 0; red.
+    #[config_log::retcd_test]
+    fn own81_v10_a_restart_wanted_exits_75() {
+        use std::process::ExitCode;
+        for reason in [RestartReason::ReplaceStopped, RestartReason::HostFaulted] {
+            assert_eq!(
+                super::exit_code(Ok(Served::Restart(reason))),
+                ExitCode::from(75),
+                "{reason}"
+            );
+        }
+        assert_eq!(super::exit_code(Ok(Served::Stopped)), ExitCode::SUCCESS);
+        assert_eq!(
+            super::exit_code(Err("a failure".to_owned())),
+            ExitCode::from(1)
         );
     }
 
