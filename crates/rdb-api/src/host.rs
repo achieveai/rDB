@@ -517,6 +517,18 @@ pub enum Msg {
         /// The note read, at or past `generation`.
         note: CommittedWithout,
     },
+    /// R5: the reopen's heal planned `partition` without these regular copies, each at the boot
+    /// its grant names (`admin::heal`). They are left out as a drop records it, so a copy that
+    /// starts again at a newer boot is re-added ([`Host::readd_candidate`]). A copy with no
+    /// grant record comes at `UNLINKED_BOOT`: it may still run, so with `live_readd` on it is
+    /// also recorded for #107's live re-add, as an unreachable drop. Sent before the heal's
+    /// `Plan`. Not routed.
+    HealLeftOut {
+        /// The partition.
+        partition: PartitionId,
+        /// The copies left out.
+        left: Vec<Member>,
+    },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
         /// The partition.
@@ -1695,8 +1707,9 @@ struct LiveReadd {
     /// [`LIVE_READD_HOLD_MILLIS`]; crate tests set it directly.
     hold_millis: u64,
     /// Per partition and node, a copy this owner's own drop clock left out, and why
-    /// ([`LiveReturn`]). Set only by [`Host::note_left_out`] from the committed plan's
-    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none.
+    /// ([`LiveReturn`]). Set by [`Host::note_left_out`] from the committed plan's
+    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none, and
+    /// by R5's `Msg::HealLeftOut` for a copy the reopen's heal left out with no grant record.
     /// Spent by the one live re-add it allows (slice 2a: one attempt per drop), and removed by
     /// a commit that pins the node regular, or that leaves it out with no cause.
     clocked: BTreeMap<(PartitionId, NodeId), LiveReturn>,
@@ -2797,6 +2810,11 @@ struct Host {
     /// owner re-plans with it as the rejoiner, as for a restart; its entry goes once it is
     /// pinned again.
     left_out: BTreeMap<PartitionId, Vec<Member>>,
+    /// R5: each copy the reopen's heal left out at the boot its grant names (`Msg::HealLeftOut`).
+    /// This process's net never saw that boot, so the copy's next start reaches it as a first
+    /// link, which posts no `PeerBooted`; [`Self::readd_heal_noted`] starts the restart re-plan
+    /// for it instead. Goes once the copy is pinned again or no longer left out.
+    heal_noted: BTreeSet<(PartitionId, NodeId)>,
     /// S4a: each left-out copy `copy_left_out_until_restart` has been logged for, so the line
     /// comes once per partition, node and boot.
     left_out_warned: BTreeSet<(PartitionId, NodeId, BootId)>,
@@ -3066,6 +3084,7 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rejoins: BTreeMap::new(),
             left_out: BTreeMap::new(),
+            heal_noted: BTreeSet::new(),
             left_out_warned: BTreeSet::new(),
             live_readd: LiveReadd::off(),
             spare_notes: BTreeMap::new(),
@@ -3511,6 +3530,48 @@ impl Host {
                     if let Some(generation) = generation {
                         self.end_barriers_below(partition, generation);
                     }
+                }
+                Ok(())
+            }
+            Msg::HealLeftOut { partition, left } => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    left_out = ?left.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
+                    "heal_left_out_noted"
+                );
+                // R5 (no grant record): a copy that may still run returns by #107 once its link
+                // is back. Memory only, like a drop's: a restart of this owner forgets it.
+                if self.live_readd.on {
+                    for member in left
+                        .iter()
+                        .filter(|member| member.boot == crate::admin::UNLINKED_BOOT)
+                    {
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            left_out = member.node.0,
+                            "heal_left_out_clocked"
+                        );
+                        self.live_readd.clocked.insert(
+                            (partition, member.node),
+                            LiveReturn {
+                                clock: DropClock::Unreachable,
+                                durable: None,
+                                link_lost: true,
+                            },
+                        );
+                    }
+                }
+                for member in &left {
+                    if member.boot != crate::admin::UNLINKED_BOOT {
+                        self.heal_noted.insert((partition, member.node));
+                    }
+                }
+                let entry = self.left_out.entry(partition).or_default();
+                for member in left {
+                    entry.retain(|known| known.node != member.node);
+                    entry.push(member);
                 }
                 Ok(())
             }
@@ -7539,6 +7600,7 @@ impl Host {
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
             self.restore_left_out(partition);
+            self.readd_heal_noted(partition);
             self.warn_left_out(partition, now);
             // D1 (#93): ahead of the gate below, so an idle partition, which L1 never pauses,
             // drops a dead copy too.
@@ -7892,6 +7954,65 @@ impl Host {
             .get(&partition)
             .and_then(|l1| l1.protection.admission_state(now))
             .is_some_and(|state| state.allow || state.reason == Some(ErrorKind::ProtectionPaused))
+    }
+
+    /// R5: start the restart re-plan for a copy the reopen's heal left out ([`Self::heal_noted`])
+    /// once its link reports a boot newer than the one noted, as [`Self::peer_booted`] would had
+    /// this process's net seen the copy's old boot. Logged `heal_left_out_restarted`, and
+    /// `heal_left_out_readd_ignored{why}` when [`Self::rejoin_if_stale`] starts nothing.
+    fn readd_heal_noted(&mut self, partition: PartitionId) {
+        if !self.heal_noted.iter().any(|(noted, _)| *noted == partition) {
+            return;
+        }
+        let pinned: Vec<NodeId> = self
+            .committed
+            .get(&partition)
+            .map(|committed| {
+                committed
+                    .committed
+                    .pinned_config
+                    .members
+                    .iter()
+                    .map(|member| member.node)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let left: Vec<NodeId> = self
+            .left_out
+            .get(&partition)
+            .map(|left| left.iter().map(|member| member.node).collect())
+            .unwrap_or_default();
+        self.heal_noted.retain(|(noted, node)| {
+            *noted != partition || (left.contains(node) && !pinned.contains(node))
+        });
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let Some(member) = self.readd_candidate(partition, &committed.committed.pinned_config)
+        else {
+            return;
+        };
+        if !self.heal_noted.contains(&(partition, member.node)) {
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            left_out = member.node.0,
+            noted_boot = member.boot.0,
+            "heal_left_out_restarted"
+        );
+        if let Some(why) = self.rejoin_if_stale(partition) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                why,
+                "heal_left_out_readd_ignored"
+            );
+        }
     }
 
     /// S4a: rebuild what `left_out`, memory only, lost in a restart of this owner, and give a
@@ -16014,6 +16135,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::OwnerLearned { .. } => "owner_learned",
         Msg::FenceBound { .. } => "fence_bound",
         Msg::ReplanNote { .. } => "replan_note",
+        Msg::HealLeftOut { .. } => "heal_left_out",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",

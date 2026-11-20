@@ -605,6 +605,12 @@ struct Opened {
     /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
     /// given it, so an owner re-seats the copies its partition was placed on.
     nodes: Arc<[NodeId]>,
+    /// What this open found of the OS boot (R5, [`crate::os_boot`]): the heal goes on without a
+    /// down copy only when it is `Same`. `Unknown` in an open that never looked.
+    os_boot: crate::os_boot::OsBoot,
+    /// The OS boot id to write to the folder's `os_boot` file once this open is ready
+    /// ([`Db::wait_ready`]), when it is not on file already; taken by the first ready answer.
+    os_boot_record: Mutex<Option<(PathBuf, String)>>,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -649,6 +655,8 @@ impl Default for Opened {
             instance: None,
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
+            os_boot: crate::os_boot::OsBoot::Unknown,
+            os_boot_record: Mutex::new(None),
         }
     }
 }
@@ -1781,6 +1789,8 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
+        // R5: read with the engines' `LOCK`s held, so an open refused `InUse` never touches it.
+        let os_boot = crate::os_boot::observe(&config.dir)?;
         let mut found = Self::check(
             &mut claim.engines,
             absent,
@@ -1923,6 +1933,8 @@ impl Db {
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
                 nodes: Arc::clone(&nodes),
+                os_boot: os_boot.verdict,
+                os_boot_record: Mutex::new(os_boot.to_record),
                 ..Opened::default()
             },
             route: Route {
@@ -2610,6 +2622,8 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                os_boot: self.opened.os_boot,
+                links_since: Default::default(),
             });
         }
         let state = Arc::clone(&self.opened.heal);
@@ -2683,6 +2697,7 @@ impl Db {
             .into_iter();
         let Some(mut partition) = waiting.next() else {
             self.ready_seen.store(true, Ordering::Relaxed);
+            self.record_os_boot();
             return Ok(());
         };
         let timed_out = |partition: PartitionId, phase: String| {
@@ -2725,6 +2740,7 @@ impl Db {
                         continue;
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
+                    self.record_os_boot();
                     return Ok(());
                 }
                 // It answered without admitting: a resumed old owner stays this way after a
@@ -2786,6 +2802,19 @@ impl Db {
                 return Err(timed_out(partition, phase));
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
+    /// are whole again: write the OS boot id to the folder's `os_boot` file, once, when this
+    /// open found it missing or stale. A failed write is logged `os_boot_record_failed` and
+    /// leaves no file, so the next open waits for every copy, as before R5.
+    fn record_os_boot(&self) {
+        let Some((dir, id)) = lock(&self.opened.os_boot_record).take() else {
+            return;
+        };
+        if let Err(error) = crate::os_boot::record(&dir, &id) {
+            tracing::error!(dir = %dir.display(), %error, "os_boot_record_failed");
         }
     }
 

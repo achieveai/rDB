@@ -417,6 +417,32 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
+- **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271): after a process restart, an
+  owner heals with a majority of its copies.** The bullet above still holds after a host crash.
+  - **Process restart, same OS boot (Linux):** the owner's open does not wait for a copy that
+    is down, when a majority of the partition's copies, the owner included, is up and the down
+    copy's grant (`grants/{node}`) is frozen or proven expired on the owner's clock. It logs
+    `heal_proceed_without` and leaves that copy out; the copy rejoins by itself when it starts
+    again. A copy with a live grant is waited for: it may be alive with a slow link. The wait is
+    at most one grant lifetime plus the clock margins, never a fixed delay. A copy with no grant
+    record (one that never owned a partition) is waited for one heal window
+    (`no_grant_record`), then left out too (`evidence=no_grant_after_window`); if it was alive
+    with a late link, it is re-added once its link is back (with `Timeouts::live_readd`), else when it
+    starts again. That costs availability only, never an acknowledged write.
+  - **Host crash or reboot:** the owner waits for every copy, as above, or for
+    `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
+    steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
+  - Every wait logs `heal_wait_all` with its reason: `os_boot_changed`, `os_boot_unknown`,
+    `unsupported_platform`, `no_majority`, `copy_not_proven_down`, `no_grant_record` or `no_clock_bound`. A
+    `wait_ready` that times out names it.
+  - How it tells: the node folder's `os_boot` file, beside `boot`, holds the OS boot id
+    (`/proc/sys/kernel/random/boot_id`) once an open has been ready. A first open, a missing or
+    unreadable id, and macOS or Windows all count as a host crash.
+  - **Containers:** the boot id is the host kernel's, so restarting a container is the same boot.
+    That is correct: the host kept the unsynced data.
+  - **Known limits:** restoring a VM or disk snapshot, or network storage that drops its write
+    cache without a reboot, keeps the boot id but loses data. Before starting a node on a
+    restored snapshot, delete `os_boot` from its folder; it then waits for every copy.
 
 ### Fencing your own side effects
 

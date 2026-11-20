@@ -59,6 +59,7 @@ use rdb_core::partition_map::RoutesRoot;
 use crate::clock::HostClock;
 use crate::db::{ApiError, Db};
 use crate::host::{Msg, NodeStatus, NodeStopped, BOOT};
+use crate::os_boot::OsBoot;
 
 /// The partition S0 serves.
 pub const PARTITION: PartitionId = PartitionId(1);
@@ -2077,7 +2078,7 @@ pub enum HealError {
     /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
     #[error(
         "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
-         boot: start node {who}, then open again",
+         boot: start node {who}, then open again (it waits for every copy: {reason})",
         who = names_in_words(.nodes),
         secs = seconds_in_words(*.within_ms)
     )]
@@ -2086,6 +2087,8 @@ pub enum HealError {
         nodes: Vec<u32>,
         /// The heal's bound.
         within_ms: u128,
+        /// Why the heal did not go on without them (R5): the last `heal_wait_all` reason.
+        reason: &'static str,
     },
 }
 
@@ -2119,6 +2122,13 @@ pub(crate) struct HealCtx {
     /// last handshake reported for another ([`crate::transport::Links::boot_of`]); `None`
     /// until that node's link has come up (arch-s2 B1).
     pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+    /// Whether the OS rebooted since this folder's last ready open (R5, [`crate::os_boot`]):
+    /// only [`OsBoot::Same`] lets the heal go on without a copy that is down.
+    pub(crate) os_boot: OsBoot,
+    /// When this heal first began to wait for its members' links (R5): its first attempt's
+    /// first look, kept across [`heal_retrying`]'s attempts. A copy with no grant record may be
+    /// left out once one full window (`within`) has passed since.
+    pub(crate) links_since: Arc<std::sync::OnceLock<tokio::time::Instant>>,
 }
 
 /// The correlation a heal's two events carry.
@@ -2150,7 +2160,10 @@ const HEAL: CorrelationId = CorrelationId(2);
 ///
 /// [`HealError`]. Nothing is sent to node 1 unless every step held.
 pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
-    let deadline = tokio::time::Instant::now() + ctx.within;
+    let started = tokio::time::Instant::now();
+    let deadline = started + ctx.within;
+    // R5: the first attempt's start opens the window a copy with no grant record is waited for.
+    ctx.links_since.get_or_init(|| started);
     // M11 T6: the members are the ones `partitions/1` pins, not nodes 1 to 3. A move may have
     // put a copy on node 4; re-pinning node 3 would recover from a copy the move left behind.
     let pinned = pinned_members(&ctx).await?;
@@ -2169,7 +2182,10 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // Every member's boot first (arch-s2 B1): the plan pins them, and waiting here leaves the
     // fence's reads and decision tick as fresh as they were. One union over the partitions.
     let union = member_union(&[pinned.as_slice(), forming.as_slice()].concat());
-    let boots = member_boots(&ctx, &union, deadline).await?;
+    let Boots {
+        members: boots,
+        left,
+    } = member_boots(&ctx, &union, &pinned, &forming, deadline).await?;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle. Once, for
     // every partition this node owns (issue #79).
@@ -2214,7 +2230,26 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         },
         |plan| plan.0,
     );
-    for (_, partition, events) in planned {
+    for ((_, partition, events), was) in planned.into_iter().zip(&pinned) {
+        // R5: each copy the heal went on without is left out at the boot its grant names, as a
+        // drop records it, so it is re-added once it starts at a newer boot.
+        let left_here: Vec<Member> = was
+            .iter()
+            .filter_map(|member| {
+                let (_, boot) = left.iter().find(|(node, _)| *node == member.node)?;
+                Some(member.at(*boot))
+            })
+            .collect();
+        if !left_here.is_empty() {
+            ctx.owner
+                .send(Msg::HealLeftOut {
+                    partition,
+                    left: left_here,
+                })
+                .map_err(|_| HealError::NodeStopped {
+                    node: ctx.owner_node,
+                })?;
+        }
         for event in events {
             ctx.owner
                 .send(Msg::Inject {
@@ -2491,12 +2526,21 @@ pub(crate) async fn heal_retrying(
             partitions: ctx.partitions.clone(),
             bootstrap: ctx.bootstrap.clone(),
             nodes: Arc::clone(&ctx.nodes),
+            links_since: Arc::clone(&ctx.links_since),
             ..ctx
         };
         match heal(again).await {
-            Err(HealError::PeersUnknown { nodes, within_ms }) => {
+            Err(HealError::PeersUnknown {
+                nodes,
+                within_ms,
+                reason,
+            }) => {
                 let missing = nodes.clone();
-                let error = HealError::PeersUnknown { nodes, within_ms };
+                let error = HealError::PeersUnknown {
+                    nodes,
+                    within_ms,
+                    reason,
+                };
                 tracing::warn!(
                     attempt,
                     missing = ?missing,
@@ -2560,15 +2604,38 @@ fn pinned_of(partition: PartitionId, body: &[u8]) -> Result<Option<Vec<RecordMem
     }
 }
 
+/// What [`member_boots`] settled: each member at its boot, and the down copies the heal goes on
+/// without (R5), each with the boot its grant names.
+struct Boots {
+    members: Vec<Member>,
+    left: Vec<(NodeId, BootId)>,
+}
+
+/// How often [`member_boots`] asks [`leave_out`] again while a copy is still down: each ask reads
+/// that copy's grant from the control store.
+const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
+
 /// `pinned`, each at the boot `ctx.member_boot` names for its node, once every regular one is
 /// known. Polls until `deadline`: a peer's boot arrives with its handshake. A `Shadow` whose
 /// node is unknown is left out at once, never waited for (A-R451, critic A3): the plan commits
 /// without it, and a re-run of its move starts it again.
+///
+/// R5: while a regular copy is still unknown, [`leave_out`] is asked, at most every
+/// [`LEAVE_OUT_EVERY`], whether the heal may go on without it. Its first answer and each change
+/// of it are logged once: `heal_proceed_without` per partition when it may,
+/// `heal_wait_all{reason}` while it may not. `rooted` and `forming` are the members each of the
+/// heal's partitions pins, by partition, in `ctx.partitions` and `ctx.bootstrap` order.
 async fn member_boots(
     ctx: &HealCtx,
     pinned: &[RecordMember],
+    rooted: &[Vec<RecordMember>],
+    forming: &[Vec<RecordMember>],
     deadline: tokio::time::Instant,
-) -> Result<Vec<Member>, HealError> {
+) -> Result<Boots, HealError> {
+    let mut said: Option<&'static str> = None;
+    let mut reason = "copy_not_proven_down";
+    let mut next_ask = tokio::time::Instant::now();
+    let since = *ctx.links_since.get_or_init(tokio::time::Instant::now);
     loop {
         let found: Vec<(RecordMember, Option<BootId>)> = pinned
             .iter()
@@ -2582,8 +2649,35 @@ async fn member_boots(
             .filter(|(member, boot)| boot.is_none() && member.role != ReplicaRole::Shadow)
             .map(|(member, _)| member.node.0)
             .collect();
-        if missing.is_empty() {
-            for (member, _) in found.iter().filter(|(_, boot)| boot.is_none()) {
+        let mut left = Vec::new();
+        if !missing.is_empty() && tokio::time::Instant::now() >= next_ask {
+            next_ask = tokio::time::Instant::now() + LEAVE_OUT_EVERY;
+            // The first attempt's window ends at its own deadline, so it never counts there:
+            // that attempt ends `PeersUnknown`, and [`heal_retrying`]'s next one goes on with a
+            // whole budget left for the rest of the heal.
+            let window_passed = !late && tokio::time::Instant::now() >= since + ctx.within;
+            match leave_out(ctx, &found, rooted, forming, &missing, window_passed).await {
+                Ok(down) => left = down,
+                Err(why) => {
+                    reason = why;
+                    if said != Some(why) {
+                        said = Some(why);
+                        tracing::info!(
+                            owner = ctx.owner_node.0,
+                            partitions = ?ctx.partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
+                            missing = ?missing,
+                            reason = why,
+                            "heal_wait_all"
+                        );
+                    }
+                }
+            }
+        }
+        if missing.is_empty() || !left.is_empty() {
+            for (member, _) in found
+                .iter()
+                .filter(|(member, boot)| boot.is_none() && member.role == ReplicaRole::Shadow)
+            {
                 tracing::warn!(
                     node = member.node.0,
                     copy = member.copy.0,
@@ -2598,16 +2692,193 @@ async fn member_boots(
                 boots = ?members.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
                 "heal_member_boots"
             );
-            return Ok(members);
+            return Ok(Boots {
+                members,
+                left: left
+                    .into_iter()
+                    .map(|(node, boot, _)| (node, boot))
+                    .collect(),
+            });
         }
         if late {
-            tracing::warn!(missing = ?missing, "heal_peers_unknown");
+            tracing::warn!(missing = ?missing, reason, "heal_peers_unknown");
             return Err(HealError::PeersUnknown {
                 nodes: missing,
                 within_ms: ctx.within.as_millis(),
+                reason,
             });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// R5: may the reopen's heal go on without the regular copies on `missing`, whose nodes have
+/// no link yet? `Ok` with each such node, the boot its grant names and the evidence, or `Err`
+/// with the `heal_wait_all` reason. Logs `heal_proceed_without` for each partition it leaves a
+/// copy out of.
+///
+/// Safety (design spec §5.2 steps 3, 6 and 7): an owner acknowledges a write once it is in its
+/// own WAL, not yet synced, and applied on one regular secondary; the WAL is synced later, in
+/// groups. A process restart under the same OS boot keeps the owner's WAL, its unsynced tail
+/// included, so the owner's log holds every write it acknowledged, and recovery's
+/// `holds_last_writable` check confirms it on the copies that are present. After a host restart
+/// the unsynced tail may be gone and the down copy may be the only holder of an acknowledged
+/// write, so the heal waits for every copy, as before: [`OsBoot`] is `Same` only when this
+/// folder's last ready open ran under the OS boot running now.
+///
+/// It goes on only when all of these hold:
+/// - the OS did not reboot: `os_boot_changed`, `os_boot_unknown` or `unsupported_platform`;
+/// - no partition still to form pins the copy: `partition_forming` (nothing written there, and
+///   its formation pins every placed member);
+/// - each partition that pins a missing copy has a majority of its non-shadow members, the
+///   owner included, with a known boot: `no_majority`;
+/// - each missing copy is proven down: its `grants/{C}` is frozen, or its expiry is proven on
+///   this node's clock by [`expiry_proven`], guard 2 of [`clear_verdict`]. A copy with a live
+///   grant may be alive with a late link: `copy_not_proven_down`. One with no grant record:
+///   [`no_grant_record`], until one full heal window has passed (`window_passed`). A clock with
+///   no established bound proves nothing: `no_clock_bound`.
+async fn leave_out(
+    ctx: &HealCtx,
+    found: &[(RecordMember, Option<BootId>)],
+    rooted: &[Vec<RecordMember>],
+    forming: &[Vec<RecordMember>],
+    missing: &[u32],
+    window_passed: bool,
+) -> Result<Vec<(NodeId, BootId, &'static str)>, &'static str> {
+    if let Some(reason) = ctx.os_boot.wait_reason() {
+        return Err(reason);
+    }
+    let is_missing = |member: &RecordMember| missing.contains(&member.node.0);
+    if forming.iter().flatten().any(is_missing) {
+        return Err("partition_forming");
+    }
+    let known = |node: NodeId| {
+        found
+            .iter()
+            .any(|(m, boot)| m.node == node && boot.is_some())
+    };
+    let mut short = Vec::new();
+    for (partition, was) in ctx.partitions.iter().zip(rooted) {
+        if !was.iter().any(is_missing) {
+            continue;
+        }
+        let regular: Vec<&RecordMember> = was
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .collect();
+        let majority = regular.len() / 2 + 1;
+        let present: Vec<u32> = regular
+            .iter()
+            .filter(|member| known(member.node))
+            .map(|member| member.node.0)
+            .collect();
+        if present.len() < majority {
+            return Err("no_majority");
+        }
+        let gone: Vec<u32> = regular
+            .iter()
+            .filter(|member| is_missing(member))
+            .map(|member| member.node.0)
+            .collect();
+        short.push((*partition, gone, present, majority));
+    }
+    let mut down = Vec::with_capacity(missing.len());
+    for node in missing {
+        let (evidence, boot) = copy_down(ctx, NodeId(*node), window_passed).await?;
+        down.push((NodeId(*node), boot, evidence));
+    }
+    for (partition, gone, present, majority) in short {
+        let evidence: Vec<&str> = down
+            .iter()
+            .filter(|(node, ..)| gone.contains(&node.0))
+            .map(|(.., evidence)| *evidence)
+            .collect();
+        tracing::info!(
+            owner = ctx.owner_node.0,
+            partition = partition.0,
+            missing = ?gone,
+            present = ?present,
+            majority,
+            reason = "same_os_boot",
+            evidence = evidence.join(","),
+            "heal_proceed_without"
+        );
+    }
+    Ok(down)
+}
+
+/// R5 (lead ruling (a)): what a copy with no `grants/{C}` record proves. Only an owner takes a
+/// grant, and only a node's own next process deletes one, so a copy that never owned a
+/// partition has none while it is alive. Nothing is proven before the heal's first full window
+/// has passed, counted from when it began to wait for links: it waits, `no_grant_record`. After
+/// it the copy is left out, `no_grant_after_window`, at [`UNLINKED_BOOT`]: the owner records the
+/// first boot it sees for it (`Host::restore_left_out`), so a copy still alive at that boot can
+/// come back by #107's live re-add, and one that restarts by the restart path.
+///
+/// Why leaving out a copy that may be alive loses nothing (same OS boot, checked before this):
+/// - the owner's WAL holds every write it acknowledged, its unsynced tail included;
+/// - the new generation pins its members' boots, so the copy's acknowledgements no longer
+///   count anywhere;
+/// - the copy cannot become owner: a promote must freeze the owner's grant, which the owner
+///   keeps renewing.
+///
+/// The cost is availability only: the partition runs on fewer copies until it is back.
+const fn no_grant_record(window_passed: bool) -> Result<(&'static str, BootId), &'static str> {
+    if window_passed {
+        Ok(("no_grant_after_window", UNLINKED_BOOT))
+    } else {
+        Err("no_grant_record")
+    }
+}
+
+/// R5: whether the copy on `node` is proven down: its `grants/{node}` frozen (`grant_frozen`),
+/// or its expiry proven past on this node's clock (`grant_expired`), with the boot the record
+/// names. Read only: nothing is cleared, unlike [`judge`]. `Err` is a [`leave_out`] reason.
+async fn copy_down(
+    ctx: &HealCtx,
+    node: NodeId,
+    window_passed: bool,
+) -> Result<(&'static str, BootId), &'static str> {
+    const NOT_PROVEN: &str = "copy_not_proven_down";
+    let key = ControlKey::Grant(node).encode();
+    let read = match ctx
+        .store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+    {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(node = node.0, %error, "heal_copy_grant_unread");
+            return Err(NOT_PROVEN);
+        }
+    };
+    let Some(found) = read.record else {
+        return no_grant_record(window_passed);
+    };
+    let Some(record) = GrantRecord::decode(&found.value) else {
+        tracing::warn!(
+            node = node.0,
+            revision = found.mod_revision,
+            "heal_copy_grant_unreadable"
+        );
+        return Err(NOT_PROVEN);
+    };
+    if record.frozen {
+        return Ok(("grant_frozen", record.boot));
+    }
+    let now = ctx.clock.now();
+    let sample = ctx.clock.sample(now, &ctx.budgets);
+    if !sample.bound_established {
+        return Err("no_clock_bound");
+    }
+    let mut clock = ClockView::new();
+    clock.accept(sample);
+    if expiry_proven(&clock, record.expiry_utc_ms, now, &ctx.budgets).is_some() {
+        Ok(("grant_expired", record.boot))
+    } else {
+        Err(NOT_PROVEN)
     }
 }
 
@@ -5099,6 +5370,8 @@ mod tests {
     ) -> (Result<Healed, HealError>, Vec<Msg>) {
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
+            os_boot: crate::os_boot::OsBoot::Unknown,
+            links_since: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store,
@@ -5883,6 +6156,8 @@ mod tests {
             let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
             let (owner, mailbox) = std::sync::mpsc::channel();
             let ctx = HealCtx {
+                os_boot: crate::os_boot::OsBoot::Unknown,
+                links_since: Default::default(),
                 partition_count: 2,
                 nodes: crate::db::ALL_NODES.into(),
                 store,
@@ -7297,6 +7572,8 @@ mod tests {
         rooted(&*store, &rt, BootId(5));
         let (owner, mailbox) = std::sync::mpsc::channel();
         let ctx = HealCtx {
+            os_boot: crate::os_boot::OsBoot::Unknown,
+            links_since: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
@@ -7736,6 +8013,8 @@ mod tests {
         let (owner, mailbox) = std::sync::mpsc::channel();
         drop(mailbox);
         let ctx = HealCtx {
+            os_boot: crate::os_boot::OsBoot::Unknown,
+            links_since: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
@@ -8633,6 +8912,8 @@ mod tests {
         let (owner, _mailbox) = std::sync::mpsc::channel();
         let within = Duration::from_secs(10);
         let ctx = HealCtx {
+            os_boot: crate::os_boot::OsBoot::Unknown,
+            links_since: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::new(config_testkit::MemStore::new()),
@@ -8659,11 +8940,13 @@ mod tests {
         });
         let (members, waited) = rt.block_on(async {
             let start = tokio::time::Instant::now();
-            let members = member_boots(&ctx, &pinned, start + within).await;
+            let rooted = [pinned.to_vec()];
+            let members = member_boots(&ctx, &pinned, &rooted, &[], start + within).await;
             (members, start.elapsed())
         });
         let nodes: Vec<u32> = members
             .expect("the regular members are known")
+            .members
             .iter()
             .map(|member| member.node.0)
             .collect();
@@ -8672,5 +8955,377 @@ mod tests {
             waited < Duration::from_millis(100),
             "the heal waited {waited:?} for a down shadow"
         );
+    }
+
+    // ---- R5: a restarted owner heals with a majority of its copies (same OS boot) ----
+
+    /// The boot `grants/3` names in the R5 rows: node 3's last process.
+    const C_BOOT: BootId = BootId(77);
+
+    /// `grants/{node}` of node `node`'s process at [`C_BOOT`], expiring at `expiry_utc_ms`.
+    fn r5_grant(node: u32, expiry_utc_ms: i64, frozen: bool) -> GrantRecord {
+        GrantRecord {
+            grant: GrantId(1),
+            node: NodeId(node),
+            boot: C_BOOT,
+            authority_generation: AuthorityGeneration(1),
+            expiry_utc_ms,
+            frozen,
+        }
+    }
+
+    /// Now on a fresh `HostClock`, in UTC milliseconds.
+    fn utc_now() -> i64 {
+        i64::try_from(HostClock::start().now().0).expect("a tick fits")
+    }
+
+    /// One R5 heal: `partitions/1` rooted (members nodes 1 to 3, `owner_node` primary),
+    /// `grants` written, and every node's boot `boot_of` gives. Real time, `within` to wait.
+    /// Answers how it ended, what it sent node 1, and how long it took.
+    fn r5_heal(
+        os_boot: OsBoot,
+        owner_node: NodeId,
+        boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+        grants: &[GrantRecord],
+        clock: HostClock,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
+        r5_heal_by(false, os_boot, owner_node, boot_of, grants, clock, within)
+    }
+
+    /// [`r5_heal`], through [`heal_retrying`] when `retrying`, as an open runs it.
+    fn r5_heal_by(
+        retrying: bool,
+        os_boot: OsBoot,
+        owner_node: NodeId,
+        boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+        grants: &[GrantRecord],
+        clock: HostClock,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        for grant in grants {
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(grant.node).encode()),
+                value: grant.encode(),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("the grant is written");
+        }
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            os_boot,
+            links_since: Default::default(),
+            partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock,
+            owner,
+            within,
+            member_boot: boot_of,
+            owner_node,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let healed = if retrying {
+            rt.block_on(heal_retrying(ctx, &std::sync::Mutex::new(None)))
+        } else {
+            rt.block_on(heal(ctx))
+        };
+        (healed, mailbox.try_iter().collect(), started.elapsed())
+    }
+
+    /// Every node but `down` at `OPEN_2`.
+    fn r5_up_but(down: &'static [u32]) -> Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> {
+        Arc::new(move |node: NodeId| (!down.contains(&node.0)).then_some(OPEN_2))
+    }
+
+    /// The nodes and boots the heal's `Plan` pins; empty when it sent none.
+    fn r5_planned(sent: &[Msg]) -> Vec<(u32, BootId)> {
+        sent.iter()
+            .find_map(|msg| match msg {
+                Msg::Inject {
+                    kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))),
+                    ..
+                } => Some(
+                    plan.config
+                        .members
+                        .iter()
+                        .map(|member| (member.node.0, member.boot))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The copies a `HealLeftOut` names, with the index of that letter among `sent`.
+    fn r5_left_out(sent: &[Msg]) -> Option<(usize, Vec<Member>)> {
+        sent.iter().enumerate().find_map(|(at, msg)| match msg {
+            Msg::HealLeftOut { partition, left } if *partition == PARTITION => {
+                Some((at, left.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// R5 rows 2 and (frozen) evidence: same OS boot, node 3 (a regular copy) has no boot and
+    /// its grant is proven expired, or frozen; nodes 1 and 2 are a majority. The heal does not
+    /// wait: the plan pins nodes 1 and 2 only, and before it a `HealLeftOut` names node 3 at the
+    /// boot its grant names, a regular copy. Unit (~100 ms each). Cut: `member_boots` never asks
+    /// `leave_out`: `PeersUnknown` after the budget, red.
+    #[test]
+    fn r5_b_same_os_boot_leaves_out_a_copy_proven_down() {
+        let far = utc_now() + 3_600_000;
+        for (expiry, frozen) in [(0, false), (far, true)] {
+            let (healed, sent, _) = r5_heal(
+                OsBoot::Same,
+                OWNER,
+                r5_up_but(&[3]),
+                &[r5_grant(3, expiry, frozen)],
+                HostClock::start(),
+                Duration::from_secs(2),
+            );
+            healed.unwrap_or_else(|e| panic!("frozen {frozen}: the heal goes on: {e}"));
+            assert_eq!(
+                r5_planned(&sent),
+                [(1, OPEN_2), (2, OPEN_2)],
+                "frozen {frozen}"
+            );
+            let (at, left) = r5_left_out(&sent).expect("node 3 is noted left out");
+            assert_eq!(at, 0, "noted before the plan");
+            assert_eq!(left.len(), 1, "{left:?}");
+            assert_eq!(left[0].node, NodeId(3));
+            assert_eq!(left[0].boot, C_BOOT, "at the boot its grant names");
+            assert_eq!(left[0].role, ReplicaRole::RegularSecondary);
+        }
+    }
+
+    /// R5 rows 5 (c), 6 and 7, and the evidence rule: each case waits for every copy, ends
+    /// `PeersUnknown` with its `heal_wait_all` reason after the budget, and sends nothing.
+    /// - (c) same OS boot, nodes 2 and 3 down with expired grants: `no_majority`;
+    /// - the OS rebooted: `os_boot_changed`; no id on file or unreadable: `os_boot_unknown`;
+    ///   not Linux: `unsupported_platform`;
+    /// - same OS boot, node 3 down with a live grant: `copy_not_proven_down`. (With no grant
+    ///   record it waits one window, then goes on: [`r5_i_a_copy_with_no_grant_is_left_out_after_one_heal_window`].)
+    ///
+    /// Unit (~300 ms each). Cuts: `leave_out` without its `os_boot` check: the three OS cases
+    /// heal, red; without its majority check: (c) heals, red.
+    #[test]
+    fn r5_c_the_heal_waits_for_every_copy_without_its_conditions() {
+        let cases: [(OsBoot, &'static [u32], &[GrantRecord], &str); 5] = [
+            (
+                OsBoot::Same,
+                &[2, 3],
+                &[r5_grant(2, 0, false), r5_grant(3, 0, false)],
+                "no_majority",
+            ),
+            (
+                OsBoot::Changed,
+                &[3],
+                &[r5_grant(3, 0, false)],
+                "os_boot_changed",
+            ),
+            (
+                OsBoot::Unknown,
+                &[3],
+                &[r5_grant(3, 0, false)],
+                "os_boot_unknown",
+            ),
+            (
+                OsBoot::Unsupported,
+                &[3],
+                &[r5_grant(3, 0, false)],
+                "unsupported_platform",
+            ),
+            (
+                OsBoot::Same,
+                &[3],
+                &[r5_grant(3, utc_now() + 3_600_000, false)],
+                "copy_not_proven_down",
+            ),
+        ];
+        for (os_boot, down, grants, want) in cases {
+            let (healed, sent, _) = r5_heal(
+                os_boot,
+                OWNER,
+                r5_up_but(down),
+                grants,
+                HostClock::start(),
+                Duration::from_millis(300),
+            );
+            match &healed {
+                Err(HealError::PeersUnknown { nodes, reason, .. }) => {
+                    assert_eq!(nodes.as_slice(), down, "{os_boot:?}");
+                    assert_eq!(*reason, want, "{os_boot:?} {down:?}");
+                    assert!(
+                        healed.as_ref().is_err_and(|e| e.to_string().contains(want)),
+                        "the error names its reason: {healed:?}"
+                    );
+                }
+                other => panic!("{os_boot:?} {down:?} must wait: {other:?}"),
+            }
+            assert!(sent.is_empty(), "{os_boot:?}: {} sent", sent.len());
+        }
+    }
+
+    /// R5 row 9 (late link): same OS boot, node 3 alive with a live grant and its link late:
+    /// its boot is known only 400 ms into the heal. The heal must not leave it out: the plan
+    /// pins node 3 at its boot, a regular copy, and nothing is noted left out. Unit (~500 ms).
+    /// Cut: `copy_down` answers `grant_expired` without reading the grant (the evidence check
+    /// removed): node 3 is planned out, red.
+    #[test]
+    fn r5_d_a_live_copy_with_a_late_link_is_not_left_out() {
+        let started = std::time::Instant::now();
+        let late: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+            (node != NodeId(3) || started.elapsed() >= Duration::from_millis(400)).then_some(OPEN_2)
+        });
+        let (healed, sent, _) = r5_heal(
+            OsBoot::Same,
+            OWNER,
+            late,
+            &[r5_grant(3, utc_now() + 3_600_000, false)],
+            HostClock::start(),
+            Duration::from_secs(5),
+        );
+        healed.expect("the heal ends once node 3 is linked");
+        assert_eq!(
+            r5_planned(&sent),
+            [(1, OPEN_2), (2, OPEN_2), (3, OPEN_2)],
+            "node 3 is pinned at its boot"
+        );
+        assert!(r5_left_out(&sent).is_none(), "nothing is left out");
+    }
+
+    /// R5 row 10: node 3 crashed with the owner, so its grant is still live at the reopen: it
+    /// expires 1.5 s in. The heal waits until the expiry is proven on its clock (expiry plus
+    /// epsilon plus delta, 200 ms at the spec's budgets), then goes on without node 3: never
+    /// sooner, and within one grant lifetime plus that margin plus a poll's slack. Unit (~2 s).
+    /// Cut: `copy_down` proves expiry at the record's expiry without epsilon and delta: done
+    /// before 1.7 s, red.
+    #[test]
+    fn r5_e_a_copy_that_crashed_with_the_owner_is_waited_out_one_grant_lifetime() {
+        const LIFETIME_MS: u64 = 1_500;
+        let margin = Budgets::SPEC_DEFAULTS.clock_error_millis
+            + Budgets::SPEC_DEFAULTS.dispatch_margin_millis;
+        let expiry = utc_now() + i64::try_from(LIFETIME_MS).expect("small");
+        let (healed, sent, took) = r5_heal(
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[r5_grant(3, expiry, false)],
+            HostClock::start(),
+            Duration::from_secs(10),
+        );
+        healed.expect("the heal goes on once the grant has run out");
+        assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)]);
+        let floor = Duration::from_millis(LIFETIME_MS + margin);
+        assert!(took >= floor, "went on after {took:?}, before {floor:?}");
+        let bound = crate::host::test_patience(floor + Duration::from_secs(1));
+        assert!(took <= bound, "waited {took:?}, past {bound:?}");
+    }
+
+    /// R5 row 11: node 3's grant expired long ago by the wall clock, but this node's clock bound
+    /// is not established (a `Net` attached, no peer agreed yet). The heal must not leave node 3
+    /// out: it waits, `no_clock_bound`. Once the bound holds, it goes on. Unit (~400 ms).
+    /// Cut: `copy_down` compares the raw local time with the expiry, skipping the bound: the
+    /// first heal goes on, red.
+    #[test]
+    fn r5_f_no_clock_bound_proves_no_copy_down() {
+        let clock = HostClock::guarded(0);
+        let guard = clock.guard().expect("a guarded clock");
+        guard.attach(3);
+        assert!(!guard.established(), "no peer has agreed");
+        let (healed, sent, _) = r5_heal(
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[r5_grant(3, 0, false)],
+            clock,
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&healed, Err(HealError::PeersUnknown { reason, .. }) if *reason == "no_clock_bound"),
+            "{healed:?}"
+        );
+        assert!(sent.is_empty(), "{} sent", sent.len());
+        guard.disable();
+        let (healed, sent, _) = r5_heal(
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[r5_grant(3, 0, false)],
+            clock,
+            Duration::from_secs(2),
+        );
+        healed.expect("with the bound, the heal goes on");
+        assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)]);
+    }
+
+    /// R5, lead ruling (a): same OS boot, node 3 (a regular copy) down with no `grants/3`. Run
+    /// as an open runs it, through `heal_retrying`: the first attempt waits its whole window
+    /// (`within`, 800 ms here), `no_grant_record`; the next, the window counted from the first
+    /// attempt's start, goes on at once. The plan pins nodes 1 and 2, and before it a
+    /// `HealLeftOut` names node 3 at `UNLINKED_BOOT`, so the owner records the first live boot
+    /// it sees. Unit (~1.5 s). Cuts: `no_grant_record` ignores the window: done before 800 ms,
+    /// red; the window counted from each attempt's start: every attempt ends `PeersUnknown`,
+    /// past the bound, red.
+    #[test]
+    fn r5_i_a_copy_with_no_grant_is_left_out_after_one_heal_window() {
+        let window = Duration::from_millis(800);
+        let (healed, sent, took) = r5_heal_by(
+            true,
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[],
+            HostClock::start(),
+            window,
+        );
+        healed.expect("the heal goes on after one window");
+        assert!(
+            took >= window,
+            "went on after {took:?}, before the window {window:?}"
+        );
+        // One window, the first retry's 500 ms, and slack.
+        let bound = crate::host::test_patience(window + Duration::from_millis(1_500));
+        assert!(took <= bound, "waited {took:?}, past {bound:?}");
+        assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)]);
+        let (at, left) = r5_left_out(&sent).expect("node 3 is noted left out");
+        assert_eq!(at, 0, "noted before the plan");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].node, NodeId(3));
+        assert_eq!(left[0].boot, UNLINKED_BOOT, "no boot is known for it");
+        assert_eq!(left[0].role, ReplicaRole::RegularSecondary);
+    }
+
+    /// R5 row 3 (a): a promote moved partition 1 to node 1 while node 2, the owner this open
+    /// found, was down with node 3. Same OS boot, node 3's grant expired: the heal may go on
+    /// without node 3, but the record now names owner node 1, so the owner check (B2) refuses
+    /// and nothing is sent, no left-out note either; the open then serves as a copy. Unit
+    /// (~100 ms). Cut: `plan_heal` without its owner check: a plan is sent, red.
+    #[test]
+    fn r5_g_a_promote_while_the_owner_was_down_refuses_the_heal() {
+        let (healed, sent, _) = r5_heal(
+            OsBoot::Same,
+            NodeId(2),
+            r5_up_but(&[3]),
+            &[r5_grant(3, 0, false)],
+            HostClock::start(),
+            Duration::from_secs(2),
+        );
+        match &healed {
+            Err(HealError::Record(text)) => {
+                assert!(text.contains("names owner node 1"), "{text}");
+            }
+            other => panic!("the owner check refuses: {other:?}"),
+        }
+        assert!(sent.is_empty(), "{} sent", sent.len());
     }
 }
