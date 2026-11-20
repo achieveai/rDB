@@ -2114,6 +2114,71 @@ fn m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base() {
     );
 }
 
+/// Issue #61 R26: node 2 holds generation 2 as a snapshot install leaves it: 6 records with no
+/// link (no parent) and its own trim mark at 4, rooted at `(4, digest 4)` (B1). Answers the
+/// host over it and the digests.
+fn installed_at_four(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> (Host, Vec<Digest>) {
+    let digests = {
+        let mut engine = RocksEngine::open(path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(2), 6);
+        engine
+            .stage_trim_history(
+                PartitionId(1),
+                Generation(2),
+                TrimFloor {
+                    seq: Seq(4),
+                    root_base: Seq(4),
+                    root_digest: digests[3],
+                },
+            )
+            .expect("the mark is staged");
+        digests
+    };
+    let host = host_over(path, rt);
+    assert_eq!(host.engine.link(PartitionId(1), Generation(2)), None, "unlinked");
+    (host, digests)
+}
+
+/// Issue #61 R26 (i): a lineage a snapshot installed has no link, only its own trim mark at the
+/// barrier. A re-plan anchored at that barrier asks it for an inventory, and it answers, where
+/// it was refused `anchor_generation_unlinked`: the first re-plan after every snapshot rebuild
+/// then dropped the rebuilt copy as `Stalled` and committed `ReadOnly` again (R26, manual D1).
+/// Cut: the old `ok_or("anchor_generation_unlinked")` on the link, red.
+/// Unit.
+#[test]
+fn t61_r26_an_installed_lineage_answers_an_inventory_at_its_barrier() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 4, digests[3]), None);
+    assert!(answer.is_ok(), "{:?}", answer.err());
+}
+
+/// Issue #61 R26 (ii): an unlinked lineage answers only from its own mark's root up. Anchored
+/// at 2, below the mark's root at 4, it is still refused `anchor_generation_unlinked`.
+/// Cut: the root-base condition skipped, red (refused `base_below_floor` instead).
+/// Unit.
+#[test]
+fn t61_r26_an_unlinked_lineage_rooted_above_the_base_is_refused_unlinked() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1]), None);
+    assert_eq!(answer.err(), Some("anchor_generation_unlinked"));
+}
+
+/// Issue #61 R26 (iii): an unlinked lineage rooted at the base still proves the base by its
+/// digest there. Anchored at 4 with record 3's digest, it is refused `base_digest_differs`.
+/// Unit.
+#[test]
+fn t61_r26_an_unlinked_lineage_with_another_digest_at_the_base_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 4, digests[2]), None);
+    assert_eq!(answer.err(), Some("base_digest_differs"));
+}
+
 /// Critic-s1b A2: `ladder_duty` warmed partitions in a fixed order, [`WARM_RUNGS`] records a
 /// pass across all of them, so while partition 1 had more to read than that, partition 2 was
 /// never reached. Here partition 1 holds two passes' worth and partition 2 holds 10 records:

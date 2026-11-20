@@ -14372,11 +14372,14 @@ impl Host {
     /// too (D8, A-R337). A link above the base is an adopted tail's (issue #105 unit 2, design
     /// section 5.1, M1): it passes only when the chain from the base through the link verifies
     /// record by record from the anchor's digest ([`Self::chain`]), and is refused
-    /// `base_differs` otherwise. A copy missing the anchor's generation, or holding it staged
-    /// under a release, links it first ([`Self::inherit_missed_link`]). A copy holding a newer
-    /// generation of the partition is ahead of the plan and answers nothing; roll-forward is
-    /// decided before the plan is made, never here. Its ladder is the kept one, extended through
-    /// the head ([`Self::inventory_ladder`], A-R461), cut at the base.
+    /// `base_differs` otherwise. A lineage a snapshot installed has no link: it answers when its
+    /// own trim mark roots it at or below the anchor's base, and is refused
+    /// `anchor_generation_unlinked` otherwise, as any other unlinked lineage (issue #61 R26). A
+    /// copy missing the anchor's generation, or holding it staged under a release, links it
+    /// first ([`Self::inherit_missed_link`]). A copy holding a newer generation of the partition
+    /// is ahead of the plan and answers nothing; roll-forward is decided before the plan is
+    /// made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -14408,10 +14411,22 @@ impl Host {
                 "inventory_link_inherited"
             );
         }
-        let link = self
-            .engine
-            .link(partition, generation)
-            .ok_or("anchor_generation_unlinked")?;
+        // Issue #61 R26 (A8): a lineage a snapshot installed has no link (a link names an older
+        // parent); its own trim mark roots it at the barrier instead (B1). It answers when that
+        // mark is the anchor generation's own and is rooted at or below the anchor's base; the
+        // base digest check below then proves the prefix as for any lineage. Anything else
+        // unlinked is refused as before.
+        let link = self.engine.link(partition, generation);
+        if link.is_none()
+            && !self
+                .engine
+                .floor(partition, generation)
+                .is_some_and(|(level, mark)| {
+                    level == generation && mark.root_base <= anchor.base_seq
+                })
+        {
+            return Err("anchor_generation_unlinked");
+        }
         // Issue #61 (design section 3.5, rev 4 m-e): History below the trim floor is gone, so a
         // base under it is proved by the mark the trim wrote, never by a record. The mark
         // counts only when it is the anchor generation's own and names the anchor's base as
@@ -14435,7 +14450,7 @@ impl Host {
             // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
             // tail's. It passes only when the chain from the base through the link verifies,
             // record by record, from the anchor's digest; anything else is refused as before.
-            if link.base > anchor.base_seq {
+            if let Some(link) = link.filter(|link| link.base > anchor.base_seq) {
                 self.chain(
                     partition,
                     generation,
