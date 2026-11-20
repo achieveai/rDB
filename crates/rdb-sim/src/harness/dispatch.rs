@@ -68,7 +68,7 @@ use rdb_core::{
         retention::{
             cap_seq, needs_history_budget, overrun_action, retention_floor, OverrunAction,
             RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
-            HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
+            HISTORY_BUDGET_GIVE_UP_CLEARED, HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
         },
         wire, Replication,
     },
@@ -333,6 +333,10 @@ pub struct Dispatcher {
     /// ([`needs_history_budget`]), the twin of the host's `NodeStatus::needs_operator`; cleared
     /// with the count. Process memory.
     needs_operator: BTreeMap<(NodeId, PartitionId, CopyId), String>,
+    /// Per `(source, partition, copy)` given up on, the budget in force and the generation the
+    /// give-up was recorded at (lead ruling R27): a duty round with a higher budget, or of a
+    /// newer generation, clears the give-up ([`Self::clear_give_ups`]). Process memory.
+    given_up: BTreeMap<(NodeId, PartitionId, CopyId), (u64, Generation)>,
     /// Each node's inventory pin per partition (issue #61, design 3.5; the host's
     /// `inventory_pins`): taken at restart for every partition its engine holds, and on every
     /// inventory it reports. While held the retention duty trims nothing (`InventoryPinned`).
@@ -497,6 +501,7 @@ impl Dispatcher {
             behind_floor: BTreeSet::new(),
             overruns: BTreeMap::new(),
             needs_operator: BTreeMap::new(),
+            given_up: BTreeMap::new(),
             inventory_pins: BTreeMap::new(),
             grace: BTreeMap::new(),
             #[cfg(test)]
@@ -2306,6 +2311,51 @@ impl Dispatcher {
         self.snapshot_offer(to, &offer, scheduler)
     }
 
+    /// Clear every give-up of `node`'s `partition` the round at `generation` with
+    /// `budget_bytes` in force no longer stands by (lead ruling R27): the budget is higher than
+    /// the one recorded at the give-up (`budget_raised`, the operator's remedy, which must work
+    /// without a restart), or the generation is newer (`new_generation`, a new plan). The count
+    /// and `needs_operator` go with it, logged [`HISTORY_BUDGET_GIVE_UP_CLEARED`], so the copy's
+    /// next ask is offered again. A lower or equal budget clears nothing.
+    fn clear_give_ups(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+        budget_bytes: u64,
+    ) {
+        let cleared: Vec<_> = self
+            .given_up
+            .iter()
+            .filter(|((source, p, _), _)| *source == node && *p == partition)
+            .filter_map(|(key, (budget, at))| {
+                if generation > *at {
+                    Some((*key, "new_generation", *budget, *at))
+                } else if budget_bytes > *budget {
+                    Some((*key, "budget_raised", *budget, *at))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (key, why, budget, at) in cleared {
+            self.given_up.remove(&key);
+            self.overruns.remove(&key);
+            self.needs_operator.remove(&key);
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                copy = key.2 .0,
+                why,
+                budget_was = budget,
+                budget = budget_bytes,
+                generation_was = at.0,
+                generation = generation.0,
+                "{HISTORY_BUDGET_GIVE_UP_CLEARED}"
+            );
+        }
+    }
+
     /// The overruns in a row of `copy`'s transfers from `node` on `partition` (owner ruling
     /// 2026-11-20, option 1): 0 when none, or since a caught-up release.
     #[must_use]
@@ -2339,6 +2389,7 @@ impl Dispatcher {
         if why == "caught_up" {
             self.overruns.remove(&key);
             self.needs_operator.remove(&key);
+            self.given_up.remove(&key);
         }
         let Some(transfer) = self.snapshot_transfers.remove(&key) else {
             return;
@@ -3496,7 +3547,8 @@ impl Dispatcher {
     ///   (`budget_overran`), so the copy's next ask opens a new one, until [`overrun_action`]
     ///   gives up on the copy: then `history_budget_gave_up` names it in
     ///   [`Self::needs_operator`] and it is offered nothing more until a `caught_up` release
-    ///   (owner ruling 2026-11-20, option 1).
+    ///   (owner ruling 2026-11-20, option 1), or a round with a higher budget or a newer
+    ///   generation clears it first ([`Self::clear_give_ups`], lead ruling R27).
     /// * A copy behind the floor is logged `history_copy_behind_floor` once, until it is counted
     ///   again.
     /// * A hold ([`Self::retention_hold`]) trims nothing, logged `history_trim_held{reason}`.
@@ -3528,6 +3580,8 @@ impl Dispatcher {
             .map(|((_, generation), _)| *generation)
             .max()
             .ok_or(SimError::Config { field: "partition" })?;
+        self.clear_give_ups(node, partition, generation, config.budget_bytes);
+        let engine = &self.engines[&node];
         let prev = engine.floor_seq(partition, generation);
         let applied = Seq(engine.buffered_applied(partition, generation).0);
         let own_durable = engine.durable(partition, generation);
@@ -3625,6 +3679,8 @@ impl Dispatcher {
                     "history_budget_gave_up"
                 );
                 self.needs_operator.insert(*key, needs);
+                self.given_up
+                    .insert(*key, (config.budget_bytes, generation));
             }
         }
         if floor.floor > prev {
@@ -6742,7 +6798,8 @@ mod dormant_twin_tests {
 
     /// One overrun of copy 2's open transfer: node 1 applies three records past its head, and a
     /// duty round at `now`, whose budget holds only those three, passes the transfer's pin.
-    fn overrun_copy_2(dispatcher: &mut Dispatcher, seed: &DormantSeed, now: Tick) {
+    /// Returns that budget.
+    fn overrun_copy_2(dispatcher: &mut Dispatcher, seed: &DormantSeed, now: Tick) -> u64 {
         let pin = copy_2_transfer(dispatcher).expect("a transfer is open");
         let head = dispatcher.engines[&OWNER]
             .buffered_applied(P, Generation(1))
@@ -6760,6 +6817,150 @@ mod dormant_twin_tests {
             panic!("held: {decision:?}");
         };
         assert_eq!(floor.overran_pins, vec![pin], "the cap passes the pin");
+        tight.budget_bytes
+    }
+
+    /// Three overruns of copy 2's transfers in a row, at ticks 1 to 3: node 1 gives up on it.
+    /// Returns the budget the give-up was recorded at.
+    fn give_up_on_copy_2(
+        dispatcher: &mut Dispatcher,
+        seed: &DormantSeed,
+        scheduler: &mut Scheduler,
+    ) -> u64 {
+        let mut budget = 0;
+        for round in 1..=3 {
+            copy_2_asks(dispatcher, scheduler).expect("re-offered");
+            budget = overrun_copy_2(dispatcher, seed, Tick(round));
+        }
+        assert!(dispatcher.needs_operator(OWNER, P, CopyId(2)).is_some());
+        budget
+    }
+
+    /// `history_budget_give_up_cleared`'s `why` for copy 2, in order.
+    fn give_up_cleared(method: &str) -> Vec<Option<String>> {
+        logged(method, "history_budget_give_up_cleared")
+            .iter()
+            .filter(|line| line["copy"].as_u64() == Some(2))
+            .map(|line| line["why"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Lead ruling R27: the operator's remedy, a raised history budget, works without a
+    /// restart. A give-up records the budget in force; a duty round at that same budget leaves
+    /// it standing, and one with a higher budget clears it.
+    ///
+    /// **Asserted.** After [`give_up_on_copy_2`], a duty round at the recorded budget clears
+    /// nothing and node 3's next ask opens no transfer. A round at that budget plus one logs
+    /// `history_budget_give_up_cleared{why = budget_raised}` and empties the count and
+    /// `needs_operator`. With node 3's pull no longer held, its next ask opens a fourth transfer,
+    /// at node 1's head, whose install completes: node 3 holds that head.
+    ///
+    /// Cuts: no `budget_raised` clear, red (no clear, no offer); a clear at an equal budget, red
+    /// (the same-budget round clears). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_raised_budget_clears_the_give_up_and_the_copy_is_rebuilt() {
+        const METHOD: &str =
+            "t61_sim_s3_r4b_a_raised_budget_clears_the_give_up_and_the_copy_is_rebuilt";
+        let (mut dispatcher, seed, three) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        let budget = give_up_on_copy_2(&mut dispatcher, &seed, &mut scheduler);
+        let at_budget = |budget_bytes| super::RetentionConfig {
+            keep_millis: 3_600_000,
+            budget_bytes,
+            ..RETAIN
+        };
+
+        dispatcher
+            .retention_duty(OWNER, P, Tick(4), at_budget(budget))
+            .expect("duty");
+        assert_eq!(give_up_cleared(METHOD), Vec::<Option<String>>::new());
+        assert!(dispatcher.needs_operator(OWNER, P, CopyId(2)).is_some());
+        assert_eq!(
+            copy_2_asks(&mut dispatcher, &mut scheduler),
+            None,
+            "the same budget: still no offer"
+        );
+
+        dispatcher
+            .retention_duty(OWNER, P, Tick(5), at_budget(budget + 1))
+            .expect("duty");
+        assert_eq!(
+            give_up_cleared(METHOD),
+            vec![Some("budget_raised".to_owned())]
+        );
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 0);
+        assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
+
+        dispatcher.snapshot_hooks.pages_held_from = None;
+        let head = dispatcher.engines[&OWNER]
+            .buffered_applied(P, Generation(1))
+            .0;
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(2), Seq(HEAD), &mut scheduler)
+            .expect("served");
+        let opened: Vec<_> = logged(METHOD, "snapshot_transfer_opened")
+            .iter()
+            .map(|line| line["at"].as_u64())
+            .collect();
+        assert_eq!(opened.len(), 4, "offered again: {opened:?}");
+        assert_eq!(opened.last(), Some(&Some(head)));
+        let installed: Vec<_> = logged(METHOD, "snapshot_transfer_installed")
+            .iter()
+            .map(|line| line["at"].as_u64())
+            .collect();
+        assert_eq!(installed, vec![Some(head)], "the new offer completes");
+        assert_eq!(
+            dispatcher.engines[&three].buffered_applied(P, Generation(1)),
+            AppliedSeq(head)
+        );
+    }
+
+    /// Lead ruling R27: a new generation of the partition is a new plan, so it clears a give-up
+    /// recorded under the old one, whatever the budget.
+    ///
+    /// **Asserted.** After [`give_up_on_copy_2`] under generation 1, node 1's engine inherits
+    /// generation 2 at its head. A duty round at the recorded budget (not raised) logs
+    /// `history_budget_give_up_cleared{why = new_generation}` and empties the count and
+    /// `needs_operator`.
+    ///
+    /// **Differs.** No offer follows here: node 1's primary still serves generation 1, so an
+    /// offer under generation 2 needs the new primary the failover rows build. The clear is the
+    /// claim.
+    ///
+    /// Cut: no `new_generation` clear, red. Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_new_generation_clears_the_give_up() {
+        const METHOD: &str = "t61_sim_s3_r4b_a_new_generation_clears_the_give_up";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        let budget = give_up_on_copy_2(&mut dispatcher, &seed, &mut scheduler);
+        let head = dispatcher.engines[&OWNER]
+            .buffered_applied(P, Generation(1))
+            .0;
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .inherit(P, Generation(1), Generation(2), Seq(head))
+            .expect("inherit at the head");
+        dispatcher
+            .retention_duty(
+                OWNER,
+                P,
+                Tick(4),
+                super::RetentionConfig {
+                    keep_millis: 3_600_000,
+                    budget_bytes: budget,
+                    ..RETAIN
+                },
+            )
+            .expect("duty");
+        assert_eq!(
+            give_up_cleared(METHOD),
+            vec![Some("new_generation".to_owned())]
+        );
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 0);
+        assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
     }
 
     /// `history_budget_overran_pin`'s `(attempts, gave_up)` for copy 2, in order.
