@@ -1747,8 +1747,9 @@ fn unbounded_install_at(t: u64) -> (Authority, Vec<AuthorityView>) {
 /// nothing" there.
 ///
 /// This pins today's behaviour, both ticks, so a change to either side shows up here. It is not
-/// reached by a real node: `rdb_api`'s `HostClock::now` counts ticks from the Unix epoch in
-/// milliseconds. Whether the kernel itself should refuse tick 0 is open on #130.
+/// reached by a real node: tick 0 is never a real step tick (ruling on #130). `rdb_api`'s
+/// `HostClock::now` counts Unix-epoch milliseconds, and `Host::offer` refuses to step a kernel
+/// at tick 0.
 ///
 /// [`view_admits`]: rdb_core::transaction::view_admits
 #[retcd_test]

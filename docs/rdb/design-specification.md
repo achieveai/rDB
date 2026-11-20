@@ -529,6 +529,8 @@ stateDiagram-v2
 
 **Clock uncertainty is the clock guard's word (issue #80 S2c).** A node's clock bound holds only while the node and the peers whose fresh verdict (at most 5 s old) is Agree are a majority of the cluster, and outnumber the fresh Breaches. A node without one has no bound: it admits nothing (`ClockUnbounded`), and a promote run on its clock is refused before it writes anything.
 
+**Tick 0 is never a real step tick (issue #130).** A view that admits nothing has a horizon one tick before its step. At tick 0 that saturates to tick 0 itself, so check 6 would admit a view A1 denies. A real node's ticks count Unix-epoch milliseconds, so they never read 0. Only the clock's dev hooks (`--clock-step-file`, `--clock-offset-ms`) can push a node there, and the host then refuses to step any kernel and faults. The simulator starts at tick 0. Its rows treat tick 0 as test-only.
+
 
 The selected design requires new fenced-grant semantics; inspected rDB surfaces do not establish an existing implementation. A grant service uses rDB consensus to serialize grant/renew/revoke state; it is not a separate authority outside rDB.
 
