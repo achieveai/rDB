@@ -1,6 +1,7 @@
 //! #81 V10: when a node process should restart, the rule [`super::Db::restart_wanted`] polls
 //! and `rdb_node` exits 75 on.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use config_core::{ConfigStore, ListRequest};
@@ -98,10 +99,94 @@ pub(crate) async fn owns_no_partition(
     Ok(true)
 }
 
+/// [`owns_no_partition`] run on `rt` and waited for, from this blocking thread, for at most
+/// `within`: `true` only when the read answered that no `partitions/` record names one of
+/// `nodes` owner. Every other outcome is `false` and logged `db_restart_check_unread`: a list
+/// that fails, comes back truncated, or holds a record that does not decode, and a read that
+/// does not answer within `within`. A read that does not answer is aborted, so a store that
+/// never answers leaves no task behind, poll after poll (PR #171 review).
+pub(crate) fn owns_none_within(
+    rt: &tokio::runtime::Handle,
+    store: Arc<dyn ConfigStore>,
+    nodes: Vec<NodeId>,
+    within: Duration,
+) -> bool {
+    let (done, answer) = std::sync::mpsc::channel();
+    let read = rt.spawn(async move {
+        let _ = done.send(owns_no_partition(&*store, &nodes).await);
+    });
+    match answer.recv_timeout(within) {
+        Ok(Ok(none)) => none,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "db_restart_check_unread");
+            false
+        }
+        Err(_) => {
+            read.abort();
+            tracing::warn!(
+                error = "partitions/ did not answer within the read timeout",
+                within_ms = within.as_millis(),
+                "db_restart_check_unread"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{restart_due, RestartReason, RESTART_HOLD};
+    use super::{owns_none_within, restart_due, RestartReason, RESTART_HOLD};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use config_core::ConfigStore;
+    use rdb_core::contracts::ids::NodeId;
+
+    /// How long the rows give a read that never answers.
+    const WITHIN: Duration = Duration::from_millis(50);
+
+    /// The `db_restart_check_unread` lines the current row logged.
+    fn unread(method: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_restart_check_unread")
+            .collect()
+    }
+
+    /// PR #171 review (item 7): a control store whose `partitions/` list never answers. Each of
+    /// three polls gives up at the read timeout, says `db_restart_check_unread`, answers "owns
+    /// some", and aborts its read, so all three pending reads are dropped: no task is left per
+    /// poll. Unit (in-memory store, no sockets).
+    /// Cut: no `abort` after the timeout; no read is dropped, red at "every pending read is
+    /// dropped".
+    #[config_log::retcd_test]
+    fn own81_v10_a_restart_check_that_never_answers_leaves_no_task() {
+        const METHOD: &str = "own81_v10_a_restart_check_that_never_answers_leaves_no_task";
+        let rt = crate::db::reopen_tests::runtime();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn ConfigStore> = crate::test_store::ListFault::new(
+            Arc::new(config_testkit::MemStore::new()),
+            crate::test_store::ListFaultMode::Never(Arc::clone(&drops)),
+        );
+        for _ in 0..3 {
+            assert!(!owns_none_within(
+                rt.handle(),
+                Arc::clone(&store),
+                vec![NodeId(1)],
+                WITHIN
+            ));
+        }
+        assert_eq!(unread(METHOD).len(), 3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while drops.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "every pending read is dropped: {} of 3",
+                drops.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// V10 (#81) `restart_due`: a stopped self-replace is due only once held for
     /// `RESTART_HOLD`, and only when the node owns no partition; the ownership read is not

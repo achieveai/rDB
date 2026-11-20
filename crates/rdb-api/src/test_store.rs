@@ -686,6 +686,88 @@ impl ConfigStore for PutAfterGet {
     }
 }
 
+/// What a [`ListFault`] does to every list.
+#[derive(Clone)]
+pub(crate) enum ListFaultMode {
+    /// Read, and answer with `truncated` set.
+    Truncate,
+    /// Never answer. Each dropped list adds one to the count: a caller that gives up on a list
+    /// it spawned must abort it, or the count stays where it was (PR #171 review).
+    Never(std::sync::Arc<std::sync::atomic::AtomicUsize>),
+}
+
+/// Adds one to its count when the list future holding it is dropped.
+struct CountDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Any control store whose every list is faulted by `mode`. Every other call passes.
+pub(crate) struct ListFault {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    mode: ListFaultMode,
+}
+
+impl ListFault {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        mode: ListFaultMode,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { inner, mode })
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for ListFault {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        match &self.mode {
+            ListFaultMode::Truncate => {
+                let mut listed = self.inner.list(request).await?;
+                listed.truncated = true;
+                Ok(listed)
+            }
+            ListFaultMode::Never(drops) => {
+                let _counted = CountDrop(std::sync::Arc::clone(drops));
+                std::future::pending::<Result<ListResponse, ConfigError>>().await
+            }
+        }
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
 /// Any control store that reports `TransportSecurity::MutualTls` (#80 S2, ADR-rdb-0024): what a
 /// `GrpcClient` under mutual TLS says about itself, so a row can declare or open a database
 /// whose nodes are on other machines against an in-memory store. Every call is forwarded.
