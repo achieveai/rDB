@@ -2611,8 +2611,9 @@ impl Fault {
 
     /// [`Self::error`] for a call that reached the node after it faulted: refused before
     /// admission, so it mutated nothing (#124, ruling Q15 (b)). Its retry rule is unchanged.
-    /// A call admitted before the fault keeps [`Self::error`], and so does a status query or a
-    /// resend after it: each is about an earlier write that may have applied (#136).
+    /// A call admitted before the fault keeps [`Self::error`], and so does a status query after
+    /// it: it is about an earlier write that may have applied (#136). A resend takes this
+    /// refusal, as `Db::put`'s first send; `Db::resend` clears `no_mutation` itself.
     fn refusal(&self) -> ApiError {
         let mut error = self.error();
         error.no_mutation = true;
@@ -3859,11 +3860,13 @@ impl Host {
     fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
-                // A status query or a resend is about an earlier write, which may have applied
-                // before the fault: its refusal must not say nothing was applied, or the step
-                // sends that write again as a new one (#136).
+                // A status query is about an earlier write, which may have applied before the
+                // fault: its refusal must not say nothing was applied, or the step sends that
+                // write again as a new one (#136). A resend keeps the refusal: `Db::put` sends
+                // a compiled request first as a resend, and that first send was never admitted
+                // (#124, `m10_124_...`); `Db::resend` clears `no_mutation` for a real resend.
                 let error = match client.call {
-                    ClientCall::Status { .. } | ClientCall::Resend { .. } => fault.error(),
+                    ClientCall::Status { .. } => fault.error(),
                     _ => fault.refusal(),
                 };
                 let _ = client.reply.send(Answer::Error {

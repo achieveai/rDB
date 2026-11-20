@@ -1696,11 +1696,12 @@ fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
 /// that is refused at once. The fault here is the control adapter's own (`Msg::Fault`), the
 /// one input that faults a healthy node without a kernel or storage defect. The waiting put
 /// was admitted, so its answer says `no_mutation` false; a call after the fault was not, so
-/// its answer says true (#124, ruling Q15 (b)), except a status query or a resend, which ask
-/// about the waiting put and say false (#136).
-/// Cuts: `Host::answer_faulted` answers with `Fault::error` (before #124), red on the get and
-/// put after the fault. It answers every call with `Fault::refusal` (before #136), red on the
-/// status and the resend. `Fault::error` itself sets `no_mutation`, red on the waiting put.
+/// its answer says true (#124, ruling Q15 (b)), except a status query, which asks about the
+/// waiting put and says false (#136). A resend stays true at the host: `Db::put`'s first send
+/// is a resend (`m10_124_...`), and `Db::resend` clears `no_mutation` itself.
+/// Cuts: `Host::answer_faulted` answers with `Fault::error` (before #124), red on the get, the
+/// put and the resend after the fault. It answers every call with `Fault::refusal` (before
+/// #136), red on the status. `Fault::error` itself sets `no_mutation`, red on the waiting put.
 #[test]
 fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls() {
     let dir = config_testkit::fs::temp_dir();
@@ -1743,9 +1744,10 @@ fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls
     };
 
     // #124: a call that arrives after the fault is refused before admission, so it says
-    // `no_mutation`, a put as well as a read. #136: a status query and a resend are about the
-    // waiting put, which may have applied, so they keep `no_mutation` false: true would tell
-    // the caller to send that write again as a new one.
+    // `no_mutation`, a put as well as a read. #136: a status query is about the waiting put,
+    // which may have applied, so it keeps `no_mutation` false: true would tell the caller to
+    // send that write again as a new one. A resend stays true here: `Db::put` sends a request
+    // first as a resend, and only `Db::resend` (which clears the flag) means "again".
     for (name, call, no_mutation) in [
         ("get", get(2, b"a"), true),
         ("put", put(3, b"b", b"2", None), true),
@@ -1757,7 +1759,7 @@ fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls
             },
             false,
         ),
-        ("resend", ClientCall::Resend { request }, false),
+        ("resend", ClientCall::Resend { request }, true),
     ] {
         let (reply, refused) = mpsc::channel();
         host.handle(Msg::Client(Client {
