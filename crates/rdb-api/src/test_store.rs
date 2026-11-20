@@ -598,6 +598,94 @@ impl ConfigStore for ClockOnPut {
     }
 }
 
+/// Any control store that, once [`PutAfterGet::arm`]ed, on the next get of one key reads it and
+/// then puts `value` at `key` before it answers: a write that lands between a caller's read of one key and its next call
+/// (PR #171 review: a partition that comes to name a node right after the planner read that
+/// node's frozen grant, or a grant that moves before its delete). Every other call passes.
+pub(crate) struct PutAfterGet {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    watch: Vec<u8>,
+    key: String,
+    value: bytes::Bytes,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl PutAfterGet {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        watch: &str,
+        key: &str,
+        value: bytes::Bytes,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            watch: watch.as_bytes().to_vec(),
+            key: key.to_owned(),
+            value,
+            done: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Put after the next get of the watched key, once. Gets before this pass untouched, so a
+    /// row's own setup reads do not fire it.
+    pub(crate) fn arm(&self) {
+        self.done.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PutAfterGet {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        let watched = request.key.as_ref() == self.watch.as_slice();
+        let answer = self.inner.get(request).await;
+        if watched && !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let put = self
+                .inner
+                .put(PutRequest {
+                    key: bytes::Bytes::from(self.key.clone()),
+                    value: self.value.clone(),
+                    expected_mod_revision: None,
+                    dedup: None,
+                })
+                .await
+                .expect("the row's put after the get lands");
+            tracing::info!(key = %self.key, revision = put.revision, "test_put_after_get");
+        }
+        answer
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
 /// Any control store that reports `TransportSecurity::MutualTls` (#80 S2, ADR-rdb-0024): what a
 /// `GrpcClient` under mutual TLS says about itself, so a row can declare or open a database
 /// whose nodes are on other machines against an in-memory store. Every call is forwarded.

@@ -607,10 +607,10 @@ impl Planner {
             .filter(|(_, record)| record.frozen)
             .map(|(node, _)| *node)
             .collect();
-        // #81 X2: a frozen grant of a node that owns nothing is a candidate for the clear.
-        let records: Vec<PartitionRecord> = partitions.iter().map(|entry| entry.0).collect();
+        // #81 X2: a frozen grant of a node that owns nothing in this snapshot is a candidate
+        // for the clear. Only a candidate: `clear_frozen` reads both families again, in order.
         for node in frozen.iter().filter(|node| !owned.contains_key(node)) {
-            self.clear_frozen(*node, &records).await;
+            self.clear_frozen(*node, memory.held).await;
         }
         let mut todo = Vec::new();
         for (owner, records) in owned {
@@ -949,10 +949,17 @@ impl Planner {
     /// #81 X2 (owner answer (a) on #81, 2026-11-19): delete `grants/{node}` when it is a frozen
     /// record of a boot that is gone and the node owns nothing ([`clear_frozen_verdict`]), so
     /// the node's new boot can be chosen and promoted again. Run by [`Self::sweep`] only, so
-    /// only while this planner holds `planner/grant`. The record is read again here and deleted
-    /// at that read's `mod_revision`: a renewal or a fresh freeze in between makes the delete
-    /// a conflict, and nothing is cleared.
-    async fn clear_frozen(&self, node: NodeId, partitions: &[PartitionRecord]) {
+    /// only while this planner holds `planner/grant`; `held` is the grant the sweep started
+    /// under.
+    ///
+    /// The sweep's snapshot only names the candidate. Here `grants/{node}` is read first, and
+    /// `partitions/` again after it, so no partition can come to name the node between the
+    /// ownership read and the grant it judges (PR #171 review): a read that fails refuses the
+    /// clear. The planner's grant is checked again ([`Self::still_held`]) right before the
+    /// delete, which goes at the grant read's `mod_revision`: a renewal or a fresh freeze in
+    /// between makes it a conflict, and nothing is cleared. Every refusal is logged, and the
+    /// next sweep tries again.
+    async fn clear_frozen(&self, node: NodeId, held: Option<Held>) {
         let key = ControlKey::Grant(node).encode();
         let found = match self
             .store
@@ -976,11 +983,26 @@ impl Planner {
             );
             return;
         };
+        // After the grant read, never before it: the ownership the verdict judges is at least
+        // as new as the record it would delete.
+        let partitions: Vec<PartitionRecord> = match self.partitions().await {
+            Ok(entries) => entries.into_iter().map(|entry| entry.0).collect(),
+            Err(unread) => {
+                tracing::warn!(
+                    node = node.0,
+                    revision = found.mod_revision,
+                    error = %unread.text,
+                    cause = unread.cause,
+                    "planner_frozen_grant_partitions_unread"
+                );
+                return;
+            }
+        };
         let live = self.links.boot_of(node);
         let now = self.clock.now();
         let sample = self.clock.sample(now, &self.budgets);
         if let Err(refusal) =
-            clear_frozen_verdict(node, &record, live, partitions, sample, now, &self.budgets)
+            clear_frozen_verdict(node, &record, live, &partitions, sample, now, &self.budgets)
         {
             tracing::debug!(
                 node = node.0,
@@ -988,6 +1010,14 @@ impl Planner {
                 live_boot = live.map(|boot| boot.0),
                 ?refusal,
                 "planner_frozen_grant_kept"
+            );
+            return;
+        }
+        if self.still_held(held).is_none() {
+            tracing::info!(
+                node = node.0,
+                revision = found.mod_revision,
+                "planner_frozen_grant_skipped_grant_expired"
             );
             return;
         }
@@ -1001,7 +1031,7 @@ impl Planner {
                 "planner_frozen_grant_cleared"
             ),
             // Moved or gone since the read (a new freeze, a takeover): the next sweep reads again.
-            Ok(clearance) => tracing::debug!(
+            Ok(clearance) => tracing::info!(
                 node = node.0,
                 revision = found.mod_revision,
                 ?clearance,
