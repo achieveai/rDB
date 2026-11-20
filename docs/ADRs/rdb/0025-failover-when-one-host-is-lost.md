@@ -151,10 +151,45 @@ the host's 1-minute load average from `uptime`. All observed 2026-11-20.
 - Row R5 `s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are` pins the
   `lone_survivor` limit. It is red when `choose_target` accepts one candidate.
 - `rdb_node`'s bound line is pinned by `s80s3_failover_prints_its_outage_bound_and_without_it_nothing`.
-- **Docker (#176):** the d1 run on separate containers is pending a re-run with #171.
+### Docker run, `scripts/docker-multihost.sh d1` (#176)
 
-<!-- #176: the Docker d1 result goes here: per-class outage times, the host load, and the
-commit it ran on. -->
+**What it proves.** Five data nodes and three rEtcd voters, each in its own container with its
+own IP, on one physical host. Every data node runs `rdb_node --failover`. The control link is
+mutual TLS. The run kills one data node (`docker kill`, a crash), probes every partition, then
+restarts the node and checks it rejoins. It then repeats with other nodes, back to back. It
+does not test a hang, and it does not test separate machines.
+
+**Run 2, 2026-11-20, image without #171: failed.** Load 10.8 at the start, 10.2 at the end.
+
+| Step | Owner | Secondary kill | Result |
+|---|---|---|---|
+| failover 3 | 6.72 s | 10.88 s | passed; node 3 restarted and was pinned again |
+| failover 1 | never | 10.71 s | partitions 1, 6, 11 and 16 not promoted |
+| failover 5 | 7.25 s | 10.41 s | partitions 3 and 13 not promoted |
+
+- **Why it failed.** The image predates #171, so nothing cleared a frozen grant. Node 3
+  restarted after failover 3 and owned nothing, but `grants/3` stayed frozen. A frozen node is
+  never a promote target, so node 3's copies did not count.
+- So in failover 1, partitions 1, 6, 11 and 16 (copies on nodes 1, 2 and 3) had one candidate.
+  The planner refused them as `lone_survivor`. Failover 5 did the same to partitions 3 and 13
+  (copies on nodes 3, 4 and 5).
+- Failover 5 also froze `grants/5` while promoting node 5's other partitions. Node 5 still
+  owned 3 and 13, so its restart stopped at `heal_grant_frozen` and never became ready. That
+  blocked the later steps.
+- **#171 fixes this.** It clears a restarted node's frozen grant once the node owns nothing
+  (`planner_frozen_grant_cleared`). Row R3 shows the in-process case: after a kill and a
+  restart, a second kill still fails over every partition.
+
+**Re-run with #171.** <!-- #176 re-run: fill the image commit, the date, the load and the
+cells below, then replace this comment with one verdict sentence. -->
+
+| Step | Owner | Secondary kill | Result |
+|---|---|---|---|
+| failover 3 | _pending_ | _pending_ | _pending_ |
+| failover 1 | _pending_ | _pending_ | _pending_ |
+| failover 5 | _pending_ | _pending_ | _pending_ |
+
+Image commit: _pending_. Load: _pending_ at the start, _pending_ at the end.
 
 <!-- S4 (membership, dev-s4): the membership rows go here. -->
 
