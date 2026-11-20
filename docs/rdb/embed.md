@@ -1297,10 +1297,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
-  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
-  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
-  separate issue.
+  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
+  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
+  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
+  last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied": ask
+  `db.status`, send it again with `db.resend`, or read the key back. Never send it again as a
+  new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or

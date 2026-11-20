@@ -5474,7 +5474,7 @@ fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_ab
 /// the write in that state on demand, as a revocation staged after its dispatch does. Timed on
 /// the trio's own clock, the one the post-apply deadline runs on, so the answer cannot be that
 /// deadline's. Status then says the write is applied.
-/// Cut: remove the emit in `PubKernel::recovery_unknown_replies`, red (answered after 5,500 ms,
+/// Cut: remove the emit in `PubKernel::recovery_replies`, red (answered after 5,500 ms,
 /// the host's waiter expiry: the recovery has also dropped the candidate's deadline).
 /// Integration (~2 s): bootstrap, the pause age, one rejoin.
 #[config_log::retcd_test]
