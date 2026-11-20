@@ -4285,8 +4285,8 @@ impl Db {
     ///   fails: no answer is given without a current address. A later call can succeed. An
     ///   absent `nodes/{id}` record is not an error: the address is `None`.
     /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
-    ///   owner's node record does not decode: a newer build wrote it, so no retry succeeds until
-    ///   this app runs a build that reads it. Logged `db_route_read_undecodable`.
+    ///   owner's node record does not decode: a newer build may have written it, or it is
+    ///   damaged; no retry succeeds. Logged `db_route_read_undecodable`.
     pub fn route(&self, group: AffinityId) -> Result<RouteInfo, ApiError> {
         self.route_partition(self.partition_for(group))
     }

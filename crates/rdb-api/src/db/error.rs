@@ -105,10 +105,14 @@ pub(crate) const TAIL_ADOPTABLE_RESEND: &str = "reads still work and nothing was
     under a new request id";
 
 /// The tail of [`super::Db::route`]'s `INCOMPATIBLE_VERSION` (#135): a control record this
-/// build cannot decode was written by a newer build, and stays undecodable on every retry, so
-/// the step is an upgrade, not "try again".
-pub(crate) const ROUTE_NEWER_RECORD_STEP: &str = "a newer build wrote this record, so retrying \
-    will not help: run this app on the rDB build the database's nodes run, or a newer one";
+/// build cannot decode. A newer build may have written it, or its bytes are damaged; either way
+/// every retry decodes the same bytes, so the step is an upgrade, then corruption recovery, not
+/// "try again" (PR #159 review).
+pub(crate) const ROUTE_NEWER_RECORD_STEP: &str = "a newer build may have written this record, \
+    or it is damaged; retrying will not help: run this app on the rDB build the database's \
+    nodes run, or a newer one; if the nodes' own build cannot read it either, it is damaged: \
+    stop sending this partition's calls, keep the store as it is, never edit the record by \
+    hand, and report it with this message";
 
 /// The tail of [`crate::admin::PromoteError::TargetFrozen`], for the same reason.
 pub(crate) const PROMOTE_FROZEN_STEP: &str = "promote another node";
