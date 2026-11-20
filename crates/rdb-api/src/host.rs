@@ -643,6 +643,10 @@ pub enum Msg {
         emitter: NodeId,
         /// Not before this tick.
         not_before: Tick,
+        /// `Timeouts::live_readd` on the owner whose F1 committed it (#107 slice 2b). A re-post
+        /// ([`Host::copy_ahead`]) relays that owner's value, never the relaying node's. A copy
+        /// refused this landing marks its receiver only when it is on ([`Host::land_link`]).
+        owner_live_readd: bool,
     },
     /// A client call.
     Client(Client),
@@ -2471,6 +2475,7 @@ enum Delayed {
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
+        owner_live_readd: bool,
     },
     RebuildCheck {
         partition: PartitionId,
@@ -2823,8 +2828,10 @@ struct Host {
     /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
     /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
     snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
-    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
-    committed_correlation: BTreeMap<PartitionId, CorrelationId>,
+    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root,
+    /// with the committing owner's `live_readd` it came with, which the re-post relays (#107
+    /// slice 2b). Inserted with `committed`, always.
+    committed_correlation: BTreeMap<PartitionId, (CorrelationId, bool)>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     /// #59 item 4: the `CopyCaughtUp` each such link answered, re-sent until F1 has it.
@@ -3823,6 +3830,7 @@ impl Host {
                 correlation,
                 emitter,
                 not_before,
+                owner_live_readd,
             } => {
                 let site = Site {
                     partition,
@@ -3834,6 +3842,7 @@ impl Host {
                         result,
                         site,
                         emitter,
+                        owner_live_readd,
                     },
                 );
                 Ok(())
@@ -4097,7 +4106,8 @@ impl Host {
                     result,
                     site,
                     emitter,
-                } => self.land(result, site, emitter),
+                    owner_live_readd,
+                } => self.land(result, site, emitter, owner_live_readd),
                 Delayed::RebuildCheck {
                     partition,
                     generation,
@@ -6741,7 +6751,7 @@ impl Host {
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
         self.committed_correlation
-            .insert(partition, site.correlation);
+            .insert(partition, (site.correlation, self.live_readd.on));
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -6772,6 +6782,7 @@ impl Host {
                 correlation: site.correlation,
                 emitter: self.node,
                 not_before,
+                owner_live_readd: self.live_readd.on,
             };
             if let Err(fault) = self.links.post(member, msg) {
                 tracing::warn!(
@@ -7643,16 +7654,13 @@ impl Host {
     /// One attempt per drop: the plan's start spends the entry, so a re-add F1 blocks, or a
     /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
     ///
-    /// Protocol (Rev 5 m5, ADR-rdb-0009 section 7): every peer that completes a handshake at
-    /// [`crate::net::PROTOCOL_VERSION`] 9 has check A in [`Self::land_link`]: a refused landing
-    /// in a commit that takes writes drops the live receiver, so the copy is walked from the root
-    /// and never turns regular over a hole. That covers a writable commit only. A `ReadOnly`
-    /// return keeps the receiver, and is safe only with the copy's refusal mark
-    /// (`AppendReceiver::refuse_landing`) and check B (`from_has_no_floor`), which a peer of
-    /// 1eb3fe0 lacks at the same protocol. Hence the prerequisites there: the setting goes on
-    /// only once every node runs a build with both, on every node (an operator rule while it is
-    /// off by default), and a bump to 10 or a capability bit before it is on by default. Any
-    /// change that weakens check A takes a bump.
+    /// Protocol (Rev 5 m5, #107 slice 2b, ADR-rdb-0009 section 7): every peer that completes a
+    /// handshake at [`crate::net::PROTOCOL_VERSION`] 10 has check A in [`Self::land_link`] (a
+    /// refused landing in a commit that takes writes drops the live receiver), check B
+    /// (`from_has_no_floor`) and the refusal mark (`AppendReceiver::refuse_landing`), which a
+    /// `ReadOnly` return needs. A peer at 9 never links, so it is never probed or re-added
+    /// here. The copy marks by this owner's setting, carried on the `Landed`, not by its own.
+    /// Any change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none.
@@ -7726,7 +7734,7 @@ impl Host {
                 self.live_readd_unanswered(partition, node, now, "send_failed");
                 return;
             }
-            tracing::debug!(
+            tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 probed = node.0,
@@ -10856,12 +10864,14 @@ impl Host {
         }
     }
 
-    /// A member hears a committed recovery (the sim's `run_due_watches`).
+    /// A member hears a committed recovery (the sim's `run_due_watches`). `owner_live_readd` is
+    /// the committing owner's setting, carried on the `Landed` (#107 slice 2b).
     fn land(
         &mut self,
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
+        owner_live_readd: bool,
     ) -> Result<(), Fault> {
         let partition = site.partition;
         let landed_generation = result.new_generation;
@@ -10888,7 +10898,7 @@ impl Host {
         // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is: the
         // acquire waits for the link's sync on the syncer (A-R326).
         let caught_up = if first && !barrier {
-            let caught_up = self.land_link(partition, &result)?;
+            let caught_up = self.land_link(partition, &result, owner_live_readd)?;
             self.sync_link(partition, result.new_generation)?;
             caught_up
         } else {
@@ -10913,7 +10923,7 @@ impl Host {
         self.acquire_after_link(&result, site);
         self.committed.insert(partition, result.clone());
         self.committed_correlation
-            .insert(partition, site.correlation);
+            .insert(partition, (site.correlation, owner_live_readd));
         self.push(
             site,
             EventKind::Kernel(KernelEvent::Recovered(result)),
@@ -10978,10 +10988,13 @@ impl Host {
     /// handling and keeps whatever receiver it holds. For the refusals after those, in a commit
     /// that takes writes it also drops any live receiver it holds (check A), so it walks up from
     /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
-    /// stays, as the held tail does; with `live_readd` on it is marked so it never anchors below
+    /// stays, as the held tail does; with `owner_live_readd` on (the committing owner's
+    /// `live_readd`, #107 slice 2b) it is marked so it never anchors below
     /// the cutoff on this generation's `Recovered` (`AppendReceiver::refuse_landing`, #107 row
     /// 31b): at the cutoff it holds, or at the root, so it is never walked from inside the new
-    /// prefix. A copy
+    /// prefix. Every landing reaches here through `Msg::Landed`, which carries that flag; a
+    /// future path that lands from the stored `partitions/{id}` record would have to carry it
+    /// on the record. A copy
     /// refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
     /// writes: the drop duty leaves it out, and it is re-added as a shadow and walked up from the
@@ -11002,6 +11015,7 @@ impl Host {
         &mut self,
         partition: PartitionId,
         result: &RecoveryResult,
+        owner_live_readd: bool,
     ) -> Result<Option<RecoveryEvent>, Fault> {
         // The new generation's lineage, spelled once (review-r185 ADV1).
         let lineage = result.selected.root;
@@ -11191,11 +11205,11 @@ impl Host {
                 // receiver does, so R1 never walks it from inside the new generation's prefix.
                 // Which of the two is known only at the `Recovered`, so the line says marked,
                 // not where it anchors. Review round 2: only with `live_readd` on. Off, nothing
-                // new happens here, and the receiver anchors as before slice 2a. The owner that
-                // re-adds a copy cannot tell it its own setting (neither the plan nor the result
-                // carries one), so this copy's setting stands in for it: set it the same on
-                // every node (ADR-rdb-0009 section 7).
-                if self.live_readd.on
+                // new happens here, and the receiver anchors as before slice 2a. Slice 2b: the
+                // setting is the committing owner's, carried on the landing, since only that
+                // owner re-adds a copy at the boot it still runs. This copy's own setting does
+                // not count (ADR-rdb-0009 section 7).
+                if owner_live_readd
                     && self
                         .replication
                         .refuse_landing(self.node, partition, generation)
@@ -12629,7 +12643,7 @@ impl Host {
     /// `copy_ahead_unknown_copy`, and an unreachable node `copy_ahead_unreachable` (all warn).
     fn copy_ahead(&mut self, partition: PartitionId, copy: CopyId) {
         let node = self.node.0;
-        let (Some(result), Some(&correlation)) = (
+        let (Some(result), Some(&(correlation, owner_live_readd))) = (
             self.committed.get(&partition),
             self.committed_correlation.get(&partition),
         ) else {
@@ -12664,6 +12678,8 @@ impl Host {
             correlation,
             emitter: self.node,
             not_before: self.clock.now().plus_millis(CONTROL_WATCH_MILLIS),
+            // The committing owner's setting as heard, never this node's (#107 slice 2b).
+            owner_live_readd,
         };
         match self.links.send(self.node, member, msg) {
             Ok(()) => tracing::info!(

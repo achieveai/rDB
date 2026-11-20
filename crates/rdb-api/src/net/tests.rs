@@ -546,6 +546,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             correlation: zero(),
             emitter: NodeId(2),
             not_before: zero(),
+            owner_live_readd: true,
         },
     ];
     for msg in plain {
@@ -1587,6 +1588,7 @@ fn a_sender_is_held_to_its_certificate_label() {
         correlation: zero(),
         emitter: NodeId(2),
         not_before: zero(),
+        owner_live_readd: true,
     });
     for peer in [
         on_wire(frame_from(2)),
@@ -1781,7 +1783,27 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 10");
+}
+
+/// Issue #107 slice 2b: a build speaking protocol_version 9 is refused at the handshake naming
+/// both versions. A build at 9 may lack check B and the refusal mark (ADR-rdb-0009 section 7)
+/// and cannot read `WireMsg::Landed::owner_live_readd`, so it never links, and an owner's live
+/// re-add never probes it. Cut: `PROTOCOL_VERSION` left at 9 → the link comes up.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_peer_speaking_protocol_version_9_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let older = Spec {
+        version: 9,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(reason, "node-2 speaks protocol_version 9, node-1 speaks 10");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
@@ -2729,6 +2751,63 @@ async fn row_13f_a_link_held_on_both_ends_outlives_the_silence_limit() {
         .filter(|line| line["@m"] == "net_link_down")
         .collect();
     assert!(closed.is_empty(), "a hold is a delay: {closed:?}");
+}
+
+/// #107 slice 2b manual walk: `mute` holds a link down, as a stopped process does. Node 2 dials
+/// node 1. Once node `muted` goes mute, the link closes on silence (`PROBE_SILENCE`), and it
+/// then stays down for longer than the shortest `unreachable_drop_after` a node accepts
+/// ([`crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]), so the owner's unreachable clock can
+/// fire. Both ends: a muted dialler (2) dials nobody, and a muted listener (1) answers no
+/// handshake. Before the fix the handshake ran while muted and the link was back in ~100 ms.
+/// Cuts: drop the dial loop's `unmuted` wait, red (case 2); answer a hello while muted, red
+/// (case 1).
+/// Integration (~9 s): the silence limit, then the watch; the two cases run at once.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_muted_node_keeps_its_link_down_past_the_drop_clock() {
+    async fn case(muted: u32) {
+        let dir = config_testkit::fs::temp_dir();
+        certs_for(dir.path(), &[1, 2]);
+        let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+        let addr = one.net.addr().expect("listening");
+        let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+        one.net
+            .wait_up(&[NodeId(2)], PATIENCE)
+            .await
+            .expect("the link comes up");
+        // The side that is not muted watches the link, as the owner's drop clock does.
+        let (silent, watcher, peer) = if muted == 1 {
+            (&one, &two, NodeId(1))
+        } else {
+            (&two, &one, NodeId(2))
+        };
+        silent.faults.apply("mute\n");
+        let up = |side: &Side| matches!(side.net.states().get(&peer), Some(LinkState::Up(_)));
+        let patience = crate::host::test_patience(super::PROBE_SILENCE + PATIENCE);
+        let deadline = tokio::time::Instant::now() + patience;
+        while up(watcher) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {muted} muted: the link never closed within {patience:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let hold = Duration::from_millis(crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS + 500);
+        let until = tokio::time::Instant::now() + hold;
+        while tokio::time::Instant::now() < until {
+            assert!(
+                !up(watcher),
+                "node {muted} muted: the link came back up while muted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        silent.faults.apply("");
+        watcher
+            .net
+            .wait_up(&[peer], crate::host::test_patience(PATIENCE))
+            .await
+            .expect("the link comes back once the mute lifts");
+    }
+    tokio::join!(case(1), case(2));
 }
 
 /// PR #103 review: a hold on one end only, longer than `PROBE_SILENCE`, is still a delay. Node

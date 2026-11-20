@@ -150,15 +150,13 @@ pub struct Timeouts {
     /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
     /// operator, a move or a promote still returns only when its node restarts. One attempt per
     /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
-    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
-    /// owner and as a returning copy (which marks a refused landing only with it on).
+    /// until the 512-partition acceptance run passes. Each node process reads its own, for its
+    /// duty as an owner. A returning copy follows the setting of the owner that re-adds it,
+    /// which rides on the landing, not its own (ADR-rdb-0009 section 7, #107 slice 2b).
     ///
-    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
-    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
-    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
-    /// setting off, a read-only return can leave the partition read-only until that copy
-    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
-    /// moves to 10, or a capability bit gates the re-add.
+    /// Every build that speaks protocol 10 has check B and the refused-receiver mark, and an
+    /// older build is refused at the handshake, so it is never re-added. Set it on every node
+    /// anyway, so whichever node owns a partition re-adds its copies the same way.
     pub live_readd: bool,
 }
 
