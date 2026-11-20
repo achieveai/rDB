@@ -1,8 +1,11 @@
 # ADR-rdb-0020: A change feed for external apps — read every committed change, in order
 
-**Status:** Accepted, option A (issue #87, 2026-11-19). Slice 1 is built: see the amendment
-below. Slice 2 (wire) is not; slice 4 (long-poll) stays deferred. The prefix filter (slice 3) is
-dropped from #87: shared config stays in rEtcd (lead, 2026-11-19).
+**Status:** Accepted, option A (issue #87, 2026-11-19). Built: slice 1 (in process) and slice 2
+(the wire, protocol 10). **The current contract is the dated amendments below, newest last**
+(2026-11-20, #170 review r1). Deferred: retention (`History` is not trimmed yet, #61) and
+long-poll (slice 4). The prefix filter (slice 3) is dropped from #87: shared config stays in
+rEtcd (lead, 2026-11-19). The Decision, Consequences and Verification sections below are
+historical: they were written on 2026-10-23, while this ADR was Proposed.
 **Date:** 2026-10-23
 **Spec:** `docs/rdb/design-specification.md` §4.1, §4.3, §5.1–§5.3, §6.1, §6.3, §8.1, §8.4, §10.1, §11
 **Raised by:** Gautam, 2026-10-23: "whenever you make a write and change the data, we may want to
@@ -91,7 +94,23 @@ The app does the undo. The database only supplies the record.
 - **No answer for loss.** A recovery can drop acknowledged writes (spec §6.3, §8.4). A consumer may
   already have read them. Nothing tells it.
 
+**Amended 2026-11-20 (#170 review r1).** Paging: a page returns at most `max` records (at most
+256) and 4 MiB of them, at least one record when one is due, and a call examines at most 1024
+records and 8 MiB of record bytes, counting skipped records; `more` says a cap stopped it, and a
+page with no records may still move `next` with `more` set. A cursor whose record the copy still
+holds at the same stamp and digest is served, even when a later generation linked above it (a
+max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
+envelope that does not decode) is `CORRUPT_HISTORY` with the feed's step, for every caller waiting
+on that copy. `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
+
 ## Decision
+
+> **Historical (2026-10-23, written while Proposed).** Kept as the reasoning; the amendments at
+> the top are the current contract. The leaning below was replaced by: option A, pull per
+> partition, capped at the owner's published position or a secondary's applied one; a cursor of
+> `(generation, seq, digest)`, not `(generation, seq)`; `Rewound { to }` in place of a marker
+> carrying `base`; `Trimmed` defined but retention deferred (#61); physical writes, no
+> before-images and no previous version; any app may call it, scoped to the caller's tenant.
 
 **Provisional. Nothing is decided.** This section records options and a leaning. Whoever picks this
 up decides, after a critic.
@@ -177,6 +196,9 @@ rule anyway. B and C cost bytes and format changes before anyone has asked for t
 
 ## Consequences
 
+> **Historical (2026-10-23).** Written while Proposed; "no code in M10" no longer holds. Retention
+> and the feed's IO budget are still open.
+
 - If A is chosen, `History` becomes a public contract. Its encoding can no longer change freely;
   the feed needs its own version.
 - History retention stops being only an internal catch-up concern (§10.1, ADR-rdb-0010 O4). The
@@ -188,6 +210,9 @@ rule anyway. B and C cost bytes and format changes before anyone has asked for t
 - Nothing changes for current callers. No code, test or format changes in M10.
 
 ## Verification
+
+> **Historical (2026-10-23).** The built feed's rows are named in the amendments' PRs (#87, #170);
+> retention and the dead-consumer budget are not built.
 
 For this document:
 

@@ -67,7 +67,10 @@ pub struct FeedWrite {
     pub object: Bytes,
     /// The stored key.
     pub key: Bytes,
-    /// The stored value; `None` is a delete.
+    /// `Some(bytes)`: the stored after-image this write put at `key`. `None`: the write deleted
+    /// the stored key `key`, so a consumer removes that key from its destination; there are no
+    /// bytes to decode. A physical delete removes one stored key, not necessarily the whole
+    /// object, which may keep other keys.
     pub value: Option<Bytes>,
 }
 

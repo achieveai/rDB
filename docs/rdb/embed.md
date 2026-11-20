@@ -1108,15 +1108,17 @@ above comes back by itself once its link is back:
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
 - **Mixed builds.** A build with this setting speaks wire version 10. An older build speaks 9,
   and the two refuse each other when they connect, each logging `net_handshake_refused` with
-  both versions. So an older node is never added back live, and it cannot link at all. To
-  upgrade to 10: stop every node, upgrade, start every node. A rolling upgrade, with some
-  nodes at 9 and some at 10, does not link.
+  both versions. So an older node is never added back live, and it cannot link at all. The
+  same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
+  10. To upgrade to 10: stop every node and every app process that links to them, upgrade
+  them all, start the nodes, then the apps. A rolling upgrade, with some processes at 9 and
+  some at 10, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
   whose node has the setting off is still protected when an owner with it on adds it back. A
   copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
   the same on every node anyway, so a partition behaves the same whichever node owns it
   (ADR-rdb-0009 section 7).
-- **Default on.** The wire guard is now in place. The setting still stays off by default
+- **Default off.** The wire guard is now in place. The setting still stays off by default
   until the 512-partition acceptance run passes.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
@@ -1385,7 +1387,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  as undecodable. Its node protocol is version 10 (issues #107 and #87), and the handshake
+  refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
@@ -1621,8 +1624,11 @@ from a node. Any app may call it; it is not an admin call. Every write of your t
 a key-prefix filter is not offered yet.
 
 Each write is physical: the stored key, with its group and object id parsed out, and the stored
-value bytes. Decode a value with `rdb-value`: `envelope::open`, then `cbor::decode` the payload. A
-`Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
+value bytes. `FeedWrite.value` is `Some(bytes)`, the stored after-image, when the write stored a
+value, and `None` when it deleted that stored key: remove that one key from your destination;
+there is nothing to decode. A physical delete removes one stored key, not necessarily the whole
+object, which may keep other keys. Decode a value with `rdb-value`: `envelope::open`, then
+`cbor::decode` the payload. A `Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
 not read that format is answered `INCOMPATIBLE_VERSION` (upgrade the client) rather than misreading
 it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]`.
 
@@ -1651,7 +1657,7 @@ loop {
             }
         }
         FeedPage::Behind { .. } => std::thread::sleep(poll_interval), // keep the cursor
-        FeedPage::Trimmed { .. } => rebuild_from_your_own_source(),
+        FeedPage::Trimmed { .. } => ask_another_copy_or_rebuild(),
         FeedPage::Rewound { to } => {
             retract_everything_above(to.seq); // rDB lost those records
             cursor = to;
@@ -1664,11 +1670,19 @@ loop {
   header, its `seq` and its digest. Store it with your effect, in one write, and pass it back
   unchanged. `FeedCursor::START` reads from the first record.
 - **The answers.**
-  - `Records`: whole records after the cursor, and `next`. With `more` set a page cap stopped it
-    (256 records or 4 MiB, at least one record): call again at once.
+  - `Records`: whole records after the cursor, and `next`. A page returns at most `max`
+    records (your argument, itself at most 256) and 4 MiB of them, but always at least one
+    when one is due. Apart from that, a call examines at most 1024 records and 8 MiB of
+    record bytes, counting the records it skips (other tenants' writes). With `more` set,
+    one of those caps stopped the page: call again at once from `next`. A page with no
+    records can still have `more` set and a `next` that moved past skipped records; it is not
+    the end. Only `more` unset means nothing more is held now.
   - `Behind`: the copy you asked has not got that far yet, or not that generation. Keep the
     cursor; wait, or ask another copy.
-  - `Trimmed`: the copy no longer holds the record you need. Rebuild from your own source.
+  - `Trimmed`: the copy does not hold the record you need (`floor` is the lowest it serves).
+    Ask another copy, which may still hold it, or rebuild from your own source. Today no
+    copy trims its `History`, so this answer comes only once the retention work (#61) lands;
+    handle it anyway.
   - `Rewound`: **a promote cut records you have already applied.** Undo what you applied above
     `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB has lost.
   - `CORRUPT_HISTORY` error: the cursor's record has another digest on this copy, or a record
@@ -1690,10 +1704,12 @@ loop {
   out (dropped while it was cut off from the owner, say) or that never held the partition
   answers `UNAVAILABLE` with rule `Definitive`, naming the generation that left it out and the
   owner: "read from the owner or another member". Switch source; calling that node again
-  answers the same until it is a member again. An owner whose grant does not admit answers
-  as a write would, `LEASE_EXPIRED` or `NOT_PRIMARY`. Right after a promote the new owner
-  answers `LEASE_EXPIRED` until it holds its grant: call again. An old owner the promote left
-  out keeps answering so: ask the new owner, or another copy.
+  answers the same until it is a member again. An owner whose grant does not admit refuses
+  as a write's admission would, usually `LEASE_EXPIRED`, with no hint naming the new owner.
+  Right after a promote the new owner answers `LEASE_EXPIRED` until it holds its grant: call
+  again. An old owner the promote left out keeps answering so: `Source::Owner` re-reads who
+  owns the partition and asks the new owner; with `Source::Node` of the old owner, switch to
+  `Source::Owner` or another copy.
 - **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
   may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
   undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last

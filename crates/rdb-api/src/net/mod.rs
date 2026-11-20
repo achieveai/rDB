@@ -126,7 +126,9 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `10` came with issue #107 slice 2b: `WireMsg::Landed::owner_live_readd`, the committing
 /// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
 /// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
-/// refused at the handshake. Upgrade: stop every node, upgrade, start every node.
+/// refused at the handshake. That includes an app process with no copy (`--nodes`): an app at
+/// 9 is refused by nodes at 10. Upgrade: stop every node and every app process that links to
+/// them, upgrade them all, start the nodes, then the apps.
 ///
 /// `10` also carries issue #87's change feed, in the same bump: `WireCall::Changes`,
 /// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,

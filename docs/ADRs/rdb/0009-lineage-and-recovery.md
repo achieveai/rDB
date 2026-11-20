@@ -524,7 +524,9 @@ stays as written; this amendment replaces it.
   `net_handshake_refused` naming both versions. An owner never sees a link to a peer at 9 come
   up, so its live re-add never probes that peer and never re-adds it at the boot it still runs.
   So the operator rule of slice 2a ("only once every node runs a build with both") is now
-  enforced at the handshake. Upgrade: stop every node, upgrade, start every node, as for 9.
+  enforced at the handshake. Upgrade: stop every node and every app process that links to
+  them (an app at 9 is refused by nodes at 10 too), upgrade them all, start the nodes, then
+  the apps (#170 review r1).
   A capability bit was rejected: `wire::Hello` has no field for it, so it would change a wire
   type and need the bump anyway.
 - **The owner's setting rides on the landing.** `Landed` carries `owner_live_readd`: the
