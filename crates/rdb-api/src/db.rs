@@ -719,6 +719,10 @@ pub struct PartitionReady {
     pub ready: bool,
     /// Why not; `None` when ready.
     pub reason: Option<NotReady>,
+    /// Issue #61 (design rev 5 M1): the owner's `NodeStatus::needs_operator`, the command an
+    /// operator must run for a copy that holds a tail past the history floor. Independent of
+    /// `ready`: a partition whose other copies admit writes is ready and still degraded.
+    pub degraded: Option<String>,
 }
 
 /// Why a partition is not ready.
@@ -2913,17 +2917,20 @@ impl Db {
         asked
             .into_iter()
             .map(|(partition, owner, sent)| {
-                let reason = match sent {
-                    Err(_) => Some(NotReady::NoLink),
+                let (reason, degraded) = match sent {
+                    Err(_) => (Some(NotReady::NoLink), None),
                     Ok(answer) => answer
                         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .map_or(Some(NotReady::NoAnswer), |status| not_ready(&status)),
+                        .map_or((Some(NotReady::NoAnswer), None), |status| {
+                            (not_ready(&status), status.needs_operator)
+                        }),
                 };
                 PartitionReady {
                     partition,
                     owner,
                     ready: reason.is_none(),
                     reason,
+                    degraded,
                 }
             })
             .collect()
@@ -10468,6 +10475,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -10557,6 +10565,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -10655,6 +10664,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -10756,6 +10766,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -10871,6 +10882,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -11753,6 +11765,7 @@ mod tests {
                 clock_bound_lost: false,
                 committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
                 tail_refused: None,
+                needs_operator: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -12810,6 +12823,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {

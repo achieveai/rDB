@@ -1918,6 +1918,8 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
+    /// Added under version 12 (#61 rev 5 M1): the command an operator must run.
+    pub needs_operator: Option<String>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -1937,12 +1939,13 @@ pub struct WireTailRefused {
 
 /// A [`crate::host::TailAdoption`] as [`WireTailRefused::adoption`] and its reason.
 fn adoption_to_wire(adoption: crate::host::TailAdoption) -> (String, Option<String>) {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let (state, reason) = match adoption {
         Adoptable => ("adoptable", None),
         NotReady(reason) => ("not_ready", Some(reason)),
         Refused(reason) => ("refused", Some(reason)),
         Unchecked => ("unchecked", None),
+        Trimmed(reason) => ("trimmed", Some(reason)),
     };
     (state.to_owned(), reason.map(str::to_owned))
 }
@@ -1953,10 +1956,11 @@ fn adoption_from_wire(
     state: &str,
     reason: Option<&str>,
 ) -> Result<crate::host::TailAdoption, WireError> {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let known = |reason: &str| {
         crate::host::ADOPTION_REFUSALS
             .iter()
+            .chain(crate::host::ADOPTION_TRIMMED.iter())
             .copied()
             .find(|known| *known == reason)
             .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
@@ -1973,10 +1977,11 @@ fn adoption_from_wire(
         ("unchecked", None) => Unchecked,
         ("not_ready", Some(reason)) => NotReady(known(reason)?),
         ("refused", Some(reason)) => Refused(known(reason)?),
+        ("trimmed", Some(reason)) => Trimmed(known(reason)?),
         (state, reason) => return mismatch(state, reason),
     };
     match adoption {
-        NotReady(reason) | Refused(reason)
+        NotReady(reason) | Refused(reason) | Trimmed(reason)
             if crate::host::TailAdoption::of::<()>(&Err(reason)) != adoption =>
         {
             mismatch(state, Some(reason))
@@ -2030,6 +2035,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            needs_operator: status.needs_operator.clone(),
         }
     }
 }
@@ -2092,6 +2098,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                     })
                 })
                 .transpose()?,
+            needs_operator: status.needs_operator,
             lengths: None,
         })
     }

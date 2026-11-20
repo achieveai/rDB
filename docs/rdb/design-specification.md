@@ -835,6 +835,7 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `NotReady(reason)` | The proofs hold so far, but a precondition is not met yet | Holds | Needs `--give-up-live-copy` |
 | `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
 | `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
+| `Trimmed(reason)` | The proofs could not run: the history they read is trimmed (issue #61, protocol 12). The tail cannot come back | Holds | Needs `--give-up-live-copy` |
 
 `ADOPTION_REFUSALS` holds every reason, 11 in all. The first three are `NotReady`:
 
@@ -852,7 +853,9 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `anchor_lineage_differs` | `Refused` | Replay: the anchor's lineage does not chain into the tail |
 | `tail_too_long` | `Refused` | Replay: more than `ADOPT_REPLAY_MAX` records |
 
-`TailAdoption::could_return` is true for every state but `Refused`.
+`ADOPTION_TRIMMED` holds the two `Trimmed` reasons: `tail_below_floor` (the tail's lineage is trimmed above the anchor's base) and `base_below_floor` (the chain from the base is trimmed). A bare `forget-tail --through` over a `Trimmed` tail is refused with "they cannot come back: the history needed to adopt them is trimmed", naming the whole command `admin forget-tail --partition P --through H --give-up-live-copy`.
+
+`TailAdoption::needs_give_up_flag` is true for every state but `Refused`.
 
 The owner's membership repair re-plans only when every held tail is `Adoptable`. A stalled rebuild copy whose tail is `Adoptable` does not hold that repair back, since the re-plan is what adopts it.
 

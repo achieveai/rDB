@@ -1280,6 +1280,7 @@ pub struct TailRefused {
 /// | `NotReady` | holds | needs `--give-up-live-copy`: a later landing can make it adoptable |
 /// | `Refused` | holds | needs no flag: a failed proof can restore nothing |
 /// | `Unchecked` | holds | needs `--give-up-live-copy`, as before unit 2 |
+/// | `Trimmed` | holds | needs `--give-up-live-copy`: it cannot come back, but nothing proved it superseded |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailAdoption {
     /// Every adoption proof holds against the generation (P1 to P3, and replay's
@@ -1298,15 +1299,21 @@ pub enum TailAdoption {
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
     /// survivor's own check). The next landing scan replaces it.
     Unchecked,
+    /// Issue #61 (lead rulings R10 and R16, protocol 12): the proofs could not run because the
+    /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
+    /// back by adoption, yet giving it up still takes `--give-up-live-copy`: the copy may hold
+    /// the only record of an acknowledged write (design rev 5a).
+    Trimmed(&'static str),
 }
 
 impl TailAdoption {
-    /// The state [`Host::adoption`]'s answer names. A reason outside [`ADOPTION_REFUSALS`]
-    /// (issue #61's `tail_below_floor`: the proofs could not be run, the history they read is
-    /// trimmed) is [`Self::Unchecked`], so it costs no wire vocabulary (lead ruling, t4).
+    /// The state [`Host::adoption`]'s answer names. Issue #61's trimmed-history reasons
+    /// ([`ADOPTION_TRIMMED`]) are [`Self::Trimmed`] (lead ruling R16); any other reason outside
+    /// [`ADOPTION_REFUSALS`] (t4's check-B reasons) is [`Self::Unchecked`].
     pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
+            Err(reason) if ADOPTION_TRIMMED.contains(reason) => Self::Trimmed(reason),
             Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
                 Self::NotReady(reason)
             }
@@ -1321,13 +1328,23 @@ impl TailAdoption {
         matches!(self, Self::Adoptable)
     }
 
-    /// Whether this tail could come back without the operator, so giving it up must be named
-    /// (`--give-up-live-copy`). Only a failed proof cannot.
+    /// Whether `admin forget-tail --through` over this tail needs `--give-up-live-copy` (lead
+    /// ruling R16 item 2: named for the flag, not for whether the tail can come back). A tail
+    /// that could come back without the operator needs it, and so does a [`Self::Trimmed`] one,
+    /// which cannot come back but was never proved superseded. Only a failed proof needs none.
     #[must_use]
-    pub const fn could_return(self) -> bool {
-        !matches!(self, Self::Refused(_))
+    pub const fn needs_give_up_flag(self) -> bool {
+        match self {
+            Self::Adoptable | Self::NotReady(_) | Self::Unchecked | Self::Trimmed(_) => true,
+            Self::Refused(_) => false,
+        }
     }
 }
+
+/// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
+/// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
+/// `base_below_floor` from [`Host::chain`].
+pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
 
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
 pub const ADOPTION_NOT_READY: usize = 3;
@@ -1458,6 +1475,12 @@ pub struct NodeStatus {
     /// inventory, or from a staged child on the newest lineage, so a restart cannot hide one.
     /// Crosses the wire.
     pub tail_refused: Option<TailRefused>,
+    /// Issue #61 (design rev 5 M1): the command an operator must run, when a copy holds a tail
+    /// past the history floor that only `admin forget-tail` can give up. On that copy, from its
+    /// own `tail_held` refusal of an offer; on the owner, from a refusal it heard and no
+    /// forget-tail has released yet. Names the copy, its node, `H` and the full command.
+    /// `None` while nothing needs one. Crosses the wire.
+    pub needs_operator: Option<String>,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -2848,8 +2871,9 @@ struct Host {
     ladder_passes: usize,
     /// H2 (A-R254): each `(partition, copy)`'s last barrier served, so a repeat is dropped
     /// (B-R48: R1 keeps no memory of its asks; the consumer dedups). Issue #61: one per copy,
-    /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it.
-    snapshots_served: BTreeMap<(PartitionId, CopyId), Seq>,
+    /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it. With
+    /// the generation it was served under (lead ruling R18), so a new commit serves it again.
+    snapshots_served: BTreeMap<(PartitionId, CopyId), (Generation, Seq)>,
     /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
     transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
     /// Issue #61 S2: the install this target runs, per partition.
@@ -2955,6 +2979,14 @@ struct Host {
     /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
+    /// Issue #61 (design rev 5b): per partition and copy, a `tail_held` refusal of this
+    /// primary's offer, and the `--through` an accepted forget-tail released it with. In
+    /// memory: an owner restart loses it, and the next refused offer records it again.
+    /// Cleared on that copy's `CopyCaughtUp` or when a commit pins it as a member again.
+    offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
+    /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
+    /// warned `copy_needs_forget_tail` once. Cleared by an install or a release mark.
+    offer_tail_held: BTreeMap<PartitionId, snapshot::OfferTailHeld>,
     /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
     /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
     /// to log once per change and to log the hold's end.
@@ -3206,6 +3238,8 @@ impl Host {
             repair_probes: BTreeMap::new(),
             tail_refused: BTreeMap::new(),
             tail_holds: BTreeMap::new(),
+            offer_holds: BTreeMap::new(),
+            offer_tail_held: BTreeMap::new(),
             rebuild_hold: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
@@ -6760,6 +6794,11 @@ impl Host {
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
                 self.shadow_at_head(site.partition, *copy);
+                // Issue #61 rev 5b: the copy is caught up, so a hold its offer refusal left
+                // here has ended.
+                if let Some(holds) = self.offer_holds.get_mut(&site.partition) {
+                    holds.remove(copy);
+                }
                 self.end_transfer(
                     site.partition,
                     *copy,
@@ -6898,6 +6937,15 @@ impl Host {
         self.inherit(partition, result, false)?;
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
+        // Issue #61 rev 5b: a copy pinned as a regular member again is back in the re-plan's
+        // inventory, so no offer hold stands for it.
+        if let Some(holds) = self.offer_holds.get_mut(&partition) {
+            holds.retain(|copy, _| {
+                !result.committed.pinned_config.members.iter().any(|member| {
+                    member.copy == *copy && member.role == ReplicaRole::RegularSecondary
+                })
+            });
+        }
         self.committed_correlation
             .insert(partition, site.correlation);
         if self.landed.insert((partition, result.new_generation)) {
@@ -10334,7 +10382,7 @@ impl Host {
     ///
     /// - `--through H` at or below the committed cutoff, or with no held tail to give up;
     /// - `--through H` while a live copy reports a tail above the cutoff that could come back
-    ///   ([`TailAdoption::could_return`]: adoptable, not ready yet, or unchecked), unless
+    ///   ([`TailAdoption::needs_give_up_flag`]: adoptable, not ready yet, unchecked, or trimmed), unless
     ///   `give_up_live_copy`. A tail whose adoption proof failed needs no flag. A holder the
     ///   committed ledger marks that no probe has reported on yet counts as unchecked;
     /// - `--no-intact-copy` when the intact rule did not cap this owner's last commit;
@@ -10424,6 +10472,16 @@ impl Host {
                 live.push((held.node, held.head, TailAdoption::Unchecked));
             }
         }
+        // Issue #61 rev 5b: a copy that refused this primary's snapshot offer for a held tail
+        // is counted too, unchecked: nothing has run its adoption proofs for this generation.
+        live.extend(
+            self.offer_holds
+                .get(&partition)
+                .into_iter()
+                .flatten()
+                .filter(|(_, hold)| hold.head > cutoff)
+                .map(|(_, hold)| (hold.node, hold.head, TailAdoption::Unchecked)),
+        );
         live.sort_unstable_by_key(|(node, head, _)| (*node, *head));
         live.dedup_by_key(|(node, head, _)| (*node, *head));
         let mut given_up = Vec::new();
@@ -10453,10 +10511,29 @@ impl Host {
             // or not ready yet, needs giving up named. One whose adoption proof failed can
             // restore nothing.
             // Lead ruling R8: the refusal says what is true of the tail's state.
-            let restorable = live.iter().find(|(_, _, adoption)| adoption.could_return());
+            let restorable = live
+                .iter()
+                .find(|(_, _, adoption)| adoption.needs_give_up_flag());
             if let Some((node, head, adoption)) = restorable.filter(|_| !give_up_live_copy) {
                 // An Unchecked holder may be one only the ledger names, possibly down, so its
                 // refusal says it holds the seqs, not that a live copy does.
+                // Lead rulings R10 and R16: a trimmed tail cannot come back, and its text says
+                // so, naming the whole command.
+                if matches!(adoption, TailAdoption::Trimmed(_)) {
+                    return refuse(
+                        InvalidArgument,
+                        format!(
+                            "node {} holds seqs {} to {} of partition {}; they cannot come back: \
+                             the history needed to adopt them is trimmed. To give them up \
+                             anyway, for good, run {}",
+                            node.0,
+                            cutoff.0 + 1,
+                            head.0,
+                            partition.0,
+                            snapshot::forget_tail_command(partition, *head)
+                        ),
+                    );
+                }
                 let state = if matches!(adoption, TailAdoption::Unchecked) {
                     "; it has not been checked whether that copy can bring them back"
                 } else {
@@ -10479,6 +10556,21 @@ impl Host {
                 through.0
             ));
         }
+        let mut offered = Vec::new();
+        if let Some(through) = release.through {
+            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
+            // writable commit supersedes its tail for the next ordinary offer.
+            for (copy, node, head) in self.offer_holds_released(partition, through) {
+                offered.push(format!(
+                    "copy {} on node {}: seqs {}..={} given up for good",
+                    copy.0,
+                    node.0,
+                    cutoff.0 + 1,
+                    head.0
+                ));
+            }
+        }
+        given_up.extend(offered);
         if release.no_intact_copy {
             let capped = self
                 .recoveries
@@ -13405,7 +13497,22 @@ impl Host {
             if let Some(hit) = hit {
                 match release_through.filter(|through| hit.head <= *through) {
                     Some(through) => {
-                        self.tail_released(partition, copy, anchor, hit, through);
+                        if let Err(fault) =
+                            self.tail_released(partition, copy, anchor, hit, through)
+                        {
+                            // Issue #61 M1: no answer before the mark is durable. Without it
+                            // a later offer would be refused for the tail given up here.
+                            tracing::warn!(
+                                node = self.node.0,
+                                partition = partition.0,
+                                copy = copy.0,
+                                from = hit.from.0,
+                                through = through.0,
+                                ?fault,
+                                "tail_release_write_failed"
+                            );
+                            return RecoveryEvent::InventoryFailed { copy };
+                        }
                         released = Some(hit);
                     }
                     None => match self.adopt(partition, copy, anchor, last_writable, hit) {
@@ -13424,7 +13531,9 @@ impl Host {
                             );
                             // A write that failed after the proofs held proves nothing
                             // about the tail: it stays `Unchecked`.
-                            let adoption = if ADOPTION_REFUSALS.contains(&refusal) {
+                            let adoption = if ADOPTION_REFUSALS.contains(&refusal)
+                                || ADOPTION_TRIMMED.contains(&refusal)
+                            {
                                 TailAdoption::of::<()>(&Err(refusal))
                             } else {
                                 TailAdoption::Unchecked
@@ -13887,7 +13996,17 @@ impl Host {
         anchor: LineageAnchor,
         hit: TailHit,
         through: Seq,
-    ) {
+    ) -> Result<(), StorageFault> {
+        // Issue #61 (design rev 5 M1, 5c): the release is durable before the inventory answers,
+        // so a later snapshot offer is accepted over this tail, even after a restart.
+        self.engine.put_tail_release(partition, hit.from, through)?;
+        if self
+            .offer_tail_held
+            .get(&partition)
+            .is_some_and(|held| held.head <= through)
+        {
+            self.offer_tail_held.remove(&partition);
+        }
         tracing::warn!(
             node = self.node.0,
             partition = partition.0,
@@ -13907,6 +14026,7 @@ impl Host {
         {
             self.tail_refused.remove(&partition);
         }
+        Ok(())
     }
 
     /// Issue #105 unit 2 (design section 5.1): whether `hit` can be adopted onto `anchor`'s
@@ -13931,10 +14051,10 @@ impl Host {
     ///
     /// Issue #61: before P1, a tail lineage trimmed above the anchor's base is
     /// `tail_below_floor` (the history P1 and P2 read is gone; the copy is rebuilt by snapshot).
-    /// That reason and [`Self::chain`]'s `base_below_floor` stay **out of**
-    /// [`ADOPTION_REFUSALS`]: they count as [`TailAdoption::Unchecked`] ([`TailAdoption::of`]),
-    /// as t4's check-B reasons do, so they cost no wire vocabulary now. All of them join it in
-    /// one later protocol bump (lead ruling, review notes 3a).
+    /// That reason and [`Self::chain`]'s `base_below_floor` are [`ADOPTION_TRIMMED`], not
+    /// [`ADOPTION_REFUSALS`]: they answer [`TailAdoption::Trimmed`] ([`TailAdoption::of`]), which
+    /// crosses the wire from protocol 12 (lead ruling R16). t4's check-B reasons stay
+    /// [`TailAdoption::Unchecked`].
     fn adoption(
         &self,
         partition: PartitionId,
@@ -15737,6 +15857,7 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             tail_refused: self.tail_refused_of(partition),
+            needs_operator: self.needs_operator(partition),
             reload_pending: None,
             lengths: Some(IndexLengths {
                 dedup: self

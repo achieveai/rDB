@@ -131,7 +131,11 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// refused at the handshake. The numbers between main's and this one are held by other branches
 /// in flight (#107, #148), so no two name one number for two vocabularies; whichever merges later
 /// renumbers this constant alone, since every row and message derives the number from it. The
-/// snapshot transfer frames of the same PR ride this bump.
+/// snapshot transfer frames of the same PR ride this bump, and so do (A8b)
+/// `WireNodeStatus::needs_operator`, `WireMsg::SnapshotOfferRefused`'s `tail_held` reason with
+/// its `through`, and the adoption state `trimmed`
+/// (`WireTailRefused::adoption`, reasons `tail_below_floor` and `base_below_floor`). A build
+/// before 12 never reads `trimmed`: the handshake refuses it first, peer and app alike.
 pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

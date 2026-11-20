@@ -141,7 +141,6 @@ fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
             at: Seq(800),
             root: (Seq(120), digest),
             barrier: Bytes::from_static(b"barrier record"),
-            released_through: Some(Seq(640)),
         })),
         Msg::SnapshotPull(SnapshotPull {
             partition: PartitionId(1),
@@ -527,6 +526,12 @@ fn status() -> NodeStatus {
             reason: "held_past_base",
             adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
         }),
+        needs_operator: Some(crate::host::snapshot::needs_forget_tail(
+            PartitionId(1),
+            CopyId(2),
+            NodeId(3),
+            rdb_core::contracts::ids::Seq(9),
+        )),
     }
 }
 
@@ -1151,17 +1156,20 @@ fn status_through_the_wire(
     NodeStatus::try_from(*back)
 }
 
-/// PR #110 review: a status naming a tail crosses the wire unchanged in each of the four
-/// adoption states, `Adoptable`, `NotReady`, `Refused` and `Unchecked`. Unit.
+/// PR #110 review: a status naming a tail crosses the wire unchanged in each adoption state,
+/// `Adoptable`, `NotReady`, `Refused`, `Unchecked`, and (issue #61, protocol 12) `Trimmed` with
+/// each of its reasons. Unit.
 /// Cut: `adoption_to_wire` sends `unchecked` for every state, red.
 #[test]
 fn pr110_a_tail_status_round_trips_in_every_adoption_state() {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     for adoption in [
         Adoptable,
         NotReady("replay_not_ready"),
         Refused("base_digest_differs"),
         Unchecked,
+        Trimmed("tail_below_floor"),
+        Trimmed("base_below_floor"),
     ] {
         let back = status_through_the_wire(adoption).expect("lands");
         assert_eq!(
@@ -1210,6 +1218,16 @@ fn pr110_wire_refuses_adoptable_with_a_reason() {
 #[test]
 fn pr110_wire_refuses_unchecked_with_a_reason() {
     odd_adoption_is_refused("unchecked", Some("base_digest_differs"));
+}
+
+/// Issue #61 (lead ruling R16), wire decoder: `refused` naming a trimmed history is refused,
+/// and so is `trimmed` naming a failed proof or no reason. Unit.
+/// Cut: the state check after `known` skips `Trimmed`, red.
+#[test]
+fn t61_wire_refuses_trimmed_on_the_wrong_state() {
+    odd_adoption_is_refused("refused", Some("tail_below_floor"));
+    odd_adoption_is_refused("trimmed", Some("base_digest_differs"));
+    odd_adoption_is_refused("trimmed", None);
 }
 
 /// PR #110 review, wire decoder: `not_ready` with no reason is refused. Unit.
@@ -1898,6 +1916,34 @@ async fn t61_a_peer_one_protocol_version_behind_is_refused() {
     assert_eq!(
         reason,
         format!("node-2 speaks protocol_version {previous}, node-1 speaks {PROTOCOL_VERSION}")
+    );
+}
+
+/// Issue #61 A8b (lead ruling R16 item 1): an app one protocol version behind is refused at the
+/// handshake as a peer is, so no build before 12 ever reads the adoption state `trimmed` or
+/// `WireNodeStatus::needs_operator`: the guarantee is the refusal, and there is no down-level
+/// encoding to keep. The number is derived from `PROTOCOL_VERSION`.
+/// Cut: the listener accepts an older hello (`refusal` skips the version) → the link comes up.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn t61_an_app_one_protocol_version_behind_never_reads_trimmed() {
+    let dir = config_testkit::fs::temp_dir();
+    let label = Label::App("pilot".to_owned());
+    certs::generate(dir.path(), &[Label::Node(NodeId(1)), label.clone()]).expect("certs");
+    let one = side(Spec::node(1, dir.path(), &[]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let previous = PROTOCOL_VERSION - 1;
+    let older = Spec {
+        claim: Some(label.clone()),
+        cert_of: Some(label),
+        version: previous,
+        ..Spec::node(9, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(
+        reason,
+        format!("app-pilot speaks protocol_version {previous}, node-1 speaks {PROTOCOL_VERSION}")
     );
 }
 

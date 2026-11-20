@@ -2426,6 +2426,66 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
     assert_eq!(refusals, 5, "node 1 refused five times");
 }
 
+/// Issue #61 (lead rulings R10 and R16): a tail whose adoption could not run because its history
+/// is trimmed is `Trimmed`. A bare `--through` over it is refused, and the refusal says the
+/// seqs cannot come back and names the whole command, `admin forget-tail --partition 1
+/// --through H --give-up-live-copy`; never "not checked". With the flag it is accepted. Both
+/// trimmed reasons map to `Trimmed` and need the flag. Planted on the owner's status.
+/// Cut: `TailAdoption::of` maps the trimmed reasons to `Refused`, red (the bare ask is accepted).
+#[config_log::retcd_test]
+fn t61_forget_tail_over_a_trimmed_tail_needs_the_flag_and_says_it_cannot_come_back() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (before, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let head = Seq(cutoff.0 + 3);
+    let through = TailRelease {
+        through: Some(head),
+        no_intact_copy: false,
+    };
+    for reason in crate::host::ADOPTION_TRIMMED {
+        let adoption = TailAdoption::of::<()>(&Err(reason));
+        assert_eq!(adoption, TailAdoption::Trimmed(reason), "{reason}");
+        assert!(adoption.needs_give_up_flag(), "{reason}");
+    }
+    let owner = &mut trio.nodes[0].0;
+    owner.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: before,
+            head,
+            base: cutoff,
+            reason: "tail_on_older_lineage",
+            adoption: TailAdoption::of::<()>(&Err("tail_below_floor")),
+        },
+    );
+    let error = owner
+        .forget_tail_asked(p, through, false)
+        .expect_err("a bare --through over a trimmed tail");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.starts_with(&format!(
+            "node 1 holds seqs {} to {} of partition 1; they cannot come back: the history \
+             needed to adopt them is trimmed. To give them up anyway, for good, run admin \
+             forget-tail --partition 1 --through {} --give-up-live-copy",
+            cutoff.0 + 1,
+            head.0,
+            head.0
+        )),
+        "{error:?}"
+    );
+    assert!(!error.detail.contains("not been checked"), "{error:?}");
+    let line = owner
+        .forget_tail_asked(p, through, true)
+        .expect("accepted with the flag");
+    assert!(line.contains("given up, for good"), "{line}");
+}
+
 /// Issue #105 unit 2 (lead ruling on the forget-tail narrowing, architect section 14 item 2):
 /// `--give-up-live-copy` is needed only for a live tail that could come back. Planted on the
 /// owner's status, one state at a time: `Adoptable`, `NotReady` and `Unchecked` each refuse a
@@ -2433,7 +2493,7 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
 /// too, naming that member. A `Refused` tail alone (a failed proof, here `base_digest_differs`)
 /// is accepted with no flag, and the owner re-plans with the release.
 /// Cuts: every live tail needs the flag (unit 1's rule), red (the `Refused` ask is refused);
-/// `TailAdoption::could_return` true only for `Adoptable`, red (the `NotReady` ask is accepted).
+/// `TailAdoption::needs_give_up_flag` true only for `Adoptable`, red (the `NotReady` ask is accepted).
 #[config_log::retcd_test]
 fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
     const METHOD: &str =
@@ -3613,7 +3673,7 @@ fn u2_r7_8_a_tail_whose_set_aside_is_still_copying_is_not_ready_until_it_finishe
     let adoption = host.tail_refused.get(&p).map(|refused| refused.adoption);
     assert_eq!(adoption, Some(copying), "the inventory");
     assert!(!copying.is_adoptable(), "the repair holds");
-    assert!(copying.could_return(), "forget-tail needs the flag");
+    assert!(copying.needs_give_up_flag(), "forget-tail needs the flag");
 
     host.engine
         .inherit(p, Generation(2), Generation(3), Seq(2))
@@ -5382,7 +5442,6 @@ fn t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched() {
         at: Seq(applied.0 + 5),
         root: (Seq::ZERO, Digest::ROOT),
         barrier: barrier.clone(),
-        released_through: None,
     };
     let offers = [
         SnapshotOffer {
