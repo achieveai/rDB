@@ -111,6 +111,7 @@ fn open_node(
                 addresses: Some(NodeAddresses {
                     listen: rig.addrs[&node].clone(),
                     peers: peers.clone(),
+                    app: None,
                 }),
                 partitions: Some(PARTITIONS),
                 ..config(dir.path())

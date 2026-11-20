@@ -28,7 +28,8 @@
    one version byte (1), the node (u32 LE), then the address and the machine, each as one
    length byte and that many bytes. The address is UTF-8 `host:port`, 1 to 255 bytes, that a
    peer can dial. It is checked by a rule of what is allowed, not by a list of bad hosts, since
-   a record is never rewritten:
+   a node's declared address is never rewritten (amendment 6 lets a node rewrite only its app
+   address):
    - the port is 1 to 65535 (port 0 is refused);
    - the host is a four-octet IPv4 address, or an IPv6 address in brackets, that is not
      unspecified, broadcast or multicast (`0.0.0.0`, `[::]`, `255.255.255.255`, `224.0.0.0/4`,
@@ -49,7 +50,9 @@
    record (`Undecodable`). Codec: `rdb_core::authority::node::NodeRecord`, outside `contracts/`,
    beside the partition codec. `admin::declare` writes one per declared node, create-or-adopt,
    after `routes/0` and before any `partitions/{p}`, so a store that holds a partition record
-   holds every node's address. Nothing updates one in place.
+   holds every node's address. Nothing updates one in place. *(Amended by Decision 6: the
+   node itself may rewrite its own app address; the declared address and machine are still
+   never rewritten.)*
    **This amends ADR-rdb-0008's `nodes/{id}` row:** the writer is the declaration (later
    add-node), not the node at start-up; the body is the address and the machine; the boot
    comes from the link handshake, not from this record; role, failure domain, capacity, cores
@@ -116,6 +119,59 @@
      `admin::read_nodes` and `admin::node_start_refusal` first, as `rdb_node` does.
    `Db::open` also refuses, first, an open whose local node has no record and a store with no
    records at all (the S1a text).
+
+6. **Amendment (#83 slice B2, owner ruling 2026-11-19): node layout 2 carries the node's app
+   address, and the node may rewrite that address, and nothing else, in its own record at
+   open.** "Layout 2" and "layout 3" here are the `nodes/{id}` record's version bytes. They
+   are not the reservation's layout 2 (Decision 2), a different codec: this amendment leaves
+   the reservation, and the declared node fields embedded in it, unchanged.
+   - **Node layout 2.** Layout 1's bytes after a version byte of 2, then the app address as a
+     u16 LE length and that many bytes of UTF-8, at least 1. Only the writer caps it, at 512
+     bytes (`rdb_core::authority::node::MAX_APP_ADDR_LEN`, re-exported as
+     `rdb_api::MAX_APP_ADDR_LEN`; a lead decision), so the cap can rise without a new layout.
+     Node layout 3 is reserved for #80 S4's removed-node state.
+   - **When a node writes.** A declared `Db::open` given `NodeAddresses::app` (`rdb_node
+     --app-addr`) reads its own record after its engines' locks and before any host starts.
+     Each such open makes sure the record holds that address: when the record already holds
+     it, and no earlier write may still be in flight (below), nothing is written, so a
+     restart with the same address changes nothing. Otherwise it puts node layout 2 at the
+     revision it read: node, declared address and machine as they are. An open with no app
+     address writes nothing and keeps the stored one. An address cannot be cleared: `None`
+     keeps it, and an empty string is refused. An app address on an undeclared open is
+     refused, and so is `rdb_node --app-addr` with `--form`, `--declare` or `--gen-certs`.
+   - **A changed record refuses the open.** Only the declaration, create-only, also writes the
+     record, so a record that changed between the read and the put means another process
+     claims the node: refused, nothing started, even when the other write holds exactly this
+     open's bytes.
+   - **The fence (PR #159 review).** A put whose reply is lost may still apply later, at the
+     revision it was sent at. Before every put, the open writes a marker file,
+     `app-addr-pending`, holding that revision, into the node process's folder, synced and
+     renamed into place; on Unix its folder is synced too (Windows cannot sync a folder; the
+     rename is still atomic). It removes the marker once the outcome is known: the put applied
+     (or a read back shows its bytes at a newer revision), or the record moved past that
+     revision. A lost reply whose read back shows no change, a failed read back, an open
+     dropped mid-put and a crash leave it. The next open that finds the marker writes even
+     when the record already holds its address: the revision moves on, so no put sent at the
+     old revision can apply after the open returned, and an address the open registered is
+     never replaced by a late one. Each refusal says whether the outcome is known and keeps
+     the store error. The marker is the only file this writes in the folder, besides what an
+     open already creates.
+   - **Reads and checks.** `NodeRecord::decode` reads both node layouts as the declared fields
+     alone, and `NodeRecord::decode_with_app` also returns the app address. The declared
+     fields are what every check compares: the start check decodes them; declaring a formed
+     database again reads `admin::read_nodes`, which decodes them, and compares those
+     (`declare`'s `same`); and `declare_preflight` compares decoded fields too. `admin::adopt`
+     compares raw bytes, but only for a create whose reply was lost, during a declaration not
+     yet formed, before any node can register an address (a node registers only once the
+     formation record exists), so it only meets layout 1. `Db::route` returns the address as
+     `RouteInfo::app_address`, read again about once a second per owner.
+   - **What this amends.** Decision 1's "nothing updates one in place" now means: nothing
+     updates the declared address or machine; the node itself may update its app address.
+   - **No rollback after node layout 2.** A build before node layout 2 (S1b) cannot decode a
+     layout-2 record, so it refuses to start on such a store. S1b never shipped and no S1b
+     store is in use (lead ruling, PR #159 review), so no rollback is supported once any node
+     has registered an app address: to run an older build, declare a new database on a new
+     empty control store. Never hand-edit a record of a live store to get back to layout 1.
 
 ## Consequences
 
@@ -193,6 +249,23 @@ every rig open passes the address check it would meet in use.
   then `rdb_node --gen-certs --cert-dir C --nodes 5`, then five
   `rdb_node --node N --dir D --listen 127.0.0.N:7100 --peers <the same list> --control E --cert-dir C`
   processes, each with its own `--dir`.
+
+- #83 B2 (amendment 6): `rdb-core` `authority::node` rows
+  `b2_1_node_record_layout_2_bytes_are_pinned_and_layout_1_still_reads`,
+  `b2_2_the_app_address_cap_is_512_bytes`;
+  `crates/rdb-api/src/db/formation_tests.rs`:
+  `own83_b2_1_route_forwards_to_the_owners_app_address_across_a_promote`,
+  `own83_b2_2_a_declared_open_registers_its_app_address_once_per_change`,
+  `own83_b2_3_an_app_address_is_refused_where_no_record_can_hold_it`,
+  and the fence: `own83_b2_4_a_late_write_cannot_replace_a_successful_retry`,
+  `own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next`,
+  `own83_b2_6_an_unknown_registration_outcome_is_read_back`,
+  `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`;
+  `crates/rdb-api/src/db/partition_tests.rs`:
+  `own83_25_a_changed_app_address_is_seen_within_the_gap` to
+  `own83_30_no_log_line_holds_an_app_address`; `rdb_node`'s
+  `own83_b2_app_addr_parses_and_form_refuses_it`; `rdb_dev`'s
+  `route_line_names_the_owners_app_address_on_one_line`.
 
 ## References
 

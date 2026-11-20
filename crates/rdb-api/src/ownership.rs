@@ -723,9 +723,16 @@ impl Drop for RouteWatch {
 }
 
 /// Where [`crate::Db::route`] sends an affinity group's calls (#83): the owner and token that
-/// `partitions/{p}` names. A hint, never authority: act on a token only through
-/// [`crate::Db::still_owner`] on the owner, and the destination's own token check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `partitions/{p}` names, and the app address that owner registered in its `nodes/{id}`
+/// record. A hint, never authority: act on a token only through [`crate::Db::still_owner`] on
+/// the owner, and the destination's own token check.
+///
+/// **Migration (#83 B2):** `RouteInfo` is no longer `Copy`, since it owns the address: a caller
+/// that used an answer after moving it needs `.clone()`. It can no longer be built by struct
+/// literal, or matched by an exhaustive pattern, outside this crate: match with `..`. Its
+/// equality now includes the address, so two answers with one owner and token but different
+/// addresses are not equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteInfo {
     /// The group's partition.
     pub partition: PartitionId,
@@ -733,6 +740,21 @@ pub struct RouteInfo {
     pub owner: NodeId,
     /// The record's `(generation, owner_epoch)`.
     pub token: OwnerToken,
+    /// The owner's app address (#83 slice B2). Private behind [`Self::app_address`], so the
+    /// shape can grow without a break.
+    pub(crate) owner_address: Option<String>,
+}
+
+impl RouteInfo {
+    /// Where the owner's app takes forwarded requests: the address the owner's node wrote into
+    /// its `nodes/{id}` record at open ([`crate::NodeAddresses::app`]), opaque to rDB (#83 B2).
+    /// `None` when the owner registered none, or the database was formed in one process
+    /// (`rdb_node --form`), which has no `nodes/` records. Read again at most once a second, so
+    /// an owner restarted with a new address is seen within about a second.
+    #[must_use]
+    pub fn app_address(&self) -> Option<&str> {
+        self.owner_address.as_deref()
+    }
 }
 
 #[cfg(test)]
