@@ -3125,3 +3125,119 @@ fn a_link_whose_task_panicked_is_still_closed_by_shutdown() {
     net.shutdown();
     no_link_to_2(&net, &mut out);
 }
+
+/// How many `net_shutdown` lines the current row logged.
+fn shutdowns_logged(test: &str) -> usize {
+    config_testkit::logs::lines_for_current_test(module_path!(), test)
+        .iter()
+        .filter(|line| line["@m"].as_str() == Some("net_shutdown"))
+        .count()
+}
+
+/// PR #171 review (lifecycle): `Net::shutdown` twice. The second does nothing: one
+/// `net_shutdown` line, and the link stays down. Unit (no sockets).
+/// Cut: no once-only guard in `shutdown`; two lines, red.
+#[config_log::retcd_test]
+fn net_shutdown_twice_is_one_shutdown() {
+    const TEST: &str = "net_shutdown_twice_is_one_shutdown";
+    let (_rt, net) = shutdown_rig();
+    let (_, mut out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+    net.shutdown();
+    net.shutdown();
+    assert_eq!(shutdowns_logged(TEST), 1);
+    no_link_to_2(&net, &mut out);
+}
+
+/// PR #171 review (lifecycle): `Net::shutdown`, then the last `Arc<Net>` dropped. `Drop` runs
+/// the shutdown again and it does nothing: one `net_shutdown` line, no panic. Unit.
+/// Cut: no once-only guard in `shutdown`; two lines, red.
+#[config_log::retcd_test]
+fn net_shutdown_then_drop_is_one_shutdown() {
+    const TEST: &str = "net_shutdown_then_drop_is_one_shutdown";
+    let (_rt, net) = shutdown_rig();
+    let (_, mut out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+    net.shutdown();
+    let weak = Arc::downgrade(&net);
+    drop(net);
+    assert!(weak.upgrade().is_none(), "the row held the last Arc<Net>");
+    assert_eq!(shutdowns_logged(TEST), 1);
+    assert!(matches!(
+        out.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+/// PR #171 review (lifecycle): a `Net` started with no listener (it only dials, as `rdb_node
+/// --form` does) shuts down: its dial task ends, one `net_shutdown` line names no link ended,
+/// and nothing panics. Integration (~10 ms: no handshake is made).
+/// No cut is shown: nothing in `shutdown` depends on a listener. The row pins that a dial-only
+/// `Net` shuts down whole. Under the cut "no once-only guard" it stays green (one call).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn net_shutdown_with_no_server() {
+    const TEST: &str = "net_shutdown_with_no_server";
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let side = side(
+        Spec::node(2, dir.path(), &[1]).dialling(1, "127.0.0.1:9".parse().expect("an address")),
+        false,
+    )
+    .await;
+    side.net.shutdown();
+    let lines: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| line["@m"].as_str() == Some("net_shutdown"))
+            .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["ended"], 0, "{lines:?}");
+    assert!(
+        !matches!(side.net.states()[&NodeId(1)], LinkState::Up(_)),
+        "no link to node 1"
+    );
+}
+
+/// PR #171 review (lifecycle): a `Net` serving on a runtime, with a link up to a peer, dropped
+/// on a thread outside any runtime. `Drop` runs the shutdown there without panicking: it only
+/// signals and aborts, which needs no runtime context. One `net_shutdown` line, and the peer
+/// loses its route. Integration (~150 ms: real TLS on loopback).
+/// Cut: `Drop` awaits the serve task's end with `Handle::current().block_on`; it panics with no
+/// runtime, red at "dropped without a panic".
+#[config_log::retcd_test]
+fn net_drop_outside_a_runtime() {
+    const TEST: &str = "net_drop_outside_a_runtime";
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = rt.block_on(side(Spec::node(1, dir.path(), &[2]), true));
+    let addr = one.net.addr().expect("node 1 listens");
+    let two = rt.block_on(side(
+        Spec::node(2, dir.path(), &[1]).dialling(1, addr),
+        false,
+    ));
+    rt.block_on(two.net.wait_up(&[NodeId(1)], PATIENCE))
+        .expect("node 2 reaches node 1");
+    let span = tracing::Span::current();
+    let dropped = std::thread::spawn(move || {
+        let _entered = span.enter();
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this thread is outside any runtime"
+        );
+        drop(one);
+    })
+    .join();
+    assert!(dropped.is_ok(), "dropped without a panic");
+    assert_eq!(shutdowns_logged(TEST), 1);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while two.net.connection(NodeId(1)).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 still holds a link to node 1"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
