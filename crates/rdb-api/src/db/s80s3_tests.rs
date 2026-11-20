@@ -173,8 +173,20 @@ fn survivor(lost: &Lost) -> NodeId {
 /// every partition until each class's expected bound has passed and every partition's last
 /// put landed, or until the scaled bound of the slowest class present runs out.
 fn lose_one(loss: Loss, timeouts: Timeouts, failover: Option<Failover>) -> Lost {
-    let mut rig = failover_rig(timeouts, failover);
+    let rig = failover_rig(timeouts, failover);
     let dead = victim(&rig);
+    lose(rig, dead, loss, timeouts, failover)
+}
+
+/// [`lose_one`] on a rig already running: a pre-loss value in every partition, then lose `dead`
+/// by `loss` and probe every partition as [`lose_one`] says.
+fn lose(
+    mut rig: Rig,
+    dead: NodeId,
+    loss: Loss,
+    timeouts: Timeouts,
+    failover: Option<Failover>,
+) -> Lost {
     let prober = (1..=S1B_K)
         .map(NodeId)
         .find(|node| *node != dead)
@@ -772,4 +784,113 @@ fn s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are() {
             "partition {p}'s pre-loss value"
         );
     }
+}
+
+/// #80 S3 R3 (AC5): R1's kill, then R2's restart of the killed node V on its folder, until every
+/// partition whose ring seat names V pins it regular again with three regular copies and V's
+/// frozen grant is cleared (#81 X2: `planner_frozen_grant_cleared`). Then a second kill: M,
+/// the owner now of the lowest partition V owned before, whose copies are V and one other.
+/// Every partition takes a put again within the bound, as in R1: M's partitions move (that
+/// one with V a candidate beside the other copy), M's copy seats are dropped by the unreachable
+/// clock, the rest see no gap; nothing acknowledged is lost. Integration (~35-60 s).
+/// Cut: `Planner::sweep` skips `clear_frozen`; V's grant stays frozen after its restart, so V
+/// is never a candidate again ("grants/1 is still frozen after its restart"), red, observed
+/// 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_after_a_kill_and_restart_a_second_kill_keeps_every_partition_writable() {
+    const TEST: &str =
+        "s80s3_after_a_kill_and_restart_a_second_kill_keeps_every_partition_writable";
+    let mut lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let first = lost.dead;
+    let moved: Vec<u32> = lost
+        .seats
+        .iter()
+        .filter(|(_, seat)| **seat == Seat::Owner)
+        .map(|(p, _)| *p)
+        .collect();
+    lost.rig.restart(first, probe_timeouts());
+    lost.rig
+        .of(first)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("node {} is ready again: {e}", first.0));
+    for p in (1..=S1B_P).filter(|p| ring(S1B_K, *p).copies.contains(&first.0)) {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+        loop {
+            let roles = pinned_roles(&lost.rig, p);
+            let regular = roles
+                .values()
+                .filter(|role| **role != ReplicaRole::Shadow)
+                .count();
+            if roles
+                .get(&first.0)
+                .is_some_and(|role| *role != ReplicaRole::Shadow)
+                && regular == 3
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p} never pins node {} regular with three regular copies: {roles:?}",
+                first.0
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    // X2 lets the old boot's frozen grant go once the node owns nothing; until then it is no
+    // promote candidate, so the second kill is measured from there.
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    while grant_of(&lost.rig, ControlKey::Grant(first)).is_some_and(|grant| grant.frozen) {
+        assert!(
+            Instant::now() < deadline,
+            "grants/{} is still frozen after its restart",
+            first.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let lowest = *moved.first().expect("the first kill moved a partition");
+    let second = token_of(&lost.rig, lowest).1;
+    assert!(
+        second != first && pinned_nodes(&lost.rig, lowest).contains(&first.0),
+        "partition {lowest}: owner {second:?}, node {} a copy",
+        first.0
+    );
+    tracing::info!(
+        first = first.0,
+        second = second.0,
+        partition = lowest,
+        "s80s3_second_kill"
+    );
+    let lost = lose(
+        lost.rig,
+        second,
+        Loss::Kill,
+        probe_timeouts(),
+        Some(Failover::default()),
+    );
+    after_loss(&lost, TEST);
+    reads_back(&lost, first);
+    // The restarted node was a candidate for that partition (X2), not left out as frozen.
+    let decided: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| {
+                line["@m"] == "planner_promote_decision"
+                    && line["partition"] == lowest
+                    && line["dead"] == second.0
+            })
+            .collect();
+    assert!(
+        decided.iter().any(|line| line["answering"]
+            .as_str()
+            .is_some_and(|nodes| nodes.contains(&first.0.to_string()))),
+        "partition {lowest}: node {} answers as a candidate: {decided:?}",
+        first.0
+    );
+    let (_, owner) = token_of(&lost.rig, lowest);
+    tracing::info!(
+        partition = lowest,
+        owner = owner.0,
+        "s80s3_second_kill_moved"
+    );
 }
