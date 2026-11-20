@@ -730,6 +730,9 @@ record. Use it to send a request to the right node.
   every group of a partition moves with it.
 - `db.leader_of(partition)` is `route` by partition. A partition the database does not have
   is `INVALID_ARGUMENT`.
+- A record this build cannot decode is `INCOMPATIBLE_VERSION` (retry `Quarantine`): a newer
+  build wrote it, and a retry cannot help. Run the build the nodes run. A record that cannot be
+  read right now is `UNAVAILABLE`, and a later call can succeed.
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.

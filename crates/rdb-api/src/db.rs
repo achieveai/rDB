@@ -912,8 +912,8 @@ async fn register_app_addr(
     Ok(())
 }
 
-/// Why [`read_route`] has no answer: a store that cannot answer, or a record this build cannot
-/// decode. Both are `UNAVAILABLE` for now; the log names which.
+/// Why [`read_route`] has no answer: `UNAVAILABLE`, which a later call can fix, or a record this
+/// build cannot decode, which none can (#135).
 #[derive(Debug)]
 enum RouteReadError {
     Unavailable(String),
@@ -4144,10 +4144,12 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// `UNAVAILABLE` (retry `BoundedJitter`) when a record cannot be read in the read timeout,
-    /// the partition record is absent, or the partition record or the owner's node record does
-    /// not decode (logged `db_route_read_undecodable`), and from a `Db` a crate test built by
-    /// hand, which has no control store.
+    /// - `UNAVAILABLE` (retry `BoundedJitter`) when a record cannot be read in the read timeout,
+    ///   or the partition record is absent, and from a `Db` a crate test built by hand, which has
+    ///   no control store. A later call can succeed.
+    /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
+    ///   owner's node record does not decode: a newer build wrote it, so no retry succeeds until
+    ///   this app runs a build that reads it. Logged `db_route_read_undecodable`.
     pub fn route(&self, group: AffinityId) -> Result<RouteInfo, ApiError> {
         self.route_partition(self.partition_for(group))
     }
@@ -4238,8 +4240,8 @@ impl Db {
     }
 
     /// Run `read` against the control store on its runtime, within the read timeout: a store
-    /// that answers late or fails, or a record this build cannot decode, is `UNAVAILABLE`; the
-    /// two are logged apart.
+    /// that answers late or fails is `UNAVAILABLE`, a record this build cannot decode
+    /// `INCOMPATIBLE_VERSION` (#135), since no retry decodes it.
     fn control_read<T, F>(
         &self,
         what: &str,
@@ -4269,7 +4271,10 @@ impl Db {
             }
             Ok(Err(RouteReadError::Undecodable(detail))) => {
                 tracing::warn!(what, %detail, "db_route_read_undecodable");
-                Err(ApiError::new(ErrorKind::Unavailable, detail))
+                Err(ApiError::new(
+                    ErrorKind::IncompatibleVersion,
+                    format!("{detail}; {}", error::ROUTE_NEWER_RECORD_STEP),
+                ))
             }
             Err(_) => {
                 let detail = format!("route: {what} did not read within {:?}", self.timeouts.read);

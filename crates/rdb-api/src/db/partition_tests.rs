@@ -2901,7 +2901,7 @@ fn own83_22_a_change_during_a_route_read_leaves_its_answer_stale() {
     db.shutdown();
 }
 
-// ---- #83 slice B2: `route` names the owner's address ----
+// ---- #83 slice B2: `route` names the owner's address; #135: an undecodable record ----
 
 /// Write `node`'s `nodes/{id}` record as a declaration writes it (layout 1), or, with `app`,
 /// as the node rewrites it at open (layout 2).
@@ -3047,5 +3047,59 @@ fn own83_24_leader_of_a_partition_the_database_lacks_is_invalid() {
         assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused}");
     }
     assert_eq!(store.reads.load(Ordering::SeqCst), 0, "nothing was read");
+    db.shutdown();
+}
+
+/// own135_1 (#135): a record `route` cannot decode answers `INCOMPATIBLE_VERSION` with retry
+/// `Quarantine` and an upgrade step, not `UNAVAILABLE` with "try again": partition 1's record
+/// in a layout this build does not read, and then a readable one whose owner's `nodes/{id}`
+/// record does not decode. A record that is only absent stays `UNAVAILABLE`, which a later
+/// call can fix. Cut: the undecodable arm mapped back to `UNAVAILABLE`, red at each kind.
+/// Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own135_1_an_undecodable_record_is_an_incompatible_version() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let incompatible = |what: &str| {
+        let refused = db.route(G1).expect_err(what);
+        assert_eq!(
+            refused.kind,
+            ErrorKind::IncompatibleVersion,
+            "{what}: {refused}"
+        );
+        assert_eq!(refused.retry, RetryRule::Quarantine, "{what}: {refused}");
+        let text = refused.to_string();
+        assert!(text.contains("retrying will not help"), "{what}: {text}");
+        assert!(!text.contains("try again"), "{what}: {text}");
+    };
+
+    let key = ControlKey::Partition(PARTITION).encode();
+    put_raw(
+        &rt,
+        &store,
+        key.clone(),
+        Bytes::from_static(&[0xEE, 1, 2, 3]),
+    );
+    incompatible("a partition record of a newer layout");
+
+    write_route(&rt, &store, NodeId(1), 1);
+    put_raw(
+        &rt,
+        &store,
+        ControlKey::Node(NodeId(1)).encode(),
+        Bytes::from_static(&[0xEE]),
+    );
+    incompatible("the owner's node record of a newer layout");
+
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    assert!(db.route(G1).is_ok(), "both records decode");
+    rt.block_on(store.inner.delete(config_core::DeleteRequest {
+        key: Bytes::from(key),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("deleted");
+    let absent = db.route(G1).expect_err("absent");
+    assert_eq!(absent.kind, ErrorKind::Unavailable, "{absent}");
     db.shutdown();
 }
