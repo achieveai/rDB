@@ -122,12 +122,15 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
 /// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// default. Default on: a bump to the next free number at that merge, or a capability bit that
+/// gates the re-add. Any change that
 /// weakens check A takes a bump.
 ///
 /// `11` came with issue #148: the `TooLarge` error kind, which `WireApiError::kind` carries.
 /// Only the `Db` raises it, before it sends, so no node answers it today; the type changed all
-/// the same. `10` is held by #107, so the number taken at merge may move (lead ruling).
+/// the same. No number is reserved (the rule above): main is at 9, and open branches each took
+/// the next number they saw, #170 (the feed and live re-add, carrying #107) 10, this one 11 and
+/// #61 PR-A 12. Whichever merges later renumbers to the next free number at its merge.
 pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
