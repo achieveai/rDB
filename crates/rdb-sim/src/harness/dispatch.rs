@@ -3433,15 +3433,22 @@ impl Dispatcher {
     /// * `anchor_seen` is that generation's committed root, as F1's own [`RecoveryResult`]
     ///   recorded it: [`SelectedLineage::root`] with the cutoff as its base.
     /// * `head` is the highest record the holder's engine applied under that generation, and
-    ///   `ladder` every record the engine stores from the base through it, each with the digest
-    ///   the engine stores ([`stored_digest`]). Never a digest the harness made up.
+    ///   `ladder` every record the engine stores from `max(base, F)` through it, each with the
+    ///   digest the engine stores ([`stored_digest`]). Never a digest the harness made up.
+    /// * Issue #61 (design 3.5, B3), the twin of the host's `Host::survivor`: when the base is
+    ///   below the generation's trim floor `F`, its record is gone, so the base is proved by the
+    ///   trim mark instead. The mark counts only when it is that generation's own and names the
+    ///   base as its root; the ladder then starts with the root rung `(base, base_digest)`.
     ///
     /// # Errors
     ///
     /// [`SimError::Config`] naming `survivor_generation` when no `RecoveryResult` for the adopted
     /// generation was recorded, so there is no committed root to anchor at; naming
     /// `survivor_base` when the holder's engine does not store the committed digest at the
-    /// cutoff; naming `survivor_head` when it stores no record at its own applied head.
+    /// cutoff, or its own mark names another digest there (the host's `base_digest_differs`);
+    /// naming `survivor_base_below_floor` when the cutoff is below the floor and the mark is a
+    /// parent's or rooted elsewhere (the host's `base_below_floor`); naming `survivor_head` when
+    /// it stores no record at its own applied head.
     ///
     /// [`SelectedLineage::root`]: rdb_core::contracts::recovery::SelectedLineage::root
     fn current_inventory(
@@ -3477,18 +3484,40 @@ impl Dispatcher {
             field: "survivor_base",
         })?;
         let lineage = (holder, partition, generation);
-        if stored_digest(engine, lineage, selected.cutoff_seq) != Some(selected.cutoff_digest) {
-            return Err(SimError::Config {
-                field: "survivor_base",
-            });
-        }
+        let base = selected.cutoff_seq;
+        let trimmed = engine.floor_seq(partition, generation);
+        let root = if base < trimmed {
+            let below = SimError::Config {
+                field: "survivor_base_below_floor",
+            };
+            let (level, mark) = engine.floor(partition, generation).ok_or(below.clone())?;
+            if level != generation || mark.root_base != base {
+                return Err(below);
+            }
+            if mark.root_digest != selected.cutoff_digest {
+                return Err(SimError::Config {
+                    field: "survivor_base",
+                });
+            }
+            Some((base, selected.cutoff_digest))
+        } else {
+            if stored_digest(engine, lineage, base) != Some(selected.cutoff_digest) {
+                return Err(SimError::Config {
+                    field: "survivor_base",
+                });
+            }
+            None
+        };
         let head = Seq(engine.buffered_applied(partition, generation).0);
         let head_digest = stored_digest(engine, lineage, head).ok_or(SimError::Config {
             field: "survivor_head",
         })?;
-        let ladder = (selected.cutoff_seq.0..=head.0)
-            .filter_map(|seq| stored_digest(engine, lineage, Seq(seq)).map(|d| (Seq(seq), d)))
-            .collect();
+        let ladder =
+            root.into_iter()
+                .chain((base.max(trimmed).0..=head.0).filter_map(|seq| {
+                    stored_digest(engine, lineage, Seq(seq)).map(|d| (Seq(seq), d))
+                }))
+                .collect();
         tracing::info!(
             node = holder.0,
             partition = partition.0,
