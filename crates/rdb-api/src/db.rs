@@ -3277,13 +3277,20 @@ impl Db {
     ///
     /// Every error claims `no_mutation`: a feed call writes nothing. `UNAVAILABLE` when the copy
     /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
-    /// nothing in its generation, or (a secondary) has no fresh read of `partitions/{p}` naming
-    /// its generation with it pinned. The first call to a secondary starts that read and is
-    /// refused: call again. `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// nothing in its generation, or (a secondary) has not established freshness: no read of
+    /// `partitions/{p}` within the grant naming its generation with it pinned. A call to a
+    /// secondary without one starts that read, or joins the one in flight, and waits for it up
+    /// to 500 ms; it is refused when the read has not landed by then, and sooner when the read
+    /// fails or names another generation or membership. Follow the returned error: its retry
+    /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
+    /// copy is left out). `UNAVAILABLE` also when no answer came within the read timeout, or
     /// `Source::Node(n)` names a node this process has no link to. `INCOMPATIBLE_VERSION` when
-    /// the node sent records of a format this build does not read.
-    /// An owner whose grant no longer admits, such as one a promote left out, answers as a write
-    /// would: `LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner.
+    /// this build refuses the node's records because their format is one it does not read.
+    /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
+    /// write's admission would, `LEASE_EXPIRED` (or `PROTECTION_PAUSED`, `GENERATION_CHANGED`),
+    /// with no redirect hint: `Source::Owner` re-reads the owner route on `LEASE_EXPIRED` and
+    /// calls the new owner, so a caller of `Source::Node` of the old owner switches to
+    /// `Source::Owner` or another member.
     /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the
     /// same lineage (or the cursor is from another partition's history), and when the copy's
     /// own history is damaged: then the node faults, and every caller waiting on it hears the

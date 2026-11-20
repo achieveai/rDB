@@ -14963,9 +14963,10 @@ impl Host {
         }
         let (source, cap) = if let Some(primary) = self.replication.primary(self.node, partition) {
             // The grant bounds the owner's cap (design-87 section 2). A promote that leaves this
-            // node out keeps its tracker here, fenced: it is refused as a write would be
-            // (`LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner), as
-            // `Self::start_barrier` refuses, so `Source::Owner` re-routes.
+            // node out keeps its tracker here, fenced: it is refused as a write's admission
+            // would be (`LEASE_EXPIRED` for a lost grant), with no redirect hint, which
+            // `answer_feed` does not add. `Source::Owner` re-reads the owner route on
+            // `LEASE_EXPIRED`.
             let lineage = primary.tracker().lineage();
             if let Verdict::Deny(reason) =
                 self.authority
