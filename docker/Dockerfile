@@ -1,6 +1,7 @@
 # rDB node image: one image, two roles (issue #85).
 #   voter  -> config-server, the rEtcd voter (control plane)
 #   data   -> rdb_node, one rDB data node (example of rdb-api)
+#   dev    -> rdb_dev, an rDB app for admin and data lines (#80 S2)
 # Build from the repository root:
 #   docker build -f docker/Dockerfile -t rdb-bf-node:dev .
 # See docker/README.md for how to run each role.
@@ -17,16 +18,17 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p config-server \
- && cargo build --release --locked -p rdb-api --example rdb_node \
+ && cargo build --release --locked -p rdb-api --example rdb_node --example rdb_dev \
  && mkdir /out \
- && cp target/release/config-server target/release/examples/rdb_node /out/
+ && cp target/release/config-server target/release/examples/rdb_node \
+       target/release/examples/rdb_dev /out/
 
 FROM ${RUNTIME_IMAGE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssl curl ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --create-home --home-dir /data --uid 10001 rdb
-COPY --from=build /out/config-server /out/rdb_node /usr/local/bin/
+COPY --from=build /out/config-server /out/rdb_node /out/rdb_dev /usr/local/bin/
 COPY docker/entrypoint.sh /usr/local/bin/rdb-entrypoint
 RUN chmod 0755 /usr/local/bin/rdb-entrypoint
 USER rdb
