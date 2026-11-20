@@ -598,3 +598,178 @@ fn s80s3_a_killed_node_restarted_on_its_folder_is_pinned_again_everywhere() {
         );
     }
 }
+
+/// Puts through `db` into `group` until one lands or `patience` runs out: the put, or the last
+/// refusal.
+fn put_within(db: &Db, group: AffinityId, patience: Duration) -> Result<PutOk, String> {
+    let deadline = Instant::now() + patience;
+    loop {
+        match db.put_in(group, b"s3-two", b"1", None) {
+            Ok(put) => return Ok(put),
+            Err(refused) if Instant::now() >= deadline => return Err(format!("{refused:?}")),
+            Err(_) => std::thread::sleep(PROBE_GAP),
+        }
+    }
+}
+
+/// #80 S3 R5 (AC6, #81 Q1 on the ring): five declared nodes, sixteen partitions, the planner on
+/// every node; two ring-adjacent nodes, 2 and 3, have their processes ended. A partition whose
+/// dead owner's only other copies are both down has one answering copy, so the planner refuses
+/// it (`planner_no_eligible_copy`, `lone_survivor`) and writes nothing to its record: the same
+/// owner and token, and no put lands. A partition whose dead owner has two answering copies is
+/// promoted and takes a put. A partition whose owner lives and has its two copies down takes
+/// no put either (it pauses, then is read-only: no copy can acknowledge) and keeps its owner;
+/// its owner's own drop re-plan may raise its token. Every other partition takes a put, and the
+/// writable ones read their pre-loss value back. Integration (~30-40 s).
+/// Two nodes down is beyond S3's promise (one host killed or hung), so the row stops there.
+/// Two restart findings are open (lead ruling, 2026-11-20).
+/// (a) #168: restarting node 3 brings nothing back. The promote of node 3's partitions
+/// froze `grants/3`, and a frozen node is never a promote target (`PromoteError::TargetFrozen`,
+/// #61 critic Y3).
+/// (b) #169: restarting node 2, the refused partitions' owner, with node 3 still down, it
+/// never recovers them (`wait_ready` times out with "recovery phase is partition 2: none"); it
+/// does once node 3 is back too.
+/// Cut: `choose_target` needs one candidate, not two; red, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are() {
+    const TEST: &str = "s80s3_two_of_a_partitions_copies_down_is_not_promoted_others_are";
+    let mut rig = failover_rig(probe_timeouts(), Some(Failover::default()));
+    let down = [2_u32, 3];
+    let via = NodeId(4);
+    let groups: BTreeMap<u32, AffinityId> =
+        (1..=S1B_P).map(|p| (p, group_of(rig.of(via), p))).collect();
+    for (p, group) in &groups {
+        put_lands(rig.of(via), *group, b"s3-pre", p.to_string().as_bytes());
+    }
+    for p in 1..=S1B_P {
+        let placed: BTreeSet<u32> = ring(S1B_K, p).copies.into_iter().collect();
+        pins_until(
+            &rig,
+            p,
+            Duration::from_secs(10),
+            "the ring's pins",
+            |pins| *pins == placed,
+        );
+    }
+    let tokens: BTreeMap<u32, ((u64, u64), NodeId)> =
+        (1..=S1B_P).map(|p| (p, token_of(&rig, p))).collect();
+    let both_down = |p: u32| {
+        let pins = pinned_nodes(&rig, p);
+        down.iter().all(|node| pins.contains(node))
+    };
+    let owner_down = |p: u32| down.contains(&tokens[&p].1 .0);
+    let lone: Vec<u32> = (1..=S1B_P)
+        .filter(|p| owner_down(*p) && both_down(*p))
+        .collect();
+    let promoted: Vec<u32> = (1..=S1B_P)
+        .filter(|p| owner_down(*p) && !both_down(*p))
+        .collect();
+    let owner_alone: Vec<u32> = (1..=S1B_P)
+        .filter(|p| !owner_down(*p) && both_down(*p))
+        .collect();
+    let rest: Vec<u32> = (1..=S1B_P)
+        .filter(|p| !lone.contains(p) && !promoted.contains(p) && !owner_alone.contains(p))
+        .collect();
+    tracing::info!(
+        ?lone,
+        ?promoted,
+        ?owner_alone,
+        ?rest,
+        "s80s3_two_down_classes"
+    );
+    assert!(
+        !lone.is_empty() && !promoted.is_empty(),
+        "the ring puts partitions in both"
+    );
+
+    let t0 = Instant::now();
+    for node in down {
+        rig.stop(NodeId(node));
+    }
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let db = rig.of(via);
+    for p in promoted.iter().chain(&rest) {
+        let put = put_within(db, groups[p], patience);
+        tracing::info!(
+            partition = p,
+            at_ms = ms(t0.elapsed()),
+            ok = put.is_ok(),
+            "s80s3_two_down_put"
+        );
+        put.unwrap_or_else(|e| panic!("partition {p} takes a put with two nodes down: {e}"));
+    }
+    for p in &owner_alone {
+        let put = put_within(db, groups[p], Duration::from_secs(5));
+        tracing::info!(
+            partition = p,
+            at_ms = ms(t0.elapsed()),
+            outcome = ?put.as_ref().map(|_| ()),
+            pins = ?pinned_roles(&rig, *p),
+            "s80s3_two_down_owner_alone"
+        );
+        assert!(
+            put.is_err(),
+            "partition {p}: no copy can acknowledge, yet a put landed"
+        );
+        // Its owner's own drop re-plan may raise the token; the owner stays.
+        assert_eq!(
+            token_of(&rig, *p).1,
+            tokens[p].1,
+            "partition {p}: not failed over"
+        );
+    }
+    for p in &lone {
+        let deadline = Instant::now() + patience;
+        loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), TEST);
+            let said = lines.iter().any(|line| {
+                line["@m"] == "planner_no_eligible_copy"
+                    && line["partition"] == *p
+                    && line["reason"] == "lone_survivor"
+            });
+            if said {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p}: no planner_no_eligible_copy lone_survivor"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            token_of(&rig, *p),
+            tokens[p],
+            "partition {p}: nothing written"
+        );
+        let put = db.put_in(groups[p], b"s3-two", b"1", None);
+        assert!(put.is_err(), "partition {p} takes no put: {put:?}");
+    }
+    let promotes: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| line["@m"] == "planner_promoted")
+            .collect();
+    for p in &lone {
+        assert!(
+            !promotes.iter().any(|line| line["partition"] == *p),
+            "partition {p} was not promoted: {promotes:?}"
+        );
+    }
+    for p in &promoted {
+        let (token, owner) = token_of(&rig, *p);
+        assert!(
+            token > tokens[p].0 && !down.contains(&owner.0),
+            "partition {p}: {owner:?}"
+        );
+    }
+
+    for p in promoted.iter().chain(&rest) {
+        let group = &groups[p];
+        let pre = db.get_in(*group, b"s3-pre").expect("a get");
+        assert_eq!(
+            pre.value.as_ref().map(|(_, v)| v.to_vec()),
+            Some(p.to_string().into_bytes()),
+            "partition {p}'s pre-loss value"
+        );
+    }
+}
