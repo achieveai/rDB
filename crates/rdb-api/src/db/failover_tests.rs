@@ -1777,3 +1777,42 @@ fn own81_sweep_restarts_before_freeze() {
 fn own81_sweep_restarts_after_freeze() {
     interrupted_sweep("own81_sweep_restarts_after_freeze", HoldAt::BeforeReply);
 }
+
+/// PR #156 review, #127 through the planner `Db` spawns: node 1's process opens with a
+/// planner over a control store whose `planner/grant` read panics. `Db::start_planner`'s task
+/// logs exactly one `planner_panicked`, an error naming node 1 and the panic's message, and
+/// the process still shuts down. `i127_a_planner_panic_is_logged` drives the wrapper alone, so
+/// it stays green if `start_planner` spawns `run` again; this row does not.
+/// Cut: `start_planner` spawns `planner.run()` instead of `run_logged()`; the panic ends the
+/// task with no line, red.
+/// Integration (~1 s).
+#[config_log::retcd_test]
+fn pr156_a_spawned_planner_logs_its_panic() {
+    const METHOD: &str = "pr156_a_spawned_planner_logs_its_panic";
+    const MESSAGE: &str = "pr156 planner grant read";
+    let rt = runtime();
+    let dir = config_testkit::fs::temp_dir();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    formed(&rt, dir.path(), &store, 1);
+    let panicking: Arc<dyn ConfigStore> =
+        crate::test_store::PanicOnPlannerGrantRead::new(Arc::clone(&store), MESSAGE);
+    let mut db = rt
+        .block_on(Db::open_with(
+            node_with(dir.path(), failover()),
+            panicking,
+            rt.handle().clone(),
+            budgets(),
+        ))
+        .expect("node 1 opens");
+    let lines = logged_at_least_within(METHOD, "planner_panicked", 1, lifetimes(3));
+    db.shutdown();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["@l"], "Error", "{lines:?}");
+    assert_eq!(lines[0]["node"], 1, "{lines:?}");
+    assert_eq!(lines[0]["panic"], MESSAGE, "{lines:?}");
+    assert_eq!(
+        logged(METHOD, "planner_panicked").len(),
+        1,
+        "the planner stopped at its panic"
+    );
+}
