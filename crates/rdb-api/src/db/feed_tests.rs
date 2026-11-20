@@ -259,8 +259,10 @@ fn f87_1_promote_to_tailing_secondary_resumes_without_gap_or_repeat() {
 /// record, with no `User` write, is skipped), and a cursor whose digest is not the record's is
 /// `CORRUPT_HISTORY`, claiming no mutation. That cursor is the caller's input, so the node logs
 /// it at warn and says it may not belong to this partition's history (review r1).
+/// `max` 0 is `INVALID_ARGUMENT` with `no_mutation`, from the owner and from a secondary.
 /// Cuts: `feed::resume` skips the digest comparison, red (a page, not the error);
-/// `feed_cursor_diverged` back at error, red (level `Error`).
+/// `feed_cursor_diverged` back at error, red (level `Error`); `Host::changes` without its
+/// `max == 0` refusal, red (an empty page).
 /// Integration (~2 s): a fresh open.
 #[config_log::retcd_test]
 fn f87_1_owner_feed_matches_puts_in_order_and_a_wrong_digest_is_corrupt_history() {
@@ -301,6 +303,18 @@ fn f87_1_owner_feed_matches_puts_in_order_and_a_wrong_digest_is_corrupt_history(
             .contains("may not belong to partition 1's history"),
         "{error:?}"
     );
+    // Review r1: `max` 0 is refused before any copy is read, from the owner and a secondary.
+    for source in [Source::Owner, Source::Node(NodeId(2))] {
+        let error = db
+            .changes(PARTITION, FeedCursor::START, 0, source)
+            .expect_err("max 0");
+        assert_eq!(
+            error.kind,
+            ErrorKind::InvalidArgument,
+            "{source:?}: {error:?}"
+        );
+        assert!(error.no_mutation, "{source:?}: {error:?}");
+    }
     let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
         .into_iter()
         .filter(|line| line["@m"] == "feed_cursor_diverged")
