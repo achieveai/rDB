@@ -99,7 +99,10 @@ absent() {
 # forms Docker 20 to 28 print: `No such container: NAME`, `get NAME: no such volume`,
 # `No such volume: NAME`, `network NAME not found`, `No such network: NAME`.
 absent_answer() {
-    local kind="$1" name="$2" line
+    # Docker's text is compared lowercased, so the name is too: `--name Rdb` asks about
+    # `Rdb-net`, and Docker answers `network Rdb-net not found` (review r3).
+    local kind="$1" name line
+    name="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
     while IFS= read -r line; do
         line="${line#Error response from daemon: }"
         line="${line#Error: }"
@@ -542,6 +545,57 @@ selftest_absent_answer() {
     done
 }
 
+# absent() itself, with docker stubbed to answer as a daemon would: Docker's not-found answer
+# for that name, in any case, is "absent" (exit 0); a DNS or socket error ends the run (exit
+# 1) and is never read as "absent".
+selftest_absent_caller() {
+    local case want got kind name text
+    for case in "0|network|Rdb-net|Error response from daemon: network Rdb-net not found" \
+                "0|container|rdbst-x|Error response from daemon: No such container: rdbst-x" \
+                "1|volume|rdbst-x|error during connect: Get \"http://h:2375/v1.51/volumes/rdbst-x\": dial tcp: lookup h: no such host" \
+                "1|volume|rdbst-x|error during connect: dial unix /run/docker.sock: connect: no such file or directory"; do
+        IFS='|' read -r want kind name text <<< "$case"
+        ( ST_TEXT="$text"; docker() { echo "$ST_TEXT" >&2; return 1; }
+          absent "$kind" "$name" ) >/dev/null 2>&1
+        got=$?
+        [ "$got" = "$want" ]
+        st "absent $kind $name exits $want when Docker says: $text (got $got)" $?
+    done
+}
+
+# `check` through its entry point, with a stub `docker` on PATH that answers the settings and
+# fails everything else: its scratch folder exists while it runs, and is gone, with nothing
+# printed about it, after the process exits (review r3).
+selftest_check_entry() {
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin" "$t/tmp"
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+case "$1 $2" in
+    "network inspect")
+        [ "$3" = -f ] || exit 0
+        case "$4" in
+            *.nodes*) echo 2 ;; *.voters*) echo 1 ;; *.partitions*) echo 2 ;;
+            *.subnet*) echo 10.180.96.0/24 ;; *.image*) echo stub ;; *.cluster*) echo c ;;
+        esac
+        exit 0 ;;
+    "container inspect") echo "Error response from daemon: No such container: $3" >&2; exit 1 ;;
+esac
+# While check runs, record what its scratch area holds.
+[ "$1" = logs ] && ls "$TMPDIR" >> "$SEEN"
+exit 1
+SH
+    chmod +x "$t/bin/docker"
+    PATH="$t/bin:$PATH" TMPDIR="$t/tmp" SEEN="$t/seen" \
+        "$0" check --name rdbst-ck > "$t/out" 2> "$t/err" < /dev/null
+    [ -s "$t/seen" ] && [ -z "$(ls -A "$t/tmp")" ] && ! grep -qi "unbound" "$t/err"
+    st "check's scratch folder is made, then removed when check's process exits" $?
+    [ -s "$t/seen" ] || echo "  check never reached docker logs: $(tail -n 2 "$t/err")"
+    [ -z "$(ls -A "$t/tmp")" ] || echo "  left behind: $(ls -A "$t/tmp")"
+    grep -i "unbound" "$t/err" | sed 's/^/  /'
+    rm -rf "$t"
+}
+
 # check's cleanup runs after check() has returned, under set -u: it must remove the scratch
 # folder and print nothing.
 selftest_check_cleanup() {
@@ -571,7 +625,8 @@ selftest_subnet() {
                     "network ls") [ "$DOCKER_MODE" != lsfail ] || return 1; printf 'aaa\nbbb\n' ;;
                     "network inspect")
                         case "$DOCKER_MODE" in
-                            whole) printf 'aaa 172.17.0.0/16 \nbbb 10.180.98.0/24 \n' ;;
+                            # lsfail answers inspect in full, so only the listing can abort.
+                            whole|lsfail) printf 'aaa 172.17.0.0/16 \nbbb 10.180.98.0/24 \n' ;;
                             partial) printf 'aaa 172.17.0.0/16 \n'; return 1 ;;
                             short) printf 'aaa 172.17.0.0/16 \n' ;;
                             fail) return 1 ;;
@@ -582,7 +637,7 @@ selftest_subnet() {
             }
             check_subnet
             docker network create x
-        ) >/dev/null 2>&1
+        ) >/dev/null 2>"$t/err"
     }
     CREATED="$t/created"
     export CREATED
@@ -594,7 +649,10 @@ selftest_subnet() {
         run_preflight $mode
         local rc=$?
         [ "$rc" != 0 ] && [ ! -s "$t/created" ]
-        st "subnet preflight aborts before creation: docker ${mode%% *}, ip ${mode##*/}" $?
+        local aborted=$?
+        # The listing case must abort for the listing's own reason, not a later guard.
+        [ "${mode%% *}" != lsfail ] || grep -q "docker network ls failed" "$t/err" || aborted=1
+        st "subnet preflight aborts before creation: docker ${mode%% *}, ip ${mode##*/}" "$aborted"
     done
     ( SUBNET=10.180.98.0/24; IP_CMD="$t/ip-ok"
       docker() { case "$1 $2" in "network ls") echo aaa ;; "network inspect") echo 'aaa 10.180.98.0/24 ' ;; esac; }
@@ -681,7 +739,9 @@ selftest() {
     set +e
     selftest_read_check
     selftest_check_cleanup
+    selftest_check_entry
     selftest_absent_answer
+    selftest_absent_caller
     selftest_subnet
     selftest_docker
     if [ "$ST_FAILS" = 0 ]; then say "selftest: all passed"; else say "selftest: $ST_FAILS failed"; fi
