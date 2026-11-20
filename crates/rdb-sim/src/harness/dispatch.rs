@@ -34,6 +34,7 @@ use bytes::Bytes;
 use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, FenceCredential, Lineage};
 use rdb_core::contracts::control::WatchTermination;
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::{AppendOutcome, ReplicationEnvelope};
 use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName,
@@ -63,7 +64,7 @@ use rdb_core::{
     publication::{Publication, ReplicationView},
     recovery::{Recovery, RecoveryPhase},
     replication::{
-        append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit},
+        append::{AppendReceiver, CatchUpPlan, Head, ReceiverInit, UNSOLICITED},
         wire, Replication,
     },
     transaction::Transaction,
@@ -76,6 +77,10 @@ use crate::harness::protection::ProtectionTable;
 use crate::harness::route;
 use crate::harness::run::{FaultTag, StepAction};
 use crate::harness::semantic;
+use crate::harness::snapshot::{
+    chunk_chain, ladder_dense, reseed_ack, ChunkEntry, SnapshotOffer, SnapshotRefusal,
+    SnapshotTransfer, SNAPSHOT_PAGE_KEYS,
+};
 use crate::harness::trace::Site;
 use crate::harness::transfer::{Step, Transfer, TransferPlan};
 use crate::sim::clock::Clock;
@@ -265,13 +270,18 @@ pub struct Dispatcher {
     plans: BTreeMap<(NodeId, PartitionId), PartitionConfig>,
     /// Each `(node, partition)` whose dormant receiver holds its ladder: the host's `ladders`.
     ladders: BTreeSet<(NodeId, PartitionId)>,
-    /// Each `(node, partition, generation)` whose primary was given its engine's ladder by the
-    /// `SnapshotCatchupRequired` consumer (K3, the H2 twin): once per generation. Process memory,
-    /// dropped with the process.
-    primary_ladders: BTreeSet<(NodeId, PartitionId, Generation)>,
-    /// Each `(node, partition, copy, barrier)` the `SnapshotCatchupRequired` consumer served: it
-    /// is served and logged once (lead ruling B-R48: the consumer dedups per copy and barrier).
-    snapshots_served: BTreeSet<(NodeId, PartitionId, CopyId, Seq)>,
+    /// The barrier of each snapshot transfer a source opened, by `(source, partition, copy)`:
+    /// the host's `snapshots_served` (A8a). A repeat ask at that barrier is dropped (B-R48); a
+    /// refusal keeps it, so the copy is not offered again at that `S`; every other end of the
+    /// transfer forgets it. A ladder refill is never recorded here. Process memory.
+    snapshots_served: BTreeMap<(NodeId, PartitionId, CopyId), Seq>,
+    /// Each snapshot transfer a source has open, by `(source, partition, copy)`: the host's
+    /// `transfers` (issue #61 S2, [`crate::harness::snapshot`]). Process memory of the source.
+    snapshot_transfers: BTreeMap<(NodeId, PartitionId, CopyId), SnapshotTransfer>,
+    /// S2-R3's hook, the host's debug `snapshot_chunk_fault`: the page of this index has one
+    /// byte of its first entry's value flipped after its chain is computed
+    /// ([`Self::fault_snapshot_chunk`]).
+    snapshot_chunk_fault: Option<u64>,
     /// The last `RecoveryResult` each F1 emitted, by the emitter's `(node, partition)`: what a
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
@@ -414,8 +424,9 @@ impl Dispatcher {
             catch_ups: BTreeMap::new(),
             plans: BTreeMap::new(),
             ladders: BTreeSet::new(),
-            primary_ladders: BTreeSet::new(),
-            snapshots_served: BTreeSet::new(),
+            snapshots_served: BTreeMap::new(),
+            snapshot_transfers: BTreeMap::new(),
+            snapshot_chunk_fault: None,
             committed: BTreeMap::new(),
             transfer_plans: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -629,6 +640,13 @@ impl Dispatcher {
         self.members.get(&node).copied()
     }
 
+    /// Corrupt page `index` of every snapshot transfer from now on: one byte of its first
+    /// entry's value flipped after its chain is computed, so the target refuses it `chain`
+    /// (S2-R3's hook, the host's debug `snapshot_chunk_fault`). A scenario operation.
+    pub fn fault_snapshot_chunk(&mut self, index: u64) {
+        self.snapshot_chunk_fault = Some(index);
+    }
+
     /// Whether `node` is down: a planned crash was taken there and it has not restarted.
     #[must_use]
     pub fn is_down(&self, node: NodeId) -> bool {
@@ -840,9 +858,26 @@ impl Dispatcher {
         self.catch_ups.retain(|(_, _, source), _| *source != node);
         self.plans.retain(|(held, _), _| *held != node);
         self.ladders.retain(|(held, _)| *held != node);
-        self.primary_ladders.retain(|(held, _, _)| *held != node);
         self.snapshots_served
-            .retain(|(held, _, _, _)| *held != node);
+            .retain(|(held, _, _), _| *held != node);
+        // A source's transfers were its process memory. A target's restart is its `PeerBooted`
+        // on the host, which ends every transfer to it at once (m-d); the simulator has no such
+        // message, so they end here.
+        self.snapshot_transfers
+            .retain(|(source, _, _), _| *source != node);
+        let to_node: Vec<_> = self
+            .snapshot_transfers
+            .iter()
+            .filter(|(_, transfer)| transfer.node == node)
+            .map(|(key, _)| *key)
+            .collect();
+        for (source, partition, copy) in to_node {
+            self.end_transfer(
+                (source, partition, copy),
+                "peer_booted",
+                "snapshot_transfer_abandoned",
+            );
+        }
     }
 
     /// Hold, for release with this restart, each partition's newest committed root, when its
@@ -1792,7 +1827,7 @@ impl Dispatcher {
                 return self.send_envelopes(node, *copy, (*first, *through), site, scheduler);
             }
             KernelEffect::SnapshotCatchupRequired { copy, barrier } => {
-                return self.snapshot_catchup(node, site.1, *copy, *barrier);
+                return self.snapshot_catchup(node, site.1, *copy, *barrier, scheduler);
             }
             KernelEffect::CopyAheadOnControl { copy } => {
                 return self.copy_ahead(node, site.1, *copy, scheduler.now());
@@ -1815,6 +1850,11 @@ impl Dispatcher {
             // A source's catch-up is F1's, and F1 may run on another node: its answer goes back
             // there (B-R59 surface item 4). A primary's goes to F1 on its own node, below.
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
+                self.end_transfer(
+                    (node, site.1, *copy),
+                    "caught_up",
+                    "snapshot_transfer_released",
+                );
                 if let Some(asker) = self.catch_ups.remove(&(site.1, *copy, node)) {
                     let kind =
                         EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
@@ -1929,32 +1969,37 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// R1's `SnapshotCatchupRequired` (the twin of the host's H2 arm, lead ruling A-R223): the
-    /// primary on `node` met a record it does not retain. Its engine still holds every record
-    /// (history is never pruned), so the consumer gives the primary its engine's ladder
-    /// ([`Replication::restore_primary_history`], K3), once per generation, and the copy's next
-    /// `NeedPrefix` — the keepalive's head draws one — walks it record by record. Each
-    /// `(copy, barrier)` is served and logged once, `snapshot_catchup_served{copy, barrier,
-    /// rungs, millis}` (B-R48: the consumer dedups).
+    /// R1's `SnapshotCatchupRequired`, the twin of the host's `Host::snapshot_catchup` (issue #61
+    /// A8a; [`crate::harness::snapshot`] lists what differs). Never a harness fault once a
+    /// primary is here. In the host's order:
     ///
-    /// A new ask after the ladder was restored cannot be served by re-sending: the copy is past
-    /// the head or the probe cap ran out, and snapshot transfer waits for pruning. It is logged
-    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named.
+    /// 1. **Refill** (lead ruling 1): when the primary's ladder is not dense from its engine's
+    ///    floor ([`ladder_dense`]), it lacks a rung the engine holds. The primary is given the
+    ///    engine's rungs from
+    ///    the floor ([`Replication::restore_primary_history`]) and the copy's next `NeedPrefix`
+    ///    walks them: `snapshot_catchup_served{how="ladder", rungs}`. Never deduped, so the ask
+    ///    after it reaches step 3.
+    /// 2. **In flight** (lead ruling 2): while a transfer of this generation is open for the
+    ///    copy, every ask is dropped, a newer barrier too: `snapshot_catchup_in_flight{at,
+    ///    barrier}`.
+    /// 3. **Transfer**: a repeat barrier is dropped (B-R48); otherwise a transfer opens at `S` =
+    ///    the engine's applied seq (`snapshot_transfer_opened`), its offer sent once `durable`
+    ///    reaches `S` ([`Self::snapshot_offer_due`]).
     ///
     /// # Errors
     ///
     /// [`SimError::Unavailable`] under the kernel seam when `node` hosts no primary there: a
     /// recovery source's ask, which nothing consumes (F1's deadline answers it). The same when
-    /// the engine's ladder cannot be read or the primary refuses it, logged
-    /// `snapshot_catchup_unserved{reason}`: the engine and the primary disagree, a harness fault.
+    /// the engine cannot serve the refill or the offer, logged `snapshot_catchup_unserved
+    /// {reason}`: the engine and the primary disagree, a harness fault.
     fn snapshot_catchup(
         &mut self,
         node: NodeId,
         partition: PartitionId,
         copy: CopyId,
         barrier: Seq,
+        scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        let started = std::time::Instant::now();
         let unserved = |reason: &str| {
             tracing::warn!(
                 node = node.0,
@@ -1969,71 +2014,527 @@ impl Dispatcher {
         let Some(primary) = self.replication.primary(node, partition) else {
             return unserved("no_primary");
         };
-        let generation = primary.tracker().lineage().generation;
-        if !self
-            .snapshots_served
-            .insert((node, partition, copy, barrier))
-        {
-            return Ok(());
-        }
-        // The twin of the host's A5 refusal (issue #61, design N4): a trimmed engine cannot
-        // refill the ladder from 0, and the snapshot transfer that serves it lands in A9. Named,
-        // and nothing below the floor is read.
+        let tracker = primary.tracker();
+        let lineage = tracker.lineage();
+        let generation = lineage.generation;
+        let config = tracker.config().clone();
         let floor = self
             .engines
             .get(&node)
             .map_or(Seq::ZERO, |engine| engine.floor_seq(partition, generation));
-        if floor > Seq::ZERO {
-            tracing::warn!(
+        // Lead ruling 1, "not dense", as A8a2's host counts it (`ladder_dense`): the lowest rung
+        // is the engine's floor and every seq from it to the ladder's highest is a rung. A8a's
+        // host tested the first rung only, which read a recovered primary's `{root, cutoff}` as
+        // dense; the lead ruled that wrong (2026-11-20).
+        let thin = !ladder_dense(tracker.history(), floor);
+        if thin {
+            let read = match self.dormant_rungs(node, partition, generation) {
+                Ok(read) => read,
+                Err(reason) => return unserved(reason),
+            };
+            if self
+                .replication
+                .restore_primary_history(node, partition, &read)
+                .is_err()
+            {
+                return unserved("ladder_refused");
+            }
+            tracing::info!(
                 node = node.0,
                 partition = partition.0,
                 copy = copy.0,
                 barrier = barrier.0,
                 generation = generation.0,
+                how = "ladder",
                 floor = floor.0,
-                reason = "below_floor",
-                "snapshot_catchup_unservable"
+                rungs = read.len(),
+                "snapshot_catchup_served"
             );
             return Ok(());
         }
-        if self
-            .primary_ladders
-            .contains(&(node, partition, generation))
+        let key = (node, partition, copy);
+        if let Some(open) = self
+            .snapshot_transfers
+            .get(&key)
+            .filter(|open| open.lineage.generation == generation)
         {
-            tracing::warn!(
+            tracing::info!(
                 node = node.0,
                 partition = partition.0,
                 copy = copy.0,
+                at = open.at.0,
                 barrier = barrier.0,
-                generation = generation.0,
-                "snapshot_catchup_unservable"
+                "snapshot_catchup_in_flight"
             );
             return Ok(());
         }
-        let read = match self.dormant_rungs(node, partition, generation) {
-            Ok(read) => read,
-            Err(reason) => return unserved(reason),
-        };
-        if self
-            .replication
-            .restore_primary_history(node, partition, &read)
-            .is_err()
-        {
-            return unserved("ladder_refused");
+        if self.snapshots_served.get(&key) == Some(&barrier) {
+            return Ok(());
         }
-        self.primary_ladders.insert((node, partition, generation));
-        let rungs = read.len();
+        self.snapshots_served.insert(key, barrier);
+        let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
+            return unserved("copy_not_in_config");
+        };
+        let Some(primary_member) = config
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+        else {
+            return unserved("no_primary_member");
+        };
+        let Some(engine) = self.engines.get(&node) else {
+            return unserved("no_engine");
+        };
+        let at = Seq(engine.buffered_applied(partition, generation).0);
+        let Some(root) = transfer_root(engine, (node, partition, generation)) else {
+            return unserved("root_unreadable");
+        };
+        let Some((barrier_record, _)) = engine.history_at(partition, generation, at) else {
+            return unserved("no_barrier_record");
+        };
+        let offer = SnapshotOffer {
+            lineage,
+            config_version: config.config_version,
+            from: node,
+            boot: primary_member.boot,
+            copy,
+            at,
+            root,
+            barrier: barrier_record,
+        };
+        let replaced = self
+            .snapshot_transfers
+            .insert(
+                key,
+                SnapshotTransfer {
+                    lineage,
+                    node: target.node,
+                    at,
+                    offer: Some(offer),
+                },
+            )
+            .map(|old| old.at.0);
         tracing::info!(
             node = node.0,
             partition = partition.0,
             copy = copy.0,
+            to = target.node.0,
             barrier = barrier.0,
             generation = generation.0,
-            rungs,
-            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "snapshot_catchup_served"
+            at = at.0,
+            floor = floor.0,
+            replaced = ?replaced,
+            "snapshot_transfer_opened"
         );
+        self.snapshot_offer_due(key, scheduler)
+    }
+
+    /// Send every open transfer's offer whose `S` is now durable on its source: the host's
+    /// `transfer_duty`, run after each tick's host flushes.
+    fn snapshot_offers_due(&mut self, scheduler: &mut Scheduler) -> Result<(), SimError> {
+        let keys: Vec<_> = self.snapshot_transfers.keys().copied().collect();
+        for key in keys {
+            self.snapshot_offer_due(key, scheduler)?;
+        }
         Ok(())
+    }
+
+    /// Send `key`'s offer once the source engine's `durable` has reached its `S`, so a target
+    /// never installs a record its source could still lose in a crash: logged
+    /// `snapshot_offer_sent{at, durable}`. The target then runs the whole install in this step
+    /// ([`Self::snapshot_offer`]). An offer to a node that is down is lost
+    /// (`snapshot_send_failed`), and the transfer stays open until that node's restart.
+    fn snapshot_offer_due(
+        &mut self,
+        key: (NodeId, PartitionId, CopyId),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let (node, partition, copy) = key;
+        let Some(transfer) = self.snapshot_transfers.get_mut(&key) else {
+            return Ok(());
+        };
+        let durable = self.engines.get(&node).map_or(0, |engine| {
+            engine.durable(partition, transfer.lineage.generation).0
+        });
+        if durable < transfer.at.0 {
+            return Ok(());
+        }
+        let Some(offer) = transfer.offer.take() else {
+            return Ok(());
+        };
+        let to = transfer.node;
+        tracing::info!(
+            node = node.0,
+            partition = partition.0,
+            copy = copy.0,
+            to = to.0,
+            generation = offer.lineage.generation.0,
+            at = offer.at.0,
+            durable,
+            "snapshot_offer_sent"
+        );
+        if self.is_down(to) || !self.members.contains_key(&to) {
+            tracing::warn!(
+                node = node.0,
+                to = to.0,
+                what = "snapshot_offer",
+                "snapshot_send_failed"
+            );
+            return Ok(());
+        }
+        self.snapshot_offer(to, &offer, scheduler)
+    }
+
+    /// End transfer `key` and forget its barrier, unless it ended `refused` (rev 5 M1: no
+    /// re-offer at that `S`), logged `event{why}`: the host's `end_transfer`.
+    fn end_transfer(&mut self, key: (NodeId, PartitionId, CopyId), why: &str, event: &'static str) {
+        let Some(transfer) = self.snapshot_transfers.remove(&key) else {
+            return;
+        };
+        if why != "refused" {
+            self.snapshots_served.remove(&key);
+        }
+        let (node, partition, copy) = key;
+        if event == "snapshot_transfer_abandoned" {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                at = transfer.at.0,
+                why,
+                "snapshot_transfer_abandoned"
+            );
+        } else {
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                at = transfer.at.0,
+                why,
+                "snapshot_transfer_released"
+            );
+        }
+    }
+
+    /// The target `to` takes `offer`: the host's `snapshot_offer`, `snapshot_chunk` and
+    /// `reseed` run as one call. A refusal of the offer or of the install is logged
+    /// `snapshot_offer_refused{reason}` or `snapshot_install_refused{reason}` on the target and
+    /// ends the source's transfer `refused`. Each page's chain is checked before it is written;
+    /// the first page runs `install_begin`, so nothing is switched before a page checks.
+    fn snapshot_offer(
+        &mut self,
+        to: NodeId,
+        offer: &SnapshotOffer,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let partition = offer.lineage.partition;
+        let source = (offer.from, partition, offer.copy);
+        if let Err(reason) = self.offer_check(to, offer) {
+            tracing::warn!(
+                node = to.0,
+                partition = partition.0,
+                copy = offer.copy.0,
+                from = offer.from.0,
+                generation = offer.lineage.generation.0,
+                epoch = offer.lineage.owner_epoch.0,
+                at = offer.at.0,
+                reason = reason.reason(),
+                "snapshot_offer_refused"
+            );
+            self.offer_refused_heard(source, offer, to, reason);
+            return Ok(());
+        }
+        let barrier = ReplicationEnvelope::decode(&offer.barrier)
+            .map(|envelope| envelope.record_digest)
+            .map_err(|_| SimError::Config {
+                field: "snapshot_barrier",
+            })?;
+        tracing::info!(
+            node = to.0,
+            partition = partition.0,
+            copy = offer.copy.0,
+            from = offer.from.0,
+            generation = offer.lineage.generation.0,
+            at = offer.at.0,
+            "snapshot_offer_accepted"
+        );
+        let (generation, at) = (offer.lineage.generation, offer.at);
+        let (mut chain, mut after) = (barrier, None);
+        let (mut begun, mut entries, mut chunks) = (false, 0_u64, 0_u64);
+        loop {
+            // The source's page, answering the pull `(after, chain)`.
+            let page: Vec<ChunkEntry> =
+                self.engines
+                    .get(&offer.from)
+                    .map_or_else(Vec::new, |engine| {
+                        engine
+                            .entries_after(
+                                partition,
+                                generation,
+                                after.as_ref(),
+                                SNAPSHOT_PAGE_KEYS,
+                            )
+                            .into_iter()
+                            .map(|(ns, key, value, version)| (ns, key, value, version, generation))
+                            .collect()
+                    });
+            let done = page.len() < SNAPSHOT_PAGE_KEYS;
+            let sent = chunk_chain(chain, &page);
+            let page = self.snapshot_chunk_corrupted(chunks, page);
+            // The target's side of the page.
+            if chunk_chain(chain, &page) != sent {
+                return self.install_refused(
+                    to,
+                    offer,
+                    (begun, chunks),
+                    SnapshotRefusal::Chain,
+                    "chain",
+                );
+            }
+            let engine = self.engine_mut(to);
+            if !begun {
+                if let Err(error) = engine.install_begin(partition, generation, at) {
+                    return self.install_refused(
+                        to,
+                        offer,
+                        (begun, chunks),
+                        SnapshotRefusal::Install,
+                        error.reason(),
+                    );
+                }
+                begun = true;
+                self.ladders.remove(&(to, partition));
+            }
+            let written: Vec<_> = page
+                .iter()
+                .map(|(ns, key, value, version, _)| (*ns, key.clone(), value.clone(), *version))
+                .collect();
+            if let Err(error) = self
+                .engine_mut(to)
+                .install_chunk(partition, generation, at, &written)
+            {
+                return self.install_refused(
+                    to,
+                    offer,
+                    (begun, chunks),
+                    SnapshotRefusal::Install,
+                    error.reason(),
+                );
+            }
+            chain = sent;
+            entries += page.len() as u64;
+            chunks += 1;
+            after = page
+                .last()
+                .map(|(ns, key, ..)| (*ns, key.clone()))
+                .or(after);
+            if done {
+                break;
+            }
+        }
+        if let Err(error) = self.engine_mut(to).install_finish(
+            partition,
+            generation,
+            at,
+            &offer.barrier,
+            offer.root,
+        ) {
+            return self.install_refused(
+                to,
+                offer,
+                (begun, chunks),
+                SnapshotRefusal::Install,
+                error.reason(),
+            );
+        }
+        self.reseed(to, offer, barrier, (entries, chunks), scheduler)
+    }
+
+    /// The host's `offer_check`, in its order: a live receiver that adopted the offer's
+    /// lineage and copy, the offerer the config's primary node and boot, `S` above the applied
+    /// head, and a barrier that decodes, names `S` and recomputes.
+    fn offer_check(&self, to: NodeId, offer: &SnapshotOffer) -> Result<(), SnapshotRefusal> {
+        let partition = offer.lineage.partition;
+        let receiver = self
+            .replication
+            .receiver(to, partition)
+            .filter(|receiver| !receiver.is_dormant() && !receiver.retired())
+            .ok_or(SnapshotRefusal::NotAdopted)?;
+        if receiver.lineage() != offer.lineage || receiver.copy() != offer.copy {
+            return Err(SnapshotRefusal::NotAdopted);
+        }
+        let primary = receiver
+            .config()
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary);
+        if primary.is_none_or(|primary| (primary.node, primary.boot) != (offer.from, offer.boot)) {
+            return Err(SnapshotRefusal::NotPrimary);
+        }
+        if offer.at <= receiver.applied_head().seq {
+            return Err(SnapshotRefusal::NotAhead);
+        }
+        let barrier =
+            ReplicationEnvelope::decode(&offer.barrier).map_err(|_| SnapshotRefusal::BadBarrier)?;
+        if barrier.header.seq != offer.at
+            || barrier.compute_record_digest().ok() != Some(barrier.record_digest)
+        {
+            return Err(SnapshotRefusal::BadBarrier);
+        }
+        Ok(())
+    }
+
+    /// The target `to` stopped `offer`'s install (the host's `install_refused`): logged
+    /// `snapshot_install_refused{reason, detail}`, and the source hears the refusal.
+    fn install_refused(
+        &mut self,
+        to: NodeId,
+        offer: &SnapshotOffer,
+        (begun, chunks): (bool, u64),
+        reason: SnapshotRefusal,
+        detail: &str,
+    ) -> Result<(), SimError> {
+        tracing::warn!(
+            node = to.0,
+            partition = offer.lineage.partition.0,
+            copy = offer.copy.0,
+            at = offer.at.0,
+            begun,
+            chunks,
+            reason = reason.reason(),
+            detail,
+            "snapshot_install_refused"
+        );
+        let source = (offer.from, offer.lineage.partition, offer.copy);
+        self.offer_refused_heard(source, offer, to, reason);
+        Ok(())
+    }
+
+    /// The source hears `to`'s refusal (the host's `snapshot_refused_heard`): its transfer, if
+    /// it is still this offer's, ends `refused` and keeps the barrier.
+    fn offer_refused_heard(
+        &mut self,
+        source: (NodeId, PartitionId, CopyId),
+        offer: &SnapshotOffer,
+        to: NodeId,
+        reason: SnapshotRefusal,
+    ) {
+        tracing::info!(
+            node = source.0 .0,
+            partition = source.1 .0,
+            copy = source.2 .0,
+            from = to.0,
+            at = offer.at.0,
+            reason = reason.reason(),
+            "snapshot_offer_refused_heard"
+        );
+        let ours = self
+            .snapshot_transfers
+            .get(&source)
+            .is_some_and(|transfer| {
+                transfer.lineage.generation == offer.lineage.generation && transfer.at == offer.at
+            });
+        if ours {
+            self.end_transfer(source, "refused", "snapshot_transfer_released");
+        }
+    }
+
+    /// After `install_finish`, the host's `reseed`: a live receiver over the held receiver's
+    /// config, at `(S, barrier digest)` and durable `S`, replaces it, this node's ladder for the
+    /// partition is dropped, and the receiver's own ACK goes to the offerer unsolicited (lead
+    /// ruling A). [`reseed_ack`] withholds it unless the receiver is durable through `S`:
+    /// `snapshot_reseed_ack_withheld` (error), nothing sent.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `snapshot_reseed` when `to` holds no receiver of the
+    /// partition or the new one is refused: the host's fault. Whatever [`Self::send`] returns.
+    fn reseed(
+        &mut self,
+        to: NodeId,
+        offer: &SnapshotOffer,
+        digest: Digest,
+        (entries, chunks): (u64, u64),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let partition = offer.lineage.partition;
+        let fault = SimError::Config {
+            field: "snapshot_reseed",
+        };
+        let config = self
+            .replication
+            .receiver(to, partition)
+            .map(|held| held.config().clone())
+            .ok_or_else(|| fault.clone())?;
+        let receiver = AppendReceiver::new(ReceiverInit {
+            config: config.clone(),
+            own: offer.copy,
+            lineage: offer.lineage,
+            head: Head {
+                seq: offer.at,
+                digest,
+            },
+            durable: DurableSeq(offer.at.0),
+        })
+        .map_err(|_| fault)?;
+        let ack = reseed_ack(&receiver, offer.at);
+        self.replication.install_receiver(receiver);
+        self.ladders.remove(&(to, partition));
+        tracing::info!(
+            node = to.0,
+            partition = partition.0,
+            copy = offer.copy.0,
+            from = offer.from.0,
+            generation = offer.lineage.generation.0,
+            at = offer.at.0,
+            entries,
+            chunks,
+            "snapshot_transfer_installed"
+        );
+        let Some(ack) = ack else {
+            tracing::error!(
+                node = to.0,
+                partition = partition.0,
+                at = offer.at.0,
+                "snapshot_reseed_ack_withheld"
+            );
+            return Ok(());
+        };
+        let frame = Frame {
+            id: UNSOLICITED,
+            protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
+            config: config.config_version,
+            sender: offer.lineage,
+            body: wire::encode_reply(&AppendOutcome::Accepted(ack)),
+        };
+        let boot = self.boot(to).unwrap_or_default();
+        self.send(
+            to,
+            boot,
+            offer.from,
+            &frame,
+            (to, partition, CorrelationId(0)),
+            scheduler,
+        )
+    }
+
+    /// S2-R3's hook: page `index` with one byte of its first entry's value flipped, when
+    /// [`Self::fault_snapshot_chunk`] named it. Logged `snapshot_chunk_corrupted`.
+    fn snapshot_chunk_corrupted(&self, index: u64, mut page: Vec<ChunkEntry>) -> Vec<ChunkEntry> {
+        if self.snapshot_chunk_fault != Some(index) {
+            return page;
+        }
+        let Some(entry) = page.first_mut() else {
+            return page;
+        };
+        let mut value = entry.2.to_vec();
+        match value.first_mut() {
+            Some(byte) => *byte ^= 0xff,
+            None => value.push(0xff),
+        }
+        entry.2 = Bytes::from(value);
+        tracing::warn!(index, "snapshot_chunk_corrupted");
+        page
     }
 
     /// R1's `CopyAheadOnControl` (the twin of the host's H3 arm, I1): `copy` answered
@@ -2678,6 +3179,8 @@ impl Dispatcher {
     /// # Errors
     ///
     /// [`SimError::Config`] naming `node` or `partition` when there is nothing to trim,
+    /// `transfer_pinned` past the lowest `S` of a snapshot transfer `node` serves (logged
+    /// `history_trim_transfer_pinned{pin}`, nothing changed),
     /// `trim_history_digest` when the record at `through` or at the root cannot be read,
     /// `trim_history_kernel` when R1 refuses (nothing changed), and `history_trim_refused` when
     /// the engine refuses (logged with its reason; the kernel is then already trimmed, the safe
@@ -2698,6 +3201,28 @@ impl Dispatcher {
             .map(|((_, generation), _)| *generation)
             .max()
             .ok_or(SimError::Config { field: "partition" })?;
+        // The transfer pin (design 3.1, the host's `transfer_pinned`): a trim never passes the
+        // lowest `S` of a transfer this node serves, so the walk after the re-seed's ACK finds
+        // every record from `S` on.
+        if let Some(pin) = self
+            .snapshot_transfers
+            .iter()
+            .filter(|((source, p, _), _)| *source == node && *p == partition)
+            .map(|(_, transfer)| transfer.at)
+            .min()
+            .filter(|pin| through > *pin)
+        {
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                pin = pin.0,
+                through = through.0,
+                "history_trim_transfer_pinned"
+            );
+            return Err(SimError::Config {
+                field: "transfer_pinned",
+            });
+        }
         let refused = SimError::Config {
             field: "history_trim_refused",
         };
@@ -3712,6 +4237,7 @@ impl Dispatcher {
             })?;
         }
         let flushed = self.run_due_flushes(now, scheduler)?;
+        self.snapshot_offers_due(scheduler)?;
         let stepped = self.run_due_transfers(now, scheduler)?;
         let watched = self.run_due_watches(now, scheduler)?;
         Ok(fired + evaluated + flushed + stepped + watched)
@@ -3841,6 +4367,25 @@ impl DormantSeed {
             cutoff,
         }
     }
+}
+
+/// The root a snapshot of `generation` carries, the host's `transfer_root`: the trim mark's root
+/// when the mark is this lineage's own, else the lineage's link base and the digest there, else
+/// `(0, ROOT)`. `None` when the record at the link base cannot be read.
+fn transfer_root(
+    engine: &MemoryEngine,
+    (holder, partition, generation): (NodeId, PartitionId, Generation),
+) -> Option<(Seq, Digest)> {
+    if let Some((marked, mark)) = engine.floor(partition, generation) {
+        if marked == generation {
+            return Some((mark.root_base, mark.root_digest));
+        }
+    }
+    if engine.parent(partition, generation).is_none() {
+        return Some((Seq::ZERO, Digest::ROOT));
+    }
+    let base = engine.base(partition, generation);
+    stored_digest(engine, (holder, partition, generation), base).map(|digest| (base, digest))
 }
 
 fn stored_digest(
@@ -4236,7 +4781,11 @@ mod dormant_twin_tests {
     use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
     use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 
+    use rdb_core::contracts::storage::CapturedPrefix;
+
     use super::{Digest, Dispatcher, DormantSeed};
+    use crate::error::SimError;
+    use crate::sim::scheduler::Scheduler;
     use crate::storage::history::canonical_history;
     use crate::storage::memory::MemoryEngine;
 
@@ -4523,10 +5072,11 @@ mod dormant_twin_tests {
 
     /// Issue #61 A6, the twin of the host's floor-aware readers (A5): after a trim on node 1
     /// the primary's ladder starts at the floor (kernel first), a source restore builds the
-    /// dormant receiver's ladder from the engine's floor, not from 0, and a snapshot catch-up is
-    /// refused `below_floor` without refilling the primary from the engine (design N4).
-    /// Cuts: `dormant_rungs` from 0, red (`no_record`, no ladder); the snapshot refusal removed,
-    /// red (the primary is refilled). Unit, under a second.
+    /// dormant receiver's ladder from the engine's floor, not from 0, and a snapshot catch-up
+    /// opens a transfer at the head without refilling the primary from the engine: its ladder
+    /// already starts at the engine's floor (A9b, lead ruling 1; A6's `below_floor` refusal is
+    /// gone with the host's). Cuts: `dormant_rungs` from 0, red (`no_record`, no ladder); always
+    /// refill, red (no transfer). Unit, under a second.
     #[test]
     fn t61_sim_restore_and_snapshot_catchup_respect_the_floor() {
         let (mut dispatcher, seed) = serving_owner();
@@ -4566,18 +5116,194 @@ mod dormant_twin_tests {
         );
 
         dispatcher
-            .snapshot_catchup(OWNER, P, CopyId(1), Seq(1))
-            .expect("a refusal is not a harness fault");
-        assert!(
-            !dispatcher
-                .primary_ladders
-                .contains(&(OWNER, P, Generation(1))),
-            "the primary is not refilled from the engine"
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(1), &mut Scheduler::new())
+            .expect("a transfer is not a harness fault");
+        assert_eq!(
+            open_transfer(&dispatcher),
+            Some((NodeId(2), Seq(HEAD), true)),
+            "a transfer opens at the head, its offer held until durable reaches it"
         );
         assert_eq!(
             floor_of_primary(&dispatcher),
             Some(Seq(2)),
             "nothing below the floor read"
+        );
+    }
+
+    /// Node 1's open transfer to copy 1: its target, `S`, and whether its offer is still held.
+    fn open_transfer(dispatcher: &Dispatcher) -> Option<(NodeId, Seq, bool)> {
+        dispatcher
+            .snapshot_transfers
+            .get(&(OWNER, P, CopyId(1)))
+            .map(|transfer| (transfer.node, transfer.at, transfer.offer.is_some()))
+    }
+
+    /// Issue #61 A9b, the twin of the host's `h2_a_snapshot_catch_up_refills_a_thin_ladder_then_
+    /// opens_a_transfer` and its pin: node 1's ladder starts at 1, above its engine's floor 0,
+    /// so the first ask refills it from the engine (lead ruling 1) and the same ask again, never
+    /// deduped after a refill, opens a transfer at the head. A newer barrier while it is open is
+    /// dropped and the transfer kept (lead ruling 2), and a trim past its `S` is refused
+    /// `transfer_pinned` with the floor unmoved. Cuts: always transfer, red (no refill); a
+    /// refill deduped, red (no transfer); a newer barrier replaces, red (the barrier moves); the pin
+    /// ignored, red (the trim passes). Unit, under a second.
+    #[test]
+    fn t61_sim_a_thin_ladder_is_refilled_then_one_transfer_holds_and_pins() {
+        let (mut dispatcher, _) = serving_owner();
+        let mut scheduler = Scheduler::new();
+        let ladder_floor = |dispatcher: &Dispatcher| {
+            dispatcher
+                .replication
+                .primary(OWNER, P)
+                .expect("the primary")
+                .tracker()
+                .history()
+                .floor()
+        };
+        assert_eq!(ladder_floor(&dispatcher), Some(Seq(1)), "the thin ladder");
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+            .expect("the refill");
+        assert_eq!(
+            (ladder_floor(&dispatcher), open_transfer(&dispatcher)),
+            (Some(Seq::ZERO), None),
+            "refilled from the engine's floor, no transfer"
+        );
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+            .expect("the transfer");
+        assert_eq!(
+            open_transfer(&dispatcher),
+            Some((NodeId(2), Seq(HEAD), true)),
+            "the same ask again opens a transfer at the head; nothing is durable, so it waits"
+        );
+
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD + 1), &mut scheduler)
+            .expect("in flight");
+        assert_eq!(
+            (
+                open_transfer(&dispatcher),
+                dispatcher
+                    .snapshots_served
+                    .get(&(OWNER, P, CopyId(1)))
+                    .copied()
+            ),
+            (Some((NodeId(2), Seq(HEAD), true)), Some(Seq(HEAD))),
+            "a newer barrier leaves the open transfer as it was"
+        );
+        // A record past S, committed straight into the engine, so a trim has one to pass.
+        let lineage = Lineage {
+            partition: P,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+        };
+        let next = canonical_history(lineage, ConfigVersion(1), HEAD + 1)
+            .expect("history")
+            .batches
+            .last()
+            .cloned()
+            .expect("the next batch");
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .commit(next)
+            .expect("commit");
+        assert_eq!(
+            dispatcher.trim_history(OWNER, P, Seq(HEAD + 1)),
+            Err(SimError::Config {
+                field: "transfer_pinned"
+            }),
+            "a trim past S is refused"
+        );
+        assert_eq!(
+            dispatcher.engines[&OWNER].floor_seq(P, Generation(1)),
+            Seq::ZERO,
+            "and nothing was trimmed"
+        );
+    }
+
+    /// Issue #61 A9b, the sim side of S2-R5's first refusal: once node 1's `S` is durable its
+    /// offer goes to copy 1 on node 2, which holds generation 1 through 1 and no receiver, so
+    /// it refuses `not_adopted`. Node 2's store is untouched, node 1's transfer ends and keeps
+    /// the barrier: the same barrier opens nothing, a newer one opens a new transfer, which
+    /// node 2 refuses again at once. Cuts:
+    /// `install_begin` before the offer check, red (node 2 wiped); the offer sent before
+    /// durable reaches `S`, red (refused before the sync); a refusal forgets the barrier, red
+    /// (a second transfer at the same barrier). Unit, under a second.
+    #[test]
+    fn t61_sim_a_refused_offer_changes_nothing_and_ends_the_transfer() {
+        let (mut dispatcher, seed) = serving_owner();
+        let mut scheduler = Scheduler::new();
+        let target = NodeId(2);
+        let mut engine = MemoryEngine::new(target);
+        let history = canonical_history(seed.lineage, ConfigVersion(1), 1).expect("history");
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit");
+        }
+        dispatcher.register_node(target, BootId(1));
+        dispatcher.engines.insert(target, engine);
+        // The first ask refills the thin ladder; the second opens the transfer.
+        for _ in 0..2 {
+            dispatcher
+                .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+                .expect("served");
+        }
+        dispatcher
+            .snapshot_offers_due(&mut scheduler)
+            .expect("nothing is due");
+        assert_eq!(
+            open_transfer(&dispatcher),
+            Some((target, Seq(HEAD), true)),
+            "the offer waits for durable"
+        );
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .sync_wal_through(vec![CapturedPrefix {
+                partition: P,
+                generation: Generation(1),
+                through: AppliedSeq(HEAD),
+            }])
+            .expect("node 1 syncs");
+        dispatcher
+            .snapshot_offers_due(&mut scheduler)
+            .expect("a refusal is not a harness fault");
+        let node_2 = &dispatcher.engines[&target];
+        assert_eq!(
+            (
+                node_2.buffered_applied(P, Generation(1)),
+                node_2.installing(P, Generation(1)),
+            ),
+            (AppliedSeq(1), None),
+            "node 2's store is unchanged"
+        );
+        assert_eq!(
+            (
+                open_transfer(&dispatcher),
+                dispatcher
+                    .snapshots_served
+                    .get(&(OWNER, P, CopyId(1)))
+                    .copied()
+            ),
+            (None, Some(Seq(HEAD))),
+            "the transfer ended and keeps its barrier"
+        );
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+            .expect("dropped");
+        assert_eq!(open_transfer(&dispatcher), None, "no re-offer at that S");
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD + 1), &mut scheduler)
+            .expect("a new barrier");
+        assert_eq!(
+            dispatcher
+                .snapshots_served
+                .get(&(OWNER, P, CopyId(1)))
+                .copied(),
+            Some(Seq(HEAD + 1)),
+            "a new barrier opens a new transfer (offered at once, and refused again)"
         );
     }
 

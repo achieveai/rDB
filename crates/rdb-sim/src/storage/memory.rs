@@ -572,10 +572,24 @@ impl MemoryEngine {
         generation: Generation,
         handle: SnapshotHandle,
     ) -> MemorySnapshot {
+        MemorySnapshot::new(
+            handle,
+            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
+            generation,
+            self.view(partition, generation),
+        )
+    }
+
+    /// Every record lineage `(partition, generation)` shows, as [`Self::snapshot`] describes.
+    fn view(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> BTreeMap<(Namespace, Bytes), (Bytes, Version)> {
         let inherited = self
             .lineage(partition, generation)
             .is_some_and(|lineage| lineage.parent.is_some());
-        let records = if inherited {
+        if inherited {
             let mut records = BTreeMap::new();
             self.replay_into(partition, generation, None, &mut records);
             records
@@ -587,13 +601,35 @@ impl MemoryEngine {
                     ((*ns, key.clone()), (value.clone(), *version))
                 })
                 .collect()
-        };
-        MemorySnapshot::new(
-            handle,
-            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
-            generation,
-            records,
-        )
+        }
+    }
+
+    /// One page of lineage `(partition, generation)`'s view after the exclusive cursor `after`,
+    /// at most `limit` entries in `(namespace, key)` order (issue #61 S2): the twin of
+    /// `RocksSnapshot::entries_after`, which the host's source pages with. History and the head
+    /// `Progress` are left out: the barrier carries History and `install_finish` writes the
+    /// head. Meta is left out too; the host's export lists it, but format 1 stores no Meta
+    /// record under a lineage (commit and open refuse one, m8s_25a and m8s_25b), so neither
+    /// list ever yields one, and an install refuses all three ([`InstallError::ForeignEntry`]),
+    /// as the host's does. Each entry carries the version its record was written at.
+    #[must_use]
+    pub fn entries_after(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        after: Option<&(Namespace, Bytes)>,
+        limit: usize,
+    ) -> Vec<InstallEntry> {
+        self.view(partition, generation)
+            .into_iter()
+            .filter(|((ns, key), _)| {
+                !matches!(ns, Namespace::History | Namespace::Meta)
+                    && !(*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
+            })
+            .filter(|(cursor, _)| after.is_none_or(|after| cursor > after))
+            .take(limit)
+            .map(|((ns, key), (value, version))| (ns, key, value, version))
+            .collect()
     }
 
     /// Apply `generation`'s history to `records`: its predecessor's through the base it was cut

@@ -32,6 +32,7 @@ pub mod replay;
 pub mod route;
 pub mod run;
 pub mod semantic;
+pub mod snapshot;
 pub mod trace;
 pub mod transfer;
 
