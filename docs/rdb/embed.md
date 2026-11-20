@@ -1255,8 +1255,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. For a declared database, an owner whose
-  folder is lost after its first root and before any admitted write is still refused as
-  unfinished forming; repeating --declare does not recover it (#137).
+  folder is lost after its first root and before any admitted write takes that root back on
+  restart, with nothing lost (#137). One that may have admitted writes is refused and told to
+  move the partition with `admin promote`.
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take

@@ -1611,71 +1611,150 @@ fn s1a_an_unreachable_store_at_the_formation_read_says_what_to_do() {
     );
 }
 
-/// PR #138 review, and #137: node 1 roots its first partition and stops before any write is
-/// admitted (the commit hook faults it before activation), then loses its whole folder. With
-/// the formation record present, its reopen is refused "has not finished forming", and running
-/// the same declaration again (`Already`) does not change that: today's limit, which #137
-/// owns. The refusal says so and does not tell the operator to run the formation again. The
-/// refused opens bind nothing, start nothing and write nothing. Integration (~4 s).
-/// Cut: `empty_owner_refusal` answers the shared `RERUN_FORM` step for a declared database
-/// too; red at the text.
-#[config_log::retcd_test]
-fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
+/// #137: declare `partitions` over nodes 1 to 3 and open them, `wiped`'s commit hook faulting it
+/// right after its first root commits, before that generation is linked or activated, so no
+/// write is ever admitted; wait until one of its partitions is rooted, then end every process
+/// and lose `wiped`'s whole folder. Every process then reopens: the wiped owner's open rolls
+/// each rooted partition it owns forward onto its own empty copy (no promote, no re-form),
+/// every partition takes a write, and after a restart of all three every write reads back.
+/// Returns the partitions that were rolled forward.
+fn wiped_owner_before_any_write_rolls_forward(
+    method: &str,
+    partitions: u32,
+    wiped: NodeId,
+) -> Vec<PartitionId> {
     let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
-    rig.declare_created();
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration is written: {other:?}"),
+    }
+    let nodes = ALL_NODES;
+    let owner_of = |partition: u32| admin::owner_in(&nodes, PartitionId(partition));
     let dirs = fresh_dirs();
-    crate::host::set_after_commit(&dirs[0].0, Some(crate::host::AfterCommit::Fault));
+    crate::host::set_after_commit(
+        &dirs[wiped.0 as usize - 1].0,
+        Some(crate::host::AfterCommit::Fault),
+    );
     rig.open_all(dirs);
-    let owned: Vec<PartitionId> = (1..=PARTITIONS)
-        .map(PartitionId)
-        .filter(|partition| admin::initial_owner(*partition) == NodeId(1))
-        .collect();
-    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
-    while !rig.rt.block_on(async {
-        partition_states(&rig.store, PARTITIONS)
-            .await
+    let rooted_of_wiped = |rig: &Rig| -> Vec<(PartitionId, NodeId, Generation)> {
+        rig.rt
+            .block_on(partition_states(&rig.store, partitions))
             .expect("the store answers")
-            .iter()
-            .any(|(partition, state)| {
-                owned.contains(partition) && matches!(state, PartitionState::Rooted(..))
+            .into_iter()
+            .filter_map(|(partition, state)| match state {
+                PartitionState::Rooted(record, _) if owner_of(partition.0) == wiped => {
+                    Some((partition, record.owner, record.generation))
+                }
+                _ => None,
             })
-    }) {
-        assert!(Instant::now() < deadline, "node 1 never rooted a partition");
+            .collect()
+    };
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while rooted_of_wiped(&rig).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "node {} never rooted a partition",
+            wiped.0
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     rig.shutdown_all();
-    crate::host::set_after_commit(&rig.procs[0].dir, None);
-    let before = snapshot(&rig.rt, &*rig.store);
-    rig.wipe(NodeId(1));
-    for attempt in ["first", "after declaring again"] {
-        let refused = rig
-            .reopen(NodeId(1))
-            .map(|_| ())
-            .expect_err("the wiped owner is refused");
+    crate::host::set_after_commit(&rig.procs[wiped.0 as usize - 1].dir, None);
+    let rooted = rooted_of_wiped(&rig);
+    rig.wipe(wiped);
+    rig.restart_all();
+    rig.wait_ready();
+    // The roll-forward names the root's generation (below); the reopen's heal may commit a
+    // later one, but the owner stays: nothing promoted the partition away.
+    let after = rooted_of_wiped(&rig);
+    for (partition, owner, generation) in &rooted {
         assert!(
-            refused.to_string().contains("has not finished forming")
-                && refused
-                    .to_string()
-                    .contains("does not finish it (issue #137)")
-                && !refused
-                    .to_string()
-                    .contains("run the command that formed it again"),
-            "{attempt}: {refused}"
-        );
-        assert!(!has_copies(&rig.procs[0].dir), "{attempt}: nothing bound");
-        assert_eq!(
-            snapshot(&rig.rt, &*rig.store),
-            before,
-            "{attempt}: nothing written"
-        );
-        let again = rig
-            .rt
-            .block_on(admin::declare(&rig.store, &rig.declaration()));
-        assert!(
-            matches!(again, Ok(admin::Declared::Already(_))),
-            "{again:?}"
+            after
+                .iter()
+                .any(|(p, o, g)| p == partition && o == owner && g >= generation),
+            "partition {} keeps owner {}: {after:?}",
+            partition.0,
+            owner.0
         );
     }
+    let rolled: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_rolled_forward")
+            .collect();
+    for (partition, _, generation) in &rooted {
+        // Partition 1's line names no partition; a later partition's names it. `copies` is
+        // logged as its debug text.
+        let names = |line: &serde_json::Value| {
+            line["generation"] == generation.0
+                && line["copies"] == format!("[{}]", wiped.0)
+                && match partition.0 {
+                    1 => line["partition"].is_null(),
+                    n => line["partition"] == n,
+                }
+        };
+        assert!(
+            rolled.iter().any(names),
+            "partition {} rolled forward onto node {}'s copy: {rolled:?}",
+            partition.0,
+            wiped.0
+        );
+    }
+    let groups: Vec<(u32, AffinityId)> = (1..=partitions)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    for (partition, group) in &groups {
+        let put = put_lands(rig.of(owner_of(*partition)), *group, b"k", b"v");
+        assert_eq!(put.partition, PartitionId(*partition), "{put:?}");
+    }
+    rig.restart_all();
+    rig.wait_ready();
+    for (partition, group) in &groups {
+        let got = rig
+            .of(owner_of(*partition))
+            .get_in(*group, b"k")
+            .expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"v"[..]),
+            "partition {partition} keeps its write"
+        );
+    }
+    rooted
+        .into_iter()
+        .map(|(partition, ..)| partition)
+        .collect()
+}
+
+/// #137, a later partition: node 2 owns no partition 1, so its reopen reaches the owner's empty
+/// copy in `Db::decide_partition` (from `Db::check_others`). Integration (~8 s).
+/// Cut: `Db::decide_partition` refuses the owner's empty copy unconditionally (its
+/// `empty_owner` call answers the old refusal); `restart_all` panics "has not finished forming".
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_before_any_write_rolls_forward_a_later_partition() {
+    const METHOD: &str =
+        "s1a_a_declared_owner_wiped_before_any_write_rolls_forward_a_later_partition";
+    assert_ne!(admin::owner_in(&ALL_NODES, PARTITION), NodeId(2));
+    let rolled = wiped_owner_before_any_write_rolls_forward(METHOD, PARTITIONS, NodeId(2));
+    assert!(
+        !rolled.is_empty() && !rolled.contains(&PARTITION),
+        "{rolled:?}"
+    );
+}
+
+/// #137, partition 1: one partition, owned by node 1, so the reopen reaches the owner's empty
+/// copy in `Db::check`. Integration (~6 s).
+/// Cut: `Db::check`'s owner-local branch refuses unconditionally (its `empty_owner` call
+/// answers the old refusal); `restart_all` panics "has not finished forming".
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1() {
+    const METHOD: &str = "s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1";
+    assert_eq!(admin::owner_in(&ALL_NODES, PARTITION), NodeId(1));
+    let rolled = wiped_owner_before_any_write_rolls_forward(METHOD, 1, NodeId(1));
+    assert_eq!(rolled, [PARTITION]);
 }
 
 /// PR #138 review: after acknowledged writes, node 1 loses its whole folder. With the
