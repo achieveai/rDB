@@ -1,4 +1,5 @@
 using System.Reflection;
+using Grpc.Core;
 using Google.Protobuf.Reflection;
 using Pb = Rdb.V1;
 
@@ -60,6 +61,31 @@ public class WireTableTests
     {
         Assert.Equal(protoName, ProtoName<Pb.RetryRule>(wire));
         Assert.Equal(rule, RdbErrors.Retry(new Pb.RdbError { Retry = (Pb.RetryRule)wire }));
+    }
+
+    /// <summary>
+    /// Issue #61 A8c: a write refused in the read-only window while a copy is rebuilt. RECOVERY_READ_ONLY with
+    /// retry_after_ms 5000 is RetryAfter 5 s, NoMutation, and retryable as a new write. The 5 s is a poll hint,
+    /// not an estimate of when writes resume.
+    /// </summary>
+    [Fact]
+    public void A_rebuild_window_refusal_waits_five_seconds_and_may_be_sent_again()
+    {
+        var d = new Pb.RdbError
+        {
+            Kind = Pb.ErrorKind.RecoveryReadOnly,
+            KindName = "RECOVERY_READ_ONLY",
+            Retry = Pb.RetryRule.RetryAfterRecovery,
+            NoMutation = true,
+            RetryAfterMs = 5000,
+        };
+        var e = RdbErrors.Map(new RpcException(new Status(StatusCode.Unavailable, "read-only")), d, isWrite: true);
+        Assert.IsNotType<RdbUnknownOutcomeException>(e);
+        Assert.Equal(RdbErrorKind.RecoveryReadOnly, e.Kind);
+        Assert.Equal(RdbRetry.RetryAfterRecovery, e.Retry);
+        Assert.True(e.NoMutation);
+        Assert.Equal(TimeSpan.FromSeconds(5), e.RetryAfter);
+        Assert.True(RdbErrors.MayRetry(d, isWrite: true));
     }
 
     [Fact]

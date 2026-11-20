@@ -9527,3 +9527,189 @@ fn t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_th
     assert_eq!(trio.status(0).needs_operator, None);
     assert_eq!(trio.status(2).needs_operator, None);
 }
+
+/// Issue #61 S1-R9a (design N3 and B3, A8c): the read-only window, named. Every copy is trimmed
+/// and node 3 comes back on an empty disk; node 1 opens node 3's transfer but holds its offer,
+/// and dies. Node 2 is promoted: F1 commits `ReadOnly` (node 3 a shadow below the floor) and
+/// node 2 opens its own transfer to node 3, its offer held so the window stays open. A put to
+/// node 2 then is refused `RECOVERY_READ_ONLY`, `RetryAfterRecovery`, `no_mutation`, with a
+/// `retry_after` of [`REBUILD_RETRY_HINT`] (5 s) and a detail naming copy 2 on node 3, the
+/// transfer's progress, and [`crate::db::error::REBUILDING_STEP`], which `next_step` treats as
+/// the detail's own step. Released, node 3 is rebuilt from node 2's snapshot, node 2 commits
+/// writable above G (`DegradedRf2` on copies 2 and 3: copy 1 stays down, ruling R21 a1), and
+/// the same put, sent again as a new write, lands; until then each send is refused
+/// `PROTECTION_PAUSED` or `RECOVERY_READ_ONLY`, never anything else.
+/// Not here (ruling R21 b1): `survivor_behind_retention`. Node 3 comes back on an empty disk,
+/// so F1 takes it as a shadow and never pair-probes it; A4's kernel rows
+/// (`recovery_f1.rs`) pin that path.
+/// Cut: `named_read_only` without the rebuild arm, red (the plain read-only detail, no hint).
+/// Integration (~20 s): S2-R1's setup bound to an instance, and a promote.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_s1_r9a_a_write_in_the_rebuild_window_is_refused_read_only_with_a_poll_hint() {
+    const METHOD: &str =
+        "t61_s1_r9a_a_write_in_the_rebuild_window_is_refused_read_only_with_a_poll_hint";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        // Bound to an instance, so F1 writes the rooted layout `admin::promote` reads.
+        host.engine
+            .bind_instance(super::note_tests::INSTANCE)
+            .expect("bind instance");
+        host.instance = Some(super::note_tests::INSTANCE);
+        if host.node != NodeId(3) {
+            host.snapshot_offer_held = true;
+        }
+    });
+    let three = &mut trio.nodes[2].0;
+    three
+        .engine
+        .bind_instance(super::note_tests::INSTANCE)
+        .expect("bind instance");
+    three.instance = Some(super::note_tests::INSTANCE);
+    trio.until("node 1 opened node 3's transfer", |_| {
+        logged!(METHOD, "snapshot_transfer_opened")
+            .iter()
+            .any(|line| line["node"] == 1)
+            .then_some(())
+    });
+    kill(&trio, 1, &[2, 3]);
+    let promote = super::seal_tests::spawn_promote(&trio, 2);
+    super::seal_tests::only_until(&mut trio, &[1, 2], "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let generation = super::seal_tests::only_until(
+        &mut trio,
+        &[1, 2],
+        "node 2 committed and opened node 3's transfer",
+        |trio| {
+            let opened = logged!(METHOD, "snapshot_transfer_opened")
+                .iter()
+                .any(|line| line["node"] == 2);
+            let committed = trio.nodes[1].0.committed.get(&p)?;
+            (opened && committed.mode == PartitionMode::ReadOnly)
+                .then_some(committed.new_generation)
+        },
+    );
+    let three = copy_of(&trio, 3);
+    // Until node 2 adopts G its answer is `no generation adopted yet`; then the window's.
+    let error = super::seal_tests::only_until(&mut trio, &[1, 2], "a read-only refusal", |trio| {
+        let (reply, answer) = mpsc::channel();
+        trio.nodes[1]
+            .1
+            .send(Msg::Client(Client {
+                partition: p,
+                call: put(41),
+                reply,
+            }))
+            .expect("node 2's mailbox");
+        let answer =
+            super::seal_tests::only_until(trio, &[1, 2], "an answer", |_| answer.try_recv().ok());
+        match answer {
+            Answer::Error { error, .. } if error.kind == ErrorKind::RecoveryReadOnly => Some(error),
+            Answer::Error { error, .. }
+                if error.detail.starts_with("no generation adopted yet") =>
+            {
+                None
+            }
+            other => panic!("a put in the window: {other:?}"),
+        }
+    });
+    assert_eq!(error.retry, RetryRule::RetryAfterRecovery, "{error:?}");
+    assert!(error.no_mutation, "{error:?}");
+    assert_eq!(error.retry_after(), Some(REBUILD_RETRY_HINT), "{error:?}");
+    assert_eq!(REBUILD_RETRY_HINT, Duration::from_secs(5));
+    // The whole detail, against the constant; only the elapsed time is read back. The offer
+    // is held, so nothing has been sent.
+    let secs = error
+        .detail
+        .split(" sent in ")
+        .nth(1)
+        .and_then(|rest| rest.split(" s;").next())
+        .unwrap_or_else(|| panic!("no elapsed time: {error:?}"));
+    assert_eq!(
+        error.detail,
+        format!(
+            "partition PartitionId(1) is read-only in generation {generation:?}: copy {} on node 3 \
+             is being rebuilt from a snapshot: 0 entries (0.0 MiB) sent in {secs} s; writes \
+             resume when it is caught up; not before ~5s; {}",
+            three.0,
+            crate::db::error::REBUILDING_STEP
+        )
+    );
+    assert_eq!(error.next_step(), None, "the detail carries its own step");
+    trio.nodes[1].0.snapshot_offer_held = false;
+    super::seal_tests::only_until(&mut trio, &[1, 2], "node 3 was rebuilt", |_| {
+        logged!(METHOD, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["node"] == 2 && line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert!(installed[0]["at"].as_u64() >= Some(floor), "{installed:?}");
+    // Writes resume: node 2 commits writable above G (`DegradedRf2` on copies 2 and 3, copy 1
+    // being down), and the same put, sent again as a new write, lands there.
+    let (resumed, mode, members) = super::seal_tests::only_until(
+        &mut trio,
+        &[1, 2],
+        "node 2 committed writable above the read-only generation",
+        |trio| {
+            let committed = trio.nodes[1].0.committed.get(&p)?;
+            (committed.new_generation > generation && committed.mode != PartitionMode::ReadOnly)
+                .then(|| {
+                    let members: Vec<u32> = committed
+                        .committed
+                        .pinned_config
+                        .members
+                        .iter()
+                        .map(|member| member.node.0)
+                        .collect();
+                    (committed.new_generation, committed.mode.clone(), members)
+                })
+        },
+    );
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::DegradedRf2, vec![2, 3]),
+        "writable on copies 2 and 3"
+    );
+    // Polled on the scaled deadline; until the pause clears, each send is refused only as the
+    // window refuses, and wrote nothing.
+    let landed =
+        super::seal_tests::only_until(&mut trio, &[1, 2], "the resent put landed", |trio| {
+            let (reply, answer) = mpsc::channel();
+            trio.nodes[1]
+                .1
+                .send(Msg::Client(Client {
+                    partition: p,
+                    call: put(41),
+                    reply,
+                }))
+                .expect("node 2's mailbox");
+            match super::seal_tests::only_until(trio, &[1, 2], "an answer", |_| {
+                answer.try_recv().ok()
+            }) {
+                Answer::Txn { result, .. } => Some(result),
+                Answer::Error { error, .. }
+                    if matches!(
+                        error.kind,
+                        ErrorKind::ProtectionPaused | ErrorKind::RecoveryReadOnly
+                    ) && error.no_mutation =>
+                {
+                    None
+                }
+                other => panic!("the resent put, before it landed: {other:?}"),
+            }
+        });
+    assert!(landed.generation >= resumed, "{landed:?}");
+    assert_eq!(
+        landed.outcome,
+        rdb_core::contracts::txn::Outcome::Published,
+        "{landed:?}"
+    );
+}

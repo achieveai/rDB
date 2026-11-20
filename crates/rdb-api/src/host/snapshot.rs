@@ -302,6 +302,10 @@ pub(crate) struct Transfer {
     pub(crate) offer: Option<SnapshotOffer>,
     /// Entries sent so far (a move's progress, A8c).
     pub(crate) pulled: u64,
+    /// Key and value bytes sent so far (A8c, design N3: the read-only refusal's detail).
+    pub(crate) bytes: u64,
+    /// When the transfer was opened (A8c, design N3).
+    pub(crate) opened: rdb_core::contracts::time::Tick,
     /// Pages sent so far.
     pub(crate) pages: u64,
     /// The last time the transfer was opened, offered or pulled.
@@ -483,6 +487,8 @@ impl Host {
                     view,
                     offer: Some(offer),
                     pulled: 0,
+                    bytes: 0,
+                    opened: self.clock.now(),
                     pages: 0,
                     touched: self.clock.now(),
                 },
@@ -704,6 +710,10 @@ impl Host {
         };
         transfer.touched = now;
         transfer.pulled += page.len() as u64;
+        transfer.bytes += page
+            .iter()
+            .map(|(_, key, value, _, _)| (key.len() + value.len()) as u64)
+            .sum::<u64>();
         let index = transfer.pages;
         transfer.pages += 1;
         let done = page.len() < self.snapshot_page_keys;

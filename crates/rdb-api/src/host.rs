@@ -226,6 +226,11 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
+/// Issue #61 (design N3): the "not before" poll hint on a write refused read-only while this
+/// owner rebuilds a copy from a snapshot. Fixed, and not an estimate: the source knows how much
+/// it has sent, not how much is left.
+pub const REBUILD_RETRY_HINT: Duration = Duration::from_secs(5);
+
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
 /// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282): the paused
 /// clock of the host's drop duty. A reachable copy's clock starts at the later of the last
@@ -5553,10 +5558,13 @@ impl Host {
     }
 
     /// A read-only refusal's detail, with the copies a held repair names and the step this owner
-    /// can actually give (#79 S4d), when that is why it stays read-only. Unchanged otherwise.
+    /// can actually give (#79 S4d), when that is why it stays read-only. Issue #61 (design N3):
+    /// else, while this owner rebuilds a copy from a snapshot, the copy and the transfer's
+    /// progress, [`crate::db::error::REBUILDING_STEP`], and a "not before" poll hint of
+    /// [`REBUILD_RETRY_HINT`], which is not an estimate. Unchanged otherwise.
     fn named_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
         let Some(holds) = self.tail_holds.get(&partition) else {
-            return refused;
+            return self.rebuilding_read_only(partition, refused);
         };
         let named = holds
             .iter()
@@ -5590,6 +5598,33 @@ impl Host {
             (false, false) => crate::db::error::TAIL_HELD_RESEND,
         };
         refused.detail = format!("{}: {named}; {step}", refused.detail);
+        refused
+    }
+
+    /// [`Self::named_read_only`]'s rebuild arm (issue #61, design N3): the first transfer this
+    /// node serves for `partition`, by copy, named with its progress. Unchanged with none.
+    fn rebuilding_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let Some(((_, copy), transfer)) = self
+            .transfers
+            .range((partition, CopyId(0))..)
+            .find(|((at, _), _)| *at == partition)
+        else {
+            return refused;
+        };
+        let millis = transfer.opened.millis_until(self.clock.now());
+        refused.detail = format!(
+            "{}: copy {} on node {} is being rebuilt from a snapshot: {} entries ({:.1} MiB) sent \
+             in {}.{} s; writes resume when it is caught up",
+            refused.detail,
+            copy.0,
+            transfer.node.0,
+            transfer.pulled,
+            transfer.bytes as f64 / f64::from(1u32 << 20),
+            millis / 1000,
+            (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
         refused
     }
 
