@@ -3402,7 +3402,9 @@ fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
 /// own83_30 (#83 B2, PR #159 review): an app address is opaque and may carry a credential, so
 /// no log line holds it: `route` and `leader_of` of an owner whose address holds a synthetic
 /// credential return it byte for byte, while every line this row logged lacks it. The address
-/// read is logged, with its length. Cut: `db_route_app_addr_read` logs `app = %app`, red.
+/// read is logged, with its length, at DEBUG (PR #159 review r3, T49): a routine read is
+/// neither lifecycle nor mutation. Cut: `db_route_app_addr_read` logs `app = %app`, red. Cut:
+/// the read logged at INFO again, red at "DEBUG".
 /// Unit (~0.1 s).
 #[config_log::retcd_test]
 fn own83_30_no_log_line_holds_an_app_address() {
@@ -3424,6 +3426,12 @@ fn own83_30_no_log_line_holds_an_app_address() {
             .any(|line| line["@m"] == "db_route_app_addr_read" && line["app_len"] == SECRET.len()),
         "the address read is logged with its length"
     );
+    for line in lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_read")
+    {
+        assert_eq!(line["@l"], "Debug", "DEBUG: {line}");
+    }
     for line in &lines {
         assert!(!line.to_string().contains("pw-SYNTHETIC-7f3a9c"), "{line}");
     }

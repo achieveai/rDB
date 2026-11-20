@@ -4444,7 +4444,8 @@ impl Db {
     /// for another call's read of it included.
     ///
     /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
-    /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read
+    /// partition-record read and `db_route_app_addr_read{node, app_len}` (DEBUG, target
+    /// `rdb_api::route_addr`) on each address read
     /// that succeeds; `db_route_read_failed{what, detail}` (warn) when a read fails or does not
     /// answer in time, then `db_route_app_addr_unreadable{node, reason, served}` (warn) when
     /// that read was the address's (`served` is `last_good` or `none`); and
@@ -4586,7 +4587,8 @@ impl Db {
     /// read that succeeds is shared with every caller already waiting, even if its pre-read
     /// stamp has expired by then; a later caller reads again. Concurrent callers never queue
     /// read after read. A failed read keeps nothing, so the next caller reads again. Other
-    /// nodes never wait on this one's read. Logged `db_route_app_addr_read{node, app_len}`;
+    /// nodes never wait on this one's read. Logged `db_route_app_addr_read{node, app_len}` at
+    /// DEBUG, target `rdb_api::route_addr`;
     /// the address itself is never logged, since it may carry a credential.
     ///
     /// A failed read is `UNAVAILABLE` here; [`Self::owner_address`] answers the last good
@@ -4629,7 +4631,10 @@ impl Db {
             read_app_addr(&*store, node).await
         });
         if let Ok(app) = &app {
-            tracing::info!(
+            // PR #159 review r3 (T49): a routine read, neither lifecycle nor mutation, so
+            // DEBUG, under its own target, which test logging enables.
+            tracing::debug!(
+                target: "rdb_api::route_addr",
                 node = node.0,
                 app_len = app.as_ref().map_or(0, String::len),
                 "db_route_app_addr_read"
