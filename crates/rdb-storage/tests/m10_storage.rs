@@ -1609,84 +1609,54 @@ fn t61_trim_marks_each_cut_parent_level() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// Write a `parent` record and `applied` for `child` straight into the closed copy at `db`: a
-/// lineage linked to `parent` at `base` that `inherit` would refuse, since the parent is sealed
-/// for another child. Open accepts it (it checks only applied >= base).
-fn t61_raw_sibling(db: &std::path::Path, child: Generation, parent: Generation, base: u64) {
-    let prefix = rdb_storage::keys::encode_key(P61, child, Namespace::User, b"")[..12].to_vec();
-    let record = |name: &[u8]| {
-        let mut key = prefix.clone();
-        key.push(0xFF);
-        key.extend_from_slice(name);
-        key
-    };
-    let mut link = parent.0.to_be_bytes().to_vec();
-    link.extend_from_slice(&base.to_be_bytes());
-    link.push(0);
-    put_raw(db, &record(b"parent"), &link);
-    put_raw(db, &record(b"applied"), &base.to_be_bytes());
-}
-
-/// Design rev 5c: `floor` is the highest mark that cuts what a lineage reads, so a sibling over
-/// the same parent sees the cut another child's trim made there. g1 holds 1..=12; g2 is a copied
-/// inherit at 10 to 20; siblings g3 (base 10, to 14) and g4 (base 5, to 8) are linked to g1 by
-/// raw records. g3's own trim at 5 marks g3 and g1 at 5; g2's trim at 15 raises g1's mark to 11.
-/// `floor(g3)` is then g1's 11, not g3's own 5, and g3 verifies from it. g4's trim at 7 cuts g1
-/// only to 6, below its 11: the mark is never lowered. Red if `floor` takes the first mark up the
-/// chain, or the trim overwrites a higher mark.
+/// Design rev 5d: on one engine a cut level is always on the trimmed lineage's own chain, so a
+/// sealed intermediate lineage reads under its **own** mark, and so does its parent. g1 holds
+/// 1..=10; g2 is linked at 10 and holds 11..=22; g3 is a copied inherit of g2 at 20 (g2 keeps
+/// its tail 21..=22) and holds 21..=30. A trim of g3 at 25 marks g2 at 21, inside its tail, and
+/// g1 at 11, past its head. `floor(g2)` is g2's own 21 and g2 verifies from it, head 22;
+/// `floor(g1)` is g1's own 11 and g1 verifies as empty, through a reopen. Red if the trim marks
+/// only its own level (`floor(g2)` falls back to `None`).
 #[retcd_test]
-fn t61_floor_of_a_sealed_sibling_sees_the_parent_cut() {
-    let (g1, g2, g3, g4) = (Generation(1), Generation(2), Generation(3), Generation(4));
-    let dir = data_dir("t61-sibling");
+fn t61_floor_of_a_sealed_intermediate_lineage() {
+    let (g1, g2, g3) = (Generation(1), Generation(2), Generation(3));
+    let dir = data_dir("t61-sealed-intermediate");
     let db = dir.join("db");
     let mut engine = RocksEngine::open(&db).expect("open");
-    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 12);
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    let h2 = t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 22);
     assert!(matches!(
-        engine.inherit(P61, g1, g2, Seq(10)),
+        engine.inherit(P61, g2, g3, Seq(20)),
         Ok(rdb_storage::Inherited::Copied { .. })
     ));
-    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
-    drop(engine);
-    t61_raw_sibling(&db, g3, g1, 10);
-    t61_raw_sibling(&db, g4, g1, 5);
-    let mut engine = RocksEngine::open(&db).expect("open with the siblings");
-    let h3 = t61_commit(&mut engine, g3, (Seq(10), h1.digest(10)), 14);
-    t61_commit(&mut engine, g4, (Seq(5), h1.digest(5)), 8);
+    t61_commit(&mut engine, g3, (Seq(20), h2.digest(20)), 30);
 
     assert_eq!(
-        engine.stage_trim_history(P61, g3, t61_rooted(5, &h1, 3)),
-        Ok(2)
+        engine.stage_trim_history(P61, g3, t61_rooted(25, &h1, 3)),
+        Ok(3)
     );
-    assert_eq!(
-        engine.stage_trim_history(P61, g2, t61_rooted(15, &h1, 2)),
-        Ok(2)
-    );
-    let cut = t61_rooted(11, &h1, 2);
-    assert_eq!(
-        engine.floor(P61, g3),
-        Some((g1, cut)),
-        "g3 reads under g1's cut"
-    );
-    assert_eq!(t61_seen(&engine, g3, 1..=14), (11..=14).collect::<Vec<_>>());
-    let verified = verify_lineage(&engine, P61, g3).expect("g3 verifies from g1's cut");
-    assert_eq!(verified.head_digest, h3.digest(14));
 
-    assert_eq!(
-        engine.stage_trim_history(P61, g4, t61_rooted(7, &h1, 4)),
-        Ok(2)
-    );
     for round in ["staged", "reopened"] {
+        assert_eq!(engine.sealed_by(P61, g2), Some(g3), "{round}: g2 is sealed");
+        assert_eq!(
+            engine.floor(P61, g2),
+            Some((g2, t61_rooted(21, &h1, 3))),
+            "{round}: g2 reads under its own mark"
+        );
+        assert_eq!(
+            t61_seen(&engine, g2, 1..=22),
+            vec![21, 22],
+            "{round}: g2's tail stays"
+        );
+        let verified = verify_lineage(&engine, P61, g2).expect("g2 verifies from 21");
+        assert_eq!(verified.head_digest, h2.digest(22), "{round}");
         assert_eq!(
             engine.floor(P61, g1),
-            Some((g1, cut)),
-            "{round}: g1 kept 11"
+            Some((g1, t61_rooted(11, &h1, 3))),
+            "{round}: g1 reads under its own mark"
         );
-        assert_eq!(engine.floor(P61, g3), Some((g1, cut)), "{round}");
-        assert_eq!(
-            engine.floor(P61, g4),
-            Some((g4, t61_rooted(7, &h1, 4))),
-            "{round}: g1's 11 is above what g4 reads there"
-        );
+        let verified = verify_lineage(&engine, P61, g1).expect("g1 verifies as empty");
+        assert_eq!(verified.head_digest, h1.digest(10), "{round}");
         drop(engine);
         engine = RocksEngine::open(&db).expect("reopen");
     }

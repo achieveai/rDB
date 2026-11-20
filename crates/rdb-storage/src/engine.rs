@@ -1862,7 +1862,8 @@ impl RocksEngine {
     /// through all of them. A level's mark counts only while it is at most one past the last seq
     /// the lineage reads there: `applied + 1` on its own level (a cut level whose History is
     /// all gone is marked `head + 1`, "empty"), `base + 1` through a link, the smallest along
-    /// the path. A sealed sibling sharing a parent so sees the cut another child's trim made.
+    /// the path. On one engine every cut level is on the trimmed lineage's own chain (`inherit`
+    /// refuses a second child of a sealed parent), so a sealed level reads under its own mark.
     /// A caller that needs the lineage's own mark (its root is that lineage's root) checks the
     /// generation. `None` when no level holds one: History is whole from seq 1.
     #[must_use]
@@ -1981,7 +1982,7 @@ impl RocksEngine {
         let cf = self.cf(CF_HISTORY);
         let mut write = WriteBatch::default();
         // Every level cut gets its own mark at its cut, in this batch (design rev 5c), so a
-        // reader of that level alone (a sealed sibling, an older generation) knows its History
+        // reader of that level alone (a sealed intermediate, an older generation) knows its History
         // starts there. A mark never goes down, and its root is the child's.
         let mut marked: Vec<(Generation, TrimFloor)> = Vec::new();
         let (mut level, mut end, mut levels) = (generation, floor.seq.0, 0_usize);
