@@ -22,6 +22,7 @@ use super::reopen_tests::fast;
 use super::*;
 use crate::planner::{write_outage_bound, Failover, OutageClass, PROBE_PUT_TIMEOUT};
 use rdb_core::authority::grant::GrantRecord;
+use rdb_core::contracts::ids::ReplicaRole;
 
 /// How often a probe puts.
 const PROBE_GAP: Duration = Duration::from_millis(200);
@@ -515,4 +516,85 @@ fn s80s3_a_silently_stopped_node_of_five_keeps_every_partition_writable() {
         "s80s3_a_silently_stopped_node_of_five_keeps_every_partition_writable",
     );
     reads_back(&lost, survivor(&lost));
+}
+
+/// The roles `partitions/{partition}` pins, by node.
+fn pinned_roles(rig: &Rig, partition: u32) -> BTreeMap<u32, ReplicaRole> {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Partition(PartitionId(partition)).encode()),
+        }))
+        .expect("the store answers");
+    read.record
+        .and_then(|found| RecordMember::decode_all(&found.value))
+        .map(|members| members.iter().map(|m| (m.node.0, m.role)).collect())
+        .unwrap_or_default()
+}
+
+/// #80 S3 R2 (AC4, risk A2): after R1's kill, the dead node restarts on its own folder. Every
+/// partition whose ring seat named it pins it again as a regular copy, three regular copies
+/// each, with no operator action and one restart; it owns no partition (ownership never fails
+/// back); the pre-loss values and the probe's last landed value still read back, and a put lands
+/// in every partition. Integration (~40-70 s).
+/// Green on its first run (2026-11-20): the existing restart re-plan (`Host::peer_booted`, then
+/// `rejoin_if_stale`) re-adds the node, about 0.8 s after it is ready; design risk A2 did not
+/// occur. Cut: `peer_booted` checks no partition; partition 1 stays pinned to nodes 2 and 3
+/// only, red, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s3_a_killed_node_restarted_on_its_folder_is_pinned_again_everywhere() {
+    const TEST: &str = "s80s3_a_killed_node_restarted_on_its_folder_is_pinned_again_everywhere";
+    let mut lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let dead = lost.dead;
+    lost.rig.restart(dead, probe_timeouts());
+    lost.rig
+        .of(dead)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("node {} is ready again: {e}", dead.0));
+    let rejoined = Instant::now();
+    for p in (1..=S1B_P).filter(|p| ring(S1B_K, *p).copies.contains(&dead.0)) {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+        loop {
+            let roles = pinned_roles(&lost.rig, p);
+            let regular = roles
+                .values()
+                .filter(|role| **role != ReplicaRole::Shadow)
+                .count();
+            if roles
+                .get(&dead.0)
+                .is_some_and(|role| *role != ReplicaRole::Shadow)
+                && regular == 3
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {p} never pins node {} regular with three regular copies: {roles:?}",
+                dead.0
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    tracing::info!(
+        node = dead.0,
+        rejoin_ms = ms(rejoined.elapsed()),
+        "s80s3_rejoined"
+    );
+    for p in 1..=S1B_P {
+        assert_ne!(
+            token_of(&lost.rig, p).1,
+            dead,
+            "partition {p} did not fail back"
+        );
+    }
+    reads_back(&lost, dead);
+    for (p, group) in &lost.groups {
+        put_lands(
+            lost.rig.of(dead),
+            *group,
+            b"s3-after",
+            p.to_string().as_bytes(),
+        );
+    }
 }
