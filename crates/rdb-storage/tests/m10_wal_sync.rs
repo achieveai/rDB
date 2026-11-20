@@ -7,6 +7,8 @@
 //!    and seal) survives the finish, and the A-R214 synced marker never moves backwards.
 //! 3. The staged writes a node's thread makes (publish marks, an epoch revocation, a dedup trim)
 //!    fsync nothing and do not count as synced until the next sync completes (A-R322).
+//! 4. Unix only (issue #71): the WAL directory fsync runs on every sync while RocksDB rolls to
+//!    new WAL files and deletes old ones, and the credited prefixes survive a process crash.
 //!
 //! The debug-only `wal_syncs` count is RocksDB's own ticker, so these rows run in debug builds.
 //! Data goes under `RETCD_TEST_DATA_DIR` (set by `scripts/gate.sh`), else Cargo's per-target tmp
@@ -317,5 +319,230 @@ fn m10_f4_a_wal_whose_open_is_still_refused_after_the_relist_fails_the_sync() {
             vec![durable(G1, 1)]
         );
     }
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Env var that turns [`zz_child_rolls_wals_under_syncs_then_is_killed`] from a no-op into the
+/// crashing child of the issue #71 row; it names the database directory.
+#[cfg(unix)]
+const ROLLOVER_CHILD_DIR: &str = "RDB_STORAGE_F4_ROLLOVER_CHILD_DIR";
+/// The child's report, written only once every sync it made succeeded.
+#[cfg(unix)]
+const ROLLOVER_REPORT: &str = "rollover-report.txt";
+/// Records the child commits and syncs under a running sync, in chunks of [`ROLLOVER_CHUNK`].
+#[cfg(unix)]
+const ROLLOVER_RECORDS: u64 = 200;
+#[cfg(unix)]
+const ROLLOVER_CHUNK: u64 = 20;
+/// Records committed after the last sync, never synced, before the kill.
+#[cfg(unix)]
+const ROLLOVER_TAIL: u64 = 5;
+
+/// The `*.log` file names in `db`, which sort in WAL number order.
+#[cfg(unix)]
+fn wal_files(db: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(db)
+        .expect("list the database directory")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .map(|path| {
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// The crashing child of the issue #71 row. A no-op unless the parent set
+/// [`ROLLOVER_CHILD_DIR`]. Then, on a store with a 64 KiB memtable budget (so a 256 KiB
+/// `max_total_wal_size`), it commits [`ROLLOVER_RECORDS`] canonical records of `(P, G1)`. Each
+/// chunk of [`ROLLOVER_CHUNK`] is committed on this thread while a [`WalSync::flush`] begun
+/// before it runs on another, so RocksDB switches and deletes WAL files while syncs go on. One
+/// more sync credits everything, [`ROLLOVER_TAIL`] records follow unsynced, the report is
+/// written, and the process SIGKILLs itself with the engine open: no close, no destructor, no
+/// handler. Not `abort()`: that runs the host's core-dump handler, about 1.2 s here.
+#[cfg(unix)]
+#[test]
+fn zz_child_rolls_wals_under_syncs_then_is_killed() {
+    use rdb_storage::StorageOptions;
+
+    let Some(db) = std::env::var_os(ROLLOVER_CHILD_DIR).map(PathBuf::from) else {
+        return;
+    };
+    let mut engine = RocksEngine::open_with(
+        &db,
+        StorageOptions {
+            memtable_budget_bytes: Some(64 << 10),
+            ..StorageOptions::default()
+        },
+    )
+    .expect("child open");
+    let g1 = chain(
+        G1,
+        (Seq::ZERO, Digest::ROOT),
+        ROLLOVER_RECORDS + ROLLOVER_TAIL,
+    );
+    commit(&mut engine, &g1, 1, ROLLOVER_CHUNK);
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut deleted = 0usize;
+    let mut syncs = 0u64;
+    let mut syncs_after_a_delete = 0u64;
+    let mut next = ROLLOVER_CHUNK + 1;
+    while next <= ROLLOVER_RECORDS {
+        let live = wal_files(&db);
+        deleted = seen.difference(&live).count();
+        seen.extend(live);
+
+        let sync = engine.begin_sync(vec![capture(G1, next - 1)]);
+        let to = (next + ROLLOVER_CHUNK - 1).min(ROLLOVER_RECORDS);
+        let flushed = std::thread::scope(|scope| {
+            let flushing = scope.spawn(|| sync.flush());
+            commit(&mut engine, &g1, next, to);
+            flushing.join().expect("the flush thread")
+        });
+        assert_eq!(
+            flushed,
+            Ok(()),
+            "sync {syncs} with records {next}..={to} under way"
+        );
+        let credited = engine.finish_sync(sync, flushed).expect("finish the sync");
+        assert_eq!(credited, vec![durable(G1, next - 1)], "sync {syncs}");
+        syncs += 1;
+        if deleted > 0 {
+            syncs_after_a_delete += 1;
+        }
+        next = to + 1;
+    }
+    let credited = sync_now(&mut engine, vec![capture(G1, ROLLOVER_RECORDS)]);
+    assert_eq!(
+        credited,
+        vec![durable(G1, ROLLOVER_RECORDS)],
+        "the last sync"
+    );
+    syncs += 1;
+    seen.extend(wal_files(&db));
+    commit(
+        &mut engine,
+        &g1,
+        ROLLOVER_RECORDS + 1,
+        ROLLOVER_RECORDS + ROLLOVER_TAIL,
+    );
+
+    let report = format!(
+        "syncs={syncs}\ndir_syncs={}\nwal_files_seen={}\nwal_files_deleted={deleted}\n\
+         syncs_after_a_delete={syncs_after_a_delete}\ncredited={ROLLOVER_RECORDS}\n",
+        engine.wal_dir_syncs(),
+        seen.len(),
+    );
+    std::fs::write(
+        db.parent()
+            .expect("the test directory")
+            .join(ROLLOVER_REPORT),
+        report,
+    )
+    .expect("write the report");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &std::process::id().to_string()])
+        .status();
+    // Reached only if the kill failed; the parent then sees SIGABRT, not SIGKILL, and fails.
+    eprintln!("kill -KILL of the child did not end it: {killed:?}");
+    std::process::abort();
+}
+
+/// Issue #71, the WAL directory fsync of [`WalSync::flush`] on unix (A-R373). A child process
+/// commits 205 canonical records on a 64 KiB memtable budget, each chunk while a sync runs on
+/// another thread, so RocksDB rolls to new WAL files and deletes old ones between and during
+/// syncs; then it SIGKILLs itself with the engine open. Here:
+/// - every sync it made fsynced the directory (the debug-only `wal_dir_syncs` count equals its
+///   syncs), including the syncs made after a WAL it had seen was deleted;
+/// - it saw at least three WAL files and at least one deleted;
+/// - the reopen after the kill verifies the whole chain, keeps the durable mark the last sync
+///   credited (200), and keeps the 5 unsynced records too.
+///
+/// What this proves: the directory step runs and succeeds on Linux across rollover and
+/// deletion, never failing a sync, and a crash with no close keeps every credited prefix. What
+/// it does not: that the fsync made a new WAL's entry survive a power cut. A killed process
+/// leaves the OS cache, so the reopen would read the same with no fsync at all; proving that
+/// needs a power cut or a block-level fault device (dm-flakey), which need root.
+/// Integration (1.6-5.8 s here, at load ~140): disk-latency bound, a child process making ~60
+/// real fsyncs (WAL files, the directory, RocksDB's own flushes) and a reopen.
+/// Cut: remove the directory fsync in `WalSync::flush`, red (`dir_syncs=0`).
+/// Cut: run it only on an open's first sync, so every sync after a rollover skips it, red
+/// (`dir_syncs=1`).
+#[cfg(unix)]
+#[retcd_test]
+fn m10_f4_unix_wal_rollover_under_syncs_keeps_credited_prefixes_after_a_crash() {
+    use std::os::unix::process::ExitStatusExt;
+
+    use rdb_storage::verify_lineage;
+
+    let dir = data_dir("unix-rollover");
+    let db = dir.join("db");
+    let out = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .args([
+            "zz_child_rolls_wals_under_syncs_then_is_killed",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(ROLLOVER_CHILD_DIR, &db)
+        .output()
+        .expect("spawn the child");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.signal(),
+        Some(9),
+        "the child must die by SIGKILL, got {:?}; stderr:\n{stderr}",
+        out.status
+    );
+    let report = std::fs::read_to_string(dir.join(ROLLOVER_REPORT))
+        .unwrap_or_else(|e| panic!("the child's report: {e}; stderr:\n{stderr}"));
+    let field = |name: &str| -> u64 {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in the report:\n{report}"))
+            .parse()
+            .expect("a number")
+    };
+    tracing::info!(report = %report.replace('\n', " "), "m10_f4_unix_rollover_report");
+
+    let syncs = field("syncs");
+    assert_eq!(
+        syncs,
+        ROLLOVER_RECORDS / ROLLOVER_CHUNK,
+        "the child's syncs"
+    );
+    assert_eq!(
+        field("dir_syncs"),
+        syncs,
+        "every sync fsynced the WAL directory:\n{report}"
+    );
+    assert!(
+        field("wal_files_seen") >= 3,
+        "RocksDB rolled to new WAL files:\n{report}"
+    );
+    assert!(
+        field("wal_files_deleted") >= 1 && field("syncs_after_a_delete") >= 1,
+        "RocksDB deleted a WAL file and syncs went on after it:\n{report}"
+    );
+
+    let engine = RocksEngine::open(&db).expect("reopen after the kill");
+    let verified = verify_lineage(&engine, P, G1).expect("the chain verifies after the kill");
+    let committed = ROLLOVER_RECORDS + ROLLOVER_TAIL;
+    let g1 = chain(G1, (Seq::ZERO, Digest::ROOT), committed);
+    assert_eq!(
+        verified.durable,
+        DurableSeq(field("credited")),
+        "the credited prefix is durable after the kill"
+    );
+    assert_eq!(
+        verified.applied,
+        AppliedSeq(committed),
+        "a process crash keeps the unsynced tail too"
+    );
+    assert_eq!(verified.head_digest, g1.digest(committed));
+    drop(engine);
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }

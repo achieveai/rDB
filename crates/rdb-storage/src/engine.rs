@@ -328,6 +328,10 @@ pub struct RocksEngine {
     /// How many times a [`WalSync::flush`] synced the WAL files through its own handles
     /// (A-R365): RocksDB's `rocksdb.wal.synced` does not see those, so [`Self::wal_syncs`] adds them.
     wal_flushes: Arc<AtomicU64>,
+    /// Debug builds: how many [`WalSync::flush`] calls also fsynced the database directory,
+    /// the unix-only step (issue #71); see [`Self::wal_dir_syncs`].
+    #[cfg(debug_assertions)]
+    wal_dir_syncs: Arc<AtomicU64>,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -390,6 +394,9 @@ pub struct WalSync {
     dir: PathBuf,
     /// The engine's count of WAL syncs made here ([`RocksEngine::wal_syncs`]).
     flushes: Arc<AtomicU64>,
+    /// Debug builds: the engine's count of directory fsyncs ([`RocksEngine::wal_dir_syncs`]).
+    #[cfg(debug_assertions)]
+    dir_syncs: Arc<AtomicU64>,
     /// RocksDB's latest sequence number when the sync began (A-R214).
     latest: u64,
     /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
@@ -441,11 +448,15 @@ impl WalSync {
         // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
         // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
         // directory as a `File`. So sync it wherever the OS can (A-R373).
-        // Never executed on this host; the first Linux gate owes a row (achieveai/rDB#71).
+        // On Linux the row `m10_f4_unix_wal_rollover_under_syncs_keeps_credited_prefixes_after_a_crash`
+        // (`tests/m10_wal_sync.rs`, issue #71) runs it across WAL rollovers and deletions and
+        // counts it through [`RocksEngine::wal_dir_syncs`]. Windows never takes it.
         if cfg!(unix) {
             std::fs::File::open(&self.dir)
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| format!("sync the WAL directory {}: {e}", self.dir.display()))?;
+            #[cfg(debug_assertions)]
+            self.dir_syncs.fetch_add(1, Ordering::Relaxed);
         }
         self.flushes.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -535,6 +546,15 @@ impl RocksEngine {
             options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
                 + self.wal_flushes.load(Ordering::Relaxed)
         })
+    }
+
+    /// Debug builds only: how many [`WalSync::flush`] calls since this engine opened also
+    /// fsynced the database directory after syncing the WAL files (A-R373, issue #71). Unix
+    /// only: on Windows it stays zero, as that step does not run there.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn wal_dir_syncs(&self) -> u64 {
+        self.wal_dir_syncs.load(Ordering::Relaxed)
     }
 
     /// The one synced write of a metadata key (review-s1 F-008): a put with `sync` set, and
@@ -734,6 +754,8 @@ impl RocksEngine {
             sync_in_flight: false,
             wal_flushes: Arc::default(),
             #[cfg(debug_assertions)]
+            wal_dir_syncs: Arc::default(),
+            #[cfg(debug_assertions)]
             options: Some(options),
         })
     }
@@ -778,6 +800,8 @@ impl RocksEngine {
             storage: StorageOptions::default(),
             sync_in_flight: false,
             wal_flushes: Arc::default(),
+            #[cfg(debug_assertions)]
+            wal_dir_syncs: Arc::default(),
             #[cfg(debug_assertions)]
             options: None,
         })
@@ -1474,6 +1498,8 @@ impl RocksEngine {
             _claim: self.claim.clone(),
             dir: self.path.clone(),
             flushes: Arc::clone(&self.wal_flushes),
+            #[cfg(debug_assertions)]
+            dir_syncs: Arc::clone(&self.wal_dir_syncs),
             latest,
             failed,
             captured,
