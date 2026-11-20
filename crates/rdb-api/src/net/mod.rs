@@ -309,6 +309,12 @@ struct Shared {
     span: tracing::Span,
     #[allow(clippy::type_complexity)]
     on_boot: Mutex<Option<Box<dyn Fn(NodeId, BootId) + Send + Sync>>>,
+    /// The inbound link tasks [`Service::link`] spawns, which are not [`Net`]'s own `tasks`.
+    /// `None` once [`Net::shutdown`] ran: a link accepted after that is aborted at once.
+    link_tasks: Mutex<Option<Vec<tokio::task::AbortHandle>>>,
+    /// Set by [`Net::shutdown`]: the listener's serve loop stops, and every connection it
+    /// accepted is shut down with it (`serve_with_incoming_shutdown`).
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 /// The remote backend of one process's [`Links`].
@@ -371,6 +377,8 @@ impl Net {
             rt: tokio::runtime::Handle::current(),
             span: tracing::Span::current(),
             on_boot: Mutex::new(None),
+            link_tasks: Mutex::new(Some(Vec::new())),
+            stop: tokio::sync::watch::channel(false).0,
         });
         // Only a process with peers has a bound to prove: an app with none, or a node alone,
         // stays "no `Net` attached", always established, as before this guard.
@@ -396,13 +404,22 @@ impl Net {
             let tls = config.tls.server_tls_config();
             let incoming = accepted_streams(listener);
             let label = config.label.clone();
+            let mut stop = shared.stop.subscribe();
             tasks.push(tokio::spawn(
                 async move {
                     let served = tonic::transport::Server::builder()
                         .tls_config(tls)
                         .map(|mut builder| builder.add_service(service));
+                    // The shutdown variant, not `serve_with_incoming`: only it gives each
+                    // accepted connection a watch on the stop signal. tonic spawns every
+                    // connection as its own task, so without one an aborted serve leaves them
+                    // all serving. With one, a stop or this task's abort (which drops the
+                    // signal's sender) shuts each connection down (tonic 0.12 `serve_connection`).
+                    let stopped = async move {
+                        let _ = stop.wait_for(|stopped| *stopped).await;
+                    };
                     let result = match served {
-                        Ok(router) => router.serve_with_incoming(incoming).await,
+                        Ok(router) => router.serve_with_incoming_shutdown(incoming, stopped).await,
                         Err(error) => Err(error),
                     };
                     if let Err(error) = result {
@@ -726,6 +743,8 @@ impl Net {
             rt,
             span: tracing::Span::current(),
             on_boot: Mutex::new(None),
+            link_tasks: Mutex::new(Some(Vec::new())),
+            stop: tokio::sync::watch::channel(false).0,
         });
         Arc::new(Self {
             shared,
@@ -748,17 +767,38 @@ impl Net {
     }
 }
 
-impl Drop for Net {
-    fn drop(&mut self) {
+impl Net {
+    /// Take this process's links down for good: stop serving, stop dialling, end every link
+    /// (dialled or accepted), and refuse any link accepted later. Peers see each link end and
+    /// find nothing listening when they redial, so they stop hearing this process and drop
+    /// their route to it. Idempotent; [`Drop`] calls it.
+    ///
+    /// Without it, an embedder that drops its `Db` but keeps this `Net` (or a `Links` that
+    /// holds it) still answers peers' probes at the old boot, and a restart on the same
+    /// address is never met as a new boot (#81).
+    pub fn shutdown(&self) {
+        let Some(links) = lock(&self.shared.link_tasks).take() else {
+            return;
+        };
+        self.shared.stop.send_replace(true);
         for task in lock(&self.tasks).drain(..) {
             task.abort();
         }
-        let conns: Vec<Arc<Conn>> = std::mem::take(&mut *lock(&self.shared.conns))
-            .into_values()
-            .collect();
-        for conn in conns {
-            lock(&conn.pending).clear();
+        for task in links {
+            task.abort();
         }
+        let conns: Vec<Arc<Conn>> = lock(&self.shared.conns).values().cloned().collect();
+        let ended = conns.len();
+        for conn in conns {
+            close(&self.shared, &conn, "this process's links shut down");
+        }
+        tracing::info!(label = %self.shared.label, ended, "net_shutdown");
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1610,7 +1650,7 @@ impl RdbNet for Service {
         let (tx, rx) = unbounded_channel::<Envelope>();
         let shared = Arc::clone(&self.shared);
         let span = shared.span.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let first = tokio::time::timeout(HANDSHAKE, inbound.next()).await;
             let hello = match first {
                 Ok(Some(Ok(envelope))) => match wire::decode(&envelope.body) {
@@ -1646,6 +1686,14 @@ impl RdbNet for Service {
             close(&shared, &conn, &reason);
         }
         .instrument(span));
+        // Tracked, so `Net::shutdown` ends it; past a shutdown it ends now.
+        match &mut *lock(&self.shared.link_tasks) {
+            Some(tasks) => {
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task.abort_handle());
+            }
+            None => task.abort(),
+        }
         let outgoing = UnboundedReceiverStream::new(rx).map(Ok::<_, Status>);
         Ok(Response::new(Box::pin(outgoing)))
     }

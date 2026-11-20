@@ -524,6 +524,80 @@ impl ConfigStore for PutHold {
     }
 }
 
+/// Any control store that moves a held test clock forward by `millis`, once, when the first put
+/// of a key under one prefix arrives, and then applies the put: time that passes inside a call
+/// already under way, at the tick the row names (#81: a planner grant that runs out during a
+/// promote). Every other call passes.
+pub(crate) struct ClockOnPut {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    prefix: Vec<u8>,
+    millis: u64,
+    moved: std::sync::atomic::AtomicBool,
+    /// The held clock: the row advances it too, before the call it is waiting for.
+    pub(crate) hold: crate::clock::ClockHold,
+}
+
+impl ClockOnPut {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        prefix: &str,
+        hold: crate::clock::ClockHold,
+        millis: u64,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            millis,
+            moved: std::sync::atomic::AtomicBool::new(false),
+            hold,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for ClockOnPut {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        if request.key.starts_with(&self.prefix)
+            && !self.moved.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.hold.advance(self.millis);
+            tracing::info!(ms = self.millis, "test_clock_moved_on_put");
+        }
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
 /// Any control store that reports `TransportSecurity::MutualTls` (#80 S2, ADR-rdb-0024): what a
 /// `GrpcClient` under mutual TLS says about itself, so a row can declare or open a database
 /// whose nodes are on other machines against an in-memory store. Every call is forwarded.
