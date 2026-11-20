@@ -52,7 +52,8 @@ pub(crate) fn restart_due(
 ) -> Option<RestartReason> {
     let reason = if faulted {
         RestartReason::HostFaulted
-    } else if stopped_since.is_some_and(|since| now.saturating_duration_since(since) >= RESTART_HOLD)
+    } else if stopped_since
+        .is_some_and(|since| now.saturating_duration_since(since) >= RESTART_HOLD)
     {
         RestartReason::ReplaceStopped
     } else {
@@ -115,9 +116,12 @@ mod tests {
         let owns_some = || false;
         assert_eq!(restart_due(None, false, at, || panic!("not asked")), None);
         assert_eq!(
-            restart_due(since, false, at + RESTART_HOLD - Duration::from_millis(100), || {
-                panic!("not asked while the hold runs")
-            }),
+            restart_due(
+                since,
+                false,
+                at + RESTART_HOLD - Duration::from_millis(100),
+                || { panic!("not asked while the hold runs") }
+            ),
             None,
             "held 4.9 s"
         );

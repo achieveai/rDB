@@ -105,7 +105,8 @@ use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
 use rdb_api::{
-    Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, RestartReason, Timeouts,
+    Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, RestartReason,
+    Timeouts,
 };
 
 #[derive(Debug, Default)]
@@ -2039,9 +2040,11 @@ mod tests {
             );
             std::fs::write(&faults[0], b"").expect("resume node 1");
             let first = running.remove(0);
-            wait("node 1's serve returns", Duration::from_secs(90), &mut || {
-                first.is_finished()
-            });
+            wait(
+                "node 1's serve returns",
+                Duration::from_secs(90),
+                &mut || first.is_finished(),
+            );
             let still = owned_by(1);
             let served = first.join().expect("node 1's thread");
             assert!(
@@ -2068,9 +2071,11 @@ mod tests {
                 let (rt, on_ready) = (&rt, &on_ready);
                 scope.spawn(move || serve_on_ready(&args, rt, store, None, on_ready))
             };
-            wait("node 1 is ready again", Duration::from_secs(60), &mut || {
-                ready_count(1) == 2
-            });
+            wait(
+                "node 1 is ready again",
+                Duration::from_secs(60),
+                &mut || ready_count(1) == 2,
+            );
             wait(
                 "node 1 is a regular copy of every partition again",
                 Duration::from_secs(90),

@@ -499,14 +499,12 @@ const T_PROMOTE: Duration = Duration::from_secs(2);
 /// timeout; then the promotes run `max_concurrent` at a time.
 fn b1_bound(moving: usize, failover: &Failover) -> Duration {
     let b = budgets();
-    let expired = Duration::from_millis(b.grant_millis + b.clock_error_millis + b.dispatch_margin_millis)
-        .max(failover.silent_after);
+    let expired =
+        Duration::from_millis(b.grant_millis + b.clock_error_millis + b.dispatch_margin_millis)
+            .max(failover.silent_after);
     let waves = u32::try_from(moving.div_ceil(failover.max_concurrent)).expect("few waves");
     let look_within = Timeouts::default().read;
-    expired
-        + failover.poll * 2
-        + look_within
-        + crate::host::test_patience(T_PROMOTE) * waves
+    expired + failover.poll * 2 + look_within + crate::host::test_patience(T_PROMOTE) * waves
 }
 
 /// V7 and B1: stop node 1's process for longer than G. Every partition it owned moves to a
@@ -1829,24 +1827,37 @@ fn own81_net_shutdown_leaves_no_link_answering() {
             && rig.procs[i].net.heard_within(node, Duration::from_secs(1))
     };
     until("every node hears every other", lifetimes(5), || {
-        (0..3).all(|i| ALL_NODES.iter().filter(|n| **n != ALL_NODES[i]).all(|n| hears(&rig, i, *n)))
+        (0..3).all(|i| {
+            ALL_NODES
+                .iter()
+                .filter(|n| **n != ALL_NODES[i])
+                .all(|n| hears(&rig, i, *n))
+        })
     });
 
     rig.procs[0].db.shutdown();
     rig.procs[0].net.shutdown();
     until("nodes 2 and 3 stop hearing node 1", lifetimes(3), || {
         (1..3).all(|i| rig.procs[i].net.connection(NodeId(1)).is_none())
-            && (1..3).all(|i| !rig.procs[i].net.heard_within(NodeId(1), Duration::from_secs(1)))
+            && (1..3).all(|i| {
+                !rig.procs[i]
+                    .net
+                    .heard_within(NodeId(1), Duration::from_secs(1))
+            })
     });
 
     let proc = rig.procs.remove(1);
     let net = Arc::downgrade(&proc.net);
     drop(proc);
-    until("node 2's Net is gone", lifetimes(3), || net.upgrade().is_none());
+    until("node 2's Net is gone", lifetimes(3), || {
+        net.upgrade().is_none()
+    });
     // `procs` is now nodes 1 and 3.
     until("node 3 stops hearing node 2", lifetimes(3), || {
         rig.procs[1].net.connection(NodeId(2)).is_none()
-            && !rig.procs[1].net.heard_within(NodeId(2), Duration::from_secs(1))
+            && !rig.procs[1]
+                .net
+                .heard_within(NodeId(2), Duration::from_secs(1))
     });
 }
 
@@ -1874,7 +1885,10 @@ fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
     });
     let first = rig.record(1);
     let new_owner = first.owner;
-    assert!(rig.grants()[&NodeId(1)].frozen, "the promote froze grants/1");
+    assert!(
+        rig.grants()[&NodeId(1)].frozen,
+        "the promote froze grants/1"
+    );
     let old_boot = rig.procs[0].boot;
 
     rig.restart(0, Some(failover()));
@@ -1882,11 +1896,14 @@ fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
     assert!(boot > old_boot, "a new boot: {old_boot:?} -> {boot:?}");
     until("node 1 is a regular copy again", lifetimes(20), || {
         rig.members(1).iter().any(|member| {
-            member.node == NodeId(1) && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+            member.node == NodeId(1)
+                && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
         })
     });
     until("the frozen grants/1 is cleared", lifetimes(10), || {
-        rig.grants().get(&NodeId(1)).is_none_or(|grant| !grant.frozen)
+        rig.grants()
+            .get(&NodeId(1))
+            .is_none_or(|grant| !grant.frozen)
     });
     let cleared = logged_at_least(METHOD, "planner_frozen_grant_cleared", 1);
     assert!(
@@ -1928,9 +1945,9 @@ fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
         .collect();
     assert!(
         // `answering` is logged with `?`, as `[1, 3]`.
-        decided.iter().any(|line| line["answering"]
-            .as_str()
-            .is_some_and(|nodes| nodes
+        decided
+            .iter()
+            .any(|line| line["answering"].as_str().is_some_and(|nodes| nodes
                 .trim_matches(|c| c == '[' || c == ']')
                 .split(", ")
                 .any(|node| node == "1"))),
