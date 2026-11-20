@@ -5,8 +5,9 @@
 
 use super::reopen_tests::{config, fast, runtime};
 use super::*;
-use crate::net::faults::Faults;
+use crate::net::faults::{CutStore, Faults};
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
+use crate::planner::Failover;
 use crate::test_store::{HoldAt, PutHold, Script, Scripted, TlsReported};
 
 /// The partition count the rows declare: more than one per node, so each owner forms several.
@@ -31,11 +32,15 @@ struct Proc {
     /// it ends every task the process ran, its peers' accepted links included, as a process
     /// exit does. Last, so it outlives the `Db` and net that run on it.
     own_rt: Option<tokio::runtime::Runtime>,
+    /// The fault file of this process's links and of its control store (#80 S3: `mute` and
+    /// `cut-control` silence it). Wired for a process [`Rig::open_all`] or [`Rig::restart`]
+    /// opened; any other open's is a fresh one nothing reads.
+    faults: Arc<Faults>,
 }
 
-struct Rig {
-    rt: tokio::runtime::Runtime,
-    store: Arc<dyn ConfigStore>,
+pub(super) struct Rig {
+    pub(super) rt: tokio::runtime::Runtime,
+    pub(super) store: Arc<dyn ConfigStore>,
     cert_dir: PathBuf,
     _cert_dir: Box<dyn std::any::Any>,
     procs: Vec<Proc>,
@@ -43,6 +48,9 @@ struct Rig {
     k: u32,
     /// The timeouts [`Rig::open_all`] opens every node with.
     timeouts: Timeouts,
+    /// The planner [`Rig::open_all`] and [`Rig::restart`] open every node with (#80 S3); `None`
+    /// runs none.
+    failover: Option<Failover>,
     /// Whether [`Rig::open_all`] runs each process on a runtime of its own, so that
     /// [`Rig::stop`] and [`Rig::restart`] end it as a process exit would (#80 S1b).
     own_runtimes: bool,
@@ -131,10 +139,13 @@ fn open_node(
         listener,
         addrs,
         Timeouts::default(),
+        None,
+        Faults::new(),
     )
 }
 
-/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop).
+/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop), `failover` (#80 S3),
+/// and `faults` on its links and its control store, which it reaches through a [`CutStore`].
 #[allow(clippy::too_many_arguments)]
 fn open_node_with(
     rt: &tokio::runtime::Runtime,
@@ -145,6 +156,8 @@ fn open_node_with(
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
+    failover: Option<Failover>,
+    faults: Arc<Faults>,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
@@ -159,25 +172,27 @@ fn open_node_with(
             dial: NetConfig::dial_lower(node, addrs),
             protocol_version: PROTOCOL_VERSION,
             admin_apps: BTreeSet::new(),
-            faults: Faults::new(),
+            faults: Arc::clone(&faults),
         },
         &links,
         Some(listener),
     )
     .expect("the node's net starts");
+    let control: Arc<dyn ConfigStore> = CutStore::new(Arc::clone(store), faults);
     let db = rt.block_on(Db::open_with(
         DbConfig {
             local: vec![node],
             links: Some(links),
             boot: Some(boot),
             timeouts,
+            failover,
             addresses: Some(NodeAddresses {
                 listen: addrs[&node].clone(),
                 peers: addrs.clone(),
             }),
             ..config(dir)
         },
-        Arc::clone(store),
+        control,
         rt.handle().clone(),
         fast(),
     ))?;
@@ -226,6 +241,7 @@ fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
         procs: Vec::new(),
         k,
         timeouts: Timeouts::default(),
+        failover: None,
         own_runtimes: false,
         addrs,
         reserved: std::sync::Mutex::new(reserved),
@@ -370,6 +386,7 @@ impl Rig {
         for (node, (dir, keep)) in nodes.iter().zip(dirs) {
             let listener = self.listen(&self.rt, *node);
             let own_rt = self.own_runtimes.then(runtime);
+            let faults = Faults::new();
             let (db, net) = open_node_with(
                 own_rt.as_ref().unwrap_or(&self.rt),
                 &self.store,
@@ -379,6 +396,8 @@ impl Rig {
                 listener,
                 &addrs,
                 self.timeouts,
+                self.failover,
+                Arc::clone(&faults),
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
@@ -388,6 +407,7 @@ impl Rig {
                 dir,
                 _dir: keep,
                 own_rt,
+                faults,
             });
         }
     }
@@ -426,7 +446,7 @@ impl Rig {
         std::fs::create_dir_all(dir).expect("an empty folder");
     }
 
-    fn wait_ready(&self) {
+    pub(super) fn wait_ready(&self) {
         for proc in &self.procs {
             proc.db
                 .as_ref()
@@ -437,7 +457,7 @@ impl Rig {
     }
 
     /// The process that runs `node`.
-    fn of(&self, node: NodeId) -> &Db {
+    pub(super) fn of(&self, node: NodeId) -> &Db {
         self.procs[node.0 as usize - 1]
             .db
             .as_ref()
@@ -468,7 +488,7 @@ impl Rig {
 }
 
 /// An affinity group that maps to `partition`.
-fn group_of(db: &Db, partition: u32) -> AffinityId {
+pub(super) fn group_of(db: &Db, partition: u32) -> AffinityId {
     (1..1_000_000)
         .map(AffinityId)
         .find(|group| db.partition_for(*group) == PartitionId(partition))
@@ -476,7 +496,7 @@ fn group_of(db: &Db, partition: u32) -> AffinityId {
 }
 
 /// Put in `group` through `db` until one lands; a partition still recovering refuses first.
-fn put_lands(db: &Db, group: AffinityId, key: &[u8], value: &[u8]) -> PutOk {
+pub(super) fn put_lands(db: &Db, group: AffinityId, key: &[u8], value: &[u8]) -> PutOk {
     let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
     loop {
         match db.put_in(group, key, value, None) {
@@ -1422,6 +1442,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
             dir,
             _dir: keep,
             own_rt: None,
+            faults: Faults::new(),
         });
     }
     rig.wait_ready();
@@ -2463,8 +2484,21 @@ fn declared_rig_of(k: u32, partitions: u32) -> Rig {
 
 /// [`declared_rig_of`], each process on a runtime of its own when `own_runtimes`.
 fn declared_rig_with(k: u32, partitions: u32, own_runtimes: bool) -> Rig {
+    declared_rig_opts(k, partitions, own_runtimes, Timeouts::default(), None)
+}
+
+/// [`declared_rig_with`], every node opened with `timeouts` and `failover` (#80 S3).
+pub(super) fn declared_rig_opts(
+    k: u32,
+    partitions: u32,
+    own_runtimes: bool,
+    timeouts: Timeouts,
+    failover: Option<Failover>,
+) -> Rig {
     let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), k);
     rig.own_runtimes = own_runtimes;
+    rig.timeouts = timeouts;
+    rig.failover = failover;
     match rig
         .rt
         .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
@@ -2477,7 +2511,7 @@ fn declared_rig_with(k: u32, partitions: u32, own_runtimes: bool) -> Rig {
 }
 
 /// Where the ring places `partition` over nodes 1 to `k`.
-fn ring(k: u32, partition: u32) -> rdb_core::placement::Partition {
+pub(super) fn ring(k: u32, partition: u32) -> rdb_core::placement::Partition {
     let nodes: Vec<u32> = (1..=k).collect();
     rdb_core::placement::initial(&nodes, partition)
 }
@@ -2500,7 +2534,7 @@ fn held_partitions(dir: &Path, node: NodeId) -> BTreeSet<u32> {
 impl Rig {
     /// Take `node`'s process down, the others running: shut its `Db` down and drop its net, so
     /// its listener and every link to it are gone. [`Rig::restart`] brings it back.
-    fn stop(&mut self, node: NodeId) {
+    pub(super) fn stop(&mut self, node: NodeId) {
         let proc = &mut self.procs[node.0 as usize - 1];
         if let Some(mut db) = proc.db.take() {
             db.shutdown();
@@ -2513,7 +2547,7 @@ impl Rig {
 
     /// Restart `node`'s process on its own folder and its own address, the others running:
     /// shut it down, let go of its listener, bind the same address again, open again.
-    fn restart(&mut self, node: NodeId, timeouts: Timeouts) {
+    pub(super) fn restart(&mut self, node: NodeId, timeouts: Timeouts) {
         let at = node.0 as usize - 1;
         let Proc {
             node,
@@ -2522,6 +2556,7 @@ impl Rig {
             dir,
             _dir,
             own_rt,
+            faults: _,
         } = self.procs.remove(at);
         if let Some(mut db) = db {
             db.shutdown();
@@ -2535,6 +2570,7 @@ impl Rig {
         let own_rt = self.own_runtimes.then(runtime);
         let rt = own_rt.as_ref().unwrap_or(&self.rt);
         let listener = rebind(rt, &self.addrs[&node]);
+        let faults = Faults::new();
         let (db, net) = open_node_with(
             rt,
             &self.store,
@@ -2544,6 +2580,8 @@ impl Rig {
             listener,
             &self.addrs,
             timeouts,
+            self.failover,
+            Arc::clone(&faults),
         )
         .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
         self.procs.insert(
@@ -2555,14 +2593,21 @@ impl Rig {
                 dir,
                 _dir,
                 own_rt,
+                faults,
             },
         );
+    }
+
+    /// The fault file of `node`'s process (#80 S3), as [`Rig::open_all`] or [`Rig::restart`]
+    /// wired it: `mute` silences its links, `cut-control` its control store.
+    pub(super) fn faults_of(&self, node: NodeId) -> &Arc<Faults> {
+        &self.procs[node.0 as usize - 1].faults
     }
 }
 
 /// The node count and partition count the S1b integration rows declare.
-const S1B_K: u32 = 5;
-const S1B_P: u32 = 16;
+pub(super) const S1B_K: u32 = 5;
+pub(super) const S1B_P: u32 = 16;
 
 /// #80 S1b row 11, acceptance: five nodes declared, each node process on its own empty folder
 /// and its own host on this machine (127.0.0.1 to 127.0.0.5), sixteen partitions. Every node
@@ -2690,7 +2735,7 @@ fn s1b_restart_of_each_of_five_nodes_reopens_its_own_folder() {
 }
 
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
-fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
+pub(super) fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
     let read = rig
         .rt
         .block_on(rig.store.get(config_core::GetRequest {
@@ -2705,7 +2750,7 @@ fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
 
 /// Poll `partitions/{partition}`'s pinned nodes until `done` holds of them, and answer every
 /// set seen on the way, the last one included. Panics after `within`.
-fn pins_until(
+pub(super) fn pins_until(
     rig: &Rig,
     partition: u32,
     within: Duration,

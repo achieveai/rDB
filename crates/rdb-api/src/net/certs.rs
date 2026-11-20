@@ -346,9 +346,20 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 /// Write `text` to `path`: a `.key` file is `0600` on Unix, any other `0644`, set on the open
 /// file before a byte is written, so neither the umask nor an earlier mode of a file being
 /// replaced leaves a key readable by another user.
+///
+/// A symbolic link at `path` is refused before anything is opened (#80 S2 review r2): opening
+/// follows it, so a planted link would put a private key wherever it points. The check and the
+/// open are two steps, but each caller first makes the folder owner-only ([`private_dir`]), so
+/// after the check only the folder's owner could plant one.
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
     use std::io::Write as _;
     let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "{}: is a symbolic link; refusing to write key material through it, so remove it",
+            path.display()
+        ));
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -819,5 +830,32 @@ mod tests {
         generate(&dir, &[Label::Node(NodeId(1))]).expect("certs again");
         generate_control(&dir, cluster, &voters).expect("control certs again");
         check("over world-readable files");
+    }
+
+    /// #80 S2 review r2: a symbolic link planted where a key goes is refused, and the file it
+    /// points at is left as it was.
+    #[cfg(unix)]
+    #[config_log::retcd_test]
+    fn s2_a_planted_symlink_is_refused_before_a_key_is_written() {
+        let cluster = ClusterId::from_bytes([0x25; 16]);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        let voters = [(1, "10.0.0.2".to_owned())];
+        generate(&dir, &[Label::Node(NodeId(1))]).expect("certs");
+        generate_control(&dir, cluster, &voters).expect("control certs");
+
+        let elsewhere = root.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, "not a key").expect("target");
+        let key = dir.join(CONTROL_DIR).join("client.key");
+        std::fs::remove_file(&key).expect("remove the real key");
+        std::os::unix::fs::symlink(&elsewhere, &key).expect("plant a link");
+
+        let err = generate_control(&dir, cluster, &voters).expect_err("a planted link is refused");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains("client.key"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).expect("target"),
+            "not a key"
+        );
     }
 }
