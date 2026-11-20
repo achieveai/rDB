@@ -3168,8 +3168,8 @@ fn own83_28_a_failed_address_read_of_a_cached_owner_is_unavailable_and_recovers(
 /// expired share one `nodes/` read. Four threads route while node 1's read is held at a gate:
 /// within 300 ms no second `nodes/1` read starts, and meanwhile node 3's address is read and
 /// answered, so another owner never waits on node 1's read. Released, all four answer the new
-/// address, after exactly one read. Cut: the per-node lock dropped (each caller reads), red at
-/// "one read" (4 reads held). Unit (~1.5 s: the second, and the 300 ms watch).
+/// address, after exactly one read. Cut: the read in flight not shared (each caller reads), red
+/// at "one read" (4 reads held). Unit (~1.5 s: the second, and the 300 ms watch).
 #[config_log::retcd_test]
 fn own83_29_concurrent_address_refreshes_of_one_owner_share_one_read() {
     let rt = runtime();
@@ -3211,6 +3211,117 @@ fn own83_29_concurrent_address_refreshes_of_one_owner_share_one_read() {
         before + 2,
         "one read of nodes/1, one of nodes/3"
     );
+    db.shutdown();
+}
+
+/// A [`route_db`] whose node 1 answered `gw-1:8443` once and now holds `gw-1:9443`, with that
+/// answer's second up, so the next call reads `nodes/1` again; `read` is the `Db`'s read
+/// timeout (PR #159 review r2).
+fn route_db_expired(
+    rt: &tokio::runtime::Runtime,
+    read: Duration,
+) -> (Db, Arc<RouteStore>, WatchItems) {
+    let (mut db, store, _) = route_db(rt);
+    db.timeouts.read = read;
+    write_node(rt, &store, NodeId(1), Some("gw-1:8443"));
+    let items = open_route_watch(&db, &store, 1);
+    assert_eq!(
+        db.route(G1).expect("a route").app_address(),
+        Some("gw-1:8443")
+    );
+    write_node(rt, &store, NodeId(1), Some("gw-1:9443"));
+    std::thread::sleep(Duration::from_millis(1_050));
+    *store.node_hold.lock().expect("node_hold") = Some(ControlKey::Node(NodeId(1)).encode());
+    (db, store, items)
+}
+
+/// own83_31 (#83 B2, PR #159 review r2, T27): waiting for another caller's address read is
+/// inside the one read timeout a call has for the address, not added to it. Node 1's read is
+/// held past the read timeout (1 s); four callers route at once, twice: each is `UNAVAILABLE`
+/// (retry `BoundedJitter`) within 1.75 s of its own start, under two read timeouts, where
+/// queueing read after read took one more timeout per caller ahead. Then the hold is lifted and
+/// the next call names the new address. Cut: a waiter whose shared read failed reads again
+/// itself, red at the bound (the second caller ~2 s). Unit (~3.2 s: the second, and two held
+/// rounds of one read timeout).
+#[config_log::retcd_test]
+fn own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout() {
+    const READ: Duration = Duration::from_secs(1);
+    let bound = READ + READ * 3 / 4;
+    let rt = runtime();
+    let (mut db, store, _items) = route_db_expired(&rt, READ);
+    for round in 1..=2 {
+        let answers: Vec<_> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let started = Instant::now();
+                        let answer = db.route(G1);
+                        (answer, started.elapsed())
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().expect("a caller"))
+                .collect()
+        });
+        for (answer, took) in &answers {
+            let refused = answer.as_ref().expect_err("held past the read timeout");
+            assert!(retryable_unavailable(refused), "{round}: {refused}");
+            assert!(
+                *took < bound,
+                "{round}: a caller took {took:?}, over one read timeout and its slack"
+            );
+        }
+    }
+    *store.node_hold.lock().expect("node_hold") = None;
+    store.node_gate.add_permits(100);
+    let route = db.route(G1).expect("recovered");
+    assert_eq!(route.app_address(), Some("gw-1:9443"));
+    db.shutdown();
+}
+
+/// own83_32 (#83 B2, PR #159 review r2, T30): a slow address read that succeeds is shared with
+/// the callers already waiting for it, even though its pre-read stamp has expired by the time
+/// it answers. Four callers route while node 1's read is held for more than the second
+/// (the read timeout is 3 s); every later `nodes/` read is then scripted to fail, and the held
+/// read is let go. All four name the new address, after one read. A call after that finds the
+/// answer stamped more than a second ago, so it reads again (the pre-read stamp stays the
+/// cache's), and that read fails: `UNAVAILABLE`. Cut: a waiter ignores the shared success and
+/// looks at the cache again, red at "shared" (it reads, and fails). Unit (~2.6 s).
+#[config_log::retcd_test]
+fn own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters() {
+    let rt = runtime();
+    let (mut db, store, _items) = route_db_expired(&rt, Duration::from_secs(3));
+    let node_reads = || store.node_reads.load(Ordering::SeqCst);
+    let before = node_reads();
+    std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..4).map(|_| scope.spawn(|| db.route(G1))).collect();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        while node_reads() == before {
+            assert!(Instant::now() < until, "no caller read nodes/1");
+            std::thread::yield_now();
+        }
+        let read_began = Instant::now();
+        std::thread::sleep(APP_ADDR_REREAD_GAP + Duration::from_millis(300));
+        assert!(read_began.elapsed() > Duration::from_secs(1));
+        store.fail_node_gets.store(100, Ordering::SeqCst);
+        store.node_gate.add_permits(100);
+        for caller in callers {
+            let route = caller.join().expect("a caller");
+            assert_eq!(
+                route.as_ref().map(RouteInfo::app_address),
+                Ok(Some("gw-1:9443")),
+                "shared"
+            );
+        }
+    });
+    assert_eq!(node_reads(), before + 1, "one read for the four");
+    let later = db
+        .route(G1)
+        .expect_err("a later call reads again, and that read fails");
+    assert!(retryable_unavailable(&later), "{later}");
+    assert_eq!(node_reads(), before + 2, "the pre-read stamp has expired");
     db.shutdown();
 }
 

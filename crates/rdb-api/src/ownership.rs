@@ -749,8 +749,10 @@ impl RouteInfo {
     /// Where the owner's app takes forwarded requests: the address the owner's node wrote into
     /// its `nodes/{id}` record at open ([`crate::NodeAddresses::app`]), opaque to rDB (#83 B2).
     /// `None` when the owner registered none, or the database was formed in one process
-    /// (`rdb_node --form`), which has no `nodes/` records. Read again at most once a second, so
-    /// an owner restarted with a new address is seen within about a second.
+    /// (`rdb_node --form`), which has no `nodes/` records. A read that succeeds is kept for a
+    /// second, so successful reads come at most once a second per owner, and an owner
+    /// restarted with a new address is seen within about a second. A failed read keeps
+    /// nothing: the call is `UNAVAILABLE`, and the next call reads again at once.
     #[must_use]
     pub fn app_address(&self) -> Option<&str> {
         self.owner_address.as_deref()

@@ -686,17 +686,107 @@ struct Route {
     /// #83: what [`Db::route`] last read of each partition's record, and the stamp of the
     /// `partitions/` watches it was read under. Served while the stamp is current.
     answers: Mutex<BTreeMap<u32, (RouteInfo, RouteStamp)>>,
-    /// #83 B2: per owner node, the app address its `nodes/{id}` record held and when it was
-    /// read, served for [`APP_ADDR_REREAD_GAP`], behind that node's own refresh lock.
-    addrs: Mutex<BTreeMap<NodeId, Arc<Mutex<Option<AppAddrRead>>>>>,
+    /// #83 B2: per owner node, its last good app-address read and the read in flight. The
+    /// lock is held only to look and to swap, never across a read.
+    addrs: Mutex<BTreeMap<NodeId, AddrSlot>>,
 }
 
-/// One read of an owner's app address (#83 B2): what `nodes/{id}` held, and when it was read.
-type AppAddrRead = (Option<String>, Instant);
+/// One owner's app address in [`Route`] (#83 B2, PR #159 review r2).
+#[derive(Default)]
+struct AddrSlot {
+    /// The last read that succeeded: what `nodes/{id}` held, and when that read began. Served
+    /// for [`APP_ADDR_REREAD_GAP`] from then. A failed read leaves it as it was, and does not
+    /// serve it past its gap.
+    good: Option<(Option<String>, Instant)>,
+    /// The read in flight, which callers that find `good` expired wait for.
+    reading: Option<Arc<AddrRead>>,
+}
+
+/// One read of an owner's app address that other callers wait for (PR #159 review r2): its
+/// answer, success or failure, once the reader has one.
+#[derive(Default)]
+struct AddrRead {
+    answer: Mutex<Option<Result<Option<String>, ApiError>>>,
+    done: std::sync::Condvar,
+}
+
+impl AddrRead {
+    /// Hand `answer` to every caller waiting for this read.
+    fn finish(&self, answer: Result<Option<String>, ApiError>) {
+        *lock(&self.answer) = Some(answer);
+        self.done.notify_all();
+    }
+
+    /// This read's answer, or `None` once `deadline` passes first.
+    fn wait_until(&self, deadline: Instant) -> Option<Result<Option<String>, ApiError>> {
+        let mut answer = lock(&self.answer);
+        loop {
+            if let Some(answer) = answer.as_ref() {
+                return Some(answer.clone());
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            answer = self
+                .done
+                .wait_timeout(answer, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// The caller reading an owner's app address for everyone waiting (PR #159 review r2). Dropped
+/// without [`Self::finish`], as a panic drops it, it still ends the read, failed, so no later
+/// caller waits on a read nobody is making.
+struct AddrReader<'a> {
+    route: &'a Route,
+    node: NodeId,
+    read: Arc<AddrRead>,
+    finished: bool,
+}
+
+impl AddrReader<'_> {
+    /// Keep `answer` if it succeeded, stamped `read_at`, end the read and hand `answer` to its
+    /// waiters.
+    fn finish(mut self, answer: &Result<Option<String>, ApiError>, read_at: Instant) {
+        self.end(answer.clone(), Some(read_at));
+    }
+
+    fn end(&mut self, answer: Result<Option<String>, ApiError>, read_at: Option<Instant>) {
+        self.finished = true;
+        {
+            let mut addrs = lock(&self.route.addrs);
+            let slot = addrs.entry(self.node).or_default();
+            if let (Ok(app), Some(read_at)) = (&answer, read_at) {
+                slot.good = Some((app.clone(), read_at));
+            }
+            slot.reading = None;
+        }
+        self.read.finish(answer);
+    }
+}
+
+impl Drop for AddrReader<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.end(
+                Err(ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "route: the read of nodes/{} ended without an answer",
+                        self.node.0
+                    ),
+                )),
+                None,
+            );
+        }
+    }
+}
 
 /// How long [`Db::route`] serves an owner's app address before it reads `nodes/{id}` again
 /// (#83 B2). A node writes its address only at an open, so a restart that changes it is seen
-/// within this; at most one read per owner node per gap.
+/// within this. A read that succeeds is served for this long, so successful reads come at most
+/// once per owner node per gap; a failed read keeps nothing, so the next caller reads again at
+/// once.
 pub(crate) const APP_ADDR_REREAD_GAP: Duration = Duration::from_secs(1);
 
 impl Default for Route {
@@ -4334,14 +4424,16 @@ impl Db {
     ///   partition's answer stale; the end of any such watch makes every answer stale. Nothing
     ///   new is watched. While no such watch is open (an app-only `Db`, or every node here cut
     ///   from rEtcd) nothing is cached and each call reads the record.
-    /// - The owner's app address, kept about one second per owner node and then read again,
-    ///   since nothing watches `nodes/`. A cached partition answer still needs this read once
-    ///   its second is up, and that read can be slow or fail. Concurrent callers for one owner
-    ///   share one read; other owners do not wait on it.
+    /// - The owner's app address, kept one second per owner node after a read that succeeds,
+    ///   then read again, since nothing watches `nodes/`. A failed read keeps nothing, so the
+    ///   next call reads again at once. A cached partition answer still needs this read once
+    ///   its second is up, and that read can be slow or fail. Calls that need one owner's
+    ///   address while it is being read wait for that read and take its answer, success or
+    ///   failure; other owners do not wait on it.
     ///
-    /// Each read has its own read timeout ([`Timeouts::read`]), one after the other, so a call
-    /// that reads both can take up to two read timeouts; a caller that waited on another's
-    /// failed address read then reads itself, within one more. A failed read caches nothing.
+    /// A call takes at most two read timeouts ([`Timeouts::read`]) in all, however many calls
+    /// run at once: one for the partition record, and one for the owner's address, waiting
+    /// for another call's read of it included.
     /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
     /// partition-record read and `db_route_app_addr_read{node, app_len}` on each address read;
     /// the address itself is never logged, since it may carry a credential.
@@ -4413,7 +4505,8 @@ impl Db {
         // answer stale rather than cached past the change.
         let stamp = marks.stamp(partition);
         let what = format!("partitions/{}", partition.0);
-        let info = self.control_read(&what, move |store| async move {
+        let deadline = Instant::now() + self.timeouts.read;
+        let info = self.control_read(&what, deadline, move |store| async move {
             read_route(&*store, partition).await
         })?;
         tracing::info!(
@@ -4434,38 +4527,73 @@ impl Db {
     /// [`APP_ADDR_REREAD_GAP`]: a node writes it only at an open, so a restart that changes it
     /// is seen within the gap, and nothing watches `nodes/`.
     ///
-    /// Refreshes of one node are coalesced (PR #159 review): each node has its own lock, held
-    /// across the read, so callers that find one node's answer expired wait for one read and
-    /// take its answer; callers for other nodes never wait on it. A failed read caches nothing,
-    /// so the next caller, a waiter included, reads again. Logged `db_route_app_addr_read{node,
-    /// app_len}`; the address itself is never logged, since it may carry a credential.
+    /// One budget, one read timeout from entry, covers the whole call, waiting for another
+    /// caller included (PR #159 review r2). Refreshes of one node are coalesced: the first
+    /// caller to find the answer expired reads, and callers that come while it reads wait for
+    /// that read's answer, success or failure, within their own budget, and take it. So a slow
+    /// read that succeeds is shared with every caller already waiting, even if its pre-read
+    /// stamp has expired by then; a later caller reads again. Concurrent callers never queue
+    /// read after read. A failed read keeps nothing, so the next caller reads again. Other
+    /// nodes never wait on this one's read. Logged `db_route_app_addr_read{node, app_len}`;
+    /// the address itself is never logged, since it may carry a credential.
+    ///
+    /// A failed read is `UNAVAILABLE` today, even with an earlier good read kept in `good`;
+    /// answering that one past its gap instead would be a change at the `Err` arms here.
     fn app_address_of(&self, node: NodeId) -> Result<Option<String>, ApiError> {
-        let entry = Arc::clone(lock(&self.route.addrs).entry(node).or_default());
-        let mut entry = lock(&entry);
-        if let Some((app, read_at)) = entry.as_ref() {
-            if read_at.elapsed() < APP_ADDR_REREAD_GAP {
-                return Ok(app.clone());
+        let deadline = Instant::now() + self.timeouts.read;
+        let key = ControlKey::Node(node).encode();
+        let read = {
+            let mut addrs = lock(&self.route.addrs);
+            let slot = addrs.entry(node).or_default();
+            if let Some((app, read_at)) = &slot.good {
+                if read_at.elapsed() < APP_ADDR_REREAD_GAP {
+                    return Ok(app.clone());
+                }
             }
-        }
+            if let Some(reading) = slot.reading.clone() {
+                drop(addrs);
+                return reading.wait_until(deadline).unwrap_or_else(|| {
+                    let detail = format!(
+                        "route: {key} did not read within {:?}: another call's read of it is \
+                         still running",
+                        self.timeouts.read
+                    );
+                    tracing::warn!(what = %key, %detail, "db_route_read_failed");
+                    Err(ApiError::new(ErrorKind::Unavailable, detail))
+                });
+            }
+            let read = Arc::new(AddrRead::default());
+            slot.reading = Some(Arc::clone(&read));
+            read
+        };
+        let reader = AddrReader {
+            route: &self.route,
+            node,
+            read,
+            finished: false,
+        };
         let read_at = Instant::now();
-        let app = self.control_read(&ControlKey::Node(node).encode(), move |store| async move {
+        let app = self.control_read(&key, deadline, move |store| async move {
             read_app_addr(&*store, node).await
-        })?;
-        tracing::info!(
-            node = node.0,
-            app_len = app.as_ref().map_or(0, String::len),
-            "db_route_app_addr_read"
-        );
-        *entry = Some((app.clone(), read_at));
-        Ok(app)
+        });
+        if let Ok(app) = &app {
+            tracing::info!(
+                node = node.0,
+                app_len = app.as_ref().map_or(0, String::len),
+                "db_route_app_addr_read"
+            );
+        }
+        reader.finish(&app, read_at);
+        app
     }
 
-    /// Run `read` against the control store on its runtime, within the read timeout: a store
-    /// that answers late or fails is `UNAVAILABLE`, a record this build cannot decode
+    /// Run `read` against the control store on its runtime, until `deadline`: a store that
+    /// answers late or fails is `UNAVAILABLE`, a record this build cannot decode
     /// `INCOMPATIBLE_VERSION` (#135), since no retry decodes it.
     fn control_read<T, F>(
         &self,
         what: &str,
+        deadline: Instant,
         read: impl FnOnce(Arc<dyn ConfigStore>) -> F,
     ) -> Result<T, ApiError>
     where
@@ -4484,7 +4612,7 @@ impl Db {
             // The caller may have given up; then nobody needs the answer.
             let _ = done.send(reading.await);
         });
-        match answer.recv_timeout(self.timeouts.read) {
+        match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(RouteReadError::Unavailable(detail))) => {
                 tracing::warn!(what, %detail, "db_route_read_failed");

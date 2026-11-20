@@ -795,14 +795,16 @@ record. Use it to send a request to the right node.
 - It is `None` when the owner registered none, or on a database made by `rdb_node --form`,
   which has no `nodes/` records. An app address on such a database is refused at open, and
   `rdb_node --form --app-addr` is refused while parsing.
-- `route` reads an owner's address again about once a second, so a node restarted with a
-  new address is seen within about a second. Callers that need the same owner's address at
-  once share one read.
-- **How long a call can take.** `route` reads two records, the partition's and the owner's,
-  each within its own read timeout (`Timeouts::read`), so a call that reads both can take up
-  to two read timeouts. A cached owner still needs its address read once its second is up,
-  and that read can be slow or fail too: the call is then `UNAVAILABLE`, not an answer
-  without the address. A read that fails caches nothing; the next call reads again.
+- `route` keeps an owner's address for a second after a read that succeeds, then reads it
+  again, so a node restarted with a new address is seen within about a second. A read that
+  fails keeps nothing, so the next call reads again at once. Calls that need the same
+  owner's address while it is being read wait for that read and take its answer, success or
+  failure.
+- **How long a call can take.** At most two read timeouts (`Timeouts::read`) in all, however
+  many calls run at once: one for the partition's record and one for the owner's address,
+  waiting for another call's read of it included. A cached owner still needs its address
+  read once its second is up, and that read can be slow or fail too: the call is then
+  `UNAVAILABLE`, not an answer without the address.
 - `db.partition_of(group)` names the group's partition without reading anything. The count is
   fixed when the database is declared (at most 512), so a group stays in its partition, and
   every group of a partition moves with it, while the database has its original partitions:
