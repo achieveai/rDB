@@ -45,13 +45,25 @@ the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without 
 7. **Adoption is out of scope.** `Adopt::Link` and `Adopt::Resume` do not run check B. Issue #121
    tracks check B at adoption.
 
+**Amended by issue #61 (History trim), 2026-11-20: "seq 1" reads "a record at F".** A trimmed
+lineage keeps History from its floor F, the record at F included, and nothing below
+(ADR-rdb-0025). So decisions 1, 3 and 4 read the floor, not seq 1. `Host::has_floor` reads the
+record at `RocksEngine::floor_seq` of the older generation, or at seq 1 on a lineage never
+trimmed. A trimmed lineage whose record at F is held passes; one with a hole at F is refused with
+the same reasons as before. The empty-lineage exception (decision 2) is unchanged. The intact rule
+(spec §8.5.5, `Host::holds_last_writable`) makes the same read through `Host::has_floor`. Rows:
+`t61_trimmed_lineage_passes_check_b` and
+`s1_r3_check_b_after_a_trim_links_and_a_hole_at_the_floor_refuses`
+(`crates/rdb-api/src/host/catchup_tests.rs`).
+
 ## Consequences
 
 - A copy with a hole below its head can no longer be linked by landing or by the inventory. It is
   refused by name.
 - A transient `History` read fault refuses a link that would otherwise have passed. That costs a
   retry, not a wrong link.
-- Check B depends on seq 1 being kept. A history trim (#61) must revisit this ADR.
+- Check B depends on the record at the floor being kept: seq 1, or F once trimmed. Issue #61's
+  trim always keeps the record at F (amendment above).
 - Adoption can still take a holed lineage until #121 lands.
 
 ## Verification

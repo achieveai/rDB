@@ -2988,9 +2988,9 @@ struct Host {
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
     /// Issue #61 (design rev 5b): per partition and copy, a `tail_held` refusal of this
-    /// primary's offer, and the `--through` an accepted forget-tail released it with. In
-    /// memory: an owner restart loses it, and the next refused offer records it again.
-    /// Cleared on that copy's `CopyCaughtUp` or when a commit pins it as a member again.
+    /// primary's offer, with the tail's head. In memory: an owner restart loses it, and the
+    /// next refused offer records it again. Dropped by an accepted forget-tail whose `--through`
+    /// covers it, on that copy's `CopyCaughtUp`, or when a commit pins it as a member again.
     offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
     /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
     /// warned `copy_needs_forget_tail` once. Cleared by an install, or when an inventory ask
