@@ -270,11 +270,13 @@ pub struct Dispatcher {
     plans: BTreeMap<(NodeId, PartitionId), PartitionConfig>,
     /// Each `(node, partition)` whose dormant receiver holds its ladder: the host's `ladders`.
     ladders: BTreeSet<(NodeId, PartitionId)>,
-    /// The barrier of each snapshot transfer a source opened, by `(source, partition, copy)`:
-    /// the host's `snapshots_served` (A8a). A repeat ask at that barrier is dropped (B-R48); a
-    /// refusal keeps it, so the copy is not offered again at that `S`; every other end of the
-    /// transfer forgets it. A ladder refill is never recorded here. Process memory.
-    snapshots_served: BTreeMap<(NodeId, PartitionId, CopyId), Seq>,
+    /// The generation and barrier of each snapshot transfer a source opened, by `(source,
+    /// partition, copy)`: the host's `snapshots_served` (A8a, keyed by generation too since
+    /// lead ruling R18). A repeat ask at that generation and barrier is dropped (B-R48); a
+    /// refusal keeps it, so the copy is not offered again at that `S` under that generation, but
+    /// a later commit's offer at the same `S` goes; every other end of the transfer forgets it.
+    /// A ladder refill is never recorded here. Process memory.
+    snapshots_served: BTreeMap<(NodeId, PartitionId, CopyId), (Generation, Seq)>,
     /// Each snapshot transfer a source has open, by `(source, partition, copy)`: the host's
     /// `transfers` (issue #61 S2, [`crate::harness::snapshot`]). Process memory of the source.
     snapshot_transfers: BTreeMap<(NodeId, PartitionId, CopyId), SnapshotTransfer>,
@@ -2080,10 +2082,12 @@ impl Dispatcher {
             );
             return Ok(());
         }
-        if self.snapshots_served.get(&key) == Some(&barrier) {
+        // Keyed by generation too (lead ruling R18), as the host's: a refused offer at `S` must
+        // not hold back the offer a later commit makes at the same `S`.
+        if self.snapshots_served.get(&key) == Some(&(generation, barrier)) {
             return Ok(());
         }
-        self.snapshots_served.insert(key, barrier);
+        self.snapshots_served.insert(key, (generation, barrier));
         let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
             return unserved("copy_not_in_config");
         };
@@ -5263,7 +5267,10 @@ mod dormant_twin_tests {
                     .get(&(OWNER, P, CopyId(1)))
                     .copied()
             ),
-            (Some((NodeId(2), Seq(HEAD), true)), Some(Seq(HEAD))),
+            (
+                Some((NodeId(2), Seq(HEAD), true)),
+                Some((Generation(1), Seq(HEAD)))
+            ),
             "a newer barrier leaves the open transfer as it was"
         );
         // A record past S, committed straight into the engine, so a trim has one to pass.
@@ -5362,7 +5369,7 @@ mod dormant_twin_tests {
                     .get(&(OWNER, P, CopyId(1)))
                     .copied()
             ),
-            (None, Some(Seq(HEAD))),
+            (None, Some((Generation(1), Seq(HEAD)))),
             "the transfer ended and keeps its barrier"
         );
         dispatcher
@@ -5377,8 +5384,108 @@ mod dormant_twin_tests {
                 .snapshots_served
                 .get(&(OWNER, P, CopyId(1)))
                 .copied(),
-            Some(Seq(HEAD + 1)),
+            Some((Generation(1), Seq(HEAD + 1))),
             "a new barrier opens a new transfer (offered at once, and refused again)"
+        );
+    }
+
+    /// Issue #61 A9c (lead ruling R18), the sim side of the host's `snapshots_served` key: node
+    /// 2 refuses node 1's offer at `S` under generation 1, then node 1's primary moves to
+    /// generation 2 (its engine inherits at `S`, its ladder dense from the floor) and the copy is
+    /// asked for at the same `S`. A new transfer opens under generation 2, and the dedup holds
+    /// `(2, S)`. Cut: `snapshots_served` compared by barrier alone, red (no transfer: the
+    /// refusal at the same `S` holds it back). Unit, under a second.
+    #[test]
+    fn t61_sim_a_refusal_at_s_does_not_hold_back_a_later_generations_offer_at_s() {
+        let (mut dispatcher, seed) = serving_owner();
+        let mut scheduler = Scheduler::new();
+        let target = NodeId(2);
+        let mut engine = MemoryEngine::new(target);
+        let history = canonical_history(seed.lineage, ConfigVersion(1), 1).expect("history");
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit");
+        }
+        dispatcher.register_node(target, BootId(1));
+        dispatcher.engines.insert(target, engine);
+        // The first ask refills the thin ladder; the second opens the transfer, and once S is
+        // durable node 2 refuses its offer `not_adopted`.
+        for _ in 0..2 {
+            dispatcher
+                .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+                .expect("served");
+        }
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .sync_wal_through(vec![CapturedPrefix {
+                partition: P,
+                generation: Generation(1),
+                through: AppliedSeq(HEAD),
+            }])
+            .expect("node 1 syncs");
+        dispatcher
+            .snapshot_offers_due(&mut scheduler)
+            .expect("a refusal is not a harness fault");
+        assert_eq!(
+            (
+                open_transfer(&dispatcher),
+                dispatcher
+                    .snapshots_served
+                    .get(&(OWNER, P, CopyId(1)))
+                    .copied()
+            ),
+            (None, Some((Generation(1), Seq(HEAD)))),
+            "control: refused under generation 1, its barrier kept"
+        );
+
+        // Node 1's later commit: generation 2, inherited at S, its ladder dense from the floor.
+        let next = Lineage {
+            generation: Generation(2),
+            ..seed.lineage
+        };
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .inherit(P, Generation(1), Generation(2), Seq(HEAD))
+            .expect("inherit at S");
+        let full = canonical_history(seed.lineage, ConfigVersion(1), HEAD).expect("history");
+        let mut ladder = DigestLadder::new();
+        ladder.insert(Seq::ZERO, Digest::ROOT);
+        for seq in 1..=HEAD {
+            ladder.insert(Seq(seq), full.digest(seq));
+        }
+        dispatcher.replication.install_primary(
+            ProgressTracker::new(TrackerInit {
+                config: seed.config.clone(),
+                own: CopyId(0),
+                lineage: next,
+                history: ladder,
+                local: ReplicaProgress {
+                    received: ReceivedSeq(HEAD),
+                    buffered_applied: AppliedSeq(HEAD),
+                    durable: DurableSeq(HEAD),
+                },
+            })
+            .expect("node 1's generation 2 tracker"),
+        );
+        dispatcher
+            .snapshot_catchup(OWNER, P, CopyId(1), Seq(HEAD), &mut scheduler)
+            .expect("served");
+        assert_eq!(
+            (
+                open_transfer(&dispatcher),
+                dispatcher
+                    .snapshots_served
+                    .get(&(OWNER, P, CopyId(1)))
+                    .copied()
+            ),
+            (
+                Some((target, Seq(HEAD), true)),
+                Some((Generation(2), Seq(HEAD)))
+            ),
+            "the same S under generation 2 opens a new transfer"
         );
     }
 
