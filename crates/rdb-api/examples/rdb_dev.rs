@@ -10057,6 +10057,32 @@ mod tests {
         );
     }
 
+    /// #87 review r1: what `changes` prints as `next=` is usable as `--from`. `START` and a full
+    /// cursor round-trip through `cursor_text` and `parse_cursor`; a digest of the wrong hex
+    /// length and a fourth component are refused.
+    /// Cut: `parse_cursor` without its fourth-component check (`None`), red (`1:2:<hex>:9`
+    /// accepted). Unit.
+    #[test]
+    fn f87_2_a_printed_cursor_parses_back() {
+        let full = rdb_api::FeedCursor {
+            generation: rdb_api::Generation(7),
+            seq: rdb_api::Seq(42),
+            digest: rdb_core::contracts::digest::Digest([0xA5; 32]),
+        };
+        for cursor in [rdb_api::FeedCursor::START, full] {
+            let text = cursor_text(&cursor);
+            assert_eq!(parse_cursor(&text), Ok(cursor), "{text}");
+        }
+        let hex = "a5".repeat(32);
+        for bad in [
+            format!("7:42:{}", &hex[..62]),
+            format!("7:42:{hex}00"),
+            format!("7:42:{hex}:9"),
+        ] {
+            assert!(parse_cursor(&bad).is_err(), "{bad}");
+        }
+    }
+
     /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
     /// `--control-tls` folder of its fixture's client certificate, and its client endpoints
     /// followers first, so a client that cannot follow a leader hint fails (#80 S2 review r1).
