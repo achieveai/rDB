@@ -243,6 +243,10 @@ pub enum RecordDamage {
     Truncate,
     /// Set the frame's kind byte to one no build writes, so the read itself fails `Corrupt`.
     Frame,
+    /// Replace the value with the one stored, in the same namespace and lineage, at the key
+    /// that is this seq big-endian: a `History` record misplaced, which decodes and matches its
+    /// digest but names another seq.
+    ValueOf(u64),
 }
 
 /// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
@@ -1287,6 +1291,18 @@ impl RocksEngine {
                 value.pop();
             }
             RecordDamage::Frame => value[0] = 0xEE,
+            RecordDamage::ValueOf(seq) => {
+                let other = encode_key(partition, generation, ns, &seq.to_be_bytes());
+                value = self
+                    .db
+                    .get_cf(cf, &other)
+                    .map_err(|e| DamageRefused::WriteFailed {
+                        detail: e.to_string(),
+                    })?
+                    .ok_or_else(|| DamageRefused::NoValue {
+                        key_hex: hex(&other),
+                    })?;
+            }
         }
         // A synced write, debug builds only: named like every other, so one made while a sync
         // runs is loud (critic-f4 A5).

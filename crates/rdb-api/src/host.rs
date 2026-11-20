@@ -15126,6 +15126,24 @@ impl Host {
                     seq.0
                 ))
             })?;
+            // Damage that still decodes (review r2): a record stored under another seq, or one
+            // whose content no longer hashes to its digest, is not served, and a cursor naming
+            // it hears damage, not divergence.
+            if envelope.header.seq != seq {
+                return Err(feed_damage(format!(
+                    "feed: the record stored at seq {} names seq {}",
+                    seq.0, envelope.header.seq.0
+                )));
+            }
+            match envelope.compute_record_digest() {
+                Ok(digest) if digest == envelope.record_digest => {}
+                computed => {
+                    return Err(feed_damage(format!(
+                        "feed: the record at seq {} does not match its digest {} ({computed:?})",
+                        seq.0, envelope.record_digest
+                    )))
+                }
+            }
             Ok(Some((envelope, record.len())))
         };
         let floor = engine

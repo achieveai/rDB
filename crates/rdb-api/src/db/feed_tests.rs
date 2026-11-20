@@ -1538,3 +1538,97 @@ fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
         "(b) resumed at its floor"
     );
 }
+
+/// One feed call's answer once it is not `UNAVAILABLE` or `LEASE_EXPIRED`, retried as in
+/// [`page_from`] until `patience` ends.
+fn changes_settled(db: &Db, from: FeedCursor, source: Source) -> Result<FeedPage, ApiError> {
+    let deadline = Instant::now() + patience();
+    loop {
+        match db.changes(PARTITION, from, FEED_PAGE_RECORDS, source) {
+            Err(error)
+                if matches!(error.kind, ErrorKind::Unavailable | ErrorKind::LeaseExpired)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// Review r2 (thread 4647111493): a stored `History` record that still decodes but is damaged
+/// is damage, typed `CORRUPT_HISTORY` with the feed's step, never served as a page and never
+/// read as the cursor's divergence. Three copies, three cases, each its own copy (the first
+/// fault stops a node):
+/// - node 3, START: k1's last byte flipped (it decodes; its digest no longer matches);
+/// - node 2, a good cursor at k1 read before the damage: the same flip on k1;
+/// - node 1, START: k1's record stored again at k2's key (decodes, matches its digest, names
+///   seq k1).
+///
+/// Each answer names the damage ("does not match its digest", "names seq"), not "another
+/// digest", and a second call to that node hears the same fault.
+/// Cuts: no digest check in `Host::changes`'s read, red (node 3 served, node 2 diverged); no
+/// seq check, red (node 1 served k1 at k2).
+/// Integration (~3 s): a fresh open.
+#[config_log::retcd_test]
+fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    let k2 = db.put(b"k2", b"two", None).expect("k2");
+    db.wait_durable(DEFAULT_GROUP, (k2.generation, k2.seq), patience())
+        .expect("k2 on every disk");
+    let (records, _) = tail(&db, FeedCursor::START, Source::Node(NodeId(2)), k1.seq);
+    let good = records[0].at;
+    assert_eq!(good.seq, k1.seq, "the cursor at k1");
+    let damage = |node: u32, key: Seq, how: rdb_storage::RecordDamage| {
+        db.damage_record_as(
+            NodeId(node),
+            k1.generation,
+            Namespace::History,
+            &key.0.to_be_bytes(),
+            how,
+        )
+        .expect("damaged");
+    };
+    damage(3, k1.seq, rdb_storage::RecordDamage::LastByte);
+    damage(2, k1.seq, rdb_storage::RecordDamage::LastByte);
+    damage(1, k2.seq, rdb_storage::RecordDamage::ValueOf(k1.seq.0));
+    let cases = [
+        (
+            "node 3 from START",
+            FeedCursor::START,
+            3,
+            "does not match its digest",
+        ),
+        (
+            "node 2 from a good cursor",
+            good,
+            2,
+            "does not match its digest",
+        ),
+        ("node 1 from START", FeedCursor::START, 1, "names seq"),
+    ];
+    // Every case is judged before the row fails, so a cut shows each case's answer.
+    let mut wrong = Vec::new();
+    for (who, from, node, says) in cases {
+        let source = if node == 1 {
+            Source::Owner
+        } else {
+            Source::Node(NodeId(node))
+        };
+        for call in ["first", "again"] {
+            let answer = changes_settled(&db, from, source);
+            let ok = matches!(&answer, Err(error) if error.kind == ErrorKind::CorruptHistory
+                && error.detail.contains(says)
+                && !error.detail.contains("another digest")
+                && error.detail.ends_with(FEED_HISTORY_STEP));
+            if !ok {
+                wrong.push(format!("{who} ({call}): {answer:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
