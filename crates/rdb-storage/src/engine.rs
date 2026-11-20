@@ -1846,6 +1846,56 @@ impl RocksEngine {
         Ok(Some((record, progress)))
     }
 
+    /// The lowest `History` seq lineage `(partition, generation)` serves through its chain
+    /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one,
+    /// or the lineage's applied head plus one when no level holds any (1 for an empty copy). It
+    /// assumes no hole above that record: a history trim (#61) must revisit it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a `History` key does not decode.
+    pub fn history_floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<Seq, StorageFault> {
+        let mut levels = vec![generation];
+        let mut level = generation;
+        while let Some(link) = self.link(partition, level) {
+            levels.push(link.parent);
+            level = link.parent;
+        }
+        let cf = self.cf(keys::cf_for(Namespace::History));
+        for level in levels.into_iter().rev() {
+            let prefix = encode_key(partition, level, Namespace::History, &[]);
+            let first = self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+                .next();
+            let Some(item) = first else { continue };
+            let (raw, _) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "history_floor_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !raw.starts_with(&prefix) {
+                continue;
+            }
+            return decode_mark(&raw[keys::PREFIX_LEN..])
+                .map(Seq)
+                .ok_or_else(|| {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        partition = partition.0,
+                        generation = level.0,
+                        key_hex = %hex(&raw),
+                        "history_floor_key_undecodable"
+                    );
+                    StorageFault::Corrupt
+                });
+        }
+        Ok(Seq(self.buffered_applied(partition, generation).0 + 1))
+    }
+
     /// The record at `key` in `ns` as lineage `(partition, generation)` sees it: the generation
     /// that holds it, its version and its value.
     ///

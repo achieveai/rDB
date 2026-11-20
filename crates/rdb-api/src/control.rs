@@ -336,6 +336,62 @@ impl ControlAdapter {
         calls.push(task);
     }
 
+    /// #87 (R2): read `partitions/{partition}` once for the change feed, as
+    /// [`Self::read_owner_after_fence`] reads it, and answer [`Msg::FeedRead`] with the
+    /// generation it names and the members it pins, or why it could not be read. One attempt:
+    /// a failed read leaves the host's last one to go stale, and the next feed call asks again.
+    /// Never posts a control event. Tracked with the node's calls, so a restart abandons it.
+    pub fn read_partition_for_feed(
+        &self,
+        node: NodeId,
+        boot: BootId,
+        partition: PartitionId,
+        started: rdb_core::contracts::time::Tick,
+    ) {
+        let store = Arc::clone(&self.store);
+        let links = Arc::clone(&self.links);
+        let task = self.rt.spawn(
+            async move {
+                let key = ControlKey::Partition(partition).encode();
+                let read = match store
+                    .get(GetRequest {
+                        key: Bytes::from(key),
+                    })
+                    .await
+                {
+                    Ok(read) => match read.record {
+                        Some(found) => PartitionRecord::decode(&found.value)
+                            .map(|record| {
+                                (
+                                    record.generation,
+                                    rdb_core::authority::partition::RecordMember::decode_all(
+                                        &found.value,
+                                    ),
+                                )
+                            })
+                            .ok_or_else(|| "the record does not decode".to_owned()),
+                        None => Err("no record".to_owned()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                let msg = Msg::FeedRead {
+                    boot,
+                    partition,
+                    started,
+                    read,
+                };
+                if links.post(node, msg).is_err() {
+                    tracing::debug!(node = node.0, "control_completion_unclaimed");
+                }
+            }
+            .instrument(Span::current()),
+        );
+        let mut tasks = lock(&self.tasks);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
+    }
+
     /// A-R446: for a routed `FenceProven`, read `partitions/1` and then its owner's grant once,
     /// and answer [`Msg::FenceBound`] with the proof and what was read, or why it could not be.
     /// With `recheck_after`, it waits that long first and the answer is marked `rechecked`

@@ -46,6 +46,7 @@ use tokio::runtime::Handle;
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
+use crate::feed::{FeedCursor, FeedPage};
 use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
@@ -62,6 +63,15 @@ const OWNER: NodeId = admin::OWNER;
 /// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 pub const TENANT: TenantId = TenantId(1);
+
+/// Which copy [`Db::changes`] reads (#87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The partition's owner, as this `Db` routes to it.
+    Owner,
+    /// Node `n`'s copy alone: the owner, or a regular secondary serving what it applied.
+    Node(NodeId),
+}
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
 /// as its `group` to write where `put` and `get` do.
@@ -3230,6 +3240,94 @@ impl Db {
         answered.map_err(ApiError::for_barrier)
     }
 
+    /// #87 (ADR-rdb-0020): `partition`'s committed transactions after `from`, read from
+    /// `source`'s copy, at most `max` of them (and at most [`crate::feed::FEED_PAGE_RECORDS`]).
+    /// Start at [`FeedCursor::START`]; store each page's `next` with the effect it had, and call
+    /// again at once while `more` is set. A page never passes what the copy may serve: the
+    /// owner's published position, or what a regular secondary applied. `Source::Owner` goes to
+    /// the owner this `Db` routes to, re-routed as any call is; `Source::Node(n)` goes to node
+    /// `n` alone, so the owner does no work. Either works from any host: a node in this process
+    /// or one over the links, from an app that holds no copy as well as from a node.
+    ///
+    /// The other answers say what to do: [`FeedPage::Behind`] keeps the cursor (wait, or ask
+    /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
+    /// rebuild from the app's own source); [`FeedPage::Rewound`] means the cursor's record was
+    /// cut: retract what was applied above `to` and resume from `to`. See `docs/rdb/embed.md`,
+    /// "Change feed".
+    ///
+    /// # Errors
+    ///
+    /// Every error claims `no_mutation`: a feed call writes nothing. `UNAVAILABLE` when the copy
+    /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
+    /// nothing in its generation, or (a secondary) has no fresh read of `partitions/{p}` naming
+    /// its generation with it pinned. The first call to a secondary starts that read and is
+    /// refused: call again. `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// `Source::Node(n)` names a node this process has no link to. `INCOMPATIBLE_VERSION` when
+    /// the node sent records of a format this build does not read.
+    /// An owner whose grant no longer admits, such as one a promote left out, answers as a write
+    /// would: `LEASE_EXPIRED`, or `NOT_PRIMARY` once it has read the new owner.
+    /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the
+    /// same lineage. `INVALID_ARGUMENT` for `max` 0 or a partition this database does not have.
+    pub fn changes(
+        &self,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        if partition.0 == 0 || partition.0 > self.route.partitions() {
+            return Err(ApiError::invalid(format!(
+                "partition {} is not one of this database's {}",
+                partition.0,
+                self.route.partitions()
+            )));
+        }
+        let call = ClientCall::Changes {
+            identity: self.identity(),
+            from,
+            max,
+        };
+        let wait = self.timeouts.read;
+        let answer = match source {
+            Source::Owner => self.call(partition, call, wait),
+            Source::Node(node) => match self.send_call(node, partition, call) {
+                Ok(answer) => match answer.recv_timeout(wait) {
+                    Ok(answer) => Some(answer),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
+                        error: ApiError::new(
+                            ErrorKind::Unavailable,
+                            format!("node {} dropped the feed call unanswered", node.0),
+                        ),
+                        request: None,
+                    }),
+                },
+                Err(_) => Some(Answer::Error {
+                    error: ApiError::new(
+                        ErrorKind::Unavailable,
+                        format!("node {} cannot be reached from this process", node.0),
+                    ),
+                    request: None,
+                }),
+            },
+        };
+        let answered = match answer {
+            Some(Answer::Changes(page)) => Ok(page),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a feed call was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no feed answer in {wait:?}"),
+            )),
+        };
+        answered.map_err(|mut error| {
+            error.no_mutation = true;
+            self.explained(error)
+        })
+    }
+
     /// [`Self::put`] under the app's request id `request`, which this client may have used
     /// already. A fresh compile, so a changed payload under a used id meets the dedup rules
     /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
@@ -5726,7 +5824,8 @@ fn carries(call: &ClientCall) -> Carries {
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
         | ClientCall::GetPrevious { .. }
-        | ClientCall::WaitDurable { .. } => Carries::Nothing,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => Carries::Nothing,
     }
 }
 
@@ -6767,7 +6866,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Move { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
-        | ClientCall::WaitDurable { .. } => return None,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
@@ -6917,6 +7017,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod feed_tests;
 
 #[cfg(test)]
 mod tests {
