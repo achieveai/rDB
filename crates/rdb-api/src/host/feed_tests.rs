@@ -328,12 +328,25 @@ fn stopped(who: &str, answer: Result<Answer, mpsc::TryRecvError>) {
     match answer {
         Ok(Answer::Error { error, request }) => {
             assert_eq!(error.kind, ErrorKind::Unavailable, "{who}: {error:?}");
-            assert_eq!(error.retry, RetryRule::RetryAfterRecovery, "{who}: {error:?}");
+            assert_eq!(
+                error.retry,
+                RetryRule::RetryAfterRecovery,
+                "{who}: {error:?}"
+            );
             assert!(error.no_mutation, "{who}: {error:?}");
             assert!(request.is_none(), "{who}: {request:?}");
-            assert!(error.detail.contains("node 2 is stopping"), "{who}: {error:?}");
-            assert!(error.detail.ends_with(FEED_STOPPED_STEP), "{who}: {error:?}");
-            assert!(error.detail.contains("once it has restarted"), "{who}: {error:?}");
+            assert!(
+                error.detail.contains("node 2 is stopping"),
+                "{who}: {error:?}"
+            );
+            assert!(
+                error.detail.ends_with(FEED_STOPPED_STEP),
+                "{who}: {error:?}"
+            );
+            assert!(
+                error.detail.contains("once it has restarted"),
+                "{who}: {error:?}"
+            );
             assert_eq!(error.next_step(), None, "{who}: its own step only");
         }
         other => panic!("{who}: the stop left the parked call unanswered: {other:?}"),
@@ -413,7 +426,11 @@ fn f87_4_a_read_that_answers_clears_the_saved_failure() {
 
     let failed = call_two(&trio, changes(10));
     until_held(&mut trio, &mut held, 1);
-    land(&mut trio, &mut held, Some(Err("the store refused".to_owned())));
+    land(
+        &mut trio,
+        &mut held,
+        Some(Err("the store refused".to_owned())),
+    );
     assert_eq!(failure_named(failed.try_recv()), "the store refused");
 
     let served = call_two(&trio, changes(11));
@@ -457,7 +474,10 @@ fn f87_4_a_stop_answers_parked_feed_calls_while_its_sync_is_held() {
     let mailbox = trio.nodes[1].1.clone();
     trio.nodes[1].0.syncer = Some(Syncer::start(NodeId(2), path.clone(), mailbox).expect("syncer"));
     let (entered, release) = hold_sync(&path);
-    trio.nodes[1].0.start_sync(Vec::new()).expect("a sync begun");
+    trio.nodes[1]
+        .0
+        .start_sync(Vec::new())
+        .expect("a sync begun");
     entered
         .recv_timeout(test_patience(Trio::PATIENCE))
         .expect("the sync is held at its fsync");
