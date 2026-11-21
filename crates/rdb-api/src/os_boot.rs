@@ -78,6 +78,11 @@ pub(crate) struct Seen {
 pub(crate) fn observe(dir: &Path) -> std::io::Result<Seen> {
     let file = dir.join(OS_BOOT_FILE);
     let stored = match std::fs::read_to_string(&file) {
+        Ok(text) if text.trim().is_empty() => {
+            // PR #181 review: an empty file proves no boot, so it is missing, not a reboot.
+            tracing::warn!(file = %file.display(), "os_boot_file_empty");
+            None
+        }
         Ok(text) => Some(text.trim().to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -89,7 +94,7 @@ pub(crate) fn observe(dir: &Path) -> std::io::Result<Seen> {
         Ok(None) => (OsBoot::Unsupported, None, None),
         Err(error) => (OsBoot::Unknown, None, Some(error)),
         Ok(Some(now)) => match stored.as_deref() {
-            Some(was) if !was.is_empty() && was == now => (OsBoot::Same, Some(now), None),
+            Some(was) if was == now => (OsBoot::Same, Some(now), None),
             Some(_) => (OsBoot::Changed, Some(now), None),
             None => (OsBoot::Unknown, Some(now), None),
         },
@@ -235,5 +240,40 @@ mod tests {
             observe(dir.path()).expect("observed").verdict,
             OsBoot::Unknown
         );
+    }
+
+    /// The `@m` and `@l` of this test's log lines from this module.
+    fn events(method: &str) -> Vec<(String, String)> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .map(|line| {
+                (
+                    line["@m"].as_str().unwrap_or_default().to_owned(),
+                    line["@l"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// PR #181 review: an empty or blank `os_boot` file proves no boot, so it reads as missing,
+    /// `Unknown`, not as a reboot, and is warned once. The conservative wait is the same.
+    /// Unit (~5 ms). Cut: blank text compared as an id (`Changed`), red.
+    #[config_log::retcd_test]
+    fn r5_l_a_blank_os_boot_file_is_unknown_not_changed() {
+        const METHOD: &str = "r5_l_a_blank_os_boot_file_is_unknown_not_changed";
+        for blank in ["", "  \n"] {
+            let dir = config_testkit::fs::temp_dir();
+            std::fs::write(dir.path().join(OS_BOOT_FILE), blank).expect("blank file");
+            inject(dir.path(), Ok("boot-a"));
+            let seen = observe(dir.path()).expect("observed");
+            assert_eq!(seen.verdict, OsBoot::Unknown, "{blank:?}");
+            assert!(!dir.path().join(OS_BOOT_FILE).exists(), "{blank:?}");
+        }
+        let empty: Vec<_> = events(METHOD)
+            .into_iter()
+            .filter(|(m, _)| m == "os_boot_file_empty")
+            .collect();
+        assert_eq!(empty.len(), 2, "{empty:?}");
+        assert!(empty.iter().all(|(_, l)| l == "Warning"), "{empty:?}");
     }
 }
