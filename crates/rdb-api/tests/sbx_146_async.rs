@@ -181,6 +181,9 @@ fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
                     let put = db.put(group, object.clone(), value.clone(), None).await;
                     leave();
                     let put = put.unwrap_or_else(|e| panic!("put: {e}"));
+                    // #184 (PR #190): this retry stays until whichever of #178 and #190 merges
+                    // second; that one removes it and asserts the first attempt succeeds (lead
+                    // ruling, PR #178 review r2 T23).
                     let mut attempt = 1;
                     let got = loop {
                         enter();
