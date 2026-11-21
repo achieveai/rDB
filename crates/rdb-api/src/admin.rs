@@ -2088,10 +2088,11 @@ pub enum HealError {
         nodes: Vec<u32>,
         /// The heal's bound.
         within_ms: u128,
-        /// Why the heal did not go on without them (R5): the last `heal_wait_all` reason, or
-        /// `decided_past_deadline` when the attempt's answer came at or past its deadline and
-        /// was not acted on, logged `heal_leave_out_expired` instead ([`heal_retrying`] then
-        /// tries again with a whole budget).
+        /// Why the heal did not go on without them (R5). A late *decision*, one that would have
+        /// left a copy out but came at or past the attempt's deadline, is not acted on: reason
+        /// `decided_past_deadline`, logged `heal_leave_out_expired`. A late *wait* keeps its own
+        /// `heal_wait_all` reason, logged `heal_wait_all`. Both are retried automatically:
+        /// [`heal_retrying`] tries again with a whole budget.
         reason: &'static str,
     },
 }
@@ -2913,11 +2914,7 @@ const fn may_leave_out(os_boot: OsBoot, live_readd: bool) -> Option<&'static str
     if let Some(reason) = os_boot.wait_reason() {
         return Some(reason);
     }
-    if live_readd {
-        None
-    } else {
-        Some("live_readd_off")
-    }
+    None
 }
 
 /// R5 (lead ruling (a)): what a copy with no `grants/{C}` record proves. Only an owner takes a
