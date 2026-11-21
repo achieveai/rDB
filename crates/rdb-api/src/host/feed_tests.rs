@@ -280,3 +280,50 @@ fn f87_2_r2_two_parked_feed_callers_both_hear_the_damage_fault() {
         other => panic!("the status call: {other:?}"),
     }
 }
+
+/// Review r3/r4 (threads 4654331881, 4654676431): a feed call parked on node 2's control read,
+/// which never lands, is answered by node 2's clean stop: `UNAVAILABLE`, `BoundedJitter`,
+/// nothing written, the feed's other-copy step; node 2 is not faulted, and logs
+/// `feed_waiter_stopped`. Runs the run loop's own stop tail, [`Host::stop_tail`]. Not shown here:
+/// that the answer precedes the stop's disk work (this trio's final marks write nothing).
+/// Cut: no `stop_feed_waiters` in the stop tail, red (the call is never answered).
+/// Integration (~2 s): bootstrap's discovery window, then one stop.
+#[config_log::retcd_test]
+fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
+    const METHOD: &str = "f87_3_a_clean_stop_answers_a_parked_feed_call";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _, _) = serving(dir.path());
+    let _hold = trio.clock.hold();
+    let mut held = Vec::new();
+    let answer = call_two(&trio, changes(11));
+    step_two(&mut trio, &mut held);
+    assert_eq!(feed_state(&trio), (true, 1), "one call parked on one read");
+
+    let (host, _, rx) = &mut trio.nodes[1];
+    host.stop_tail(rx);
+    assert!(
+        host.fault.is_none(),
+        "a clean stop faulted node 2: {:?}",
+        host.fault
+    );
+    match answer.try_recv() {
+        Ok(Answer::Error { error, request }) => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert_eq!(error.retry, RetryRule::BoundedJitter, "{error:?}");
+            assert!(error.no_mutation, "{error:?}");
+            assert!(request.is_none(), "{request:?}");
+            assert!(error.detail.contains("node 2 is stopping"), "{error:?}");
+            assert!(error.detail.ends_with(FEED_OTHER_COPY_STEP), "{error:?}");
+        }
+        other => panic!("the stop left the parked call unanswered: {other:?}"),
+    }
+    assert_eq!(feed_state(&trio).1, 0, "nothing still waits");
+
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["@m"] == "feed_waiter_stopped" && line["node"] == 2),
+        "feed_waiter_stopped is not logged"
+    );
+}

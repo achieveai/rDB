@@ -3403,11 +3403,20 @@ impl Host {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        self.stop_tail(rx);
+    }
+
+    /// What a clean stop does after the run loop ends, in order: answers that need no disk
+    /// first, then the work that waits on it.
+    fn stop_tail(&mut self, rx: &Receiver<Msg>) {
         // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
         // everywhere and subscribe again: a restarted node would otherwise never be heard. Before
         // the syncer stops and the final marks (#123 review): both wait on the disk, and a stuck
         // disk must not hold back the terminal `Deactivated` events.
         self.ownership_stop();
+        // #170 review r3/r4 (thread 4654331881): feed calls parked on a control read are
+        // answered now, for the same reason: retryable, nothing written, the node not faulted.
+        self.stop_feed_waiters();
         // F4 (A-R317): the sync in flight returns before the final marks, so their synced write
         // never waits behind it on a live node.
         if let Some(syncer) = self.syncer.take() {
@@ -15398,6 +15407,38 @@ impl Host {
             }
         }
         Ok(())
+    }
+
+    /// A clean stop's answer to every feed call parked on a control read (review r3/r4):
+    /// `UNAVAILABLE`, `BoundedJitter`, nothing written, with the feed's other-copy step. Sent
+    /// before the stop waits on the disk, so a stuck disk cannot delay it. It does not fault the
+    /// node: a healthy node that stops is not damaged. Logged `feed_waiter_stopped` per call.
+    fn stop_feed_waiters(&mut self) {
+        let node = self.node;
+        for (partition, entry) in &mut self.feed_reads {
+            for waiter in std::mem::take(&mut entry.waiting) {
+                tracing::info!(
+                    node = node.0,
+                    partition = partition.0,
+                    client = waiter.identity.client.0,
+                    "feed_waiter_stopped"
+                );
+                let mut error = ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {} is stopping: this feed call waited on its control read of \
+                         partitions/{}, which it no longer waits for; nothing was read or \
+                         written; next: {FEED_OTHER_COPY_STEP}",
+                        node.0, partition.0
+                    ),
+                );
+                error.no_mutation = true;
+                let _ = waiter.reply.send(Answer::Error {
+                    error,
+                    request: None,
+                });
+            }
+        }
     }
 
     /// #87: the feed calls whose control read has not landed by their `until` are answered
