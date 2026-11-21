@@ -2850,6 +2850,11 @@ async fn leave_out(
             .filter(|member| is_missing(member))
             .map(|member| member.node.0)
             .collect();
+        // PR #181 review round 3: a node regular in another partition can be a `Shadow` here;
+        // this partition is short of no regular copy, so it has no `heal_proceed_without` row.
+        if gone.is_empty() {
+            continue;
+        }
         short.push((*partition, gone, present, majority));
     }
     let mut down = Vec::with_capacity(missing.len());
@@ -10154,6 +10159,53 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    /// PR #181 review round 3: node 3 is regular in partition 1 and a `Shadow` in partition 2,
+    /// and down. The majority is checked for both, and only partition 1, short of a regular
+    /// copy, logs `heal_proceed_without`: partition 2 has no row with nothing missing. Unit
+    /// (~5 ms). Cut: the push not guarded: partition 2 logs `missing=[]` with empty evidence,
+    /// red.
+    #[config_log::retcd_test]
+    fn r5_mixed_a_copy_shadow_in_one_partition_logs_only_where_it_is_regular() {
+        const METHOD: &str =
+            "r5_mixed_a_copy_shadow_in_one_partition_logs_only_where_it_is_regular";
+        let rt = runtime();
+        let ctx = HealCtx {
+            partitions: vec![PARTITION, PartitionId(2)],
+            partition_count: 2,
+            ..r5_ctx(r5_frozen_3(&rt))
+        };
+        let mut shadowed = r5_members(&[1, 2, 3]);
+        shadowed[2].role = ReplicaRole::Shadow;
+        let rooted = [r5_members(&[1, 2, 3]), shadowed];
+        let found: Vec<(RecordMember, Option<BootId>)> = rooted[0]
+            .iter()
+            .map(|member| (*member, (member.node != NodeId(3)).then_some(OPEN_2)))
+            .collect();
+        let yes = rt
+            .block_on(leave_out(
+                &ctx,
+                &found,
+                &rooted,
+                &[],
+                &[3],
+                true,
+                &mut BTreeMap::new(),
+            ))
+            .expect("node 3 is left out");
+        yes.log(OWNER);
+        let lines = r5_lines(METHOD, "heal_proceed_without");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line["partition"].as_u64())
+                .collect::<Vec<_>>(),
+            [Some(1)],
+            "{lines:?}"
+        );
+        assert_eq!(lines[0]["missing"], "[3]", "{lines:?}");
+        assert_eq!(lines[0]["evidence"], "grant_frozen", "{lines:?}");
     }
 
     /// An owner's heal for [`r5_in_turn`]: `partitions/1` rooted in a store of its own,
