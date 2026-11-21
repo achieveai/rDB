@@ -41,6 +41,7 @@ public class WireTableTests
     [InlineData(20, "UPLOAD_CHUNK_CONFLICT", RdbErrorKind.UploadChunkConflict)]
     [InlineData(21, "CORRUPT_BLOB", RdbErrorKind.CorruptBlob)]
     [InlineData(22, "DURABILITY_UNCONFIRMED", RdbErrorKind.DurabilityUnconfirmed)]
+    [InlineData(23, "TOO_LARGE", RdbErrorKind.TooLarge)]
     public void Each_wire_kind_number_is_its_proto_kind(int wire, string protoName, RdbErrorKind kind)
     {
         Assert.Equal(protoName, ProtoName<Pb.ErrorKind>(wire));
@@ -65,8 +66,8 @@ public class WireTableTests
     [Fact]
     public void The_tables_list_every_kind_and_rule()
     {
-        Assert.Equal(23, Enum.GetValues<RdbErrorKind>().Length); // 22 kinds and Unrecognized
-        Assert.Equal(23, Enum.GetValues<Pb.ErrorKind>().Length);
+        Assert.Equal(24, Enum.GetValues<RdbErrorKind>().Length); // 23 kinds and Unrecognized
+        Assert.Equal(24, Enum.GetValues<Pb.ErrorKind>().Length);
         Assert.Equal(9, Enum.GetValues<RdbRetry>().Length);
         Assert.Equal(9, Enum.GetValues<Pb.RetryRule>().Length);
     }

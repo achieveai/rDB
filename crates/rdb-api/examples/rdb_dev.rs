@@ -91,9 +91,11 @@
 //! ops, and a `txn` at most 255 puts. A map or set write also writes its root, so with distinct
 //! keys the compile's 255-write cap refuses it first, at 255 keys. `members` and `items` take
 //! `--limit` 1,000 at most, a count of items, not bytes. A text or byte map key or set member,
-//! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A request over a
-//! limit answers `INVALID_ARGUMENT`, and its detail ends `request R not sent` (a write) or
-//! `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
+//! in a write or in `members --after`, is at most 1,024 bytes (`é` counts 2). A `put` or `txn`
+//! value is at most 1,044,480 bytes (`MAX_VALUE`), a whole `put` or `txn` at most 1 MiB by the
+//! upper-bound sum (`MAX_WRITE`), and a `blob chunk` at most 1,044,480 bytes. A request over a
+//! size limit answers `TOO_LARGE`, a `--limit` over 1,000 `INVALID_ARGUMENT`, and the detail
+//! ends `request R not sent` (a write) or `request R not read` (a read): R is the id it used up. A write also prints `request=-`; a
 //! read prints no `request=` field, so its R is in the detail only.
 //!
 //! Any command answered with an error prints its `err` line, the run goes on to the next line,
@@ -4288,6 +4290,20 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 ));
             }
         }
+        // `objects n=N full=F`, then one `  id=… version=V kind=K` line each (#147).
+        rdb_api::Seen::Objects { objects, full } => {
+            say(&format!("objects n={} full={full} {view}", objects.len()));
+            for listed in objects {
+                let root = listed.root.map_or_else(
+                    || "rootless".to_owned(),
+                    |(version, kind)| format!("version={version} kind={kind:?}"),
+                );
+                say(&format!(
+                    "  id={:?} {root}",
+                    String::from_utf8_lossy(&listed.id)
+                ));
+            }
+        }
         // `blob version=V size=S chunks=N upload=U`, then `bytes="..."` for a non-empty range.
         rdb_api::Seen::Range { blob, bytes } => {
             let m = &blob.manifest;
@@ -7339,12 +7355,14 @@ mod tests {
     /// Unit.
     #[test]
     fn an_admin_error_says_whether_running_it_again_can_help() {
-        let error = |retry, no_mutation| ApiError {
-            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
-            retry,
-            no_mutation,
-            detail: "control store: list partitions/: x; nothing deleted".to_owned(),
-            retry_after: None,
+        let error = |retry, no_mutation| {
+            let mut error = ApiError::new(
+                rdb_core::contracts::errors::ErrorKind::Unavailable,
+                "control store: list partitions/: x; nothing deleted",
+            );
+            error.retry = retry;
+            error.no_mutation = no_mutation;
+            error
         };
         assert_eq!(
             admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
@@ -7373,14 +7391,15 @@ mod tests {
     /// shows whether the delete applied; only a record still there fails the same way. Unit.
     #[test]
     fn an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did() {
-        let error = |retry| ApiError {
-            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
-            retry,
-            no_mutation: false,
-            detail: "control store: delete grants/1 at revision 5: permission denied; the \
-                     delete may have applied; run it again to read where it stands"
-                .to_owned(),
-            retry_after: None,
+        let error = |retry| {
+            let mut error = ApiError::new(
+                rdb_core::contracts::errors::ErrorKind::Unavailable,
+                "control store: delete grants/1 at revision 5: permission denied; the delete \
+                 may have applied; run it again to read where it stands",
+            );
+            error.retry = retry;
+            error.no_mutation = false;
+            error
         };
         let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
         assert_eq!(

@@ -103,7 +103,9 @@ pub fn check_listen(addr: &str) -> Result<SocketAddr, String> {
 #[must_use]
 pub const fn code_for(kind: ErrorKind) -> Code {
     match kind {
-        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity => Code::InvalidArgument,
+        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity | ErrorKind::TooLarge => {
+            Code::InvalidArgument
+        }
         ErrorKind::Overloaded => Code::ResourceExhausted,
         ErrorKind::UnknownOutcome => Code::Unknown,
         ErrorKind::ConditionFailed
@@ -154,6 +156,7 @@ pub const fn wire_kind(kind: ErrorKind) -> pb::ErrorKind {
         ErrorKind::UploadChunkConflict => W::UploadChunkConflict,
         ErrorKind::CorruptBlob => W::CorruptBlob,
         ErrorKind::DurabilityUnconfirmed => W::DurabilityUnconfirmed,
+        ErrorKind::TooLarge => W::TooLarge,
     }
 }
 
@@ -308,6 +311,10 @@ pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> 
         ErrorKind::CorruptBlob => "write the blob again",
         ErrorKind::DurabilityUnconfirmed => {
             "the barrier wrote nothing and says nothing about the write: wait for it again"
+        }
+        ErrorKind::TooLarge => {
+            "make it smaller: the message names the limit, the size and the maximum; the same \
+             request fails the same way"
         }
     }
 }

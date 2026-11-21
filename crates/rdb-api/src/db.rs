@@ -39,6 +39,8 @@ use rdb_storage::RocksEngine;
 pub use rdb_storage::StorageOptions;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
+use rdb_value::envelope::Kind as ObjectKind;
+use rdb_value::keys::Listed;
 use rdb_value::value::Value;
 use rdb_value::{Document, Expected};
 use tokio::runtime::Handle;
@@ -84,7 +86,8 @@ pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest object id, in raw bytes, that any write or read through `Db` accepts (M9 S5). A
 /// raw `ClientCall` sent with `NodeHandle::send`, or a `TxnRequest` given to [`Db::resend`],
 /// is not checked (ADR-rdb-0013 decision 11). A longer one is
-/// `INVALID_ARGUMENT` before anything is compiled, sent or read, and its request id is used up.
+/// `TOO_LARGE` ([`Limit::ObjectId`]) before anything is compiled, sent or read, and its request
+/// id is used up.
 /// A read keeps this limit even if a later version lowers the write limit: data already written
 /// stays readable, so a lower write limit needs its own constant.
 pub const MAX_OBJECT_ID: usize = 1_024;
@@ -95,16 +98,46 @@ pub const MAX_OBJECT_ID: usize = 1_024;
 const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 
 /// The most ops one change carries, and the most puts one [`Db::txn`] takes (M9 S5): the
-/// kernel's own cap on writes in one request. A request over it is `INVALID_ARGUMENT` before
-/// anything is compiled or sent. A change's writes are capped separately, at compile: a map or
-/// set change also writes its root, so it takes at most 254 element changes.
+/// kernel's own cap on writes in one request. A request over it is `TOO_LARGE`
+/// ([`Limit::Ops`]) before anything is compiled or sent. A change's writes are capped
+/// separately, at compile: a map or set change also writes its root, so it takes at most 254
+/// element changes.
 pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
 
 /// The longest map key or set member, in bytes, that a write or a `Members` read's `after`
 /// accepts (M9 S5): a text key's UTF-8 length, or a byte key's length, so `é` counts 2. Other
-/// key types are short by their type. A longer one is `INVALID_ARGUMENT` before anything is
-/// compiled, sent or read.
+/// key types are short by their type. A longer one is `TOO_LARGE` ([`Limit::Key`]) before
+/// anything is compiled, sent or read.
 pub const MAX_KEY: usize = 1_024;
+
+/// The largest byte value one put carries (`put`, `put_in`, `put_as`, and each `TxnPut` of
+/// `txn` and `txn_as`), for any object id up to [`MAX_OBJECT_ID`] (#148). Fixed, so a caller
+/// can cut over on it: it does not move with the id. Equal to `rdb_value::blob::MAX_CHUNK`
+/// (1 MiB less 4 KiB). A larger value is `TOO_LARGE` ([`Limit::Value`]) before anything is
+/// compiled or sent, and its request id is used up.
+pub const MAX_VALUE: usize = 1_044_480;
+
+/// The longest object id a [`ScopedDb`] takes (#147): [`MAX_OBJECT_ID`] less the longest scope
+/// header and the 8-byte workspace group, the same for every scope. A longer one is `TOO_LARGE`
+/// ([`Limit::ObjectId`]) with this maximum, whatever the scope's own length.
+pub const MAX_SCOPED_ID: usize = MAX_OBJECT_ID - rdb_value::keys::MAX_SCOPE_HEADER;
+
+/// The largest record one atomic write ships: `MAX_ENVELOPE_BYTES` (1 MiB). A byte write
+/// (`put` and `txn` forms) is checked against it before it is sent, with the upper-bound sum
+/// `265 + for each put: value_len + id_len + zero_bytes_in_id + 71` (embed.md, "How big a
+/// transaction can be"), never below the exact record. Over it is `TOO_LARGE`
+/// ([`Limit::Write`]), with that sum as the size (#148).
+pub const MAX_WRITE: usize = rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+
+// Any one put of MAX_VALUE bytes, under any id the Db admits (all 0x00 counts twice), fits
+// MAX_WRITE by the upper-bound sum, so the value limit is never a lie.
+const _: () = assert!(WRITE_COST + MAX_VALUE + 2 * MAX_OBJECT_ID + PUT_COST <= MAX_WRITE);
+const _: () = assert!(MAX_VALUE == rdb_value::blob::MAX_CHUNK);
+
+/// The upper-bound sum's cost of a byte write, however many puts it has (embed.md).
+const WRITE_COST: usize = 265;
+/// The upper-bound sum's cost of each put besides its value, id and the id's zero bytes.
+const PUT_COST: usize = 71;
 
 /// The largest page one read asks for: the most members, or list items, a `Members`, `Items`
 /// or `ItemsAfter` look takes (M9 S5). A larger `limit` is `INVALID_ARGUMENT` before anything is
@@ -113,10 +146,20 @@ pub const MAX_KEY: usize = 1_024;
 pub const MAX_PAGE: usize = 1_000;
 
 mod ack_floor;
+mod async_db;
+pub use async_db::{AsyncDb, TxnWrite};
+mod scoped;
+pub use scoped::{ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite};
+
+// `AsyncDb` hands an `Arc<Db>` to the blocking pool, so `Db` must be `Send + Sync` (#146).
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    shared::<Db>();
+};
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
-pub use error::ApiError;
+pub use error::{ApiError, Limit, TooLarge};
 
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
@@ -397,6 +440,56 @@ pub struct ReadOk {
     /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
     /// `false` for every other read.
     pub recovery_mode: bool,
+}
+
+/// One object of an [`ObjectPage`] (#147).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    /// The object id, whole.
+    pub id: Bytes,
+    /// The root's version.
+    pub version: u64,
+    /// The object's kind: a document, a map, a set, a list or a blob.
+    pub kind: ObjectKind,
+}
+
+/// A page of [`Db::list_in`] (#147): objects with a root, in id order, from one view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPage {
+    /// The objects.
+    pub entries: Vec<ObjectEntry>,
+    /// The page is full: ask again with this as `after`. `None` when the range ended.
+    pub next: Option<Bytes>,
+    /// The storage generation of the view.
+    pub generation: Generation,
+    /// The position of the view.
+    pub at: Seq,
+}
+
+/// A [`Db::delete_prefix_in`] that stopped (#147): how many objects it emptied first, and why it
+/// stopped. Run it again to finish; it is not atomic.
+#[derive(Debug, Clone)]
+pub struct PrefixDeleteError {
+    /// Objects emptied before the error.
+    pub deleted: u64,
+    /// Why it stopped.
+    pub error: PutError,
+}
+
+impl std::fmt::Display for PrefixDeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (after {} deleted; run the delete again to finish)",
+            self.error, self.deleted
+        )
+    }
+}
+
+impl std::error::Error for PrefixDeleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error.error)
+    }
 }
 
 /// A refused write, with the request so the caller can send it again (`retry`).
@@ -3063,7 +3156,7 @@ impl Db {
             let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
             return Some(Answer::Error {
                 error: if local {
-                    ApiError::host("the owner's node thread has stopped")
+                    ApiError::owner_fault("the owner's node thread has stopped")
                 } else {
                     ApiError::owner_unreachable(owner)
                 },
@@ -3324,6 +3417,12 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
+        if let Some(error) = byte_write_refusal(&[(object, value)], identity) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
         let put = PutOp {
             group,
             object: Bytes::copy_from_slice(object),
@@ -3405,6 +3504,7 @@ impl Db {
                 error: limit_refused(
                     identity,
                     "puts",
+                    Limit::Ops,
                     puts.len(),
                     MAX_OPS,
                     format!(
@@ -3413,6 +3513,13 @@ impl Db {
                         identity.request.0
                     ),
                 ),
+                request: None,
+            });
+        }
+        let bytes: Vec<_> = puts.iter().map(|put| (put.object, put.value)).collect();
+        if let Some(error) = byte_write_refusal(&bytes, identity) {
+            return Err(PutError {
+                error,
                 request: None,
             });
         }
@@ -3593,6 +3700,20 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        match self.compile(identity, puts, deadline)? {
+            Some(request) => self.send_compiled(identity, request, wait).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The compile half of [`Self::compile_and_send`]: `puts` compiled at the owner under
+    /// `identity`, and nothing sent. `Ok(None)` when they change nothing.
+    fn compile(
+        &self,
+        identity: RequestIdentity,
+        puts: Vec<PutOp>,
+        deadline: Duration,
+    ) -> Result<Option<TxnRequest>, PutError> {
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
         if let Some(error) = write_refusal(&puts, identity) {
@@ -3626,17 +3747,7 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(partition, call, self.timeouts.put) {
-            Some(Answer::Compiled(mut request)) => {
-                // The ack floor rides the first send and every resend of it unchanged; it is
-                // not part of the request's digest (A-R252). Only this `Db`'s own write ids
-                // in flight carry one.
-                let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
-                if let Some(carried) = carried {
-                    request.acked_below = Some(carried.acked_below);
-                    request.pinned = carried.pinned;
-                }
-                self.send(ClientCall::Resend { request }, wait).map(Some)
-            }
+            Some(Answer::Compiled(request)) => Ok(Some(request)),
             Some(Answer::Unchanged) => Ok(None),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
@@ -3650,6 +3761,23 @@ impl Db {
                 ),
             )),
         }
+    }
+
+    /// The send half of [`Self::compile_and_send`]: `request`, compiled under `identity`.
+    fn send_compiled(
+        &self,
+        identity: RequestIdentity,
+        mut request: TxnRequest,
+        wait: Duration,
+    ) -> Result<PutOk, PutError> {
+        // The ack floor rides the first send and every resend of it unchanged; it is not part
+        // of the request's digest (A-R252). Only this `Db`'s own write ids in flight carry one.
+        let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
+        if let Some(carried) = carried {
+            request.acked_below = Some(carried.acked_below);
+            request.pinned = carried.pinned;
+        }
+        self.send(ClientCall::Resend { request }, wait)
     }
 
     /// Send `request` again, unchanged: same identity, same payload.
@@ -3941,6 +4069,267 @@ impl Db {
         generation: Option<Generation>,
     ) -> Result<TxnStatus, ApiError> {
         self.status_at(self.partition_for(group), request, generation)
+    }
+
+    /// Up to `limit` objects in group `group` whose id starts with `prefix`, in id order, after
+    /// object `after` when given (#147). Objects with no root, such as an unpublished upload's
+    /// chunks, are not listed. Each object costs the owner one seek, however many entries it
+    /// holds. Each page is read from its own view at the publication barrier; pages are not one
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_in`]. `INVALID_ARGUMENT` for a `limit` over [`MAX_PAGE`]; `TOO_LARGE`
+    /// for a `prefix` or `after` over [`MAX_OBJECT_ID`]; `CORRUPT_HISTORY` for a damaged key or
+    /// root in the range.
+    pub fn list_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ObjectPage, ApiError> {
+        let (objects, full, generation, at) = self.list_page(group, prefix, after, limit, false)?;
+        let entries: Vec<_> = objects
+            .into_iter()
+            .filter_map(|listed| {
+                listed.root.map(|(version, kind)| ObjectEntry {
+                    id: Bytes::from(listed.id),
+                    version,
+                    kind,
+                })
+            })
+            .collect();
+        let next = if full {
+            entries.last().map(|entry| entry.id.clone())
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            entries,
+            next,
+            generation,
+            at,
+        })
+    }
+
+    fn list_page(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        rootless: bool,
+    ) -> Result<(Vec<Listed>, bool, Generation, Seq), ApiError> {
+        let read = self.read_call(ClientCall::Get {
+            identity: self.identity(),
+            group,
+            object: Bytes::copy_from_slice(prefix),
+            look: Look::List {
+                after: after.map(Bytes::copy_from_slice),
+                limit,
+                rootless,
+            },
+        })?;
+        match read.seen {
+            Seen::Objects { objects, full } => Ok((objects, full, read.generation, read.at)),
+            other => Err(ApiError::host(&format!(
+                "a list was answered with {other:?}"
+            ))),
+        }
+    }
+
+    /// Delete every object in group `group` whose id starts with `prefix`, of every kind, and
+    /// every object with no root there, such as an unpublished upload's chunks (#147). Answers
+    /// how many objects it emptied.
+    ///
+    /// It walks the prefix a page at a time. Documents go up to [`MAX_OPS`] to a transaction,
+    /// each at the version listed; when one moved, the page is listed again, up to 3 times.
+    /// Every other object is deleted with [`Change::Delete`] until it answers `Ok(None)`.
+    /// `deadline` is each send's kernel deadline.
+    ///
+    /// **It is not atomic.** An error says how far it got, and running it again finishes the
+    /// job. An object created under the prefix after its page was read survives.
+    ///
+    /// # Errors
+    ///
+    /// [`PrefixDeleteError`]: the objects emptied so far, and the first refusal, a list's
+    /// included, as [`Self::list_in`] and [`Self::write_in`] give them.
+    pub fn delete_prefix_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        deadline: Duration,
+    ) -> Result<u64, PrefixDeleteError> {
+        let mut deleted = 0;
+        let stop = |deleted, error| PrefixDeleteError { deleted, error };
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let mut moved = 0;
+            let (objects, full) = loop {
+                let (objects, full, ..) = self
+                    .list_page(group, prefix, after.as_deref(), MAX_PAGE, true)
+                    .map_err(|error| {
+                        stop(
+                            deleted,
+                            PutError {
+                                error,
+                                request: None,
+                            },
+                        )
+                    })?;
+                let docs: Vec<_> = objects
+                    .iter()
+                    .filter_map(|listed| match listed.root {
+                        Some((version, ObjectKind::Document)) => Some((&listed.id, version)),
+                        _ => None,
+                    })
+                    .collect();
+                match self.delete_docs(group, &docs, deadline, &mut deleted) {
+                    Ok(()) => break (objects, full),
+                    Err(error) if error.error.kind == ErrorKind::ConditionFailed && moved < 3 => {
+                        moved += 1;
+                    }
+                    Err(error) => return Err(stop(deleted, error)),
+                }
+            };
+            for listed in &objects {
+                if matches!(listed.root, Some((_, ObjectKind::Document))) {
+                    continue;
+                }
+                let emptied = self
+                    .drain(group, &listed.id, None, deadline)
+                    .map_err(|error| stop(deleted, error))?;
+                deleted += u64::from(emptied);
+            }
+            match objects.last() {
+                Some(last) if full => after = Some(last.id.clone()),
+                _ => return Ok(deleted),
+            }
+        }
+    }
+
+    /// Delete documents `docs`, each at its listed version, counting each into `deleted` once
+    /// its root is gone (PR #178 review r1, T1 and T2). A pack of up to [`MAX_OPS`] documents is
+    /// compiled first and sent only when it fits one request and deletes every root in it;
+    /// otherwise it is halved. A document that does not fit alone (more records under it than
+    /// one request carries, such as a 255-chunk upload) is drained a batch at a time.
+    fn delete_docs(
+        &self,
+        group: AffinityId,
+        docs: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+        deleted: &mut u64,
+    ) -> Result<(), PutError> {
+        let mut rest = docs;
+        let mut take = MAX_OPS;
+        while !rest.is_empty() {
+            take = take.min(rest.len());
+            let pack = &rest[..take];
+            match self.delete_pack(group, pack, deadline)? {
+                Some(answer) => {
+                    if answer.is_some() {
+                        *deleted += pack.len() as u64;
+                    }
+                    rest = &rest[take..];
+                    take = MAX_OPS;
+                }
+                None if take > 1 => take /= 2,
+                None => {
+                    let (id, version) = pack[0];
+                    *deleted += u64::from(self.drain(group, id, Some(version), deadline)?);
+                    rest = &rest[1..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile the deletes of documents `pack`, each at its listed version, under one fresh
+    /// write id, and send them only when they fit one request ([`MAX_OPS`] mutations) and delete
+    /// every root in it. `Ok(None)`: they do not, and nothing was sent.
+    fn delete_pack(
+        &self,
+        group: AffinityId,
+        pack: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+    ) -> Result<Option<Option<PutOk>>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let puts = pack
+            .iter()
+            .map(|(id, version)| PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: Some(Expected::Version(*version)),
+            })
+            .collect();
+        let answer = match self.compile(identity, puts, deadline) {
+            Ok(Some(request)) => {
+                let deletes_root = |id: &[u8]| {
+                    let root = rdb_value::keys::root_key(TENANT, group, id).to_bytes();
+                    request.mutations.iter().any(
+                        |mutation| matches!(mutation, rdb_core::contracts::txn::Mutation::Delete { key, .. } if *key == root),
+                    )
+                };
+                if request.mutations.len() <= MAX_OPS && pack.iter().all(|(id, _)| deletes_root(id))
+                {
+                    self.send_compiled(identity, request, send_wait(deadline))
+                        .map(|ok| Some(Some(ok)))
+                } else {
+                    Ok(None)
+                }
+            }
+            Ok(None) => Ok(Some(None)),
+            Err(error) => Err(error),
+        };
+        self.finished(identity.request, answer)
+    }
+
+    /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch at
+    /// root version `version` when given. Whether any batch deleted something.
+    fn drain(
+        &self,
+        group: AffinityId,
+        id: &[u8],
+        version: Option<u64>,
+        deadline: Duration,
+    ) -> Result<bool, PutError> {
+        let mut emptied = false;
+        loop {
+            let put = PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: version.map(Expected::Version),
+            };
+            match self.changes(vec![put], deadline)? {
+                Some(_) => emptied = true,
+                None => return Ok(emptied),
+            }
+        }
+    }
+
+    /// Compile and send `puts` as one transaction under a fresh write id, with kernel deadline
+    /// `deadline`.
+    fn changes(&self, puts: Vec<PutOp>, deadline: Duration) -> Result<Option<PutOk>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let answer = self.compile_and_send(identity, puts, deadline, send_wait(deadline));
+        // PR #178 review r1 T3: every id `write_identity` begins is finished, or the ack floor
+        // stays below it and its dedup slot is never released.
+        self.finished(identity.request, answer)
     }
 
     fn status_at(
@@ -4913,6 +5302,8 @@ impl Db {
                     node.0
                 ),
                 retry_after: None,
+                too_large: None,
+                owner_fault: false,
             });
         }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
@@ -5511,7 +5902,7 @@ impl Db {
             reply: host::RebuildReply(reply),
         };
         if self.send_to(owner, asked).is_err() {
-            return Err(ApiError::host(&format!(
+            return Err(ApiError::owner_fault(&format!(
                 "node {} (the owner) stopped before it was asked to rebuild node {}",
                 owner.0, node.0
             )));
@@ -5719,7 +6110,11 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         }) => Some((version, Bytes::from(bytes))),
         // `get` looks with `Look::Doc`, so `Members` and `Items` are not expected here; either
         // way it is no byte string.
-        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) | Seen::Range { .. } => {
+        Seen::Doc(_)
+        | Seen::Members(_)
+        | Seen::Items(_)
+        | Seen::Range { .. }
+        | Seen::Objects { .. } => {
             return Err(ApiError::invalid(
                 "the object is not a byte string; read it with Db::read",
             ))
@@ -5790,7 +6185,7 @@ fn carries(call: &ClientCall) -> Carries {
 /// compile, a read, a status look) applied nothing (A-R394 E1).
 fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        return ApiError::host("the owner dropped the call unanswered");
+        return ApiError::owner_fault("the owner dropped the call unanswered");
     }
     match carried {
         Carries::Write => ApiError::owner_lost(owner),
@@ -5851,6 +6246,8 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
                 no_mutation: true,
                 detail: "the read was refused".to_owned(),
                 retry_after: None,
+                too_large: None,
+                owner_fault: false,
             }
         }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
@@ -5875,6 +6272,8 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -6431,6 +6830,8 @@ fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiErro
         no_mutation,
         detail: format!("{detail}; {}", error::REBUILD_STEP),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -6709,7 +7110,7 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
     })
 }
 
-/// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
+/// The first limit `puts` breaks, as `TOO_LARGE` naming the put as `op <index>`, or
 /// `None` when every put is within every limit. `identity` is the one the refused request used up.
 fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> {
     let request = identity.request;
@@ -6718,6 +7119,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "object_id",
+                Limit::ObjectId,
                 put.object.len(),
                 MAX_OBJECT_ID,
                 format!(
@@ -6733,6 +7135,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "ops",
+                Limit::Ops,
                 ops,
                 MAX_OPS,
                 format!(
@@ -6741,6 +7144,45 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
                 ),
             ));
         }
+        if let Change::Chunk { bytes, .. } = &put.change {
+            if bytes.len() > rdb_value::blob::MAX_CHUNK {
+                return Some(limit_refused(
+                    identity,
+                    "chunk",
+                    Limit::Chunk,
+                    bytes.len(),
+                    rdb_value::blob::MAX_CHUNK,
+                    format!(
+                        "op {index}: chunk {} bytes, over the {}-byte limit; request {} not sent",
+                        bytes.len(),
+                        rdb_value::blob::MAX_CHUNK,
+                        request.0
+                    ),
+                ));
+            }
+        }
+        // Q5 (PR #178 review r1, lead ruling): a document that is one byte string, the shape a
+        // byte put writes, keeps the byte put's value limit. Every other document shape keeps
+        // the owner's compile refusal.
+        if let Change::Doc(Delta(ops)) = &put.change {
+            if let [Op::Replace(Value::Bytes(bytes))] = ops.as_slice() {
+                if bytes.len() > MAX_VALUE {
+                    return Some(limit_refused(
+                        identity,
+                        "value",
+                        Limit::Value,
+                        bytes.len(),
+                        MAX_VALUE,
+                        format!(
+                            "op {index}: value {} bytes, over the {MAX_VALUE}-byte limit; \
+                             request {} not sent",
+                            bytes.len(),
+                            request.0
+                        ),
+                    ));
+                }
+            }
+        }
         let elems = match &put.change {
             Change::Map(elems) | Change::Set(elems) => elems.as_slice(),
             Change::Doc(_)
@@ -6748,7 +7190,8 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             | Change::Chunk { .. }
             | Change::Publish { .. }
             | Change::Gc { .. }
-            | Change::Clear => &[],
+            | Change::Clear
+            | Change::Delete => &[],
         };
         elems
             .iter()
@@ -6756,7 +7199,53 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
     })
 }
 
-/// `INVALID_ARGUMENT` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
+/// The first size limit a byte write breaks, or `None` (#148). `puts` are its (object id,
+/// value) pairs in order. An id over [`MAX_OBJECT_ID`] is left to [`write_refusal`], which
+/// names it first, as it always has. Then each value against [`MAX_VALUE`], naming the put as
+/// `op <index>`, then the upper-bound sum against [`MAX_WRITE`].
+fn byte_write_refusal(puts: &[(&[u8], &[u8])], identity: RequestIdentity) -> Option<ApiError> {
+    if puts.iter().any(|(object, _)| object.len() > MAX_OBJECT_ID) {
+        return None;
+    }
+    let request = identity.request.0;
+    if let Some((index, value)) = puts
+        .iter()
+        .map(|(_, value)| value.len())
+        .enumerate()
+        .find(|(_, value)| *value > MAX_VALUE)
+    {
+        return Some(limit_refused(
+            identity,
+            "value",
+            Limit::Value,
+            value,
+            MAX_VALUE,
+            format!(
+                "op {index}: value {value} bytes, over the {MAX_VALUE}-byte limit; request \
+                 {request} not sent"
+            ),
+        ));
+    }
+    let bound = puts.iter().fold(WRITE_COST, |sum, (object, value)| {
+        let zeros = object.iter().filter(|byte| **byte == 0).count();
+        sum + value.len() + object.len() + zeros + PUT_COST
+    });
+    (bound > MAX_WRITE).then(|| {
+        limit_refused(
+            identity,
+            "write",
+            Limit::Write,
+            bound,
+            MAX_WRITE,
+            format!(
+                "write {bound} bytes by the upper-bound sum, over the {MAX_WRITE}-byte limit for \
+                 the whole write; request {request} not sent"
+            ),
+        )
+    })
+}
+
+/// `TOO_LARGE` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
 /// the put, when there is one; `done` ends the detail: `request R not <done>`.
 fn key_refusal(
     key: &Value,
@@ -6770,6 +7259,7 @@ fn key_refusal(
         limit_refused(
             identity,
             "key",
+            Limit::Key,
             found,
             MAX_KEY,
             format!(
@@ -6815,13 +7305,17 @@ fn op_count(change: &Change) -> usize {
         Change::Doc(delta) => delta.0.len(),
         Change::Map(ops) | Change::Set(ops) => ops.len(),
         Change::List(edits) => edits.len(),
-        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } | Change::Clear => 0,
+        Change::Chunk { .. }
+        | Change::Publish { .. }
+        | Change::Gc { .. }
+        | Change::Clear
+        | Change::Delete => 0,
     }
 }
 
-/// The first limit a read `call` breaks, as `INVALID_ARGUMENT`, or `None` when it is within
-/// every limit. A call that is not a read is never refused here: [`Db::read_call`] sends reads
-/// only.
+/// The first limit a read `call` breaks, as `TOO_LARGE` (`INVALID_ARGUMENT` for a page), or
+/// `None` when it is within every limit. A call that is not a read is never refused here:
+/// [`Db::read_call`] sends reads only.
 fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     let (identity, object, look) = match call {
         ClientCall::Get {
@@ -6845,6 +7339,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         return Some(limit_refused(
             *identity,
             "object_id",
+            Limit::ObjectId,
             object.len(),
             MAX_OBJECT_ID,
             format!(
@@ -6858,26 +7353,39 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         Some(
             Look::Members { limit, .. }
             | Look::Items { limit, .. }
-            | Look::ItemsAfter { limit, .. },
+            | Look::ItemsAfter { limit, .. }
+            | Look::List { limit, .. },
         ) => *limit,
         Some(Look::Doc | Look::Range { .. }) | None => 0,
     };
     if page > MAX_PAGE {
-        return Some(limit_refused(
-            *identity,
-            "page",
-            page,
-            MAX_PAGE,
-            format!(
-                "page limit {page}, over {MAX_PAGE}; request {} not read",
-                request.0
-            ),
-        ));
+        // A count the read asks for, not a size it carries: `INVALID_ARGUMENT`, not `TOO_LARGE`.
+        log_limit_refused(*identity, "page", page, MAX_PAGE);
+        return Some(ApiError::invalid(format!(
+            "page limit {page}, over {MAX_PAGE}; request {} not read",
+            request.0
+        )));
     }
     match look {
         Some(Look::Members {
             after: Some(after), ..
         }) => key_refusal(after, *identity, None, "read"),
+        Some(Look::List {
+            after: Some(after), ..
+        }) if after.len() > MAX_OBJECT_ID => Some(limit_refused(
+            *identity,
+            "object_id",
+            Limit::ObjectId,
+            after.len(),
+            MAX_OBJECT_ID,
+            format!(
+                "list after an id of {} bytes, over the {MAX_OBJECT_ID}-byte limit; request {} \
+                 not read",
+                after.len(),
+                request.0
+            ),
+        )),
+        Some(Look::List { .. }) => None,
         Some(
             Look::Members { after: None, .. }
             | Look::Doc
@@ -6889,16 +7397,31 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     }
 }
 
-/// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
-/// and `INVALID_ARGUMENT` with `detail`.
+/// A request over a size limit: one `limit_refused` line, which never carries the caller's
+/// bytes, and `TOO_LARGE` with `detail`, naming `typed` with `found` and `max` (#148). `limit`
+/// is the line's name for it.
 fn limit_refused(
     identity: RequestIdentity,
     limit: &'static str,
+    typed: Limit,
     found: usize,
     max: usize,
     detail: String,
 ) -> ApiError {
-    // `client` with `request` is the key a log query joins on: `request` alone is not unique.
+    log_limit_refused(identity, limit, found, max);
+    ApiError::too_large_refusal(
+        TooLarge {
+            limit: typed,
+            size: found,
+            max,
+        },
+        detail,
+    )
+}
+
+/// The `limit_refused` line. `client` with `request` is the key a log query joins on:
+/// `request` alone is not unique.
+fn log_limit_refused(identity: RequestIdentity, limit: &'static str, found: usize, max: usize) {
     tracing::info!(
         client = identity.client.0,
         request = identity.request.0,
@@ -6907,7 +7430,6 @@ fn limit_refused(
         max,
         "limit_refused"
     );
-    ApiError::invalid(detail)
 }
 
 /// The time a transaction's send waits: its deadline plus twice the host's waiter margin, so
@@ -7882,8 +8404,8 @@ mod tests {
     /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
     /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
     /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, as does `Overloaded` (P1's
-    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host fault, never a
-    /// guess. The owner's mailbox is answered by hand.
+    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host error, never a
+    /// guess: `NotWired`, and not an owner fault, as no takeover fixes it (#134). The owner's mailbox is answered by hand.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn a_refused_get_takes_its_retry_rule_from_the_kernel() {
@@ -7942,7 +8464,8 @@ mod tests {
             assert_eq!(refused.retry, retry, "{kind:?}: {refused:?}");
             if retry == RetryRule::NotWired {
                 assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
-                assert!(refused.detail.starts_with("host fault: "), "{refused:?}");
+                assert!(refused.detail.starts_with("host error: "), "{refused:?}");
+                assert!(!refused.owner_fault, "{refused:?}");
             } else {
                 assert_eq!(refused.kind, kind, "{refused:?}");
             }
@@ -9377,11 +9900,7 @@ mod tests {
         let oversized = db
             .put_as(app, b"a", &vec![b'z'; 1_048_536], None)
             .expect_err("past the envelope");
-        assert_eq!(
-            oversized.error.kind,
-            ErrorKind::InvalidArgument,
-            "{oversized:?}"
-        );
+        assert_eq!(oversized.error.kind, ErrorKind::TooLarge, "{oversized:?}");
         assert!(!oversized.error.no_mutation, "{oversized:?}");
 
         // `status 2`, then `retry 2`: still seq 3, never a second apply.
@@ -10076,11 +10595,26 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 S5: a request over a limit is `INVALID_ARGUMENT`, `Definitive`, `no_mutation`, with no
-    /// request, its detail ending `request R not sent` or `not read`, and nothing reaches the
-    /// owner. `R` is the id it used up.
+    /// M9 S5: a request over a size limit is `TOO_LARGE` (#148; `INVALID_ARGUMENT` before it),
+    /// `Definitive`, `no_mutation`, typed in `too_large`, with no request, its detail ending
+    /// `request R not sent` or `not read`, and nothing reaches the owner. `R` is the id it used
+    /// up.
     #[track_caller]
     fn refused_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert!(error.too_large.is_some(), "typed: {error:?}");
+        unsent_as(ErrorKind::TooLarge, error, detail, mailbox);
+    }
+
+    /// [`refused_unsent`] for a refusal that is no size: a page count or a deadline, which stay
+    /// `INVALID_ARGUMENT` and carry no `too_large`.
+    #[track_caller]
+    fn invalid_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert_eq!(error.too_large, None, "{error:?}");
+        unsent_as(ErrorKind::InvalidArgument, error, detail, mailbox);
+    }
+
+    #[track_caller]
+    fn unsent_as(kind: ErrorKind, error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
         assert_eq!(
             (
                 error.kind,
@@ -10088,12 +10622,7 @@ mod tests {
                 error.no_mutation,
                 error.detail.as_str()
             ),
-            (
-                ErrorKind::InvalidArgument,
-                RetryRule::Definitive,
-                true,
-                detail
-            ),
+            (kind, RetryRule::Definitive, true, detail),
         );
         assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
     }
@@ -10218,7 +10747,7 @@ mod tests {
                 refused.request.is_none()
             ),
             (
-                ErrorKind::InvalidArgument,
+                ErrorKind::TooLarge,
                 RetryRule::Definitive,
                 false,
                 format!(
@@ -10680,6 +11209,8 @@ mod tests {
             no_mutation: true,
             detail: "lease expired for partition 1".to_owned(),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         });
         assert!(
             refused.detail.ends_with(error::QUARANTINED_STEP)
@@ -11425,7 +11956,8 @@ mod tests {
 
     /// A-R261: a `Db` with no control store (only one a crate test builds by hand, now that
     /// every open keeps one) refuses a promote with the real cause and the call that fixes it,
-    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent.
+    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent. #134 audit: the
+    /// text names its step, so no "retrying will not help: report this" follows it.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn m10_s2_a_promote_on_a_db_with_no_control_store_names_the_cause_and_the_open_to_use() {
@@ -11439,8 +11971,7 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             "UNAVAILABLE (this Db was opened without a control store, so it cannot run admin \
-             commands such as promote: open it with Db::open, which connects it to one; next: \
-             retrying will not help: keep this Db's log and report this message)"
+             commands such as promote: open it with Db::open, which connects it to one)"
         );
         assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
     }
@@ -11842,7 +12373,7 @@ mod tests {
         // The deadline comes before the count, and uses up no request id.
         let late = MAX_TXN_DEADLINE + Duration::from_millis(1);
         let txn = db.txn(&puts, late).expect_err("past the deadline");
-        refused_unsent(
+        invalid_unsent(
             &txn.error,
             &format!(
                 "deadline: {} ms is past the maximum of {} ms; nothing was sent",
@@ -12048,7 +12579,7 @@ mod tests {
         };
         for (request, look) in (1_u64..).zip(looks(MAX_PAGE + 1)) {
             let refused = db.read(b"l", look).expect_err("over the limit");
-            refused_unsent(
+            invalid_unsent(
                 &refused,
                 &format!("page limit 1001, over 1000; request {request} not read"),
                 &mailbox,
@@ -14931,11 +15462,7 @@ mod tests {
         let refused = db
             .put(&[0; MAX_OBJECT_ID + 1], b"1", None)
             .expect_err("over the limit");
-        assert_eq!(
-            refused.error.kind,
-            ErrorKind::InvalidArgument,
-            "{refused:?}"
-        );
+        assert_eq!(refused.error.kind, ErrorKind::TooLarge, "{refused:?}");
         let clients: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
             .filter(|line| line["@m"] == "limit_refused")

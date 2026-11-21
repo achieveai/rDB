@@ -122,9 +122,15 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
 /// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
-/// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// default. Default on: a bump to the next free number at that merge, or a capability bit that
+/// gates the re-add. Any change that weakens check A takes a bump.
+///
+/// Issue #148 changes a type: the `TooLarge` error kind, which `WireApiError::kind` carries.
+/// Only the `Db` raises it, before it sends, so no node answers it today; the type changed all
+/// the same. Numbers are assigned at merge (lead rule, PR #178 review): a branch takes main's
+/// version + 1, in a one-line commit just before it merges, so this branch reserves none. The
+/// value below is a placeholder until that commit sets it.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1236,8 +1242,10 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
                 }),
             );
             if posted.is_err() {
-                let error =
-                    ApiError::host(&format!("node {} is not served by {}", to.0, shared.label));
+                let error = ApiError::owner_fault(&format!(
+                    "node {} is not served by {}",
+                    to.0, shared.label
+                ));
                 conn.out(Frame::Reply {
                     correlation: reply,
                     reply: WireReply::Answer(WireAnswer::carry(&Answer::Error {
@@ -1322,6 +1330,8 @@ fn undecodable_call(to: NodeId, error: &str) -> ApiError {
             to.0
         ),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 

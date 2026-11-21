@@ -210,7 +210,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 ```
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
-  calls; do not call them from inside an async task.
+  calls. Do not call them inline from an async task: wrap the `Db` in `AsyncDb`
+  ([Async calls](#async-calls)), whose calls never block a tokio worker.
 - The runtime whose handle you pass must keep running until `db.shutdown()` returns. Control
   calls to rEtcd, watches and the reopen's repair run as tasks on it, also while your thread
   sits in `wait_ready`, `put` or `get`. A multi-thread runtime, as above, does that. A
@@ -312,6 +313,57 @@ fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
 - This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
   (`guide_sample`), so it matches this release.
 
+### Async calls
+
+Every `Db` call but `open` blocks its thread until the node answers (#146). Called inline from
+a task, it parks a tokio worker for the whole call. On a current-thread runtime it can also wait
+for a task that cannot run: `db.route(..)` on a cold cache waits for a control read on the
+`Db`'s own runtime, and answers `UNAVAILABLE "did not read within"`.
+
+`rdb_api::AsyncDb` wraps an `Arc<Db>` and runs each call, unchanged, on tokio's blocking pool
+(`spawn_blocking`), so no worker waits:
+
+```rust,ignore
+let db = AsyncDb::new(Arc::new(Db::open(config, store, handle).await?));
+db.wait_ready(Duration::from_secs(30)).await?;
+let put = db.put(group, Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).await?;
+let got = db.get(group, Bytes::from_static(b"k")).await?;
+db.shutdown().await.ok();
+```
+
+- The calls are `wait_ready`, `put`, `get`, `read`, `write`, `txn`, `txn_as`, `resend_within`,
+  `status`, `route` and `ownership_events`. `scoped(scope)` gives a tenant's handle (see
+  [Scopes, groups, list and delete](#scopes-groups-list-and-delete)). Each names its group; each answers exactly what the
+  sync `_in` call answers, with the same timeouts, errors and retry rules.
+- `txn` and `txn_as` take `Vec<TxnWrite>`, the owned form of `TxnPut`.
+- `status(group, request, generation)` is `status_in`. Ask with the write's generation: with
+  the ack floor on, asked with `None`, an acknowledged write answers `Unknown`.
+- `ownership_events()` returns a `tokio::sync::mpsc::Receiver`. One blocking-pool thread carries
+  the events for as long as the receiver lives; it lets go within 100 ms of the receiver being
+  dropped. So size the pool (`max_blocking_threads`) to at least the receivers you keep plus
+  one, or every other call, `shutdown` included, queues behind them.
+- `db.db()` gives the `Db` for the calls that never block: `ownership` and `still_owner`. Admin and dev calls have no async form; wrap them in `spawn_blocking` yourself.
+- Await the calls inside any tokio runtime: its blocking pool runs them. That pool is bounded
+  (512 threads by default). Past that, calls queue on the pool; no worker blocks.
+- A panic inside a call reaches the task that awaited it, as the sync call's panic would.
+- **Dropping a write's future does not cancel the write.** It stops the wait only: a `put`,
+  `txn` or `write` already on the pool runs on and may apply, and its request id is lost with
+  the future. That is intended. When exactly-once matters, write under a request id you saved
+  before the call (`app_request_id(n)`): `txn_as` here (a one-put transaction for a single put),
+  or `Db::put_as` and `Db::txn_as` on the sync `Db`. Then ask `status` with that id, or send it
+  again with `resend_within`.
+- A call the pool never ran (the runtime shut down first) sent nothing: a write answers
+  `no_mutation` true. `wait_ready` and `shutdown` panic then instead, having no error to
+  return.
+- Dropping the last `AsyncDb` (and the last `Arc<Db>`) inside a task drops the `Db`, whose
+  `Drop` stops and joins its node threads, on that task's thread. End with
+  `db.shutdown().await`, which does that on the blocking pool. It answers `Err(db)`, doing
+  nothing, while another clone is alive.
+- A runtime that is dropped waits for the blocking-pool calls still running.
+- To restart an embedded `Db` that runs its own links: `db.shutdown().await`, then shut the
+  `Net` down (`Net::shutdown`, which #81 adds), then drop the `Db`, the `Net` and the `Links`,
+  then open again. A `Db` shutdown does not stop its `Net`.
+
 ### How big a transaction can be
 
 A transaction must fit one record of at most 1,048,576 bytes
@@ -334,24 +386,51 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
-  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
-  bytes.
+- The largest single value a put takes is `MAX_VALUE`, 1,044,480 bytes, for any id. A byte
+  write over the bound is refused by the `Db` with `TOO_LARGE` before it is sent (see
+  [Size limits](#size-limits)).
 
-A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
+A `write` (`Change::Doc`, a map, a set or a list) one byte over the record is refused with
+`INVALID_ARGUMENT`, and nothing is written:
 
 | Over the limit | Refused by | Detail |
 |---|---|---|
 | One put, alone | the compile, with the kernel's `record_len` | `over the 1 MiB limit for the whole write` |
 | Only all the puts together | the kernel's admission check | `envelope_bytes` |
 
-- A single value of 1 MiB or more can get a different detail, naming the 1,048,536-byte limit for
-  one value (`rdb_value::envelope::MAX_PAYLOAD`). Sent to an owner in another process, it reads
-  `a value cannot be carried`. Both are `INVALID_ARGUMENT`. The record limit above is always the
-  lower one.
 - The ack floor uses only the room a transaction leaves, so it is not part of the sum.
 - `write` (`Change::Doc`, maps, sets, lists and blob chunks) has the same limit, but its overhead
   differs, so this sum does not apply to it.
+
+### Size limits
+
+Every limit below is checked by the `Db` before anything is compiled or sent (#148). Over one,
+the call is refused with `TOO_LARGE`, `retry: Definitive` and `no_mutation: true`, and nothing is
+written. The same call fails the same way, so make it smaller. `ApiError::too_large()` returns a
+`TooLarge { limit, size, max }`: which limit, the size the call carried, and the maximum.
+
+| Limit (`rdb_api::Limit`) | Constant | Maximum | Applies to |
+|---|---|---|---|
+| `ObjectId` | `MAX_OBJECT_ID` | 1,024 bytes | Every write and read |
+| `Key` | `MAX_KEY` | 1,024 bytes | A map key or set member, and `Look::Members { after }` |
+| `Value` | `MAX_VALUE` | 1,044,480 bytes | Each value of `put`, `put_in`, `put_as`, `txn` and `txn_as` |
+| `Write` | `MAX_WRITE` | 1,048,576 bytes | A whole `put` or `txn`, by the upper-bound sum above |
+| `Ops` | `MAX_OPS` | 255 | The ops of one change, and the puts of one `txn` |
+| `Chunk` | `rdb_value::blob::MAX_CHUNK` | 1,044,480 bytes | One `Change::Chunk` |
+
+- `MAX_VALUE` is fixed: it does not move with the id. A value of up to `MAX_VALUE` bytes fits one
+  put under any id the `Db` accepts. Values above it, up to the old id-dependent ceiling, were
+  accepted before #148 and are refused now. Values already stored stay readable.
+- A "1 MiB" value (1,048,576 bytes) does not fit, and never did. Store larger data as a blob:
+  `Change::Chunk` with chunks of at most `MAX_CHUNK` bytes, then `Change::Publish`.
+- For `Write`, `size` is the upper-bound sum, never below the exact record. So a write at the
+  limit always passes, and no refusal from the compile or the kernel lands first.
+- An over-long object id answers first. In a byte write, a value over `MAX_VALUE` answers
+  before the whole write.
+- A page `limit` over `MAX_PAGE` and a deadline over `MAX_TXN_DEADLINE` are not sizes. They stay
+  `INVALID_ARGUMENT`.
+- Only the `Db` raises `TOO_LARGE`, so `too_large` is never set on an answer that came over a
+  link. The gateway sends wire kind `TOO_LARGE` with gRPC code `INVALID_ARGUMENT`.
 
 ### More than one partition
 
@@ -771,6 +850,100 @@ send a request to the right node.
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
 `admin route G` prints `route group G partition P owner node N token G.E`.
 
+### Scopes, groups, list and delete
+
+Give request code a `ScopedDb`, never the `Db` (#147). A `ScopedDb` is one tenant's view: it
+reaches that tenant's data and nothing else, whatever partition the data shares.
+
+```rust,ignore
+let scope = Scope::new(b"acme", Some(b"tenant-42"))?;    // app, optional sub-tenant
+let tenant = async_db.scoped(scope);                     // hand this to request code
+tenant.put(workspace, Bytes::from_static(b"doc"), value, None).await?;
+let page = tenant.list(workspace, Bytes::new(), None, 100).await?;
+tenant.delete_prefix(workspace, Bytes::new(), deadline).await?;
+```
+
+- **A scope** is an app (1–64 bytes) and an optional sub-tenant (1–64 bytes). Any byte is
+  allowed. An empty part, or one over 64 bytes, is a `ScopeError`. A scope is a leaf: an
+  app-level handle sees none of its sub-tenants' data. Open one handle per (app, sub).
+- **A workspace** is a `u64` group inside a scope. Every call names one, and an object id inside
+  it. No call takes a key, an `AffinityId` or a raw `RequestId`.
+- The calls are `put`, `get`, `read`, `write`, `write_as`, `txn`, `txn_as`, `status`,
+  `status_of`, `resend_within`, `list` and `delete_prefix`. Each answers what its `Db` call
+  answers.
+
+**How it is stored.** These bytes are permanent (SBX ADR 0039): renaming an app means moving its
+data.
+
+```text
+S         = len(app) u8 | app | 0x00                          no sub-tenant
+S         = len(app) u8 | app | 0x01 | len(sub) u8 | sub      with a sub-tenant
+stored id = S || workspace u64 BE || id
+affinity  = first 8 bytes BE of SHA-256("RDBSCOPE1" || S || workspace BE)
+request   = APP_REQUEST_BIT | top-bit-cleared first 8 bytes BE of
+            SHA-256("RDBREQ1" || S || workspace BE || n BE)
+```
+
+- No `S || workspace` is a prefix of another, so no key of one (scope, workspace) is a key of
+  another. That is what isolates tenants. The affinity only places data: two workspaces that
+  land on one partition, or on one affinity, still share no key.
+- The affinity hashes the workspace, so one scope's workspaces spread over every partition.
+  Never place by tenant alone: one tenant would become one hot partition.
+- `write_as`, `txn_as` and `status` take the app's own request number `n`, per scope and
+  workspace. Two scopes using the same `n` never meet. A request id from two scopes collides
+  only on a 63-bit hash collision, about M²/2^64 for M live ids, and its effect is a status
+  answer, never a value.
+- `resend_within` and `status_of` take only a `ScopedSent`, which only a scope's own answers
+  carry. Another scope's token is `INVALID_ARGUMENT`, and nothing is sent. A scoped answer's
+  `PutOk.sent` holds no keys or values.
+
+**Id budget.** Every scoped id is at most `MAX_SCOPED_ID` = 885 bytes, in every scope: 1,024
+less the longest `S` (131 bytes) and the workspace (8). A longer id is `TOO_LARGE` with
+`TooLarge { limit: ObjectId, size, max: MAX_SCOPED_ID }`. The budget does not move with the
+scope's length.
+
+**List.** `list(workspace, prefix, after, limit)` returns up to `limit` (at most `MAX_PAGE`)
+objects whose id starts with `prefix`, after `after`: each `ObjectEntry { id, version, kind }`,
+with `id` inside the scope. `next` is the last id when the page is full; pass it as `after`.
+
+- An empty prefix lists the whole workspace. A workspace is the widest list: rDB keeps no list of
+  a scope's workspaces. Keep your own index of workspaces to offboard a whole tenant.
+- One object costs one seek, however many entries it holds. Records with no root, such as the
+  chunks of an upload never published, are not listed.
+- Each page is one read. Pages are not one snapshot.
+
+**Delete.** `write(workspace, id, Change::Delete, expect)` deletes any kind of object.
+
+- A document is one call. A larger map, set, list or blob is deleted in batches of up to 254
+  records: call again until `Ok(None)`. Between batches the object reads as valid or absent,
+  never as damage: a map, set or list reads with fewer entries, and a blob reads as absent
+  (its root goes first; the chunks left go in the next calls). A new object at that id never
+  inherits old entries.
+- `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
+  `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
+- `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload
+  chunks with no root included, and returns how many. **It is not atomic.** On an error,
+  `PrefixDeleteError { deleted, error }` says how far it got; run it again to finish. An object
+  created under the prefix while it runs may survive.
+- Offboarding a tenant is one `delete_prefix(workspace, "")` per workspace in your index.
+
+**What a scope does not stop.**
+
+- A holder of the `Db` or the `AsyncDb` reaches every scope. In process, the boundary is the type
+  you hand to request code.
+- An app connected over a network link is not scoped by the node. **rDB's client and peer ports
+  must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
+  your gateway. A node-side check of the certificate's app against the id is owed (#154).
+  rDB ships no deployment config, so until #154 that boundary is the embedder's network policy.
+  For SBX (checked 2026-11-20): rDB is embedded in-process only, its ports are firewalled from
+  the sandbox and app networks, and gateways talk to each other over their own mTLS.
+- `route`, `ownership` and ownership events return partition and node facts only, never a
+  record.
+
+**Try it.** `cargo run -p rdb-api --example scoped_db` writes `doc` in four scopes whose names
+run into each other (`a`, `ab`, `a`+`b`, `a`+`c`) and prints each scope's value and list, then
+deletes one scope's workspace and lists again. Only that scope's list changes.
+
 ## 5. Reopening your folder
 
 Open the same folder against the same rEtcd with the same `Db::open` call. There is nothing
@@ -1020,6 +1193,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` tries to re-read the owner on this answer (see the barrier notes below for when it does not); the retry goes to the new one once a re-read succeeds. |
+| `TOO_LARGE` | The call is over a fixed size limit: an object id, a key, a value, a whole write, a change's ops or a blob chunk. Nothing was sent. `refused.error.too_large()` names the limit, the size and the maximum ([Size limits](#size-limits)). | Never as it is. Make it smaller, and send it as a new write. |
 | `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without confirming the position. When the owner answers it, either a regular copy has not proved it, and the message names the copies still owed; or every copy proved it but the owner's grant stopped admitting before it could answer `Ok`, and the message says so, names no copy, and says to read back, since a newer owner may have replaced it. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
@@ -1113,10 +1287,12 @@ above comes back by itself once its link is back:
   and the partition can then stay read-only until that copy's node restarts. A build older than
   check B can also be left holding a lineage with a hole in it, which nothing refuses
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
-  them apart. Turning it on by default first needs the protocol version raised to 10, or a
-  capability bit that gates the re-add, so a node without these guards is refused or never
-  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
+- **Before it can be on by default.** Some builds without these guards speak protocol 9 (main at
+  1eb3fe0 has neither), and the version alone cannot tell them apart. #148 moves the version
+  again, to the number its merge commit sets. Turning it on by default first needs a protocol
+  bump that no such build shares (the next free number at that merge), or a capability bit
+  that gates the re-add, so a node without these guards is refused or never re-added live
+  (ADR-rdb-0009 section 7). Until then it stays off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1387,7 +1563,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  as undecodable. Its node protocol is version 9 (#148 moves it, to the number its merge
+  commit sets), and the handshake refuses any other version.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
@@ -1458,6 +1635,11 @@ A refused call (`put`, `get`, `read`, `write`, `status`) returns `ApiError`. Its
 alone, and `ApiError::explain()` gives the detail with it. For example, a refusal while the
 database is not serving says `UNAVAILABLE (...; next: the database is not serving right now:
 wait a few seconds and try again; ...)`.
+
+`ApiError`'s fields stay public to read, but it has a private one too (#134), so code outside
+`rdb_api` cannot build one with a struct literal. Build one with its constructors:
+`ApiError::new(kind, detail)`, `ApiError::invalid(detail)` or `ApiError::from_kernel(&error)`,
+then `with_retry_after` when needed. SBX had no such literal (checked 2026-11-20).
 
 **Refused for good.** No open of this folder, against this rEtcd, will ever succeed. Retrying
 does not help; the "what to do" column does.

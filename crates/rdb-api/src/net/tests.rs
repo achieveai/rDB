@@ -164,6 +164,65 @@ fn seed() -> Box<DormantSeed> {
     Box::new(seed)
 }
 
+/// #147: the new variants were appended, so every older variant keeps its postcard tag, and a
+/// tag a build does not know is a decode error, not a panic. An older node never sees one: the
+/// handshake refuses a peer whose `PROTOCOL_VERSION` differs. Cut: insert `Delete` before
+/// `Clear`, and `Clear`'s tag moves.
+#[test]
+fn new_scope_variants_are_appended_and_an_unknown_tag_is_refused() {
+    let tag = |bytes: Vec<u8>| bytes[0];
+    let delete = postcard::to_stdvec(&wire::WireChange::Delete).expect("encodes");
+    let clear = postcard::to_stdvec(&wire::WireChange::Clear).expect("encodes");
+    let list = postcard::to_stdvec(&wire::WireLook::List {
+        after: None,
+        limit: 1,
+        rootless: false,
+    })
+    .expect("encodes");
+    let objects = postcard::to_stdvec(&wire::WireSeen::Objects {
+        objects: Vec::new(),
+        full: false,
+    })
+    .expect("encodes");
+    assert_eq!(
+        (
+            tag(clear),
+            tag(delete.clone()),
+            tag(list.clone()),
+            tag(objects.clone())
+        ),
+        (7, 8, 5, 5)
+    );
+    let mut change = delete;
+    change[0] = 9;
+    assert!(postcard::from_bytes::<wire::WireChange>(&change).is_err());
+    let mut look = list;
+    look[0] = 6;
+    assert!(postcard::from_bytes::<wire::WireLook>(&look).is_err());
+    let mut seen = objects;
+    seen[0] = 6;
+    assert!(postcard::from_bytes::<wire::WireSeen>(&seen).is_err());
+    let frame = wire::decode(&[0xff, 0x01]).expect_err("no frame has tag 255");
+    assert!(matches!(frame, wire::WireError::Decode(_)), "{frame}");
+}
+
+/// #134: a call the node could not decode is not an owner fault, so no takeover step: its
+/// detail already says to check both sides run the same build, and its step is "retrying will
+/// not help". It keeps that across the wire. Cut: build it with `ApiError::owner_fault`: red.
+#[test]
+fn an_undecodable_call_keeps_retrying_will_not_help() {
+    let error = super::undecodable_call(NodeId(2), "unknown variant tag 9");
+    let landed = crate::db::ApiError::from(wire::WireApiError::from(&error));
+    for error in [&error, &landed] {
+        assert!(!error.owner_fault, "{error}");
+        assert_eq!(
+            error.next_step(),
+            Some("retrying will not help: keep this Db's log and report this message"),
+            "{error}"
+        );
+    }
+}
+
 /// Every client call shape the API sends: each change, each look.
 fn calls() -> Vec<ClientCall> {
     let upload = [5u8; 16];
@@ -212,6 +271,7 @@ fn calls() -> Vec<ClientCall> {
         },
         Change::Gc { floor: 12 },
         Change::Clear,
+        Change::Delete,
     ];
     let looks = vec![
         Look::Doc,
@@ -233,6 +293,16 @@ fn calls() -> Vec<ClientCall> {
             limit: 2,
         },
         Look::Range { offset: 8, len: 16 },
+        Look::List {
+            after: Some(Bytes::from_static(b"a\x00b")),
+            limit: 1_000,
+            rootless: true,
+        },
+        Look::List {
+            after: None,
+            limit: 1,
+            rootless: false,
+        },
     ];
     let mut calls: Vec<ClientCall> = changes
         .into_iter()
@@ -361,6 +431,28 @@ fn answers() -> Vec<Answer> {
                 },
             },
             bytes: Bytes::from_static(b"rang"),
+        },
+        // #147: every root kind, and a rootless id.
+        Seen::Objects {
+            objects: [
+                rdb_value::envelope::Kind::Document,
+                rdb_value::envelope::Kind::Map,
+                rdb_value::envelope::Kind::Set,
+                rdb_value::envelope::Kind::List,
+                rdb_value::envelope::Kind::Blob,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(n, kind)| rdb_value::keys::Listed {
+                id: vec![n as u8, 0x00],
+                root: Some((n as u64 + 1, kind)),
+            })
+            .chain([rdb_value::keys::Listed {
+                id: b"orphan".to_vec(),
+                root: None,
+            }])
+            .collect(),
+            full: true,
         },
     ];
     let mut answers: Vec<Answer> = seen
@@ -1781,7 +1873,7 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
+    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 11");
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

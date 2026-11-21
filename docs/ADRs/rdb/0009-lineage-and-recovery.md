@@ -517,6 +517,10 @@ node whatever the setting, as check B does (slice 1, above).
   operator rule while the setting is off by default. Default-on prerequisite: a bump to 10, or a
   capability bit that gates the re-add, so a peer without both guards refuses or is never
   re-added live (issue #107). Any change that weakens check A takes a bump.
+  *Note 2026-11-20 (PR #178 review):* "a bump to 10" reads "a bump to the next free number at
+  that merge". Protocol numbers are assigned at merge: a branch takes main's version + 1 in a
+  one-line commit just before it merges, so no branch holds a number in advance (issue #148,
+  the `TooLarge` error kind, takes one that way; `crates/rdb-api/src/net/mod.rs`).
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
