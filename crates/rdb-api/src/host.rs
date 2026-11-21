@@ -2520,8 +2520,9 @@ struct FeedFreshness {
     read: Option<(Tick, FeedControlRead)>,
     /// A read is in flight.
     in_flight: bool,
-    /// Why the last read failed, at most [`FEED_READ_FAILURE_CHARS`] characters, until a read
-    /// answers again: the refusal "call again" names it (review r4, thread 4654680320).
+    /// Why the last read failed, until a read answers again: the refusal "call again" names it
+    /// (review r4, thread 4654680320). Its first [`FEED_READ_FAILURE_CHARS`] characters, then
+    /// "..." when more were left out, so at most 203 characters.
     failed: Option<String>,
     /// Feed calls waiting for that read: answered when it lands, or at their `until`
     /// ([`FEED_READ_WAIT_MILLIS`]), whichever is first. A call is never refused only because
@@ -2530,8 +2531,9 @@ struct FeedFreshness {
     waiting: Vec<FeedWaiter>,
 }
 
-/// The most of a failed control read's error a feed refusal repeats ([`FeedFreshness::failed`]):
-/// enough to name the cause, never a whole store error.
+/// How many characters of a failed control read's error a feed refusal repeats
+/// ([`FeedFreshness::failed`]): enough to name the cause, never a whole store error. A longer
+/// error is cut there and gains "...", so the excerpt is at most 203 characters.
 const FEED_READ_FAILURE_CHARS: usize = 200;
 
 /// A feed call parked on its partition's control read ([`FeedFreshness::waiting`]).

@@ -2035,7 +2035,7 @@ fn f87_3_a_feed_call_to_a_stopped_member_names_why() {
 /// why in its refusal, bounded, and keeps the refusal's transient rule. Node 2 is cut from
 /// rEtcd (`cut-control`); once its last good read is older than the grant, a feed call is
 /// refused `UNAVAILABLE`, `BoundedJitter`, no mutation, "call again; the last read failed:"
-/// naming the cut, at most 200 characters of it.
+/// naming the cut: its first 200 characters, and "..." when it is longer, so at most 203.
 /// Cut: the refusal without the failure, red (never "the last read failed").
 /// Integration (~5 s): processes, one short grant.
 #[config_log::retcd_test]
