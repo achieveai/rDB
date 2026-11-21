@@ -1833,8 +1833,10 @@ fn pr74_r3_the_admin_list_names_who_may_move_not_the_name_admin() {
 /// #170 review (owner ruling 2026-11-20, fail closed): a change feed call passes only from an
 /// app on the admin list, or from a node, whatever tenant it names; any other app is refused
 /// with the reason naming #151, for its own tenant and for another. Other calls from that app
-/// are untouched.
-/// Cut: no `Changes` arm in `sender_refused`, red (app `gw` passes).
+/// are untouched. Round 3: membership of the configured list decides, not the name: `ops`
+/// passes under an ops-only list, and `admin` is refused under that list and under an empty one.
+/// Cuts: no `Changes` arm in `sender_refused`, red (app `gw` passes); the arm's guard
+/// `!admin_apps.contains(app)` as `app != "admin"`, red (`ops` refused, `admin` passes).
 /// Unit.
 #[test]
 fn f87_2_r2_only_an_admin_app_may_read_the_change_feed() {
@@ -1864,6 +1866,21 @@ fn f87_2_r2_only_an_admin_app_may_read_the_change_feed() {
                 && reason.contains("needs the admin certificate")
                 && reason.contains("(#151)"),
             "{reason}"
+        );
+    }
+    // Round 3 (r3 blocker 1, r4): membership of the configured list decides, not the name
+    // `admin`. A configured non-default admin reads; `admin` left off that list, or off an
+    // empty list, is refused.
+    let ops = Label::App("ops".to_owned());
+    let ops_only = BTreeSet::from(["ops".to_owned()]);
+    let msg = changes(1);
+    assert_eq!(super::sender_refused(&ops, &msg, &ops_only), None);
+    for (list, which) in [(&ops_only, "ops-only"), (&BTreeSet::new(), "empty")] {
+        let reason = super::sender_refused(&admin, &msg, list)
+            .unwrap_or_else(|| panic!("admin read the feed under the {which} list"));
+        assert!(
+            reason.contains("app admin may not read the change feed on node 2"),
+            "{which}: {reason}"
         );
     }
     let status = WireMsg::Client {
