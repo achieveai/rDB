@@ -144,15 +144,20 @@ pub(crate) fn record(dir: &Path, id: &str) -> std::io::Result<()> {
 fn current(_dir: &Path) -> Result<Option<String>, String> {
     if cfg!(target_os = "linux") {
         const PATH: &str = "/proc/sys/kernel/random/boot_id";
-        let id = std::fs::read_to_string(PATH).map_err(|error| format!("{PATH}: {error}"))?;
-        let id = id.trim();
-        if id.is_empty() {
-            return Err(format!("{PATH} is empty"));
-        }
-        Ok(Some(id.to_owned()))
+        let text = std::fs::read_to_string(PATH).map_err(|error| format!("{PATH}: {error}"))?;
+        parse_id(PATH, &text).map(Some)
     } else {
         Ok(None)
     }
+}
+
+/// The OS boot id in `text`, read from `source`: trimmed, and an error when nothing is left.
+fn parse_id(source: &str, text: &str) -> Result<String, String> {
+    let id = text.trim();
+    if id.is_empty() {
+        return Err(format!("{source} is empty"));
+    }
+    Ok(id.to_owned())
 }
 
 /// Crate tests: the id [`inject`] gave `dir`, or an error when it gave none.
@@ -189,7 +194,7 @@ pub(crate) fn inject(dir: &Path, id: Result<&str, &str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{inject, observe, record, OsBoot, OS_BOOT_FILE};
+    use super::{inject, observe, parse_id, record, OsBoot, OS_BOOT_FILE};
 
     /// R5 rows 6 and 7, detection: the verdict of a folder against its file. The same id on file
     /// is `Same` and keeps the file. A different id is `Changed`; no file, or an id that cannot
@@ -253,6 +258,17 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// PR #181 review: the production parse of `/proc/sys/kernel/random/boot_id`, which crate
+    /// tests otherwise replace whole. Unit (~1 ms).
+    /// Cut: `parse_id` keeps the newline or accepts blank text, red.
+    #[test]
+    fn r5_k_the_os_boot_id_is_trimmed_and_blank_text_is_no_id() {
+        assert_eq!(parse_id("p", "abc-123\n"), Ok("abc-123".to_owned()));
+        assert_eq!(parse_id("p", "  abc  "), Ok("abc".to_owned()));
+        assert_eq!(parse_id("p", ""), Err("p is empty".to_owned()));
+        assert_eq!(parse_id("p", " \n\t "), Err("p is empty".to_owned()));
     }
 
     /// PR #181 review: an empty or blank `os_boot` file proves no boot, so it reads as missing,
