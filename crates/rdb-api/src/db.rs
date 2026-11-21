@@ -582,6 +582,9 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Why the running heal is waiting, as its latest `heal_retry` said (R5): `wait_ready`'s
+    /// time-out names it. `None` once the heal ends, or before it has waited.
+    heal_waiting: Arc<Mutex<Option<String>>>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
@@ -603,6 +606,15 @@ struct Opened {
     /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
     /// given it, so an owner re-seats the copies its partition was placed on.
     nodes: Arc<[NodeId]>,
+    /// What this open found of the OS boot for each node it runs (R5, [`crate::os_boot`]),
+    /// from that node's own `nodes/<n>/os_boot`: an owner's heal goes on without a down copy
+    /// only when its node's is `Same`. A node not here, as in an open that never looked, is
+    /// `Unknown`.
+    os_boot: BTreeMap<NodeId, crate::os_boot::OsBoot>,
+    /// The OS boot id to write to each such node's file once this open is ready
+    /// ([`Db::wait_ready`]) with its heal done, when it is not on file already; taken by the
+    /// first such ready answer.
+    os_boot_record: Mutex<Vec<(PathBuf, String)>>,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -640,12 +652,15 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
             stuck: Mutex::new(None),
             control: None,
             instance: None,
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
+            os_boot: BTreeMap::new(),
+            os_boot_record: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1463,6 +1478,9 @@ fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, 
         live_readd = live_readd.then_some(true),
         "db_open"
     );
+    // PR #181 (SBX): the setting's state, on or off, once per open. The reopen's heal leaves a
+    // down copy out only with it on (`admin::may_leave_out`).
+    tracing::info!(enabled = live_readd, "db_open_live_readd");
 }
 
 impl Db {
@@ -1778,6 +1796,16 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
+        // R5: read with the engines' `LOCK`s held, so an open refused `InUse` never touches it.
+        // One file per node, in its own copy's folder (PR #181 review): node processes share
+        // `config.dir`, and one that leads nothing must not stamp an owner's.
+        let mut os_boot = BTreeMap::new();
+        let mut os_boot_record = Vec::new();
+        for node in &config.local {
+            let seen = crate::os_boot::observe(&nodes_dir.join(node.0.to_string()))?;
+            os_boot.insert(*node, seen.verdict);
+            os_boot_record.extend(seen.to_record);
+        }
         let mut found = Self::check(
             &mut claim.engines,
             absent,
@@ -1920,6 +1948,8 @@ impl Db {
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
                 nodes: Arc::clone(&nodes),
+                os_boot,
+                os_boot_record: Mutex::new(os_boot_record),
                 ..Opened::default()
             },
             route: Route {
@@ -2000,7 +2030,15 @@ impl Db {
                 // The owner's process heals (arch-s2 B1): this one only runs its copy.
                 tracing::info!(owner = found.owner.0, "db_open_not_owner");
             } else {
-                db.start_heal(&store, &rt, budgets, boot, heals, &config.local)?;
+                db.start_heal(
+                    &store,
+                    &rt,
+                    budgets,
+                    boot,
+                    heals,
+                    &config.local,
+                    config.timeouts.live_readd,
+                )?;
             }
         }
         db.unwind = None;
@@ -2584,6 +2622,7 @@ impl Db {
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
     /// logs how many had started.
+    #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -2592,6 +2631,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        live_readd: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
             let nodes = lock(&self.nodes);
@@ -2639,33 +2679,49 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                os_boot: self
+                    .opened
+                    .os_boot
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or(crate::os_boot::OsBoot::Unknown),
+                links_since: Default::default(),
+                live_readd,
+                waiting: Arc::clone(&self.opened.heal_waiting),
             });
         }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
-        self.opened.heal_task = Some(rt.spawn(async move {
-            // One after another: every grant expires on its own clock, so the later heals
-            // find theirs already expired.
-            let mut first = None;
-            let mut ended = Ok(());
-            for ctx in ctxs {
-                match admin::heal_retrying(ctx).await {
-                    Ok(healed) => {
-                        first.get_or_insert(healed);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "heal_failed");
-                        ended = Err(error);
-                        break;
+        let waiting = Arc::clone(&self.opened.heal_waiting);
+        // R5: the heal runs in the span of the open that started it, so its lines (`heal_retry`
+        // among them) reach that open's log and not an untagged one.
+        self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
+            async move {
+                // One after another: every grant expires on its own clock, so the later heals
+                // find theirs already expired.
+                let mut first = None;
+                let mut ended = Ok(());
+                for ctx in ctxs {
+                    match admin::heal_retrying(ctx).await {
+                        Ok(healed) => {
+                            first.get_or_insert(healed);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "heal_failed");
+                            ended = Err(error);
+                            break;
+                        }
                     }
                 }
-            }
-            *lock(&state) = match (ended, first) {
-                (Ok(()), Some(healed)) => HealState::Handed(healed),
-                (Err(error), _) => HealState::Failed(error),
-                (Ok(()), None) => HealState::NotNeeded,
-            };
-        }));
+                *lock(&state) = match (ended, first) {
+                    (Ok(()), Some(healed)) => HealState::Handed(healed),
+                    (Err(error), _) => HealState::Failed(error),
+                    (Ok(()), None) => HealState::NotNeeded,
+                };
+                *lock(&waiting) = None;
+            },
+            tracing::Span::current(),
+        )));
         Ok(())
     }
 
@@ -2705,16 +2761,25 @@ impl Db {
             .into_iter();
         let Some(mut partition) = waiting.next() else {
             self.ready_seen.store(true, Ordering::Relaxed);
+            self.record_os_boot(deadline);
             return Ok(());
         };
-        let timed_out = |partition: PartitionId, phase: String| ReadyError::TimedOut {
-            within_ms: within.as_millis(),
-            owner: self.route.owner_of(partition),
-            phase: if self.route.partitions() > 1 {
+        let timed_out = |partition: PartitionId, phase: String| {
+            let phase = if self.route.partitions() > 1 {
                 format!("partition {}: {phase}", partition.0)
             } else {
                 phase
-            },
+            };
+            // R5: a heal still waiting is why there is no recovery to look at; say what for.
+            let phase = match lock(&self.opened.heal_waiting).as_deref() {
+                Some(reason) => format!("{phase}{HEAL_WAITING}{reason}"),
+                None => phase,
+            };
+            ReadyError::TimedOut {
+                within_ms: within.as_millis(),
+                owner: self.route.owner_of(partition),
+                phase,
+            }
         };
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
@@ -2739,6 +2804,7 @@ impl Db {
                         continue;
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
+                    self.record_os_boot(deadline);
                     return Ok(());
                 }
                 // It answered without admitting: a resumed old owner stays this way after a
@@ -2800,6 +2866,39 @@ impl Db {
                 return Err(timed_out(partition, phase));
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
+    /// are whole again: write the OS boot id to each of its nodes' `os_boot` files, once, when
+    /// this open found it missing or stale. Not while its heal runs or after it failed (PR #181
+    /// review): until the heal is done, an owner's tail is not known whole, and the next open
+    /// must still wait for every copy (`os_boot_record_deferred`). A failed write is logged
+    /// `os_boot_record_failed` and leaves no file, so the next open waits for every copy, as
+    /// before R5.
+    ///
+    /// The heal task marks itself done just after its last plan is handed, so an owner can
+    /// admit a moment before that: a running heal is waited for until `deadline`.
+    fn record_os_boot(&self, deadline: std::time::Instant) {
+        if lock(&self.opened.os_boot_record).is_empty() {
+            return;
+        }
+        loop {
+            let state = match &*lock(&self.opened.heal) {
+                HealState::Running => "running",
+                HealState::Failed(_) => "failed",
+                HealState::NotNeeded | HealState::Handed(_) => break,
+            };
+            if state == "failed" || std::time::Instant::now() >= deadline {
+                tracing::info!(heal = state, "os_boot_record_deferred");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (dir, id) in std::mem::take(&mut *lock(&self.opened.os_boot_record)) {
+            if let Err(error) = crate::os_boot::record(&dir, &id) {
+                tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
+            }
         }
     }
 
@@ -6332,6 +6431,9 @@ const NO_ANSWER: &str = "unknown";
 const NO_LINK: &str = "unreachable";
 /// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
+/// What joins [`ReadyError::TimedOut`]'s phase to the reopen's heal wait, when one is waiting
+/// (R5): `wait_ready` writes it, and [`timed_out_text`] splits on it.
+const HEAL_WAITING: &str = "; the reopen's heal is waiting: ";
 
 /// Why [`Db::look`] has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6344,14 +6446,25 @@ enum Unlooked {
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
 /// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
+///
+/// A phase that carries the reopen's heal wait ([`HEAL_WAITING`]) is classified by what comes
+/// before it, so a sentinel keeps its words, and the wait is said before the step (PR #181
+/// review).
 fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
+    let (phase, heal) = phase
+        .split_once(HEAL_WAITING)
+        .map_or((phase, None), |(phase, heal)| (phase, Some(heal)));
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
         NO_LINK => error::ReadySeen::NoLink,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
-    error::ready_timed_out_text(within_ms, owner.0, seen)
+    let text = error::ready_timed_out_text(within_ms, owner.0, seen);
+    match heal {
+        Some(heal) => text.replacen("; next: ", &format!("{HEAL_WAITING}{heal}; next: "), 1),
+        None => text,
+    }
 }
 
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
@@ -8483,6 +8596,54 @@ mod tests {
         on.insert("live_readd".to_owned());
         assert_eq!(fields(&lines[1]), on, "{lines:?}");
         assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
+    }
+
+    /// PR #181 (SBX): every open logs `db_open_live_readd{enabled}` once, off as well as on, so
+    /// a log shows whether the reopen's heal may leave a copy out. Unit (~1 ms).
+    /// Cut: the line logged only when on, red at the off open.
+    #[config_log::retcd_test]
+    fn db_open_logs_the_live_readd_state_once_either_way() {
+        const METHOD: &str = "db_open_logs_the_live_readd_state_once_either_way";
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let states: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_live_readd")
+            .map(|line| (line["@l"].clone(), line["enabled"].clone()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (serde_json::json!("Information"), serde_json::json!(false)),
+                (serde_json::json!("Information"), serde_json::json!(true)),
+            ],
+        );
+    }
+
+    /// PR #181 review: while the reopen's heal waits, a `wait_ready` time-out keeps each of
+    /// its three sentinels' words (no answer, no link, no recovery) and adds the heal's wait
+    /// before the step; it never renders "recovery phase unknown". Unit (~1 ms).
+    /// Cut: `timed_out_text` classifies the phase with the heal's wait still on it: red.
+    #[test]
+    fn a_timed_out_ready_keeps_its_sentinel_words_while_the_heal_waits() {
+        for (sentinel, words) in [
+            (NO_ANSWER, "answered no status look"),
+            (NO_LINK, "is not reachable from this process"),
+            (NO_RECOVERY, "runs no recovery"),
+        ] {
+            let text = ReadyError::TimedOut {
+                within_ms: 300,
+                owner: NodeId(2),
+                phase: format!("{sentinel}{HEAL_WAITING}live_readd_off"),
+            }
+            .to_string();
+            assert!(text.contains(words), "{sentinel}: {text}");
+            assert!(!text.contains("recovery phase is"), "{sentinel}: {text}");
+            assert!(
+                text.contains("the reopen's heal is waiting: live_readd_off; next: "),
+                "{sentinel}: {text}"
+            );
+        }
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn

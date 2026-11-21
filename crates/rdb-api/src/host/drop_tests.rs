@@ -7552,6 +7552,85 @@ fn issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot() {
     );
 }
 
+/// R5, lead ruling (a), the owner's half: a copy the reopen's heal left out with no grant record
+/// is alive with a late link, and comes back by #107's live re-add at the boot it still runs,
+/// with no restart. Node 3 is held until node 1 commits without it. Node 1 then forgets what a
+/// restart forgets (`left_out` and its drop records, memory only), and gets what the heal
+/// sends: `HealLeftOut` naming node 3 at `UNLINKED_BOOT`. Writes land meanwhile. Node 3's link
+/// comes back: it is pinned as a shadow at its same boot, then promoted, three regular copies,
+/// `Active`, node 3's `Host` never replaced, and node 1 reads back what it took during the
+/// outage. The heal's half (one window, then `UNLINKED_BOOT`) is
+/// `admin::tests::r5_i_a_copy_with_no_grant_is_left_out_after_one_heal_window`; the trio has
+/// no open, so no heal of its own. At the trio layer because on this base the Db rig cannot
+/// keep one link down at the same boot (`mute` still handshakes until PR #170); a Db-rig
+/// variant using `mute` follows once #170 is on main. This row sends `HealLeftOut` by hand and
+/// runs no heal, so it pins the host's half only. Cut: the host ignores `HealLeftOut` (records
+/// nothing for the live re-add), red: no `heal_left_out_clocked`, and node 3 is never pinned.
+/// The heal's choice of `UNLINKED_BOOT` is pinned by `admin::tests::r5_b` and `r5_i`.
+/// Integration (~5 s).
+#[config_log::retcd_test]
+fn r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot() {
+    const METHOD: &str = "r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let copy = copy_of(&trio, 3);
+    hold_three(&trio);
+    let after = dropped_three(&mut trio, before);
+    owner_forgets_left_out(&mut trio);
+    trio.nodes[0].0.live_readd.clocked.clear();
+    trio.nodes[0].0.live_readd.links.clear();
+    trio.nodes[0]
+        .1
+        .send(Msg::HealLeftOut {
+            partition: P1,
+            left: vec![Member {
+                copy,
+                node: NodeId(3),
+                boot: crate::admin::UNLINKED_BOOT,
+                role: ReplicaRole::RegularSecondary,
+            }],
+        })
+        .expect("node 1's mailbox");
+    trio.ready();
+    let mut request = 1;
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    let clocked = logged!(METHOD, "heal_left_out_clocked");
+    assert_eq!(clocked.len(), 1, "{clocked:?}");
+    assert_eq!(clocked[0]["left_out"].as_u64(), Some(3), "{clocked:?}");
+
+    trio.links.heal_all();
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&P1)?;
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            .map(|member| (committed.new_generation, member.boot))
+    });
+    assert_eq!(shadowed.1, boot, "re-added at the boot it still runs");
+    active_with_three(&mut trio, shadowed.0);
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    for taken in 1..request {
+        assert!(
+            present(&mut trio, taken, 1_000 + taken),
+            "k{taken} reads back"
+        );
+    }
+}
+
 /// Issue #113 with #107 slice 2a: the live re-add's shadow is promoted at catch-up too, not
 /// only a move's. Node 3 is dropped on the unreachable clock while idle, 100 records land
 /// without it, and its link comes back at the boot it still runs, so the live re-add pins it
