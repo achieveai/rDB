@@ -1,5 +1,6 @@
 //! Automatic failover, slice C1 of issue #81: a planner in each node process that promotes the
-//! partitions of a node whose process has gone silent and whose grant has run out.
+//! partitions of a node whose grant has run out and whose process has gone silent, or whose
+//! host answers a look with a fault (#122).
 //!
 //! Off unless [`crate::DbConfig::failover`] is set. Only the holder of `planner/grant` acts, and
 //! it acts only while that grant passes the same UTC rule a node's own grant does
@@ -7,7 +8,7 @@
 //! [`admin::promote_looked`], the operator's path, so the `Fencing` CAS, the freeze, the expiry
 //! proof and the re-reads decide safety, and two planners at once give one commit.
 //!
-//! A node `X` that owns a partition is failed over when either holds:
+//! A node `X` that owns a partition is failed over when any of these holds:
 //!
 //! 1. `grants/X` is frozen. A frozen grant never comes back for that process, so the silence
 //!    check is skipped (ruling C-1): a process that resumes mid-sweep still has every partition
@@ -16,8 +17,12 @@
 //!    to `X` echoed no clock probe within [`Failover::silent_after`] ([`Links::heard_within`],
 //!    ruling C-2); and `X` answers no look within the read timeout.
 //!
-//! An expired owner that is still heard, or still answers a look, is not failed over: it is
-//! faulted or cut from rEtcd but alive (customer answers 2 and 3). The planner logs
+//! 3. `grants/X`'s expiry is proven past and `X` answers a look with a host fault. A host fault
+//!    lasts the boot: a faulted node serves nothing and writes nothing more, so waiting for it
+//!    gains nothing (#122; the owner narrowed customer answer 2 on #81, Q13).
+//!
+//! An expired owner that is still heard, or still answers a look, without a fault is not failed
+//! over: it is slow or cut from rEtcd but alive (customer answers 2 and 3). The planner logs
 //! `planner_owner_alive_not_serving` once per change and leaves it to the operator.
 //!
 //! The target is [`choose_target`]'s. With fewer than two answering regular copies besides the
@@ -260,6 +265,24 @@ pub(crate) fn no_grant_grace(budgets: &Budgets) -> Duration {
     Duration::from_millis(budgets.grant_millis.saturating_mul(3))
 }
 
+/// Run `planner` to its end; a panic in it is logged as `planner_panicked` (#127), not only
+/// printed to stderr by the default hook, where no JSONL line records it.
+pub(crate) async fn panics_logged(node: NodeId, planner: impl std::future::Future<Output = ()>) {
+    use futures::FutureExt;
+    if let Err(panic) = std::panic::AssertUnwindSafe(planner).catch_unwind().await {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".to_owned());
+        tracing::error!(
+            node = node.0,
+            panic = %message,
+            "planner_panicked"
+        );
+    }
+}
+
 /// What the planner judged a node owning partitions to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
@@ -354,6 +377,14 @@ pub(crate) struct Planner {
 
 impl Planner {
     /// Hold the grant and sweep, every [`Failover::poll`], until the task is aborted.
+    /// [`Self::run`], logging a panic as `planner_panicked` (error, with its message) instead of
+    /// leaving it to stderr (#127). The planner then stops: its grant lapses and another
+    /// node's planner takes over after the expiry, as when the process stops.
+    pub(crate) async fn run_logged(self) {
+        let node = self.node;
+        panics_logged(node, self.run()).await;
+    }
+
     pub(crate) async fn run(self) {
         tracing::info!(
             node = self.node.0,
@@ -613,17 +644,26 @@ impl Planner {
             self.clear_frozen(*node, memory.held).await;
         }
         let mut todo = Vec::new();
-        for (owner, records) in owned {
-            // A planner does not judge its own node while that node's grant stands: its own
-            // host answers for itself. A frozen grant never comes back for this process, so
-            // its own remaining partitions go through the judgment like any owner's (PR #119
-            // review): otherwise a frozen node holding `planner/grant` strands them.
-            if owner == self.node && !frozen.contains(&owner) {
-                continue;
-            }
-            let verdict = self
-                .judge(owner, grants.get(&owner), records[0].0.partition)
-                .await;
+        // A planner does not judge its own node while that node's grant stands: its own
+        // host answers for itself. A frozen grant never comes back for this process, so
+        // its own remaining partitions go through the judgment like any owner's (PR #119
+        // review): otherwise a frozen node holding `planner/grant` strands them.
+        let judged: Vec<(NodeId, Vec<&Entry>)> = owned
+            .into_iter()
+            .filter(|(owner, _)| *owner != self.node || frozen.contains(owner))
+            .collect();
+        // Every owner is judged at once. A judge can wait out one look, and an owner that is
+        // heard but slow to answer costs that wait each sweep (#122), so judged in turn, k
+        // slow owners would hold back a dead owner's failover by k looks. At once, a sweep's
+        // judging takes one look at most, however many owners are slow.
+        let verdicts = self
+            .judge_all(
+                judged
+                    .iter()
+                    .map(|(owner, records)| (*owner, grants.get(owner), records[0].0.partition)),
+            )
+            .await;
+        for ((owner, records), verdict) in judged.into_iter().zip(verdicts) {
             // No alert before the owner's first grant of its own, within [`no_grant_grace`]: a
             // node just started has none until its recovery takes one, and it is not "not
             // serving" (lead ruling on PR #119). Until then `grants/{owner}` is absent or still
@@ -779,6 +819,17 @@ impl Planner {
         answers
     }
 
+    /// [`Self::judge`] for each `(owner, grant, partition)`, all at once, in the given order.
+    async fn judge_all<'a>(
+        &self,
+        owners: impl Iterator<Item = (NodeId, Option<&'a GrantRecord>, PartitionId)>,
+    ) -> Vec<Verdict> {
+        futures::future::join_all(
+            owners.map(|(owner, grant, partition)| self.judge(owner, grant, partition)),
+        )
+        .await
+    }
+
     async fn judge(
         &self,
         owner: NodeId,
@@ -795,10 +846,17 @@ impl Planner {
         if !expired {
             return Verdict::Alive;
         }
+        // The look comes before the link: a faulted owner is still heard, and its answer is
+        // what tells it from a slow one (#122, owner's answer to Q13 on #81).
+        let looked = self.look(partition, owner).await;
+        // `planner_node_silent` names the reason once per change; the host logged the fault.
+        if looked.as_ref().is_some_and(|status| status.fault.is_some()) {
+            return Verdict::Dead("owner_faulted");
+        }
         if self.links.heard_within(owner, self.failover.silent_after) {
             return Verdict::AliveNotServing("heard_on_link");
         }
-        if self.look(partition, owner).await.is_some() {
+        if looked.is_some() {
             return Verdict::AliveNotServing("answered_look");
         }
         Verdict::Dead("silent_and_expired")
@@ -851,10 +909,18 @@ impl Planner {
         held: Option<Held>,
     ) -> Result<(NodeId, Option<Result<Promoted, PromoteError>>), NoEligible> {
         let members = members.ok_or(NoEligible::MembersUnknown)?;
-        let mut looks = Vec::new();
-        for member in members.iter().filter(|member| member.node != dead) {
-            looks.push((member.node, self.look(partition, member.node).await));
-        }
+        // The members are looked at once, so one slow member costs one look, not one each.
+        let others: Vec<NodeId> = members
+            .iter()
+            .filter(|member| member.node != dead)
+            .map(|member| member.node)
+            .collect();
+        let looks: Vec<(NodeId, Option<NodeStatus>)> = futures::future::join_all(
+            others
+                .iter()
+                .map(|node| async move { (*node, self.look(partition, *node).await) }),
+        )
+        .await;
         let to = choose_target(partition, members, dead, &looks, frozen)?;
         let looked = looks
             .iter()

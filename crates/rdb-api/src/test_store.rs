@@ -811,3 +811,147 @@ impl ConfigStore for TlsReported {
         self.inner.watch_leader(request).await
     }
 }
+
+/// Any control store whose every read of `planner/grant` panics, with the message given: a
+/// planner that panics on its grant read, the first store call of each hold (PR #156 review,
+/// #127). Every other call passes.
+pub(crate) struct PanicOnPlannerGrantRead {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    message: &'static str,
+}
+
+impl PanicOnPlannerGrantRead {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        message: &'static str,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { inner, message })
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PanicOnPlannerGrantRead {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        if request.key.as_ref()
+            == rdb_core::contracts::control::ControlKey::PlannerGrant
+                .encode()
+                .as_bytes()
+        {
+            panic!("{}", self.message);
+        }
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// Any control store whose `list` answers `partitions/1` with one rDB instance swapped for
+/// another, once [`SwapPartitionOneInstance::arm`]ed: `partitions/1` replaced between an
+/// open's `get` of it and its `list` of `partitions/` (PR #156 review). Every other call passes.
+pub(crate) struct SwapPartitionOneInstance {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    swap: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl SwapPartitionOneInstance {
+    pub(crate) fn new(inner: std::sync::Arc<dyn ConfigStore>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            swap: Mutex::new(None),
+        })
+    }
+
+    /// From now on, `partitions/1` lists with the instance bytes `from` replaced by `to`.
+    pub(crate) fn arm(&self, from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len(), "an instance keeps its length");
+        *self.swap.lock().expect("swap lock") = Some((from.to_vec(), to.to_vec()));
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for SwapPartitionOneInstance {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        let mut listed = self.inner.list(request).await?;
+        let swap = self.swap.lock().expect("swap lock").clone();
+        let Some((from, to)) = swap else {
+            return Ok(listed);
+        };
+        let key = rdb_core::contracts::control::ControlKey::Partition(
+            rdb_core::contracts::ids::PartitionId(1),
+        )
+        .encode();
+        for record in &mut listed.records {
+            if record.key.as_ref() != key.as_bytes() {
+                continue;
+            }
+            let mut value = record.value.to_vec();
+            let at: Vec<usize> = (0..=value.len().saturating_sub(from.len()))
+                .filter(|start| value[*start..].starts_with(&from))
+                .collect();
+            assert_eq!(at.len(), 1, "partitions/1 names the instance once");
+            value[at[0]..at[0] + to.len()].copy_from_slice(&to);
+            record.value = value.into();
+        }
+        Ok(listed)
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.put(request).await
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
