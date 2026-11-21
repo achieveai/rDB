@@ -154,8 +154,11 @@ The first rule that matches wins. Each writes nothing.
 
 ## Logs
 
-One JSONL file, `<L>/rocks_scenario.jsonl` (default `<parent of D>/logs`), appended by every
-invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (the `--dir` value) to tell invocations apart. The first line, `config_log`'s own start-up line, comes before that span and has none of them. Events (`@m`):
+One JSONL log, `<L>/rocks_scenario.jsonl` (default `<parent of D>/logs`), appended by every
+invocation, one invocation at a time: a second one started while another runs is refused at
+log start, exit 7 (`error: cannot start logging in <L>: ...`). Past 256 MiB it rotates to
+`rocks_scenario.jsonl.1`, up to 8 files in all, so read `rocks_scenario.jsonl*` for the whole
+history (`docs/logging.md`, #158). Every line inside an invocation carries `cmd`, `pid` and `db_dir` (the `--dir` value) to tell invocations apart. The first line, `config_log`'s own start-up line, comes before that span and has none of them. Events (`@m`):
 
 | `@logger` | `@m` | Fields |
 |---|---|---|

@@ -79,8 +79,12 @@ to the newest `testRun` seen for that method — or you are querying history, no
 result. This bit the suite once already: a test that counted its own audit lines passed on the
 first local run and failed on the second, purely from accumulation.
 
-Override the directory with `RETCD_TEST_LOG_DIR`; override the test log filter (default `info`,
-`trace` for `config_*` crates) with `RETCD_TEST_LOG`.
+Override the directory with `RETCD_TEST_LOG_DIR`; override the test log filter with
+`RETCD_TEST_LOG`. The default (`config_log::testing::init_test_logging`) is `info`, `trace` for
+the `config_*` crates, `debug` for `openraft`, and `debug` for rDB's per-request targets only
+(`rdb_api::authority_check`, `rdb_api::host::write`, `rdb_api::net::request`,
+`rdb_storage::engine::batch`), so rows can read those lines without every debug line of the
+`rdb_*` crates (#158).
 
 **The daemon.** `<--log-dir>/<node_id>.jsonl` carries every line of the process — the full
 `RUST_LOG`-filtered stream, not just test-tagged lines. When the daemon is started with
@@ -92,6 +96,19 @@ per-test routing produce the second file (see the "log routing and the final lin
 [ADR-0018](ADRs/0018-daemon-lifecycle-and-cli.md)). `--log-field k=v` fields land on the
 process root span, so they appear on every line, same as `node_id`.
 
+**rDB processes rotate their file by size** (#158). `rdb_node`, `rdb-server`, `rdb_dev`,
+`rdb_bench`, `pilot_kv` and `rocks_scenario` log through `config_log::init`, whose file is a
+`config_log::SizeRotatingFile`: before a write would take `<name>` past the cap, it becomes
+`<name>.1`, the older files shift up, and the oldest is removed. Defaults
+(`SizeRotation::DEFAULT`): 256 MiB a file and 8 files kept, the live one included, so at most
+2 GiB. `rdb_node` and `rdb-server` take `--log-max-mb M` (whole MiB; `0` never rotates) and
+`--log-files N` (at least 2). A restart with a smaller `--log-files` removes the numbered files
+past the new count. One process per log: a second writer of the same `<dir>/<name>` is refused
+at start, because two would rename and remove each other's files; give each its own
+`--log-dir`. The lock is `<dir>/.<name>.lock`, which a `<name>*` glob does not match. To read
+every file of a log, glob `<name>*` (for example `rdb_node-1.jsonl*`). The rEtcd daemon
+(`config-server`) has its own writer and does not rotate; test binaries do not rotate either.
+
 ## Level policy
 
 From [ADR-0013](ADRs/0013-structured-logging-tracing.md):
@@ -100,9 +117,30 @@ From [ADR-0013](ADRs/0013-structured-logging-tracing.md):
 |---|---|
 | `error` | Invariant violation or fatal condition. |
 | `warn` | Rejected/unsafe input, gossip mismatch. |
-| `info` | Lifecycle events, and each client-facing mutation outcome — logged once by the engine per client request. |
-| `debug` | Each RPC, and each apply-time entry outcome in `KvState::apply` — hot path: one line per replicated entry, on every voter. |
+| `info` | Lifecycle events, and in rEtcd's engine each client-facing mutation outcome — logged once by the engine per client request. In rDB: lifecycle, changes of state and faults only (below). |
+| `debug` | Each RPC, and each apply-time entry outcome in `KvState::apply` — hot path: one line per replicated entry, on every voter. In rDB: every per-request line. |
 | `trace` | Raft internals, per entry. |
+
+**rDB keeps per-request lines out of `info`** (#158). A node at 500 writes/s logged about 4.8 KB
+of info a write, about 210 GB a day; the bound is now under 300 B a write, all nodes counted
+(`r158_info_log_bytes_per_write_stay_under_the_bound` and its remote-write twin). The
+per-request events are `debug`, on their own targets, so one filter turns them on without the
+rest of a crate's debug lines:
+
+| Target | Events |
+|---|---|
+| `rdb_api::host::write` | `reply`, `client_call`, `client_compile`, `txn_dispatch`, `step_view`, `authority_view` (a renewal; a new grant, seq, fence or a view past its horizon is `info`), `publication_fact` (a status; a mode change or quarantine is `info`) |
+| `rdb_api::net::request` | `net_client_request` |
+| `rdb_storage::engine::batch` | `batch_commit` |
+| `rdb_server::write` | `rdb_server_write` |
+
+For example `RUST_LOG=info,rdb_api::host::write=debug`. A refused request is counted, not
+logged one line each: `refusal_first` (`node`, `partition`, `reason`, `request_id_hash`) at
+`info` for the first refusal of a `(reason, partition)` key, and one `refusal_summary` per 10 s
+window with `refusals`, `keys`, `top` (the 16 most refused keys, each with `count` and the
+`first`/`last` request's `request_id_hash`), `others_keys`, `others_refusals` and
+`over_cap_refusals`. A window keeps at most 64 keys, so it logs at most 64 firsts; refusals of
+further keys are counted in `over_cap_refusals`.
 
 ## Redaction rules
 
