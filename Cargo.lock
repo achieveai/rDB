@@ -3525,6 +3525,7 @@ dependencies = [
  "rdb-storage",
  "rdb-value",
  "rocksdb",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
@@ -3535,6 +3536,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

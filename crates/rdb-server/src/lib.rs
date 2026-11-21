@@ -205,8 +205,8 @@ pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> 
     // `NotWired` wins over the kind. The node that answered cannot serve the call, so retrying
     // at it will not help. `NotWired` also answers a call no retry fixes, such as one that
     // did not decode, so the takeover clause opens "if the owner faulted" (PR #129 review).
-    // Another node can take a faulted owner's partition over: an operator promote today, and
-    // automatic failover once #122 lands (ruling Q13). This gateway still routes to the
+    // Another node can take a faulted owner's partition over: an operator promote, or the
+    // planner on a node process configured with failover (ruling Q13). This gateway still routes to the
     // faulted owner after the takeover: it reads the owner again only on Ready, NotPrimary,
     // LeaseExpired or a failed send. So both steps say to call Ready until it reports ready
     // first; a call then routes to the new owner and can succeed. `no_mutation` picks how a
