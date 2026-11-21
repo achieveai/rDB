@@ -119,9 +119,10 @@
 //! rule is `Db::restart_wanted`'s, which an embedder polls the same way.
 //! #80 S4: in the same check, once `nodes/N` is removed (`Db::removed`) it prints
 //! `rdb_node removed node=N` (logged `rdb_node_removed`), shuts down and exits 0: its id is never
-//! used again, so it asks for no restart.
+//! used again, so it asks for no restart. A start as a removed node is refused "node N was
+//! removed; ids are never reused; nothing was started" and exits 2, a bad argument.
 //! Errors go to stderr with the step that failed. Exit codes: 0 stopped, formed or removed, 1 a
-//! start step failed, 2 bad arguments, 75 restart wanted (V10).
+//! start step failed, 2 bad arguments (a removed `--node` too), 75 restart wanted (V10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -690,15 +691,11 @@ fn run(
             } else {
                 serve(&args, &rt)
             };
-            match result {
-                Ok(Served::Stopped | Served::Removed) => ExitCode::SUCCESS,
-                Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
-                Err(message) => {
-                    tracing::error!(%message, "rdb_node_failed");
-                    eprintln!("rdb_node: {message}");
-                    ExitCode::from(1)
-                }
+            if let Err(message) = &result {
+                tracing::error!(%message, "rdb_node_failed");
+                eprintln!("rdb_node: {message}");
             }
+            ExitCode::from(exit_code(&result))
         }
         Err(e) => {
             eprintln!("rdb_node: runtime: {e}");
@@ -707,6 +704,16 @@ fn run(
     };
     drop(guard);
     code
+}
+
+/// The exit code of a node process whose serve, form or declare ended as `result`.
+fn exit_code(result: &Result<Served, String>) -> u8 {
+    match result {
+        Ok(Served::Stopped | Served::Removed) => 0,
+        Ok(Served::Restart(_)) => RESTART_EXIT,
+        Ok(Served::RemovedId) => 2,
+        Err(_) => 1,
+    }
 }
 
 fn gen_certs(args: &Args) -> ExitCode {
@@ -925,6 +932,31 @@ fn start_check_on(
     }
 }
 
+/// #80 S4 (M8): the refusal of a start as a removed node, "node N was removed; ids are never
+/// reused; nothing was started", or `None` when `node` is live or the database is undeclared.
+/// Run first, before [`start_check_on`]: a removed id given as `--node` is a bad argument, so
+/// the serve ends [`Served::RemovedId`], exit 2.
+fn removed_start_check(
+    node: NodeId,
+    store: &dyn ConfigStore,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Option<String>, String> {
+    let declared = rt
+        .block_on(rdb_api::admin::read_formation(store))
+        .map_err(|e| format!("start check: {e}"))?
+        .is_some();
+    if !declared {
+        return Ok(None);
+    }
+    let records = rt
+        .block_on(rdb_api::admin::read_nodes(store))
+        .map_err(|e| format!("start check: {e}"))?;
+    Ok(rt
+        .block_on(rdb_api::admin::own_removed_refusal(store, node, &records))
+        .map_err(|e| format!("start check: {e}"))?
+        .map(|why| format!("{why}; nothing was started")))
+}
+
 /// How often [`watch_ownership`] reads each partition's ownership.
 const OWNERSHIP_POLL: Duration = Duration::from_millis(10);
 
@@ -1140,7 +1172,12 @@ fn serve_on_ready(
     if let Some(path) = &args.faults {
         faults.watch_file(path.clone());
     }
-    // #80 S1b: before the boot is written or anything is bound.
+    // #80 S1b: before the boot is written or anything is bound. #80 S4: a removed id first.
+    if let Some(refused) = removed_start_check(node, &*store, rt)? {
+        tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
+        eprintln!("rdb_node: start check: {refused}");
+        return Ok(Served::RemovedId);
+    }
     start_check_on(args, node, &listen, &*store, rt)?;
     if let Some(bound) = &bound {
         let at = bound
@@ -1291,6 +1328,9 @@ enum Served {
     /// #80 S4 (S-5): this node's `nodes/` record was removed (`Db::removed`), so it serves
     /// nothing again and its id is never reused: exit 0, and a supervisor should not start it.
     Removed,
+    /// #80 S4 (M8): `--node` names a removed node, so nothing was started: exit 2, a bad
+    /// argument ([`removed_start_check`]).
+    RemovedId,
     /// V10 (#81): this boot can serve nothing again, so it asks its supervisor for a restart,
     /// [`RESTART_EXIT`]. The reason `Db::restart_wanted` gave.
     Restart(RestartReason),
@@ -2554,6 +2594,78 @@ mod tests {
         );
         super::start_check_on(&node, rdb_api::NodeId(1), "10.9.9.1:7100", &*tls, &rt)
             .expect("over TLS node 1's start check passes");
+    }
+
+    /// #80 S4 M8 start half: a database is declared with nodes 1 to 3, and `nodes/3` is then
+    /// written removed (layout 3). A start as node 3 is refused "node 3 was removed; ids are
+    /// never reused; nothing was started", writes no boot, and its exit code is 2; node 1 is
+    /// not refused. Unit (one store, no node process).
+    /// Cut: `admin::own_removed_refusal` always answers `None`: node 3's check answers
+    /// "Ok(None)", red, observed 2026-11-21 at load 17-22.
+    #[config_log::retcd_test]
+    fn s80s4_a_removed_nodes_start_check_is_refused_with_the_reused_id_text() {
+        const LOCAL: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let args = parsed(&["--declare", "--peers", LOCAL]).expect("parses");
+        declare_on(&args, &store, &rt).expect("nodes 1 to 3 are declared");
+        let three = rt
+            .block_on(rdb_api::admin::read_nodes(&*store))
+            .expect("the records list")[&rdb_api::NodeId(3)]
+            .clone();
+        let written = rt
+            .block_on(store.put(config_core::PutRequest {
+                key: bytes::Bytes::from(
+                    rdb_core::contracts::control::ControlKey::Node(rdb_api::NodeId(3)).encode(),
+                ),
+                value: three.encode_removed(None),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("nodes/3 is written removed");
+        assert_eq!(written.outcome, config_core::MutationOutcome::Applied);
+
+        let refused = super::removed_start_check(rdb_api::NodeId(3), &*store, &rt);
+        assert!(
+            matches!(&refused, Ok(Some(text)) if text == "node 3 was removed; ids are never \
+                reused; nothing was started"),
+            "{refused:?}"
+        );
+        let path = |p: &std::path::Path| p.display().to_string();
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("node-3");
+        let args = parsed(&[
+            "--node",
+            "3",
+            "--dir",
+            &path(&dir),
+            "--listen",
+            "127.0.0.3:7100",
+            "--peers",
+            LOCAL,
+            "--control",
+            "http://127.0.0.1:1",
+            "--cert-dir",
+            &path(&root.path().join("certs")),
+        ])
+        .expect("parses");
+        let served = super::serve_on(&args, &rt, Arc::clone(&store));
+        assert!(matches!(served, Ok(super::Served::RemovedId)), "{served:?}");
+        assert_eq!(
+            super::exit_code(&served),
+            2,
+            "a removed --node is a bad argument"
+        );
+        assert!(!dir.exists(), "no boot was written in {}", dir.display());
+
+        assert_eq!(
+            super::removed_start_check(rdb_api::NodeId(1), &*store, &rt),
+            Ok(None),
+            "node 1 is live"
+        );
     }
 
     /// #80 S2: `--control-cluster` and `--control-voters` are read by `--gen-certs` only, and

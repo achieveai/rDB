@@ -958,10 +958,7 @@ async fn register_app_addr(
         .ok_or_else(|| refused("absent, so node's app address has no record".to_owned()))?;
     // #80 S4: a removed record (layout 3) is terminal; nothing writes a live one over it.
     if NodeRecord::decode_removed(&found.value).is_some_and(|(record, _)| record.node == node) {
-        return Err(refused(format!(
-            "node {} was removed; ids are never reused",
-            node.0
-        )));
+        return Err(refused(admin::removed_node_text(node)));
     }
     let (record, held) = NodeRecord::decode_with_app(&found.value)
         .filter(|(record, _)| record.node == node)
@@ -6848,6 +6845,16 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(format!(
             "{}; nothing but its folder was created",
             admin::S1A_STORE
+        )));
+    }
+    // #80 S4: a removed node's own id is refused before the TLS and address checks, with the
+    // reused-id text rather than "absent" (it has a record, a removed one).
+    if let Some(why) = admin::own_removed_refusal(store, *node, &records)
+        .await
+        .map_err(nodes_refused)?
+    {
+        return Err(OpenError::Config(format!(
+            "{why}; nothing but its folder was created"
         )));
     }
     // #80 S2 ruling 1 (ADR-rdb-0024): records on another machine need a TLS control link.

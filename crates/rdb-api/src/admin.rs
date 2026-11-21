@@ -945,6 +945,34 @@ fn removed_at_key(body: &[u8], key: &str) -> Option<NodeId> {
         .filter(|node| ControlKey::Node(*node).encode() == key)
 }
 
+/// Why a removed node may not open or start again (#80 S4): "node N was removed; ids are never
+/// reused". Each refusal adds what it left undone.
+#[must_use]
+pub fn removed_node_text(node: NodeId) -> String {
+    format!("node {} was removed; ids are never reused", node.0)
+}
+
+/// Whether `node`'s own `nodes/` record is removed: the refusal of its open or start, before
+/// any other check ([`removed_node_text`]). Reads the store only when `records` (the live
+/// ones) lack `node`.
+///
+/// # Errors
+///
+/// As [`read_removed_nodes`].
+pub async fn own_removed_refusal(
+    store: &dyn ConfigStore,
+    node: NodeId,
+    records: &BTreeMap<NodeId, NodeRecord>,
+) -> Result<Option<String>, DeclareError> {
+    if records.contains_key(&node) {
+        return Ok(None);
+    }
+    Ok(read_removed_nodes(store)
+        .await?
+        .contains(&node)
+        .then(|| removed_node_text(node)))
+}
+
 /// The nodes whose `nodes/` record is removed (layout 3, #80 S4); their ids are never reused.
 /// [`read_nodes`] leaves them out. Other records are not read here.
 ///

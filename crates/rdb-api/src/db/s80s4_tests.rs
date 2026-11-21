@@ -522,13 +522,16 @@ fn s80s4_an_open_on_a_removed_record_is_refused_and_route_keeps_its_app_address(
 /// removed record beside live ones fails no list:
 /// - every running node's `nodes/` watcher lists again and drops node 5 from its members;
 /// - `admin::read_nodes` lists the four live records, and `read_removed_nodes` names node 5;
-/// - node 1's declared open check, on peers 1 to 4, passes;
+/// - node 1's declared open check, on peers 1 to 4, passes; node 5's, with no app address, is
+///   refused "node 5 was removed; ids are never reused" (M6 removed half);
 /// - node 1's `route` answers for a group of every partition, node 5's included;
 /// - `admin::add_node` takes id 6, not the removed 5.
 ///
 /// Integration (five node processes). Cut: `read_nodes_at` refuses a removed record as
 /// undecodable (its old reader), so every watcher's list fails and node 1 keeps node 5 ("not
-/// within 10s: node 1 drops removed node 5"), red, observed 2026-11-20.
+/// within 10s: node 1 drops removed node 5"), red, observed 2026-11-20. Cut 2:
+/// `admin::own_removed_refusal` always answers `None`: node 5's open is refused "nodes/5 is
+/// absent, so node 5 is not a declared node", red, observed 2026-11-21 at load 17-22.
 #[config_log::retcd_test]
 fn s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working() {
     const REMOVED: NodeId = NodeId(5);
@@ -605,6 +608,25 @@ fn s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working
             &*rig.store,
         ))
         .expect("node 1's open check passes beside a removed record");
+    let refused = rig
+        .rt
+        .block_on(declared_open_refusal(
+            &[REMOVED],
+            Some(&NodeAddresses {
+                listen: rig.addrs[&REMOVED].clone(),
+                peers: rig.addrs.clone(),
+                app: None,
+            }),
+            &formation,
+            &*rig.store,
+        ))
+        .expect_err("node 5's open is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("node 5 was removed; ids are never reused"),
+        "{refused}"
+    );
 
     let one = &rig.of(NodeId(1)).db;
     for p in 1..=PARTITIONS {
