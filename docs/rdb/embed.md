@@ -820,6 +820,9 @@ record. Use it to send a request to the right node.
   again, so a node restarted with a new address is seen within about a second. Calls that
   need the same owner's address while it is being read wait for that read and take its
   answer, success or failure.
+- A node's `Db` keeps the partition answer while its control watch is open, until the watch
+  delivers a change to that partition or ends. It opens no new watch. An app-only `Db` (no
+  local node) reads rEtcd on every call.
 - **A failed address read does not fail `route` or `leader_of`** (SBX answer, 2026-11-20).
   When the owner's `nodes/{id}` read fails or does not answer in time, the answer still names
   the owner and token, with the last address a read of that owner returned in this `Db`,
@@ -865,10 +868,13 @@ address to the node, so the address alone proves nothing:
   node id (`route.owner`) before it sends any data or credentials. A wrong or stale address
   then fails the handshake, and nothing is sent.
 - **The receiver** checks `db.still_owner(partition, token)` (#84) before it accepts
-  forwarded data, so a request that reaches a former owner is refused.
-- A node's `Db` keeps the partition answer while its control watch is open, until the watch
-  delivers a change to that partition or ends. It opens no new watch. An app-only `Db` (no
-  local node) reads rEtcd on every call.
+  forwarded data, so a request that reaches a former owner is refused. That check says only
+  that the token is the present local authority for the partition, in the receiver's own
+  process, at the moment of the check. It does not check the sender's TLS identity, and it
+  says nothing about an effect that happens later: a pause after the check (a GC pause, a VM
+  suspend) still needs the destination's token fence. See "`still_owner` alone is not
+  enough" and "The destination's fence" under
+  [Fencing your own side effects](#fencing-your-own-side-effects).
 
 **Upgrading from an earlier build.** `NodeAddresses` gained `app`: add `app: None` to an
 existing `NodeAddresses { listen, peers }`, which behaves as before. `RouteInfo` is no longer
