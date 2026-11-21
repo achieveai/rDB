@@ -260,6 +260,11 @@ pub trait FaultInjector: Send + Sync {
     /// Not a [`Boundary`]: nothing can fail here, and no boundary sits inside the batch. It
     /// exists so a test can hold an apply inside its write and show that the cheap readers
     /// (membership, last applied, revision, the retired set) do not wait for it (#186).
+    ///
+    /// A trait method rather than a `#[cfg(test)]` item, as `during_snapshot_capture` is,
+    /// because config-engine's tests park an apply through it too, and a `cfg(test)` item in
+    /// this crate is invisible to them. Every production injector leaves it a no-op: blocking
+    /// here holds the state-machine lock.
     fn before_state_write(&self) {}
 
     /// Called once per export that published or was superseded, on the store's blocking
