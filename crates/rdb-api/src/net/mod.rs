@@ -123,14 +123,13 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
 /// default. Default on: a bump to the next free number at that merge, or a capability bit that
-/// gates the re-add. Any change that
-/// weakens check A takes a bump.
+/// gates the re-add. Any change that weakens check A takes a bump.
 ///
-/// `11` came with issue #148: the `TooLarge` error kind, which `WireApiError::kind` carries.
+/// Issue #148 changes a type: the `TooLarge` error kind, which `WireApiError::kind` carries.
 /// Only the `Db` raises it, before it sends, so no node answers it today; the type changed all
-/// the same. No number is reserved (the rule above): main is at 9, and open branches each took
-/// the next number they saw, #170 (the feed and live re-add, carrying #107) 10, this one 11 and
-/// #61 PR-A 12. Whichever merges later renumbers to the next free number at its merge.
+/// the same. Numbers are assigned at merge (lead rule, PR #178 review): a branch takes main's
+/// version + 1, in a one-line commit just before it merges, so this branch reserves none. The
+/// value below is a placeholder until that commit sets it.
 pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

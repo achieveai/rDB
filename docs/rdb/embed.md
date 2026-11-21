@@ -1244,10 +1244,11 @@ above comes back by itself once its link is back:
   check B can also be left holding a lineage with a hole in it, which nothing refuses
   (ADR-rdb-0009 section 7).
 - **Before it can be on by default.** Some builds without these guards speak protocol 9 (main at
-  1eb3fe0 has neither), and the version alone cannot tell them apart. This build speaks 11
-  (#148). Turning it on by default first needs a protocol bump that no such build shares (the
-  next free number at that merge), or a capability bit that gates the re-add, so a node without these guards is refused or never
-  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
+  1eb3fe0 has neither), and the version alone cannot tell them apart. #148 moves the version
+  again, to the number its merge commit sets. Turning it on by default first needs a protocol
+  bump that no such build shares (the next free number at that merge), or a capability bit
+  that gates the re-add, so a node without these guards is refused or never re-added live
+  (ADR-rdb-0009 section 7). Until then it stays off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1513,8 +1514,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9 (11 from #148), and the handshake refuses any
-  other version.
+  as undecodable. Its node protocol is version 9 (#148 moves it, to the number its merge
+  commit sets), and the handshake refuses any other version.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
