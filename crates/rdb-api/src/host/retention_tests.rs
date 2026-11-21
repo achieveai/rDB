@@ -369,3 +369,207 @@ fn t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer() {
             .then_some(())
     });
 }
+
+/// Issue #61 S3-R3 (design 3.1, `need`): a lagging member within budget holds `F`. Node 3
+/// applies the trio's first three puts and node 1's grace ends; then node 3's links are held
+/// and three more puts land, to `P`. With no byte cap and `history_keep` = 0, so `keep` reaches
+/// node 1's head after a round has sampled it, node 1's second round stops at copy 3's durable
+/// as node 1's tracker knows it, below `P`: copy 3 is counted, not behind, and nothing is
+/// trimmed past it. Healed, node 3 catches up from History, with no snapshot transfer.
+///
+/// Cut: `need` ignores member durable, red (the floor reaches `P`).
+/// Integration (~3 s): bootstrap, a hold and a heal.
+#[config_log::retcd_test]
+fn t61_s3_r3_a_lagging_member_within_budget_holds_the_floor() {
+    const METHOD: &str = "t61_s3_r3_a_lagging_member_within_budget_holds_the_floor";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        no_duty(host);
+        host.inventory_pin_millis = 0;
+    });
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    rounds_until(&mut trio, "node 1's grace ends", |host| {
+        grace_of(host).is_none()
+    });
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), P)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    for request in 4..=6 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let past = trio.head().expect("node 1 holds a head");
+    trio.until("node 1 is durable through P", |trio| {
+        let host = &trio.nodes[0].0;
+        let generation = host.newest_held(P)?;
+        (host.engine.durable(P, generation).0 >= past).then_some(())
+    });
+    trio.nodes[0].0.history_retention = HistoryRetention {
+        keep_millis: 0,
+        budget_bytes: u64::MAX,
+    };
+    let lagging = |trio: &Trio| {
+        trio.nodes[0]
+            .0
+            .replication
+            .primary(NodeId(1), P)
+            .and_then(|primary| primary.tracker().known(three))
+            .map(|known| known.durable.0)
+            .expect("node 1 knows copy 3")
+    };
+    let _sampled = floor_round(&mut trio, "the round that samples P");
+    trio.step();
+    let held = floor_round(&mut trio, "the round with keep at P");
+    let durable = lagging(&trio);
+    assert!(durable < past, "copy 3 lags: {durable} against {past}");
+    assert_eq!(
+        (held.floor, held.behind.clone()),
+        (Seq(durable), Vec::new()),
+        "copy 3 within budget holds the floor at its durable"
+    );
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    assert_eq!(trio.nodes[0].0.engine.floor_seq(P, generation), Seq(durable));
+    trio.links.heal_all();
+    trio.until("node 3 applies P after the heal", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= past)
+            .then_some(())
+    });
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert!(opened.is_empty(), "History served copy 3: {opened:?}");
+}
+
+/// Send `call` to the node at `at` (0-based), as `Db` does once that node owns partition 1.
+fn ask_on(trio: &mut Trio, at: usize, call: ClientCall) -> Answer {
+    let (reply, answer) = mpsc::channel();
+    trio.nodes[at]
+        .1
+        .send(Msg::Client(Client {
+            partition: P,
+            call,
+            reply,
+        }))
+        .expect("the node's mailbox");
+    trio.answer(&answer)
+}
+
+/// Issue #61 S3-R5 (design 3.1 m2, lead ruling R23): after a failover with `history_keep` = 0,
+/// the new primary does not trim past its secondaries before their first acks. Node 3's links
+/// are held and node 1's control store is cut, then node 2 is promoted: its `Recovered` begins
+/// a grace in the new generation. Node 2 lands that generation (which drops its inventory pin)
+/// and takes three puts. With no byte cap, every round on node 2 is held `Grace` and its floor
+/// stays where the commit left it, while copy 3 has no ack. Healed, copy 3 acks, the grace ends
+/// `acked`, and the next round trims.
+///
+/// Cut: no grace begun at `Recovered`, red (node 2's first round trims to its head).
+/// Integration (~5 s): bootstrap, a promote and a heal.
+#[config_log::retcd_test]
+fn t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks() {
+    const METHOD: &str =
+        "t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, faults) = super::seal_tests::formed(dir.path());
+    for (host, _) in &mut trio.nodes {
+        host.next_retention = Tick(u64::MAX);
+    }
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    assert!(matches!(
+        trio.ask(super::seal_tests::put(1, b"a", 5_000)),
+        Answer::Txn { .. }
+    ));
+    super::seal_tests::renewal_landed_then_no_more(&mut trio);
+    faults.apply("cut-control");
+    let promote = super::seal_tests::spawn_promote(&trio, 2);
+    let committed = trio.until("node 2 committed the new generation", |trio| {
+        trio.nodes[1]
+            .0
+            .committed
+            .get(&P)
+            .filter(|result| result.new_generation > Generation(1))
+            .cloned()
+    });
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let second = committed.new_generation;
+    trio.until("node 2 landed the new generation", |trio| {
+        trio.nodes[1].0.landed.contains(&(P, second)).then_some(())
+    });
+    assert_eq!(grace_of(&trio.nodes[1].0), Some(second), "node 2's grace");
+    trio.until("node 2 admits", |trio| {
+        (trio.status(1).admits == Some(true)).then_some(())
+    });
+    for request in 2..=4 {
+        let answer = ask_on(&mut trio, 1, super::seal_tests::put(request, b"b", 5_000));
+        assert!(matches!(answer, Answer::Txn { .. }), "{answer:?}");
+    }
+    let node2 = &mut trio.nodes[1].0;
+    node2.history_retention = HistoryRetention {
+        keep_millis: 0,
+        budget_bytes: u64::MAX,
+    };
+    node2.inventory_pin_millis = 600_000;
+    let before = node2.engine.floor_seq(P, second);
+    let head = Seq(node2.engine.buffered_applied(P, second).0);
+    assert!(before < head, "there is History to trim: {before:?} {head:?}");
+    for round in 0..3 {
+        let now = trio.clock.now();
+        assert_eq!(
+            trio.nodes[1].0.retention_round(P, now),
+            Ok(RetentionDecision::Held(RetentionHold::Grace)),
+            "round {round} waits for copy 3's first ack"
+        );
+        assert_eq!(trio.nodes[1].0.engine.floor_seq(P, second), before);
+        trio.step();
+    }
+    trio.links.heal_all();
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+    loop {
+        trio.step();
+        let now = trio.clock.now();
+        let round = trio.nodes[1].0.retention_round(P, now);
+        assert!(round.is_ok(), "{round:?}");
+        if grace_of(&trio.nodes[1].0).is_none() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "node 2's grace never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
+        .into_iter()
+        .filter(|line| line["node"] == 2)
+        .map(|line| (line["generation"].clone(), line["why"].clone()))
+        .collect();
+    assert_eq!(ends, [(second.0.into(), "acked".into())]);
+}
