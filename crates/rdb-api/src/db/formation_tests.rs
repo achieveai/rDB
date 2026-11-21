@@ -2899,6 +2899,65 @@ fn get_lands(db: &Db, group: AffinityId, key: &[u8]) -> crate::GetOk {
     }
 }
 
+/// PR #181 review (Db forwarding and the deferred marker): node 2's copy holds OS boot `A` and
+/// the OS now says `B`, a reboot. With `C` down and `live_readd` on, node 2's open must keep
+/// waiting past `C`'s grant expiry, `os_boot_changed`, and write no `os_boot` file. Opened
+/// again on `B`, `C` still down, it waits again, now `os_boot_unknown`, and still writes none.
+/// Once `C` is back, it is ready and the file holds `B`. Integration (~45 s): a formation of
+/// five, two stops, three owner opens.
+/// Cuts: the open forwards `Same` to the heal whatever it found: node 2 goes on without `C`,
+/// red; the file written at open rather than once ready: red at its absence.
+#[config_log::retcd_test]
+fn r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready() {
+    const METHOD: &str =
+        "r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready";
+    let (mut rig, _, copy) = r5_scene();
+    let dir = copy_dir(&rig, R5_OWNER);
+    let marker = dir.join(crate::os_boot::OS_BOOT_FILE);
+    crate::os_boot::record(&dir, "os-boot-a").expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok("os-boot-b"));
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    // Past C's grant (6 s plus margins), when a same-boot heal would have gone on.
+    for want in ["os_boot_changed", "os_boot_unknown"] {
+        rig.restart(R5_OWNER, live_readd_on());
+        let waited = rig.of(R5_OWNER).wait_ready(Duration::from_secs(9));
+        assert!(
+            matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+            "{want}: node 2 waits for node {}: {waited:?}",
+            copy.0
+        );
+        assert!(!marker.exists(), "{want}: no os_boot file before ready");
+        let reasons: Vec<String> = heal_decisions(METHOD)
+            .iter()
+            .filter(|line| line["@m"] == "heal_wait_all")
+            .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some(want),
+            "{reasons:?}"
+        );
+    }
+    rig.restart(copy, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("the os_boot file is written once ready")
+            .trim(),
+        "os-boot-b"
+    );
+    let decisions = heal_decisions(METHOD);
+    assert!(
+        !decisions
+            .iter()
+            .any(|line| line["@m"] == "heal_proceed_without"),
+        "{decisions:?}"
+    );
+}
+
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
 fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
     let read = rig

@@ -8,16 +8,18 @@
 //! acknowledged it. The reopen's heal may leave a copy out only while this folder's tail is
 //! known intact, which is what [`OsBoot::Same`] says.
 //!
-//! The file `os_boot`, beside the node boot's `boot` file, holds the OS boot id under which the
-//! folder's tail is known intact. The open reads it and the OS's id now:
+//! The file `os_boot`, in each copy's own folder (`nodes/<n>`), holds the OS boot id under which
+//! that copy's tail is known intact: node processes that share one folder each keep their own
+//! (PR #181 review), so a node that leads nothing never vouches for an owner's tail. The open
+//! reads it and the OS's id now, for each node it runs:
 //!
 //! - equal: [`OsBoot::Same`]. The file stays.
 //! - otherwise ([`OsBoot::Changed`], [`OsBoot::Unknown`], [`OsBoot::Unsupported`]): the file is
 //!   removed at once, before the open writes anything, and written again with the OS's id only
-//!   once this open is ready ([`record`], from `Db::wait_ready`), its heal having waited for
-//!   every copy as before. An open that dies before then leaves no file, so the next open waits
-//!   for every copy too, even on the same OS boot: the lost tail may still be only on the down
-//!   copy.
+//!   once this open is ready with its heal done ([`record`], from `Db::wait_ready`), its heal
+//!   having waited for every copy as before. An empty or blank file counts as none. An open
+//!   that dies before then leaves no file, so the next open waits for every copy too, even on
+//!   the same OS boot: the lost tail may still be only on the down copy.
 //!
 //! Linux only: `/proc/sys/kernel/random/boot_id`. A container reads its host kernel's id, so a
 //! container restart counts as the same boot, which is right: the host's page cache survived.
@@ -25,7 +27,7 @@
 //!
 //! Known limits: a VM or disk snapshot restored, or network storage that drops its write cache,
 //! keeps the OS boot id while losing the tail. An operator who restores a snapshot deletes
-//! `os_boot` from the node's folder before starting it; the open then waits for every copy.
+//! `nodes/<n>/os_boot` before starting the node; the open then waits for every copy.
 //!
 //! Crate tests never read `/proc`: [`inject`] gives a folder its id, and a folder given none
 //! reads as unknown.

@@ -611,7 +611,8 @@ struct Opened {
     /// `Unknown`.
     os_boot: BTreeMap<NodeId, crate::os_boot::OsBoot>,
     /// The OS boot id to write to each such node's file once this open is ready
-    /// ([`Db::wait_ready`]), when it is not on file already; taken by the first ready answer.
+    /// ([`Db::wait_ready`]) with its heal done, when it is not on file already; taken by the
+    /// first such ready answer.
     os_boot_record: Mutex<Vec<(PathBuf, String)>>,
 }
 
@@ -2724,7 +2725,7 @@ impl Db {
             .into_iter();
         let Some(mut partition) = waiting.next() else {
             self.ready_seen.store(true, Ordering::Relaxed);
-            self.record_os_boot();
+            self.record_os_boot(deadline);
             return Ok(());
         };
         let timed_out = |partition: PartitionId, phase: String| {
@@ -2767,7 +2768,7 @@ impl Db {
                         continue;
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
-                    self.record_os_boot();
+                    self.record_os_boot(deadline);
                     return Ok(());
                 }
                 // It answered without admitting: a resumed old owner stays this way after a
@@ -2834,9 +2835,30 @@ impl Db {
 
     /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
     /// are whole again: write the OS boot id to each of its nodes' `os_boot` files, once, when
-    /// this open found it missing or stale. A failed write is logged `os_boot_record_failed`
-    /// and leaves no file, so the next open waits for every copy, as before R5.
-    fn record_os_boot(&self) {
+    /// this open found it missing or stale. Not while its heal runs or after it failed (PR #181
+    /// review): until the heal is done, an owner's tail is not known whole, and the next open
+    /// must still wait for every copy (`os_boot_record_deferred`). A failed write is logged
+    /// `os_boot_record_failed` and leaves no file, so the next open waits for every copy, as
+    /// before R5.
+    ///
+    /// The heal task marks itself done just after its last plan is handed, so an owner can
+    /// admit a moment before that: a running heal is waited for until `deadline`.
+    fn record_os_boot(&self, deadline: std::time::Instant) {
+        if lock(&self.opened.os_boot_record).is_empty() {
+            return;
+        }
+        loop {
+            let state = match &*lock(&self.opened.heal) {
+                HealState::Running => "running",
+                HealState::Failed(_) => "failed",
+                HealState::NotNeeded | HealState::Handed(_) => break,
+            };
+            if state == "failed" || std::time::Instant::now() >= deadline {
+                tracing::info!(heal = state, "os_boot_record_deferred");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         for (dir, id) in std::mem::take(&mut *lock(&self.opened.os_boot_record)) {
             if let Err(error) = crate::os_boot::record(&dir, &id) {
                 tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
