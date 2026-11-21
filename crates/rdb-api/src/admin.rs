@@ -9861,6 +9861,31 @@ mod tests {
         assert_eq!(asked, Err("partition_forming"));
     }
 
+    /// PR #181 review: a partition pinning two regular members, the owner up and its one
+    /// secondary down, has no strict majority (1 of 2), so the heal waits, `no_majority`, even
+    /// with same-boot, `live_readd` and frozen-grant evidence. Unit (~5 ms). Cut: the majority
+    /// counted as half rounded up (`(n + 1) / 2`): node 3 is left out, red.
+    #[test]
+    fn r5_t_two_pinned_members_with_one_down_is_no_majority() {
+        let rt = runtime();
+        let ctx = r5_ctx(r5_frozen_3(&rt));
+        let rooted = [r5_members(&[1, 3])];
+        let found: Vec<(RecordMember, Option<BootId>)> = rooted[0]
+            .iter()
+            .map(|member| (*member, (member.node != NodeId(3)).then_some(OPEN_2)))
+            .collect();
+        let asked = rt.block_on(leave_out(
+            &ctx,
+            &found,
+            &rooted,
+            &[],
+            &[3],
+            true,
+            &mut BTreeMap::new(),
+        ));
+        assert_eq!(asked, Err("no_majority"));
+    }
+
     /// PR #181 review: a grant read that fails keeps its cause and its own reason,
     /// `grant_unread`, not a live copy's: `heal_copy_grant_unread{error}` once while the error
     /// is the same and again when it changes, never on every 250 ms ask. Unit (~2 s). Cuts:
