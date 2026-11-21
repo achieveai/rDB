@@ -539,7 +539,11 @@ fn a_stale_delete_leaves_a_later_uploads_chunks() {
         .unwrap()
         .unwrap();
     k.commit_any_order(&batch);
-    assert_eq!(under(&k, &root), 0, "control: the blob is deleted in one batch");
+    assert_eq!(
+        under(&k, &root),
+        0,
+        "control: the blob is deleted in one batch"
+    );
     chunks(&mut k, &root, &[8; 16]);
     assert_eq!(under(&k, &root), 3, "the new upload's chunks");
     let stale = delete_object(&k.snapshot(), &root, Some(version));
@@ -564,7 +568,9 @@ fn a_set_part_deleted_reads_as_a_smaller_set() {
         let expected = s
             .version(Namespace::User, root.as_bytes())
             .map_or(Expected::Absent, Expected::Version);
-        let ops: Vec<_> = (from..(from + 200).min(255)).map(|i| ElemOp::Add(int(i))).collect();
+        let ops: Vec<_> = (from..(from + 200).min(255))
+            .map(|i| ElemOp::Add(int(i)))
+            .collect();
         let made = compile_collection(&s, &root, CollectionKind::Set, expected, &ops).unwrap();
         k.commit(&made);
     }
@@ -578,7 +584,11 @@ fn a_set_part_deleted_reads_as_a_smaller_set() {
     assert_eq!(page.collection.count, page.members.len() as u64);
     let original: Vec<_> = (0..255).map(int).collect();
     for member in &page.members {
-        assert!(original.contains(&member.key), "{:?} is an original member", member.key);
+        assert!(
+            original.contains(&member.key),
+            "{:?} is an original member",
+            member.key
+        );
         assert_eq!(member.value, None, "a set member has no value");
     }
     finish_delete(&mut k, &root);
@@ -611,10 +621,19 @@ fn a_list_with_255_upload_chunks_reads_and_takes_a_push_at_every_stop() {
         items(&s, &root, Start::Position(0), 1_000)
             .unwrap_or_else(|e| panic!("after batch {batches} the list reads: {e:?}"));
         let push = [ListOp::Push(int(1))];
-        compile_list(&s, &root, Expected::Version(version), DEFAULT_BLOCK_MAX, &push)
-            .unwrap_or_else(|e| panic!("after batch {batches} a push compiles: {e:?}"));
+        compile_list(
+            &s,
+            &root,
+            Expected::Version(version),
+            DEFAULT_BLOCK_MAX,
+            &push,
+        )
+        .unwrap_or_else(|e| panic!("after batch {batches} a push compiles: {e:?}"));
     }
-    assert!(batches >= 3, "the items, then the chunks over two batches: {batches}");
+    assert!(
+        batches >= 3,
+        "the items, then the chunks over two batches: {batches}"
+    );
     finish_delete(&mut k, &root);
     assert_eq!(under(&k, &root), 0);
 }

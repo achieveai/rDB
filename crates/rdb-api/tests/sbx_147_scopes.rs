@@ -803,7 +803,10 @@ fn sbx_147_r_a_stopped_delete_prefix_prints_and_is_an_error() {
     let mut busy = stopped.clone();
     busy.error.error.kind = ErrorKind::Overloaded;
     assert!(busy.rerun_can_finish());
-    assert!(busy.to_string().contains("run the delete again to finish"), "{busy}");
+    assert!(
+        busy.to_string().contains("run the delete again to finish"),
+        "{busy}"
+    );
     let boxed: Box<dyn std::error::Error> = Box::new(stopped);
     let source = boxed.source().expect("the refusal is the source");
     assert!(source.to_string().contains("a refusal"), "{source}");
@@ -955,7 +958,9 @@ fn sbx_147_u_a_stopped_blob_drain_is_found_and_finished_by_a_rerun() {
             chunk_size: 1,
             sha256: sha,
         };
-        c.write(0, b(b"blob"), publish, None).await.expect("publish");
+        c.write(0, b(b"blob"), publish, None)
+            .await
+            .expect("publish");
         let stopped = c
             .delete_prefix(0, Bytes::new(), DEADLINE)
             .await
@@ -976,7 +981,11 @@ fn sbx_147_u_a_stopped_blob_drain_is_found_and_finished_by_a_rerun() {
     drop(c);
     let [_, _, scope_c, _] = scopes();
     let left = left_after(w, &scope_c, 0);
-    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert!(
+        left.is_empty(),
+        "{} records survive: {left:02x?}",
+        left.len()
+    );
     assert_eq!((first, rest), (0, 1), "the blob counts once, on the rerun");
 }
 
@@ -996,9 +1005,9 @@ fn sbx_147_v_a_reused_id_the_pool_never_ran_may_have_applied() {
         .expect("runtime");
     let handle = gone.handle().clone();
     drop(gone);
-    let doc = Change::Doc(rdb_value::delta::Delta(vec![rdb_value::delta::Op::Replace(
-        Value::Bytes(b"w".to_vec()),
-    )]));
+    let doc = Change::Doc(rdb_value::delta::Delta(vec![
+        rdb_value::delta::Op::Replace(Value::Bytes(b"w".to_vec())),
+    ]));
     let write = handle.block_on(a.write_as(0, 9, b(b"doc"), doc, None));
     let write = write.expect_err("the pool never ran it");
     assert!(!write.error.no_mutation, "write_as: {}", write.error);
