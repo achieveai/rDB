@@ -2007,7 +2007,10 @@ fn f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links() {
     });
     let fault = fault.expect("a fault");
     assert!(
-        fault.contains(&format!("the record at seq {} does not match its digest", put.seq.0)),
+        fault.contains(&format!(
+            "the record at seq {} does not match its digest",
+            put.seq.0
+        )),
         "{fault}"
     );
     for digest in &digests {

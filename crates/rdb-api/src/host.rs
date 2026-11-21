@@ -4100,6 +4100,15 @@ impl Host {
             Msg::Inspect { partition, reply } => {
                 let _ = reply.send(self.status(partition));
             }
+            // Review r3/r4 (thread 4654331877): the seam's own reply carries the fault, so the
+            // caller hears why nothing was dropped instead of a dropped reply.
+            #[cfg(debug_assertions)]
+            Msg::DropHistory { reply, .. } => {
+                let _ = reply.send(Err(format!(
+                    "the node has faulted, so nothing was dropped: {}",
+                    fault.detail
+                )));
+            }
             _ => {}
         }
     }

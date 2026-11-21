@@ -3403,11 +3403,26 @@ impl Db {
                         request: None,
                     }),
                 },
+                // Review r3/r4 (thread 4654680317): the cause and its recovery rule, as
+                // `Self::call` keeps them. A local node whose thread has stopped is a host
+                // fault; a node in another process with no link up can come back.
                 Err(_) => Some(Answer::Error {
-                    error: ApiError::new(
-                        ErrorKind::Unavailable,
-                        format!("node {} cannot be reached from this process", node.0),
-                    ),
+                    error: if lock(&self.nodes).iter().any(|handle| handle.node == node) {
+                        ApiError::host(&format!("node {}'s node thread has stopped", node.0))
+                    } else {
+                        let mut error = ApiError::new(
+                            ErrorKind::Unavailable,
+                            format!(
+                                "node {} is not reachable from this process: no link to it is \
+                                 up (its process may have stopped); nothing was read; a retry \
+                                 can succeed once node {} is back, or read from the owner or \
+                                 another member",
+                                node.0, node.0
+                            ),
+                        );
+                        error.retry = RetryRule::RetryAfterRecovery;
+                        error
+                    },
                     request: None,
                 }),
             },
@@ -4369,7 +4384,9 @@ impl Db {
     /// # Errors
     ///
     /// The engine's refusal, as text (nothing was written); `node` not run by this process (a
-    /// copy is damaged from its own process); or `node` not answering within the read timeout.
+    /// copy is damaged from its own process); `node` not answering within the read timeout; or
+    /// `node` dropping the call unanswered (its thread stopped, or it faulted), said apart from
+    /// the timeout.
     #[cfg(debug_assertions)]
     pub fn damage_record(
         &self,
@@ -4430,10 +4447,7 @@ impl Db {
         }
         match answer.recv_timeout(self.timeouts.read) {
             Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
-            Err(_) => Err(format!(
-                "node {} did not answer within {:?}",
-                node.0, self.timeouts.read
-            )),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
         }
     }
 
@@ -4445,8 +4459,9 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
-    /// not answering within the read timeout.
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, not
+    /// answering within the read timeout, or dropping the call. A faulted node answers its
+    /// fault: nothing was dropped.
     #[cfg(debug_assertions)]
     pub fn drop_history(
         &self,
@@ -4475,10 +4490,7 @@ impl Db {
         }
         match answer.recv_timeout(self.timeouts.read) {
             Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
-            Err(_) => Err(format!(
-                "node {} did not answer within {:?}",
-                node.0, self.timeouts.read
-            )),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
         }
     }
 
@@ -4521,10 +4533,7 @@ impl Db {
             Ok(done) => done
                 .map(|seq| seq.0)
                 .map_err(|refused| format!("node {}: {refused}", node.0)),
-            Err(_) => Err(format!(
-                "node {} did not answer within {:?}",
-                node.0, self.timeouts.read
-            )),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
         }
     }
 
@@ -6730,6 +6739,24 @@ fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
 
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
 /// dispatch margin, and 10 s of slack for the store.
+/// **Dev tool only**: why a debug seam on `node` got no answer (review r3/r4, threads
+/// 4654331877 and 4654675984). A timeout says how long it waited; a dropped reply says the node
+/// let the call go unanswered (its thread stopped, or it faulted on a seam that has no answer
+/// for a fault), which waiting longer would not change.
+#[cfg(debug_assertions)]
+fn seam_unanswered(node: NodeId, error: mpsc::RecvTimeoutError, waited: Duration) -> String {
+    match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            format!("node {} did not answer within {waited:?}", node.0)
+        }
+        mpsc::RecvTimeoutError::Disconnected => format!(
+            "node {} dropped the call unanswered: its thread has stopped or it has faulted \
+             (`Db::node_status` says which)",
+            node.0
+        ),
+    }
+}
+
 fn heal_within(budgets: &Budgets) -> Duration {
     Duration::from_millis(
         budgets

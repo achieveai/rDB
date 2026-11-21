@@ -1933,3 +1933,100 @@ fn f87_3_a_put_pending_when_feed_damage_faults_the_owner_asks_its_status() {
     assert!(!text.contains("write over"), "{text}");
     drop(procs.nodes);
 }
+
+/// Review r3/r4 (threads 4654331877, 4654675984): the debug seams on a faulted node say why,
+/// at once, not after a timeout. Node 3 faults on a damaged record its feed read meets; then
+/// `drop_history` on node 3 answers its fault ("nothing was dropped", naming the damage), and
+/// `damage_record`, whose reply a faulted node drops, says it was dropped unanswered and not
+/// that it timed out. Both well inside the read timeout.
+/// Cuts: no `Msg::DropHistory` arm in `answer_faulted`, red ("dropped the call unanswered", not
+/// the fault); `seam_unanswered` naming a dropped reply a timeout, red ("did not answer within").
+/// Integration (~3 s): a fresh open.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn f87_3_a_seam_on_a_faulted_node_says_why_not_that_it_timed_out() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(DEFAULT_GROUP, (k1.generation, k1.seq), patience())
+        .expect("k1 on every disk");
+    let three = Source::Node(NodeId(3));
+    tail(&db, FeedCursor::START, three, k1.seq);
+    let key = k1.seq.0.to_be_bytes();
+    db.damage_record(NodeId(3), k1.generation, Namespace::History, &key)
+        .expect("damaged");
+    let read = changes_settled(&db, FeedCursor::START, three).expect_err("node 3 faults");
+    assert_eq!(read.kind, ErrorKind::CorruptHistory, "{read:?}");
+
+    let started = Instant::now();
+    let dropped = db
+        .drop_history(NodeId(3), k1.generation, 0..1)
+        .expect_err("a faulted node drops nothing");
+    assert!(
+        dropped.starts_with("node 3: the node has faulted, so nothing was dropped"),
+        "{dropped}"
+    );
+    assert!(dropped.contains("does not match its digest"), "{dropped}");
+    let damaged = db
+        .damage_record(NodeId(3), k1.generation, Namespace::History, &key)
+        .expect_err("a faulted node damages nothing");
+    assert!(
+        damaged.starts_with("node 3 dropped the call unanswered"),
+        "{damaged}"
+    );
+    assert!(!damaged.contains("did not answer within"), "{damaged}");
+    assert!(
+        started.elapsed() < db.timeouts.read,
+        "{:?}: waited for a timeout",
+        started.elapsed()
+    );
+}
+
+/// Review r3/r4 (thread 4654680317): a feed call to a member that cannot take it keeps the
+/// cause and its recovery rule, as `Db::call` does. Node 2's thread stops while its process
+/// stays up. From node 2's own process it is a host fault: "node 2's node thread has
+/// stopped", `NotWired`. From the app, another process, node 2 is unreachable: a retry helps
+/// once it is back (`RetryAfterRecovery`), and nothing was read.
+/// Cut: the send failure never taken for a local node, red (node 2's own process hears the
+/// remote "not reachable" reply, not the stopped thread).
+/// Integration (~5 s): processes, one stopped thread.
+#[config_log::retcd_test]
+fn f87_3_a_feed_call_to_a_stopped_member_names_why() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let procs = procs(&rt, dir.path(), app_dir.path(), &store, fast());
+    let two = Source::Node(NodeId(2));
+    procs.nodes[1]
+        .send_to(NodeId(2), Msg::Stop)
+        .expect("node 2's host takes the stop");
+    let refused = |db: &Db, says: &str| {
+        let deadline = Instant::now() + crate::host::test_patience(patience());
+        loop {
+            let answer = db.changes(PARTITION, FeedCursor::START, 10, two);
+            if let Err(error) = &answer {
+                if error.detail.contains(says) {
+                    return error.clone();
+                }
+            }
+            assert!(Instant::now() < deadline, "never {says:?}: {answer:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let local = refused(&procs.nodes[1], "node 2's node thread has stopped");
+    assert!(local.is_host_fault(), "{local:?}");
+    assert_eq!(local.retry, RetryRule::NotWired, "{local:?}");
+    assert!(local.no_mutation, "{local:?}");
+    let remote = refused(&procs.app, "node 2 is not reachable from this process");
+    assert!(!remote.is_host_fault(), "{remote:?}");
+    assert_eq!(
+        (remote.kind, remote.retry),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery),
+        "{remote:?}"
+    );
+    assert!(remote.no_mutation, "{remote:?}");
+    drop(procs.nodes);
+}
