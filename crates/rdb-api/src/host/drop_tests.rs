@@ -7683,13 +7683,11 @@ fn r5_pending_a_copy_left_out_before_the_heals_commit_survives_a_drop_check_in_t
     trio.nodes[0].0.committed.insert(P1, commit);
 
     trio.ready();
-    let mut request = 1;
-    for _ in 0..3 {
+    for request in 1..=3 {
         match trio.ask(put(request)) {
             Answer::Txn { result, .. } => assert_eq!(result.generation, after),
             other => panic!("put {request} during the outage: {other:?}"),
         }
-        request += 1;
     }
     trio.links.heal_all();
     let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
