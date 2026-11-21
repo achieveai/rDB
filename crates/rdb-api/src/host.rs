@@ -3391,31 +3391,33 @@ impl Host {
         guard.reanchor_if_behind();
     }
 
-    /// #158: count a refused request. `refusal_first`, at info, is the first refusal of its
-    /// `(reason, partition)` key, or the first after a whole window in which that key was not
-    /// refused. Every refusal is also in a `refusal_summary` when its window closes, so an
-    /// isolated refusal costs 2 info lines, its first and a summary with count 1. That is
-    /// intended: the summaries' counts add up to the debug `reply` lines of refusals.
+    /// #158: count a refused request: a failed reply, or a compile refused before anything was
+    /// sent. `refusal_first`, at info, is the first refusal of its `(reason, partition)` key, or
+    /// the first after a whole window in which that key was not refused. Every refusal is also
+    /// in a `refusal_summary` when its window closes, so an isolated refusal costs 2 info lines,
+    /// its first and a summary with count 1. That is intended: the summaries' counts add up to
+    /// the debug `reply` and refused `client_compile` lines.
+    ///
+    /// The request is logged as its `request_id_hash` (M7 field discipline), and the refusal as
+    /// its reason only: its detail can name a request or a key's text. The debug line of the
+    /// same refusal carries the detail.
     fn note_refusal(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
-        error: &RdbError,
+        reason: ErrorKind,
     ) {
-        let reason = error.kind();
-        let (closed, first) = self.refusals.record(
-            self.clock.now().0,
-            (reason, partition.0),
-            identity.request.0,
-        );
+        let request = refusals::request_id_hash(identity);
+        let (closed, first) =
+            self.refusals
+                .record(self.clock.now().0, (reason, partition.0), request);
         self.refusal_summaries(closed);
         if first {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 reason = ?reason,
-                request = identity.request.0,
-                detail = ?error,
+                request_id_hash = %refusals::hash_hex(request),
                 "refusal_first"
             );
         }
@@ -3429,7 +3431,8 @@ impl Host {
 
     /// One `refusal_summary` line at info per closed window: its refusals and keys, the top
     /// keys by count as a JSON array (`reason`, `partition`, `count`, and the `first` and `last`
-    /// request ids), and the rest folded into `others_keys` and `others_refusals`.
+    /// requests' `request_id_hash`), the rest folded into `others_keys` and `others_refusals`,
+    /// and the refusals of keys past the window's cap in `over_cap_refusals`.
     fn refusal_summaries(&self, closed: Vec<refusals::Summary>) {
         for summary in closed {
             tracing::info!(
@@ -3439,6 +3442,7 @@ impl Host {
                 refusals = summary.refusals,
                 others_keys = summary.others_keys,
                 others_refusals = summary.others_refusals,
+                over_cap_refusals = summary.over_cap_refusals,
                 top = %summary.top_json(),
                 "refusal_summary"
             );
@@ -14456,6 +14460,8 @@ impl Host {
                     return Ok(());
                 }
                 Err(error) => {
+                    // Refused before anything was sent: counted, as a failed reply is (#158).
+                    self.note_refusal(partition, identity, error.kind);
                     let _ = reply.send(self.redirect(
                         partition,
                         Answer::Error {
@@ -14482,31 +14488,25 @@ impl Host {
                         request: None,
                     },
                 };
-                // A refusal is info; a compile that worked is one per write, debug (#158).
-                macro_rules! client_compile {
-                    ($level:expr) => {
-                        tracing::event!(
-                            target: WRITE_LOG_TARGET,
-                            $level,
-                            node = self.node.0,
-                            partition = partition.0,
-                            client = identity.client.0,
-                            request = identity.request.0,
-                            puts = puts.len(),
-                            change = puts.first().map_or("none", |put| put.change.name()),
-                            compiled = matches!(answer, Answer::Compiled(_)),
-                            unchanged = matches!(answer, Answer::Unchanged),
-                            // The kind only: a refusal's detail can name a map key or a path segment
-                            // as text, and a log never carries a key's text (ADR-0013, A-R154).
-                            kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
-                            "client_compile"
-                        )
-                    };
-                }
-                if matches!(answer, Answer::Error { .. }) {
-                    client_compile!(tracing::Level::INFO);
-                } else {
-                    client_compile!(tracing::Level::DEBUG);
+                // One per write, debug (#158). A refusal is also counted, so info carries its
+                // key's first refusal and one summary per window, not one line per attempt.
+                tracing::debug!(
+                    target: WRITE_LOG_TARGET,
+                    node = self.node.0,
+                    partition = partition.0,
+                    client = identity.client.0,
+                    request = identity.request.0,
+                    puts = puts.len(),
+                    change = puts.first().map_or("none", |put| put.change.name()),
+                    compiled = matches!(answer, Answer::Compiled(_)),
+                    unchanged = matches!(answer, Answer::Unchanged),
+                    // The kind only: a refusal's detail can name a map key or a path segment
+                    // as text, and a log never carries a key's text (ADR-0013, A-R154).
+                    kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
+                    "client_compile"
+                );
+                if let Answer::Error { error, .. } = &answer {
+                    self.note_refusal(partition, identity, error.kind);
                 }
                 let _ = reply.send(self.redirect(partition, answer));
                 return Ok(());
@@ -15000,7 +15000,7 @@ impl Host {
         // info carries its key's first refusal and one summary per window, not one line each.
         tracing::debug!(target: WRITE_LOG_TARGET, node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
         if let ReplyEffect::Failed { error, .. } = reply {
-            self.note_refusal(partition, identity, error);
+            self.note_refusal(partition, identity, error.kind());
         }
         // A status query's answer, or its refusal, goes to the query being stepped, never to a
         // write waiting under the same identity (F-014).
@@ -16454,7 +16454,7 @@ fn head(debug: &str) -> &str {
     &debug[..end]
 }
 
-mod refusals;
+pub(crate) mod refusals;
 
 #[cfg(test)]
 mod barrier_tests;

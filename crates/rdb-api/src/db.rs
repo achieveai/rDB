@@ -15438,11 +15438,16 @@ mod tests {
         // Overload: refused puts, back to back, until three windows have passed.
         let started = Instant::now();
         let mut refused = 0_u64;
+        let mut hashes = Vec::new();
         while started.elapsed() < 3 * WINDOW || refused < 20 {
             let paused = db
                 .put(b"c", &refused.to_le_bytes(), None)
                 .expect_err("refused while the txn is unpublished");
             assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+            let identity = paused.request.as_ref().expect("the request sent").identity;
+            hashes.push(crate::host::refusals::hash_hex(
+                crate::host::refusals::request_id_hash(identity),
+            ));
             refused += 1;
         }
         let elapsed = started.elapsed();
@@ -15509,6 +15514,18 @@ mod tests {
             .filter(|line| line["reason"] == "ProtectionPaused")
             .collect();
         assert_eq!(firsts.len(), 1, "one first for the key: {firsts:?}");
+        // Review r1 (PR #182): an identity is logged as its hash, never as the raw id.
+        let first_hash = firsts[0]["request_id_hash"].as_str().expect("a hash");
+        assert!(
+            hashes.iter().any(|hash| hash == first_hash),
+            "{}",
+            firsts[0]
+        );
+        assert!(
+            firsts[0].get("request").is_none() && firsts[0].get("detail").is_none(),
+            "{}",
+            firsts[0]
+        );
         let summaries: Vec<_> = with("refusal_summary")
             .into_iter()
             .filter(|line| paused_in(line) > 0)
@@ -15523,7 +15540,7 @@ mod tests {
         for line in firsts.iter().chain(&summaries) {
             assert_eq!(line["@l"], "Information", "{line}");
         }
-        // The summaries' counts are the debug lines, and name requests among them.
+        // The summaries' counts are the debug lines, and name requests among them, by hash.
         let summarised: u64 = summaries.iter().map(|line| paused_in(line)).sum();
         assert_eq!(summarised, refused, "summaries count every refusal once");
         for line in &summaries {
@@ -15531,10 +15548,10 @@ mod tests {
                 serde_json::from_str(line["top"].as_str().expect("top")).expect("json");
             for key in top.as_array().expect("array") {
                 for end in ["first", "last"] {
-                    let id = key[end].as_u64().expect("an id");
+                    let hash = key[end].as_str().expect("a hash");
                     assert!(
-                        paused_replies.contains(&id),
-                        "{end} {id} is a refused request"
+                        hashes.iter().any(|refused| refused == hash),
+                        "{end} {hash} is a refused request"
                     );
                 }
             }
