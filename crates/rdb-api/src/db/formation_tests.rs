@@ -2718,12 +2718,20 @@ fn r5_scene() -> (Rig, Vec<(u32, AffinityId)>, NodeId) {
     (rig, owned, copy)
 }
 
-/// Give `node`'s folder the OS boot id `id`, on file as a ready open leaves it, and the same id
+/// `node`'s copy folder, where its `os_boot` file lives.
+fn copy_dir(rig: &Rig, node: NodeId) -> PathBuf {
+    rig.procs[node.0 as usize - 1]
+        .dir
+        .join("nodes")
+        .join(node.0.to_string())
+}
+
+/// Give `node`'s copy the OS boot id `id`, on file as a ready open leaves it, and the same id
 /// as the OS's now: the next open of it runs under the same OS boot.
 fn same_os_boot(rig: &Rig, node: NodeId, id: &str) {
-    let dir = &rig.procs[node.0 as usize - 1].dir;
-    crate::os_boot::record(dir, id).expect("the os_boot file is written");
-    crate::os_boot::inject(dir, Ok(id));
+    let dir = copy_dir(rig, node);
+    crate::os_boot::record(&dir, id).expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok(id));
 }
 
 /// R5 (PR #181 ruling A): the heal leaves a copy out only with `Timeouts::live_readd` on.

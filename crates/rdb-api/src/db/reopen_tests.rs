@@ -3766,6 +3766,79 @@ fn r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why() {
     one.shutdown();
 }
 
+/// PR #181 review questions 1 and 2: node processes share one folder, each with its own
+/// copy, so the OS boot marker is per copy (`nodes/<n>/os_boot`). After a reboot (copies on
+/// `boot-a`, the OS on `boot-b`), owner node 1's process opens and dies before it is ready;
+/// then node 3's process, which leads neither partition, is ready at once and records its own
+/// copy's boot. Node 1's marker stays absent, so its next open is `Unknown` and waits for every
+/// copy, never `Same`. Integration (~2 s): a fresh open, three node-process opens.
+/// Cut: one marker for the whole folder, at `config.dir`: node 3's ready stamps it and node
+/// 1's reopen reads `Same`, red.
+#[config_log::retcd_test]
+fn r5_o_a_node_that_leads_nothing_never_stamps_an_owners_os_boot() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(2),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    db.shutdown();
+    drop(db);
+    assert_eq!(admin::initial_owner(PartitionId(1)), NodeId(1));
+    assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
+    let copy = |node: u32| dir.path().join("nodes").join(node.to_string());
+    let marker = |node: u32| copy(node).join(crate::os_boot::OS_BOOT_FILE);
+    for node in 1..=3 {
+        crate::os_boot::record(&copy(node), "boot-a").expect("the marker is written");
+        crate::os_boot::inject(&copy(node), Ok("boot-b"));
+    }
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Changed)
+    );
+    owner.shutdown();
+    drop(owner);
+    assert!(!marker(1).exists(), "a reboot removes node 1's marker");
+
+    let mut third = open_node(&rt, dir.path(), &store, &[3]).expect("node 3's process opens");
+    third
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("node 3 leads nothing, so it is ready at once");
+    third.shutdown();
+    drop(third);
+    assert_eq!(
+        std::fs::read_to_string(marker(3))
+            .expect("node 3's marker")
+            .trim(),
+        "boot-b"
+    );
+    assert!(!marker(1).exists(), "node 3 never writes node 1's marker");
+    assert!(
+        !dir.path().join(crate::os_boot::OS_BOOT_FILE).exists(),
+        "no folder-wide marker"
+    );
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Unknown),
+        "node 1 waits for every copy"
+    );
+    owner.shutdown();
+}
+
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
 
 /// A-R256 follow-up, arch-s2 B1/B2: after `admin promote 2`, the folder is closed and opened

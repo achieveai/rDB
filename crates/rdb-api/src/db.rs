@@ -605,12 +605,14 @@ struct Opened {
     /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
     /// given it, so an owner re-seats the copies its partition was placed on.
     nodes: Arc<[NodeId]>,
-    /// What this open found of the OS boot (R5, [`crate::os_boot`]): the heal goes on without a
-    /// down copy only when it is `Same`. `Unknown` in an open that never looked.
-    os_boot: crate::os_boot::OsBoot,
-    /// The OS boot id to write to the folder's `os_boot` file once this open is ready
+    /// What this open found of the OS boot for each node it runs (R5, [`crate::os_boot`]),
+    /// from that node's own `nodes/<n>/os_boot`: an owner's heal goes on without a down copy
+    /// only when its node's is `Same`. A node not here, as in an open that never looked, is
+    /// `Unknown`.
+    os_boot: BTreeMap<NodeId, crate::os_boot::OsBoot>,
+    /// The OS boot id to write to each such node's file once this open is ready
     /// ([`Db::wait_ready`]), when it is not on file already; taken by the first ready answer.
-    os_boot_record: Mutex<Option<(PathBuf, String)>>,
+    os_boot_record: Mutex<Vec<(PathBuf, String)>>,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -655,8 +657,8 @@ impl Default for Opened {
             instance: None,
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
-            os_boot: crate::os_boot::OsBoot::Unknown,
-            os_boot_record: Mutex::new(None),
+            os_boot: BTreeMap::new(),
+            os_boot_record: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1790,7 +1792,15 @@ impl Db {
             created: created.then(|| nodes_dir.clone()),
         };
         // R5: read with the engines' `LOCK`s held, so an open refused `InUse` never touches it.
-        let os_boot = crate::os_boot::observe(&config.dir)?;
+        // One file per node, in its own copy's folder (PR #181 review): node processes share
+        // `config.dir`, and one that leads nothing must not stamp an owner's.
+        let mut os_boot = BTreeMap::new();
+        let mut os_boot_record = Vec::new();
+        for node in &config.local {
+            let seen = crate::os_boot::observe(&nodes_dir.join(node.0.to_string()))?;
+            os_boot.insert(*node, seen.verdict);
+            os_boot_record.extend(seen.to_record);
+        }
         let mut found = Self::check(
             &mut claim.engines,
             absent,
@@ -1933,8 +1943,8 @@ impl Db {
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
                 nodes: Arc::clone(&nodes),
-                os_boot: os_boot.verdict,
-                os_boot_record: Mutex::new(os_boot.to_record),
+                os_boot,
+                os_boot_record: Mutex::new(os_boot_record),
                 ..Opened::default()
             },
             route: Route {
@@ -2632,7 +2642,12 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
-                os_boot: self.opened.os_boot,
+                os_boot: self
+                    .opened
+                    .os_boot
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or(crate::os_boot::OsBoot::Unknown),
                 links_since: Default::default(),
                 live_readd,
                 waiting: Arc::clone(&self.opened.heal_waiting),
@@ -2818,15 +2833,14 @@ impl Db {
     }
 
     /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
-    /// are whole again: write the OS boot id to the folder's `os_boot` file, once, when this
-    /// open found it missing or stale. A failed write is logged `os_boot_record_failed` and
-    /// leaves no file, so the next open waits for every copy, as before R5.
+    /// are whole again: write the OS boot id to each of its nodes' `os_boot` files, once, when
+    /// this open found it missing or stale. A failed write is logged `os_boot_record_failed`
+    /// and leaves no file, so the next open waits for every copy, as before R5.
     fn record_os_boot(&self) {
-        let Some((dir, id)) = lock(&self.opened.os_boot_record).take() else {
-            return;
-        };
-        if let Err(error) = crate::os_boot::record(&dir, &id) {
-            tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
+        for (dir, id) in std::mem::take(&mut *lock(&self.opened.os_boot_record)) {
+            if let Err(error) = crate::os_boot::record(&dir, &id) {
+                tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
+            }
         }
     }
 
