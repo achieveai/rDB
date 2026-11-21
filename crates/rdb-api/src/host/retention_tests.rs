@@ -48,11 +48,13 @@ fn synced(engine: &mut RocksEngine, generation: Generation, through: u64) {
 ///    engine, and `host_history_trimmed` is logged once.
 ///
 /// Issue #149: the ladder duty first warms node 2's inventory ladder, reported as
-/// `IndexLengths::inventory_rungs`; after step 3 it holds the floor's rung only, and the block
-/// cache's usage is reported.
+/// `IndexLengths::inventory_rungs`, and the row warms a dormant ladder (as a move's shadow
+/// does). After step 3 each holds the floor's rung only, and the block cache's usage is
+/// reported.
 ///
 /// Cuts: the inventory-pin gate off, red (step 1 trims); `keep` ignored, red (step 2 trims);
-/// the kept ladders left untrimmed, red (every rung stays).
+/// the inventory ladder left untrimmed, red (`inventory_rungs` stays); the dormant ladder left
+/// untrimmed, red (its rungs stay).
 /// Unit.
 #[config_log::retcd_test]
 fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
@@ -76,6 +78,17 @@ fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
     assert!(
         lengths.inventory_rungs > 1,
         "the warmed ladder: {lengths:?}"
+    );
+    host.warm_dormant_ladder(P, Generation(1), Some((NodeId(1), BootId(1))));
+    let dormant = |host: &Host| {
+        host.dormant_ladders
+            .get(&P)
+            .map(|ladder| ladder.rungs.len())
+    };
+    assert!(
+        dormant(&host).is_some_and(|rungs| rungs > 1),
+        "the warmed dormant ladder: {:?}",
+        dormant(&host)
     );
     let base = host.clock.now();
     let at = |millis: u64| base.plus_millis(millis);
@@ -102,7 +115,12 @@ fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
     assert_eq!(
         (lengths.history_floor, lengths.inventory_rungs),
         (6, 1),
-        "the trim bounds the kept ladder to the floor: {lengths:?}"
+        "the trim bounds the kept inventory ladder to the floor: {lengths:?}"
+    );
+    assert_eq!(
+        dormant(&host),
+        Some(1),
+        "the trim bounds the kept dormant ladder to the floor"
     );
     assert!(lengths.block_cache_bytes.is_some(), "{lengths:?}");
     assert_eq!(logged!(METHOD, "inventory_pin_expired").len(), 1);
