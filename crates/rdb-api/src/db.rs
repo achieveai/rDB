@@ -6745,8 +6745,6 @@ fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-/// How long the heal may wait for old grants to clear: a whole grant, its clock error and
-/// dispatch margin, and 10 s of slack for the store.
 /// **Dev tool only**: why a debug seam on `node` got no answer (review r3/r4, threads
 /// 4654331877 and 4654675984). A timeout says how long it waited; a dropped reply says the node
 /// let the call go unanswered (its thread stopped, or it faulted on a seam that has no answer
@@ -6765,6 +6763,8 @@ fn seam_unanswered(node: NodeId, error: mpsc::RecvTimeoutError, waited: Duration
     }
 }
 
+/// How long the heal may wait for old grants to clear: a whole grant, its clock error and
+/// dispatch margin, and 10 s of slack for the store.
 fn heal_within(budgets: &Budgets) -> Duration {
     Duration::from_millis(
         budgets
