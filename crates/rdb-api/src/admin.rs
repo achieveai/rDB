@@ -9613,6 +9613,61 @@ mod tests {
             .collect()
     }
 
+    /// The members `nodes` at copy `node - 1`, the first primary, the rest regular.
+    fn r5_members(nodes: &[u32]) -> Vec<RecordMember> {
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| RecordMember {
+                copy: CopyId(u8::try_from(*node - 1).expect("a copy index")),
+                node: NodeId(*node),
+                role: if at == 0 {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::RegularSecondary
+                },
+            })
+            .collect()
+    }
+
+    /// A heal context over `store` for asking [`leave_out`] directly: same OS boot,
+    /// `live_readd` on, owner node 1.
+    fn r5_ctx(store: Arc<dyn ConfigStore>) -> HealCtx {
+        let (owner, _) = std::sync::mpsc::channel();
+        HealCtx {
+            os_boot: OsBoot::Same,
+            links_since: Default::default(),
+            live_readd: true,
+            waiting: Default::default(),
+            partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_secs(1),
+            member_boot: r5_up_but(&[3]),
+            owner_node: OWNER,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
+        }
+    }
+
+    /// A store holding node 3's frozen grant.
+    fn r5_frozen_3(rt: &tokio::runtime::Runtime) -> Arc<dyn ConfigStore> {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let grant = r5_grant(3, utc_now() + 3_600_000, true);
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(grant.node).encode()),
+            value: grant.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("the grant is written");
+        store
+    }
+
     /// PR #181 review, blocker 1 (ruling A): with `Timeouts::live_readd` off, the heal leaves no
     /// copy out, whatever its grant: expired, frozen (a record that may name an older process of
     /// a node already running again), or absent. It waits, `live_readd_off`, and when node 3
@@ -9776,6 +9831,34 @@ mod tests {
             None,
             "nothing after it ends"
         );
+    }
+
+    /// PR #181 review: a partition still to form pins every placed member, so the heal never
+    /// leaves one out, even with same-boot, `live_readd` and frozen-grant evidence:
+    /// `partition_forming`. Unit (~5 ms). Cut: the forming guard removed: node 3 is left out on
+    /// its frozen grant, red.
+    #[test]
+    fn r5_s_a_partition_still_to_form_leaves_no_copy_out() {
+        let rt = runtime();
+        let ctx = HealCtx {
+            partitions: Vec::new(),
+            ..r5_ctx(r5_frozen_3(&rt))
+        };
+        let forming = [r5_members(&[1, 2, 3])];
+        let found: Vec<(RecordMember, Option<BootId>)> = forming[0]
+            .iter()
+            .map(|member| (*member, (member.node != NodeId(3)).then_some(OPEN_2)))
+            .collect();
+        let asked = rt.block_on(leave_out(
+            &ctx,
+            &found,
+            &[],
+            &forming,
+            &[3],
+            true,
+            &mut BTreeMap::new(),
+        ));
+        assert_eq!(asked, Err("partition_forming"));
     }
 
     /// PR #181 review: a grant read that fails keeps its cause and its own reason,
