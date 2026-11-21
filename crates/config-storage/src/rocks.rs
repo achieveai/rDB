@@ -4713,6 +4713,8 @@ impl StateReader for RocksReader {
     // on a Tokio worker does not wait out an apply's fsync (#186). `compact_revision`,
     // `with_state`, `pin` and `journal_stats` stay on the lock: M4-32's watch replay needs the
     // compaction watermark to move before the deletion lands, which only the lock orders.
+    // `journal_stats` is in the same position: a compacting apply's `compact_journal` changes
+    // the stats in memory ahead of the `delete_range` that the same batch carries.
     fn last_applied(&self) -> Option<LogId<RaftNodeId>> {
         self.shared.applied().last_applied
     }

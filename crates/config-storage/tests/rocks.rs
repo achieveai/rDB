@@ -1801,3 +1801,71 @@ async fn i186_mirror_agrees_with_the_disk_across_a_state_batch_crash() {
         );
     }
 }
+
+/// #186 row 5: `compact_revision` stays on the state-machine lock. A replay reads a page, then
+/// reads the watermark as its witness that nothing in the page was deleted (M4-32). While a
+/// compacting apply holds the lock across its write, that witness must wait or report the new
+/// floor — never the old one, which a mirror updated after the write would still hold.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i186_compact_revision_never_reports_the_old_floor_during_a_compacting_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let s = open_at(tmp.path(), park.clone());
+    s.state_machine()
+        .apply(
+            (1..=5)
+                .map(|i| put(1, i, &format!("/c/{i}"), "v"))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let reader = s.reader();
+    let page = reader.read_events(0, 5, b"", usize::MAX).unwrap();
+    assert_eq!(
+        page.len(),
+        5,
+        "the replay page is read before the compaction"
+    );
+    assert_eq!(reader.compact_revision().unwrap(), 0);
+
+    let (reached, release) = park.arm();
+    let mut sm = s.state_machine();
+    let compacting = tokio::spawn(async move {
+        sm.apply(vec![Entry {
+            log_id: log_id(1, 6),
+            payload: EntryPayload::Normal(Command::Compact {
+                up_to_revision: 3,
+                dedup_trim_below: None,
+            }),
+        }])
+        .await
+    });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the compaction reaches its write");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let witness = Arc::clone(&reader);
+    std::thread::spawn(move || {
+        let _ = tx.send(witness.compact_revision().unwrap());
+    });
+    // `None`: blocked on the lock the compaction holds, so the witness waits for the deletion.
+    let during = rx.recv_timeout(std::time::Duration::from_millis(300)).ok();
+    if let Some(floor) = during {
+        assert_eq!(
+            floor, 3,
+            "the watermark witness reported the old floor while the deletion was in flight"
+        );
+    }
+
+    release.send(()).unwrap();
+    compacting.await.unwrap().expect("the compaction applies");
+    if during.is_none() {
+        let floor = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the blocked witness answers once the compaction is durable");
+        assert_eq!(floor, 3, "the witness that waited reports the new floor");
+    }
+    assert_eq!(reader.compact_revision().unwrap(), 3);
+}
