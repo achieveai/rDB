@@ -1239,6 +1239,37 @@ pub enum HealState {
     Failed(admin::HealError),
 }
 
+/// The reopen's heal over each owner in `ctxs`, one after another: every grant expires on its
+/// own clock, so the later heals find theirs already expired. Sets `state` to how it ended, and
+/// `waiting` to `None`; each owner's own heal clears `waiting` once its links are up (PR #181
+/// review), so a later owner's first window never names an earlier owner's wait.
+pub(crate) async fn heal_in_turn(
+    ctxs: Vec<admin::HealCtx>,
+    state: Arc<Mutex<HealState>>,
+    waiting: Arc<Mutex<Option<String>>>,
+) {
+    let mut first = None;
+    let mut ended = Ok(());
+    for ctx in ctxs {
+        match admin::heal_retrying(ctx).await {
+            Ok(healed) => {
+                first.get_or_insert(healed);
+            }
+            Err(error) => {
+                tracing::error!(%error, "heal_failed");
+                ended = Err(error);
+                break;
+            }
+        }
+    }
+    *lock(&state) = match (ended, first) {
+        (Ok(()), Some(healed)) => HealState::Handed(healed),
+        (Err(error), _) => HealState::Failed(error),
+        (Ok(()), None) => HealState::NotNeeded,
+    };
+    *lock(&waiting) = None;
+}
+
 /// Why [`Db::wait_ready`] returned without the owner admitting writes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadyError {
@@ -2696,33 +2727,20 @@ impl Db {
         // R5: the heal runs in the span of the open that started it, so its lines (`heal_retry`
         // among them) reach that open's log and not an untagged one.
         self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
-            async move {
-                // One after another: every grant expires on its own clock, so the later heals
-                // find theirs already expired.
-                let mut first = None;
-                let mut ended = Ok(());
-                for ctx in ctxs {
-                    match admin::heal_retrying(ctx).await {
-                        Ok(healed) => {
-                            first.get_or_insert(healed);
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "heal_failed");
-                            ended = Err(error);
-                            break;
-                        }
-                    }
-                }
-                *lock(&state) = match (ended, first) {
-                    (Ok(()), Some(healed)) => HealState::Handed(healed),
-                    (Err(error), _) => HealState::Failed(error),
-                    (Ok(()), None) => HealState::NotNeeded,
-                };
-                *lock(&waiting) = None;
-            },
+            heal_in_turn(ctxs, state, waiting),
             tracing::Span::current(),
         )));
         Ok(())
+    }
+
+    /// The reopen's heal state and the text of its latest wait ([`Opened::heal_waiting`]), for
+    /// a crate test that runs [`heal_in_turn`] against a `Db` built by hand.
+    #[cfg(test)]
+    pub(crate) fn heal_shared(&self) -> (Arc<Mutex<HealState>>, Arc<Mutex<Option<String>>>) {
+        (
+            Arc::clone(&self.opened.heal),
+            Arc::clone(&self.opened.heal_waiting),
+        )
     }
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at

@@ -9965,6 +9965,114 @@ mod tests {
         assert_eq!(r5_lines(METHOD, "heal_retry").len(), 2, "two late attempts");
     }
 
+    /// An owner's heal for [`r5_in_turn`]: `partitions/1` rooted in a store of its own,
+    /// `Timeouts::live_readd` off, node 3's link up `link_at` after `started`, its letters to
+    /// node 1 in the returned mailbox.
+    fn r5_turn(
+        rt: &tokio::runtime::Runtime,
+        started: std::time::Instant,
+        link_at: Duration,
+        waiting: &Arc<std::sync::Mutex<Option<String>>>,
+    ) -> (HealCtx, std::sync::mpsc::Receiver<Msg>) {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, rt, BootId(5));
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            os_boot: OsBoot::Same,
+            links_since: Default::default(),
+            live_readd: false,
+            waiting: Arc::clone(waiting),
+            partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_millis(600),
+            member_boot: Arc::new(move |node| {
+                (node != NodeId(3) || started.elapsed() >= link_at).then_some(OPEN_2)
+            }),
+            owner_node: OWNER,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
+        };
+        (ctx, mailbox)
+    }
+
+    /// PR #181 review round 2 (sequential owners): a `Db` heals two owners in turn
+    /// ([`crate::db::heal_in_turn`]). The first waits for node 3 (its `heal_retry` text is what
+    /// `wait_ready` names), then heals once node 3 is up; the second waits for node 3 again, on
+    /// a link of its own. A `wait_ready` that times out in the second's first window names no
+    /// heal wait: the first owner's is over, and the second has not missed yet. Once the second
+    /// misses, the time-out names its wait. Unit (~3 s). Cut: `heal` does not clear the text
+    /// once its links are up: the time-out in the second's first window names the first
+    /// owner's wait, red.
+    #[test]
+    fn r5_sequential_owners_a_time_out_in_the_next_owners_first_window_names_no_old_wait() {
+        /// The words `wait_ready` puts before a heal's wait.
+        const HEAL_WAITING_PREFIX: &str = "the reopen's heal is waiting: ";
+        // The heal runs on its own worker while this thread waits, as in an open.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let db = crate::db::Db::by_hand(
+            Vec::new(),
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            crate::Timeouts::default(),
+            None,
+        );
+        let (state, waiting) = db.heal_shared();
+        *state.lock().expect("state") = crate::db::HealState::Running;
+        let started = std::time::Instant::now();
+        let (first, first_sent) = r5_turn(&rt, started, Duration::from_millis(900), &waiting);
+        let (second, _) = r5_turn(&rt, started, Duration::from_secs(60), &waiting);
+        let task = rt.spawn(crate::db::heal_in_turn(
+            vec![first, second],
+            Arc::clone(&state),
+            Arc::clone(&waiting),
+        ));
+        let phase = |at: &str| match db.wait_ready(Duration::from_millis(50)) {
+            Err(crate::db::ReadyError::TimedOut { phase, .. }) => phase,
+            other => panic!("{at}: wait_ready times out: {other:?}"),
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(10));
+        // The first owner misses node 3 once: its wait is the one a time-out names.
+        let missed = std::time::Instant::now();
+        while waiting.lock().expect("waiting").is_none() {
+            assert!(
+                missed.elapsed() < patience,
+                "the first owner never waited: {:?}",
+                state.lock().expect("state")
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(phase("the first owner waits").contains(HEAL_WAITING_PREFIX));
+        // Its plan is handed: the second owner's first window is open, 600 ms long.
+        let plan = first_sent.recv_timeout(patience);
+        assert!(plan.is_ok(), "the first owner heals once node 3 is up");
+        let in_window = phase("the second owner's first window");
+        assert!(
+            !in_window.contains(HEAL_WAITING_PREFIX),
+            "no finished owner's wait: {in_window}"
+        );
+        // The second owner misses: the time-out names its own wait.
+        let missed = std::time::Instant::now();
+        while waiting.lock().expect("waiting").is_none() {
+            assert!(
+                missed.elapsed() < patience,
+                "the second owner never waited: {:?}",
+                state.lock().expect("state")
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(phase("the second owner waits").contains(HEAL_WAITING_PREFIX));
+        task.abort();
+    }
+
     /// PR #181 review (threads on the link-wait text): once an attempt has every link, the
     /// text saying to start a node is gone, while a later step of that attempt still waits
     /// (here the owner's own grant read, held 1 s); and a heal that ends leaves none, so the
