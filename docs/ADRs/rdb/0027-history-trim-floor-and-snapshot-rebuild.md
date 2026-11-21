@@ -1,4 +1,4 @@
-# ADR-rdb-0025: History trim floor and snapshot rebuild
+# ADR-rdb-0027: History trim floor and snapshot rebuild
 
 **Status:** Proposed
 **Date:** 2026-11-20

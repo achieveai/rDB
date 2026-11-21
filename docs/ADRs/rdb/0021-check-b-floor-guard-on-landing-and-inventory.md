@@ -47,7 +47,7 @@ the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without 
 
 **Amended by issue #61 (History trim), 2026-11-20: "seq 1" reads "a record at F".** A trimmed
 lineage keeps History from its floor F, the record at F included, and nothing below
-(ADR-rdb-0025). So decisions 1, 3 and 4 read the floor, not seq 1. `Host::has_floor` reads the
+(ADR-rdb-0027). So decisions 1, 3 and 4 read the floor, not seq 1. `Host::has_floor` reads the
 record at `RocksEngine::floor_seq` of the older generation, or at seq 1 on a lineage never
 trimmed. A trimmed lineage whose record at F is held passes; one with a hole at F is refused with
 the same reasons as before. The empty-lineage exception (decision 2) is unchanged. The intact rule

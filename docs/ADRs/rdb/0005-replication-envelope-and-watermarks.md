@@ -178,7 +178,7 @@ the copy is walked by ordinary catch-up. Rows: `m7b_123_historical_envelopes_rea
 
 **Amended by issue #61 (History trim), 2026-11-20: the ladder mirrors `TrimFloor`, inclusive,
 and the once-per-generation refill is removed.** A trimmed lineage keeps History from its floor F,
-the record at F included (ADR-rdb-0025, spec §4.1). Every R1 ladder, primary and receiver, and
+the record at F included (ADR-rdb-0027, spec §4.1). Every R1 ladder, primary and receiver, and
 every ladder the host keeps, holds a rung at each seq from F to its head, none below, and no
 `(0, ROOT)` once F is above 0 (`DigestLadder::trim_below`, `Replication::trim_history`). Below the
 head the ladder is dense from F, not a sparse stride (§3). The host trims R1's ladders first, then
