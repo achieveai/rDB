@@ -2624,6 +2624,7 @@ impl Db {
                 bootstrap,
                 os_boot: self.opened.os_boot,
                 links_since: Default::default(),
+                waiting: Arc::clone(&self.opened.heal_waiting),
             });
         }
         let state = Arc::clone(&self.opened.heal);
@@ -2638,7 +2639,7 @@ impl Db {
                 let mut first = None;
                 let mut ended = Ok(());
                 for ctx in ctxs {
-                    match admin::heal_retrying(ctx, &waiting).await {
+                    match admin::heal_retrying(ctx).await {
                         Ok(healed) => {
                             first.get_or_insert(healed);
                         }

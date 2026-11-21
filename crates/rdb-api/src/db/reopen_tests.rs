@@ -1401,6 +1401,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
         os_boot: crate::os_boot::OsBoot::Unknown,
         links_since: Default::default(),
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1508,6 +1509,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
         os_boot: crate::os_boot::OsBoot::Unknown,
         links_since: Default::default(),
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),

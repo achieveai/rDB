@@ -2129,6 +2129,9 @@ pub(crate) struct HealCtx {
     /// first look, kept across [`heal_retrying`]'s attempts. A copy with no grant record may be
     /// left out once one full window (`within`) has passed since.
     pub(crate) links_since: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    /// What the heal waits for now, in words, for `wait_ready`'s time-out to name (R5): set by
+    /// [`heal_retrying`] when an attempt ends waiting for links.
+    pub(crate) waiting: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// The correlation a heal's two events carry.
@@ -2509,12 +2512,9 @@ const HEAL_RETRY_MAX: Duration = Duration::from_secs(5);
 /// one attempt left the owner dead until it was opened again. Waiting for boots is the heal's
 /// first step and has done nothing yet, so trying again is safe. Any other error ends the heal
 /// as before. Each miss logs `heal_retry{attempt, missing, error, next_ms}` and puts the error's
-/// text in `waiting`, for `wait_ready`'s time-out to name (R5); the wait doubles from 0.5 s to
-/// 5 s.
-pub(crate) async fn heal_retrying(
-    ctx: HealCtx,
-    waiting: &std::sync::Mutex<Option<String>>,
-) -> Result<Healed, HealError> {
+/// text in [`HealCtx::waiting`], for `wait_ready`'s time-out to name (R5); the wait doubles
+/// from 0.5 s to 5 s.
+pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
     let mut backoff = HEAL_RETRY_FIRST;
     let mut attempt: u64 = 0;
     loop {
@@ -2527,6 +2527,7 @@ pub(crate) async fn heal_retrying(
             bootstrap: ctx.bootstrap.clone(),
             nodes: Arc::clone(&ctx.nodes),
             links_since: Arc::clone(&ctx.links_since),
+            waiting: Arc::clone(&ctx.waiting),
             ..ctx
         };
         match heal(again).await {
@@ -2548,7 +2549,7 @@ pub(crate) async fn heal_retrying(
                     next_ms = backoff.as_millis(),
                     "heal_retry"
                 );
-                *waiting
+                *ctx.waiting
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
                 tokio::time::sleep(backoff).await;
@@ -5372,6 +5373,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store,
@@ -6158,6 +6160,7 @@ mod tests {
             let ctx = HealCtx {
                 os_boot: crate::os_boot::OsBoot::Unknown,
                 links_since: Default::default(),
+                waiting: Default::default(),
                 partition_count: 2,
                 nodes: crate::db::ALL_NODES.into(),
                 store,
@@ -7574,6 +7577,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
@@ -8015,6 +8019,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::clone(&store),
@@ -8914,6 +8919,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store: Arc::new(config_testkit::MemStore::new()),
@@ -9003,8 +9009,33 @@ mod tests {
         clock: HostClock,
         within: Duration,
     ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
+        r5_heal_in(
+            Arc::new(config_testkit::MemStore::new()),
+            Arc::default(),
+            retrying,
+            os_boot,
+            owner_node,
+            boot_of,
+            grants,
+            clock,
+            within,
+        )
+    }
+
+    /// [`r5_heal_by`] over `store`, the heal's [`HealCtx::waiting`] being `waiting`.
+    #[allow(clippy::too_many_arguments)]
+    fn r5_heal_in(
+        store: Arc<dyn ConfigStore>,
+        waiting: Arc<std::sync::Mutex<Option<String>>>,
+        retrying: bool,
+        os_boot: OsBoot,
+        owner_node: NodeId,
+        boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+        grants: &[GrantRecord],
+        clock: HostClock,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
         let rt = runtime();
-        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         rooted(&*store, &rt, BootId(5));
         for grant in grants {
             rt.block_on(store.put(PutRequest {
@@ -9019,6 +9050,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot,
             links_since: Default::default(),
+            waiting,
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
             store,
@@ -9034,7 +9066,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let healed = if retrying {
-            rt.block_on(heal_retrying(ctx, &std::sync::Mutex::new(None)))
+            rt.block_on(heal_retrying(ctx))
         } else {
             rt.block_on(heal(ctx))
         };
