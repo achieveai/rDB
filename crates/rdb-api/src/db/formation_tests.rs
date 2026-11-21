@@ -3138,6 +3138,126 @@ fn r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready()
     );
 }
 
+/// `node`'s grant record in the control store, if it has one.
+fn grant_of(rig: &Rig, node: NodeId) -> Option<rdb_core::authority::grant::GrantRecord> {
+    rig.rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+        }))
+        .expect("the store answers")
+        .record
+        .map(|found| {
+            rdb_core::authority::grant::GrantRecord::decode(&found.value)
+                .expect("grants/{node} decodes")
+        })
+}
+
+/// The partitions of `owned` whose ring also places `copy`.
+fn shared_with(owned: &[(u32, AffinityId)], copy: NodeId) -> Vec<(u32, AffinityId)> {
+    owned
+        .iter()
+        .copied()
+        .filter(|(partition, _)| ring(S1B_K, *partition).copies.contains(&copy.0))
+        .collect()
+}
+
+/// Asserts that each of `shared` pins every copy its ring places, `copy` among them, that
+/// `R5_OWNER` serves it with `copy` regular, and that it reads back the value written before
+/// and takes a put.
+fn fully_pinned_and_writable(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId) {
+    for (partition, group) in shared {
+        let placed: BTreeSet<u32> = ring(S1B_K, *partition).copies.iter().copied().collect();
+        pins_until(
+            rig,
+            *partition,
+            Duration::from_secs(60),
+            "every placed copy is pinned",
+            |pins| *pins == placed,
+        );
+        owner_serves(rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// How many lines this row has logged so far: [`left_nothing_out`] reads only those after.
+fn log_mark(method: &str) -> usize {
+    config_testkit::logs::lines_for_current_test(module_path!(), method).len()
+}
+
+/// Asserts this row's log, from line `from` (a [`log_mark`], after the formation), holds no
+/// leave-out: no `heal_proceed_without` and no `heal_left_out_noted`, and that every
+/// `heal_wait_all` of node 2's heal said `live_readd_off`.
+fn left_nothing_out(method: &str, from: usize) {
+    let lines: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .skip(from)
+            .collect();
+    let named = |message: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|line| line["@m"] == message).collect()
+    };
+    assert!(named("heal_proceed_without").is_empty(), "no leave-out decision");
+    assert!(named("heal_left_out_noted").is_empty(), "no copy noted left out");
+    let waits: Vec<&serde_json::Value> = named("heal_wait_all")
+        .into_iter()
+        .filter(|line| line["owner"].as_u64() == Some(u64::from(R5_OWNER.0)))
+        .collect();
+    assert!(
+        !waits.is_empty() && waits.iter().all(|line| line["reason"] == "live_readd_off"),
+        "{waits:?}"
+    );
+}
+
+/// PR #181 review round 3, blocker 3: `Timeouts::live_readd` off, the default, through
+/// `Db::open`. Node 2 reopens under the same OS boot while copy `C` is down and has no grant
+/// record (deleted, as a copy that never owned a partition has none). Node 2's heal waits past
+/// one full heal window, when a no-grant copy could first be left out, `live_readd_off` each
+/// time, and is not ready. `C` then starts again: node 2 is ready, each shared partition pins
+/// every placed copy with `C` regular, reads back and takes a put, and nothing was ever left
+/// out. Integration (~60 s): a formation of five, two stops, a wait of one window.
+/// Cut: `may_leave_out` ignores `live_readd`: after the window `C` is left out, node 2 is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written() {
+    const METHOD: &str =
+        "r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written";
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(ControlKey::Grant(copy).encode()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("grants/C is deleted");
+    assert!(grant_of(&rig, copy).is_none(), "no grant record for node {}", copy.0);
+    let from = log_mark(METHOD);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    let window = heal_within(&fast());
+    let waited = rig
+        .of(R5_OWNER)
+        .wait_ready(window + Duration::from_secs(2));
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} after one window: {waited:?}",
+        copy.0
+    );
+    rig.restart(copy, Timeouts::default());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    left_nothing_out(METHOD, from);
+}
+
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
 fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
     let read = rig
