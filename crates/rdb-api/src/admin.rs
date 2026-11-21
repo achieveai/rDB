@@ -2203,7 +2203,16 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle. Once, for
     // every partition this node owns (issue #79).
-    let gone = clear_until(&ctx, ctx.owner_node, deadline).await?;
+    // PR #181 review round 3: a leave-out accepted just before the deadline would leave the
+    // clear almost no time, so one recoverable store fault in it would end the heal
+    // `NotCleared`, which is terminal. A heal that leaves a copy out clears within a whole
+    // window from here; one that leaves none keeps the attempt's deadline.
+    let clear_by = if left.is_empty() {
+        deadline
+    } else {
+        tokio::time::Instant::now() + ctx.within
+    };
+    let gone = clear_until(&ctx, ctx.owner_node, clear_by).await?;
     // Only now, after the owner's delete was acknowledged or its absence read (A-R163).
     let (read_revision, records) = heal_records(&ctx).await?;
     let cleared = match &gone {
@@ -9511,26 +9520,35 @@ mod tests {
         fail: Option<&'static str>,
     }
 
-    /// A `MemStore` whose reads of `key` take `steps` in order, each once its `not_before` has
-    /// come; a read before it, any other call, and every read once the steps are used up go
-    /// straight through. `in_delay` is set while a delayed read sleeps.
+    /// A `MemStore` whose reads of each scripted grant take that grant's steps in order, each
+    /// once its `not_before` has come; a read before it, any other call, and every read once
+    /// its steps are used up go straight through. `in_delay` is set while a delayed read sleeps.
     struct GrantGets {
         inner: config_testkit::MemStore,
-        key: Vec<u8>,
         made: std::time::Instant,
-        steps: std::sync::Mutex<std::collections::VecDeque<GetStep>>,
+        steps: std::sync::Mutex<BTreeMap<Vec<u8>, std::collections::VecDeque<GetStep>>>,
         in_delay: Arc<AtomicBool>,
     }
 
     impl GrantGets {
+        /// `node`'s grant reads take `steps`.
         fn new(node: NodeId, steps: Vec<GetStep>) -> Self {
             Self {
                 inner: config_testkit::MemStore::new(),
-                key: ControlKey::Grant(node).encode().into_bytes(),
                 made: std::time::Instant::now(),
-                steps: std::sync::Mutex::new(steps.into()),
+                steps: std::sync::Mutex::new(BTreeMap::new()),
                 in_delay: Arc::new(AtomicBool::new(false)),
             }
+            .and(node, steps)
+        }
+
+        /// `node`'s grant reads take `steps` too.
+        fn and(self, node: NodeId, steps: Vec<GetStep>) -> Self {
+            self.steps
+                .lock()
+                .expect("steps")
+                .insert(ControlKey::Grant(node).encode().into_bytes(), steps.into());
+            self
         }
     }
 
@@ -9540,18 +9558,18 @@ mod tests {
             'a: 'b,
             Self: 'b,
         {
-            let step = if request.key == self.key.as_slice() {
-                let mut steps = self.steps.lock().expect("steps");
-                let due = steps
-                    .front()
-                    .is_some_and(|step| self.made.elapsed() >= step.not_before);
-                if due {
-                    steps.pop_front()
-                } else {
-                    None
-                }
-            } else {
-                None
+            let step = {
+                let mut scripts = self.steps.lock().expect("steps");
+                scripts.get_mut(request.key.as_ref()).and_then(|steps| {
+                    let due = steps
+                        .front()
+                        .is_some_and(|step| self.made.elapsed() >= step.not_before);
+                    if due {
+                        steps.pop_front()
+                    } else {
+                        None
+                    }
+                })
             };
             match step {
                 None => self.inner.get(request),
@@ -9980,6 +9998,103 @@ mod tests {
         r5_one_full_plan("twice late", &sent);
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
         assert_eq!(r5_lines(METHOD, "heal_retry").len(), 2, "two late attempts");
+    }
+
+    /// PR #181 review round 3, blocker 2: a leave-out accepted shortly before the attempt's
+    /// deadline gives the owner's clear a whole window of its own, so recoverable store faults
+    /// in it do not end the heal `NotCleared` (terminal, the Db `Failed` until a reopen). Node 3
+    /// never links. Its frozen grant read answers 900 ms into a 1.5 s window, and the decision
+    /// is accepted; the owner's own grant read then fails once (after 550 ms) or twice (after
+    /// 300 ms each) before it reads absent. Each case is one attempt, no retry: one `HealLeftOut`
+    /// naming node 3, a plan pinning nodes 1 and 2. A third case keeps the zero-omission
+    /// deadline: `live_readd` off, node 3 links at 900 ms, nothing is left out, and one failure
+    /// after 700 ms ends the heal `NotCleared` at the attempt's deadline, nothing sent. Unit
+    /// (~6 s). Cuts: the clear keeps the attempt's deadline after a leave-out: both fault cases
+    /// `NotCleared`, red; every clear gets a fresh window: the zero-omission case is planned,
+    /// red. Each cut is decided by the timings, not raced: the fault paths end past the
+    /// attempt's deadline, and inside a fresh window.
+    #[config_log::retcd_test]
+    fn r5_clear_a_leave_out_accepted_near_the_deadline_clears_within_a_window_of_its_own() {
+        const METHOD: &str =
+            "r5_clear_a_leave_out_accepted_near_the_deadline_clears_within_a_window_of_its_own";
+        let ms = Duration::from_millis;
+        let window = ms(1_500);
+        let lost = |delay| GetStep {
+            not_before: Duration::ZERO,
+            delay,
+            fail: Some("lost on the way"),
+        };
+        let frozen = [r5_grant(3, utc_now() + 3_600_000, true)];
+        let faults: [(&str, Vec<GetStep>); 2] = [
+            ("one fault", vec![lost(ms(550))]),
+            ("two faults", vec![lost(ms(300)), lost(ms(300))]),
+        ];
+        let mut outcomes = Vec::new();
+        for (case, owner_steps) in faults {
+            let store = Arc::new(
+                GrantGets::new(NodeId(3), vec![r5_delay(Duration::ZERO, ms(900))])
+                    .and(OWNER, owner_steps),
+            );
+            let (healed, sent, _) = r5_heal_in(
+                store,
+                Arc::default(),
+                true,
+                true,
+                OsBoot::Same,
+                OWNER,
+                r5_up_but(&[3]),
+                &frozen,
+                HostClock::start(),
+                window,
+            );
+            // Every case runs before any assert, so a cut shows each case's result.
+            outcomes.push((case, healed, sent));
+        }
+        let failed: Vec<String> = outcomes
+            .iter()
+            .filter_map(|(case, healed, _)| healed.as_ref().err().map(|e| format!("{case}: {e}")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "the clear has a window of its own: {failed:#?}"
+        );
+        for (case, _, sent) in outcomes {
+            assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)], "{case}");
+            let (_, left) = r5_left_out(&sent).unwrap_or_else(|| panic!("{case}: node 3 noted"));
+            assert_eq!(
+                left.iter().map(|m| (m.node, m.boot)).collect::<Vec<_>>(),
+                [(NodeId(3), UNLINKED_BOOT)],
+                "{case}: node 3 is still missing"
+            );
+        }
+        assert!(
+            r5_lines(METHOD, "heal_retry").is_empty(),
+            "each fault case is one attempt"
+        );
+        assert_eq!(r5_lines(METHOD, "heal_proceed_without").len(), 2);
+
+        let started = std::time::Instant::now();
+        let late: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+            (node != NodeId(3) || started.elapsed() >= ms(900)).then_some(OPEN_2)
+        });
+        let store = Arc::new(GrantGets::new(OWNER, vec![lost(ms(700))]));
+        let (healed, sent, _) = r5_heal_in(
+            store,
+            Arc::default(),
+            true,
+            false,
+            OsBoot::Same,
+            OWNER,
+            late,
+            &[],
+            HostClock::start(),
+            window,
+        );
+        assert!(
+            matches!(healed, Err(HealError::NotCleared { node: 1, .. })),
+            "no omission keeps the attempt's deadline: {healed:?}"
+        );
+        assert!(sent.is_empty(), "nothing is sent: {sent:?}");
     }
 
     /// An owner's heal for [`r5_in_turn`]: `partitions/1` rooted in a store of its own,
