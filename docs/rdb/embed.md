@@ -444,6 +444,9 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
   `lr start N` is the restart.
 - `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
   embedder asks the same.
+- Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
+  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
+  place, as below.
 
 **Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
 supervisor, restarts the node in place:
@@ -463,6 +466,10 @@ supervisor, restarts the node in place:
 4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
    at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
    held.
+5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
+   restart policy, say) restart it. The gateway does this.
+
+Drop before you reopen, so a node never has two `Db`s at once.
 
 A peer sees every link to the old boot end, and its dials refused while nothing listens. When
 the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
