@@ -40,7 +40,7 @@ ADR that supersedes.
 | [0022](0022-formation-by-declaration.md) | Formation by declaration — each node forms its own partitions from its own folder (extends 0008) | Proposed |
 | [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 | [0024](0024-tls-to-the-control-store.md) | TLS to the control store — plaintext to rEtcd only when every node is on a loopback IP (extends 0023) | Proposed |
-| [0026](0026-check-b-at-adoption.md) | Check B at adoption (supersedes 0021 decision 7) | Proposed |
+| [0026](0026-check-b-at-adoption.md) | Check B at adoption (supersedes 0021 decision 7) | **Accepted** |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
 enables no Merge family. 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
