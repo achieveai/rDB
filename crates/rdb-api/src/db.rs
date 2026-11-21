@@ -949,6 +949,13 @@ async fn register_app_addr(
         .map_err(|error| refused(format!("read before the app address is written: {error}")))?
         .record
         .ok_or_else(|| refused("absent, so node's app address has no record".to_owned()))?;
+    // #80 S4: a removed record (layout 3) is terminal; nothing writes a live one over it.
+    if NodeRecord::decode_removed(&found.value).is_some_and(|(record, _)| record.node == node) {
+        return Err(refused(format!(
+            "node {} was removed; ids are never reused",
+            node.0
+        )));
+    }
     let (record, held) = NodeRecord::decode_with_app(&found.value)
         .filter(|(record, _)| record.node == node)
         .ok_or_else(|| refused("not a node record this build reads".to_owned()))?;
@@ -1076,7 +1083,7 @@ async fn read_route(
 
 /// The app address `nodes/{node}` holds (#83 B2): `None` when the record is absent (a database
 /// formed in one process has none) or holds none (layout 1, or a node opened with no app
-/// address).
+/// address). #80 S4: a removed record (layout 3) keeps the address it held.
 async fn read_app_addr(
     store: &dyn ConfigStore,
     node: NodeId,
@@ -1086,6 +1093,7 @@ async fn read_app_addr(
         return Ok(None);
     };
     NodeRecord::decode_with_app(&found)
+        .or_else(|| NodeRecord::decode_removed(&found))
         .filter(|(record, _)| record.node == node)
         .map(|(_, app)| app)
         .ok_or_else(|| {

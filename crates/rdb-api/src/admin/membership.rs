@@ -17,7 +17,8 @@ use rdb_core::contracts::ids::NodeId;
 use tokio_stream::StreamExt;
 
 use super::{
-    control_tls_refusal, machine_clash, read_formation, read_nodes, read_nodes_at, DeclareError,
+    control_tls_refusal, machine_clash, read_formation, read_nodes, read_nodes_at,
+    read_removed_nodes, DeclareError,
 };
 use crate::net::Net;
 
@@ -151,8 +152,11 @@ pub async fn add_node(
                 .to_owned(),
         ));
     }
+    // A removed node's id counts: ids are never reused (#80 S4).
     let records = read_nodes(&**store).await?;
-    let Some(highest) = records.keys().next_back().copied() else {
+    let removed = read_removed_nodes(&**store).await?;
+    let highest = records.keys().chain(&removed).max().copied();
+    let Some(highest) = highest else {
         return Err(refused(super::S1A_STORE.to_owned()));
     };
     let max = crate::db::MAX_NODES;

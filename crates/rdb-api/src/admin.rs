@@ -22,7 +22,7 @@
 //! [`clear_grant`] (M9 S2b) is the planner's other duty here: it removes the `grants/{node}`
 //! record a restarted node's old process left behind, through rdb-core's three guards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -879,7 +879,10 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
         .transpose()
 }
 
-/// Every `nodes/{id}` record, by node (#80 S1b, ADR-rdb-0023); empty when none was written.
+/// Every live `nodes/{id}` record, by node (#80 S1b, ADR-rdb-0023); empty when none was
+/// written. #80 S4: a removed record (layout 3) is not live and is left out, not undecodable,
+/// so one removed node does not fail the list for every reader; [`read_removed_nodes`] names
+/// it.
 ///
 /// # Errors
 ///
@@ -924,12 +927,56 @@ pub async fn read_nodes_at(
     let mut records = BTreeMap::new();
     for found in &listed.records {
         let key = String::from_utf8_lossy(&found.key).into_owned();
+        if removed_at_key(&found.value, &key).is_some() {
+            continue;
+        }
         let record = NodeRecord::decode(&found.value)
             .filter(|record| ControlKey::Node(record.node).encode() == key)
             .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
         records.insert(record.node, record);
     }
     Ok((records, listed.read_revision))
+}
+
+/// The node of `body` when it is a removed record (layout 3, #80 S4) for `key`'s node.
+fn removed_at_key(body: &[u8], key: &str) -> Option<NodeId> {
+    NodeRecord::decode_removed(body)
+        .map(|(record, _)| record.node)
+        .filter(|node| ControlKey::Node(*node).encode() == key)
+}
+
+/// The nodes whose `nodes/` record is removed (layout 3, #80 S4); their ids are never reused.
+/// [`read_nodes`] leaves them out. Other records are not read here.
+///
+/// # Errors
+///
+/// [`DeclareError::Store`] when the store fails or truncates the list.
+pub async fn read_removed_nodes(store: &dyn ConfigStore) -> Result<BTreeSet<NodeId>, DeclareError> {
+    let prefix = ControlPrefix::Nodes.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| DeclareError::Store {
+            step: format!("list {prefix}"),
+            error,
+        })?;
+    if listed.truncated {
+        return Err(DeclareError::Store {
+            step: format!("list {prefix}"),
+            error: ConfigError::Unavailable {
+                reason: format!("truncated at revision {}", listed.read_revision),
+            },
+        });
+    }
+    Ok(listed
+        .records
+        .iter()
+        .filter_map(|found| removed_at_key(&found.value, &String::from_utf8_lossy(&found.key)))
+        .collect())
 }
 
 /// Why node `node` may not start with `listen` and `peers` on a database declared as

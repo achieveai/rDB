@@ -445,3 +445,177 @@ fn s80s4_an_embedded_node_db_writes_to_a_new_owner_without_restart() {
     let route = one.route(group).expect("a route");
     assert_eq!(route.owner, ADDED, "the route names node 6");
 }
+
+/// #80 S4 M6, layout 3's half (T8): node 1's record is removed (layout 3, keeping its app
+/// address). An open of node 1 that would write its app address is refused with "node 1 was
+/// removed; ids are never reused", and writes nothing: the record's bytes and revision are
+/// unchanged and no app-address marker is left in the folder. `route`'s address read still
+/// reads the removed record's app address. Unit (one store, no node process).
+/// Cut: `register_app_addr` without its removed check: the open is refused as "not a node
+/// record this build reads" instead, red at the removal text, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s4_an_open_on_a_removed_record_is_refused_and_route_keeps_its_app_address() {
+    const APP: &str = "https://gw-1.example:8443";
+    let rt = runtime();
+    let store = config_testkit::MemStore::new();
+    let key = ControlKey::Node(NodeId(1)).encode();
+    let removed = rdb_core::authority::node::NodeRecord {
+        node: NodeId(1),
+        addr: "127.0.0.1:7100".to_owned(),
+        machine: "rack-1".to_owned(),
+    }
+    .encode_removed(Some(APP));
+    let put = rt
+        .block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(key.clone()),
+            value: removed.clone(),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the removed record is written");
+    assert_eq!(put.outcome, config_core::MutationOutcome::Applied);
+    let read = || {
+        rt.block_on(store.get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        }))
+        .expect("a read")
+        .record
+        .expect("nodes/1")
+    };
+    let before = read();
+
+    let dir = config_testkit::fs::temp_dir();
+    let refused = rt
+        .block_on(register_app_addr(
+            &store,
+            dir.path(),
+            NodeId(1),
+            "https://gw-1.b.example:9443",
+        ))
+        .expect_err("an open of a removed node is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("node 1 was removed; ids are never reused"),
+        "{refused}"
+    );
+    let after = read();
+    assert_eq!(after.value, removed, "nothing was written");
+    assert_eq!(
+        after.mod_revision, before.mod_revision,
+        "nothing was written"
+    );
+    assert!(
+        !dir.path().join(APP_ADDR_PENDING_FILE).exists(),
+        "no app-address marker is left"
+    );
+
+    assert_eq!(
+        rt.block_on(read_app_addr(&store, NodeId(1)))
+            .expect("route reads the removed record"),
+        Some(APP.to_owned())
+    );
+}
+
+/// #80 S4 T8, the removed record's readers: five nodes run; node 5 stops and its record is
+/// written removed (layout 3, a CAS at the revision read, as `remove_node` will write it). One
+/// removed record beside live ones fails no list:
+/// - every running node's `nodes/` watcher lists again and drops node 5 from its members;
+/// - `admin::read_nodes` lists the four live records, and `read_removed_nodes` names node 5;
+/// - node 1's declared open check, on peers 1 to 4, passes;
+/// - node 1's `route` answers for a group of every partition, node 5's included;
+/// - `admin::add_node` takes id 6, not the removed 5.
+///
+/// Integration (five node processes). Cut: `read_nodes_at` refuses a removed record as
+/// undecodable (its old reader), so every watcher's list fails and node 1 keeps node 5 ("not
+/// within 10s: node 1 drops removed node 5"), red, observed 2026-11-20.
+#[config_log::retcd_test]
+fn s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working() {
+    const REMOVED: NodeId = NodeId(5);
+    let (mut rig, _six) = five_ready();
+    rig.procs
+        .iter_mut()
+        .find(|proc| proc.node == REMOVED)
+        .expect("node 5 runs")
+        .db
+        .shutdown();
+    let key = ControlKey::Node(REMOVED).encode();
+    let found = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        }))
+        .expect("a read")
+        .record
+        .expect("nodes/5");
+    let (record, app) = rdb_core::authority::node::NodeRecord::decode_with_app(&found.value)
+        .expect("node 5's live record");
+    let written = rig
+        .rt
+        .block_on(rig.store.put(config_core::PutRequest {
+            key: Bytes::from(key),
+            value: record.encode_removed(app.as_deref()),
+            expected_mod_revision: Some(found.mod_revision),
+            dedup: None,
+        }))
+        .expect("the removal is written");
+    assert_eq!(written.outcome, config_core::MutationOutcome::Applied);
+
+    let four: BTreeSet<NodeId> = (1..=4).map(NodeId).collect();
+    for n in 1..=4 {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} drops removed node 5"),
+            Duration::from_secs(10),
+            || net.members() == four,
+        );
+    }
+
+    let removed = rig
+        .rt
+        .block_on(admin::read_removed_nodes(&*rig.store))
+        .expect("the removed nodes list");
+    assert_eq!(removed, BTreeSet::from([REMOVED]));
+    let live = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("the live records list");
+    assert_eq!(live.keys().copied().collect::<BTreeSet<_>>(), four);
+
+    let formation = rig
+        .rt
+        .block_on(admin::read_formation(&*rig.store))
+        .expect("a formation read")
+        .expect("the database is declared");
+    let peers: BTreeMap<NodeId, String> = rig
+        .addrs
+        .iter()
+        .filter(|(node, _)| four.contains(node))
+        .map(|(node, addr)| (*node, addr.clone()))
+        .collect();
+    rig.rt
+        .block_on(declared_open_refusal(
+            &[NodeId(1)],
+            Some(&NodeAddresses {
+                listen: rig.addrs[&NodeId(1)].clone(),
+                peers,
+                app: None,
+            }),
+            &formation,
+            &*rig.store,
+        ))
+        .expect("node 1's open check passes beside a removed record");
+
+    let one = &rig.of(NodeId(1)).db;
+    for p in 1..=PARTITIONS {
+        let group = group_in(one, PartitionId(p));
+        one.route(group)
+            .unwrap_or_else(|e| panic!("route answers for partition {p}: {e:?}"));
+    }
+
+    let added = rig
+        .rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("a node is added");
+    assert_eq!(added.node, ADDED, "the removed id 5 is not reused");
+}
