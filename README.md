@@ -180,13 +180,11 @@ Anti-flake rules enforced across the suite (normative; a violation is rejected i
   - *Narrow exception: rdb-api's own threads under an example binary's tests.* `Db::open`'s
     node and sync threads enter the opener's span only in rdb-api's own test build
     (`#[cfg(test)]` in `host.rs`), so under the tests of an example such as `rdb_node` their
-    lines land in the run's untagged file. So do the reopen heal's lines (`heal_member_boots`,
-    `heal_members`, `heal_retry`, `heal_failed`) in every build, rdb-api's own tests included:
-    `Db::start_heal` spawns its task on the runtime without the opener's span. A thread the
-    example spawns enters the test's span only where the row hands it over, as the V10 rows do;
+    lines land in the run's untagged file. A thread the example spawns enters the test's span
+    only where the row hands it over, as the V10 rows do;
     `s1b_four_declared_node_processes_run_on_one_machine` does not, so its `Db::open` lines are
-    untagged too. A row asserts only on lines from threads it put in its span. Lifting either
-    gap is a library change (PR #171 review; follow-up
+    untagged too. A row asserts only on lines from threads it put in its span. Lifting the gate
+    is a library change (PR #171 review; follow-up
     [#200](https://github.com/achieveai/rDB/issues/200)).
 - **DuckDB assertions, not eyeballing.** Log-based test assertions query that JSONL through
   `config_testkit::logs::query()`, and an empty result where rows are expected is itself a

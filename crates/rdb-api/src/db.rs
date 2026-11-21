@@ -2651,29 +2651,34 @@ impl Db {
         }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
-        self.opened.heal_task = Some(rt.spawn(async move {
-            // One after another: every grant expires on its own clock, so the later heals
-            // find theirs already expired.
-            let mut first = None;
-            let mut ended = Ok(());
-            for ctx in ctxs {
-                match admin::heal_retrying(ctx).await {
-                    Ok(healed) => {
-                        first.get_or_insert(healed);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "heal_failed");
-                        ended = Err(error);
-                        break;
+        // In the opener's span, as the planner's task is: the heal's lines land in the
+        // opener's test file (issue #200, PR #171 review).
+        self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
+            async move {
+                // One after another: every grant expires on its own clock, so the later heals
+                // find theirs already expired.
+                let mut first = None;
+                let mut ended = Ok(());
+                for ctx in ctxs {
+                    match admin::heal_retrying(ctx).await {
+                        Ok(healed) => {
+                            first.get_or_insert(healed);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "heal_failed");
+                            ended = Err(error);
+                            break;
+                        }
                     }
                 }
-            }
-            *lock(&state) = match (ended, first) {
-                (Ok(()), Some(healed)) => HealState::Handed(healed),
-                (Err(error), _) => HealState::Failed(error),
-                (Ok(()), None) => HealState::NotNeeded,
-            };
-        }));
+                *lock(&state) = match (ended, first) {
+                    (Ok(()), Some(healed)) => HealState::Handed(healed),
+                    (Err(error), _) => HealState::Failed(error),
+                    (Ok(()), None) => HealState::NotNeeded,
+                };
+            },
+            tracing::Span::current(),
+        )));
         Ok(())
     }
 
