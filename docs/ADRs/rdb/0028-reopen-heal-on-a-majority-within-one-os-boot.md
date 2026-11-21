@@ -1,4 +1,4 @@
-# ADR-rdb-0025: Reopen heal on a majority within one OS boot
+# ADR-rdb-0028: Reopen heal on a majority within one OS boot
 
 **Status:** Proposed
 **Date:** 2026-11-20

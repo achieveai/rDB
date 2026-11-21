@@ -423,7 +423,7 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
 - **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
-  ADR-rdb-0025): after a process restart, an owner with `Timeouts::live_readd` on heals with
+  ADR-rdb-0028): after a process restart, an owner with `Timeouts::live_readd` on heals with
   a majority of its copies.** The bullet above still holds after a host crash, and it holds
   whenever `live_readd` is off.
   - **Issue #169 (a restarted owner waits for a down copy) is fixed only with
