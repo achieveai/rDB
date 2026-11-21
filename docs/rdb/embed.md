@@ -99,6 +99,46 @@ scripts/local-cluster.sh up --dir C:/my-app/rEtcd --base-port 28400
 
 It runs without TLS and with every caller allowed. That is for one machine, never production.
 
+### TLS to rEtcd: nodes on other machines
+
+**Plaintext to rEtcd is refused unless every node is on a loopback IP** (ADR-rdb-0024). A
+declaration, an open (a node process's or an app's, `DbConfig::local` empty) and an
+`rdb_node` start are each refused, with nothing written, when the
+store is plaintext and any `nodes/` record names a host that is not `127.x.x.x` or `::1`. A
+host name counts as another machine, `localhost` too. The refusal names the node and its
+address, and says to pass `--control-tls`.
+
+There is no `DbConfig` field for it. The open reads the security your store reports, so build
+the rEtcd client under mutual TLS and pass it:
+
+```rust
+let tls = rdb_api::net::certs::load_control(std::path::Path::new("certs/control"))?;
+let client = config_client::GrpcClient::connect(
+    endpoints,
+    config_client::GrpcClientOptions {
+        tls: config_client::TlsMode::MutualTls(tls.mtls),
+        ..config_client::GrpcClientOptions::default()
+    },
+)?
+.with_cluster_id(tls.cluster); // without it a leader hint is not followed under TLS
+let store: Arc<dyn ConfigStore> = Arc::new(client);
+```
+
+- The folder holds `ca.pem` (the CA rEtcd's voters are signed by), `client.pem` and
+  `client.key`. Every rDB process shares that one client certificate. The `--gen-certs` one
+  names `retcd://<cluster>/client/rdb`; a production one may name any client principal
+  rEtcd's `[authz] policy` grants read and write on `""`. The loader takes any client name
+  and logs it (`control_tls_loaded`, field `principal`).
+- For development, `rdb_node --gen-certs --cert-dir C --control-cluster <32 hex>
+  --control-voters 1=HOST,2=HOST,3=HOST` writes `C/control/` with those three files and one
+  `voter-N.pem`/`.key` per voter. Production brings its own files in that layout.
+- `rdb_node`, `rdb_dev` and `rdb-server` take `--control-tls C/control`. Only `rdb_node`
+  refuses plaintext at its own start; the others meet the open's refusal, an app open
+  included. `rdb_dev --control-tls` needs `--control`.
+- `--gen-certs` makes its folder and `control/` `0700` and every key `0600` on Unix.
+- `scripts/docker-multihost.sh` runs the whole path on separate container IPs; see
+  `docker/README.md`.
+
 ## 4. Open, wait, use, shut down
 
 ```rust
@@ -358,6 +398,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
   for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
   for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
+  With `DbConfig::failover` set, the planner does the same by itself: once a faulted owner's
+  grant has run out it moves every partition of that owner, logging `planner_node_silent` with
+  reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
+  owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -1230,22 +1274,24 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
       record (those name the record and both addresses), a peer that names a node with no
       record, and a declared node given no peer address.
     - The checks `Db::open` adds itself end "nothing but its folder was created": two local
-      nodes, a store with no `nodes/` records, the local node's record absent, and no
-      `DbConfig::addresses`. They run before the node-start check, so on `Db::open` a store
+      nodes, a store with no `nodes/` records, a plaintext control link when a record names a
+      host that is not a loopback IP (`admin::control_tls_refusal`, section 3, "TLS to
+      rEtcd"), the local node's record absent, and no `DbConfig::addresses`. They run before the node-start check, so on `Db::open` a store
       with no records, or a missing record of its own, ends this way.
 
     `Db::open` binds nothing itself: your listener is already bound when you call it. To
     refuse before binding, as `rdb_node` does, call `admin::read_formation`,
-    `admin::read_nodes` and `admin::node_start_refusal` first. A store declared by an earlier
+    `admin::read_nodes`, `admin::node_start_refusal` and `admin::control_tls_refusal` first. A store declared by an earlier
     build (no `nodes/` records) is refused; declare again on a new store.
 
   This can be run with up to eight processes on 127.0.0.1 to .8 of one host: each loopback
   address counts as its own machine. The tests run five to eight nodes this way in one
-  process, and four `rdb_node` start paths; five separate processes have not been run at
-  this commit. It has not been run on separate machines. A machine
+  process, and four `rdb_node` start paths. Five separate `rdb_node` processes have run in
+  `scripts/docker-multihost.sh`'s Docker proof (#80 S2), each container on its own IP, all on
+  one physical host. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
-  Copies are uneven by up to 3 per node when K does not divide P. Still missing: TLS to
-  rEtcd from `rdb_node`, and adding or removing a node. A node process started
+  Copies are uneven by up to 3 per node when K does not divide P. Still missing: adding or
+  removing a node. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node process started
   on a folder of a database that was neither formed nor declared is still refused with
   "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
   of a declared database is refused: its node processes form it.
@@ -1253,8 +1299,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. For a declared database, an owner whose
-  folder is lost after its first root and before any admitted write is still refused as
-  unfinished forming; repeating --declare does not recover it (#137).
+  folder is lost after its first root and before any admitted write takes that root back on
+  restart, with nothing lost (#137). One that may have admitted writes is refused and told to
+  move the partition with `admin promote`.
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take
@@ -1295,10 +1342,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
-  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
-  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
-  separate issue.
+  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
+  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
+  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
+  last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied": ask
+  `db.status`, send it again with `db.resend`, or read the key back. Never send it again as a
+  new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -1454,6 +1503,7 @@ column says what to change before the next open.
 |---|---|---|
 | `OpenError::Io` | The filesystem refused: a wrong path, no permission, or a full disk | Fix what the message names, then open again |
 | `OpenError::DedupCap` | `DbConfig::dedup_cap` is above the most allowed; nothing was started | Set it to at most the number the message names, or leave it unset |
+| `OpenError::Config` ("the control store link is not TLS") | A declared database names a node off loopback, and the store you passed is plaintext. A node open has created only its folder; an app-only open creates nothing | Pass a `GrpcClient` under `TlsMode::MutualTls` (section 3, "TLS to rEtcd"), or `--control-tls` |
 | `OpenError::Node` | A node did not start: a copy's storage refused to open, or a copy could not be bound or linked. Nothing was removed | A newer format: open the folder with the build that wrote it. A disk or permission error: fix it, then open again. Anything else, or the same error again: stop and report it with the message |
 
 **Worth retrying.**
@@ -1542,9 +1592,10 @@ count grows. rDB caps it (ruling A-R166):
 
 Source: `crates/rdb-storage/README.md`, "Chain-depth ceiling".
 
-## 8. Container image (voter and data node)
+## 8. Container image (voter, data node and app)
 
-`docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with both processes:
+`docker/Dockerfile` builds one image, `rdb-bf-node:dev`, with three executables:
+`config-server` (the voter), `rdb_node` (the data node) and `rdb_dev` (the app):
 
 ```bash
 docker build -f docker/Dockerfile -t rdb-bf-node:dev .      # from the repository root
@@ -1558,5 +1609,10 @@ docker run --rm rdb-bf-node:dev help
   allow-all). Mount a volume on `/data`.
 - `data ...` runs `rdb_node` (one rDB data node) with the flags in the header of
   `crates/rdb-api/examples/rdb_node.rs`.
+- `dev ...` runs `rdb_dev` as an app (`--nodes`, `--control`, `--control-tls`).
+- `voter-init` writes a mutual-TLS voter set once: the signed manifest, `policy.toml` and
+  `voter-N/config.toml`, from `rdb_node --gen-certs --control-cluster`'s certificates.
+  `scripts/docker-multihost.sh` uses it for three voters and five data nodes, each on its own
+  IP.
 - The build needs `build-essential` and `libclang-dev` in the builder stage and sets no
   `LIBCLANG_PATH`. See `docker/README.md` for a worked run.
