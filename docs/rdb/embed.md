@@ -398,6 +398,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
   for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
   for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
+  With `DbConfig::failover` set, the planner does the same by itself: once a faulted owner's
+  grant has run out it moves every partition of that owner, logging `planner_node_silent` with
+  reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
+  owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -1316,8 +1320,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. For a declared database, an owner whose
-  folder is lost after its first root and before any admitted write is still refused as
-  unfinished forming; repeating --declare does not recover it (#137).
+  folder is lost after its first root and before any admitted write takes that root back on
+  restart, with nothing lost (#137). One that may have admitted writes is refused and told to
+  move the partition with `admin promote`.
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take
@@ -1379,10 +1384,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
     copies.
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
-  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
-  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
-  separate issue.
+  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
+  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
+  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
+  last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied": ask
+  `db.status`, send it again with `db.resend`, or read the key back. Never send it again as a
+  new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
