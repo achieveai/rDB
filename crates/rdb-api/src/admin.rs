@@ -2078,9 +2078,10 @@ pub enum HealError {
     /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
     #[error(
         "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
-         boot: start node {who}, then open again (the heal is waiting: {reason})",
+         boot: {step} (the heal is waiting: {reason})",
         who = names_in_words(.nodes),
-        secs = seconds_in_words(*.within_ms)
+        secs = seconds_in_words(*.within_ms),
+        step = peers_unknown_step(.nodes, .reason)
     )]
     PeersUnknown {
         /// The nodes with no boot yet.
@@ -3003,6 +3004,20 @@ async fn copy_down(
         Ok("grant_expired")
     } else {
         Err(NOT_PROVEN)
+    }
+}
+
+/// [`HealError::PeersUnknown`]'s next step. A late decision (`decided_past_deadline`) is
+/// retried by [`heal_retrying`] on its own, with a new window, even when the link has come
+/// back since, so it asks nothing of the operator (PR #181 review round 3). Every wait reason
+/// keeps the step it had: start the node, then open again.
+fn peers_unknown_step(nodes: &[u32], reason: &str) -> String {
+    if reason == "decided_past_deadline" {
+        "its decision came too late to act on, and the heal tries again by itself with a new \
+         window: nothing to do"
+            .to_owned()
+    } else {
+        format!("start node {}, then open again", names_in_words(nodes))
     }
 }
 
@@ -10095,6 +10110,50 @@ mod tests {
             "no omission keeps the attempt's deadline: {healed:?}"
         );
         assert!(sent.is_empty(), "nothing is sent: {sent:?}");
+    }
+
+    /// PR #181 review round 3: a late decision's `PeersUnknown` says the heal tries again by
+    /// itself, not to start the node and open again; every wait reason keeps that step,
+    /// byte for byte. Unit (~1 ms). Cut: one step for every reason: the late decision says
+    /// "start node 3", red.
+    #[test]
+    fn r5_advice_a_late_decision_says_the_heal_retries_and_waits_keep_their_step() {
+        let text = |reason| {
+            HealError::PeersUnknown {
+                nodes: vec![3],
+                within_ms: 16_200,
+                reason,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            text("decided_past_deadline"),
+            "no link to node 3 came up within 16.2 seconds, so the heal cannot pin its boot: \
+             its decision came too late to act on, and the heal tries again by itself with a \
+             new window: nothing to do (the heal is waiting: decided_past_deadline)"
+        );
+        for reason in [
+            "copy_not_proven_down",
+            "live_readd_off",
+            "os_boot_changed",
+            "os_boot_unknown",
+            "unsupported_platform",
+            "partition_forming",
+            "no_majority",
+            "grant_unread",
+            "grant_undecodable",
+            "no_grant_record",
+            "no_clock_bound",
+        ] {
+            assert_eq!(
+                text(reason),
+                format!(
+                    "no link to node 3 came up within 16.2 seconds, so the heal cannot pin its \
+                     boot: start node 3, then open again (the heal is waiting: {reason})"
+                ),
+                "{reason}"
+            );
+        }
     }
 
     /// An owner's heal for [`r5_in_turn`]: `partitions/1` rooted in a store of its own,
