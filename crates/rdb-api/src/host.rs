@@ -364,6 +364,58 @@ pub(crate) fn test_patience(base: Duration) -> Duration {
     base * config_testkit::poll::deadline_scale()
 }
 
+/// Test-only (#80 S4 M5b): how long a [`ReplanHold`] keeps a re-plan before the host faults,
+/// scaled as a wait.
+#[cfg(test)]
+pub(crate) const REPLAN_HOLD_PATIENCE: Duration = Duration::from_secs(60);
+
+/// Test-only (#80 S4 M5b): every host of `instance` stops each re-plan that re-adds `rejoiner`
+/// before it is built ([`Host::replan_hold`]), until [`Self::release`]. A row arms it to land
+/// `admin::remove_node` between a re-add's start and its build.
+#[cfg(test)]
+pub(crate) struct ReplanHold {
+    instance: [u8; INSTANCE_LEN],
+    rejoiner: NodeId,
+    reached: std::sync::atomic::AtomicU32,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+static REPLAN_HOLDS: Mutex<Vec<Arc<ReplanHold>>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+impl ReplanHold {
+    /// Hold every re-plan of `instance` that re-adds `rejoiner` from now on.
+    pub(crate) fn arm(instance: [u8; INSTANCE_LEN], rejoiner: NodeId) -> Arc<Self> {
+        let hold = Arc::new(Self {
+            instance,
+            rejoiner,
+            reached: std::sync::atomic::AtomicU32::new(0),
+            released: std::sync::atomic::AtomicBool::new(false),
+        });
+        REPLAN_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(&hold));
+        hold
+    }
+
+    /// How many re-plans have reached the hold.
+    pub(crate) fn reached(&self) -> u32 {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let every held re-plan go on, and hold no more.
+    pub(crate) fn release(self: &Arc<Self>) {
+        REPLAN_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|hold| !Arc::ptr_eq(hold, self));
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The `Db` rows' budgets where L1's timing is not the subject (A-R392): the spec's, with the
 /// resume hold cut to 50 ms so a fresh partition admits at once, and L1's warn and pause ages
 /// scaled as a wait. At scale 1 they equal the spec's 1 s and 2 s exactly. The scale stretches
@@ -7025,6 +7077,73 @@ impl Host {
         })
     }
 
+    /// #80 S4 (S-2): whether a re-plan this owner builds may pin `node` as a new member: `node` is
+    /// a live member of this process's `Net`, which its `nodes/` watcher keeps the live records
+    /// ([`crate::net::Net::set_members`]). Not, and it is left out, logged
+    /// `replan_member_not_live`. In-process links have no `Net` and no records: always.
+    fn pinnable(&self, partition: PartitionId, node: NodeId) -> bool {
+        let Some(net) = self.links.net() else {
+            return true;
+        };
+        if net.members().contains(&node) {
+            return true;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            member = node.0,
+            members_revision = net.members_revision(),
+            "replan_member_not_live"
+        );
+        false
+    }
+
+    /// [`ReplanHold`]: a re-plan of this instance that re-adds the held node waits here, before
+    /// it reads anything, until the row releases it. A hold never released faults this host
+    /// after [`REPLAN_HOLD_PATIENCE`], naming the hook, so the row fails instead of hanging.
+    #[cfg(test)]
+    fn replan_hold(&self, partition: PartitionId, rejoiner: Option<NodeId>) -> Result<(), Fault> {
+        let (Some(instance), Some(rejoiner)) = (self.instance, rejoiner) else {
+            return Ok(());
+        };
+        let hold = REPLAN_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|hold| hold.instance == instance && hold.rejoiner == rejoiner)
+            .cloned();
+        let Some(hold) = hold else {
+            return Ok(());
+        };
+        hold.reached
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            rejoiner = rejoiner.0,
+            "test_replan_held"
+        );
+        let patience = test_patience(REPLAN_HOLD_PATIENCE);
+        let deadline = Instant::now() + patience;
+        while !hold.released.load(std::sync::atomic::Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    rejoiner = rejoiner.0,
+                    "test_replan_hold_never_released"
+                );
+                return Err(Fault::from(format!(
+                    "test hook: node {}'s re-plan of partition {} re-adding node {} was held \
+                     {patience:?} and never released (ReplanHold::release)",
+                    self.node.0, partition.0, rejoiner.0
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// D10 (A-R398): each member the commit this node knew pinned and `result` (committed here)
     /// does not, at the boot it was pinned at, is left out, as [`Self::drained`] records a
     /// drop. That covers a drop this node never planned: a promote's plan pins only the members
@@ -7302,6 +7421,8 @@ impl Host {
         replan: Replan,
         note: CommittedWithout,
     ) -> Result<(), Fault> {
+        #[cfg(test)]
+        self.replan_hold(partition, replan.rejoiner)?;
         let committed = self.committed.get(&partition).ok_or_else(|| {
             Fault::from(format!(
                 "re-plan of partition {} with no commit to plan from",
@@ -7376,6 +7497,10 @@ impl Host {
             .is_none()
             .then(|| self.move_shadow(partition, replan, &pinned.members))
             .flatten();
+        // #80 S4 (S-2): a re-add or a move's target is pinned only while its record is live,
+        // read at the commit, so a re-add held across `admin::remove_node` pins nothing.
+        let readded = readded.filter(|member| self.pinnable(partition, member.node));
+        let joining = joining.filter(|member| self.pinnable(partition, member.node));
         for member in readded.into_iter().chain(joining) {
             members.push(member);
             members.sort_by_key(|member| member.copy);

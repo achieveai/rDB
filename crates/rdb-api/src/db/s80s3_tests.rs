@@ -894,3 +894,139 @@ fn s80s3_after_a_kill_and_restart_a_second_kill_keeps_every_partition_writable()
         "s80s3_second_kill_moved"
     );
 }
+
+/// #80 S4 M5b (S-2, design `arch-80-s34` rev 3): a re-add racing a remove does not pin the
+/// removed node. Node X is killed and every partition drops it; X restarts, still declared,
+/// and each owner whose partition left it out starts the re-add (`rejoin_revoke`). The re-plan
+/// is held before it is built ([`crate::host::ReplanHold`]) while `admin::remove_node(X)` lands
+/// and every survivor's `Net` drops X from its live members. Released, each held re-plan leaves
+/// X out (`replan_member_not_live{member X}`) and its commit pins only the survivors; X stays
+/// out of every `partitions/` record for five more drop checks
+/// ([`crate::host::DROP_CHECK_EVERY_MILLIS`]), so the check applies at each re-plan and not
+/// once; and `remove_node`'s re-list found nothing (`remove_node_still_pinned` absent).
+/// Integration (~40-70 s).
+/// Not covered: a re-plan built before the remove and committed after it (the plan-to-CAS
+/// window), which only `remove_node_still_pinned` reports.
+/// Cut: drop the commit-time pin refusal (`Host::pinnable` always true): "partitions/1 pins
+/// removed node 2: {1: Primary, 2: Shadow, 3: RegularSecondary}", red, observed 2026-11-21 at
+/// load 28-38. Green 4/4 at load 30-52.
+#[config_log::retcd_test]
+fn s80s4_a_re_add_racing_a_remove_does_not_pin_the_removed_node() {
+    const TEST: &str = "s80s4_a_re_add_racing_a_remove_does_not_pin_the_removed_node";
+    let mut lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let dead = lost.dead;
+    for p in 1..=S1B_P {
+        pins_until(
+            &lost.rig,
+            p,
+            Duration::from_secs(60),
+            "every partition drops the dead node",
+            |pins| !pins.contains(&dead.0),
+        );
+    }
+    let instance = lost
+        .rig
+        .rt
+        .block_on(admin::read_formation(&*lost.rig.store))
+        .expect("the formation reads")
+        .expect("a formation")
+        .instance;
+    let hold = crate::host::ReplanHold::arm(instance, dead);
+    lost.rig.restart(dead, probe_timeouts());
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    while hold.reached() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no owner started a re-add of node {} after its restart",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    lost.rig
+        .rt
+        .block_on(admin::remove_node(&lost.rig.store, dead))
+        .unwrap_or_else(|e| panic!("node {} is removed: {e:?}", dead.0));
+    let survivors: Vec<NodeId> = (1..=S1B_K).map(NodeId).filter(|n| *n != dead).collect();
+    for node in &survivors {
+        let net = lost
+            .rig
+            .of(*node)
+            .links
+            .net()
+            .unwrap_or_else(|| panic!("node {} runs a net", node.0));
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        while net.members().contains(&dead) {
+            assert!(
+                Instant::now() < deadline,
+                "node {}'s net still names removed node {} live",
+                node.0,
+                dead.0
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let held_tokens: BTreeMap<u32, (u64, u64)> =
+        (1..=S1B_P).map(|p| (p, token_of(&lost.rig, p).0)).collect();
+    let reached = hold.reached();
+    hold.release();
+    let held: BTreeSet<u32> = config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+        .iter()
+        .filter(|line| line["@m"] == "test_replan_held" && line["rejoiner"] == dead.0)
+        .filter_map(|line| line["partition"].as_u64())
+        .map(|p| u32::try_from(p).expect("a partition id"))
+        .collect();
+    assert!(!held.is_empty(), "the held re-plans name their partitions");
+    // Each held re-plan commits, without the removed node.
+    for p in &held {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+        while token_of(&lost.rig, *p).0 <= held_tokens[p] {
+            assert!(
+                Instant::now() < deadline,
+                "partition {p}'s held re-plan never committed: token {:?}",
+                held_tokens[p]
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let watch = Instant::now() + Duration::from_millis(5 * crate::host::DROP_CHECK_EVERY_MILLIS);
+    loop {
+        for p in 1..=S1B_P {
+            let roles = pinned_roles(&lost.rig, p);
+            assert!(
+                !roles.contains_key(&dead.0),
+                "partitions/{p} pins removed node {}: {roles:?}",
+                dead.0
+            );
+        }
+        if Instant::now() >= watch {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), TEST);
+    let not_live = lines
+        .iter()
+        .filter(|line| line["@m"] == "replan_member_not_live" && line["member"] == dead.0)
+        .count();
+    assert!(
+        not_live >= 1,
+        "a released re-plan leaves node {} out as not live",
+        dead.0
+    );
+    let still: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["@m"] == "remove_node_still_pinned")
+        .collect();
+    assert!(
+        still.is_empty(),
+        "remove_node's re-list found pins: {still:?}"
+    );
+    tracing::info!(
+        node = dead.0,
+        reached,
+        held = ?held,
+        not_live,
+        "s80s4_readd_race_done"
+    );
+}
