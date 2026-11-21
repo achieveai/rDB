@@ -213,3 +213,49 @@ fn sbx_148_e_a_byte_document_write_keeps_the_value_limit() {
     assert_eq!(stored(&db, b"e"), None, "nothing was written");
     db.shutdown();
 }
+
+/// PR #178 review r1 T11: the zero-byte surcharge at the `MAX_WRITE` boundary. Ids `\0a` and
+/// `\0b` each count `2 + 1` (a 0x00 counts twice), so the sum is `265 + 2 * (2 + 1 + 71) + v1 +
+/// v2`. At one under and at the limit the transaction is written. The over case is sized so the
+/// sum without the surcharge is exactly `MAX_WRITE`; with it the sum is `MAX_WRITE + 2`, and it
+/// is `TOO_LARGE` with that size. Cut: drop the zero bytes from the sum, and the over case is
+/// written and published. Integration (~1-2 s): one database open.
+#[config_log::retcd_test]
+fn sbx_148_f_zero_bytes_in_ids_push_a_txn_over_max_write() {
+    let (mut db, _kept) = open();
+    let first = vec![1_u8; MAX_VALUE];
+    let fixed = 265 + 2 * (2 + 1 + 71) + MAX_VALUE;
+    let txn = |bound: usize| {
+        let second = vec![2_u8; bound - fixed];
+        db.txn(
+            &[
+                TxnPut {
+                    group: GROUP,
+                    object: b"\0a",
+                    value: &first,
+                    if_version: None,
+                },
+                TxnPut {
+                    group: GROUP,
+                    object: b"\0b",
+                    value: &second,
+                    if_version: None,
+                },
+            ],
+            MAX_TXN_DEADLINE,
+        )
+    };
+    for bound in [MAX_WRITE - 1, MAX_WRITE] {
+        txn(bound).unwrap_or_else(|refused| panic!("a bound of {bound} is written: {refused}"));
+        assert_eq!(stored(&db, b"\0b"), Some(bound - fixed));
+    }
+    // Without the surcharge this sum is MAX_WRITE, which the Db would admit.
+    let refused = txn(MAX_WRITE + 2).expect_err("the surcharge puts it over");
+    assert_too_large(&refused.error, Limit::Write, MAX_WRITE + 2, MAX_WRITE);
+    assert_eq!(
+        stored(&db, b"\0b"),
+        Some(MAX_WRITE - fixed),
+        "nothing was written"
+    );
+    db.shutdown();
+}
