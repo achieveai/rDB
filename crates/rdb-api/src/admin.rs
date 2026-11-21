@@ -10008,8 +10008,10 @@ mod tests {
 
     /// PR #181 review round 2, blocker 1: two attempts in a row each get a grant read that ends
     /// past their deadline, and node 3's link comes up during the second. Each late attempt ends
-    /// `PeersUnknown`; the third plans node 3 at its boot. Unit (~4 s). Cut: no return after a
-    /// late answer: the second attempt reaches `clear_until` with no budget: `NotCleared`, red.
+    /// `PeersUnknown`, and warns so: two `heal_peers_unknown` at level Warning with reason
+    /// `decided_past_deadline` (review round 3). The third plans node 3 at its boot. Unit
+    /// (~4 s). Cuts: no return after a late answer: the second attempt reaches `clear_until`
+    /// with no budget: `NotCleared`, red; the late line logged at info: red at its level.
     #[config_log::retcd_test]
     fn r5_x_a_late_grant_read_twice_then_a_link_is_planned_once() {
         const METHOD: &str = "r5_x_a_late_grant_read_twice_then_a_link_is_planned_once";
@@ -10035,6 +10037,13 @@ mod tests {
         r5_one_full_plan("twice late", &sent);
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
         assert_eq!(r5_lines(METHOD, "heal_retry").len(), 2, "two late attempts");
+        // Review round 3: each late attempt warns that it ends, with the late decision's reason.
+        let ended = r5_lines(METHOD, "heal_peers_unknown");
+        assert_eq!(ended.len(), 2, "{ended:?}");
+        for line in &ended {
+            assert_eq!(line["@l"], "Warning", "{line}");
+            assert_eq!(line["reason"], "decided_past_deadline", "{line}");
+        }
     }
 
     /// PR #181 review round 3, blocker 2: a leave-out accepted shortly before the attempt's
