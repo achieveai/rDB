@@ -7464,3 +7464,89 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
     }
     assert!(host.fault.is_none(), "{:?}", host.fault);
 }
+
+/// Issue #184 on the host: the host drains one FIFO queue, commits T1's batch when it delivers
+/// the effect, and queues the completion behind whatever is already there. A Fresh read whose
+/// A1 `Read` answer is queued ahead of that completion reaches P1 with the commit visible in
+/// the step view and no candidate yet. It waits for the candidate and is served the new value,
+/// never refused `UNAVAILABLE`. The order is forced, not raced: the read's answer is held out of
+/// node 1's queue while the write steps to its commit, then put back at the front, where the
+/// race leaves it. Cut (`|| applied_ahead` dropped in `PubKernel::admit_read`): refused
+/// `Unavailable`, red. Trio, about 1 s.
+#[config_log::retcd_test]
+fn issue_184_a_read_answered_after_the_next_write_committed_waits_and_is_served() {
+    use rdb_core::contracts::authority::Checkpoint;
+
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.admits_for(1_000);
+    let published = trio.write(compile(1, b"a", b"one")).expect("first write");
+    let request = trio.compiled(compile(2, b"a", b"two"));
+
+    let host = &mut trio.nodes[0].0;
+    let step_until = |host: &mut Host, what: &str, found: &dyn Fn(&Queued) -> bool| {
+        for _ in 0..64 {
+            if let Some(at) = host.queue.iter().position(found) {
+                return at;
+            }
+            let queued = host
+                .queue
+                .pop_front()
+                .unwrap_or_else(|| panic!("{what}: queue empty"));
+            host.process(queued).expect("no fault");
+        }
+        panic!("{what}: not within 64 events");
+    };
+    let (read_reply, read_answer) = mpsc::channel();
+    host.client(Client {
+        partition: PartitionId(1),
+        call: get(3, b"a"),
+        reply: read_reply,
+    })
+    .expect("no fault");
+    let at = step_until(host, "A1's answer to the read check", &|queued| {
+        matches!(
+            &queued.event.kind,
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Answer(answer)))
+                if answer.checkpoint == Checkpoint::Read
+        )
+    });
+    let gate = host.queue.remove(at).expect("the answer");
+
+    let (put_reply, put_answer) = mpsc::channel();
+    host.client(Client {
+        partition: PartitionId(1),
+        call: ClientCall::Resend { request },
+        reply: put_reply,
+    })
+    .expect("no fault");
+    step_until(host, "the write's completion", &|queued| {
+        matches!(
+            queued.event.kind,
+            EventKind::Storage(StorageEvent::Committed { .. })
+        )
+    });
+    let p1 = host
+        .publication
+        .view(host.node, PartitionId(1))
+        .expect("P1 serves partition 1");
+    assert!(p1.pending.is_none(), "the candidate is not sent yet");
+    assert_eq!(p1.published.seq, Seq(published));
+    host.queue.push_front(gate);
+
+    match trio.answer(&read_answer) {
+        Answer::Read { outcome, seen, .. } => {
+            assert_eq!(outcome, ReadServiceOutcome::WaitedAtBarrier);
+            assert_eq!(
+                doc_bytes(seen),
+                Some((published + 1, Bytes::from_static(b"two")))
+            );
+        }
+        other => panic!("the read: {other:?}"),
+    }
+    match trio.answer(&put_answer) {
+        Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(published + 1)),
+        other => panic!("the write: {other:?}"),
+    }
+}

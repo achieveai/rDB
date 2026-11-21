@@ -848,10 +848,23 @@ impl PubKernel {
         event: PubEvent,
         repl: Option<&dyn ReplicationView>,
     ) -> Vec<PubEffect> {
+        self.apply_viewing(now, event, repl, false)
+    }
+
+    /// [`Self::apply`], told whether the step's storage view is the next applied seq: exactly
+    /// one above the published position, in the published generation (issue #184). A bool and
+    /// never the seq (§4.3 invariant 2). Only a `Read` answer reads it, in [`Self::admit_read`].
+    pub(crate) fn apply_viewing(
+        &mut self,
+        now: Tick,
+        event: PubEvent,
+        repl: Option<&dyn ReplicationView>,
+        applied_ahead: bool,
+    ) -> Vec<PubEffect> {
         match event {
             PubEvent::Candidate(cand) => self.on_candidate(now, cand),
             PubEvent::QualificationChanged(q) => self.on_qualification(now, q),
-            PubEvent::AuthorityAnswer(answer) => self.on_answer(now, &answer, repl),
+            PubEvent::AuthorityAnswer(answer) => self.on_answer(now, &answer, repl, applied_ahead),
             PubEvent::PostApplyDeadline { version } => self.on_deadline(now, version),
             PubEvent::BarrierAcquire { reader, intent } => self.on_acquire(reader, intent),
             PubEvent::StatusQuery {
@@ -896,24 +909,27 @@ impl PubKernel {
 
     fn on_candidate(&mut self, now: Tick, cand: AppliedCandidate) -> Vec<PubEffect> {
         let accepts = self.pending.is_none() && cand.lineage == self.lineage;
-        let not_serving = match &self.mode {
-            PubMode::Serving => false,
+        let (not_serving, unreachable) = match &self.mode {
+            PubMode::Serving => (false, false),
             PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(_) | FreezeCause::LocalStorageFenced,
             }
-            | PubMode::Blocked { .. } => true,
+            | PubMode::Blocked { .. } => (true, false),
             PubMode::Frozen {
                 cause: FreezeCause::UnresolvedTransaction | FreezeCause::RecoveryReadOnly,
-            } => {
-                return vec![PubEffect::Fact(PubFact::CandidateUnreachable {
-                    mode: self.mode.clone(),
-                })];
-            }
+            } => (false, true),
         };
-        if !accepts {
-            return vec![PubEffect::Fact(PubFact::CandidateUnreachable {
+        if unreachable || !accepts {
+            let mut effects = vec![PubEffect::Fact(PubFact::CandidateUnreachable {
                 mode: self.mode.clone(),
             })];
+            // Issue #184: with nothing pending, a waiter parked on the view one seq ahead was
+            // waiting for this candidate, and none other will come for it. Answered as a new
+            // reader would be.
+            if self.pending.is_none() {
+                effects.extend(self.drain_waiters());
+            }
+            return effects;
         }
         self.next_timer_version += 1;
         let deadline = TimerVersion(self.next_timer_version);
@@ -1009,6 +1025,7 @@ impl PubKernel {
         now: Tick,
         answer: &AuthorityDecision,
         repl: Option<&dyn ReplicationView>,
+        applied_ahead: bool,
     ) -> Vec<PubEffect> {
         if !self.fresh(answer) {
             let mut effects = vec![PubEffect::Fact(PubFact::StaleAuthorityAnswer)];
@@ -1020,7 +1037,7 @@ impl PubKernel {
                 .read_check
                 .is_some_and(|c| c.correlation == answer.correlation);
         if for_reads {
-            return self.on_read_answer(answer);
+            return self.on_read_answer(answer, applied_ahead);
         }
         let for_pending = answer.checkpoint == Checkpoint::Publication
             && self
@@ -1419,7 +1436,11 @@ impl PubKernel {
 
     /// The read check in flight answered, and the answer is ours. It decides exactly the reads
     /// that had arrived when it was issued; any read that arrived later is asked about again.
-    fn on_read_answer(&mut self, answer: &AuthorityDecision) -> Vec<PubEffect> {
+    fn on_read_answer(
+        &mut self,
+        answer: &AuthorityDecision,
+        applied_ahead: bool,
+    ) -> Vec<PubEffect> {
         let Some(check) = self.read_check.take() else {
             return Vec::new();
         };
@@ -1438,7 +1459,7 @@ impl PubKernel {
             self.gated.pop_front();
             match deny {
                 Some(reason) => effects.push(refuse(read.reader, read.intent, deny_kind(reason))),
-                None => effects.extend(self.admit_read(read)),
+                None => effects.extend(self.admit_read(read, applied_ahead)),
             }
         }
         if !self.gated.is_empty() {
@@ -1451,7 +1472,22 @@ impl PubKernel {
     /// (A-R72c). A previous read the mode allows is answered from the kept view — never the step's
     /// storage view, which may be above the published prefix (A-R69a). A fresh read waits behind
     /// a pending candidate, or is answered as the mode now answers it.
-    fn admit_read(&mut self, read: GatedRead) -> Option<PubEffect> {
+    ///
+    /// It also waits when `applied_ahead`: the step's view is the next seq, one above the
+    /// published position in its generation, and no candidate is pending yet (issue #184). The
+    /// host commits T1's batch when it delivers the effect but queues the completion, so a `Read`
+    /// answer already queued reaches P1 with the commit visible and the candidate not yet sent.
+    /// Answered at once, that read would meet a view above the published one and be refused
+    /// `Unavailable` (`answer_reader`); one event later it would have waited. So it waits, and the
+    /// candidate's publish releases it, or a refused candidate ([`Self::on_candidate`]), a mode
+    /// transition or a same-lineage re-emit ([`Self::on_recovered`]) drains it.
+    ///
+    /// Exactly `+1`, never "above": T1 dispatches only `published + 1`. It pumps only once
+    /// `Published` clears its inflight batch, and a new instance starts at the cutoff P1 rebases
+    /// to. Storage reports `applied = max(old mark, seq)`, so a batch T1 refuses as committed at
+    /// the wrong position (no candidate, hunt_16) leaves the view at `published + 2` or higher.
+    /// That view never parks a read, and nothing would release one parked there.
+    fn admit_read(&mut self, read: GatedRead, applied_ahead: bool) -> Option<PubEffect> {
         let reader = read.reader;
         match read.intent {
             ReadIntent::PreviousPublished => Some(PubEffect::Previous {
@@ -1461,7 +1497,9 @@ impl PubKernel {
                     None => self.kept.ok_or(ErrorKind::Unavailable),
                 },
             }),
-            ReadIntent::Fresh if self.mode == PubMode::Serving && self.pending.is_some() => {
+            ReadIntent::Fresh
+                if self.mode == PubMode::Serving && (self.pending.is_some() || applied_ahead) =>
+            {
                 self.waiters.push_back(Waiter { reader });
                 None
             }
@@ -1893,7 +1931,9 @@ impl PubKernel {
             self.lost = None;
             self.read_only_under = false;
             let mode = recovered_mode(&result.mode);
-            if self.mode != mode {
+            // Issue #184: a waiter with nothing pending sat on a view one seq ahead, and a re-emit
+            // moves no position, so it is answered here too rather than left behind it.
+            if self.mode != mode || self.pending.is_none() {
                 self.mode = mode;
                 effects.extend(self.drain_waiters());
             }
