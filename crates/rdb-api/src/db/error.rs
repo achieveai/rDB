@@ -142,6 +142,13 @@ pub(crate) const FEED_OTHER_COPY_STEP: &str = "read from the owner or another me
      (`Source::Owner`, or `Source::Node` of a member); calling this copy again will not help \
      while it holds no current copy";
 
+/// The step of a feed call that a node stopping or stopped could not answer (#170 review r5): a
+/// clean stop's answer to a call parked on its control read. Its rule is `RetryAfterRecovery`:
+/// this node serves again once it has restarted, and another copy can serve now.
+pub(crate) const FEED_STOPPED_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once it has \
+     restarted";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -385,6 +392,7 @@ impl ApiError {
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
             || self.detail.ends_with(FEED_HISTORY_STEP)
             || self.detail.ends_with(FEED_OTHER_COPY_STEP)
+            || self.detail.ends_with(FEED_STOPPED_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)

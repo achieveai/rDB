@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::db::error::{FEED_HISTORY_STEP, FEED_OTHER_COPY_STEP};
+use crate::db::error::{FEED_HISTORY_STEP, FEED_OTHER_COPY_STEP, FEED_STOPPED_STEP};
 use bytes::Bytes;
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::GrantRecord;
@@ -15477,8 +15477,11 @@ impl Host {
         Ok(())
     }
 
-    /// A clean stop's answer to every feed call parked on a control read (review r3/r4):
-    /// `UNAVAILABLE`, `BoundedJitter`, nothing written, with the feed's other-copy step. Sent
+    /// A clean stop's answer to every feed call parked on a control read (review r3/r4/r5):
+    /// `UNAVAILABLE`, nothing written, naming the stop. Its rule is `RetryAfterRecovery` and its
+    /// step [`FEED_STOPPED_STEP`]: another copy now, or this node once it has restarted. Not the
+    /// other-copy step, which says this copy holds no current copy and calling it again will
+    /// not help, nor `BoundedJitter`, which says a retry here soon is fine. Sent
     /// before the stop waits on the disk, so a stuck disk cannot delay it. It does not fault the
     /// node: a healthy node that stops is not damaged. Logged `feed_waiter_stopped` per call.
     fn stop_feed_waiters(&mut self) {
@@ -15496,10 +15499,11 @@ impl Host {
                     format!(
                         "node {} is stopping: this feed call waited on its control read of \
                          partitions/{}, which it no longer waits for; nothing was read or \
-                         written; next: {FEED_OTHER_COPY_STEP}",
+                         written; next: {FEED_STOPPED_STEP}",
                         node.0, partition.0
                     ),
                 );
+                error.retry = rdb_core::RetryRule::RetryAfterRecovery;
                 error.no_mutation = true;
                 let _ = waiter.reply.send(Answer::Error {
                     error,

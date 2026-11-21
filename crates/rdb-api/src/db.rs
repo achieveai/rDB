@@ -3322,7 +3322,9 @@ impl Db {
     /// to 500 ms; it is refused when the read has not landed by then, and sooner when the read
     /// fails or names another generation or membership. Follow the returned error: its retry
     /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
-    /// copy is left out). `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// copy is left out). A call waiting on that read when the node stops cleanly is answered at
+    /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
+    /// `UNAVAILABLE` also when no answer came within the read timeout, or
     /// `Source::Node(n)` names a node in another process this one has no link up to
     /// (`RetryAfterRecovery`); a node in this process whose thread has stopped is a host fault
     /// instead (`NotWired`). `INCOMPATIBLE_VERSION` when
@@ -4652,6 +4654,7 @@ impl Db {
     /// kind's generic "call again", which contradicts it.
     fn explained(&self, mut error: ApiError) -> ApiError {
         if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
+            || error.detail.ends_with(error::FEED_STOPPED_STEP)
             || error.detail.ends_with(error::FEED_HISTORY_STEP)
         {
             return error;

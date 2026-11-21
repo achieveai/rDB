@@ -282,8 +282,9 @@ fn f87_2_r2_two_parked_feed_callers_both_hear_the_damage_fault() {
 }
 
 /// Review r3/r4/r5 (threads 4654331881, 4654676431, 4655340430): two feed calls parked on node
-/// 2's control read, which never lands, are both answered by node 2's clean stop, each: `UNAVAILABLE`, `BoundedJitter`,
-/// nothing written, the feed's other-copy step; node 2 is not faulted, and logs
+/// 2's control read, which never lands, are both answered by node 2's clean stop, each with
+/// `UNAVAILABLE`, `RetryAfterRecovery`, nothing written, and the stop's own step (another copy
+/// now, or node 2 once it has restarted). Node 2 is not faulted, and logs
 /// `feed_waiter_stopped` once per call. Runs the run loop's own stop tail, [`Host::stop_tail`].
 /// That the answers precede the stop's disk work is
 /// `f87_4_a_stop_answers_parked_feed_calls_while_its_sync_is_held`.
@@ -321,17 +322,19 @@ fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
     assert_eq!(logged, 2, "feed_waiter_stopped once per call");
 }
 
-/// A parked feed call's answer from a clean stop: `UNAVAILABLE`, nothing written, no request,
-/// naming the stop, with the feed's other-copy step.
+/// A parked feed call's answer from a clean stop: `UNAVAILABLE`, `RetryAfterRecovery`, nothing
+/// written, no request, naming the stop, ending with the stop's own step and no other.
 fn stopped(who: &str, answer: Result<Answer, mpsc::TryRecvError>) {
     match answer {
         Ok(Answer::Error { error, request }) => {
             assert_eq!(error.kind, ErrorKind::Unavailable, "{who}: {error:?}");
-            assert_eq!(error.retry, RetryRule::BoundedJitter, "{who}: {error:?}");
+            assert_eq!(error.retry, RetryRule::RetryAfterRecovery, "{who}: {error:?}");
             assert!(error.no_mutation, "{who}: {error:?}");
             assert!(request.is_none(), "{who}: {request:?}");
             assert!(error.detail.contains("node 2 is stopping"), "{who}: {error:?}");
-            assert!(error.detail.ends_with(FEED_OTHER_COPY_STEP), "{who}: {error:?}");
+            assert!(error.detail.ends_with(FEED_STOPPED_STEP), "{who}: {error:?}");
+            assert!(error.detail.contains("once it has restarted"), "{who}: {error:?}");
+            assert_eq!(error.next_step(), None, "{who}: its own step only");
         }
         other => panic!("{who}: the stop left the parked call unanswered: {other:?}"),
     }
