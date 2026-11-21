@@ -1023,6 +1023,10 @@ pub async fn read_removed_nodes(store: &dyn ConfigStore) -> Result<BTreeSet<Node
 ///   recorded node with a **lower** id than `node` must have one: `node` dials those. A node
 ///   with a higher id dials `node`, so it may be left out (#80 S4, ADR-rdb-0025): a node added
 ///   after this one's `--peers` was written does not stop it starting.
+/// - A `peers` entry naming a node in `removed` (its record is removed) is skipped with a warn,
+///   `start_peer_removed_skipped`, and a removed node is not one that must be given, though
+///   every live lower id still is (S-4). A peer that is neither live nor removed is still
+///   refused. The caller dials none of them.
 ///
 /// Each refusal that compares a value with a record names the record (`nodes/N`) and both
 /// values.
@@ -1033,15 +1037,18 @@ pub fn node_start_refusal(
     peers: &BTreeMap<NodeId, String>,
     formation: Option<&Formation>,
     records: &BTreeMap<NodeId, NodeRecord>,
+    removed: &BTreeSet<NodeId>,
 ) -> Option<String> {
     const NOTHING: &str = "nothing was started";
     let formation = formation?;
-    // #80 S4: the formation record's nodes and every node added since, which has a record.
+    // #80 S4: the formation record's nodes and every node added since, which has a record,
+    // less the removed ones (S-4: a removed id is dropped from the next start's `--peers`).
     let declared = || {
         let mut all: Vec<u32> = formation
             .nodes
             .iter()
             .chain(records.keys())
+            .filter(|n| !removed.contains(n))
             .map(|n| n.0)
             .collect();
         all.sort_unstable();
@@ -1081,6 +1088,15 @@ pub fn node_start_refusal(
         ));
     }
     for (peer, addr) in peers {
+        if removed.contains(peer) {
+            tracing::warn!(
+                node = node.0,
+                peer = peer.0,
+                %addr,
+                "start_peer_removed_skipped"
+            );
+            continue;
+        }
         let Some(record) = records.get(peer) else {
             return Some(format!(
                 "peer address {}={addr} names node {}, which has no {}: the database declares \
@@ -5703,18 +5719,42 @@ mod tests {
             (3, "127.0.0.3:7100"),
         ]);
         let three = NodeId(3);
-        assert_eq!(node_start_refusal(three, "x", &good, None, &records), None);
         assert_eq!(
-            node_start_refusal(three, "127.0.0.3:7100", &good, Some(&formation), &records),
+            node_start_refusal(three, "x", &good, None, &records, &BTreeSet::new()),
             None
         );
         assert_eq!(
-            node_start_refusal(three, "0.0.0.0:7100", &good, Some(&formation), &records),
+            node_start_refusal(
+                three,
+                "127.0.0.3:7100",
+                &good,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
+            None
+        );
+        assert_eq!(
+            node_start_refusal(
+                three,
+                "0.0.0.0:7100",
+                &good,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
             None
         );
         let others = peers(&[(1, "127.0.0.1:7100"), (2, "127.0.0.2:7100")]);
         assert_eq!(
-            node_start_refusal(three, "127.0.0.3:7100", &others, Some(&formation), &records),
+            node_start_refusal(
+                three,
+                "127.0.0.3:7100",
+                &others,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
             None,
             "--peers need not name this node"
         );
@@ -5814,7 +5854,14 @@ mod tests {
                 vec!["no peer address for node 2", "nodes/2", "127.0.0.2:7100"],
             ),
         ] {
-            let refused = node_start_refusal(node, listen, &given, Some(&formation), &held);
+            let refused = node_start_refusal(
+                node,
+                listen,
+                &given,
+                Some(&formation),
+                &held,
+                &BTreeSet::new(),
+            );
             let Some(text) = refused else {
                 panic!("{what}: refused");
             };

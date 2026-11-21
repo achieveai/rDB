@@ -12,7 +12,8 @@ use rdb_core::authority::node::NodeRecord;
 use rdb_core::contracts::ids::NodeId;
 
 use super::super::{
-    declare, node_start_refusal, read_formation, read_nodes, Declaration, NodeDecl,
+    declare, node_start_refusal, read_formation, read_nodes, read_removed_nodes, Declaration,
+    NodeDecl,
 };
 use super::{add_node, AddNodeError};
 use crate::test_store::{Script, Scripted, TlsReported};
@@ -274,7 +275,8 @@ fn s80s4_concurrent_add_nodes_take_distinct_ids() {
 /// record, starts; a node may leave out of `--peers` any node with a higher id, which dials it,
 /// but never one with a lower id, which it dials. Every entry it gives is still checked: one
 /// naming a node with no record is refused, and so is a node with no record of its own. The
-/// removed-peer skip and the removed-own-id refusal wait on layout 3 (T8, T11b).
+/// removed-peer skip is the next row; the removed-own-id refusal is `rdb_node`'s
+/// `s80s4_a_removed_nodes_start_check_is_refused_with_the_reused_id_text`.
 /// Cut: put back the old rule, every declared node but this one needs a peer address, and
 /// node 3 with no entry for 4-6 is refused: red, observed 2026-11-20.
 #[test]
@@ -300,6 +302,7 @@ fn s80s4_start_check_accepts_an_added_node_and_a_missing_higher_peer() {
             given,
             Some(&formation),
             &records,
+            &std::collections::BTreeSet::new(),
         )
     };
     assert_eq!(start(3, &peers(&[1, 2])), None, "4, 5 and 6 dial node 3");
@@ -426,4 +429,91 @@ fn s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_
     let why = remove_refusal(rt.block_on(super::remove_node(&three, NodeId(3))));
     assert!(why.contains("leaves 2 distinct live machines"), "{why}");
     assert_eq!(snapshot(&rt, &*three), before, "a refusal writes nothing");
+}
+
+/// M6 removed-peer half (#80 S4, S-4): five nodes are declared and `nodes/2` is then written
+/// removed (layout 3). Node 3's start check with `--peers` still naming 2 passes, skipping 2
+/// with a warn (`start_peer_removed_skipped`, naming peer 2); one that leaves removed 2 out
+/// passes with no warn, as T13's start after a remove does. While 2 was live, leaving it out was
+/// refused, as before: a live lower id is still required. A peer that is neither live nor
+/// removed (node 7) is still refused. Unit (one store).
+/// Cuts: (A) `node_start_refusal` without the skip: "peer address 2=127.0.0.2:7100 names node
+/// 2, which has no nodes/2", red at (a); (B) its `declared()` keeps removed ids: "no peer address
+/// for node 2", red at (b). Both observed 2026-11-21 at load 29-33.
+#[config_log::retcd_test]
+fn s80s4_start_check_skips_a_removed_peer_and_still_refuses_an_unknown_one() {
+    const METHOD: &str = "s80s4_start_check_skips_a_removed_peer_and_still_refuses_an_unknown_one";
+    let rt = runtime();
+    let store = declared(&rt, 5);
+    let live = rt.block_on(read_nodes(&*store)).expect("records");
+    let two = live[&NodeId(2)].clone();
+    let written = rt
+        .block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(rdb_core::contracts::control::ControlKey::Node(NodeId(2)).encode()),
+            value: two.encode_removed(None),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("nodes/2 is written removed");
+    assert_eq!(written.outcome, config_core::MutationOutcome::Applied);
+    let formation = rt
+        .block_on(read_formation(&*store))
+        .expect("read")
+        .expect("declared");
+    let records = rt.block_on(read_nodes(&*store)).expect("records");
+    let removed = rt
+        .block_on(read_removed_nodes(&*store))
+        .expect("removed records");
+    assert_eq!(removed, std::collections::BTreeSet::from([NodeId(2)]));
+    let peers = |ids: &[u32]| -> BTreeMap<NodeId, String> {
+        ids.iter()
+            .map(|n| (NodeId(*n), format!("127.0.0.{n}:7100")))
+            .collect()
+    };
+    let start = |given: &BTreeMap<NodeId, String>| {
+        node_start_refusal(
+            NodeId(3),
+            "127.0.0.3:7100",
+            given,
+            Some(&formation),
+            &records,
+            &removed,
+        )
+    };
+    let skips = || -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "start_peer_removed_skipped")
+            .collect()
+    };
+
+    // (a) --peers still names removed 2: skipped, once, with a warn.
+    assert_eq!(start(&peers(&[1, 2, 4, 5])), None, "--peers still names 2");
+    let skipped = skips();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["peer"], 2, "{skipped:?}");
+
+    // (b) removed 2 left out, as T13 writes --peers after a remove: no warn.
+    assert_eq!(start(&peers(&[1, 4, 5])), None, "removed 2 is not required");
+    assert_eq!(skips().len(), 1, "no second warn");
+
+    // (c) while 2 was live, leaving it out was refused: a live lower id is still required.
+    let was = node_start_refusal(
+        NodeId(3),
+        "127.0.0.3:7100",
+        &peers(&[1, 4, 5]),
+        Some(&formation),
+        &live,
+        &std::collections::BTreeSet::new(),
+    )
+    .expect("live 2 left out is refused");
+    assert!(was.contains("no peer address for node 2"), "{was}");
+
+    // (d) a peer neither live nor removed is refused.
+
+    let refused = start(&peers(&[1, 2, 7])).expect("an unknown peer is refused");
+    assert!(
+        refused.contains("names node 7, which has no nodes/7"),
+        "{refused}"
+    );
 }

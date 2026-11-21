@@ -6890,12 +6890,17 @@ async fn declared_open_refusal(
             node.0
         )));
     };
+    // #80 S4 (S-4): a peer whose record is removed is skipped, not refused.
+    let removed = admin::read_removed_nodes(store)
+        .await
+        .map_err(nodes_refused)?;
     if let Some(refused) = admin::node_start_refusal(
         *node,
         &addresses.listen,
         &addresses.peers,
         Some(formation),
         &records,
+        &removed,
     ) {
         return Err(OpenError::Config(refused));
     }

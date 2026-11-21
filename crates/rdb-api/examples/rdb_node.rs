@@ -893,14 +893,16 @@ fn declare_on(
 /// The node-start check (#80 S1b rulings 2 and 4, ADR-rdb-0023 Decision 5): on a declared
 /// database, `--listen` and every `--peers` entry must be what the `nodes/` records say, and an
 /// S1a store (no records) is refused. Run before this process writes its boot or binds, so a
-/// refused start leaves nothing behind. An undeclared database passes.
+/// refused start leaves nothing behind. An undeclared database passes. #80 S4 (S-4): a
+/// `--peers` entry whose record is removed is skipped, not refused; the answer is the removed
+/// nodes, which this process does not dial.
 fn start_check_on(
     args: &Args,
     node: NodeId,
     listen: &str,
     store: &dyn ConfigStore,
     rt: &tokio::runtime::Runtime,
-) -> Result<(), String> {
+) -> Result<BTreeSet<NodeId>, String> {
     let formation = rt
         .block_on(rdb_api::admin::read_formation(store))
         .map_err(|e| format!("start check: {e}"))?;
@@ -909,6 +911,12 @@ fn start_check_on(
             .block_on(rdb_api::admin::read_nodes(store))
             .map_err(|e| format!("start check: {e}"))?,
         None => BTreeMap::new(),
+    };
+    let removed = match &formation {
+        Some(_) => rt
+            .block_on(rdb_api::admin::read_removed_nodes(store))
+            .map_err(|e| format!("start check: {e}"))?,
+        None => BTreeSet::new(),
     };
     // #80 S2 ruling 1 (ADR-rdb-0024): before the boot is written or anything is bound, as the
     // open would refuse it after.
@@ -922,13 +930,20 @@ fn start_check_on(
         .map(|why| format!("{why}; nothing was started"))
     });
     match plaintext.or_else(|| {
-        rdb_api::admin::node_start_refusal(node, listen, &args.peers, formation.as_ref(), &records)
+        rdb_api::admin::node_start_refusal(
+            node,
+            listen,
+            &args.peers,
+            formation.as_ref(),
+            &records,
+            &removed,
+        )
     }) {
         Some(refused) => {
             tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
             Err(format!("start check: {refused}"))
         }
-        None => Ok(()),
+        None => Ok(removed),
     }
 }
 
@@ -1178,7 +1193,15 @@ fn serve_on_ready(
         eprintln!("rdb_node: start check: {refused}");
         return Ok(Served::RemovedId);
     }
-    start_check_on(args, node, &listen, &*store, rt)?;
+    let removed = start_check_on(args, node, &listen, &*store, rt)?;
+    // S-4: a removed peer is neither dialled nor a member, nor given to the open.
+    let peers: BTreeSet<NodeId> = peers.difference(&removed).copied().collect();
+    let live_peers: BTreeMap<NodeId, String> = args
+        .peers
+        .iter()
+        .filter(|(peer, _)| !removed.contains(peer))
+        .map(|(peer, addr)| (*peer, addr.clone()))
+        .collect();
     if let Some(bound) = &bound {
         let at = bound
             .local_addr()
@@ -1209,7 +1232,7 @@ fn serve_on_ready(
             boot,
             tls,
             peers,
-            dial: NetConfig::dial_lower(node, &args.peers),
+            dial: NetConfig::dial_lower(node, &live_peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
             admin_apps: admin_apps(args),
@@ -1241,7 +1264,7 @@ fn serve_on_ready(
         // #80 S1b ruling 2: checked against the records by the open too, as an embedded node is.
         addresses: Some(rdb_api::NodeAddresses {
             listen: listen.clone(),
-            peers: args.peers.clone(),
+            peers: live_peers,
             app: args.app_addr.clone(),
         }),
     };
