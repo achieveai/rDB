@@ -2812,6 +2812,9 @@ fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
 /// #107 live return, taken back by `live_readd_duty`. Cut: the host ignores
 /// `Msg::HealLeftOut`: no clocked return, and `restore_left_out` records `C` at its new live
 /// boot, so it waits for yet another restart (`copy_left_out_until_restart`), red at the pins.
+/// The read back after the pins retries a `RetryAfterRecovery` refusal ([`get_lands`]): the
+/// client contract says retry it, and a lease taken again after the re-add is not a defect;
+/// every assert on the pins comes first, so the retry cannot hide a copy that never returned.
 #[config_log::retcd_test]
 fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
     let (mut rig, owned, copy) = r5_scene();
@@ -2857,13 +2860,34 @@ fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
             "partition {partition}: node {} leads nothing",
             copy.0
         );
-        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        let got = get_lands(rig.of(R5_OWNER), *group, b"before");
         assert_eq!(
             got.value.as_ref().map(|(_, value)| &value[..]),
             Some(&b"1"[..]),
             "partition {partition}"
         );
         put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// A get of `key` in `group`, retried while it is refused with `RetryAfterRecovery`, as a
+/// client does: the owner's read lease is taken again after a re-add's commit, so a read in
+/// that gap is refused `LeaseExpired`, with no mutation (observed on PR #181 at load 48). Any
+/// other refusal, or one past the patience, fails the row.
+fn get_lands(db: &Db, group: AffinityId, key: &[u8]) -> crate::GetOk {
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    loop {
+        match db.get_in(group, key) {
+            Ok(got) => return got,
+            Err(refused) => {
+                tracing::info!(group = ?group, error = ?refused, "r5_get_retry");
+                assert!(
+                refused.retry == crate::RetryRule::RetryAfterRecovery && Instant::now() < deadline,
+                    "no get answered in {group:?}: {refused:?}"
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
