@@ -31,15 +31,66 @@
 
 use std::collections::VecDeque;
 
-use crate::contracts::ids::{DurableSeq, Seq};
+use crate::contracts::ids::{DurableSeq, NodeId, Seq};
 use crate::contracts::membership::CopyId;
 use crate::contracts::time::Tick;
 
 /// Logged once per copy that drops below the floor in force: it no longer holds `F` back.
 pub const HISTORY_COPY_BEHIND_FLOOR: &str = "history_copy_behind_floor";
 
-/// Logged when the budget cap moves `F` past a transfer pin: that transfer restarts.
+/// Logged when the budget cap moves `F` past a transfer pin: that transfer restarts, until
+/// [`overrun_action`] gives up on the copy.
 pub const HISTORY_BUDGET_OVERRAN_PIN: &str = "history_budget_overran_pin";
+
+/// How many overruns in a row of one copy's transfer the source tries before it stops
+/// re-offering (issue #61 S3-R4 part (b), owner ruling 2026-11-20, option 1).
+pub const HISTORY_BUDGET_OVERRUN_ATTEMPTS: u32 = 3;
+
+/// What a source does after the `consecutive`-th overrun in a row of one copy's transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrunAction {
+    /// End the transfer; the copy's next ask opens a new one.
+    ReOffer,
+    /// End the transfer and offer that copy no more: warn with `gave_up = true` and name it in
+    /// `needs_operator` ([`needs_history_budget`]) until a caught-up release resets the count, or
+    /// a raised budget or a new generation clears it (lead ruling R27).
+    GiveUp,
+}
+
+/// The one seam for repeated overruns (owner ruling 2026-11-20, option 1): re-offer until
+/// [`HISTORY_BUDGET_OVERRUN_ATTEMPTS`] overruns in a row, then give up. `consecutive` counts
+/// the overrun just seen, so the first is 1. The caller keeps the count per (source, partition,
+/// copy) and resets it on any round for that copy that is not an overrun: a caught-up release,
+/// or a retention round that keeps the copy's open transfer within budget (lead ruling
+/// 2026-11-21).
+#[must_use]
+pub const fn overrun_action(consecutive: u32) -> OverrunAction {
+    if consecutive >= HISTORY_BUDGET_OVERRUN_ATTEMPTS {
+        OverrunAction::GiveUp
+    } else {
+        OverrunAction::ReOffer
+    }
+}
+
+/// `needs_operator`'s text for a copy whose transfers the budget overran
+/// [`HISTORY_BUDGET_OVERRUN_ATTEMPTS`] times in a row: the copy, the source node, and the
+/// remedy. The give-up clears itself when the budget in force rises above the one it was
+/// recorded at, or the partition moves to a new generation (lead ruling R27), so the text says
+/// the copy is retried then.
+#[must_use]
+pub fn needs_history_budget(copy: CopyId, node: NodeId, attempts: u32) -> String {
+    format!(
+        "copy {} cannot be rebuilt from node {}: the history budget overran its snapshot \
+         transfer {attempts} times in a row; raise history budget or reduce writes, then the \
+         copy is retried automatically",
+        copy.0, node.0
+    )
+}
+
+/// Logged when a source clears a give-up ([`OverrunAction::GiveUp`]) for a copy, with
+/// `why` = `budget_raised` or `new_generation` (lead ruling R27): the copy's next ask is
+/// offered again.
+pub const HISTORY_BUDGET_GIVE_UP_CLEARED: &str = "history_budget_give_up_cleared";
 
 /// Why the duty trims nothing this round (design §3.1, "No trim while"). The floor in force
 /// stays.

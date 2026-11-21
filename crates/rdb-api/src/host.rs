@@ -1307,7 +1307,7 @@ pub enum TailAdoption {
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
     /// survivor's own check). The next landing scan replaces it.
     Unchecked,
-    /// Issue #61 (lead rulings R10 and R16, protocol 12): the proofs could not run because the
+    /// Issue #61 (lead rulings R10 and R16, #61's protocol version): the proofs could not run because the
     /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
     /// back by adoption, yet giving it up still takes `--give-up-live-copy`: the copy may hold
     /// the only record of an acknowledged write (design rev 5a).
@@ -1349,7 +1349,7 @@ impl TailAdoption {
     }
 }
 
-/// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
+/// Issue #61 (lead ruling R16, #61's protocol version): the reasons [`TailAdoption::Trimmed`] names. Each
 /// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
 /// `base_below_floor` from `Host::chain`.
 pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
@@ -2987,6 +2987,11 @@ struct Host {
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
+    /// Issue #61 R26 (b): per partition, the copy a `ReadOnly` commit left outside that R1 has
+    /// since caught up, with its node and the commit's generation. The repair re-plans with it
+    /// at the next check, and until then a refused write names it
+    /// ([`Self::rebuilding_read_only`]). Read only while the commit's generation is current.
+    caught_up_outside: BTreeMap<PartitionId, (Generation, CopyId, NodeId)>,
     /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
     /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
     /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
@@ -3263,6 +3268,7 @@ impl Host {
             #[cfg(test)]
             hold_repairs: false,
             repair_since: BTreeMap::new(),
+            caught_up_outside: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
@@ -5644,7 +5650,7 @@ impl Host {
             .range((partition, CopyId(0))..)
             .find(|((at, _), _)| *at == partition)
         else {
-            return refused;
+            return self.caught_up_read_only(partition, refused);
         };
         let millis = transfer.opened.millis_until(self.clock.now());
         refused.detail = format!(
@@ -5657,6 +5663,30 @@ impl Host {
             transfer.bytes as f64 / f64::from(1u32 << 20),
             millis / 1000,
             (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
+        refused
+    }
+
+    /// [`Self::rebuilding_read_only`] once the transfer has ended (issue #61 R26): a copy the
+    /// `ReadOnly` commit left outside is caught up, and writes wait for the owner's re-plan with
+    /// it ([`Self::repair_on_caught_up`]). Unchanged when none is, or for an older commit.
+    fn caught_up_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let current = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.new_generation);
+        let Some((_, copy, node)) = self
+            .caught_up_outside
+            .get(&partition)
+            .filter(|(generation, _, _)| Some(*generation) == current)
+        else {
+            return refused;
+        };
+        refused.detail = format!(
+            "{}: copy {} on node {} is caught up; writes resume when the owner re-plans with it",
+            refused.detail, copy.0, node.0,
         );
         let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
         refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
@@ -6880,6 +6910,7 @@ impl Host {
                     "caught_up",
                     "snapshot_transfer_released",
                 );
+                self.repair_on_caught_up(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -8776,6 +8807,50 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// Issue #61 R26 (b): `copy` caught up. When it is a member this node's `ReadOnly` commit
+    /// left outside and F1 armed no rebuild (a two-copy plan never arms one, arch-s2 R2-M2),
+    /// nothing else ends the window: the repair would first wait for the member's link to age
+    /// `resume_hold_millis`. A caught-up copy has just proved it answers, so that wait is
+    /// skipped: the next check probes it, and the one after re-plans (A-R350's probe still
+    /// applies). Logged `read_only_repair_on_caught_up`.
+    fn repair_on_caught_up(&mut self, partition: PartitionId, copy: CopyId) {
+        let Some((generation, node)) = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.copy == copy)
+                .map(|member| (committed.new_generation, member.node))
+        }) else {
+            return;
+        };
+        if !self.read_only_outside(partition).contains(&node) {
+            return;
+        }
+        let armed = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| f1.phase() == RecoveryPhase::Rebuilding);
+        if armed {
+            return;
+        }
+        let now = self.clock.now();
+        let aged = Tick(now.0.saturating_sub(self.budgets.resume_hold_millis));
+        let since = self.repair_since.entry(partition).or_insert(aged);
+        *since = (*since).min(aged);
+        self.caught_up_outside
+            .insert(partition, (generation, copy, node));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            copy = copy.0,
+            holder = node.0,
+            "read_only_repair_on_caught_up"
+        );
     }
 
     /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
@@ -14118,7 +14193,7 @@ impl Host {
     /// `tail_below_floor` (the history P1 and P2 read is gone; the copy is rebuilt by snapshot).
     /// That reason and [`Self::chain`]'s `base_below_floor` are [`ADOPTION_TRIMMED`], not
     /// [`ADOPTION_REFUSALS`]: they answer [`TailAdoption::Trimmed`] ([`TailAdoption::of`]), which
-    /// crosses the wire from protocol 12 (lead ruling R16). t4's check-B reasons stay
+    /// crosses the wire from the protocol version #61 introduces (lead ruling R16). t4's check-B reasons stay
     /// [`TailAdoption::Unchecked`].
     fn adoption(
         &self,
@@ -14392,11 +14467,14 @@ impl Host {
     /// too (D8, A-R337). A link above the base is an adopted tail's (issue #105 unit 2, design
     /// section 5.1, M1): it passes only when the chain from the base through the link verifies
     /// record by record from the anchor's digest ([`Self::chain`]), and is refused
-    /// `base_differs` otherwise. A copy missing the anchor's generation, or holding it staged
-    /// under a release, links it first ([`Self::inherit_missed_link`]). A copy holding a newer
-    /// generation of the partition is ahead of the plan and answers nothing; roll-forward is
-    /// decided before the plan is made, never here. Its ladder is the kept one, extended through
-    /// the head ([`Self::inventory_ladder`], A-R461), cut at the base.
+    /// `base_differs` otherwise. A lineage a snapshot installed has no link: it answers when its
+    /// own trim mark roots it at or below the anchor's base, and is refused
+    /// `anchor_generation_unlinked` otherwise, as any other unlinked lineage (issue #61 R26). A
+    /// copy missing the anchor's generation, or holding it staged under a release, links it
+    /// first ([`Self::inherit_missed_link`]). A copy holding a newer generation of the partition
+    /// is ahead of the plan and answers nothing; roll-forward is decided before the plan is
+    /// made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -14428,10 +14506,22 @@ impl Host {
                 "inventory_link_inherited"
             );
         }
-        let link = self
-            .engine
-            .link(partition, generation)
-            .ok_or("anchor_generation_unlinked")?;
+        // Issue #61 R26 (A8): a lineage a snapshot installed has no link (a link names an older
+        // parent); its own trim mark roots it at the barrier instead (B1). It answers when that
+        // mark is the anchor generation's own and is rooted at or below the anchor's base; the
+        // base digest check below then proves the prefix as for any lineage. Anything else
+        // unlinked is refused as before.
+        let link = self.engine.link(partition, generation);
+        if link.is_none()
+            && !self
+                .engine
+                .floor(partition, generation)
+                .is_some_and(|(level, mark)| {
+                    level == generation && mark.root_base <= anchor.base_seq
+                })
+        {
+            return Err("anchor_generation_unlinked");
+        }
         // Issue #61 (design section 3.5, rev 4 m-e): History below the trim floor is gone, so a
         // base under it is proved by the mark the trim wrote, never by a record. The mark
         // counts only when it is the anchor generation's own and names the anchor's base as
@@ -14455,7 +14545,7 @@ impl Host {
             // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
             // tail's. It passes only when the chain from the base through the link verifies,
             // record by record, from the anchor's digest; anything else is refused as before.
-            if link.base > anchor.base_seq {
+            if let Some(link) = link.filter(|link| link.base > anchor.base_seq) {
                 self.chain(
                     partition,
                     generation,

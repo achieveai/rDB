@@ -8,7 +8,7 @@ and the full-copy fallback (scope ruling 2026-10-02).
 **Amends:** spec §7.2, one sentence (decision 9). ADR-rdb-0007 decision 1, decision 5 and its row
 "Late old dispatch leaves quarantine only" (decision 10). Fixes `FORMAT_VERSION`, provisional since M8 S0.
 **Extended by:** [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md) (check B);
-[ADR-rdb-0025](0025-history-trim-floor-and-snapshot-rebuild.md) (the trim floor and the snapshot
+[ADR-rdb-0027](0027-history-trim-floor-and-snapshot-rebuild.md) (the trim floor and the snapshot
 install).
 
 ## Context
@@ -101,7 +101,7 @@ install).
    and partition 0 are legal (L-R182w). Open refuses S0's provisional `0` and any unknown value.
 
 **Amended by issue #61 (History trim), 2026-11-20.** A lineage's History may now start at a trim
-floor F (ADR-rdb-0025, spec §4.1). Three things here change. Decision 4 is unchanged.
+floor F (ADR-rdb-0027, spec §4.1). Three things here change. Decision 4 is unchanged.
 
 - **The trim walk follows every link, `copied` ones included.** History falls through a copied
   level for `seq ≤ base` (decisions 5 and 6), so a trim must cut there too.

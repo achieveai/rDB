@@ -140,7 +140,7 @@ One transaction WriteBatch contains its deterministic mutation list/history enve
 
 A logical history record is retained in RocksDB as data; native engine WAL sequence numbers are not the cross-node replication identity. Core engines may mix many partitions in the physical WAL; each partition still has its own logical ordered history.
 
-**Amended 2026-11-20 (issue #61): History is kept from a floor F.** A lineage's History need not start at seq 1. ADR-rdb-0025 has the decision.
+**Amended 2026-11-20 (issue #61): History is kept from a floor F.** A lineage's History need not start at seq 1. ADR-rdb-0027 has the decision.
 
 - **The floor.** A trim writes one engine-private `TrimFloor { seq, root_base, root_digest }` record on the lineage. Its `seq` is the floor F. History then holds `F..=applied`. The record **at** F is kept; nothing below it is.
 - **Reading it.** `RocksEngine::floor` walks the lineage's chain through every link, `copied` ones included, and answers the highest mark that cuts what the lineage reads. `RocksEngine::floor_seq` is its seq, or 0 on a lineage never trimmed.
@@ -1037,7 +1037,7 @@ sequenceDiagram
 
 **Takeaway:** the target pulls a chained, paged view of the primary's state, checks each page before it writes it, and is caught up from `S` by ordinary records. The snapshot proves transport and lineage, not content.
 
-**Amended 2026-11-20 (issue #61, as built).** The diagram above is the build. The three paragraphs after this list are the original intent; where they differ, this list holds. ADR-rdb-0025 has the decision.
+**Amended 2026-11-20 (issue #61, as built).** The diagram above is the build. The three paragraphs after this list are the original intent; where they differ, this list holds. ADR-rdb-0027 has the decision.
 
 - **When.** For a copy behind its primary's History floor (§4.1), R1's ladder holds no rung to check, and R1 emits `SnapshotCatchupRequired`. `Host::snapshot_catchup` serves it.
   - If the primary's own ladder is not dense from the engine's floor to its head, it is refilled from the engine, and the copy is walked record by record (`snapshot_catchup_served{how="ladder"}`). A refill is never deduplicated.

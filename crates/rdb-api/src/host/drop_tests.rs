@@ -9784,3 +9784,440 @@ fn t61_s1_r9a_a_write_in_the_rebuild_window_is_refused_read_only_with_a_poll_hin
         "{landed:?}"
     );
 }
+
+/// Issue #61 lead ruling R26 item 0: the real failover with `--drop`. S1-R9a's world, but node
+/// 1 is dead and node 2 is promoted dropping it: the plan keeps copies 2 and 3 only, so F1
+/// commits `ReadOnly` (node 3 a shadow below the floor) and arms no rebuild (arch-s2 R2-M2: a
+/// two-copy plan never activates). Node 3 is then rebuilt by R1's snapshot, which F1 never
+/// hears of. The row asks whether node 2 still commits writable once node 3 is caught up, with
+/// no node 1 to re-add, and logs how long the partition stayed read-only after `caught_up`.
+/// Integration (~15 s): S1-R9a's setup, a promote, and the repair's real 5 s wait.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r26_a_dead_owner_dropped_by_promote_still_goes_writable_after_the_rebuild() {
+    const METHOD: &str =
+        "t61_r26_a_dead_owner_dropped_by_promote_still_goes_writable_after_the_rebuild";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        host.engine
+            .bind_instance(super::note_tests::INSTANCE)
+            .expect("bind instance");
+        host.instance = Some(super::note_tests::INSTANCE);
+        if host.node != NodeId(3) {
+            host.snapshot_offer_held = true;
+        }
+    });
+    let three = &mut trio.nodes[2].0;
+    three
+        .engine
+        .bind_instance(super::note_tests::INSTANCE)
+        .expect("bind instance");
+    three.instance = Some(super::note_tests::INSTANCE);
+    trio.until("node 1 opened node 3's transfer", |_| {
+        logged!(METHOD, "snapshot_transfer_opened")
+            .iter()
+            .any(|line| line["node"] == 1)
+            .then_some(())
+    });
+    kill(&trio, 1, &[2, 3]);
+    let promote = super::seal_tests::spawn_promote_dropping(&trio, 2, Some(NodeId(1)));
+    super::seal_tests::only_until(&mut trio, &[1, 2], "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let generation =
+        super::seal_tests::only_until(&mut trio, &[1, 2], "node 2 committed read-only", |trio| {
+            let committed = trio.nodes[1].0.committed.get(&p)?;
+            (committed.mode == PartitionMode::ReadOnly).then_some(committed.new_generation)
+        });
+    let three = copy_of(&trio, 3);
+    trio.nodes[1].0.snapshot_offer_held = false;
+    super::seal_tests::only_until(&mut trio, &[1, 2], "node 3 was rebuilt", |_| {
+        logged!(METHOD, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["node"] == 2 && line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let caught_up = Instant::now();
+    let patience = test_patience(Duration::from_secs(30));
+    let (mode, members) = loop {
+        super::seal_tests::step_only(&mut trio, &[1, 2]);
+        let writable = trio.nodes[1].0.committed.get(&p).and_then(|committed| {
+            (committed.new_generation > generation && committed.mode != PartitionMode::ReadOnly)
+                .then(|| {
+                    let members: Vec<u32> = committed
+                        .committed
+                        .pinned_config
+                        .members
+                        .iter()
+                        .map(|member| member.node.0)
+                        .collect();
+                    (committed.mode.clone(), members)
+                })
+        });
+        if let Some(found) = writable {
+            break found;
+        }
+        assert!(
+            caught_up.elapsed() < patience,
+            "node 2 stayed read-only {patience:?} after node 3 caught up, with no owner to \
+             re-add"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    tracing::info!(
+        read_only_after_caught_up_ms =
+            u64::try_from(caught_up.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ?mode,
+        ?members,
+        "r26_writable"
+    );
+    assert_eq!(
+        (mode, members),
+        (PartitionMode::DegradedRf2, vec![2, 3]),
+        "writable on copies 2 and 3"
+    );
+}
+
+/// Issue #61 lead ruling R26, the SBX failover world: node 3 keeps its disk but falls behind
+/// the trim. Every copy applies 5 puts; node 3's links are dropped both ways (it hears nothing,
+/// and nothing is buffered for it); 25 more puts land on nodes 1 and 2, which trim to the head
+/// less 4, past node 3. Node 1 then dies when `owner_dead` (else it stays up, linked to node 2
+/// and stepped), node 3 is linked to node 2 again, and node 2 is promoted dropping node 1: F1 finds node 3 below the floor (`survivor_behind_retention`) and
+/// commits `ReadOnly` on copy 2 alone. Drop-after is set long, so node 3 stays a member
+/// throughout, as it did in the manual run. Every node is bound to an instance, so F1 writes
+/// the rooted layout `admin::promote` reads. Answers the trio and the read-only generation.
+#[cfg(debug_assertions)]
+fn behind_the_trim_after_a_dropping_promote(
+    dir: &std::path::Path,
+    method: &str,
+    owner_dead: bool,
+) -> (Trio, Generation) {
+    let p = PartitionId(1);
+    let mut trio = Trio::new(dir, |host| {
+        Trio::fast(host);
+        host.snapshot_page_keys = 4;
+        host.peer_drop_after_millis = 600_000;
+        host.unreachable_drop_after_millis = 600_000;
+        host.engine
+            .bind_instance(super::note_tests::INSTANCE)
+            .expect("bind instance");
+        host.instance = Some(super::note_tests::INSTANCE);
+    });
+    trio.rt
+        .block_on(crate::admin::count_open(
+            &*trio.store,
+            &super::note_tests::INSTANCE,
+            true,
+            crate::admin::COUNT_WITHIN,
+        ))
+        .expect("the open counter");
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=5 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with every copy up: {other:?}"),
+        }
+    }
+    let early = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the early head", |trio| {
+        let host = &trio.nodes[2].0;
+        host.replication
+            .receiver(host.node, p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= early)
+            .then_some(())
+    });
+    for other in [1, 2] {
+        trio.links.drop_direction(NodeId(3), NodeId(other));
+        trio.links.drop_direction(NodeId(other), NodeId(3));
+    }
+    for request in 6..=30 {
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request} with node 3 unheard: {other:?}"),
+        }
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    let floor = head - 4;
+    trio.until("node 2 applied the head", |trio| {
+        let host = &trio.nodes[1].0;
+        host.replication
+            .receiver(host.node, p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    for at in 0..2 {
+        assert_eq!(
+            super::trio::trim(&mut trio, at, floor),
+            Ok(Seq(floor)),
+            "node {} trimmed",
+            at + 1
+        );
+    }
+    assert!(
+        early < floor,
+        "node 3's head {early} is below the floor {floor}"
+    );
+    if owner_dead {
+        kill(&trio, 1, &[2, 3]);
+    }
+    trio.links.heal(NodeId(2), NodeId(3));
+    let stepped = stepped(owner_dead);
+    let promote = super::seal_tests::spawn_promote_dropping(&trio, 2, Some(NodeId(1)));
+    super::seal_tests::only_until(&mut trio, stepped, "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let generation =
+        super::seal_tests::only_until(&mut trio, stepped, "node 2 committed read-only", |trio| {
+            let committed = trio.nodes[1].0.committed.get(&p)?;
+            (committed.mode == PartitionMode::ReadOnly).then_some(committed.new_generation)
+        });
+    let behind = logged!(method, "survivor_behind_retention");
+    assert!(
+        behind
+            .iter()
+            .any(|line| line["copy"] == copy_of(&trio, 3).0),
+        "F1 found node 3 behind the trim: {behind:?}"
+    );
+    (trio, generation)
+}
+
+/// The trio nodes a row steps: nodes 2 and 3 once node 1 is dead, else all three.
+#[cfg(debug_assertions)]
+fn stepped(owner_dead: bool) -> &'static [usize] {
+    if owner_dead {
+        &[1, 2]
+    } else {
+        &[0, 1, 2]
+    }
+}
+
+/// Issue #61 lead ruling R26 (b), the SBX failover world
+/// ([`behind_the_trim_after_a_dropping_promote`]). Node 2's repair waits the spec's
+/// `resume_hold_millis` for a member's link, scaled as the bound is, so the trigger's absence
+/// cannot hide inside the bound. Once R1's snapshot has caught node 3 up, writes go to node 2
+/// one every ~10 ms. The first lands within one F1 recovery window plus 1 s (scaled), through
+/// `read_only_repair_on_caught_up`, on a new `DegradedRf2` commit holding copies 2 and 3.
+/// Every refusal before it is `no_mutation` with a retry rule that retries (the contract, not a
+/// list of kinds). Every `RECOVERY_READ_ONLY` among them names copy 3 as caught up and the
+/// owner's re-plan, with `retry_after` 5 s and `REBUILDING_STEP`. There may be none: when the
+/// re-plan's revoke reaches node 2 before it has installed the `ReadOnly` commit
+/// (`revoke_asked_unheld`), every write in the window is refused `UNAVAILABLE` "no generation
+/// adopted yet" (seen under the whole suite's load, 2026-11-20). The detail is pinned by
+/// [`t61_r26_b_a_caught_up_copy_names_the_owners_re_plan_in_the_refusal`]. Every
+/// re-plan's inventory from node 3 answers (R26's installed lineage). Logged
+/// `r26_writable{read_only_after_caught_up_ms, interim}`.
+/// Observed (2026-11-20, scale 3, bound 9 s): first write 591 ms (live owner) and 681 ms (dead
+/// owner) after `caught_up`; interim `UNAVAILABLE` ("no generation adopted yet") 21-23,
+/// `RECOVERY_READ_ONLY` 9-12, `LEASE_EXPIRED` 1, `PROTECTION_PAUSED` 13. Observations, not
+/// the pass rule.
+#[cfg(debug_assertions)]
+fn caught_up_copy_ends_the_read_only_window(method: &str, owner_dead: bool) {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, generation) =
+        behind_the_trim_after_a_dropping_promote(dir.path(), method, owner_dead);
+    let nodes = stepped(owner_dead);
+    let spec = Budgets::SPEC_DEFAULTS;
+    let hold = test_patience(Duration::from_millis(spec.resume_hold_millis));
+    trio.nodes[1].0.budgets.resume_hold_millis =
+        u64::try_from(hold.as_millis()).expect("a hold in millis");
+    let bound = test_patience(Duration::from_millis(
+        trio.nodes[1].0.budgets.discovery_window_millis + 1_000,
+    ));
+    let three = copy_of(&trio, 3);
+    super::seal_tests::only_until(&mut trio, nodes, "node 3 was rebuilt", |_| {
+        logged!(method, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["node"] == 2 && line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let caught_up = Instant::now();
+    let deadline = caught_up + test_patience(Duration::from_secs(60));
+    let (mut read_only, mut interim) = (Vec::new(), BTreeMap::<String, u32>::new());
+    let mut request = 40;
+    let took = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no write landed after node 3 caught up"
+        );
+        request += 1;
+        let (reply, answer) = mpsc::channel();
+        trio.nodes[1]
+            .1
+            .send(Msg::Client(Client {
+                partition: p,
+                call: put(request),
+                reply,
+            }))
+            .expect("node 2's mailbox");
+        match super::seal_tests::only_until(&mut trio, nodes, "an answer", |_| {
+            answer.try_recv().ok()
+        }) {
+            Answer::Txn { .. } => break caught_up.elapsed(),
+            Answer::Error { error, .. } => {
+                assert!(
+                    error.no_mutation
+                        && !matches!(
+                            error.retry,
+                            RetryRule::Definitive | RetryRule::Quarantine | RetryRule::NotWired
+                        ),
+                    "an interim refusal must be retryable and prove no mutation: {error:?}"
+                );
+                *interim.entry(error.name()).or_default() += 1;
+                if error.kind == ErrorKind::RecoveryReadOnly {
+                    read_only.push(error);
+                }
+            }
+            other => panic!("a put answered {other:?}"),
+        }
+        let paced = Instant::now() + Duration::from_millis(10);
+        while Instant::now() < paced {
+            super::seal_tests::step_only(&mut trio, nodes);
+        }
+    };
+    let committed = &trio.nodes[1].0.committed[&p];
+    let (mode, members): (_, Vec<u32>) = (
+        committed.mode.clone(),
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .map(|member| member.node.0)
+            .collect(),
+    );
+    tracing::info!(
+        read_only_after_caught_up_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        ?interim,
+        ?mode,
+        ?members,
+        "r26_writable"
+    );
+    assert!(
+        took <= bound,
+        "the first write landed {took:?} after node 3 caught up, past one recovery window and \
+         1 s ({bound:?})"
+    );
+    assert!(committed.new_generation > generation, "a new commit");
+    assert_eq!(mode, PartitionMode::DegradedRf2, "writable on two copies");
+    assert!(
+        members.contains(&2) && members.contains(&3),
+        "copies 2 and 3: {members:?}"
+    );
+    for error in &read_only {
+        assert!(
+            error.detail.contains(&format!(
+                "copy {} on node 3 is caught up; writes resume when the owner re-plans with it",
+                three.0
+            )),
+            "{error:?}"
+        );
+        assert!(
+            error.detail.ends_with(crate::db::error::REBUILDING_STEP),
+            "{error:?}"
+        );
+        assert_eq!(error.retry_after, Some(REBUILD_RETRY_HINT), "{error:?}");
+    }
+    assert_eq!(logged!(method, "read_only_repair_on_caught_up").len(), 1);
+    let unlinked: Vec<_> = logged!(method, "inventory_failed")
+        .into_iter()
+        .filter(|line| line["reason"] == "anchor_generation_unlinked")
+        .collect();
+    assert!(
+        unlinked.is_empty(),
+        "the rebuilt copy answers every re-plan: {unlinked:?}"
+    );
+}
+
+/// Issue #61 R26 (b): the refusal detail once a copy the `ReadOnly` commit left outside has
+/// caught up, set up directly on node 1's host over its bootstrap commit. With
+/// `caught_up_outside` naming copy 3 on node 3 in the current generation, a
+/// `RECOVERY_READ_ONLY` refusal names it and the owner's re-plan, with `retry_after` 5 s and
+/// `REBUILDING_STEP`. Recorded for an older generation, the refusal is unchanged.
+/// Cut: `rebuilding_read_only` returns the refusal as it was, without `caught_up_read_only`,
+/// red.
+/// Unit (a trio bootstrap for the commit).
+#[config_log::retcd_test]
+fn t61_r26_b_a_caught_up_copy_names_the_owners_re_plan_in_the_refusal() {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let generation = trio.until("node 1 committed", |trio| {
+        trio.nodes[0]
+            .0
+            .committed
+            .get(&p)
+            .map(|committed| committed.new_generation)
+    });
+    let host = &mut trio.nodes[0].0;
+    let refused = || {
+        ApiError::from_kernel(&RdbError::RecoveryReadOnly {
+            partition: p,
+            generation,
+        })
+    };
+    host.caught_up_outside
+        .insert(p, (generation, CopyId(3), NodeId(3)));
+    let named = host.rebuilding_read_only(p, refused());
+    assert_eq!(named.kind, ErrorKind::RecoveryReadOnly, "{named:?}");
+    assert!(
+        named.detail.contains(
+            "copy 3 on node 3 is caught up; writes resume when the owner re-plans with it"
+        ),
+        "{named:?}"
+    );
+    assert!(
+        named.detail.ends_with(crate::db::error::REBUILDING_STEP),
+        "{named:?}"
+    );
+    assert_eq!(named.retry_after, Some(REBUILD_RETRY_HINT), "{named:?}");
+    host.caught_up_outside
+        .insert(p, (Generation(generation.0 - 1), CopyId(3), NodeId(3)));
+    let older = host.rebuilding_read_only(p, refused());
+    assert_eq!(
+        older.detail,
+        refused().detail,
+        "an older commit's copy is not named"
+    );
+    assert_eq!(older.retry_after, None, "{older:?}");
+}
+
+/// Issue #61 R26 (b), the real failover: [`caught_up_copy_ends_the_read_only_window`] with
+/// node 1 dead, so no re-add can end the window.
+/// Cuts: no `repair_on_caught_up` at `CopyCaughtUp`, red on the bound (first write 17.2 s after
+/// `caught_up`, the scaled hold and a probe); no `caught_up_read_only`, red (the generic
+/// read-only detail).
+/// Integration (~10 s): the setup, a promote, a snapshot rebuild and one re-plan.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r26_b_a_dead_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught_up() {
+    caught_up_copy_ends_the_read_only_window(
+        "t61_r26_b_a_dead_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught_up",
+        true,
+    );
+}
+
+/// Issue #61 R26 (b), the manual run's world (D1): [`caught_up_copy_ends_the_read_only_window`]
+/// with node 1 alive and dropped by the promote.
+/// Cuts: as the dead-owner row (17.2 s; the generic detail).
+/// Integration (~10 s): as the dead-owner row.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r26_b_a_live_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught_up() {
+    caught_up_copy_ends_the_read_only_window(
+        "t61_r26_b_a_live_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught_up",
+        false,
+    );
+}

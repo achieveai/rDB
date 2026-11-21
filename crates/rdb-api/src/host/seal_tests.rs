@@ -52,7 +52,7 @@ fn tuned(host: &mut Host) {
 }
 
 /// One round for the hosts at `nodes` only: the others hear nothing and run nothing.
-fn step_only(trio: &mut Trio, nodes: &[usize]) {
+pub(super) fn step_only(trio: &mut Trio, nodes: &[usize]) {
     for &at in nodes {
         let (host, _, rx) = &mut trio.nodes[at];
         host.run_due();

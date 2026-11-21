@@ -1157,7 +1157,7 @@ fn status_through_the_wire(
 }
 
 /// PR #110 review: a status naming a tail crosses the wire unchanged in each adoption state,
-/// `Adoptable`, `NotReady`, `Refused`, `Unchecked`, and (issue #61, protocol 12) `Trimmed` with
+/// `Adoptable`, `NotReady`, `Refused`, `Unchecked`, and (issue #61, its protocol version) `Trimmed` with
 /// each of its reasons. Unit.
 /// Cut: `adoption_to_wire` sends `unchecked` for every state, red.
 #[test]
@@ -1920,7 +1920,7 @@ async fn t61_a_peer_one_protocol_version_behind_is_refused() {
 }
 
 /// Issue #61 A8b (lead ruling R16 item 1): an app one protocol version behind is refused at the
-/// handshake as a peer is, so no build before 12 ever reads the adoption state `trimmed` or
+/// handshake as a peer is, so no build before #61's version ever reads the adoption state `trimmed` or
 /// `WireNodeStatus::needs_operator`: the guarantee is the refusal, and there is no down-level
 /// encoding to keep. The number is derived from `PROTOCOL_VERSION`.
 /// Cut: the listener accepts an older hello (`refusal` skips the version) → the link comes up.
