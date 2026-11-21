@@ -106,6 +106,23 @@ pub(super) fn put_answer<T>(answer: Result<Result<T, PutError>, String>) -> Resu
     })
 }
 
+/// A put answer from [`blocking`] for a call under an id that may have been sent before:
+/// `txn_as` and `resend_within` (PR #178 review r2, T21). A call that never ran sent nothing
+/// this time, but an earlier send under the same id may have applied, so `no_mutation` stays
+/// false, as [`Db::txn_as`] and [`Db::resend_within`] answer, and `sent` is handed back when
+/// there is one: ask status, or resend it, rather than write again under a new id.
+pub(super) fn reused_answer<T>(
+    answer: Result<Result<T, PutError>, String>,
+    sent: Option<TxnRequest>,
+) -> Result<T, PutError> {
+    answer.unwrap_or_else(|detail| {
+        Err(PutError {
+            error: ApiError::host(&detail),
+            request: sent.map(Box::new),
+        })
+    })
+}
+
 /// A read answer from [`blocking`].
 pub(super) fn read_answer<T>(answer: Result<Result<T, ApiError>, String>) -> Result<T, ApiError> {
     answer.unwrap_or_else(|detail| Err(ApiError::host(&detail)))
@@ -228,7 +245,10 @@ impl AsyncDb {
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
         let db = Arc::clone(&self.db);
-        put_answer(blocking(move || db.txn_as(request, &borrowed(&puts), deadline)).await)
+        reused_answer(
+            blocking(move || db.txn_as(request, &borrowed(&puts), deadline)).await,
+            None,
+        )
     }
 
     /// [`Db::resend_within`].
@@ -241,8 +261,11 @@ impl AsyncDb {
         request: TxnRequest,
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
-        let db = Arc::clone(&self.db);
-        put_answer(blocking(move || db.resend_within(request, deadline)).await)
+        let (db, sent) = (Arc::clone(&self.db), request.clone());
+        reused_answer(
+            blocking(move || db.resend_within(request, deadline)).await,
+            Some(sent),
+        )
     }
 
     /// [`Db::status_in`]. Ask with the write's generation: with the ack floor on, an answered
@@ -352,7 +375,7 @@ mod tests {
     use config_core::ConfigStore;
 
     use super::super::{lock, Db, DbConfig, Timeouts, ALL_NODES, DEFAULT_CLIENT};
-    use super::{put_answer, AsyncDb};
+    use super::{put_answer, reused_answer, AsyncDb};
 
     /// PR #178 review r1 T7: on a current-thread runtime, subscribing while the nodes lock is
     /// held (as a restart holds it) returns at once; the registration waits on the pool. Cut:
@@ -425,5 +448,37 @@ mod tests {
             put_answer::<()>(Err("the blocking call did not run".to_owned())).expect_err("refused");
         assert!(refused.request.is_none(), "{refused:?}");
         assert!(refused.error.no_mutation, "{refused:?}");
+    }
+
+    /// PR #178 review r2 T21: a `txn_as` or `resend_within` the pool never ran answers
+    /// `no_mutation` false, since an earlier send under its id may have applied, and a resend
+    /// hands back the request it was given, so the app resends it or asks status and never
+    /// writes it again under a new id. Cut: answer them with `put_answer`: red, `no_mutation`
+    /// true and no request.
+    #[test]
+    fn a_reused_id_the_pool_never_ran_may_have_applied() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let sent = super::TxnRequest {
+            api_version: 1,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: super::RequestId(1 << 63),
+            },
+            affinity: super::AffinityId(1),
+            expected_generation: None,
+            remaining_millis: 1_000,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+            acked_below: None,
+            pinned: Vec::new(),
+        };
+        let refused = reused_answer::<()>(Err("did not run".to_owned()), Some(sent.clone()))
+            .expect_err("refused");
+        assert!(!refused.error.no_mutation, "{refused:?}");
+        assert_eq!(refused.request.as_deref(), Some(&sent));
+        let refused =
+            reused_answer::<()>(Err("did not run".to_owned()), None).expect_err("refused");
+        assert!(!refused.error.no_mutation, "{refused:?}");
     }
 }
