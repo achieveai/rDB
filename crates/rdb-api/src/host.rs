@@ -1304,7 +1304,7 @@ pub enum TailAdoption {
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
     /// survivor's own check). The next landing scan replaces it.
     Unchecked,
-    /// Issue #61 (lead rulings R10 and R16, protocol 12): the proofs could not run because the
+    /// Issue #61 (lead rulings R10 and R16, #61's protocol version): the proofs could not run because the
     /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
     /// back by adoption, yet giving it up still takes `--give-up-live-copy`: the copy may hold
     /// the only record of an acknowledged write (design rev 5a).
@@ -1346,7 +1346,7 @@ impl TailAdoption {
     }
 }
 
-/// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
+/// Issue #61 (lead ruling R16, #61's protocol version): the reasons [`TailAdoption::Trimmed`] names. Each
 /// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
 /// `base_below_floor` from `Host::chain`.
 pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
@@ -14173,7 +14173,7 @@ impl Host {
     /// `tail_below_floor` (the history P1 and P2 read is gone; the copy is rebuilt by snapshot).
     /// That reason and [`Self::chain`]'s `base_below_floor` are [`ADOPTION_TRIMMED`], not
     /// [`ADOPTION_REFUSALS`]: they answer [`TailAdoption::Trimmed`] ([`TailAdoption::of`]), which
-    /// crosses the wire from protocol 12 (lead ruling R16). t4's check-B reasons stay
+    /// crosses the wire from the protocol version #61 introduces (lead ruling R16). t4's check-B reasons stay
     /// [`TailAdoption::Unchecked`].
     fn adoption(
         &self,
