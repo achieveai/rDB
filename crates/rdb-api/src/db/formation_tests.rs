@@ -5082,6 +5082,46 @@ fn own83_b2_18_a_no_address_fence_applied_and_unanswered_refuses_until_it_fences
     none_fence_refuses_until_it_fences(FenceMeets::AppliedLost);
 }
 
+/// own83_b2_19 (#83 B2, PR #159 review r4, T28): the new-folder fence file cannot be put in
+/// place. B's write may still apply and node 1's folder is emptied; a non-empty folder stands
+/// where `app-addr-fence` goes, so its rename fails. Two opens given no app address are each
+/// refused `OpenError::Io` before any host starts, with no `nodes/` put and no `CURRENT`
+/// created. With the path repaired, a no-address open fences and opens, and the late B is
+/// refused. Cut: the fence file's write failure ignored (`let _ =`), red at "no nodes/ put"
+/// (the open goes on and sends the fence before it fails). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    let blocker = fence.dir.0.join(APP_ADDR_FENCE_FILE);
+    std::fs::create_dir(&blocker).expect("a folder where the fence file goes");
+    std::fs::write(blocker.join("keep"), b"x").expect("it is not empty");
+    let current = fence.dir.0.join("nodes").join("1").join("CURRENT");
+    let rt = &fence.rig.rt;
+    for attempt in 1..=2 {
+        let puts = fence.node_puts();
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("the fence file cannot be put in place");
+        assert!(matches!(refused, OpenError::Io(_)), "{attempt}: {refused}");
+        assert_eq!(fence.node_puts(), puts, "{attempt}: no nodes/ put");
+        assert!(!current.exists(), "{attempt}: no CURRENT");
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    std::fs::remove_dir_all(&blocker).expect("the path is repaired");
+    fence
+        .open_on(rt, None)
+        .expect("the repaired no-address open fences");
+    late_b_is_refused(&fence, A, r);
+    assert!(!blocker.exists(), "fenced: the fence file is removed");
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 
