@@ -2720,7 +2720,7 @@ impl Db {
             };
             // R5: a heal still waiting is why there is no recovery to look at; say what for.
             let phase = match lock(&self.opened.heal_waiting).as_deref() {
-                Some(reason) => format!("{phase}; the reopen's heal is waiting: {reason}"),
+                Some(reason) => format!("{phase}{HEAL_WAITING}{reason}"),
                 None => phase,
             };
             ReadyError::TimedOut {
@@ -6357,6 +6357,9 @@ const NO_ANSWER: &str = "unknown";
 const NO_LINK: &str = "unreachable";
 /// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
+/// What joins [`ReadyError::TimedOut`]'s phase to the reopen's heal wait, when one is waiting
+/// (R5): `wait_ready` writes it, and [`timed_out_text`] splits on it.
+const HEAL_WAITING: &str = "; the reopen's heal is waiting: ";
 
 /// Why [`Db::look`] has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6369,14 +6372,25 @@ enum Unlooked {
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
 /// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
+///
+/// A phase that carries the reopen's heal wait ([`HEAL_WAITING`]) is classified by what comes
+/// before it, so a sentinel keeps its words, and the wait is said before the step (PR #181
+/// review).
 fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
+    let (phase, heal) = phase
+        .split_once(HEAL_WAITING)
+        .map_or((phase, None), |(phase, heal)| (phase, Some(heal)));
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
         NO_LINK => error::ReadySeen::NoLink,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
-    error::ready_timed_out_text(within_ms, owner.0, seen)
+    let text = error::ready_timed_out_text(within_ms, owner.0, seen);
+    match heal {
+        Some(heal) => text.replacen("; next: ", &format!("{HEAL_WAITING}{heal}; next: "), 1),
+        None => text,
+    }
 }
 
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
@@ -8508,6 +8522,32 @@ mod tests {
         on.insert("live_readd".to_owned());
         assert_eq!(fields(&lines[1]), on, "{lines:?}");
         assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
+    }
+
+    /// PR #181 review: while the reopen's heal waits, a `wait_ready` time-out keeps each of
+    /// its three sentinels' words (no answer, no link, no recovery) and adds the heal's wait
+    /// before the step; it never renders "recovery phase unknown". Unit (~1 ms).
+    /// Cut: `timed_out_text` classifies the phase with the heal's wait still on it: red.
+    #[test]
+    fn a_timed_out_ready_keeps_its_sentinel_words_while_the_heal_waits() {
+        for (sentinel, words) in [
+            (NO_ANSWER, "answered no status look"),
+            (NO_LINK, "is not reachable from this process"),
+            (NO_RECOVERY, "runs no recovery"),
+        ] {
+            let text = ReadyError::TimedOut {
+                within_ms: 300,
+                owner: NodeId(2),
+                phase: format!("{sentinel}{HEAL_WAITING}live_readd_off"),
+            }
+            .to_string();
+            assert!(text.contains(words), "{sentinel}: {text}");
+            assert!(!text.contains("recovery phase is"), "{sentinel}: {text}");
+            assert!(
+                text.contains("the reopen's heal is waiting: live_readd_off; next: "),
+                "{sentinel}: {text}"
+            );
+        }
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
