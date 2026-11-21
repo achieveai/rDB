@@ -549,17 +549,41 @@ node and removing the old one, and it uses an id.
 **A removed node cannot come back.** Opening the database as a removed node is refused:
 "node N was removed; ids are never reused". Start a new node instead.
 
+**A removed node's own `Db` stops for good.** Once its node is removed, every `Db` call is
+refused `INVALID_ARGUMENT`, with nothing sent: "node N was removed; ids are never reused:
+this Db serves nothing again, and nothing was sent". Its host stops at the first call after
+the removal, so poll `Db::removed()` or handle the refusal. The node logs
+`members_own_node_removed`.
+
+**How `rdb_node` exits.** `rdb_node` exits 0 when its node is removed while it runs, and asks
+for no restart. It exits 2 when it is started as a node that is already removed. Under a
+supervisor that restarts on failure, a removed node therefore exits 2 on each restart until
+the supervisor gives up; with Docker's `--restart on-failure:3`, it is restarted 3 times and
+then stays down.
+
+**A removed id in `--peers` is skipped.** It is logged `start_peer_removed_skipped`, and
+nothing dials it. You need not list a removed lower id; every live lower id must still be
+listed.
+
 **One change at a time, and every node must answer.** Before it writes anything, the check
 asks every live node for a fresh status, within the time you pass (`within`). Each must
 answer and must have seen the latest membership change. If one does not, the change is
 refused and names it. If that node is dead, name it in `unreachable_ok`. Upgrade that node
 before you restart it: an older build cannot read the removed record and refuses to open.
+The node you remove is asked too, so a stopped node can be removed only if you name it in
+`unreachable_ok`.
 
 **A remove is refused** when node N is already removed, is not a live member, would leave
 fewer than 3 distinct machines, or still owns or holds a copy of a partition ("run admin
 drain N first").
 
-<!-- TODO (S4): drain, rebalance, and the pin refusal at commit. -->
+**A late pin heals by itself.** A re-plan built before the remove and committed after it can
+still name the removed node; the remove logs `remove_node_still_pinned`. Nothing is needed
+from you, and running the remove again is refused because the node is already removed. Within
+about 10 to 16 s the owner drops the removed node from those partitions. Writes to them may
+pause until then, inside the 15 s lost-host bound.
+
+<!-- TODO (S4): drain and rebalance. -->
 
 **Upgrade the whole cluster first, apps included.** This is the same one-way, whole-cluster
 upgrade as in "Known limits in this release" ("This build's upgrade is one-way ..."). The S4

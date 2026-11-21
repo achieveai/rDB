@@ -134,6 +134,8 @@ plus ids still linked).
     - A member named in `unreachable_ok` is not asked: the operator says it is dead. It must
       be upgraded before it restarts. An older build cannot read layout 3, so its open fails
       on the removed record.
+    - The node being removed is a live member too, so it is asked. A stopped target can be
+      removed only if it is named in `unreachable_ok`.
 
     Why the check needs no version field of its own: a build without layout 3 fails its whole
     `nodes/` list on one removed record. A status answered over a link proves the member runs
@@ -148,10 +150,44 @@ plus ids still linked).
     `remove_node_still_pinned` for any record that pins N (a move that committed in between,
     S-2).
 
-<!-- TODO (S4, not yet built): the R8-7 count of K (live records plus ids still linked) and
-`set_members` closing a retired node's links; the start check (S-4: removed ids in `--peers`
-skipped, a node's own removed id refused); the embedded `Db`'s terminal `Removed` state
-(S-5); the commit-time pin refusal; drain; rebalance; the `rdb_dev` verbs and their
+13. **A removed node loses its links, and K shrinks (B-2, R8-7).** `Net::set_members` sets
+    the members first, then drops each retired node's route and closes every connection to
+    it ("not a live member: its nodes/ record is removed"). The dial loop skips a node that
+    is not a member, and a retired node's dial back is refused. K is members plus linked
+    routes, so it shrinks once the retired route goes.
+
+14. **A removed node's own `Db` stops for good (S-5).** The `nodes/` watcher of a declared
+    node process that finds its own id removed logs `members_own_node_removed` and ends; a
+    record is never deleted, so this is terminal. `Db::removed()` then reports true. The
+    first call after the removal stops this process's nodes, planner and heal (`db_removed`).
+    From then on every call is refused `INVALID_ARGUMENT`, with nothing sent: "node N was
+    removed; ids are never reused: this Db serves nothing again, and nothing was sent". The
+    stop is lazy, by ruling: the host stops at the first call after the removal, so an
+    embedder should poll `Db::removed()` or handle the refusal.
+
+15. **`rdb_node` exits 0 when removed, and 2 when started as a removed node.** It checks
+    `Db::removed()` once a second; once removed it prints `rdb_node removed node=N`
+    (`rdb_node_removed`), shuts down and exits 0, asking for no restart. A start whose
+    `--node` is removed is a bad argument: `removed_start_check` runs before any other start
+    step, prints "rdb_node: start check: node N was removed; ids are never reused; nothing
+    was started" (`rdb_node_start_refused`) and exits 2. A `Db` open as a removed node is
+    refused with the same text (`admin::own_removed_refusal`, `admin::removed_node_text`).
+
+16. **A removed id in `--peers` is skipped, not refused (S-4).** The start check skips it
+    with the warn `start_peer_removed_skipped` (`node`, `peer`, `addr`), and nothing dials it.
+    A removed lower id need not be listed; every live lower id still must be. A peer that is
+    neither live nor removed is still refused.
+
+17. **A re-plan never pins a node that is not live (S-2).** An owner pins a re-added node or
+    a move's target only while that node is a live member of its `Net`. Otherwise it leaves
+    it out and logs `replan_member_not_live`.
+
+    One window stays open: a re-plan built before remove-node and committed after it can still
+    pin the removed node. `nodes/N` and `partitions/P` are separate keys with no transaction
+    spanning them. remove-node's re-list reports it as `remove_node_still_pinned`. This is
+    informational: the pin heals by itself (Consequences).
+
+<!-- TODO (S4, not yet built): drain; rebalance; the `rdb_dev` verbs and their
 `--unreachable-ok` flag; the `scripts/docker-multihost.sh` commands. -->
 
 ## Consequences
@@ -189,7 +225,20 @@ skipped, a node's own removed id refused); the embedded `Db`'s terminal `Removed
   `membership_settled` asks data nodes only, so it cannot catch an older app. Upgrade every
   node and app before removing a node (N-3).
 - **A dead node blocks a membership change until the operator says it is dead**
-  (`unreachable_ok`). That node must then be upgraded before it restarts.
+  (`unreachable_ok`). That node must then be upgraded before it restarts. This holds for the
+  node being removed too: a stopped target can be removed only if it is named there.
+- **A late re-plan can pin a removed node for a while, and it heals by itself.** In the
+  window Decision item 17 leaves open:
+  - A shadow pin is given up after `PEER_DROP_AFTER_MILLIS` (10 s by default; observed
+    10.5-16.0 s), and writes keep landing.
+  - A regular pin is dropped by the unreachable or paused clock after
+    `Timeouts::unreachable_drop_after` (10 s; observed 10.8-11.3 s). Writes to those
+    partitions pause until then, inside the 15 s lost-host bound.
+  - Running remove again is refused: the record is already removed. No operator action is
+    needed.
+- **An embedder must poll for its own removal.** A removed node's host stops only at the
+  first `Db` call after the removal, so an app that makes no calls keeps its host up until it
+  polls `Db::removed()`.
 - **Ids run out.** Ids are never reused and the limit is 8, so a database can see at most 8
   nodes over its whole life. Replacing a host is "add a new node, remove the old one", and
   each replacement uses an id.
@@ -312,13 +361,40 @@ In `crates/rdb-api/src/admin/membership/tests.rs`:
 
 - `s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_machines`
   (unit). Cut: no pin check; red "refused, not Ok(..)".
+- `s80s4_start_check_skips_a_removed_peer_and_still_refuses_an_unknown_one` (unit). Cuts: no
+  skip; and a removed id still counted as a lower id that must be given.
+
+Also in `crates/rdb-api/src/db/s80s4_tests.rs`:
+
+- `s80s4_a_removed_node_loses_its_links_and_k_shrinks` (six processes). Cut: `set_members`
+  leaves the retired connections open; red "node 1 holds no link to removed node 6".
+- `s80s4_a_removed_nodes_db_stops_its_host_and_refuses_every_call`. Cuts: the watcher never
+  marks the removal, red "node 6's Db reports removed"; `removed()` stops no node, red "node
+  6's host has stopped".
+- `s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working` also checks
+  that node 5's declared open is refused with the removed-id text. Cut:
+  `own_removed_refusal` always none.
+
+In `crates/rdb-api/examples/rdb_node.rs`:
+
+- `s80s4_a_removed_nodes_start_check_is_refused_with_the_reused_id_text` (unit): a start as a
+  removed node is refused with the text, writes no boot, and exits 2.
+
+In `crates/rdb-api/src/db/s80s3_tests.rs`, the remove race:
+
+- `s80s4_a_re_add_racing_a_remove_does_not_pin_the_removed_node`: a held re-add released
+  after the remove commits without the removed node. Cut: every member pinnable.
+- `s80s4_a_removed_node_still_pinned_is_dropped_by_the_unreachable_clock`: a late regular pin
+  is dropped; heal 10.8-11.3 s, slowest put 4.6-10.8 s. Cut: no drop clock for a partition
+  that pins a node outside its `Net`'s members; red `ProtectionPaused`.
+- `s80s4_a_removed_node_pinned_as_a_shadow_late_is_given_up`: a late shadow pin is given up
+  (`move_given_up`); heal 10.5-16.0 s, slowest put 0.2-5.0 s. Cut: `shadow_give_up_duty` gives
+  nothing up; red "partitions [2] still pin removed node 2 after 60.6s".
 
 Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
 `PROTOCOL_VERSION` instead of pinning a number, because the bump changed what it pinned.
 
-<!-- TODO (S4): rows for K shrinking, a removed node's refused links, the `Removed` Db state,
-the removed-own-id start refusal, rebalance, drain, and the Docker add d6 / remove d2 run
-(D2). -->
+<!-- TODO (S4): rows for rebalance, drain, and the Docker add d6 / remove d2 run (D2). -->
 
 ## References
 
@@ -333,5 +409,7 @@ the removed-own-id start refusal, rebalance, drain, and the Docker add d6 / remo
   `membership_settled`, `add_node`, `remove_node`, `MIN_MACHINES`; `admin::read_removed_nodes`.
 - `crates/rdb-core/src/authority/node.rs` (S4): `NodeRecord::encode_removed`,
   `NodeRecord::decode_removed`.
+- S4 also: `Db::removed` (`db.rs`); `admin::own_removed_refusal`, `admin::removed_node_text`
+  (`admin.rs`); `Net::set_members` (`net/mod.rs`); `replan_member_not_live` (`host.rs`).
 - `crates/rdb-api/src/net/mod.rs` (S4): `PROTOCOL_VERSION`, `Net::members_revision`.
 - Issues #80 (S3, S4), #81 (C1, V10, X2), #168, #169, #172, #176, #177.
