@@ -352,8 +352,8 @@ async fn eight_puts(db: &AsyncDb) -> Vec<rdb_api::PutOk> {
 }
 
 /// PR #178 review r1 T9: eight concurrent `AsyncDb::read`s on the current-thread runtime
-/// overlap, the ticker runs on, and each reads its document. Cut: `read` calls `read_in`
-/// inline: at most 1 in flight. Integration (~1-2 s): one database open.
+/// overlap, the ticker runs on, and each reads the value the setup wrote. Cut: `read` calls
+/// `read_in` inline: at most 1 in flight. Integration (~1-2 s): one database open.
 #[config_log::retcd_test]
 fn sbx_146_d_read_does_not_block_the_worker() {
     on_current_thread("sbx_146_d", |db| async move {
@@ -363,7 +363,14 @@ fn sbx_146_d_read_does_not_block_the_worker() {
             async move {
                 let object = Bytes::from(format!("o{i}"));
                 let read = db.read(AffinityId(1), object, rdb_api::Look::Doc).await;
-                read.unwrap_or_else(|e| panic!("read {i}: {e}"));
+                let read = read.unwrap_or_else(|e| panic!("read {i}: {e}"));
+                // PR #178 review r2 T24: it reads what the setup wrote.
+                match read.seen {
+                    rdb_api::Seen::Doc(doc) => {
+                        assert_eq!(doc.value, Value::Bytes(b"v".to_vec()), "read {i}");
+                    }
+                    other => panic!("read {i} is a document: {other:?}"),
+                }
             }
         })
         .await;
