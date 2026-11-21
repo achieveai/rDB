@@ -227,7 +227,14 @@ impl Publication {
                 if let EventKind::Client(ClientEvent::Read { identity, key }) = kind {
                     slot.read_keys.insert(*identity, key.clone());
                 }
-                let produced = slot.kernel.apply(ctx.now, input, repl);
+                // Issue #184: whether the step's view is the next applied seq. The kernel gets
+                // the bool, never the seq (§4.3 invariant 2); `PubKernel::admit_read` says why.
+                let published = slot.kernel.published();
+                let applied_ahead = ctx.snapshot.generation() == published.generation
+                    && ctx.snapshot.at() == published.seq.next();
+                let produced = slot
+                    .kernel
+                    .apply_viewing(ctx.now, input, repl, applied_ahead);
                 let kinds: Vec<EffectKind> = produced
                     .into_iter()
                     .flat_map(|effect| route(ctx, event, slot, effect))
@@ -530,7 +537,9 @@ fn route(ctx: &StepCtx<'_>, event: &Event, slot: &mut Slot, effect: PubEffect) -
 ///
 /// The step's snapshot is used **only when it is the published position the kernel handed out**
 /// (§4.3 invariant 2). Any other view — the raw applied prefix above it, or a stale one below
-/// it — serves nothing, answers `Unavailable`, and says so with `ReadViewNotPublished`.
+/// it — serves nothing, answers `Unavailable`, and says so with `ReadViewNotPublished`. A Fresh
+/// read admitted while the view is exactly one seq ahead is not answered then: it waits for
+/// that seq's candidate (issue #184, `PubKernel::admit_read`).
 ///
 /// The key is held per identity, and [`Publication::step_with`] refuses a second read under an
 /// identity that still waits (A-R71), so every answer finds its own key. An answer that finds
