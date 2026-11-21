@@ -5013,6 +5013,11 @@ impl Db {
         self.look_in(PARTITION, node)
     }
 
+    /// The timeouts this `Db` was opened with (#80 S4: `admin::drain` waits on `read`).
+    pub(crate) fn timeouts(&self) -> &Timeouts {
+        &self.timeouts
+    }
+
     /// A fresh status request to each of `nodes`, each answered within `within` (#80 S4, for
     /// [`admin::membership_settled`]): its status, or why not, naming `within`.
     #[must_use]
@@ -5913,6 +5918,98 @@ impl Db {
         }
     }
 
+    /// #80 S4 (A-R456 narrowed by the lead, 2026-11-21: refill): ask `partition`'s owner to add
+    /// a copy on node `to` while the partition has fewer than rf regular copies, or say where
+    /// that refill stands. Asking again resumes it. Before sending, this reads `nodes/` and
+    /// `partitions/{partition}` and refuses a `to` on the machine of a node that already holds
+    /// a copy, or with no `nodes/` record. That read can be stale; the owner re-checks, on its
+    /// own committed configuration, that `to` is not a member and that a slot is free, so a
+    /// stale read cannot place two copies in one slot.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing sent, for a partition this database does not have, a `to`
+    /// with no `nodes/` record, or one on a used machine; `UNAVAILABLE` when the records do not
+    /// read in time; otherwise the owner's refusal, which ends with
+    /// [`error::REFILL_STEP`] and changed nothing.
+    pub fn refill_in(
+        &self,
+        partition: PartitionId,
+        to: NodeId,
+    ) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
+        let partitions = self.route.partitions();
+        if partition.0 == 0 || partition.0 > partitions {
+            let mut error = ApiError::invalid(format!(
+                "refill_in: partition {} is not one of this database's {partitions}; nothing \
+                 was sent",
+                partition.0
+            ));
+            error.no_mutation = true;
+            return Err(error);
+        }
+        let (nodes, members) =
+            self.control_read("nodes/ and the partition record", move |store| async move {
+                let nodes = admin::read_nodes(&*store)
+                    .await
+                    .map_err(|error| RouteReadError::Unavailable(format!("nodes/: {error}")))?;
+                let (_, members) = admin::drain::record_of(&*store, partition)
+                    .await
+                    .map_err(RouteReadError::Unavailable)?;
+                Ok((nodes, members))
+            })?;
+        let refuse = |guard: &'static str, detail: String| {
+            tracing::warn!(partition = partition.0, to = to.0, guard, "refill_refused");
+            let mut error = ApiError::invalid(format!("{detail}; {}", error::REFILL_STEP));
+            error.no_mutation = true;
+            Err(error)
+        };
+        let Some(machine) = nodes.get(&to).map(|record| record.machine.clone()) else {
+            return refuse(
+                "no_record",
+                format!(
+                    "node {} has no nodes/ record: add it with `admin add-node`, then refill",
+                    to.0
+                ),
+            );
+        };
+        if let Some(holder) = members.iter().find(|member| {
+            member.node != to
+                && nodes
+                    .get(&member.node)
+                    .is_some_and(|record| record.machine == machine)
+        }) {
+            return refuse(
+                "machine",
+                format!(
+                    "node {} is on machine {machine:?}, where node {} already holds a copy of \
+                     partition {}: name a node on another machine",
+                    to.0, holder.node.0, partition.0
+                ),
+            );
+        }
+        match self.call(
+            partition,
+            ClientCall::Refill {
+                identity: self.identity(),
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(refilled)) => Ok(refilled),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a refill was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the refill in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
     /// Issue #105 (design section 8.1): `admin forget-tail`. Asks the owner to re-plan
     /// partition 1 once, giving up what `release` names: with `through`, every held tail at or
     /// below that seq; with `no_intact_copy`, the intact rule. `give_up_live_copy` allows giving
@@ -6431,9 +6528,10 @@ enum Carries {
 fn carries(call: &ClientCall) -> Carries {
     match call {
         ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
-        ClientCall::Move { .. } | ClientCall::Rebuild { .. } | ClientCall::ForgetTail { .. } => {
-            Carries::Admin
-        }
+        ClientCall::Move { .. }
+        | ClientCall::Refill { .. }
+        | ClientCall::Rebuild { .. }
+        | ClientCall::ForgetTail { .. } => Carries::Admin,
         ClientCall::Compile { .. }
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
@@ -7508,6 +7606,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Resend { .. }
         | ClientCall::Status { .. }
         | ClientCall::Move { .. }
+        | ClientCall::Refill { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
         | ClientCall::WaitDurable { .. } => return None,

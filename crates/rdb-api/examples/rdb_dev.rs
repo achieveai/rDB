@@ -5872,15 +5872,18 @@ fn set_lifecycle(
     })
 }
 
-/// `control freeze-grant`: read `grants/<n>` on the rEtcd leader and write it back frozen, at
-/// the revision read. Returns the line to print.
+/// `control freeze-grant`: [`admin::freeze_grant`] of `grants/<n>` on the rEtcd leader.
+/// Returns the line to print.
 fn freeze_grant(rt: &tokio::runtime::Runtime, cluster: &Cluster, node: NodeId) -> String {
     let key = ControlKey::Grant(node).encode();
-    rewrite(rt, cluster, &key, |body| {
-        let mut record = GrantRecord::decode(body)?;
-        record.frozen = true;
-        Some((record.encode(), format!("frozen boot={}", record.boot.0)))
-    })
+    let Some(leader) = cluster.leader_now() else {
+        return format!("err control {key}: no rEtcd leader now; try again");
+    };
+    let store = cluster.client(leader);
+    match rt.block_on(admin::freeze_grant(&*store, node)) {
+        Ok((record, revision)) => format!("{key} rev={revision} frozen boot={}", record.boot.0),
+        Err(e) => format!("err control {key}: {e}"),
+    }
 }
 
 /// Read `key` on the rEtcd leader, let `change` rewrite its body, and put the result at the

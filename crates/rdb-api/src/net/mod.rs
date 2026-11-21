@@ -129,7 +129,8 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// membership watcher last applied. A frame is positional postcard, so a build at 9 cannot read
 /// a status from 13 nor 13 one from 9; the handshake refuses the pair instead. `remove_node`
 /// relies on that: a member counts as current only once a status from it has arrived since its
-/// boot, which a build without layout 3 cannot send. 13 is a placeholder: just before merge it
+/// boot, which a build without layout 3 cannot send. `WireCall::Refill` (#80 S4, A-R456 narrowed)
+/// was added under 13 too, last, so the variants before it keep their index. 13 is a placeholder: just before merge it
 /// is set to main's version + 1 in a one-line commit. Nothing else writes the number.
 pub const PROTOCOL_VERSION: u32 = 13;
 
@@ -1258,6 +1259,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 call:
                     call @ (wire::WireCall::Move { .. }
                     | wire::WireCall::Rebuild { .. }
+                    | wire::WireCall::Refill { .. }
                     | wire::WireCall::ForgetTail { .. }),
                 to,
                 ..
@@ -1265,6 +1267,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         ) if !admin_apps.contains(app) => {
             let (verb, step) = match call {
                 wire::WireCall::Move { .. } => ("move", crate::db::error::MOVE_STEP),
+                wire::WireCall::Refill { .. } => ("refill", crate::db::error::REFILL_STEP),
                 wire::WireCall::ForgetTail { .. } => {
                     ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
                 }
@@ -1278,7 +1281,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 format!(" or run the {verb} as an admin app (`lr` runs it as `admin`)")
             };
             return Some(format!(
-                "app {app} is not an admin app on node {}: only an admin app may move or \
+                "app {app} is not an admin app on node {}: only an admin app may move, refill or \
                  rebuild a copy or forget a tail, and the node's operator names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",

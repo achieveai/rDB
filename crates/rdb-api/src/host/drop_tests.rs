@@ -8768,3 +8768,151 @@ fn issue107_r2_the_gate_refuses_each_reason_before_the_probe_and_logs_it_once() 
         .collect();
     assert!(refused.is_empty(), "{refused:?}");
 }
+
+fn refill_call(request: u64, to: u32) -> ClientCall {
+    ClientCall::Refill {
+        identity: identity(request),
+        to: NodeId(to),
+    }
+}
+
+/// Ask node 1 for `call` and expect a refusal of `kind` whose detail holds `says`, ending with
+/// [`crate::db::error::REFILL_STEP`], logged `refill_refused` with `guard`, and changing nothing:
+/// node 1's commit and its refill entry are as before the ask.
+fn refill_refused(trio: &mut Trio, call: ClientCall, kind: ErrorKind, guard: &str, says: &str) {
+    const METHOD: &str =
+        "s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one";
+    let before = commit_of(trio);
+    let held = trio.nodes[0].0.refills.get(&PartitionId(1)).cloned();
+    match trio.ask(call) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, kind, "{guard}: {error:?}");
+            assert!(error.detail.contains(says), "{guard}: {error:?}");
+            assert!(
+                error.detail.ends_with(crate::db::error::REFILL_STEP),
+                "{guard}: {error:?}"
+            );
+        }
+        other => panic!("{guard}: {other:?}"),
+    }
+    assert_eq!(commit_of(trio), before, "{guard}: the commit changed");
+    assert_eq!(
+        trio.nodes[0].0.refills.get(&PartitionId(1)),
+        held.as_ref(),
+        "{guard}: the refill entry changed"
+    );
+    assert!(
+        trio.nodes[0].0.rejoins.is_empty(),
+        "{guard}: a re-plan started"
+    );
+    let refused: Vec<_> = logged!(METHOD, "refill_refused")
+        .into_iter()
+        .filter(|line| line["guard"] == guard)
+        .collect();
+    assert!(!refused.is_empty(), "{guard}: not logged");
+}
+
+/// #80 S4 (A-R456 narrowed by the lead, 2026-11-21: refill): `Host::refill_step` refuses, with
+/// nothing changed, each target that must not take the free slot:
+///
+/// - at 3 regular copies, any refill (`full`);
+/// - after node 3's drop, node 1 itself (`owner`), node 2 (`member`, regular), and node 3, the
+///   dead node left out (`left_out`);
+/// - with node 4 pinned as the refill's shadow, its links held so it stays one, node 5
+///   (`slot_taken`).
+///
+/// Node 4 then catches up and is pinned regular in the free slot with nothing left out: members
+/// 1, 2, 4. Its refill is answered done once, and a later ask is refused `member`.
+/// Cut: drop the `left_out` check in `refill_step`. Red, observed 2026-11-21 at load 57: `left_out:
+/// Moved(MoveAnswer { done: false, line: "refilling: node 3 joining as a shadow" })`. The
+/// refill was taken onto the dead node, because a dropped direction still counts as linked
+/// (A-R350).
+/// Integration (~4 s): bootstrap's window, the drop clock, the refill's two re-plans.
+#[config_log::retcd_test]
+fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one() {
+    const METHOD: &str =
+        "s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::with_nodes(dir.path(), tuned, 5);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (before, _, members) = commit_of(&trio).expect("bootstrap committed");
+    assert_eq!(members, vec![1, 2, 3]);
+    refill_refused(
+        &mut trio,
+        refill_call(1, 4),
+        ErrorKind::InvalidArgument,
+        "full",
+        "already has 3 regular copies",
+    );
+    kill(&trio, 3, &[1, 2, 4, 5]);
+    let (request, _) = put_until_paused(&mut trio, 2);
+    dropped_three(&mut trio, before);
+    for (to, guard, says) in [
+        (1, "owner", "node 1 owns partition 1"),
+        (2, "member", "node 2 already holds a regular copy"),
+        (3, "left_out", "node 3 was left out of partition 1"),
+    ] {
+        refill_refused(
+            &mut trio,
+            refill_call(request, to),
+            ErrorKind::InvalidArgument,
+            guard,
+            says,
+        );
+    }
+    match trio.ask(refill_call(request + 1, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("refill 4: {other:?}"),
+    }
+    // Hold node 4's links, so it cannot catch up and be promoted before node 5 is asked: the
+    // owner judges no promote for a shadow it has no link to. Healed well inside the drop clock.
+    trio.links.hold(NodeId(1), NodeId(4));
+    trio.links.hold(NodeId(2), NodeId(4));
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::Shadow) && trio.nodes[0].0.rejoins.is_empty())
+            .then_some(())
+    });
+    refill_refused(
+        &mut trio,
+        refill_call(request + 2, 5),
+        ErrorKind::Unavailable,
+        "slot_taken",
+        "free slot is taken",
+    );
+    assert_eq!(
+        pinned_role(&trio, 4),
+        Some(ReplicaRole::Shadow),
+        "node 4 still a shadow"
+    );
+    trio.links.heal(NodeId(1), NodeId(4));
+    trio.links.heal(NodeId(2), NodeId(4));
+    let (_, _, members) = trio.until("node 4 regular", |trio| {
+        (pinned_role(trio, 4) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(members, vec![1, 2, 4], "node 4 filled the free slot");
+    match trio.ask(refill_call(request + 3, 4)) {
+        Answer::Moved(answer) => {
+            assert!(answer.done, "{answer:?}");
+            assert!(
+                answer.line.starts_with("refilled: node 4 regular"),
+                "{answer:?}"
+            );
+        }
+        other => panic!("refill 4 again: {other:?}"),
+    }
+    refill_refused(
+        &mut trio,
+        refill_call(request + 4, 4),
+        ErrorKind::InvalidArgument,
+        "member",
+        "node 4 already holds a regular copy",
+    );
+    let committed: Vec<_> = logged!(METHOD, "refill_committed")
+        .into_iter()
+        .map(|line| line["phase"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(committed, ["shadow_pinned", "refilled"], "{committed:?}");
+}

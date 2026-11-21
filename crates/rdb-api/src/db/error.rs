@@ -63,6 +63,10 @@ pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this sa
 /// The tail every `admin move` refusal ends with (M11): its detail names the step.
 pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 
+/// The tail every refill refusal ends with (#80 S4, A-R456 narrowed: refill): its detail names
+/// the step.
+pub(crate) const REFILL_STEP: &str = "the refill did nothing more than this says";
+
 /// The tail every `admin forget-tail` refusal ends with (issue #105): its detail names the step,
 /// and nothing was given up.
 pub(crate) const FORGET_TAIL_STEP: &str = "nothing was given up";
@@ -361,6 +365,7 @@ impl ApiError {
             || self.detail.ends_with(REBUILD_STEP)
             || self.detail.ends_with(BARRIER_STEP)
             || self.detail.ends_with(MOVE_STEP)
+            || self.detail.ends_with(REFILL_STEP)
             || self.detail.ends_with(FORGET_TAIL_STEP)
             || self.detail.ends_with(MOVE_ENDED)
             || self.detail.ends_with(ADMIN_LOST_STEP)

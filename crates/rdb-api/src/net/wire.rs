@@ -874,6 +874,11 @@ pub enum WireCall {
         no_intact_copy: bool,
         give_up_live_copy: bool,
     },
+    // #80 S4 (A-R456 narrowed: refill): added last, under the existing version-13 bump.
+    Refill {
+        identity: RequestIdentity,
+        to: NodeId,
+    },
 }
 
 impl WireCall {
@@ -889,7 +894,8 @@ impl WireCall {
             | Self::Status { identity, .. }
             | Self::Move { identity, .. }
             | Self::Rebuild { identity, .. }
-            | Self::ForgetTail { identity, .. } => Some(*identity),
+            | Self::ForgetTail { identity, .. }
+            | Self::Refill { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -909,6 +915,7 @@ impl WireCall {
             Self::Rebuild { .. } => "rebuild",
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
+            Self::Refill { .. } => "refill",
         }
     }
 }
@@ -976,6 +983,10 @@ impl TryFrom<&ClientCall> for WireCall {
             ClientCall::Rebuild { identity, node } => Self::Rebuild {
                 identity: *identity,
                 node: *node,
+            },
+            ClientCall::Refill { identity, to } => Self::Refill {
+                identity: *identity,
+                to: *to,
             },
             ClientCall::ForgetTail {
                 identity,
@@ -1052,6 +1063,7 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::Refill { identity, to } => Self::Refill { identity, to },
             WireCall::ForgetTail {
                 identity,
                 through,

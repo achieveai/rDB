@@ -954,6 +954,18 @@ pub enum ClientCall {
         /// The node that takes it, first as a shadow.
         to: NodeId,
     },
+    /// #80 S4 (A-R456 narrowed by the lead, 2026-11-21: refill): add a copy of the partition on
+    /// node `to`, or say where that refill stands ([`Answer::Moved`]). Only the pinned primary
+    /// takes it, and only below rf regular copies: `to` joins as a shadow at its live boot and is
+    /// pinned regular once caught up; no copy leaves and the owner stays. Asking again resumes
+    /// it. It changes who holds a copy, so over a link only an admin app may send it
+    /// (`NetConfig::admin_apps`, A-R479).
+    Refill {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The node that takes the new copy, first as a shadow.
+        to: NodeId,
+    },
     /// M11 T12 over processes: `admin rebuild node` from an app with no node of its own
     /// ([`Answer::Rebuilt`]). Only the pinned primary takes it, and only for a node it does not
     /// pin: a spare is noted for the free slot, a copy already left out is answered as it is.
@@ -1827,6 +1839,17 @@ struct CopyMove {
     /// next ask says why even with the target reachable (T9 would start it afresh), and the ask
     /// after that starts it afresh.
     lagged: bool,
+}
+
+/// #80 S4 (A-R456 narrowed: refill): a refill the owner was asked for, from its ask to the
+/// commit that pins `to` regular. Kept in memory only, like [`CopyMove`]: once `to` is pinned
+/// as a shadow, asking again resumes it, and [`Host::shadow_duty`] promotes a shadow below rf
+/// regular copies with or without the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refill {
+    to: NodeId,
+    /// Set when the refill was given up; the next ask answers it once and clears the entry.
+    abandoned: Option<String>,
 }
 
 /// A-R463: a move's shadow found behind the head, and since when it has made no progress:
@@ -2879,6 +2902,9 @@ struct Host {
     /// done ([`Host::move_step`]). Only the ask: where the move stands is read from the
     /// commit's pinned members each time (D2, A-R452).
     moves: BTreeMap<PartitionId, CopyMove>,
+    /// #80 S4: per partition, the refill this owner was asked for and has not yet answered done
+    /// ([`Host::refill_step`]). Only the ask, as for [`Self::moves`].
+    refills: BTreeMap<PartitionId, Refill>,
     /// M11 (A-R452 amendment): per partition, the last move that committed here, `(from, to)`.
     /// While the commit still shows it done it is answered `moved` on every ask, so a replayed
     /// plan passes. In memory only: a restarted owner, or a new one, refuses the replay (T1).
@@ -3139,6 +3165,7 @@ impl Host {
             live_readd: LiveReadd::off(),
             spare_notes: BTreeMap::new(),
             moves: BTreeMap::new(),
+            refills: BTreeMap::new(),
             moved: BTreeMap::new(),
             quarantines: BTreeMap::new(),
             rebuild_asks: BTreeMap::new(),
@@ -7537,7 +7564,13 @@ impl Host {
         let joining = readded
             .is_none()
             .then(|| self.move_shadow(partition, replan, &pinned.members))
-            .flatten();
+            .flatten()
+            .or_else(|| {
+                readded
+                    .is_none()
+                    .then(|| self.refill_shadow(partition, replan, &pinned.members))
+                    .flatten()
+            });
         // #80 S4 (S-2): a re-add or a move's target is pinned only while its record is live,
         // read at the commit, so a re-add held across `admin::remove_node` pins nothing.
         let readded = readded.filter(|member| self.pinnable(partition, member.node));
@@ -7665,6 +7698,7 @@ impl Host {
         self.rejoins.remove(&partition);
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         self.move_committed(partition, generation, waited_ms);
+        self.refill_committed(partition, generation, waited_ms);
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
@@ -9024,6 +9058,377 @@ impl Host {
         progress(false)
     }
 
+    /// #80 S4 (A-R456 narrowed by the lead, 2026-11-21: refill): add a copy of `partition` on
+    /// `to`, or say where that refill stands. Only the pinned primary takes it, and only while
+    /// fewer than rf copies are regular. The refill is two re-plans, as a move's are: the first
+    /// pins `to` as a shadow at its live boot ([`Self::refill_shadow`]), and once it is caught up
+    /// [`Self::shadow_duty`] pins it regular in the free slot; no copy leaves and the owner
+    /// stays. Given up as a move's shadow is: unreachable past the drop clock
+    /// ([`Self::shadow_give_up_duty`]) or making no progress ([`Self::move_lag_duty`]); the next
+    /// ask says why, once. Asking again resumes. Every refusal changes nothing, names the next
+    /// step and is logged `refill_refused` with its `guard`.
+    fn refill_step(&mut self, partition: PartitionId, to: NodeId) -> Result<MoveAnswer, ApiError> {
+        let Some(committed) = self.committed.get(&partition) else {
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "no_generation",
+                true,
+                format!(
+                    "node {} has committed no generation of partition {} yet: run the refill \
+                     again once it serves",
+                    self.node.0, partition.0
+                ),
+            ));
+        };
+        let members = committed.committed.pinned_config.members.clone();
+        let generation = committed.new_generation;
+        let epoch = committed.selected.root.owner_epoch;
+        let owner = members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .map(|member| member.node);
+        self.answers_as_owner(partition, owner)?;
+        let rf = crate::admin::RF;
+        let role = |node: NodeId| {
+            members
+                .iter()
+                .find(|member| member.node == node)
+                .map(|member| member.role)
+        };
+        let regular = members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .count();
+        let asked = self.refills.get(&partition).cloned();
+        if let Some(why) = asked
+            .as_ref()
+            .filter(|refill| refill.to == to)
+            .and_then(|refill| refill.abandoned.clone())
+        {
+            // Said once; the entry goes, so the next ask starts afresh.
+            self.refills.remove(&partition);
+            return Err(self.refill_refusal(partition, to, "given_up", true, why));
+        }
+        let ours = asked
+            .as_ref()
+            .is_some_and(|refill| refill.to == to && refill.abandoned.is_none());
+        match role(to) {
+            Some(ReplicaRole::Primary) => {
+                return Err(self.refill_refusal(
+                    partition,
+                    to,
+                    "owner",
+                    false,
+                    format!(
+                        "node {} owns partition {}: name a node with no copy",
+                        to.0, partition.0
+                    ),
+                ));
+            }
+            Some(ReplicaRole::RegularSecondary) if ours => {
+                self.refills.remove(&partition);
+                return Ok(MoveAnswer {
+                    done: true,
+                    line: format!(
+                        "refilled: node {} regular; partition {} is at generation {} with \
+                         {regular} regular copies (members: {})",
+                        to.0,
+                        partition.0,
+                        generation.0,
+                        member_list(&members)
+                    ),
+                });
+            }
+            Some(ReplicaRole::RegularSecondary) => {
+                return Err(self.refill_refusal(
+                    partition,
+                    to,
+                    "member",
+                    false,
+                    format!(
+                        "node {} already holds a regular copy of partition {} (members: {}): \
+                         name a node with no copy",
+                        to.0,
+                        partition.0,
+                        member_list(&members)
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        let shadow = role(to) == Some(ReplicaRole::Shadow);
+        let progress = |line: String| Ok(MoveAnswer { done: false, line });
+        if self.rejoins.contains_key(&partition) {
+            if ours {
+                return progress(format!(
+                    "refilling: node {} {} as a shadow",
+                    to.0,
+                    if shadow { "catching up" } else { "joining" }
+                ));
+            }
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "replanning",
+                true,
+                format!(
+                    "a re-plan of partition {} is running: run the refill again once it commits",
+                    partition.0
+                ),
+            ));
+        }
+        if let Some(mv) = self
+            .moves
+            .get(&partition)
+            .filter(|mv| mv.abandoned.is_none())
+        {
+            let detail = format!(
+                "the move of node {} to node {} is still running: run `admin move {} {}` to \
+                 follow it, then this refill",
+                mv.from.0, mv.to.0, mv.from.0, mv.to.0
+            );
+            return Err(self.refill_refusal(partition, to, "move_running", true, detail));
+        }
+        if regular >= rf {
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "full",
+                false,
+                format!(
+                    "partition {} already has {regular} regular copies (members: {}): a refill \
+                     only fills a missing copy; use `admin move` to place a copy elsewhere",
+                    partition.0,
+                    member_list(&members)
+                ),
+            ));
+        }
+        if shadow {
+            // Resumed: the pin names the shadow; shadow_duty promotes it once caught up.
+            self.refills.insert(
+                partition,
+                Refill {
+                    to,
+                    abandoned: None,
+                },
+            );
+            if !ours {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    to = to.0,
+                    "refill_resumed"
+                );
+            }
+            if !self.linked(to) {
+                return progress(format!(
+                    "refilling: node {} is pinned as a shadow but is not reachable from node {} \
+                     (the owner): start it and the refill goes on; unreachable for {} ms in all, \
+                     the refill is given up and node {} is left out",
+                    to.0, self.node.0, self.peer_drop_after_millis, to.0
+                ));
+            }
+            return progress(format!("refilling: node {} catching up as a shadow", to.0));
+        }
+        if self
+            .left_out
+            .get(&partition)
+            .is_some_and(|left| left.iter().any(|member| member.node == to))
+        {
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "left_out",
+                false,
+                format!(
+                    "node {} was left out of partition {} and comes back only by its own \
+                     restart (or `admin rebuild {}`): name a node with no copy",
+                    to.0, partition.0, to.0
+                ),
+            ));
+        }
+        if let Some(net) = self.links.net().filter(|net| !net.members().contains(&to)) {
+            let detail = format!(
+                "node {} is not a live member: no nodes/ record for it has reached node {} \
+                 (members_revision {}); add it with `admin add-node` and wait for its record, \
+                 then refill",
+                to.0,
+                self.node.0,
+                net.members_revision()
+            );
+            return Err(self.refill_refusal(partition, to, "not_live", false, detail));
+        }
+        // The slot count, shadows counted (A-R455): pinned members, spares a rebuild noted that
+        // are still left out (critic A5), and another refill this owner holds.
+        let left = self.left_out.get(&partition);
+        let noted = self
+            .spare_notes
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .filter(|noted| left.is_some_and(|left| left.iter().any(|m| m.node == **noted)))
+            .count();
+        let other = usize::from(
+            asked
+                .as_ref()
+                .is_some_and(|refill| refill.to != to && refill.abandoned.is_none()),
+        );
+        if members.len() + noted + other >= rf {
+            let detail = format!(
+                "partition {}'s free slot is taken (members: {}; {noted} rebuild spares noted; \
+                 {other} other refill held): run the refill again once that copy is regular or \
+                 given up",
+                partition.0,
+                member_list(&members)
+            );
+            return Err(self.refill_refusal(partition, to, "slot_taken", true, detail));
+        }
+        if !self.linked(to) || self.links.boot_of(to).is_none() {
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "unreachable",
+                true,
+                format!(
+                    "node {} is not reachable from node {} (the owner): start it, or name a \
+                     node that runs, and run the refill again",
+                    to.0, self.node.0
+                ),
+            ));
+        }
+        if move_copy_id(to).is_none_or(|copy| members.iter().any(|member| member.copy == copy)) {
+            return Err(self.refill_refusal(
+                partition,
+                to,
+                "copy_id",
+                false,
+                format!(
+                    "node {}'s copy id is taken in partition {} (members: {}): name another node",
+                    to.0,
+                    partition.0,
+                    member_list(&members)
+                ),
+            ));
+        }
+        self.refills.insert(
+            partition,
+            Refill {
+                to,
+                abandoned: None,
+            },
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            to = to.0,
+            regular,
+            "refill_started"
+        );
+        let replan = Replan {
+            drop: None,
+            rejoiner: Some(to),
+            promote: false,
+            since: self.clock.now(),
+            release: TailRelease::default(),
+            cause: None,
+        };
+        self.start_revoke(partition, epoch, replan);
+        progress(format!("refilling: node {} joining as a shadow", to.0))
+    }
+
+    /// A refill refusal: logged `refill_refused` with its `guard`, ending with
+    /// [`crate::db::error::REFILL_STEP`]. `wait`: `Unavailable`, the same ask may pass later;
+    /// otherwise invalid, it needs another target.
+    fn refill_refusal(
+        &self,
+        partition: PartitionId,
+        to: NodeId,
+        guard: &'static str,
+        wait: bool,
+        detail: String,
+    ) -> ApiError {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            to = to.0,
+            guard,
+            "refill_refused"
+        );
+        let detail = format!("{detail}; {}", crate::db::error::REFILL_STEP);
+        if wait {
+            let mut error = ApiError::new(ErrorKind::Unavailable, detail);
+            error.no_mutation = true;
+            error
+        } else {
+            ApiError::invalid(detail)
+        }
+    }
+
+    /// #80 S4: the shadow a refill pins, when `replan` is that refill's first re-plan: `to` is
+    /// the rejoiner, not pinned, and this owner holds the refill. As for [`Self::move_shadow`].
+    fn refill_shadow(
+        &self,
+        partition: PartitionId,
+        replan: Replan,
+        pinned: &[Member],
+    ) -> Option<Member> {
+        let refill = self.refills.get(&partition)?;
+        if replan.promote
+            || refill.abandoned.is_some()
+            || replan.rejoiner != Some(refill.to)
+            || pinned.iter().any(|member| member.node == refill.to)
+            || pinned.len() >= crate::admin::RF
+        {
+            return None;
+        }
+        let copy = move_copy_id(refill.to)?;
+        if pinned.iter().any(|member| member.copy == copy) {
+            return None;
+        }
+        Some(Member {
+            copy,
+            node: refill.to,
+            boot: self.links.boot_of(refill.to)?,
+            role: ReplicaRole::Shadow,
+        })
+    }
+
+    /// #80 S4: a commit that ends one of a refill's re-plans, `waited_ms` after its revocation
+    /// was asked. Logged `refill_committed` with the `phase` the commit shows `to` in; the entry
+    /// stays until the next ask answers it.
+    fn refill_committed(&mut self, partition: PartitionId, generation: Generation, waited_ms: u64) {
+        let Some(refill) = self.refills.get(&partition) else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let phase = match committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == refill.to)
+            .map(|member| member.role)
+        {
+            Some(ReplicaRole::Shadow) => "shadow_pinned",
+            Some(ReplicaRole::RegularSecondary) => "refilled",
+            _ => "other",
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            to = refill.to.0,
+            phase,
+            waited_ms,
+            "refill_committed"
+        );
+    }
+
     /// M11: the shadow a move pins, when `replan` is that move's first re-plan: `to` is the
     /// rejoiner, not pinned, and this owner holds the move. It joins at its live boot under
     /// [`move_copy_id`]; R1 feeds it by its probe and catch-up cursor, and F1's barrier skips it.
@@ -9241,6 +9646,18 @@ impl Host {
             waited_ms,
             "move_given_up"
         );
+        if let Some(refill) = self
+            .refills
+            .get_mut(&partition)
+            .filter(|refill| refill.to == node && refill.abandoned.is_none())
+        {
+            refill.abandoned = Some(format!(
+                "the refill of node {} into partition {} was given up: node {} was unreachable \
+                 from node {} (the owner) for {waited_ms} ms and is left out; start it, or name \
+                 another node, and run the refill again",
+                node.0, partition.0, node.0, self.node.0
+            ));
+        }
         if let Some(mv) = held {
             let why = format!(
                 "the move of node {} to node {} was given up: node {} was unreachable from node \
@@ -9430,7 +9847,11 @@ impl Host {
         let epoch = committed.selected.root.owner_epoch;
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
-            if moving.is_some() {
+            let refilling = self
+                .refills
+                .get(&partition)
+                .is_some_and(|refill| refill.to == shadow.node && refill.abandoned.is_none());
+            if moving.is_some() || refilling {
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
@@ -9497,6 +9918,36 @@ impl Host {
         let waited_ms = HostClock::millis_until(clock.since, now);
         if waited_ms < self.move_catch_up_millis {
             self.move_catching_up.insert(partition, clock);
+            return;
+        }
+        if let Some(refill) = self
+            .refills
+            .get_mut(&partition)
+            .filter(|refill| refill.to == to && refill.abandoned.is_none())
+        {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                to = to.0,
+                behind,
+                waited_ms,
+                "refill_catch_up_given_up"
+            );
+            refill.abandoned = Some(format!(
+                "the refill of node {} into partition {} was given up: node {} made no progress \
+                 for {} s and was still {behind} records behind node {}'s head, and it is \
+                 promoted only within {PROMOTE_LAG_RECORDS}: writes are arriving faster than the \
+                 copy catches up, or its link from node {} is slow. Run the refill again onto \
+                 another node, or when the write load drops",
+                to.0,
+                partition.0,
+                to.0,
+                waited_ms / 1_000,
+                self.node.0,
+                self.node.0
+            ));
+            self.blamed.remove(&partition);
+            self.revoke(partition, epoch, Some(to), None);
             return;
         }
         let Some(mv) = self.moves.get(&partition).cloned() else {
@@ -9585,7 +10036,7 @@ impl Host {
     /// a shadow never counts, and the owner holds everything the shadow could have been sent.
     /// A shadow the plan keeps from the committed configuration that is not a move's target,
     /// a restarted regular among them, is still asked: its report can name a divergence (B3).
-    /// A-R462: a given-up move's entry names no target, and with no committed record yet (a
+    /// A refill's target (#80 S4) is not asked either. A-R462: a given-up move's entry names no target, and with no committed record yet (a
     /// reopen, before `Recovered`) nothing is known to be new, so every shadow is asked.
     fn unwaited_shadows(&self, partition: PartitionId, members: &[Member]) -> BTreeSet<NodeId> {
         let Some(committed) = self.committed.get(&partition) else {
@@ -9597,11 +10048,19 @@ impl Host {
             .get(&partition)
             .filter(|mv| mv.abandoned.is_none())
             .map(|mv| mv.to);
+        // #80 S4: a refill's target is a new copy, as a move's is.
+        let refill = self
+            .refills
+            .get(&partition)
+            .filter(|refill| refill.abandoned.is_none())
+            .map(|refill| refill.to);
         members
             .iter()
             .filter(|member| member.role == ReplicaRole::Shadow)
             .filter(|member| {
-                Some(member.node) == target || !pinned.iter().any(|kept| kept.node == member.node)
+                Some(member.node) == target
+                    || Some(member.node) == refill
+                    || !pinned.iter().any(|kept| kept.node == member.node)
             })
             .map(|member| member.node)
             .collect()
@@ -14382,6 +14841,7 @@ impl Host {
             ClientCall::Compile { .. }
             | ClientCall::Status { .. }
             | ClientCall::Move { .. }
+            | ClientCall::Refill { .. }
             | ClientCall::Rebuild { .. }
             | ClientCall::ForgetTail { .. }
             | ClientCall::WaitDurable { .. } => None,
@@ -14521,6 +14981,18 @@ impl Host {
             ClientCall::Move { from, to, .. } => {
                 let answer = match self.move_step(partition, from, to) {
                     Ok(moved) => Answer::Moved(moved),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
+            // #80 S4: answered in this step, as a move is.
+            ClientCall::Refill { to, .. } => {
+                let answer = match self.refill_step(partition, to) {
+                    Ok(refilled) => Answer::Moved(refilled),
                     Err(error) => Answer::Error {
                         error,
                         request: None,
