@@ -317,9 +317,10 @@ pub struct Dispatcher {
     /// call here ([`Self::snapshot_offer`]), so one is left open only when
     /// `SnapshotHooks::pages_held_from` stops it (S2-R2's twin). Process memory of the target.
     snapshot_installs: BTreeMap<(NodeId, PartitionId), (Generation, Seq, u64)>,
-    /// The applied head over time, per `(node, partition)`, for the retention duty's `keep`
-    /// (issue #61 S3, [`Self::retention_duty`]): the host's `RetentionSamples`. Process memory.
-    retention_samples: BTreeMap<(NodeId, PartitionId), RetentionSamples>,
+    /// The applied head over time, per `(node, partition)`, of the generation named, for the
+    /// retention duty's `keep` (issue #61 S3, [`Self::retention_duty`]): the host's
+    /// `RetentionState::samples`. Another generation starts them afresh. Process memory.
+    retention_samples: BTreeMap<(NodeId, PartitionId), (Generation, RetentionSamples)>,
     /// Each copy the retention duty found behind its node's floor and has logged
     /// `history_copy_behind_floor` for, until it is counted again: the alert is logged once.
     /// Process memory.
@@ -3589,7 +3590,7 @@ impl Dispatcher {
         let cap = cap_seq(prev, applied, config.budget_bytes, |from| {
             engine.history_bytes(partition, generation, from)
         });
-        let samples = self.retention_samples.entry((node, partition)).or_default();
+        let samples = self.retention_samples_of(node, partition, generation);
         samples
             .record(now, applied, config.keep_millis)
             .map_err(|field| SimError::Config { field })?;
@@ -3693,6 +3694,32 @@ impl Dispatcher {
             self.trim_history(node, partition, floor.floor)?;
         }
         Ok(decision)
+    }
+
+    /// `node`'s retention samples of `partition` in `generation`. Samples of another generation
+    /// are dropped and started afresh, logged `retention_samples_reset{from_gen, to_gen}`: a
+    /// newer generation's head may sit below the old one's (the host's `retention_keep`).
+    fn retention_samples_of(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> &mut RetentionSamples {
+        let held = self
+            .retention_samples
+            .entry((node, partition))
+            .or_insert_with(|| (generation, RetentionSamples::new()));
+        if held.0 != generation {
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                from_gen = held.0 .0,
+                to_gen = generation.0,
+                "retention_samples_reset"
+            );
+            *held = (generation, RetentionSamples::new());
+        }
+        &mut held.1
     }
 
     /// The no-trim gate the retention duty finds on `node`'s `partition` (design 3.1), the
@@ -6448,9 +6475,44 @@ mod dormant_twin_tests {
         );
         assert_eq!(widest, 10, "never more than a window past the floor");
         assert!(
-            dispatcher.retention_samples[&(OWNER, P)].len() <= 11,
+            dispatcher.retention_samples[&(OWNER, P)].1.len() <= 11,
             "samples bounded by the window"
         );
+    }
+
+    /// Issue #61 S3 (lead note a), the twin of the host's
+    /// `t61_s3_a_newer_generation_resets_the_retention_samples`: a newer generation starts the
+    /// samples afresh, logged `retention_samples_reset{from_gen, to_gen}`, so a head below the
+    /// old generation's is not refused `applied_backwards`.
+    ///
+    /// **Asserted.** Node 1 holds generation 1 through 6 and a round samples head 6. Its engine
+    /// then gains generation 2 through 3, and the next round, at head 3, answers. A third round
+    /// in generation 2 logs no second reset; the one reset names generations 1 and 2.
+    ///
+    /// Cut: no reset, red (the second round fails `applied_backwards`). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_a_newer_generation_resets_the_retention_samples() {
+        const METHOD: &str = "t61_sim_a_newer_generation_resets_the_retention_samples";
+        let (mut dispatcher, seed) = owner_of(1, 6);
+        let round = dispatcher.retention_duty(OWNER, P, Tick(1_000), RETAIN);
+        assert!(round.is_ok(), "generation 1: {round:?}");
+        let g2 = Lineage {
+            generation: Generation(2),
+            ..seed.lineage
+        };
+        let history = canonical_history(g2, ConfigVersion(1), 3).expect("history");
+        let engine = dispatcher.engines.get_mut(&OWNER).expect("node 1's engine");
+        for batch in &history.batches {
+            engine.commit(batch.clone()).expect("commit generation 2");
+        }
+        let round = dispatcher.retention_duty(OWNER, P, Tick(2_000), RETAIN);
+        assert!(round.is_ok(), "generation 2: {round:?}");
+        let round = dispatcher.retention_duty(OWNER, P, Tick(3_000), RETAIN);
+        assert!(round.is_ok(), "generation 2 again: {round:?}");
+        let resets = logged(METHOD, "retention_samples_reset");
+        assert_eq!(resets.len(), 1, "{resets:?}");
+        assert_eq!(resets[0]["from_gen"], 1);
+        assert_eq!(resets[0]["to_gen"], 2);
     }
 
     /// Issue #61 S3-R3 and the cap half of S3-R2 (design 3.1 to 3.3): copy 1 acked nothing, so
@@ -7158,6 +7220,136 @@ mod dormant_twin_tests {
         assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
     }
 
+    /// Issue #61 S3-R4 part (b), the twin of the host's
+    /// `t61_s3_r4b_a_caught_up_release_resets_the_count_and_the_give_up`: a caught-up release
+    /// after the give-up ends it, so the copy is offered again with nothing standing.
+    ///
+    /// **Asserted.** After [`give_up_on_copy_2`], R1's `CopyCaughtUp` for copy 2 reaches the
+    /// dispatcher's arm: the count is 0 and nobody needs the operator. Node 3's next ask opens a
+    /// transfer. A later round at a raised budget logs no `history_budget_give_up_cleared`: no
+    /// give-up was left to clear.
+    ///
+    /// **Differs.** The `CopyCaughtUp` effect is handed to [`Dispatcher::kernel`] directly, as in
+    /// [`t61_sim_s3_r4b_a_caught_up_release_resets_the_overrun_count`].
+    ///
+    /// Cuts, each red: the count kept (still 3); `needs_operator` kept (still named); the
+    /// recorded give-up kept (the raised budget clears it). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_caught_up_release_ends_the_give_up() {
+        use rdb_core::contracts::event::{KernelEffect, ModuleName};
+        use rdb_core::contracts::ids::CorrelationId;
+
+        const METHOD: &str = "t61_sim_s3_r4b_a_caught_up_release_ends_the_give_up";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        let budget = give_up_on_copy_2(&mut dispatcher, &seed, &mut scheduler);
+        dispatcher
+            .kernel(
+                OWNER,
+                ModuleName::Replication,
+                &KernelEffect::CopyCaughtUp {
+                    copy: CopyId(2),
+                    head: Seq(HEAD),
+                    digest: Digest::ROOT,
+                },
+                (OWNER, P, CorrelationId(0)),
+                &[],
+                &mut scheduler,
+            )
+            .expect("caught up");
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 0);
+        assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
+        assert!(
+            copy_2_asks(&mut dispatcher, &mut scheduler).is_some(),
+            "offered again"
+        );
+        dispatcher
+            .retention_duty(
+                OWNER,
+                P,
+                Tick(10),
+                super::RetentionConfig {
+                    keep_millis: 3_600_000,
+                    budget_bytes: budget + 1,
+                    ..RETAIN
+                },
+            )
+            .expect("duty");
+        assert_eq!(give_up_cleared(METHOD), Vec::<Option<String>>::new());
+    }
+
+    /// Issue #61 S3-R4 part (b), lead ruling 2026-11-21, step 2 of the host's
+    /// `t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises`: a held
+    /// round decides no floor, so it neither counts as an overrun nor resets the count.
+    ///
+    /// **Asserted.** Two overruns of copy 2's transfers (count 2), and node 1 opens a third. An
+    /// inventory pin is planted and node 1 applies three records past the head; a round whose
+    /// budget holds only those three is held `InventoryPinned`, the count still 2 and the
+    /// transfer still open. The pin is dropped, and the same round again is the third overrun
+    /// in a row: warned `attempts` 3, `gave_up` true.
+    ///
+    /// **Differs.** The pin is planted in the dispatcher's map rather than taken by answering an
+    /// inventory.
+    ///
+    /// Cuts, each red: a held round counts (the count is 3 at the held round); a held round
+    /// resets (the count is 0 there). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_held_round_neither_counts_nor_resets() {
+        const METHOD: &str = "t61_sim_s3_r4b_a_held_round_neither_counts_nor_resets";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        for round in 1..=2 {
+            copy_2_asks(&mut dispatcher, &mut scheduler).expect("re-offered");
+            overrun_copy_2(&mut dispatcher, &seed, Tick(round));
+        }
+        let pin = copy_2_asks(&mut dispatcher, &mut scheduler).expect("a third transfer");
+
+        dispatcher.inventory_pins.insert(
+            (OWNER, P),
+            super::InventoryPin {
+                generation: Generation(1),
+                since: Tick(3),
+            },
+        );
+        let head = dispatcher.engines[&OWNER]
+            .buffered_applied(P, Generation(1))
+            .0;
+        owner_applies(&mut dispatcher, seed.lineage, head + 1, head + 3);
+        let tight = super::RetentionConfig {
+            keep_millis: 3_600_000,
+            budget_bytes: dispatcher.engines[&OWNER].history_bytes(P, Generation(1), Seq(head + 1)),
+            ..RETAIN
+        };
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(3), tight),
+            Ok(RetentionDecision::Held(RetentionHold::InventoryPinned))
+        );
+        assert_eq!(
+            dispatcher.overruns(OWNER, P, CopyId(2)),
+            2,
+            "held: no change"
+        );
+        assert_eq!(copy_2_transfer(&dispatcher), Some(pin));
+
+        dispatcher.inventory_pins.clear();
+        let decision = dispatcher
+            .retention_duty(OWNER, P, Tick(4), tight)
+            .expect("duty");
+        let RetentionDecision::Floor(floor) = decision else {
+            panic!("held: {decision:?}");
+        };
+        assert_eq!(floor.overran_pins, vec![pin]);
+        assert_eq!(
+            overran_attempts(METHOD),
+            vec![
+                (Some(1), Some(false)),
+                (Some(2), Some(false)),
+                (Some(3), Some(true))
+            ]
+        );
+        assert!(dispatcher.needs_operator(OWNER, P, CopyId(2)).is_some());
+    }
+
     /// Issue #61 S3-R4 part (b), lead ruling 2026-11-21: the owner's three overruns are
     /// consecutive, so a round for the copy that is not an overrun resets the count, a round
     /// within budget as much as a caught-up release.
@@ -7535,6 +7727,16 @@ mod dormant_twin_tests {
     /// Step [`owner_recovery_result`] into node 1's R1 through [`Dispatcher::step`] at `now`, so the
     /// harness's ladder alignment and grace run, and assert a primary stands after it.
     fn step_recovered(dispatcher: &mut Dispatcher, seed: &DormantSeed, now: Tick) {
+        step_result(dispatcher, seed.lineage, owner_recovery_result(seed), now);
+    }
+
+    /// [`step_recovered`] with `result`, stepped under `lineage`.
+    fn step_result(
+        dispatcher: &mut Dispatcher,
+        lineage: Lineage,
+        result: rdb_core::contracts::recovery::RecoveryResult,
+        now: Tick,
+    ) {
         use rdb_core::contracts::event::{Budgets, Event, EventKind, KernelEvent, ModuleName};
         use rdb_core::contracts::ids::{CorrelationId, EventId};
 
@@ -7544,7 +7746,7 @@ mod dormant_twin_tests {
         let budgets = Budgets::SPEC_DEFAULTS;
         let ctx = rdb_core::contracts::event::StepCtx {
             now,
-            ..owner_ctx(&snapshot, &budgets, seed.lineage)
+            ..owner_ctx(&snapshot, &budgets, lineage)
         };
         Dispatcher::step(
             dispatcher,
@@ -7557,9 +7759,7 @@ mod dormant_twin_tests {
                 boot: BootId(1),
                 partition: P,
                 correlation: CorrelationId(1),
-                kind: EventKind::Kernel(KernelEvent::Recovered(Box::new(owner_recovery_result(
-                    seed,
-                )))),
+                kind: EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
             },
         )
         .expect("R1 answers its own event");
@@ -7569,6 +7769,15 @@ mod dormant_twin_tests {
     /// Copy `copy` (on node `copy + 1`) acks [`HEAD`], durable, to node 1's R1: the frame its
     /// receiver would send, delivered authenticated.
     fn copy_acks(dispatcher: &mut Dispatcher, seed: &DormantSeed, copy: u8) {
+        let digest = canonical_history(seed.lineage, ConfigVersion(1), HEAD)
+            .expect("history")
+            .digest(HEAD);
+        copy_acks_at(dispatcher, seed.lineage, digest, copy);
+    }
+
+    /// [`copy_acks`] under `lineage`, its record at [`HEAD`] digesting to `digest`: the ack of a
+    /// generation that inherited its prefix.
+    fn copy_acks_at(dispatcher: &mut Dispatcher, lineage: Lineage, digest: Digest, copy: u8) {
         use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, ReplicaProgress};
         use rdb_core::contracts::event::{Budgets, Event, EventKind, Module};
         use rdb_core::contracts::ids::{CorrelationId, EventId, MessageId, ReceivedSeq};
@@ -7576,10 +7785,6 @@ mod dormant_twin_tests {
 
         use crate::storage::snapshot::EmptySnapshot;
 
-        let lineage = seed.lineage;
-        let digest = canonical_history(lineage, ConfigVersion(1), HEAD)
-            .expect("history")
-            .digest(HEAD);
         let from = NodeId(u32::from(copy) + 1);
         let frame = Frame {
             id: MessageId(u32::from(copy)),
@@ -7829,9 +8034,8 @@ mod dormant_twin_tests {
     /// 300 000 logs no second `history_grace_begun`, and the grace still expires 600 000 after
     /// the first, not the second.
     ///
-    /// Not covered by a row: a `Recovered` landing a new generation ending the old grace
-    /// `superseded` and beginning a fresh one (no unit fixture here builds a second generation's
-    /// result for a standing primary).
+    /// A new generation's `Recovered` ending the old grace `superseded` is
+    /// [`t61_sim_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one`].
     ///
     /// Cut: the reset kept (each `Recovered` overwrites `since`), red (two begun, and the round
     /// at 600 000 still holds). Unit, under a second.
@@ -7859,6 +8063,111 @@ mod dormant_twin_tests {
             "expired from the first"
         );
         assert_eq!(grace_ends(METHOD), vec![Some("expired".to_owned())]);
+    }
+
+    /// Issue #61, lead ruling R23, the twin of the host's
+    /// `t61_s3_a_grace_on_a_node_with_no_primary_ends_no_primary`: a grace whose node no longer
+    /// holds a primary ends `no_primary` at the next round, so it does not hold the trim.
+    ///
+    /// **Asserted.** After [`failed_over_owner`], node 1's R1 forgets its primary. The next
+    /// round, long before the grace could expire, logs `history_grace_ended{no_primary}` once and
+    /// is not held `Grace`; nor is the round after it, which logs no second end.
+    ///
+    /// Cut: no `no_primary` release, red (no end; the round is held `Grace`). Unit, under a
+    /// second.
+    #[config_log::retcd_test]
+    fn t61_sim_a_grace_on_a_node_with_no_primary_ends_no_primary() {
+        const METHOD: &str = "t61_sim_a_grace_on_a_node_with_no_primary_ends_no_primary";
+        let (mut dispatcher, _) = failed_over_owner();
+        dispatcher.replication.forget_node(OWNER);
+        assert!(dispatcher.replication.primary(OWNER, P).is_none());
+        for now in [1_000, 2_000] {
+            let decision = dispatcher
+                .retention_duty(OWNER, P, Tick(now), NO_KEEP)
+                .expect("duty");
+            assert_ne!(
+                decision,
+                RetentionDecision::Held(RetentionHold::Grace),
+                "at {now}"
+            );
+        }
+        assert_eq!(grace_ends(METHOD), vec![Some("no_primary".to_owned())]);
+    }
+
+    /// Issue #61, lead ruling R24, the twin of the host's
+    /// `t61_s3_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one`: a
+    /// `Recovered` of a newer generation ends the open grace `superseded` and begins a fresh one,
+    /// which its copies' acks then end.
+    ///
+    /// **Asserted.** After [`failed_over_owner`] (grace of generation 1 from tick 0), node 1's
+    /// engine inherits generation 2 through [`HEAD`] and generation 2's `Recovered` is stepped at
+    /// 300 000. `history_grace_ended{generation 1, superseded}` and a second
+    /// `history_grace_begun{generation 2}` are logged. At 600 000, when generation 1's grace
+    /// would have expired, the duty is still held `Grace`: the new one started afresh. Copies 1
+    /// and 2 ack generation 2, and the next round trims, the grace ended `acked`.
+    ///
+    /// **Differs.** Generation 2 inherits generation 1's prefix in the engine directly, and its
+    /// result is [`owner_recovery_result`] renamed to generation 2: no unit fixture runs F1 for a
+    /// second generation on a standing primary.
+    ///
+    /// Cut: a newer generation keeps the open grace, red (no `superseded`, one begun). Unit,
+    /// under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one() {
+        const METHOD: &str =
+            "t61_sim_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one";
+        let (mut dispatcher, seed) = failed_over_owner();
+        let g2 = Generation(2);
+        dispatcher
+            .engines
+            .get_mut(&OWNER)
+            .expect("node 1's engine")
+            .inherit(P, seed.lineage.generation, g2, Seq(HEAD))
+            .expect("generation 2 inherits the prefix");
+        let next = Lineage {
+            generation: g2,
+            ..seed.lineage
+        };
+        let mut result = owner_recovery_result(&seed);
+        result.new_generation = g2;
+        result.selected.root.generation = g2;
+        let digest = result.selected.cutoff_digest;
+        step_result(&mut dispatcher, next, result, Tick(300_000));
+
+        let ended: Vec<_> = logged(METHOD, "history_grace_ended")
+            .iter()
+            .map(|line| {
+                (
+                    line["generation"].as_u64(),
+                    line["why"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(ended, vec![(Some(1), Some("superseded".to_owned()))]);
+        let begun: Vec<_> = logged(METHOD, "history_grace_begun")
+            .iter()
+            .map(|line| line["generation"].as_u64())
+            .collect();
+        assert_eq!(begun, vec![Some(1), Some(2)]);
+        assert_eq!(
+            dispatcher.retention_duty(OWNER, P, Tick(600_000), NO_KEEP),
+            Ok(RetentionDecision::Held(RetentionHold::Grace)),
+            "generation 2's grace started afresh"
+        );
+
+        copy_acks_at(&mut dispatcher, next, digest, 1);
+        copy_acks_at(&mut dispatcher, next, digest, 2);
+        let decision = dispatcher
+            .retention_duty(OWNER, P, Tick(600_001), NO_KEEP)
+            .expect("duty");
+        assert!(
+            matches!(decision, RetentionDecision::Floor(_)),
+            "acked: {decision:?}"
+        );
+        assert_eq!(
+            grace_ends(METHOD),
+            vec![Some("superseded".to_owned()), Some("acked".to_owned())]
+        );
     }
 
     /// Issue #61 R26, the twin of the host's 92d2084 rows: node 3 holds generation 2 of `P` as a
