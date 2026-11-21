@@ -1477,6 +1477,9 @@ fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, 
         live_readd = live_readd.then_some(true),
         "db_open"
     );
+    // PR #181 (SBX): the setting's state, on or off, once per open. The reopen's heal leaves a
+    // down copy out only with it on (`admin::may_leave_out`).
+    tracing::info!(enabled = live_readd, "db_open_live_readd");
 }
 
 impl Db {
@@ -8558,6 +8561,28 @@ mod tests {
         on.insert("live_readd".to_owned());
         assert_eq!(fields(&lines[1]), on, "{lines:?}");
         assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
+    }
+
+    /// PR #181 (SBX): every open logs `db_open_live_readd{enabled}` once, off as well as on, so
+    /// a log shows whether the reopen's heal may leave a copy out. Unit (~1 ms).
+    /// Cut: the line logged only when on, red at the off open.
+    #[config_log::retcd_test]
+    fn db_open_logs_the_live_readd_state_once_either_way() {
+        const METHOD: &str = "db_open_logs_the_live_readd_state_once_either_way";
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let states: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_live_readd")
+            .map(|line| (line["@l"].clone(), line["enabled"].clone()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (serde_json::json!("Information"), serde_json::json!(false)),
+                (serde_json::json!("Information"), serde_json::json!(true)),
+            ],
+        );
     }
 
     /// PR #181 review: while the reopen's heal waits, a `wait_ready` time-out keeps each of
