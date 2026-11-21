@@ -2632,8 +2632,8 @@ const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
 /// R5: while a regular copy is still unknown, [`leave_out`] is asked, at most every
 /// [`LEAVE_OUT_EVERY`], whether the heal may go on without it. Its first answer and each change
 /// of it are logged once per attempt (each [`heal_retrying`] attempt logs its own first):
-/// `heal_proceed_without` per partition when it may, `heal_wait_all{reason}` while it may not.
-/// An answer that arrives at or past `deadline` is not acted on: the attempt ends
+/// `heal_proceed_without` per partition when it may and the answer is acted on,
+/// `heal_wait_all{reason}` while it may not. An answer that arrives at or past `deadline` is not acted on: the attempt ends
 /// [`HealError::PeersUnknown`] at once, before it reads the links again, so the next one
 /// decides with a whole budget for the clear, rather than reaching it with none. A late
 /// decision logs `heal_leave_out_expired` and ends with reason `decided_past_deadline`; a late
@@ -2696,7 +2696,10 @@ async fn member_boots(
                         "heal_leave_out_expired"
                     );
                 }
-                Ok(down) => left = down,
+                Ok(yes) => {
+                    yes.log(ctx.owner_node);
+                    left = yes.down;
+                }
                 Err(why) => {
                     reason = why;
                     if said != Some(why) {
@@ -2764,8 +2767,8 @@ async fn member_boots(
 
 /// R5: may the reopen's heal go on without the regular copies on `missing`, whose nodes have
 /// no link yet? `Ok` with each such node, at [`UNLINKED_BOOT`], and the evidence, or `Err`
-/// with the `heal_wait_all` reason. Logs `heal_proceed_without` for each partition it leaves a
-/// copy out of.
+/// with the `heal_wait_all` reason. Logs nothing on `Ok`: the caller logs it
+/// ([`LeaveOut::log`]) only when it acts on the answer, so a late one logs no proceed.
 ///
 /// Safety (design spec §5.2 steps 3, 6 and 7): an owner acknowledges a write once it is in its
 /// own WAL, not yet synced, and applied on one regular secondary; the WAL is synced later, in
@@ -2798,7 +2801,7 @@ async fn leave_out(
     missing: &[u32],
     window_passed: bool,
     failed: &mut BTreeMap<NodeId, String>,
-) -> Result<Vec<(NodeId, BootId, &'static str)>, &'static str> {
+) -> Result<LeaveOut, &'static str> {
     if let Some(reason) = may_leave_out(ctx.os_boot, ctx.live_readd) {
         return Err(reason);
     }
@@ -2841,24 +2844,40 @@ async fn leave_out(
         let evidence = copy_down(ctx, NodeId(*node), window_passed, failed).await?;
         down.push((NodeId(*node), UNLINKED_BOOT, evidence));
     }
-    for (partition, gone, present, majority) in short {
-        let evidence: Vec<&str> = down
-            .iter()
-            .filter(|(node, ..)| gone.contains(&node.0))
-            .map(|(.., evidence)| *evidence)
-            .collect();
-        tracing::info!(
-            owner = ctx.owner_node.0,
-            partition = partition.0,
-            missing = ?gone,
-            present = ?present,
-            majority,
-            reason = "same_os_boot",
-            evidence = evidence.join(","),
-            "heal_proceed_without"
-        );
+    Ok(LeaveOut { down, short })
+}
+
+/// [`leave_out`]'s yes: each copy it leaves out, with its node, [`UNLINKED_BOOT`] and evidence,
+/// and each partition short of one, with the copies gone, those present and its majority.
+#[derive(Debug, PartialEq, Eq)]
+struct LeaveOut {
+    down: Vec<(NodeId, BootId, &'static str)>,
+    short: Vec<(PartitionId, Vec<u32>, Vec<u32>, usize)>,
+}
+
+impl LeaveOut {
+    /// Logs `heal_proceed_without` for each partition left short of a copy. [`member_boots`]
+    /// calls it only for an answer it acts on, so each accepted decision logs once.
+    fn log(&self, owner: NodeId) {
+        for (partition, gone, present, majority) in &self.short {
+            let evidence: Vec<&str> = self
+                .down
+                .iter()
+                .filter(|(node, ..)| gone.contains(&node.0))
+                .map(|(.., evidence)| *evidence)
+                .collect();
+            tracing::info!(
+                owner = owner.0,
+                partition = partition.0,
+                missing = ?gone,
+                present = ?present,
+                majority,
+                reason = "same_os_boot",
+                evidence = evidence.join(","),
+                "heal_proceed_without"
+            );
+        }
     }
-    Ok(down)
 }
 
 /// R5 (PR #181 ruling A): whether the reopen's heal may go on without a down copy at all, or
@@ -9756,9 +9775,10 @@ mod tests {
     /// is not acted on. Node 3's grant read is held past the first window (frozen case) or
     /// past the window of the attempt that may first go on (no-grant case); that attempt logs
     /// `heal_leave_out_expired`, sends nothing and ends `PeersUnknown`, and the next one goes on
-    /// with a whole budget: one `HealLeftOut` and one plan, never `NotCleared`. Unit (~3 s).
-    /// Cut: the deadline recheck removed: `clear_until` gets no budget and ends the heal
-    /// `NotCleared`, red.
+    /// with a whole budget: one `HealLeftOut` and one plan, never `NotCleared`. Only the
+    /// accepted decision logs `heal_proceed_without`: two in all (review round 2). Unit (~3 s).
+    /// Cuts: the deadline recheck removed: `clear_until` gets no budget and ends the heal
+    /// `NotCleared`, red; `leave_out` logs the proceed itself, before the recheck: four, red.
     #[config_log::retcd_test]
     fn r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed() {
         const METHOD: &str = "r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed";
@@ -9802,6 +9822,11 @@ mod tests {
             assert_eq!(notes, 1, "{case}: only the attempt that went on sent");
         }
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
+        assert_eq!(
+            r5_lines(METHOD, "heal_proceed_without").len(),
+            2,
+            "one accepted decision per case; a late one logs no proceed"
+        );
     }
 
     /// A heal of [`r5_heal_in`] through [`heal_retrying`] over `store`, `live_readd` on, the
