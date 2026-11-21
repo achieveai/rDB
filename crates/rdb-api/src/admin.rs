@@ -1234,8 +1234,10 @@ fn s1a_reservation_refused(key: &str, held: &Reservation) -> DeclareError {
 
 /// Before [`declare`] writes anything (PR #138 review): what is already in the store must be a
 /// prefix of what this declaration writes, which it then adopts. It reads, in order: the
-/// reservation, refused when an S1a build wrote it (#80 S1b); every `nodes/` record, each of which
-/// must be this declaration's record for its node, byte for byte; `routes/0`, which must be at this
+/// reservation, refused when an S1a build wrote it (#80 S1b); every `nodes/` record, whose
+/// declared fields, decoded, must equal this declaration's for its node (node, address and
+/// machine; a node's own app address, layout 2, is ignored on purpose, #83 B2, so a formed
+/// database whose nodes registered one is still adopted); `routes/0`, which must be at this
 /// count, if any; and the partition records, which must be untouched generation-0 records of
 /// partitions 1 to `partitions` only. So a database formed some other way (a rooted
 /// `partitions/1`), or an interrupted declaration of another count (its `routes/0`, or a record
@@ -1279,8 +1281,10 @@ async fn declare_preflight(
             return Err(s1a_reservation_refused(&key, &held));
         }
     }
-    // #80 S1b: every `nodes/` record already there must be one this declaration writes, byte
-    // for byte. Read before `partitions/`, which stays the preflight's last read.
+    // #80 S1b: every `nodes/` record already there must hold the declared fields this
+    // declaration writes. `read_nodes` decodes them, so this compares decoded fields, not
+    // bytes: an app address a node wrote into its own record (layout 2, #83 B2) is ignored.
+    // Read before `partitions/`, which stays the preflight's last read.
     for (node, held) in read_nodes(store).await? {
         let key = ControlKey::Node(node).encode();
         match records.iter().find(|record| record.node == node) {
