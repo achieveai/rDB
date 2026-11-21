@@ -2639,6 +2639,8 @@ async fn member_boots(
 ) -> Result<Boots, HealError> {
     let mut said: Option<&'static str> = None;
     let mut reason = "copy_not_proven_down";
+    // Each grant's last failed read, so an unchanged failure warns once per attempt.
+    let mut failed: BTreeMap<NodeId, String> = BTreeMap::new();
     let mut next_ask = tokio::time::Instant::now();
     let since = *ctx.links_since.get_or_init(tokio::time::Instant::now);
     loop {
@@ -2661,7 +2663,17 @@ async fn member_boots(
             // that attempt ends `PeersUnknown`, and [`heal_retrying`]'s next one goes on with a
             // whole budget left for the rest of the heal.
             let window_passed = !late && tokio::time::Instant::now() >= since + ctx.within;
-            match leave_out(ctx, &found, rooted, forming, &missing, window_passed).await {
+            let asked = leave_out(
+                ctx,
+                &found,
+                rooted,
+                forming,
+                &missing,
+                window_passed,
+                &mut failed,
+            )
+            .await;
+            match asked {
                 Ok(down) => left = down,
                 Err(why) => {
                     reason = why;
@@ -2740,7 +2752,8 @@ async fn member_boots(
 ///   owner included, with a known boot: `no_majority`;
 /// - each missing copy is proven down: its `grants/{C}` is frozen, or its expiry is proven on
 ///   this node's clock by [`expiry_proven`], guard 2 of [`clear_verdict`]. A copy with a live
-///   grant may be alive with a late link: `copy_not_proven_down`. One with no grant record:
+///   grant may be alive with a late link: `copy_not_proven_down`. A grant that cannot be
+///   read, `grant_unread`, proves nothing either. One with no grant record:
 ///   [`no_grant_record`], until one full heal window has passed (`window_passed`). A clock with
 ///   no established bound proves nothing: `no_clock_bound`.
 async fn leave_out(
@@ -2750,6 +2763,7 @@ async fn leave_out(
     forming: &[Vec<RecordMember>],
     missing: &[u32],
     window_passed: bool,
+    failed: &mut BTreeMap<NodeId, String>,
 ) -> Result<Vec<(NodeId, BootId, &'static str)>, &'static str> {
     if let Some(reason) = may_leave_out(ctx.os_boot, ctx.live_readd) {
         return Err(reason);
@@ -2790,7 +2804,7 @@ async fn leave_out(
     }
     let mut down = Vec::with_capacity(missing.len());
     for node in missing {
-        let evidence = copy_down(ctx, NodeId(*node), window_passed).await?;
+        let evidence = copy_down(ctx, NodeId(*node), window_passed, failed).await?;
         down.push((NodeId(*node), UNLINKED_BOOT, evidence));
     }
     for (partition, gone, present, majority) in short {
@@ -2863,10 +2877,15 @@ const fn no_grant_record(window_passed: bool) -> Result<&'static str, &'static s
 /// is not used: a frozen or expired record can outlive the process it names while a newer one
 /// of the same node runs (PR #181 review). Read only: nothing is cleared, unlike [`judge`].
 /// `Err` is a [`leave_out`] reason.
+///
+/// A read that fails (`grant_unread`) is warned with its cause, `heal_copy_grant_unread{error}`,
+/// once while the cause stays the same: `failed` holds each node's last one, and a read that
+/// succeeds clears it.
 async fn copy_down(
     ctx: &HealCtx,
     node: NodeId,
     window_passed: bool,
+    failed: &mut BTreeMap<NodeId, String>,
 ) -> Result<&'static str, &'static str> {
     const NOT_PROVEN: &str = "copy_not_proven_down";
     let key = ControlKey::Grant(node).encode();
@@ -2879,11 +2898,16 @@ async fn copy_down(
     {
         Ok(read) => read,
         Err(error) => {
-            tracing::warn!(node = node.0, %error, "heal_copy_grant_unread");
-            return Err(NOT_PROVEN);
+            let cause = error.to_string();
+            if failed.get(&node) != Some(&cause) {
+                tracing::warn!(node = node.0, %error, "heal_copy_grant_unread");
+                failed.insert(node, cause);
+            }
+            return Err("grant_unread");
         }
     };
     let Some(found) = read.record else {
+        failed.remove(&node);
         return no_grant_record(window_passed);
     };
     let Some(record) = GrantRecord::decode(&found.value) else {
@@ -2894,6 +2918,7 @@ async fn copy_down(
         );
         return Err(NOT_PROVEN);
     };
+    failed.remove(&node);
     if record.frozen {
         return Ok("grant_frozen");
     }
@@ -9417,6 +9442,128 @@ mod tests {
 
     // ---- PR #181 review round 1 ----
 
+    /// What a [`GrantGets`] store does to a read of its key: from `not_before` after the store
+    /// was made, sleep `delay` and then read, or fail with `fail` as `Unavailable`.
+    struct GetStep {
+        not_before: Duration,
+        delay: Duration,
+        fail: Option<&'static str>,
+    }
+
+    /// A `MemStore` whose reads of `key` take `steps` in order, each once its `not_before` has
+    /// come; a read before it, any other call, and every read once the steps are used up go
+    /// straight through. `in_delay` is set while a delayed read sleeps.
+    struct GrantGets {
+        inner: config_testkit::MemStore,
+        key: Vec<u8>,
+        made: std::time::Instant,
+        steps: std::sync::Mutex<std::collections::VecDeque<GetStep>>,
+        in_delay: Arc<AtomicBool>,
+    }
+
+    impl GrantGets {
+        fn new(node: NodeId, steps: Vec<GetStep>) -> Self {
+            Self {
+                inner: config_testkit::MemStore::new(),
+                key: ControlKey::Grant(node).encode().into_bytes(),
+                made: std::time::Instant::now(),
+                steps: std::sync::Mutex::new(steps.into()),
+                in_delay: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl ConfigStore for GrantGets {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let step = if request.key == self.key.as_slice() {
+                let mut steps = self.steps.lock().expect("steps");
+                let due = steps
+                    .front()
+                    .is_some_and(|step| self.made.elapsed() >= step.not_before);
+                if due {
+                    steps.pop_front()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match step {
+                None => self.inner.get(request),
+                Some(GetStep {
+                    fail: Some(reason), ..
+                }) => Box::pin(std::future::ready(Err(ConfigError::Unavailable {
+                    reason: reason.to_owned(),
+                }))),
+                Some(GetStep { delay, .. }) => {
+                    let in_delay = Arc::clone(&self.in_delay);
+                    let read = self.inner.get(request);
+                    Box::pin(async move {
+                        in_delay.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        in_delay.store(false, Ordering::SeqCst);
+                        read.await
+                    })
+                }
+            }
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.list(request)
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.put(request)
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
+    /// A failed read of a grant with `reason`, due at once.
+    const fn r5_fail(reason: &'static str) -> GetStep {
+        GetStep {
+            not_before: Duration::ZERO,
+            delay: Duration::ZERO,
+            fail: Some(reason),
+        }
+    }
+
     /// This test's lines named `message`.
     fn r5_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
         config_testkit::logs::lines_for_current_test(module_path!(), method)
@@ -9483,5 +9630,53 @@ mod tests {
             "one heal_wait_all per attempt that waited"
         );
         assert!(r5_lines(METHOD, "heal_proceed_without").is_empty());
+    }
+
+    /// PR #181 review: a grant read that fails keeps its cause and its own reason,
+    /// `grant_unread`, not a live copy's: `heal_copy_grant_unread{error}` once while the error
+    /// is the same and again when it changes, never on every 250 ms ask. Unit (~2 s). Cuts:
+    /// the dedupe removed: six warnings, red; the error left out of the line: red.
+    #[config_log::retcd_test]
+    fn r5_u_a_failing_grant_read_warns_its_cause_once_per_change() {
+        const METHOD: &str = "r5_u_a_failing_grant_read_warns_its_cause_once_per_change";
+        let steps = [["first fault"; 3], ["second fault"; 3]]
+            .concat()
+            .into_iter()
+            .map(r5_fail)
+            .collect();
+        let store = Arc::new(GrantGets::new(NodeId(3), steps));
+        let (healed, sent, _) = r5_heal_in(
+            store,
+            Arc::default(),
+            false,
+            true,
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[],
+            HostClock::start(),
+            Duration::from_millis(2_000),
+        );
+        assert!(
+            matches!(&healed, Err(HealError::PeersUnknown { .. })),
+            "{healed:?}"
+        );
+        assert!(sent.is_empty(), "{} sent", sent.len());
+        let warned: Vec<String> = r5_lines(METHOD, "heal_copy_grant_unread")
+            .iter()
+            .map(|line| {
+                assert_eq!(line["@l"], "Warning", "{line}");
+                line["error"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect();
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert!(warned[0].contains("first fault"), "{warned:?}");
+        assert!(warned[1].contains("second fault"), "{warned:?}");
+        let reasons = r5_wait_reasons(METHOD);
+        assert_eq!(
+            reasons.first().map(String::as_str),
+            Some("grant_unread"),
+            "{reasons:?}"
+        );
     }
 }
