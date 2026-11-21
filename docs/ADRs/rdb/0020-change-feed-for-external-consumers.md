@@ -4,8 +4,10 @@
 (the wire, protocol 10). **The current contract is the dated amendments below, newest last**
 (2026-11-20, #170 review r1 and r2). Deferred: retention (`History` is not trimmed yet, #61) and
 long-poll (slice 4). The prefix filter (slice 3) is dropped from #87: shared config stays in
-rEtcd (lead, 2026-11-19). The Decision, Consequences and Verification sections below are
-historical: they were written on 2026-10-23, while this ADR was Proposed.
+rEtcd (lead, 2026-11-19). **The Decision section is superseded by
+[ADR-rdb-0029](0029-change-feed-as-built.md)**, which records what replaced its leaning; it is
+kept as written. The Decision, Consequences and Verification sections below are historical: they
+were written on 2026-10-23, while this ADR was Proposed.
 **Date:** 2026-10-23
 **Spec:** `docs/rdb/design-specification.md` §4.1, §4.3, §5.1–§5.3, §6.1, §6.3, §8.1, §8.4, §10.1, §11
 **Raised by:** Gautam, 2026-10-23: "whenever you make a write and change the data, we may want to
@@ -125,14 +127,6 @@ plain app could map their write boundaries. Per-app tenant binding, and with it 
 plain apps, comes with #151. This replaces slice 2's "any authenticated app may call it".
 
 ## Decision
-
-> **Historical (2026-10-23, written while Proposed).** Kept as the reasoning; the amendments at
-> the top are the current contract. The leaning below was replaced by: option A, pull per
-> partition, capped at the owner's published position or a secondary's applied one; a cursor of
-> `(generation, seq, digest)`, not `(generation, seq)`; `Rewound { to }` in place of a marker
-> carrying `base`; `Trimmed` defined but retention deferred (#61); physical writes, no
-> before-images and no previous version; scoped to the caller's tenant, and over the links served
-> only to nodes and admin apps (the 2026-11-20 r2 amendment; "any app may call it" is replaced).
 
 **Provisional. Nothing is decided.** This section records options and a leaning. Whoever picks this
 up decides, after a critic.
