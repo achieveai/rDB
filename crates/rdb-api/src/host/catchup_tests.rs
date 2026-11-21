@@ -5,6 +5,9 @@ use super::trio::{
     current_thread, host_over, logged, write_chain, write_chain_after, write_chain_in, Trio,
 };
 use super::*;
+// `host.rs` imports `TrimFloor` only under `debug_assertions`, but these rows also build in
+// the gate's release check (`cargo check --release --tests`).
+use rdb_storage::TrimFloor;
 
 /// M9 serves only an empty copy, so a copy that holds anything must answer
 /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
