@@ -1960,27 +1960,38 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 10");
+    assert_eq!(
+        reason,
+        format!("node-2 speaks protocol_version 3, node-1 speaks {PROTOCOL_VERSION}")
+    );
 }
 
-/// Issue #107 slice 2b: a build speaking protocol_version 9 is refused at the handshake naming
-/// both versions. A build at 9 may lack check B and the refusal mark (ADR-rdb-0009 section 7)
-/// and cannot read `WireMsg::Landed::owner_live_readd`, so it never links, and an owner's live
-/// re-add never probes it. Cut: `PROTOCOL_VERSION` left at 9 → the link comes up.
+/// Issue #107 slice 2b: a build one protocol_version behind this one is refused at the
+/// handshake naming both versions. Written when that was 9, which may lack check B and the
+/// refusal mark (ADR-rdb-0009 section 7) and cannot read `WireMsg::Landed::owner_live_readd`,
+/// so it never links, and an owner's live re-add never probes it. Both versions are read from
+/// `PROTOCOL_VERSION`, so the bump at merge keeps this row (lead rule, 2026-11-21).
+/// Cut: the peer at `PROTOCOL_VERSION` → the link comes up.
 /// Integration (~150 ms).
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
-async fn issue107_a_peer_speaking_protocol_version_9_is_refused() {
+async fn issue107_a_peer_one_protocol_version_behind_is_refused() {
     let dir = config_testkit::fs::temp_dir();
     certs_for(dir.path(), &[1, 2]);
     let one = side(Spec::node(1, dir.path(), &[2]), true).await;
     let addr = one.net.addr().expect("listening");
     let older = Spec {
-        version: 9,
+        version: PROTOCOL_VERSION - 1,
         ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 9, node-1 speaks 10");
+    assert_eq!(
+        reason,
+        format!(
+            "node-2 speaks protocol_version {}, node-1 speaks {PROTOCOL_VERSION}",
+            PROTOCOL_VERSION - 1
+        )
+    );
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a
