@@ -294,3 +294,134 @@ fn sbx_146_c_a_quiet_ownership_subscription_does_not_hold_the_runtime() {
         db
     });
 }
+
+/// Run `calls` concurrent calls of one wrapper on the current runtime, made by `call(i)`, and
+/// answer the most that were in flight at once and the ticker's longest gap. A wrapper that ran
+/// its sync call inline never yields, so it answers exactly 1.
+async fn overlapped<F, Fut>(calls: usize, call: F) -> (usize, Duration)
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let ticker = Ticker::start();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<_> = (0..calls)
+        .map(|i| {
+            let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
+            let made = call(i);
+            tokio::spawn(async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                made.await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.expect("task");
+    }
+    (most.load(Ordering::SeqCst), ticker.longest())
+}
+
+/// The check every T9 row ends with: the calls overlapped and the runtime ran on through them.
+#[track_caller]
+fn did_not_block(wrapper: &str, (most, longest): (usize, Duration)) {
+    assert!(most >= 2, "{wrapper}: at most {most} in flight");
+    let bound = Duration::from_millis(250) * scale();
+    assert!(longest < bound, "{wrapper}: the runtime stalled {longest:?} (bound {bound:?})");
+}
+
+/// Eight byte documents in group 1, written before a T9 row's calls; their answers.
+async fn eight_puts(db: &AsyncDb) -> Vec<rdb_api::PutOk> {
+    let mut puts = Vec::new();
+    for i in 0..8 {
+        let object = Bytes::from(format!("o{i}"));
+        let put = db.put(AffinityId(1), object, Bytes::from_static(b"v"), None).await;
+        puts.push(put.unwrap_or_else(|e| panic!("put {i}: {e}")));
+    }
+    puts
+}
+
+/// PR #178 review r1 T9: eight concurrent `AsyncDb::read`s on the current-thread runtime
+/// overlap, the ticker runs on, and each reads its document. Cut: `read` calls `read_in`
+/// inline: at most 1 in flight. Integration (~1-2 s): one database open.
+#[config_log::retcd_test]
+fn sbx_146_d_read_does_not_block_the_worker() {
+    on_current_thread("sbx_146_d", |db| async move {
+        eight_puts(&db).await;
+        let seen = overlapped(8, |i| {
+            let db = db.clone();
+            async move {
+                let object = Bytes::from(format!("o{i}"));
+                let read = db.read(AffinityId(1), object, rdb_api::Look::Doc).await;
+                read.unwrap_or_else(|e| panic!("read {i}: {e}"));
+            }
+        })
+        .await;
+        did_not_block("read", seen);
+        db
+    });
+}
+
+/// PR #178 review r1 T9: eight concurrent `AsyncDb::txn_as` calls under app ids 1-8 overlap, the
+/// ticker runs on, and each is resolved under its id. Cut: `txn_as` calls `Db::txn_as` inline:
+/// at most 1 in flight. Integration (~1-2 s): one database open.
+#[config_log::retcd_test]
+fn sbx_146_e_txn_as_does_not_block_the_worker() {
+    on_current_thread("sbx_146_e", |db| async move {
+        let seen = overlapped(8, |i| {
+            let db = db.clone();
+            async move {
+                let request = rdb_api::app_request_id(1 + i as u64).expect("an app id");
+                let write = TxnWrite {
+                    group: AffinityId(1),
+                    object: Bytes::from(format!("t{i}")),
+                    value: Bytes::from_static(b"1"),
+                    if_version: None,
+                };
+                let ok = db.txn_as(request, vec![write], MAX_TXN_DEADLINE).await;
+                let ok = ok.unwrap_or_else(|e| panic!("txn_as {i}: {e}"));
+                assert_eq!(ok.request, request);
+            }
+        })
+        .await;
+        did_not_block("txn_as", seen);
+        db
+    });
+}
+
+/// PR #178 review r1 T9: eight concurrent `AsyncDb::resend_within` calls of eight answered
+/// writes overlap, the ticker runs on, and each replays its write's seq. The writes are
+/// `txn_as` under app ids 101-108: the ack floor drops a `Db`-chosen id's answer once it is
+/// answered (its resend is `STATUS_EXPIRED`), while an app's id keeps the retention rule. Cut:
+/// `resend_within` calls `Db::resend_within` inline: at most 1 in flight. Integration (~1-2 s):
+/// one database open.
+#[config_log::retcd_test]
+fn sbx_146_f_resend_within_does_not_block_the_worker() {
+    on_current_thread("sbx_146_f", |db| async move {
+        let mut puts = Vec::new();
+        for i in 0..8_u64 {
+            let request = rdb_api::app_request_id(101 + i).expect("an app id");
+            let write = TxnWrite {
+                group: AffinityId(1),
+                object: Bytes::from(format!("r{i}")),
+                value: Bytes::from_static(b"v"),
+                if_version: None,
+            };
+            let ok = db.txn_as(request, vec![write], MAX_TXN_DEADLINE).await;
+            puts.push(ok.unwrap_or_else(|e| panic!("txn_as {i}: {e}")));
+        }
+        let seen = overlapped(8, |i| {
+            let (db, put) = (db.clone(), puts[i].clone());
+            async move {
+                let again = db.resend_within(*put.sent.clone(), MAX_TXN_DEADLINE).await;
+                let again = again.unwrap_or_else(|e| panic!("resend {i}: {e}"));
+                assert_eq!(again.seq, put.seq, "resend {i} replays its answer");
+            }
+        })
+        .await;
+        did_not_block("resend_within", seen);
+        db
+    });
+}
