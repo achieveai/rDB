@@ -2752,8 +2752,9 @@ async fn member_boots(
 ///   owner included, with a known boot: `no_majority`;
 /// - each missing copy is proven down: its `grants/{C}` is frozen, or its expiry is proven on
 ///   this node's clock by [`expiry_proven`], guard 2 of [`clear_verdict`]. A copy with a live
-///   grant may be alive with a late link: `copy_not_proven_down`. A grant that cannot be
-///   read, `grant_unread`, proves nothing either. One with no grant record:
+///   grant may be alive with a late link: `copy_not_proven_down`. A grant that cannot be read,
+///   `grant_unread`, or decoded, `grant_undecodable`, proves nothing either. One with no grant
+///   record:
 ///   [`no_grant_record`], until one full heal window has passed (`window_passed`). A clock with
 ///   no established bound proves nothing: `no_clock_bound`.
 async fn leave_out(
@@ -2878,9 +2879,10 @@ const fn no_grant_record(window_passed: bool) -> Result<&'static str, &'static s
 /// of the same node runs (PR #181 review). Read only: nothing is cleared, unlike [`judge`].
 /// `Err` is a [`leave_out`] reason.
 ///
-/// A read that fails (`grant_unread`) is warned with its cause, `heal_copy_grant_unread{error}`,
-/// once while the cause stays the same: `failed` holds each node's last one, and a read that
-/// succeeds clears it.
+/// A read that fails (`grant_unread`) or a record that does not decode (`grant_undecodable`)
+/// is warned with its cause, `heal_copy_grant_unread{error}` or
+/// `heal_copy_grant_unreadable{revision}`, once while the cause stays the same: `failed` holds
+/// each node's last one, and a read that succeeds clears it.
 async fn copy_down(
     ctx: &HealCtx,
     node: NodeId,
@@ -2911,12 +2913,16 @@ async fn copy_down(
         return no_grant_record(window_passed);
     };
     let Some(record) = GrantRecord::decode(&found.value) else {
-        tracing::warn!(
-            node = node.0,
-            revision = found.mod_revision,
-            "heal_copy_grant_unreadable"
-        );
-        return Err(NOT_PROVEN);
+        let cause = format!("undecodable at revision {}", found.mod_revision);
+        if failed.get(&node) != Some(&cause) {
+            tracing::warn!(
+                node = node.0,
+                revision = found.mod_revision,
+                "heal_copy_grant_unreadable"
+            );
+            failed.insert(node, cause);
+        }
+        return Err("grant_undecodable");
     };
     failed.remove(&node);
     if record.frozen {
@@ -9678,5 +9684,46 @@ mod tests {
             Some("grant_unread"),
             "{reasons:?}"
         );
+    }
+
+    /// PR #181 review: a grant record that does not decode is its own reason,
+    /// `grant_undecodable`, warned once with its revision however many asks see it. Unit
+    /// (~1 s). Cut: the dedupe removed: one warning per ask, red.
+    #[config_log::retcd_test]
+    fn r5_v_an_undecodable_grant_warns_once_with_its_revision() {
+        const METHOD: &str = "r5_v_an_undecodable_grant_warns_once_with_its_revision";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let revision = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(NodeId(3)).encode()),
+                value: Bytes::from_static(b"not a grant"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("the bytes are written")
+            .revision;
+        drop(rt);
+        let (healed, sent, _) = r5_heal_in(
+            store,
+            Arc::default(),
+            false,
+            true,
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[],
+            HostClock::start(),
+            Duration::from_millis(1_000),
+        );
+        assert!(
+            matches!(&healed, Err(HealError::PeersUnknown { reason, .. }) if *reason == "grant_undecodable"),
+            "{healed:?}"
+        );
+        assert!(sent.is_empty(), "{} sent", sent.len());
+        let warned = r5_lines(METHOD, "heal_copy_grant_unreadable");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0]["revision"], revision, "{warned:?}");
+        assert_eq!(r5_wait_reasons(METHOD), ["grant_undecodable"]);
     }
 }
