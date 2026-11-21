@@ -257,7 +257,7 @@ os_pid_of_child() { # $! of a child of this shell, program name: prints its OS p
         done
         return 1
     fi
-    for i in $(seq 1 100); do
+    for i in $(seq 1 200); do
         case "$(cat "/proc/$pid/exename" 2>/dev/null)" in
             *"$name"*) cat "/proc/$pid/winpid"; return 0 ;;
         esac
