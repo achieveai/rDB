@@ -2826,7 +2826,7 @@ impl Db {
             return;
         };
         if let Err(error) = crate::os_boot::record(&dir, &id) {
-            tracing::error!(dir = %dir.display(), %error, "os_boot_record_failed");
+            tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
         }
     }
 
