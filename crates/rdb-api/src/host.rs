@@ -79,7 +79,6 @@ use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-#[cfg(debug_assertions)]
 use rdb_storage::TrimFloor;
 use rdb_storage::{
     InheritError, Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions,
