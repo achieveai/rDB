@@ -92,7 +92,11 @@ pub(crate) fn observe(dir: &Path) -> std::io::Result<Seen> {
     };
     let (verdict, current, error) = match current(dir) {
         Ok(None) => (OsBoot::Unsupported, None, None),
-        Err(error) => (OsBoot::Unknown, None, Some(error)),
+        Err(error) => {
+            // PR #181 review: this turns the same-boot heal off for every open until it reads.
+            tracing::warn!(dir = %dir.display(), %error, "os_boot_id_unreadable");
+            (OsBoot::Unknown, None, Some(error))
+        }
         Ok(Some(now)) => match stored.as_deref() {
             Some(was) if was == now => (OsBoot::Same, Some(now), None),
             Some(_) => (OsBoot::Changed, Some(now), None),
@@ -291,5 +295,33 @@ mod tests {
             .collect();
         assert_eq!(empty.len(), 2, "{empty:?}");
         assert!(empty.iter().all(|(_, l)| l == "Warning"), "{empty:?}");
+    }
+
+    /// PR #181 review: an OS id that cannot be read is warned with its cause, apart from a
+    /// missing file, which is not warned. Unit (~5 ms).
+    /// Cut: the `os_boot_id_unreadable` warn removed, red.
+    #[config_log::retcd_test]
+    fn r5_m_an_unreadable_os_id_is_warned_with_its_cause() {
+        const METHOD: &str = "r5_m_an_unreadable_os_id_is_warned_with_its_cause";
+        let missing = config_testkit::fs::temp_dir();
+        inject(missing.path(), Ok("boot-a"));
+        assert_eq!(
+            observe(missing.path()).expect("observed").verdict,
+            OsBoot::Unknown
+        );
+        let unread = config_testkit::fs::temp_dir();
+        inject(unread.path(), Err("no proc"));
+        assert_eq!(
+            observe(unread.path()).expect("observed").verdict,
+            OsBoot::Unknown
+        );
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let warned: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "os_boot_id_unreadable")
+            .collect();
+        assert_eq!(warned.len(), 1, "only the unreadable id: {lines:?}");
+        assert_eq!(warned[0]["@l"], "Warning");
+        assert_eq!(warned[0]["error"], "no proc");
     }
 }
