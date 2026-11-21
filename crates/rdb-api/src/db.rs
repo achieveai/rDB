@@ -467,7 +467,8 @@ pub struct ObjectPage {
 }
 
 /// A [`Db::delete_prefix_in`] that stopped (#147): how many objects it emptied first, and why it
-/// stopped. Run it again to finish; it is not atomic.
+/// stopped. It is not atomic: run it again to finish, once the cause is gone. Its message says
+/// so only when a rerun can finish ([`Self::rerun_can_finish`]).
 #[derive(Debug, Clone)]
 pub struct PrefixDeleteError {
     /// Objects emptied before the error.
@@ -476,13 +477,35 @@ pub struct PrefixDeleteError {
     pub error: PutError,
 }
 
+impl PrefixDeleteError {
+    /// Whether running the delete again can finish it (PR #178 review r2, T14). Not after a
+    /// refusal of the call itself, which a rerun meets the same way: `INVALID_ARGUMENT`,
+    /// `TOO_LARGE`, `CROSS_AFFINITY`, `INCOMPATIBLE_VERSION`, or `CORRUPT_HISTORY`, a damaged
+    /// object that needs repair first.
+    #[must_use]
+    pub fn rerun_can_finish(&self) -> bool {
+        !matches!(
+            self.error.error.kind,
+            ErrorKind::InvalidArgument
+                | ErrorKind::TooLarge
+                | ErrorKind::CrossAffinity
+                | ErrorKind::IncompatibleVersion
+                | ErrorKind::CorruptHistory
+        )
+    }
+}
+
 impl std::fmt::Display for PrefixDeleteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} (after {} deleted; run the delete again to finish)",
-            self.error, self.deleted
-        )
+        if self.rerun_can_finish() {
+            write!(
+                f,
+                "{} (after {} deleted; run the delete again to finish)",
+                self.error, self.deleted
+            )
+        } else {
+            write!(f, "{} (after {} deleted)", self.error, self.deleted)
+        }
     }
 }
 

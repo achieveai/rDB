@@ -781,8 +781,9 @@ fn sbx_147_q_delete_prefix_finishes_every_write_id_it_takes() {
 }
 
 /// PR #178 review r1 T14: a stopped delete prefix prints, with how far it got, and is an
-/// `Error` whose source is the refusal. Cut: drop the `Display` impl (or the `Error` impl):
-/// the row does not compile.
+/// `Error` whose source is the refusal. It advises a rerun only when one can finish (review r2
+/// T14). Cuts: drop the `Display` impl (or the `Error` impl), and the row does not compile;
+/// advise a rerun always, and the `INVALID_ARGUMENT` message is red.
 #[config_log::retcd_test]
 fn sbx_147_r_a_stopped_delete_prefix_prints_and_is_an_error() {
     let stopped = rdb_api::PrefixDeleteError {
@@ -795,6 +796,14 @@ fn sbx_147_r_a_stopped_delete_prefix_prints_and_is_an_error() {
     let text = stopped.to_string();
     assert!(text.starts_with("INVALID_ARGUMENT"), "{text}");
     assert!(text.contains("after 3 deleted"), "{text}");
+    // PR #178 review r2 T14: a rerun meets INVALID_ARGUMENT the same way, so no rerun advice;
+    // OVERLOADED clears, so it is advised.
+    assert!(!stopped.rerun_can_finish());
+    assert!(!text.contains("run the delete again"), "{text}");
+    let mut busy = stopped.clone();
+    busy.error.error.kind = ErrorKind::Overloaded;
+    assert!(busy.rerun_can_finish());
+    assert!(busy.to_string().contains("run the delete again to finish"), "{busy}");
     let boxed: Box<dyn std::error::Error> = Box::new(stopped);
     let source = boxed.source().expect("the refusal is the source");
     assert!(source.to_string().contains("a refusal"), "{source}");
