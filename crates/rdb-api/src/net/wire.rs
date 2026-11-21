@@ -1871,6 +1871,8 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
+    /// Added under protocol 13 (#80 S4): [`NodeStatus::members_revision`].
+    pub members_revision: Option<u64>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -1983,6 +1985,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            members_revision: status.members_revision,
         }
     }
 }
@@ -2046,6 +2049,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 })
                 .transpose()?,
             lengths: None,
+            members_revision: status.members_revision,
         })
     }
 }

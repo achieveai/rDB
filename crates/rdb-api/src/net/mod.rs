@@ -124,7 +124,14 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// once every node runs a build with both, and on every node, an operator rule while it is off by
 /// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// 13 (#80 S4, T12): `WireNodeStatus::members_revision`, the `nodes/` revision a node's
+/// membership watcher last applied. A frame is positional postcard, so a build at 9 cannot read
+/// a status from 13 nor 13 one from 9; the handshake refuses the pair instead. `remove_node`
+/// relies on that: a member counts as current only once a status from it has arrived since its
+/// boot, which a build without layout 3 cannot send. 13 is a placeholder: just before merge it
+/// is set to main's version + 1 in a one-line commit. Nothing else writes the number.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;

@@ -451,6 +451,7 @@ fn status() -> NodeStatus {
             reason: "held_past_base",
             adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
         }),
+        members_revision: Some(41),
     }
 }
 
@@ -1781,7 +1782,10 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     };
     let older = side(older, false).await;
     let reason = refusal(&older, 1).await;
-    assert_eq!(reason, "node-2 speaks protocol_version 3, node-1 speaks 9");
+    assert_eq!(
+        reason,
+        format!("node-2 speaks protocol_version 3, node-1 speaks {PROTOCOL_VERSION}")
+    );
 }
 
 /// M10 S2 W4 handshake row (`--cert-dir other`): a certificate from another CA never gets a

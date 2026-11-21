@@ -1413,6 +1413,10 @@ pub struct NodeStatus {
     /// inventory, or from a staged child on the newest lineage, so a restart cannot hide one.
     /// Crosses the wire.
     pub tail_refused: Option<TailRefused>,
+    /// The `nodes/` revision this node's membership watcher last applied
+    /// ([`crate::net::Net::members_revision`], #80 S4); `None` with no `Net`, or before the
+    /// watcher's first list. Crosses the wire, added under protocol 13.
+    pub members_revision: Option<u64>,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -15201,6 +15205,11 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             tail_refused: self.tail_refused_of(partition),
+            members_revision: self
+                .links
+                .net()
+                .map(|net| net.members_revision())
+                .filter(|revision| *revision > 0),
             reload_pending: None,
             lengths: Some(IndexLengths {
                 dedup: self

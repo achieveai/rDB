@@ -619,3 +619,66 @@ fn s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working
         .expect("a node is added");
     assert_eq!(added.node, ADDED, "the removed id 5 is not reused");
 }
+
+/// #80 S4 T12, `members_revision` on the wire: five nodes run. Node 1 looks at node 2 over its
+/// link, and node 2's status names the `nodes/` revision its watcher last applied, the one its
+/// own `Net` holds and below `nodes/6`'s. `admin::add_node` writes `nodes/6`; node 1's look at
+/// node 2 then reports a `members_revision` at or above `nodes/6`'s mod revision. This is what
+/// T11b's remove gate reads from each live member.
+///
+/// Integration (five node processes). Cut: `WireNodeStatus::from` sends `members_revision:
+/// None`, so node 1's look carries none ("node 2's status over the wire names its members
+/// revision"), red, observed 2026-11-21.
+#[config_log::retcd_test]
+fn s80s4_a_nodes_status_reports_its_members_revision_and_it_moves_after_an_add() {
+    const LOOKED: NodeId = NodeId(2);
+    let (rig, _six) = five_ready();
+    let one = &rig.of(NodeId(1)).db;
+    let local = rig.of(LOOKED).net.members_revision();
+    let mut before = None;
+    until(
+        "node 2's status over the wire names its members revision",
+        Duration::from_secs(10),
+        || {
+            before = one
+                .inspect(LOOKED)
+                .and_then(|status| status.members_revision);
+            before.is_some()
+        },
+    );
+    let before = before.expect("a members revision");
+    assert!(
+        before >= local && local > 0,
+        "node 2's look carries at least the revision its Net held before it: {before} vs {local}"
+    );
+
+    let added = rig
+        .rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("node 6 is added");
+    let six = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Node(added.node).encode()),
+        }))
+        .expect("a read")
+        .record
+        .expect("nodes/6")
+        .mod_revision;
+    assert!(
+        before < six,
+        "nodes/6 is written after the first look: {before} vs {six}"
+    );
+    let mut after = None;
+    until(
+        "node 2's status reports a members revision at or above nodes/6's",
+        Duration::from_secs(10),
+        || {
+            after = one
+                .inspect(LOOKED)
+                .and_then(|status| status.members_revision);
+            after.is_some_and(|revision| revision >= six)
+        },
+    );
+    tracing::info!(before, six, after = ?after, "s80s4_members_revision_moved");
+}
