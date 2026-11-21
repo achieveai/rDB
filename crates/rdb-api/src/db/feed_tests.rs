@@ -177,9 +177,14 @@ fn patience() -> Duration {
 /// first call to a secondary starts its control read and is refused; a new owner refuses until
 /// it holds its grant.
 fn page_from(db: &Db, from: FeedCursor, source: Source) -> FeedPage {
+    page_of(db, from, FEED_PAGE_RECORDS, source)
+}
+
+/// [`page_from`] asking for at most `max` records.
+fn page_of(db: &Db, from: FeedCursor, max: u32, source: Source) -> FeedPage {
     let deadline = Instant::now() + patience();
     loop {
-        match db.changes(PARTITION, from, FEED_PAGE_RECORDS, source) {
+        match db.changes(PARTITION, from, max, source) {
             Ok(page) => return page,
             Err(error)
                 if matches!(error.kind, ErrorKind::Unavailable | ErrorKind::LeaseExpired)
@@ -1509,13 +1514,16 @@ fn owner_serves(db: &Db, than: Generation) -> Generation {
 /// (a) Owner and secondary: `START` and a cursor at k1 answer exactly `Trimmed { floor: k3 }`,
 /// found through the link; a retained cursor at k3 resumes across the link. Node 2, untouched,
 /// still serves from `START`: the floor is per copy.
+/// (a) also pages with `max` 1 above that floor, on the owner and on node 3: from k3 only k4,
+/// `next` at k4 and `more`, then only k5 (`newer`) on the next call (round 3).
 /// (b) An empty lineage: node 3 with every record dropped answers `Trimmed` at its applied head
 /// plus one; after the next put that is its first record, and a cursor there resumes.
 /// No re-plan follows a drop: recovery reads `History` a dropped copy no longer holds (tried
 /// while writing this row: the partition stayed `ReadOnly`), which is #61's work.
 /// Cuts: `Host::changes` ignoring `history_floor` (floor `Seq(1)`), red ((a): `START` meets the
 /// hole, `CORRUPT_HISTORY`, not `Trimmed`); `RocksEngine::history_floor`'s empty-lineage
-/// fallback answering `Seq(1)`, red ((b)).
+/// fallback answering `Seq(1)`, red ((b)); `feed::page` without its `records.len() < returned`
+/// bound, red ((a) max 1 returns k4 and k5).
 /// Integration (~10 s): one restart's rejoin.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
@@ -1567,6 +1575,30 @@ fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
                 && got.windows(2).all(|pair| pair[0] < pair[1]),
             "(a) {source:?} across the link: {got:?}"
         );
+    }
+    // (a) max 1 above the real floor (round 3, r3 blocker 2): k4 and k5 (`newer`) are held
+    // above the floor and cursor k3. One record per call, `more` while one is left.
+    for source in [owner, three] {
+        match page_of(&db, at(k3.seq), 1, source) {
+            FeedPage::Records {
+                records,
+                next,
+                more,
+            } => {
+                assert_eq!(seqs(&records), vec![k4.seq.0], "(a) max 1 {source:?}");
+                assert_eq!(next, at(k4.seq), "(a) max 1 {source:?}: next is k4");
+                assert!(more, "(a) max 1 {source:?}: k5 is left");
+                match page_of(&db, next, 1, source) {
+                    FeedPage::Records { records, .. } => assert_eq!(
+                        seqs(&records),
+                        vec![newer.seq.0],
+                        "(a) max 1 {source:?}: k5 on the next call"
+                    ),
+                    other => panic!("(a) max 1 {source:?} from k4: {other:?}"),
+                }
+            }
+            other => panic!("(a) max 1 {source:?} from k3: {other:?}"),
+        }
     }
     let (untouched, _) = tail(&db, FeedCursor::START, two, newer.seq);
     assert_eq!(seqs(&untouched), seqs(&all), "(a) node 2 is untouched");
