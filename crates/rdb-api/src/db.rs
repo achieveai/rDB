@@ -3291,11 +3291,22 @@ impl Db {
     /// with no redirect hint: `Source::Owner` re-reads the owner route on `LEASE_EXPIRED` and
     /// calls the new owner, so a caller of `Source::Node` of the old owner switches to
     /// `Source::Owner` or another member.
-    /// `CORRUPT_HISTORY` when the cursor's record has another digest at the same position on the
-    /// same lineage (or the cursor is from another partition's history), and when the copy's
-    /// own history is damaged: then the node faults, and every caller waiting on it hears the
-    /// same error. Both say to read another copy or rebuild. `INVALID_ARGUMENT` for `max` 0 or
-    /// a partition this database does not have.
+    /// `CORRUPT_HISTORY`, in two ways, both with the feed's step (read another copy, or
+    /// rebuild from your own source):
+    /// - refused to this caller, the node unaffected: the copy holds the cursor's seq on that
+    ///   lineage with another digest (the cursor may come from another partition's history,
+    ///   the copies' histories may have diverged, or the record may be damaged), or a stored
+    ///   `User` key in a record due to be returned does not parse;
+    /// - the node faults: a storage read fails as corrupt, a record does not decode, does not
+    ///   match its digest or names another seq, a record is missing between the floor and the
+    ///   cap, or the first `History` key does not parse. Every feed call waiting on the node,
+    ///   and every later one, hears the same error; a put or a get hears the fault without the
+    ///   feed's step.
+    ///
+    /// A cursor from another partition's history is not sure to be `CORRUPT_HISTORY`: it is
+    /// judged against what this copy holds at its position, so it can read as `Behind`,
+    /// `Trimmed` or `Rewound` too. `INVALID_ARGUMENT` for `max` 0 or a partition this database
+    /// does not have, and over the links for an app not on the node's admin apps (#151).
     pub fn changes(
         &self,
         partition: PartitionId,

@@ -1241,8 +1241,9 @@ fn f87_2_replay_from_start_rebuilds_user_state() {
 /// answers hears `CORRUPT_HISTORY` with the feed's step, never a generic host fault or a call
 /// dropped unanswered. The owner's record with a broken frame (the read itself fails
 /// `Corrupt`): typed. Then node 2's record cut one byte short (the envelope does not decode),
-/// with two callers parked on one held control read: when the read lands, the first answer
-/// faults the node, and the second caller hears the same typed fault.
+/// with two callers parked on one held control read, counted from node 2's
+/// `feed_waits_for_control_read` lines before the read is let go: when the read lands, the
+/// first answer faults the node, and the second caller hears the same typed fault.
 /// Cuts: `feed_damage` returning `Fault::from` (untyped), red (caller 0: the generic host
 /// fault, `UNAVAILABLE`); `answer_feed_waiters` dropping the rest at the fault (the old `?`),
 /// red (caller 1: "node 2 dropped the feed call unanswered"); no `feed_reads` drain in
@@ -1286,9 +1287,25 @@ fn f87_2_damaged_history_answers_every_feed_caller_corrupt_history() {
     gated.close();
     let callers = calls_together(&db, NodeId(2), 2);
     until_held(&gated, 1);
-    // Both calls reach node 2 within microseconds of their threads starting; the held read
-    // keeps them parked (`feed_waits_for_control_read`, debug) for as long as this lasts.
-    std::thread::sleep(Duration::from_millis(200));
+    // Review r2: open the read only once node 2 says both calls are parked on it.
+    let deadline = Instant::now() + patience();
+    loop {
+        let parked = config_testkit::logs::lines_for_current_test(
+            module_path!(),
+            "f87_2_damaged_history_answers_every_feed_caller_corrupt_history",
+        )
+        .into_iter()
+        .filter(|line| line["@m"] == "feed_waits_for_control_read" && line["node"] == 2)
+        .count();
+        if parked >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{parked} feed calls parked, not 2"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     gated.open();
     for (index, caller) in callers.into_iter().enumerate() {
         let (answer, _) = caller.join().expect("the caller");
@@ -1631,4 +1648,97 @@ fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review r2 (threads 4647111507 and 4647111500): the owner's `History` keeps its floor, its
+/// head and every other record, but one interior record is gone. A feed read from START meets
+/// the hole below the cap: `CORRUPT_HISTORY` naming the seq, with the feed's step once, and the
+/// node faults. Then a put and a get hear the fault without the feed's step (it is advice for a
+/// cursor), and a later feed call to the faulted node hears it with the step. Both feed
+/// answers claim no mutation.
+/// Cuts: the hole mapped to a generic fault (`Fault::from`), red (the first feed answer is not
+/// `CORRUPT_HISTORY`); `feed_damage` keeping the step in the node's fault, red (the put carries
+/// it); `answer_faulted` answering a feed call as any other, red (the later feed call lacks it).
+/// Integration (~2 s): a fresh open.
+#[config_log::retcd_test]
+fn f87_2_r2_a_hole_in_history_faults_the_node_with_the_step_on_feed_replies_only() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    let k2 = db.put(b"k2", b"two", None).expect("k2");
+    let k3 = db.put(b"k3", b"three", None).expect("k3");
+    db.wait_durable(DEFAULT_GROUP, (k3.generation, k3.seq), patience())
+        .expect("k3 on every disk");
+    let dropped = db
+        .drop_history(NodeId(1), k1.generation, k2.seq.0..k2.seq.0 + 1)
+        .expect("k2's record dropped");
+    assert_eq!(dropped, 1);
+    let hole = format!("no record at seq {}", k2.seq.0);
+    let feed = |who: &str| {
+        let error = db
+            .changes(PARTITION, FeedCursor::START, 10, Source::Owner)
+            .expect_err("a hole below the cap");
+        assert_eq!(error.kind, ErrorKind::CorruptHistory, "{who}: {error:?}");
+        assert!(error.detail.contains(&hole), "{who}: {error:?}");
+        assert!(
+            error.detail.ends_with(FEED_HISTORY_STEP),
+            "{who}: {error:?}"
+        );
+        assert_eq!(error.detail.matches("next:").count(), 1, "{who}: {error:?}");
+        assert!(
+            error.no_mutation,
+            "{who}: a feed call writes nothing: {error:?}"
+        );
+    };
+    feed("the first feed call");
+    let put = db.put(b"k4", b"four", None).expect_err("the owner faulted");
+    let put = format!("{put:?}");
+    assert!(put.contains(&hole), "the put names the fault: {put}");
+    assert!(!put.contains(FEED_HISTORY_STEP), "the put: {put}");
+    let get = db.get(b"k1").expect_err("the owner faulted");
+    assert!(
+        get.detail.contains(&hole),
+        "the get names the fault: {get:?}"
+    );
+    assert!(!get.detail.contains(FEED_HISTORY_STEP), "the get: {get:?}");
+    feed("a later feed call");
+}
+
+/// Review r2 (thread 4647111514): node 2's first `History` key does not parse (the record at
+/// k1 also stored under its key's first byte, which sorts before every seq). The floor lookup
+/// in `Host::changes` meets it: `CORRUPT_HISTORY` from `RocksEngine::history_floor`'s `Corrupt`,
+/// named "history floor", with the feed's step, and node 2 faults (a second call hears the
+/// same).
+/// Cut: the floor call site mapping to a generic fault (`Fault::from`), red (not
+/// `CORRUPT_HISTORY`).
+/// Integration (~2 s): a fresh open.
+#[config_log::retcd_test]
+fn f87_2_r2_a_malformed_first_history_key_faults_the_node_typed() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = opened(&rt, dir.path(), &store);
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(DEFAULT_GROUP, (k1.generation, k1.seq), patience())
+        .expect("k1 on every disk");
+    db.damage_record_as(
+        NodeId(2),
+        k1.generation,
+        Namespace::History,
+        &k1.seq.0.to_be_bytes(),
+        rdb_storage::RecordDamage::ShortKey,
+    )
+    .expect("a short key planted");
+    for call in ["first", "again"] {
+        let answer = changes_settled(&db, FeedCursor::START, Source::Node(NodeId(2)));
+        let error = answer.expect_err("a malformed floor key");
+        assert_eq!(error.kind, ErrorKind::CorruptHistory, "{call}: {error:?}");
+        assert!(error.detail.contains("history floor"), "{call}: {error:?}");
+        assert!(
+            error.detail.ends_with(FEED_HISTORY_STEP),
+            "{call}: {error:?}"
+        );
+    }
 }

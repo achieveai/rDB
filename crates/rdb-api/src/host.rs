@@ -2759,6 +2759,20 @@ impl Fault {
         error.no_mutation = true;
         error
     }
+
+    /// [`Self::error`] for a feed call (#87), which writes nothing, so it claims no mutation.
+    /// Stored history damage carries the feed's step, read another copy or rebuild from your
+    /// own source, which suits a cursor and not a put or a get (review r2).
+    fn feed_error(&self) -> ApiError {
+        let mut error = self.error();
+        error.no_mutation = true;
+        if self.damage == Some(ErrorKind::CorruptHistory)
+            && !error.detail.ends_with(FEED_HISTORY_STEP)
+        {
+            error.detail = format!("{}; next: {FEED_HISTORY_STEP}", error.detail);
+        }
+        error
+    }
 }
 
 /// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
@@ -4041,8 +4055,13 @@ impl Host {
     fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
+                let error = if matches!(client.call, ClientCall::Changes { .. }) {
+                    fault.feed_error()
+                } else {
+                    fault.refusal()
+                };
                 let _ = client.reply.send(Answer::Error {
-                    error: fault.refusal(),
+                    error,
                     request: None,
                 });
             }
@@ -4114,7 +4133,7 @@ impl Host {
                     "feed_waiter_failed_by_fault"
                 );
                 let _ = waiter.reply.send(Answer::Error {
-                    error: fault.error(),
+                    error: fault.feed_error(),
                     request: None,
                 });
             }
@@ -15172,8 +15191,11 @@ impl Host {
                 );
                 return Ok(FeedCall::Answer(Ok(page)));
             }
-            // The caller's input, not this node's state: a cursor from another partition's
-            // history reads the same way as divergence. Refused, and logged at warn.
+            // The cursor's record is held at its seq with another digest. That can be the
+            // caller's cursor (from another partition's history), copies whose histories
+            // diverged, or damage that decodes and still matches its own digest; this node
+            // cannot tell which. Refused to this caller without faulting the node, and logged
+            // at warn.
             feed::Resume::Diverged { seq, held } => {
                 tracing::warn!(
                     node,
@@ -15255,9 +15277,18 @@ impl Host {
         waiter: FeedWaiter,
         wait: bool,
     ) -> Result<(), Fault> {
+        // The caller hears the fault now, with the feed's step; `fail_waiter` is the shared form
+        // without it.
         let call = self
             .changes(partition, waiter.identity, waiter.from, waiter.max, wait)
-            .map_err(|fault| fail_waiter(&self.owner_views, &waiter.reply, fault))?;
+            .map_err(|fault| {
+                self.owner_views.revoke();
+                let _ = waiter.reply.send(Answer::Error {
+                    error: fault.feed_error(),
+                    request: None,
+                });
+                fault
+            })?;
         match call {
             FeedCall::Answer(answer) => {
                 let answer = match answer {
@@ -15270,7 +15301,9 @@ impl Host {
                 let _ = waiter.reply.send(answer);
             }
             FeedCall::WaitForRead => {
-                tracing::debug!(
+                // Info: at most one per call that finds no read within the grant, and the
+                // event a row waits on (review r2).
+                tracing::info!(
                     node = self.node.0,
                     partition = partition.0,
                     client = waiter.identity.client.0,
@@ -16422,13 +16455,13 @@ fn feed_no_copy(node: NodeId, partition: PartitionId, why: &str) -> ApiError {
     error
 }
 
-/// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`, its
-/// detail ending with the feed's step ([`FEED_HISTORY_STEP`]), so a caller answered with
-/// [`Fault::error`] reads another copy or rebuilds.
+/// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`. A feed
+/// call answered with it hears [`Fault::feed_error`], which adds the feed's step
+/// ([`FEED_HISTORY_STEP`]); a put or a get hears [`Fault::error`] without it (review r2).
 fn feed_damage(detail: String) -> Fault {
     Fault {
         damage: Some(ErrorKind::CorruptHistory),
-        detail: format!("{detail}; next: {FEED_HISTORY_STEP}"),
+        detail,
     }
 }
 
@@ -17217,6 +17250,8 @@ mod barrier_tests;
 mod catchup_tests;
 #[cfg(test)]
 mod drop_tests;
+#[cfg(test)]
+mod feed_tests;
 #[cfg(test)]
 mod note_tests;
 #[cfg(test)]

@@ -247,6 +247,9 @@ pub enum RecordDamage {
     /// that is this seq big-endian: a `History` record misplaced, which decodes and matches its
     /// digest but names another seq.
     ValueOf(u64),
+    /// Leave the value and store it again under the key's first byte alone: a key no build
+    /// writes, which in `History` sorts before every seq.
+    ShortKey,
 }
 
 /// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
@@ -1285,6 +1288,7 @@ impl RocksEngine {
             return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
         }
         let last = value.len() - 1;
+        let mut raw = raw;
         match how {
             RecordDamage::LastByte => value[last] ^= 0xFF,
             RecordDamage::Truncate => {
@@ -1302,6 +1306,9 @@ impl RocksEngine {
                     .ok_or_else(|| DamageRefused::NoValue {
                         key_hex: hex(&other),
                     })?;
+            }
+            RecordDamage::ShortKey => {
+                raw = encode_key(partition, generation, ns, &key[..1.min(key.len())]);
             }
         }
         // A synced write, debug builds only: named like every other, so one made while a sync
