@@ -1110,10 +1110,10 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** A build with this setting speaks the wire version in `PROTOCOL_VERSION` (10
-  at this commit; set at merge). An older build speaks 9,
-  and the two refuse each other when they connect, each logging `net_handshake_refused` with
-  both versions. So an older node is never added back live, and it cannot link at all. The
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (10 at this commit;
+  set at merge), whether or not this setting is on. An older build speaks 9, even one that has
+  this setting, and the two refuse each other when they connect, each logging
+  `net_handshake_refused` with both versions. So an older node is never added back live, and it cannot link at all. The
   same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
   10. To upgrade to 10: stop every node and every app process that links to them, upgrade
   them all, start the nodes, then the apps. A rolling upgrade, with some processes at 9 and
