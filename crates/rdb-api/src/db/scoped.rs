@@ -296,9 +296,11 @@ impl ScopedDb {
         self.sealed_change(group, answer)
     }
 
-    /// [`Self::write`] under the app's request number `n`, as [`Db::write_as_in`]: a resend of
-    /// the same `n` in the same workspace replays its answer. Numbers are the app's own per
-    /// scope and workspace; two scopes using the same `n` never meet.
+    /// [`Self::write`] under the app's request number `n`, as [`Db::write_as_in`]: a fresh
+    /// compile, so once `n` applied, writing it again meets the dedup rules
+    /// (`REQUEST_ID_REUSE`) and writes nothing. To replay the answer, resend its token with
+    /// [`Self::resend_within`]; after a crash, ask [`Self::status`] for `n`. Numbers are the
+    /// app's own per scope and workspace; two scopes using the same `n` never meet.
     ///
     /// # Errors
     ///

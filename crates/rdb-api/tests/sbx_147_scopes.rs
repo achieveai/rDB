@@ -766,3 +766,37 @@ fn sbx_147_r_a_stopped_delete_prefix_prints_and_is_an_error() {
     let source = boxed.source().expect("the refusal is the source");
     assert!(source.to_string().contains("a refusal"), "{source}");
 }
+
+/// PR #178 review r1 T8: `ScopedDb::write_as`. The first answer's token resent replays it (same
+/// seq) and its status is that answer. Writing `n` again compiles afresh, as `Db::write_as_in`
+/// does, so after it applied the payload differs and the answer is `RequestIdReuse`, nothing
+/// written. Scope C's same `n` on the same partition and affinity is its own request. Cuts: the
+/// request id without the scope's hash, and C's write is refused as A's reuse; `write_as`
+/// through `write_in` (a fresh id each call), and the second write is written.
+#[config_log::retcd_test]
+fn sbx_147_s_write_as_replays_in_its_scope_and_is_isolated_from_another() {
+    use rdb_value::delta::{Delta, Op};
+    let doc = |v: &[u8]| Change::Doc(Delta(vec![Op::Replace(Value::Bytes(v.to_vec()))]));
+    let w = world(false);
+    let [a, _, c, _] = w.pinned();
+    w.on(async {
+        let first = a.write_as(1, 5, b(b"doc"), doc(b"A1"), None).await;
+        let first = first.expect("A n=5").expect("sent");
+        let again = a.resend_within(first.sent.clone(), DEADLINE).await;
+        let again = again.expect("A's token resent");
+        assert_eq!(again.ok.seq, first.ok.seq, "the resend replays the first answer");
+        match a.status(1, 5, Some(first.ok.generation)).await.expect("status") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, first.ok.seq),
+            other => panic!("n=5 is resolved: {other:?}"),
+        }
+        let reused = a.write_as(1, 5, b(b"doc"), doc(b"A2"), None).await;
+        let reused = reused.expect_err("n=5 compiled again");
+        assert_eq!(reused.error.kind, ErrorKind::RequestIdReuse, "{}", reused.error);
+        assert_eq!(value(&a, 1, b"doc").await, Some(b(b"A1")), "nothing new written");
+        let other = c.write_as(1, 5, b(b"doc"), doc(b"C1"), None).await;
+        let other = other.expect("C n=5").expect("sent");
+        assert_ne!(other.ok.seq, first.ok.seq, "C's n=5 is its own request");
+        assert_eq!(value(&c, 1, b"doc").await, Some(b(b"C1")));
+        assert_eq!(value(&a, 1, b"doc").await, Some(b(b"A1")));
+    });
+}
