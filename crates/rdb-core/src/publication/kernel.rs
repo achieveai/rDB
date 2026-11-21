@@ -233,6 +233,13 @@ pub enum ReplyOutcome {
     },
     /// `UNKNOWN_OUTCOME`. Never a definitive failure.
     Unknown,
+    /// `RECOVERED_APPLIED`: a recovery's cutoff carried the write into the new lineage, so it
+    /// landed (issue #111). Answered only for a write still pending when that recovery lands,
+    /// with the result its status entry folded to.
+    RecoveredApplied {
+        /// The recovered result, as `StatusOutcome::RecoveredApplied` holds it.
+        result: TxnResult,
+    },
 }
 
 /// P1's inputs (design §4.1).
@@ -1619,29 +1626,43 @@ impl PubKernel {
 
     /// A new lineage ends every write this generation still owes an answer: no later check or
     /// deadline of this generation can reach it, so without this its client waits out its whole
-    /// timeout. `Unknown`, never `GenerationChanged`: the write was applied, so nothing proves it
-    /// did not happen. Never `Published`: no check admitted the candidate. Status tells them
-    /// apart, and `fold_recovered` has already run. A write the deadline answered is skipped,
-    /// and the kernel's start record has no client (M9 S0 rule 5).
-    fn recovery_unknown_replies(&self) -> Vec<PubEffect> {
+    /// timeout. Never `GenerationChanged`: the write was applied, so nothing proves it did not
+    /// happen. Never `Published`: no check admitted the candidate. `fold_recovered` has already
+    /// run, so a write still **pending** whose entry the cutoff carried into the new lineage is
+    /// answered `RecoveredApplied`, the same result its status query answers (issue #111): the
+    /// cutoff is the explicit recovery decision spec §5.2 names. Every other owed write is
+    /// `Unknown` — a pending one the fold left uncertain, discarded or past the cutoff, and a
+    /// published one whose `Reply` check is still owed (K-A-40), which status tells apart. A
+    /// write the deadline answered is skipped, and the kernel's start record has no client (M9
+    /// S0 rule 5).
+    fn recovery_replies(&self) -> Vec<PubEffect> {
         let awaiting = self
             .awaiting_reply
             .values()
             .filter(|awaiting| !awaiting.replied)
-            .map(|awaiting| awaiting.request);
+            .map(|awaiting| PubEffect::Reply {
+                request: awaiting.request,
+                outcome: ReplyOutcome::Unknown,
+            });
         let pending = self
             .pending
             .as_ref()
             .filter(|pending| !pending.replied)
-            .map(|pending| pending.cand.request)
-            .filter(|request| *request != RequestIdentity::START_RECORD);
-        awaiting
-            .chain(pending)
-            .map(|request| PubEffect::Reply {
-                request,
-                outcome: ReplyOutcome::Unknown,
-            })
-            .collect()
+            .filter(|pending| pending.cand.request != RequestIdentity::START_RECORD)
+            .map(|pending| {
+                let request = pending.cand.request;
+                let outcome = match self.status.lookup(request, pending.cand.lineage.generation) {
+                    StatusOutcome::RecoveredApplied { result } => {
+                        ReplyOutcome::RecoveredApplied { result }
+                    }
+                    StatusOutcome::Published { .. }
+                    | StatusOutcome::Unknown
+                    | StatusOutcome::Rejected { .. }
+                    | StatusOutcome::StatusExpired => ReplyOutcome::Unknown,
+                };
+                PubEffect::Reply { request, outcome }
+            });
+        awaiting.chain(pending).collect()
     }
 
     fn withhold_awaiting(&mut self, why: Withheld) -> Vec<PubEffect> {
@@ -1962,7 +1983,7 @@ impl PubKernel {
             retained_through: result.retained_status_map.retained_through,
             map: result.retained_status_map,
         });
-        let mut effects = self.recovery_unknown_replies();
+        let mut effects = self.recovery_replies();
         effects.extend(self.withhold_awaiting(Withheld::Recovery));
         // The predecessor's view is not a prefix of the new lineage (A-R69a), so it is released
         // and one at the cutoff asked for: design §4.2 rebases `published_snapshot` here, and

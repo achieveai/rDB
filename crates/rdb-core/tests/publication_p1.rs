@@ -3028,6 +3028,85 @@ fn m10_r397_a4_a_write_pending_at_recovery_resolves_only_when_the_cutoff_retaine
     }
 }
 
+/// Issue #111: a re-plan revokes the epoch while a put is in flight. Its `Publication` check
+/// is denied `EpochRevoked`, so it is quarantined unanswered, and the recovery that follows
+/// decides it. A cutoff that kept its seq is the explicit recovery decision (spec §5.2), so
+/// the client is answered `RECOVERED_APPLIED` — the same result its status query answers —
+/// instead of `UNKNOWN_OUTCOME`. Through `Module::step`:
+/// (a) quarantined, cutoff at r5: `RecoveredApplied`, never `Failed`;
+/// (b) quarantined, cutoff below r5 and r5 discarded: `Unknown`;
+/// (c) a candidate never checked, cutoff at r5: `RecoveredApplied`;
+/// (d) quarantined under an uncertain map: `Unknown`;
+/// (e) each reply equals the status answer for r5 afterwards.
+#[retcd_test]
+fn i111_a_put_quarantined_at_a_replan_whose_cutoff_kept_it_is_answered_recovered_applied() {
+    let applied = TxnResult {
+        outcome: Outcome::RecoveredApplied,
+        ..result(P, 5)
+    };
+    let recovered_reply = EffectKind::Reply(ReplyEffect::Transaction {
+        identity: req(5),
+        result: applied,
+    });
+    let quarantine = |rig: &mut Rig| {
+        let c = rig.pending_with_recheck(5);
+        let effects = rig.step(answer(
+            Checkpoint::Publication,
+            c,
+            Verdict::Deny(DenyReason::EpochRevoked),
+        ));
+        assert!(effects.contains(&quarantined(5)), "{effects:?}");
+        assert_eq!(replies_for(&effects, 5), 0, "no reply at the quarantine");
+    };
+    let never_checked = |rig: &mut Rig| {
+        rig.step(candidate(5, 5));
+    };
+    type Setup<'a> = &'a dyn Fn(&mut Rig);
+    let cases: [(&str, Setup, EventKind, EffectKind, TxnStatus); 4] = [
+        (
+            "a: quarantined, cutoff kept it",
+            &quarantine,
+            recovered(PartitionMode::Active, 5, false, None),
+            recovered_reply.clone(),
+            TxnStatus::Resolved(applied),
+        ),
+        (
+            "b: quarantined, discarded below the cutoff",
+            &quarantine,
+            recovered(PartitionMode::Active, 4, false, Some(5)),
+            unknown_reply(5),
+            TxnStatus::Unknown,
+        ),
+        (
+            "c: never checked, cutoff kept it",
+            &never_checked,
+            recovered(PartitionMode::Active, 5, false, None),
+            recovered_reply.clone(),
+            TxnStatus::Resolved(applied),
+        ),
+        (
+            "d: quarantined, uncertain map",
+            &quarantine,
+            recovered(PartitionMode::Active, 5, true, None),
+            unknown_reply(5),
+            TxnStatus::Unknown,
+        ),
+    ];
+    for (name, setup, recovery, want_reply, want_status) in cases {
+        let mut rig = Rig::new();
+        setup(&mut rig);
+        let effects = rig.step(recovery);
+        assert!(effects.contains(&want_reply), "{name}: {effects:?}");
+        assert_eq!(
+            replies_for(&effects, 5),
+            1,
+            "{name}: one reply: {effects:?}"
+        );
+        // (e) one decision, two readers.
+        status_is(&mut rig, 5, want_status);
+    }
+}
+
 // ---- reads ------------------------------------------------------------------------------------
 
 /// A fresh read waits behind the candidate and is served at the new published position.
@@ -8138,7 +8217,7 @@ fn m10_s2_p1_c_the_status_seed_learns_the_floor_from_t1s_floor_record() {
 /// The state the rejoin left seven puts in: applied, in `pending`, and no check or deadline of
 /// this generation left to answer it. A new lineage answers `UNKNOWN_OUTCOME` once, whether the
 /// candidate was still waiting or A1 had already quarantined it at the `Publication` check.
-/// Cut: remove the emit in `recovery_unknown_replies`, red.
+/// Cut: remove the emit in `recovery_replies`, red.
 #[retcd_test]
 fn s4c_a_new_lineage_answers_an_unreplied_candidate_unknown_once() {
     for quarantined in [false, true] {
@@ -8164,7 +8243,7 @@ fn s4c_a_new_lineage_answers_an_unreplied_candidate_unknown_once() {
 }
 
 /// A candidate the post-apply deadline already answered gets no second answer from the recovery.
-/// Cut: drop the `replied` test on `pending` in `recovery_unknown_replies`, red.
+/// Cut: drop the `replied` test on `pending` in `recovery_replies`, red.
 #[retcd_test]
 fn s4c_a_candidate_the_deadline_answered_is_not_answered_again() {
     let mut rig = Rig::new();
@@ -8176,7 +8255,7 @@ fn s4c_a_candidate_the_deadline_answered_is_not_answered_again() {
 }
 
 /// The kernel's own start record has no client to answer (M9 S0 rule 5).
-/// Cut: drop the `START_RECORD` test in `recovery_unknown_replies`, red.
+/// Cut: drop the `START_RECORD` test in `recovery_replies`, red.
 #[retcd_test]
 fn s4c_the_start_record_is_answered_to_nobody_by_a_recovery() {
     let mut rig = Rig::new();
@@ -8210,7 +8289,7 @@ fn s4c_a_re_emit_of_the_served_lineage_answers_nobody() {
 /// that would have released it is asked under a lineage nothing serves any more. Each such
 /// entry answers `Unknown`, unless the deadline already answered it, and each still leaves its
 /// `ReplyWithheld` fact. The check's late answer then finds nothing to reply to.
-/// Cut: leave `awaiting_reply` out of `recovery_unknown_replies`, red.
+/// Cut: leave `awaiting_reply` out of `recovery_replies`, red.
 #[retcd_test]
 fn s4c_a_new_lineage_answers_an_unreplied_published_write_and_keeps_the_fact() {
     let mut rig = Rig::new();
@@ -8246,16 +8325,26 @@ fn s4c_a_new_lineage_answers_an_unreplied_published_write_and_keeps_the_fact() {
 }
 
 /// `Unknown` means "ask", and asking must not settle `Published` for a write no check admitted.
-/// Inside the cutoff it answers `RecoveredApplied`, past it `Unknown`, quarantined or not.
+/// Inside the cutoff it answers `RecoveredApplied`, past it `Unknown`, quarantined or not. The
+/// recovery's own reply says the same (issue #111): `RECOVERED_APPLIED` inside the cutoff,
+/// `UNKNOWN_OUTCOME` past it, never `Published`.
 /// Cut: `fold_recovered`'s `Unknown` arm writes the `Published` outcome, red.
 #[retcd_test]
 fn s4c_a_candidate_the_recovery_answered_never_settles_published() {
-    let applied = TxnStatus::Resolved(TxnResult {
+    let recovered_result = TxnResult {
         outcome: Outcome::RecoveredApplied,
         ..result(P, 5)
+    };
+    let applied = TxnStatus::Resolved(recovered_result);
+    let applied_reply = EffectKind::Reply(ReplyEffect::Transaction {
+        identity: req(5),
+        result: recovered_result,
     });
     for quarantined in [false, true] {
-        for (cutoff, want) in [(4, TxnStatus::Unknown), (5, applied)] {
+        for (cutoff, want, reply) in [
+            (4, TxnStatus::Unknown, unknown_reply(5)),
+            (5, applied, applied_reply.clone()),
+        ] {
             let mut rig = Rig::new();
             let c = rig.pending_with_recheck(5);
             if quarantined {
@@ -8267,9 +8356,10 @@ fn s4c_a_candidate_the_recovery_answered_never_settles_published() {
             }
             let effects = rig.step(recovered(PartitionMode::Active, cutoff, false, None));
             assert!(
-                effects.contains(&unknown_reply(5)),
+                effects.contains(&reply),
                 "{quarantined} {cutoff}: {effects:?}"
             );
+            assert_eq!(replies_for(&effects, 5), 1, "{quarantined} {cutoff}");
             assert!(!published_any(&effects), "{quarantined} {cutoff}");
             status_is(&mut rig, 5, want);
         }

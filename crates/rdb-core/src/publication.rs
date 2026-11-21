@@ -49,6 +49,7 @@ use crate::contracts::publication::{PublicationEffect, PublicationEvent};
 use crate::contracts::storage::{Namespace, SnapshotRead, StorageEvent, StoreEffect};
 use crate::contracts::time::TimerEffect;
 use crate::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
+use crate::contracts::txn::{Outcome as TxnOutcome, TxnResult};
 
 /// The first [`TimerId`] P1 owns. P1 arms one timer per partition, at `base + partition`.
 pub const PUBLICATION_TIMER_BASE: u64 = 0x00D1 << 48;
@@ -453,6 +454,18 @@ fn route(ctx: &StepCtx<'_>, event: &Event, slot: &mut Slot, effect: PubEffect) -
         } => EffectKind::Reply(ReplyEffect::Transaction {
             identity: request,
             result,
+        }),
+        // A recovery's cutoff kept a pending write (issue #111): the wire answer is the one
+        // `status::to_wire` gives its folded entry.
+        PubEffect::Reply {
+            request,
+            outcome: ReplyOutcome::RecoveredApplied { result },
+        } => EffectKind::Reply(ReplyEffect::Transaction {
+            identity: request,
+            result: TxnResult {
+                outcome: TxnOutcome::RecoveredApplied,
+                ..result
+            },
         }),
         PubEffect::Reply {
             request,
