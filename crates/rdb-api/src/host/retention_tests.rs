@@ -493,23 +493,12 @@ fn t61_s3_r3_a_lagging_member_within_budget_holds_the_floor() {
     assert!(opened.is_empty(), "History served copy 3: {opened:?}");
 }
 
-/// Issue #61 S3-R5 (design 3.1 m2, lead ruling R23): after a failover with `history_keep` = 0,
-/// the new primary does not trim past its secondaries before their first acks. Node 3's links
-/// are held and node 1's control store is cut, then node 2 is promoted: its `Recovered` begins
-/// a grace in the new generation. Node 1 is left out and copy 3 is unreachable, so the commit
-/// is `ReadOnly` and takes no writes; its lineage holds History below the cutoff. Node 2 lands
-/// that generation (which drops its inventory pin). With no byte cap, every round on node 2 is
-/// held `Grace` and its floor stays where the commit left it, while copy 3 has no ack. Healed,
-/// copy 3 acks and the grace ends `acked`.
-///
-/// Cut: no grace begun at `Recovered`, red (node 2's first round trims to its head).
-/// Integration (~5 s): bootstrap, a promote and a heal.
-#[config_log::retcd_test]
-fn t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks() {
-    const METHOD: &str =
-        "t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks";
-    let dir = config_testkit::fs::temp_dir();
-    let (mut trio, faults) = super::seal_tests::formed(dir.path());
+/// S3-R5's failover: node 3's links held, node 1's control store cut, node 2 promoted. Node 1
+/// is left out and copy 3 is unreachable, so node 2's commit is `ReadOnly` and takes no writes.
+/// Returns once node 2 has landed the new generation (which drops its inventory pin) with a
+/// grace open in it, and the generation. No retention duty runs by itself.
+fn failed_over_with_copy_3_held(dir: &std::path::Path) -> (Trio, Generation) {
+    let (mut trio, faults) = super::seal_tests::formed(dir);
     for (host, _, _) in &mut trio.nodes {
         host.next_retention = Tick(u64::MAX);
     }
@@ -542,6 +531,26 @@ fn t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks(
         trio.nodes[1].0.landed.contains(&(P, second)).then_some(())
     });
     assert_eq!(grace_of(&trio.nodes[1].0), Some(second), "node 2's grace");
+    (trio, second)
+}
+
+/// Issue #61 S3-R5 (design 3.1 m2, lead ruling R23): after a failover with `history_keep` = 0,
+/// the new primary does not trim past its secondaries before their first acks. Node 3's links
+/// are held and node 1's control store is cut, then node 2 is promoted: its `Recovered` begins
+/// a grace in the new generation. Node 1 is left out and copy 3 is unreachable, so the commit
+/// is `ReadOnly` and takes no writes; its lineage holds History below the cutoff. Node 2 lands
+/// that generation (which drops its inventory pin). With no byte cap, every round on node 2 is
+/// held `Grace` and its floor stays where the commit left it, while copy 3 has no ack. Healed,
+/// copy 3 acks and the grace ends `acked`.
+///
+/// Cut: no grace begun at `Recovered`, red (node 2's first round trims to its head).
+/// Integration (~5 s): bootstrap, a promote and a heal.
+#[config_log::retcd_test]
+fn t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks() {
+    const METHOD: &str =
+        "t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, second) = failed_over_with_copy_3_held(dir.path());
     let node2 = &mut trio.nodes[1].0;
     node2.history_retention = HistoryRetention {
         keep_millis: 0,
@@ -583,4 +592,92 @@ fn t61_s3_r5_after_a_failover_with_no_keep_the_new_primary_waits_for_first_acks(
         .map(|line| (line["generation"].clone(), line["why"].clone()))
         .collect();
     assert_eq!(ends, [(second.0.into(), "acked".into())]);
+}
+
+/// Issue #61 S3 (design 3.1 m2, lead ruling R23): a copy that never acks does not pin History
+/// for ever. After [`failed_over_with_copy_3_held`], copy 3 stays held. With `history_keep` =
+/// 1 s, `inventory_pin_millis` = 4 s and no byte cap, node 2's grace waits for the longer, 4 s
+/// from its start. Node 2's lineage is first trimmed by one seq and synced through its head, as
+/// a gateway taking writes is (the floor never passes this node's own durable). On an
+/// untrimmed lineage (`F_prev` = 0) copy 3's durable 0 is not below the floor, so `need` counts
+/// it and only the byte cap passes it.
+///
+/// 1. At start + 1.5 s, past `history_keep` but inside the pin window, the round is held
+///    `Grace` and the floor stays.
+/// 2. At start + 4 s the grace ends `history_grace_ended{why = expired}`: copy 3 is behind the
+///    floor and the round trims above it.
+///
+/// Cuts: the grace never expires, red (step 2 is held); it expires at `history_keep` alone,
+/// red (step 1 ends it). Integration (~4 s): bootstrap and a promote.
+#[config_log::retcd_test]
+fn t61_s3_a_grace_no_copy_acks_ends_expired_at_the_longer_of_keep_and_the_pin_window() {
+    const METHOD: &str =
+        "t61_s3_a_grace_no_copy_acks_ends_expired_at_the_longer_of_keep_and_the_pin_window";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, second) = failed_over_with_copy_3_held(dir.path());
+    let node2 = &mut trio.nodes[1].0;
+    node2.history_retention = HistoryRetention {
+        keep_millis: 1_000,
+        budget_bytes: u64::MAX,
+    };
+    node2.inventory_pin_millis = 4_000;
+    let (_, since) = node2
+        .retention
+        .get(&P)
+        .and_then(|state| state.grace)
+        .expect("node 2's grace");
+    let untrimmed = node2.engine.floor_seq(P, second);
+    let head = Seq(node2.engine.buffered_applied(P, second).0);
+    assert!(untrimmed.0 + 1 < head.0, "{untrimmed:?} {head:?}");
+    let before = Seq(untrimmed.0 + 1);
+    assert_eq!(node2.trim_history_through(P, before), Ok(before));
+    synced(&mut node2.engine, second, head.0);
+    assert_eq!(
+        node2.retention_round(P, since.plus_millis(1_500)),
+        Ok(RetentionDecision::Held(RetentionHold::Grace)),
+        "past history_keep, inside the pin window"
+    );
+    assert_eq!(node2.engine.floor_seq(P, second), before);
+    let round = node2.retention_round(P, since.plus_millis(4_000));
+    assert!(
+        matches!(&round, Ok(RetentionDecision::Floor(f)) if f.floor > before && !f.behind.is_empty()),
+        "the grace expired, the copy with no ack is behind and the floor moves: {round:?}"
+    );
+    assert_eq!(grace_of(node2), None);
+    assert!(node2.engine.floor_seq(P, second) > before);
+    let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
+        .into_iter()
+        .filter(|line| line["node"] == 2)
+        .map(|line| (line["generation"].clone(), line["why"].clone()))
+        .collect();
+    assert_eq!(ends, [(second.0.into(), "expired".into())]);
+}
+
+/// Issue #61 S3 (lead ruling R23): a grace on a node that holds no primary ends
+/// `history_grace_ended{why = no_primary}` at the next round. The grace is planted: node 2 here
+/// holds generation 1 of seqs 1-3 and no R1 side, which is what a demoted primary is left
+/// with; demoting one for real takes a second re-plan.
+///
+/// Cut: the `no_primary` arm keeps the grace, red (it stays open). Unit.
+#[config_log::retcd_test]
+fn t61_s3_a_grace_on_a_node_with_no_primary_ends_no_primary() {
+    const METHOD: &str = "t61_s3_a_grace_on_a_node_with_no_primary_ends_no_primary";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 3);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let now = host.clock.now();
+    host.retention.entry(P).or_default().grace = Some((Generation(1), now));
+    let round = host.retention_round(P, now.plus_millis(1));
+    assert!(round.is_ok(), "{round:?}");
+    assert_eq!(grace_of(&host), None, "the grace ended");
+    let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
+        .into_iter()
+        .map(|line| line["why"].clone())
+        .collect();
+    assert_eq!(ends, ["no_primary"]);
 }
