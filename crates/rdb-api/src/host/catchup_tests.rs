@@ -5661,7 +5661,6 @@ fn t61_a_reseed_below_its_durable_does_not_ack_s() {
     );
 }
 
-
 /// What a tail held `Unchecked` by check B must still be, whichever path held it (PR #156
 /// review, #153 rule). Its status crosses the wire: a peer's look decodes it, so the link
 /// stays up. A bare `forget-tail --through` over it, on the pinned owner in this process,
