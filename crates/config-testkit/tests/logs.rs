@@ -222,6 +222,49 @@ fn a_reader_whose_long_line_never_comes_fails_within_its_patience() {
     );
 }
 
+/// [`run_bounded_child`]'s kill: a child that never exits is killed at its bound, reaped, and
+/// reported as a failure, and what it wrote before the kill is kept.
+///
+/// The bound here is short ([`MISSING_PATIENCE`] times [`scale`]) because the whole of it is
+/// spent; the rows above derive theirs the same way, from a patience, with [`child_bound`].
+///
+/// Cut: drop the kill branch, and the parent polls a child that never ends, so this row never
+/// ends either.
+#[test]
+fn a_child_that_never_exits_is_killed_at_its_bound() {
+    const CHILD: &str = "child_never_exits";
+    let bound = MISSING_PATIENCE * scale();
+    let run = run_bounded_child(CHILD, bound);
+    assert!(run.killed, "{CHILD} was not killed: {run}");
+    assert!(!run.success, "a killed child is a failure: {run}");
+    assert!(
+        run.elapsed >= bound,
+        "{CHILD} was killed before its bound {bound:?}: {run}"
+    );
+    assert!(
+        run.stderr.contains(STUCK_MARKER),
+        "the output {CHILD} wrote before the kill was lost: {run}"
+    );
+}
+
+/// What [`child_never_exits`] writes before it blocks.
+const STUCK_MARKER: &str = "stuck child is up";
+
+/// The body of [`a_child_that_never_exits_is_killed_at_its_bound`]: write a line, then block
+/// for ever.
+#[test]
+#[ignore = "run in a child process by a_child_that_never_exits_is_killed_at_its_bound"]
+fn child_never_exits() {
+    use std::io::Write;
+    // Straight to the process's stderr, past libtest's capture, which a kill would discard.
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "{STUCK_MARKER}").expect("write the marker");
+    stderr.flush().expect("flush the marker");
+    loop {
+        std::thread::park();
+    }
+}
+
 /// What a bounded child run ended with.
 struct ChildRun {
     success: bool,
