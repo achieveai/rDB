@@ -2820,9 +2820,9 @@ fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
 /// #107 live return, taken back by `live_readd_duty`. Cut: the host ignores
 /// `Msg::HealLeftOut`: no clocked return, and `restore_left_out` records `C` at its new live
 /// boot, so it waits for yet another restart (`copy_left_out_until_restart`), red at the pins.
-/// The read back after the pins retries a `RetryAfterRecovery` refusal ([`get_lands`]): the
-/// client contract says retry it, and a lease taken again after the re-add is not a defect;
-/// every assert on the pins comes first, so the retry cannot hide a copy that never returned.
+/// The read back waits first for the owner to serve each partition at its final generation
+/// ([`owner_serves`]): the re-add pins `C` as a shadow, and its promote is one more re-plan,
+/// whose epoch fence refuses a read on purpose (#191). The read itself is plain.
 #[config_log::retcd_test]
 fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
     let (mut rig, owned, copy) = r5_scene();
@@ -2868,7 +2868,8 @@ fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
             "partition {partition}: node {} leads nothing",
             copy.0
         );
-        let got = get_lands(rig.of(R5_OWNER), *group, b"before");
+        owner_serves(&rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
         assert_eq!(
             got.value.as_ref().map(|(_, value)| &value[..]),
             Some(&b"1"[..]),
@@ -2878,23 +2879,55 @@ fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
     }
 }
 
-/// A get of `key` in `group`, retried while it is refused with `RetryAfterRecovery`, as a
-/// client does: the owner's read lease is taken again after a re-add's commit, so a read in
-/// that gap is refused `LeaseExpired`, with no mutation (observed on PR #181 at load 48). Any
-/// other refusal, or one past the patience, fails the row.
-fn get_lands(db: &Db, group: AffinityId, key: &[u8]) -> crate::GetOk {
-    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+/// Wait until `owner` serves `partition` at its final generation: the record pins `copy` as a
+/// regular copy (a re-add pins it as a shadow first, and its promote is one more re-plan), and
+/// the owner has adopted that record's generation and epoch and still leads under it. Until
+/// then a re-plan's epoch fence refuses reads `RetryAfterRecovery` by design (#191), so a row
+/// that reads before this races the fence. Panics after `within`, with the last state seen.
+fn owner_serves(rig: &Rig, partition: u32, owner: NodeId, copy: NodeId, within: Duration) {
+    let deadline = Instant::now() + crate::host::test_patience(within);
+    let id = PartitionId(partition);
     loop {
-        match db.get_in(group, key) {
-            Ok(got) => return got,
-            Err(refused) => {
-                tracing::info!(group = ?group, error = ?refused, "r5_get_retry");
-                assert!(
-                refused.retry == crate::RetryRule::RetryAfterRecovery && Instant::now() < deadline,
-                    "no get answered in {group:?}: {refused:?}"
-                );
-            }
+        let value = rig
+            .rt
+            .block_on(rig.store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(id).encode()),
+            }))
+            .expect("the store answers")
+            .record
+            .map(|found| found.value);
+        let record = value
+            .as_ref()
+            .and_then(|value| PartitionRecord::decode(value));
+        let regular = value
+            .as_ref()
+            .and_then(|value| RecordMember::decode_all(value))
+            .is_some_and(|members| {
+                members.iter().any(|member| {
+                    member.node == copy
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+        let adopted = rig.of(owner).ownership(id);
+        let serves = record
+            .as_ref()
+            .zip(adopted.as_ref())
+            .is_some_and(|(record, adopted)| {
+                record.owner == owner
+                    && adopted.token.generation == record.generation
+                    && adopted.token.owner_epoch == record.owner_epoch
+                    && rig.of(owner).still_owner(id, adopted.token)
+            });
+        if regular && serves {
+            return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "partition {partition}: node {} never served it with node {} regular: \
+             regular {regular}, record {record:?}, adopted {adopted:?}",
+            owner.0,
+            copy.0
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
