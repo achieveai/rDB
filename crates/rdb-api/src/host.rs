@@ -2520,12 +2520,19 @@ struct FeedFreshness {
     read: Option<(Tick, FeedControlRead)>,
     /// A read is in flight.
     in_flight: bool,
+    /// Why the last read failed, at most [`FEED_READ_FAILURE_CHARS`] characters, until a read
+    /// answers again: the refusal "call again" names it (review r4, thread 4654680320).
+    failed: Option<String>,
     /// Feed calls waiting for that read: answered when it lands, or at their `until`
     /// ([`FEED_READ_WAIT_MILLIS`]), whichever is first. A call is never refused only because
     /// it started the read: a consumer that calls less often than once a grant was refused at
     /// every call (#87 lr walk).
     waiting: Vec<FeedWaiter>,
 }
+
+/// The most of a failed control read's error a feed refusal repeats ([`FeedFreshness::failed`]):
+/// enough to name the cause, never a whole store error.
+const FEED_READ_FAILURE_CHARS: usize = 200;
 
 /// A feed call parked on its partition's control read ([`FeedFreshness::waiting`]).
 #[derive(Debug)]
@@ -15512,9 +15519,12 @@ impl Host {
             if wait {
                 return Freshness::Reading;
             }
+            let failed = entry.failed.as_ref().map_or_else(String::new, |failed| {
+                format!("; the last read failed: {failed}")
+            });
             return transient(format!(
                 "no control read of partitions/{p} within the grant ({grant} ms); one is under \
-                 way, so call again"
+                 way, so call again{failed}"
             ));
         };
         // `None`: a layout that pins no members leaves the landed configuration as the only
@@ -15566,13 +15576,21 @@ impl Host {
                 if entry.read.as_ref().is_none_or(|(at, _)| *at <= started) {
                     entry.read = Some((started, read));
                 }
+                entry.failed = None;
             }
-            Err(error) => tracing::warn!(
-                node = self.node.0,
-                partition = partition.0,
-                %error,
-                "feed_control_read_failed"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    %error,
+                    "feed_control_read_failed"
+                );
+                let mut bounded: String = error.chars().take(FEED_READ_FAILURE_CHARS).collect();
+                if bounded.len() < error.len() {
+                    bounded.push_str("...");
+                }
+                entry.failed = Some(bounded);
+            }
         }
         self.answer_feed_waiters(partition, |_| true)
     }

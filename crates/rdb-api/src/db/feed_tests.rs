@@ -2030,3 +2030,57 @@ fn f87_3_a_feed_call_to_a_stopped_member_names_why() {
     assert!(remote.no_mutation, "{remote:?}");
     drop(procs.nodes);
 }
+
+/// Review r4 (thread 4654680320): a secondary whose control read of `partitions/1` fails says
+/// why in its refusal, bounded, and keeps the refusal's transient rule. Node 2 is cut from
+/// rEtcd (`cut-control`); once its last good read is older than the grant, a feed call is
+/// refused `UNAVAILABLE`, `BoundedJitter`, no mutation, "call again; the last read failed:"
+/// naming the cut, at most 200 characters of it.
+/// Cut: the refusal without the failure, red (never "the last read failed").
+/// Integration (~5 s): processes, one short grant.
+#[config_log::retcd_test]
+fn f87_3_a_failed_control_read_is_named_in_the_refusal() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let budgets = short_grant();
+    let procs = procs(&rt, dir.path(), app_dir.path(), &store, budgets);
+    let k1 = procs.app.put(b"k1", b"one", None).expect("k1");
+    procs
+        .app
+        .wait_durable(DEFAULT_GROUP, (k1.generation, k1.seq), patience())
+        .expect("k1 on every disk");
+    let two = Source::Node(NodeId(2));
+    let (_, at_k1) = tail(&procs.app, FeedCursor::START, two, k1.seq);
+
+    procs.faults[1].apply("cut-control");
+    let bound = Duration::from_millis(budgets.grant_millis) + procs.app.timeouts.read;
+    let deadline = Instant::now() + crate::host::test_patience(bound);
+    let error = loop {
+        match procs.app.changes(PARTITION, at_k1, 10, two) {
+            Err(error) if error.detail.contains("the last read failed: ") => break error,
+            other => assert!(
+                Instant::now() < deadline,
+                "never named the failed read: {other:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        (error.kind, error.retry),
+        (ErrorKind::Unavailable, RetryRule::BoundedJitter),
+        "{error:?}"
+    );
+    assert!(error.no_mutation, "{error:?}");
+    assert!(error.detail.contains("so call again"), "{error:?}");
+    let failed = error
+        .detail
+        .split("the last read failed: ")
+        .nth(1)
+        .and_then(|rest| rest.split("; next: ").next())
+        .expect("the failure");
+    assert!(failed.contains("cut-control"), "{failed}");
+    assert!(failed.chars().count() <= 203, "{failed}");
+    drop(procs.nodes);
+}
