@@ -1201,3 +1201,88 @@ fn own81_bad_partition_entry_warns_once() {
         "partition_entry_undecodable",
     );
 }
+
+/// #127: a panic in the planner is logged as `planner_panicked` at error, naming the node and
+/// the panic's message, for a `&str` panic and a formatted one. A planner that ends normally
+/// logs nothing.
+/// Cut: `panics_logged` awaits the future with no `catch_unwind`; the panic escapes the row, red.
+#[config_log::retcd_test]
+fn i127_a_planner_panic_is_logged() {
+    const METHOD: &str = "i127_a_planner_panic_is_logged";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    rt.block_on(panics_logged(NodeId(2), async { panic!("i127 static") }));
+    rt.block_on(panics_logged(NodeId(3), async {
+        panic!("i127 formatted {}", 7)
+    }));
+    rt.block_on(panics_logged(NodeId(4), async {}));
+    let lines = messages(METHOD, "planner_panicked");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["@l"], "Error", "{lines:?}");
+    assert_eq!(lines[0]["node"], 2, "{lines:?}");
+    assert_eq!(lines[0]["panic"], "i127 static", "{lines:?}");
+    assert_eq!(lines[1]["node"], 3, "{lines:?}");
+    assert_eq!(lines[1]["panic"], "i127 formatted 7", "{lines:?}");
+}
+
+/// #122 cost, bounded: an owner whose grant ran out is looked at before it is judged, and an
+/// owner that never answers holds its judge for the whole look. A sweep judges every owner at
+/// once, so four such owners cost one look, not four: a dead owner's failover is not held
+/// back by other owners that are slow in the same sweep (t1 S3, 15 s bound).
+///
+/// The proof is that all four looks are outstanding at the same time, not a wall-clock cap
+/// (PR #156 review: a cap fails on a loaded host even when judging is parallel). The row holds
+/// every look it receives, unanswered, until it holds all four; only then does it let them go,
+/// by dropping their reply channels. Each look waits longer than the row's patience, so a
+/// look still held when the next arrives was outstanding beside it.
+/// Cut: judge the owners in turn in `judge_all`; the second look never comes while the first
+/// is held, red.
+#[config_log::retcd_test]
+fn i122_owners_are_judged_at_once() {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script::default(),
+    ));
+    let links = Links::new();
+    let mut mailboxes = Vec::new();
+    for node in 1..=4u32 {
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        links.register(NodeId(node), tx, BootId(1));
+        mailboxes.push(rx);
+    }
+    let patience = crate::host::test_patience(Duration::from_secs(5));
+    let look_within = patience * 2;
+    let planner = Planner {
+        look_within,
+        ..planner(9, &store, links)
+    };
+    // Takes each owner's look and keeps it, reply channel and all, until it holds all four or
+    // runs out of patience; then drops them, which answers each judge at once.
+    let holder = std::thread::spawn(move || {
+        let started = Instant::now();
+        let deadline = started + patience;
+        let mut held = Vec::new();
+        for mailbox in &mailboxes {
+            match mailbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(look @ Msg::Inspect { .. }) => held.push(look),
+                Ok(other) => panic!("not a look: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        (held.len(), started.elapsed())
+    });
+    let verdicts = rt.block_on(
+        planner.judge_all((1..=4u32).map(|node| (NodeId(node), None, PartitionId(node)))),
+    );
+    let (outstanding, took) = holder.join().expect("the holder ends");
+    assert_eq!(
+        outstanding, 4,
+        "all four looks were outstanding at once within {patience:?}"
+    );
+    assert!(
+        took < look_within,
+        "held before the first look gave up: {took:?}"
+    );
+    assert_eq!(verdicts, vec![Verdict::Dead("silent_and_expired"); 4]);
+}

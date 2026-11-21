@@ -8,6 +8,8 @@
 **Extends:** [ADR-rdb-0010](0010-generation-inheritance.md) decision 8 (its two callers, landing and
 the inventory link). ADR-rdb-0010 is Accepted, so this ADR adds a guard without editing it.
 **Issue:** #107 slice 1.
+**Amended by:** [ADR-rdb-0026](0026-check-b-at-adoption.md), which supersedes decision 7: adoption
+runs check B too (issue #121).
 
 ## Context
 
