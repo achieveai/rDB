@@ -130,7 +130,8 @@ pub struct DrainReport {
 ///    already moved off the node, before the drain's or by winning the CAS against it, counts as
 ///    done: the re-read of the record is what keeps a drain beside a planner correct, and the
 ///    wait only lets the planner go first.
-/// 4. [`rebalance`] again, which evens the skew.
+/// 4. [`rebalance`] again, which refills each partition the promotes left below RF through
+///    [`Db::refill_in`] and evens the skew.
 ///
 /// Logged `drain_promoted`, `drain_promote_elsewhere`, `drain_promote_lost` and `drain_done`.
 ///

@@ -8779,9 +8779,14 @@ fn refill_call(request: u64, to: u32) -> ClientCall {
 /// Ask node 1 for `call` and expect a refusal of `kind` whose detail holds `says`, ending with
 /// [`crate::db::error::REFILL_STEP`], logged `refill_refused` with `guard`, and changing nothing:
 /// node 1's commit and its refill entry are as before the ask.
-fn refill_refused(trio: &mut Trio, call: ClientCall, kind: ErrorKind, guard: &str, says: &str) {
-    const METHOD: &str =
-        "s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one";
+fn refill_refused(
+    trio: &mut Trio,
+    method: &str,
+    call: ClientCall,
+    kind: ErrorKind,
+    guard: &str,
+    says: &str,
+) {
     let before = commit_of(trio);
     let held = trio.nodes[0].0.refills.get(&PartitionId(1)).cloned();
     match trio.ask(call) {
@@ -8805,7 +8810,7 @@ fn refill_refused(trio: &mut Trio, call: ClientCall, kind: ErrorKind, guard: &st
         trio.nodes[0].0.rejoins.is_empty(),
         "{guard}: a re-plan started"
     );
-    let refused: Vec<_> = logged!(METHOD, "refill_refused")
+    let refused: Vec<_> = logged!(method, "refill_refused")
         .into_iter()
         .filter(|line| line["guard"] == guard)
         .collect();
@@ -8840,6 +8845,7 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
     assert_eq!(members, vec![1, 2, 3]);
     refill_refused(
         &mut trio,
+        METHOD,
         refill_call(1, 4),
         ErrorKind::InvalidArgument,
         "full",
@@ -8855,6 +8861,7 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
     ] {
         refill_refused(
             &mut trio,
+            METHOD,
             refill_call(request, to),
             ErrorKind::InvalidArgument,
             guard,
@@ -8875,6 +8882,7 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
     });
     refill_refused(
         &mut trio,
+        METHOD,
         refill_call(request + 2, 5),
         ErrorKind::Unavailable,
         "slot_taken",
@@ -8905,6 +8913,7 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
     }
     refill_refused(
         &mut trio,
+        METHOD,
         refill_call(request + 4, 4),
         ErrorKind::InvalidArgument,
         "member",
@@ -8915,4 +8924,212 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
         .map(|line| line["phase"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert_eq!(committed, ["shadow_pinned", "refilled"], "{committed:?}");
+}
+
+/// Five hosts, bootstrapped with nodes 1 to 3 and admitting, node 3 then killed and dropped:
+/// node 1 commits nodes 1 and 2 with node 3 left out, and nodes 4 and 5 are spares. Returns the
+/// next free request id.
+fn five_with_three_dropped(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> (Trio, u64) {
+    let mut trio = Trio::with_nodes(dir, tune, 5);
+    trio.bootstrap();
+    trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
+    let (before, _, members) = commit_of(&trio).expect("bootstrap committed");
+    assert_eq!(members, vec![1, 2, 3]);
+    kill(&trio, 3, &[1, 2, 4, 5]);
+    let (request, _) = put_until_paused(&mut trio, 1);
+    dropped_three(&mut trio, before);
+    (trio, request)
+}
+
+/// Ask node 1 to refill onto `to` every 200 ms of host time while it answers `refilling`, for
+/// at most `bound_ms`; the first other answer.
+fn refill_until_answered(trio: &mut Trio, request: &mut u64, to: u32, bound_ms: u64) -> Answer {
+    let until = trio.clock.now().plus_millis(bound_ms);
+    let mut last = None;
+    while trio.clock.now() < until {
+        *request += 1;
+        match trio.ask(refill_call(*request, to)) {
+            Answer::Moved(answer) if !answer.done => last = Some(answer.line),
+            other => return other,
+        }
+        pass(trio, 200);
+    }
+    panic!("refill {to} still running after {bound_ms} ms of host time; last: {last:?}")
+}
+
+/// After a refill of node 4 was given up: once node 1 commits without node 4, asking node 4
+/// again is refused `left_out`, node 5 is refilled in its place, ending with 3 regular copies
+/// (nodes 1, 2, 5, each its own machine), and a put lands.
+fn refill_five_after_four(trio: &mut Trio, method: &str, request: &mut u64) {
+    trio.until("node 4 left out", |trio| {
+        commit_of(trio)
+            .filter(|(_, _, members)| !members.contains(&4))
+            .filter(|_| trio.nodes[0].0.rejoins.is_empty())
+    });
+    *request += 1;
+    refill_refused(
+        trio,
+        method,
+        refill_call(*request, 4),
+        ErrorKind::InvalidArgument,
+        "left_out",
+        "node 4 was left out of partition 1",
+    );
+    *request += 1;
+    match trio.ask(refill_call(*request, 5)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("refill 5: {other:?}"),
+    }
+    let (_, _, members) = trio.until("node 5 regular", |trio| {
+        (pinned_role(trio, 5) == Some(ReplicaRole::RegularSecondary))
+            .then(|| commit_of(trio))
+            .flatten()
+    });
+    assert_eq!(members, vec![1, 2, 5], "node 5 filled the free slot");
+    *request += 1;
+    match trio.ask(refill_call(*request, 5)) {
+        Answer::Moved(answer) => assert!(answer.done, "{answer:?}"),
+        other => panic!("refill 5 again: {other:?}"),
+    }
+    trio.ready();
+    *request += 1;
+    match trio.ask(put(*request)) {
+        Answer::Txn { .. } => {}
+        other => panic!("a put after the refill: {other:?}"),
+    }
+}
+
+/// #80 S4 (lead's ruling 2026-11-21, A-R459 for a refill): a refill whose shadow stays linked
+/// but makes no progress is given up at the catch-up deadline, as a move's is. Node 1's
+/// deadline is 3 s; the refill pins node 4, and node 1's stream to it is cut (a dropped
+/// direction still counts as linked) while 100 records land, as `m11_m2_c` does for a move.
+/// While node 4 holds the slot, a refill of node 5 is refused `slot_taken`. Past the deadline
+/// the next ask of node 4 says it made no progress, once; then node 4 is left out, a refill of
+/// node 5 succeeds, and the partition ends at 3 regular copies.
+/// Node 4's own ask is what the row watches, not node 5's: an ask of node 5 is taken as soon as
+/// node 4's drop commits and replaces node 4's entry, so node 4's one given-up answer would
+/// never be seen.
+/// Cut: the refill is not in `move_lag_duty` (`shadow_duty` runs it for a held move only).
+/// Red, observed 2026-11-21 at load 26: `refill 4 still running after 20000 ms of host time;
+/// last: Some("refilling: node 4 catching up as a shadow")`.
+/// Integration (~8 s): bootstrap's window, the drop, the pin, the deadline, two re-plans.
+#[config_log::retcd_test]
+fn s80s4_a_refill_that_makes_no_progress_is_given_up_and_another_node_refills() {
+    const METHOD: &str =
+        "s80s4_a_refill_that_makes_no_progress_is_given_up_and_another_node_refills";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, mut request) = five_with_three_dropped(dir.path(), tuned);
+    trio.nodes[0].0.move_catch_up_millis = 3_000;
+    request += 1;
+    match trio.ask(refill_call(request, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("refill 4: {other:?}"),
+    }
+    trio.until("node 1 pinned node 4 as a shadow", |trio| {
+        let pinned = pinned_role(trio, 4) == Some(ReplicaRole::Shadow);
+        if pinned {
+            trio.links.drop_direction(NodeId(1), NodeId(4));
+        }
+        pinned.then_some(())
+    });
+    trio.until("the pin's re-plan ended", |trio| {
+        trio.nodes[0].0.rejoins.is_empty().then_some(())
+    });
+    trio.ready();
+    for _ in 0..100 {
+        request += 1;
+        match trio.ask(put(request)) {
+            Answer::Txn { .. } => {}
+            other => panic!("put {request}: {other:?}"),
+        }
+    }
+    request += 1;
+    refill_refused(
+        &mut trio,
+        METHOD,
+        refill_call(request, 5),
+        ErrorKind::Unavailable,
+        "slot_taken",
+        "free slot is taken",
+    );
+    match refill_until_answered(&mut trio, &mut request, 4, 20_000) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(
+                error.detail.contains(
+                    "the refill of node 4 into partition 1 was given up: node 4 made no \
+                     progress for "
+                ) && error
+                    .detail
+                    .contains("Run the refill again onto another node"),
+                "{error:?}"
+            );
+            assert!(
+                error.detail.ends_with(crate::db::error::REFILL_STEP),
+                "{error:?}"
+            );
+        }
+        other => panic!("refill 4 at its deadline: {other:?}"),
+    }
+    let given_up = logged!(METHOD, "refill_catch_up_given_up");
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert!(
+        given_up[0]["behind"].as_u64().expect("behind") > PROMOTE_LAG_RECORDS,
+        "{given_up:?}"
+    );
+    trio.links.heal(NodeId(1), NodeId(4));
+    refill_five_after_four(&mut trio, METHOD, &mut request);
+}
+
+/// #80 S4 (A-R457 b for a refill): a refill whose shadow the owner has no link to for the
+/// drop clock is given up by `shadow_give_up_duty`, and its entry no longer holds the slot.
+/// The refill pins node 4, whose links to nodes 1 and 2 are then held (a hold, unlike a
+/// dropped direction, unlinks it). Once node 1 commits without node 4, the next ask of node 4
+/// says it was unreachable, once; then node 4 is refused `left_out`, a refill of node 5
+/// succeeds, and the partition ends at 3 regular copies.
+/// Cut: `shadow_give_up_duty` does not mark the refill given up. Red, observed 2026-11-21 at
+/// load 32: the first ask of node 4 after the drop is refused `InvalidArgument`, "node 4 was
+/// left out of partition 1 ...", not given up.
+/// Integration (~6 s): bootstrap's window, the drop, the pin, the drop clock, two re-plans.
+#[config_log::retcd_test]
+fn s80s4_a_refill_whose_shadow_is_unreachable_is_given_up_and_another_node_refills() {
+    const METHOD: &str =
+        "s80s4_a_refill_whose_shadow_is_unreachable_is_given_up_and_another_node_refills";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, mut request) = five_with_three_dropped(dir.path(), tuned);
+    request += 1;
+    match trio.ask(refill_call(request, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("refill 4: {other:?}"),
+    }
+    trio.links.hold(NodeId(1), NodeId(4));
+    trio.links.hold(NodeId(2), NodeId(4));
+    trio.until("node 4 pinned as a shadow, then left out", |trio| {
+        let left = trio.nodes[0]
+            .0
+            .left_out
+            .get(&PartitionId(1))
+            .is_some_and(|left| left.iter().any(|member| member.node == NodeId(4)));
+        (left && pinned_role(trio, 4).is_none() && trio.nodes[0].0.rejoins.is_empty()).then_some(())
+    });
+    request += 1;
+    match trio.ask(refill_call(request, 4)) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(
+                error.detail.contains(
+                    "the refill of node 4 into partition 1 was given up: node 4 was \
+                     unreachable from node 1 (the owner) for "
+                ),
+                "{error:?}"
+            );
+        }
+        other => panic!("refill 4 after the give-up: {other:?}"),
+    }
+    let given_up: Vec<_> = logged!(METHOD, "move_given_up")
+        .into_iter()
+        .filter(|line| line["shadow"] == 4)
+        .collect();
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    refill_five_after_four(&mut trio, METHOD, &mut request);
 }

@@ -1,9 +1,10 @@
 //! Copy placement over the runtime membership (#80 S4 T12, design `arch-80-s34` rev 3): the
-//! inventory the records describe, and `rebalance`, which runs `placement::plan`'s copy moves
-//! through [`Db::move_copy_in`] one at a time. Copies only (Q4 a): an owner moves by failover or
+//! inventory the records describe, and `rebalance`, which refills a partition below RF through
+//! [`Db::refill_in`] and runs `placement::plan`'s copy moves through [`Db::move_copy_in`], one
+//! at a time. Copies only (Q4 a): an owner moves by failover or
 //! drain, so a primary step is reported as the residual `no_live_handoff`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -95,7 +96,8 @@ pub async fn inventory(
 /// What [`rebalance`] is asked to do.
 #[derive(Debug, Clone, Default)]
 pub struct RebalanceOpts {
-    /// The most copy moves to run. `0` runs none and reports the plan's residuals.
+    /// The most copy moves and refills to run, together. `0` runs none and reports the plan's
+    /// residuals.
     pub max_moves: usize,
     /// Nodes whose copies must leave and which take none (`admin drain`).
     pub draining: BTreeSet<NodeId>,
@@ -106,6 +108,9 @@ pub struct RebalanceOpts {
 pub struct RebalanceReport {
     /// The copy moves that committed, in order.
     pub moved: Vec<Step>,
+    /// The refills that committed, in order, as `(partition, to)`: a copy added to a partition
+    /// with fewer than [`crate::admin::RF`] regular copies.
+    pub refilled: Vec<(u32, u32)>,
     /// Claims left unmet, in plain words: `placement`'s residuals, and each primary step as
     /// `no_live_handoff: ...` (Q4 a).
     pub residuals: Vec<String>,
@@ -115,17 +120,21 @@ pub struct RebalanceReport {
     pub primary_skew: usize,
 }
 
-/// Move copies until `placement::plan` has no copy step left, or `opts.max_moves` moves ran
-/// (#80 S4 T12). Each round reads the inventory again ([`inventory`]), so a run stopped part way
-/// resumes where the records are: it plans afresh and runs the plan's first copy step through
-/// `db`'s [`Db::move_copy_in`], following it every [`MOVE_POLL`] until it answers `done`. A
-/// primary step is never run (Q4 a); the report names it `no_live_handoff`. Blocking: run it
-/// off any runtime thread. Logged `rebalance_move` per move and `rebalance_done` at the end.
+/// Refill and move copies until every partition has RF regular copies and `placement::plan` has
+/// no copy step left, or `opts.max_moves` refills and moves ran (#80 S4 T12). Each round reads
+/// the inventory again ([`inventory`]), so a run stopped part way resumes where the records are.
+/// A round first refills the lowest partition below RF onto [`refill_target`] through `db`'s
+/// [`Db::refill_in`] (A-R456 narrowed by the lead, 2026-11-21); with none below RF, it plans
+/// afresh and runs the plan's first copy step through [`Db::move_copy_in`]. Either is followed
+/// every [`MOVE_POLL`] until it answers `done`. A primary step is never run (Q4 a); the report
+/// names it `no_live_handoff`, and a partition below RF with no node to take a copy
+/// `no_refill_target`. Blocking: run it off any runtime thread. Logged `rebalance_refill` per
+/// refill, `rebalance_move` per move and `rebalance_done` at the end.
 ///
 /// # Errors
 ///
-/// The text of a failed inventory read, of a move refused for good (its `RetryRule` is
-/// `Definitive`) or given up, or of a move not done within [`MOVE_WITHIN`], naming the step.
+/// The text of a failed inventory read, of a refill or move refused for good (its `RetryRule`
+/// is `Definitive`) or given up, or of one not done within [`MOVE_WITHIN`], naming the step.
 pub fn rebalance(
     db: &Db,
     rt: &tokio::runtime::Handle,
@@ -133,13 +142,20 @@ pub fn rebalance(
     opts: &RebalanceOpts,
 ) -> Result<RebalanceReport, String> {
     let mut moved: Vec<Step> = Vec::new();
+    let mut refilled: Vec<(u32, u32)> = Vec::new();
     loop {
         let inventory = rt.block_on(inventory(store, &opts.draining))?;
-        let budget = opts.max_moves.saturating_sub(moved.len());
+        let budget = opts.max_moves.saturating_sub(moved.len() + refilled.len());
+        let refill = next_refill(&inventory);
+        if let Some((partition, Some(to))) = refill.filter(|_| budget > 0) {
+            run_refill(db, partition, to)?;
+            refilled.push((partition, to));
+            continue;
+        }
         let plan = placement::plan(&inventory, budget.max(1))
             .map_err(|error| format!("inventory: {error}"))?;
         let next = runnable(&inventory, &plan.steps);
-        match next.filter(|_| budget > 0) {
+        match next.filter(|_| budget > 0 && refill.is_none()) {
             Some(step) => {
                 run_move(db, step)?;
                 moved.push(step);
@@ -167,14 +183,37 @@ pub fn rebalance(
                         )
                     }
                 }));
+                residuals.extend(
+                    inventory
+                        .partitions
+                        .iter()
+                        .filter(|p| p.copies.len() < crate::admin::RF)
+                        .map(|p| {
+                            let why = if refill_target(&inventory, p.id).is_some() {
+                                "the budget ran out"
+                            } else {
+                                "no ok node without a copy sits on an unused machine"
+                            };
+                            format!(
+                            "no_refill_target: partition {} has {} of {} regular copies (copies: \
+                             {:?}): {why}",
+                            p.id,
+                            p.copies.len(),
+                            crate::admin::RF,
+                            p.copies
+                        )
+                        }),
+                );
                 let report = RebalanceReport {
                     moved,
+                    refilled,
                     residuals,
                     copy_skew: placement::copy_skew(&inventory),
                     primary_skew: placement::primary_skew(&inventory),
                 };
                 tracing::info!(
                     moved = report.moved.len(),
+                    refilled = ?report.refilled,
                     copy_skew = report.copy_skew,
                     primary_skew = report.primary_skew,
                     residuals = ?report.residuals,
@@ -208,11 +247,89 @@ fn runnable(inventory: &Inventory, steps: &[Step]) -> Option<Step> {
     None
 }
 
-/// Whether a move answer says the host gave the move up. Covers host.rs's three
-/// "the move of node A to node B was given up: ..." texts (`move_blocked`,
-/// `shadow_give_up_duty`, the catch-up bound), and no other "given up" text.
+/// Whether a move or refill answer says the host gave it up. Covers host.rs's three "the move
+/// of node A to node B was given up: ..." texts (`move_blocked`, `shadow_give_up_duty`, the
+/// catch-up bound) and its two "the refill of node T into partition P was given up: ..." texts
+/// (`shadow_give_up_duty`, the catch-up bound), and no other "given up" text.
 fn move_given_up(detail: &str) -> bool {
-    detail.contains("the move of node ") && detail.contains(" was given up: ")
+    (detail.contains("the move of node ") || detail.contains("the refill of node "))
+        && detail.contains(" was given up: ")
+}
+
+/// Where a partition below RF copies takes its next one: a node that is not draining, holds no
+/// copy of it, and sits on a machine none of its copies uses; of those, the one holding fewest
+/// copies, ties to the lowest id. Pure; `None` when no node qualifies.
+pub(crate) fn refill_target(inventory: &Inventory, partition: u32) -> Option<u32> {
+    let p = inventory.partitions.iter().find(|p| p.id == partition)?;
+    let machine = |id: u32| {
+        inventory
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.machine.as_str())
+    };
+    let used: BTreeSet<&str> = p.copies.iter().filter_map(|id| machine(*id)).collect();
+    let mut held: BTreeMap<u32, usize> = BTreeMap::new();
+    for q in &inventory.partitions {
+        for id in &q.copies {
+            *held.entry(*id).or_default() += 1;
+        }
+    }
+    inventory
+        .nodes
+        .iter()
+        .filter(|n| n.state == NodeState::Ok)
+        .filter(|n| !p.copies.contains(&n.id) && !used.contains(n.machine.as_str()))
+        .min_by_key(|n| (held.get(&n.id).copied().unwrap_or(0), n.id))
+        .map(|n| n.id)
+}
+
+/// The lowest partition in `inventory` with fewer than RF regular copies, with its
+/// [`refill_target`]. `None` when every partition has RF.
+fn next_refill(inventory: &Inventory) -> Option<(u32, Option<u32>)> {
+    inventory
+        .partitions
+        .iter()
+        .find(|p| p.copies.len() < crate::admin::RF)
+        .map(|p| (p.id, refill_target(inventory, p.id)))
+}
+
+/// Refill `partition` onto `to` through `db` until it answers `done`. Logged `rebalance_refill`.
+fn run_refill(db: &Db, partition: u32, to: u32) -> Result<(), String> {
+    let started = Instant::now();
+    let deadline = started + MOVE_WITHIN;
+    let mut last: String;
+    loop {
+        match db.refill_in(PartitionId(partition), NodeId(to)) {
+            Ok(answer) if answer.done => {
+                tracing::info!(
+                    partition,
+                    to,
+                    took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    line = %answer.line,
+                    "rebalance_refill"
+                );
+                return Ok(());
+            }
+            Ok(answer) => last = answer.line,
+            // Refused for good, or given up: the host says why once, and the next ask would
+            // start afresh.
+            Err(error) if error.retry == RetryRule::Definitive || move_given_up(&error.detail) => {
+                return Err(format!(
+                    "rebalance: the refill of partition {partition} onto node {to}: {}",
+                    error.detail
+                ));
+            }
+            Err(error) => last = error.detail,
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "rebalance: the refill of partition {partition} onto node {to} was not done \
+                 within {MOVE_WITHIN:?}; last: {last}"
+            ));
+        }
+        std::thread::sleep(MOVE_POLL);
+    }
 }
 
 /// Run `step`'s copy move through `db` until it answers `done`.
