@@ -125,9 +125,11 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// default. Default on: a bump to the next free number at that merge, or a capability bit that
 /// gates the re-add. Any change that weakens check A takes a bump.
 ///
-/// Issue #148 changes a type: the `TooLarge` error kind, which `WireApiError::kind` carries.
-/// Only the `Db` raises it, before it sends, so no node answers it today; the type changed all
-/// the same. Numbers are assigned at merge (lead rule, PR #178 review): a branch takes main's
+/// This branch changes three types for #147 and one for #148: `WireChange::Delete`,
+/// `WireLook::List` and `WireSeen::Objects` (the ordinary delete and the object list, each
+/// added last so earlier variants keep their numbers), and the `TooLarge` error kind, which
+/// `WireApiError::kind` carries. Only the `Db` raises `TooLarge`, before it sends, so no node
+/// answers it today; the type changed all the same. Numbers are assigned at merge (lead rule, PR #178 review): a branch takes main's
 /// version + 1, in a one-line commit just before it merges, so this branch reserves none. The
 /// value below is a placeholder until that commit sets it.
 pub const PROTOCOL_VERSION: u32 = 11;
