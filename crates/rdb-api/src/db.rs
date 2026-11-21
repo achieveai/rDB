@@ -15776,8 +15776,9 @@ mod tests {
     /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal `Failed` writes no
     /// marker, at once (a failed heal is not waited for), logs
     /// `os_boot_record_deferred{heal=failed}` and keeps the queued id; a later call with the
-    /// heal `Handed` writes the queued id once. Unit (~10 ms). Cut: `Failed` taken as done:
-    /// the marker is written, red.
+    /// heal `Handed` writes the queued id once: the file, overwritten after that write, is
+    /// left alone by the next call. Unit (~10 ms). Cuts: `Failed` taken as done: the marker is
+    /// written, red; the id kept after the write: the next call writes `boot-a` again, red.
     #[config_log::retcd_test]
     fn r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id() {
         const METHOD: &str = "r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id";
@@ -15802,10 +15803,18 @@ mod tests {
 
         *lock(&db.opened.heal) = HealState::Handed(R5_HANDED);
         db.record_os_boot(std::time::Instant::now());
-        db.record_os_boot(std::time::Instant::now());
         assert_eq!(
             std::fs::read_to_string(&marker).expect("the marker").trim(),
             "boot-a"
+        );
+        // Review round 3: a rewrite of the same bytes is caught too. A later ready answer
+        // writes nothing: the file is left as it is.
+        std::fs::write(&marker, "left alone").expect("overwrite");
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker"),
+            "left alone",
+            "written once"
         );
         assert!(
             lock(&db.opened.os_boot_record).is_empty(),
