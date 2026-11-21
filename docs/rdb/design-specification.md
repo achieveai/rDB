@@ -840,7 +840,7 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
 | `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
 
-`ADOPTION_REFUSALS` holds every reason, 11 in all. The first three are `NotReady`:
+`ADOPTION_REFUSALS` is the wire vocabulary: the 11 reasons a peer can decode. The first three are `NotReady`. Two more refusals sit outside it: check B's floor refusals `tail_has_no_floor` and `tail_history_read_failed` (#121). A reason outside the list is reported as `Unchecked`, so it never crosses the wire as `Refused`.
 
 | Reason | State | Meaning |
 |---|---|---|
