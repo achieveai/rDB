@@ -177,6 +177,12 @@ Anti-flake rules enforced across the suite (normative; a violation is rejected i
 - **Per-test JSONL.** Every test opens `#[config_log::retcd_test]`; every line it (or a node
   it spawns) emits carries `testModule`/`testMethod`/`testRun` and lands in
   `target/test-logs/<module>/<method>.jsonl`.
+  - *Narrow exception: rdb-api's own threads under an example binary's tests.* `Db::open`'s
+    node and sync threads enter the opener's span only in rdb-api's own test build
+    (`#[cfg(test)]` in `host.rs`), so under the tests of an example such as `rdb_node` their
+    lines land in the run's untagged file. Threads the example spawns itself still enter the
+    test's span. A row there asserts only on lines from its own threads. Lifting the gate is a
+    library change (PR #171 review).
 - **DuckDB assertions, not eyeballing.** Log-based test assertions query that JSONL through
   `config_testkit::logs::query()`, and an empty result where rows are expected is itself a
   test failure (`assert_nonempty`), never a silent pass.
