@@ -2626,8 +2626,9 @@ const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
 ///
 /// R5: while a regular copy is still unknown, [`leave_out`] is asked, at most every
 /// [`LEAVE_OUT_EVERY`], whether the heal may go on without it. Its first answer and each change
-/// of it are logged once: `heal_proceed_without` per partition when it may,
-/// `heal_wait_all{reason}` while it may not. `rooted` and `forming` are the members each of the
+/// of it are logged once per attempt (each [`heal_retrying`] attempt logs its own first):
+/// `heal_proceed_without` per partition when it may, `heal_wait_all{reason}` while it may not.
+/// `rooted` and `forming` are the members each of the
 /// heal's partitions pins, by partition, in `ctx.partitions` and `ctx.bootstrap` order.
 async fn member_boots(
     ctx: &HealCtx,
