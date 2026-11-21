@@ -1286,18 +1286,18 @@ above comes back by itself once its link is back:
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
 - **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
+  it, and then on every node. A build without it can speak the same wire version, so nothing
+  refuses the pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
   older build. The re-add itself needs a partition that takes writes. But if the partition goes
   read-only before that copy has caught up, such a copy does not mark the landing it refuses,
   and the partition can then stay read-only until that copy's node restarts. A build older than
   check B can also be left holding a lineage with a hole in it, which nothing refuses
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Some builds without these guards speak protocol 9 (main at
-  1eb3fe0 has neither), and the version alone cannot tell them apart. #148 moves the version
-  again, to the number its merge commit sets. Turning it on by default first needs a protocol
-  bump that no such build shares (the next free number at that merge), or a capability bit
-  that gates the re-add, so a node without these guards is refused or never re-added live
+- **Before it can be on by default.** Some builds without these guards speak the same protocol
+  version as builds with them (main at 1eb3fe0 has neither), and the version alone cannot tell
+  them apart. Each merge that changes a wire type sets the next version in its merge commit.
+  Turning it on by default first needs a protocol bump that no such build shares, or a
+  capability bit that gates the re-add, so a node without these guards is refused or never re-added live
   (ADR-rdb-0009 section 7). Until then it stays off by default.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
@@ -1569,8 +1569,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9 (#148 moves it, to the number its merge
-  commit sets), and the handshake refuses any other version.
+  as undecodable. Its node protocol version is the one its merge commit sets
+  (`PROTOCOL_VERSION`), and the handshake refuses any other version.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
