@@ -28,6 +28,14 @@ const PARTITIONS: u32 = 4;
 const PIN: AffinityId = AffinityId(0x5150);
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// `RETCD_TEST_DEADLINE_SCALE`, default 1.
+fn scale() -> u32 {
+    std::env::var("RETCD_TEST_DEADLINE_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse().ok())
+        .unwrap_or(1)
+}
+
 struct World {
     db: Arc<Db>,
     async_db: AsyncDb,
@@ -47,6 +55,15 @@ fn world(ack_floor: bool) -> World {
 
 /// [`world`] with dedup cap `dedup_cap` (the default when `None`).
 fn world_with(ack_floor: bool, dedup_cap: Option<usize>) -> World {
+    world_retaining(ack_floor, dedup_cap, None)
+}
+
+/// [`world_with`] with dedup retention `dedup_retention` (the default when `None`).
+fn world_retaining(
+    ack_floor: bool,
+    dedup_cap: Option<usize>,
+    dedup_retention: Option<Duration>,
+) -> World {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -62,7 +79,7 @@ fn world_with(ack_floor: bool, dedup_cap: Option<usize>) -> World {
         hold: Vec::new(),
         timeouts: Timeouts::default(),
         dedup_cap,
-        dedup_retention: None,
+        dedup_retention,
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
@@ -798,5 +815,58 @@ fn sbx_147_s_write_as_replays_in_its_scope_and_is_isolated_from_another() {
         assert_ne!(other.ok.seq, first.ok.seq, "C's n=5 is its own request");
         assert_eq!(value(&c, 1, b"doc").await, Some(b(b"C1")));
         assert_eq!(value(&a, 1, b"doc").await, Some(b(b"A1")));
+    });
+}
+
+/// PR #178 review r1 T10: delete prefix pages on, stops at a refused batch with what it counted,
+/// and a rerun finishes the rest. 1,300 documents are two list pages (`MAX_PAGE` is 1,000). With
+/// no ack floor every answer holds a dedup slot for the retention, and the cap leaves room for
+/// the setup's 6 transactions and 5 delete packs: page 1's four and page 2's first. So the first
+/// run is `OVERLOADED` after more than one page, counting what it emptied. Once the retention
+/// frees the slots, a rerun deletes exactly the rest, and nothing is left. Cuts: stop after
+/// page 1 (`full` ignored), and the first run answers `Ok(1000)`; report the stop with 0
+/// deleted, and the count is 0. Integration (~10-20 s): one database open and one retention.
+#[config_log::retcd_test]
+fn sbx_147_t_a_stopped_delete_prefix_counts_its_pages_and_a_rerun_finishes() {
+    const DOCS: usize = 1_300;
+    let setup = DOCS.div_ceil(255);
+    let retention = Duration::from_secs(4) * scale();
+    let w = world_retaining(false, Some(setup + 5), Some(retention));
+    let [a, ..] = w.pinned();
+    w.on(async {
+        for pack in (0..DOCS).collect::<Vec<_>>().chunks(255) {
+            let puts = pack
+                .iter()
+                .map(|i| ScopedWrite {
+                    id: Bytes::from(format!("d{i:04}")),
+                    value: b(b"v"),
+                    if_version: None,
+                })
+                .collect();
+            a.txn(0, puts, DEADLINE).await.expect("setup transaction");
+        }
+        let stopped = a
+            .delete_prefix(0, Bytes::new(), DEADLINE)
+            .await
+            .expect_err("the cap stops it on page 2");
+        assert_eq!(stopped.error.error.kind, ErrorKind::Overloaded, "{stopped}");
+        let first = stopped.deleted;
+        assert!(first > 1_000 && first < DOCS as u64, "first run counted {first}");
+        let listed = a.list(0, Bytes::new(), None, MAX_PAGE).await.expect("list");
+        assert_eq!(listed.entries.len() as u64, DOCS as u64 - first, "count matches the store");
+        let until = Instant::now() + retention * 4 + Duration::from_secs(10);
+        let rest = loop {
+            match a.delete_prefix(0, Bytes::new(), DEADLINE).await {
+                Ok(rest) => break rest,
+                Err(e) if e.error.error.kind == ErrorKind::Overloaded && Instant::now() < until => {
+                    assert_eq!(e.deleted, 0, "a refused rerun empties nothing: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("rerun: {e}"),
+            }
+        };
+        assert_eq!(first + rest, DOCS as u64, "the rerun counts exactly the rest");
+        let listed = a.list(0, Bytes::new(), None, MAX_PAGE).await.expect("list");
+        assert!(listed.entries.is_empty(), "{} left", listed.entries.len());
     });
 }
