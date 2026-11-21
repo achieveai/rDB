@@ -6,8 +6,10 @@
 **Extends:** [ADR-rdb-0023](0023-node-records-ring-placement-one-node-per-machine.md) (ring
 placement: which partitions a lost host owned or held a copy of) and
 [ADR-rdb-0007](0007-fenced-grants-and-epochs.md) (the grant that fences a dead owner).
-**Issue:** #80 slice S3 (failover). Slice S4 (membership) adds its own sections, marked below.
-Owner rulings Q1 (15 s) and B-1 option (a) (the silent class).
+**Issue:** #80 slice S3 (failover) and slice S4 (membership: adding and removing a data node).
+Owner rulings Q1 (15 s) and B-1 option (a) (the silent class); for S4, Q3 (a) (a removed node
+is a `Removed` record, never deleted; ids are never reused) and R8-7 (K counts live records
+plus ids still linked).
 
 ## Context
 
@@ -85,9 +87,72 @@ Owner rulings Q1 (15 s) and B-1 option (a) (the silent class).
    old boot's frozen grant (`planner_frozen_grant_cleared`, #81 X2), so it can be promoted
    again by a later failover.
 
-<!-- S4 (membership, dev-s4): layout 3, the start check, the N-3 mixed-version rule (remove a
-node only after every node and app runs the S4 build), the R8-7 ruling and one change at a
-time. Add them here as Decision items 6 onward. -->
+6. **A removed node is a record, not a deletion (`nodes/` layout 3).** Removing node N
+   rewrites its `nodes/{N}` record once, to layout 3. Layout 3 is layout 2's fields plus one
+   state byte; `1` means removed, and any other value does not decode. The record keeps the
+   node's app address, so `route` and `leader_of` still read it. Live records stay layout 1
+   or 2. `NodeRecord::encode_removed` writes layout 3 and `NodeRecord::decode_removed` reads
+   it. `NodeRecord::decode` and `decode_with_app` return nothing for it.
+
+7. **Ids are never reused.** `admin::add_node` takes the next id above the highest id of all
+   records, removed ones included (`admin::read_removed_nodes`). So a removed id is never
+   handed out again, and 8 ids is the lifetime limit of one database, not the live limit.
+
+8. **Every reader skips a removed record, and an open on one is refused.** One removed
+   record must not break readers of the whole list. So:
+   - the `nodes/` watcher (`read_nodes_at`) leaves a removed node out, and every running node
+     drops it from its live members;
+   - `Db::open`, an app open and an `rdb_node` start read the other nodes as before;
+   - opening a database as a removed node is refused, naming it:
+     "node N was removed; ids are never reused".
+
+   Any other record that does not decode still fails the whole list, as before.
+
+9. **Every node reports its membership revision (`members_revision`).** `NodeStatus` carries
+   `members_revision`: the `nodes/` revision this node's membership watcher last applied
+   (`Net::members_revision`). It is empty before the first list, or in a process with no
+   `Net`. The membership check (item 11) reads it.
+
+10. **Adding that field moved the protocol version.** Link frames are positional postcard:
+    fields are read in order, with no names and no tags. So a field cannot be added to
+    `WireNodeStatus` without breaking an older reader. The new field is last, and
+    `PROTOCOL_VERSION` moved. The link handshake refuses a peer at any other version, so a
+    node of an older build cannot link to one of this build.
+
+11. **A membership change waits until membership is settled (`admin::membership_settled`,
+    S-3).** The checked calls are `admin::remove_member` and `admin::add_member`. Each runs
+    `admin::membership_settled`, then `admin::remove_node` or `admin::add_node`. An app that
+    embeds `rdb_api` calls these two. `remove_node` and `add_node` are store-only and skip the
+    check.
+    - `membership_settled` sends every live member a fresh status request
+      (`Db::fresh_looks`), each answered within the caller's `within` (the rows pass 500 ms).
+      Each must report a `members_revision` at or above the newest `nodes/` mod revision,
+      removed records included. So one membership change runs at a time.
+    - Otherwise it refuses, writing nothing, and names the first member that blocks: one
+      below the newest revision, one that reports none, or one that does not answer ("has
+      sent no status since its boot").
+    - A member named in `unreachable_ok` is not asked: the operator says it is dead. It must
+      be upgraded before it restarts. An older build cannot read layout 3, so its open fails
+      on the removed record.
+
+    Why the check needs no version field of its own: a build without layout 3 fails its whole
+    `nodes/` list on one removed record. A status answered over a link proves the member runs
+    this build, because the handshake refuses any other protocol version.
+
+12. **What `remove_node` refuses.** It writes nothing, in this order, when there is no
+    formation record; when N is already removed ("node N is already removed; ids are never
+    reused"); when N is not a live member; when fewer than 3 distinct live machines would be
+    left (N-2, `MIN_MACHINES`); or when a `partitions/` record names N owner or pins a copy on
+    it ("node N is still pinned by partitions [...]: run admin drain N first"). Then it writes
+    one CAS at the revision it read. It lists `partitions/` again afterwards and logs
+    `remove_node_still_pinned` for any record that pins N (a move that committed in between,
+    S-2).
+
+<!-- TODO (S4, not yet built): the R8-7 count of K (live records plus ids still linked) and
+`set_members` closing a retired node's links; the start check (S-4: removed ids in `--peers`
+skipped, a node's own removed id refused); the embedded `Db`'s terminal `Removed` state
+(S-5); the commit-time pin refusal; drain; rebalance; the `rdb_dev` verbs and their
+`--unreachable-ok` flag; the `scripts/docker-multihost.sh` commands. -->
 
 ## Consequences
 
@@ -117,7 +182,21 @@ time. Add them here as Decision items 6 onward. -->
     other copies are also down, restarting that host does not bring the partition back; it
     returns when one of its other copies returns. See #168 and #172.
 
-<!-- S4 (membership, dev-s4): the consequences of adding and removing a node go here. -->
+- **Removing a node is one more reason the whole cluster upgrades together.** The S4
+  protocol bump means an older node cannot link, and an older build cannot read layout 3.
+  See `docs/rdb/embed.md`, "Known limits in this release", the bullet "This build's upgrade is
+  one-way, and the whole cluster stops and restarts together". That includes apps:
+  `membership_settled` asks data nodes only, so it cannot catch an older app. Upgrade every
+  node and app before removing a node (N-3).
+- **A dead node blocks a membership change until the operator says it is dead**
+  (`unreachable_ok`). That node must then be upgraded before it restarts.
+- **Ids run out.** Ids are never reused and the limit is 8, so a database can see at most 8
+  nodes over its whole life. Replacing a host is "add a new node, remove the old one", and
+  each replacement uses an id.
+- **A removed node keeps the shared `rdb` rEtcd principal** (Q5 b). Only rDB links refuse
+  it. It could still write control records.
+
+<!-- TODO (S4): rebalance after an add, drain before a remove, and the copy-skew limit. -->
 
 ## Verification
 
@@ -207,7 +286,39 @@ cleared.
 - Evidence: `/data/gb_build_temp_data/tmp/team/t1-multihost/s4a/t6e/` (`d1.txt`, `load.*`,
   `wall.*`, the `logs-*` captures).
 
-<!-- S4 (membership, dev-s4): the membership rows go here. -->
+### Membership rows (#80 S4)
+
+Each was shown red under a source cut first, then green.
+
+In `crates/rdb-api/src/db/s80s4_tests.rs`:
+
+- `s80s4_node_record_layout_3_round_trips_and_keeps_the_app_address` (unit). Cut: the state
+  byte ignored; red at "state byte 0".
+- `s80s4_an_open_on_a_removed_record_is_refused_and_route_keeps_its_app_address`. Cut: no
+  removed check; red "not a node record this build reads".
+- `s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working` (five
+  processes). Cut: `read_nodes_at` refuses layout 3; red "node 1 drops removed node 5".
+- `s80s4_a_nodes_status_reports_its_members_revision_and_it_moves_after_an_add` (five
+  processes). Node 1's look at node 2 over its link names node 2's members revision, and
+  after `add_node` it reaches `nodes/6`'s revision. Cut: `WireNodeStatus::from` sends
+  nothing; red "node 2's status over the wire names its members revision".
+- `s80s4_membership_changes_refuse_until_every_live_node_has_applied_the_last` (five
+  processes). Cut: any reported revision is current; red "node 3's held watcher blocks".
+- `s80s4_a_remove_is_refused_while_a_live_member_has_sent_no_status_since_its_boot` (five
+  processes, through `remove_member`). Cut: an unanswered request is current; red "node 4's
+  silence refuses the remove".
+
+In `crates/rdb-api/src/admin/membership/tests.rs`:
+
+- `s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_machines`
+  (unit). Cut: no pin check; red "refused, not Ok(..)".
+
+Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
+`PROTOCOL_VERSION` instead of pinning a number, because the bump changed what it pinned.
+
+<!-- TODO (S4): rows for K shrinking, a removed node's refused links, the `Removed` Db state,
+the removed-own-id start refusal, rebalance, drain, and the Docker add d6 / remove d2 run
+(D2). -->
 
 ## References
 
@@ -218,4 +329,9 @@ cleared.
 - `crates/rdb-api/src/host.rs`: `DropClock`, `PEER_DROP_AFTER_MILLIS`,
   `UNREACHABLE_DROP_AFTER_MILLIS`, `DROP_CHECK_EVERY_MILLIS`.
 - `docs/rdb/embed.md`, section 4, "When a host is lost: automatic failover".
-- Issues #80 (S3), #81 (C1, V10, X2), #168, #169, #172, #176, #177.
+- `crates/rdb-api/src/admin/membership.rs` (S4): `add_member`, `remove_member`,
+  `membership_settled`, `add_node`, `remove_node`, `MIN_MACHINES`; `admin::read_removed_nodes`.
+- `crates/rdb-core/src/authority/node.rs` (S4): `NodeRecord::encode_removed`,
+  `NodeRecord::decode_removed`.
+- `crates/rdb-api/src/net/mod.rs` (S4): `PROTOCOL_VERSION`, `Net::members_revision`.
+- Issues #80 (S3, S4), #81 (C1, V10, X2), #168, #169, #172, #176, #177.

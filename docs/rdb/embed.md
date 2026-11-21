@@ -530,8 +530,40 @@ back, and restarts each one.
   restarts. Writes came back within 7.3 s for an owner's partitions and 10.6 s for a copy's.
   Each restarted node's frozen grant was cleared about 1 s after it restarted. Load was 2 to 3.
 
-<!-- S4 (membership, dev-s4): adding and removing a node goes here, with its limits: layout 3,
-the start check, the N-3 mixed-version rule, the R8-7 ruling, one change at a time. -->
+### Adding and removing a node
+
+Call `admin::add_member` to add a data node and `admin::remove_member` to remove one. Each
+checks membership first, then writes. `admin::add_node` and `admin::remove_node` write
+without the check; do not call them from an app.
+
+<!-- TODO (S4): the `rdb_dev` verbs and the `scripts/docker-multihost.sh` commands, and the
+order "add, restart apps, rebalance". -->
+
+**What a remove does.** Removing node N marks its record removed. It is never deleted.
+Every running node drops N from its members. `route` still knows N's app address.
+
+**Ids are never reused.** The next node added gets an id above every id ever used, removed
+ones included. A database has 8 ids for its whole life. Replacing a host means adding a new
+node and removing the old one, and it uses an id.
+
+**A removed node cannot come back.** Opening the database as a removed node is refused:
+"node N was removed; ids are never reused". Start a new node instead.
+
+**One change at a time, and every node must answer.** Before it writes anything, the check
+asks every live node for a fresh status, within the time you pass (`within`). Each must
+answer and must have seen the latest membership change. If one does not, the change is
+refused and names it. If that node is dead, name it in `unreachable_ok`. Upgrade that node
+before you restart it: an older build cannot read the removed record and refuses to open.
+
+**A remove is refused** when node N is already removed, is not a live member, would leave
+fewer than 3 distinct machines, or still owns or holds a copy of a partition ("run admin
+drain N first").
+
+<!-- TODO (S4): drain, rebalance, and the pin refusal at commit. -->
+
+**Upgrade the whole cluster first, apps included.** This is the same one-way, whole-cluster
+upgrade as in "Known limits in this release" ("This build's upgrade is one-way ..."). The S4
+protocol bump is one more reason for it.
 
 ### Fencing your own side effects
 
@@ -1467,10 +1499,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   `scripts/docker-multihost.sh`'s Docker proof (#80 S2), each container on its own IP, all on
   one physical host. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
-  Copies are uneven by up to 3 per node when K does not divide P. Still missing: adding or
-  removing a node. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node process started
-  on a folder of a database that was neither formed nor declared is still refused with
-  "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
+  Copies are uneven by up to 3 per node when K does not divide P. A node can be added and
+  removed (section 4, "Adding and removing a node"). Ids are never reused, so a database has
+  8 node ids for its whole life. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node
+  process started on a folder of a database that was neither formed nor declared is still
+  refused with "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
   of a declared database is refused: its node processes form it.
 - **A copy missed while the database is first formed never joins.** This happens when a node's
   report misses the first discovery window, for example when the host stalls during `lr up`.
@@ -1563,9 +1596,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  as undecodable. Its node protocol version is `rdb_api::net::PROTOCOL_VERSION`, and the
+  handshake refuses any other version, so nodes on different builds never link.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
-  such a tail at upgrade time may need `admin forget-tail` once.
+  such a tail at upgrade time may need `admin forget-tail` once. The S4 protocol bump, which
+  came with adding and removing a node, is one more reason the whole cluster upgrades together.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);
