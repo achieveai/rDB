@@ -894,7 +894,8 @@ Never hand-edit a record in a live store.
 `rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
 `admin route G` prints `route group G partition P owner node N token G.E addr ADDRESS`
-(`addr none` when no address is recorded). The address is shown with each control character
+(`addr none` when the owner's record holds no address, or when no read of that owner's
+address has succeeded yet in this `Db`, so `addr none` does not prove that none is recorded). The address is shown with each control character
 and backslash escaped (`\r`, `\n`, `\u{1b}`, `\\`), and each Unicode line separator and bidi
 control as a visible escape (`\u{2028}`, `\u{202e}`), so it stays on one line in its stored
 order;

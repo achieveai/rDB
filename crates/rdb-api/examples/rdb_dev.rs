@@ -3251,8 +3251,10 @@ fn where_line(db: &Db, group: rdb_api::AffinityId) -> String {
 }
 
 /// `admin route G` (#83): `Db::route`'s answer, the partition and the owner and token its record
-/// names, and the owner's app address (`addr none` when it registered none), or
-/// `err admin route G: <why>`. The address is the app's own bytes, so it is shown through
+/// names, and the owner's app address, or `err admin route G: <why>`. `addr none` when the
+/// owner registered none, or when no read of the owner's address has succeeded yet in this
+/// `Db` (a failed read serves the last good address, and before any there is none), so it
+/// does not prove that no address is recorded. The address is the app's own bytes, so it is shown through
 /// [`console_safe`]: a stored CR, LF or ESC cannot start a forged line or drive the terminal.
 fn route_line(db: &Db, group: rdb_api::AffinityId) -> String {
     match db.route(group) {
