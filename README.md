@@ -186,7 +186,8 @@ Anti-flake rules enforced across the suite (normative; a violation is rejected i
     example spawns enters the test's span only where the row hands it over, as the V10 rows do;
     `s1b_four_declared_node_processes_run_on_one_machine` does not, so its `Db::open` lines are
     untagged too. A row asserts only on lines from threads it put in its span. Lifting either
-    gap is a library change (PR #171 review).
+    gap is a library change (PR #171 review; follow-up
+    [#200](https://github.com/achieveai/rDB/issues/200)).
 - **DuckDB assertions, not eyeballing.** Log-based test assertions query that JSONL through
   `config_testkit::logs::query()`, and an empty result where rows are expected is itself a
   test failure (`assert_nonempty`), never a silent pass.
