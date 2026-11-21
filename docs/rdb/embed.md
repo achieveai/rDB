@@ -793,18 +793,20 @@ record. Use it to send a request to the right node.
     can leave the address out.
   - **A new or emptied folder fences.** A node folder with no data yet, new or emptied to
     rejoin, has lost any such file, so an earlier folder's write may still apply. Its open
-    first writes a third file, `app-addr-fence`, before the node's data is created, and the
-    open then fences the record: given an app address, it writes that address even if the
-    record already holds it; given none, it writes the record's own bytes back, which changes
+    first writes another file, `app-addr-fence`, before the node's data is created, the same
+    way: `app-addr-fence.new` first, then renamed (a crash before the rename can leave
+    `app-addr-fence.new` behind, and the next such open overwrites it). The open then fences
+    the record: given an app address, it writes that address even if the record already
+    holds it; given none, it writes the record's own bytes back, which changes
     nothing in it but moves its revision on. Either way no earlier write can apply after it,
     and the address the record held stays. The file is removed only once the fence is
     written, so an open that fails after the node's data was created leaves it, and the next
     open on that folder fences too. You need not supply the address for this: an open with
     none fences on its own. Supply it only when an open refuses for `app-addr-pending`
     (above).
-  - **Leave these files alone.** `app-addr-pending`, `app-addr-pending.new` and
-    `app-addr-fence` are the only files this writes in the folder, besides what an open
-    already creates.
+  - **Leave these files alone.** `app-addr-pending`, `app-addr-pending.new`,
+    `app-addr-fence` and `app-addr-fence.new` are the only four files this writes in the
+    folder, besides what an open already creates.
 - An open is also refused, with nothing started, when the record changed after it read it,
   even to the same bytes. The declaration, another process that claims the node, or a
   delayed write of an earlier open of this node can change it, and the open cannot tell

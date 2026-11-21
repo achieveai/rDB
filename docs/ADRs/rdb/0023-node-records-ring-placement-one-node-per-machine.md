@@ -162,8 +162,10 @@
      damaged fences the same, and one that is there but cannot be read refuses the open with
      a step that keeps it. A node folder with no data yet (new, or emptied to rejoin) has lost
      any marker an earlier folder held, so its open fences too (PR #159 review r3): before the
-     engine creates the node's data, the open writes `app-addr-fence` durably, and only a
-     fence removes it, so an open that fails after the data exists still leaves the next open
+     engine creates the node's data, the open writes `app-addr-fence` durably, the same way
+     as the marker (`app-addr-fence.new` written, synced and renamed into place; a crash
+     before the rename can leave `app-addr-fence.new` behind, and the next such open
+     overwrites it), and only a fence removes it, so an open that fails after the data exists still leaves the next open
      fencing. Given an app address, the fence is that address's write; given none, it is the
      record's own bytes written back at the revision they were read at, which moves the
      revision on and changes nothing else. So a no-address rejoin on an emptied folder needs
@@ -171,8 +173,9 @@
      An open given no app address while the marker is there cannot tell which address should
      win, so the marker refuses it (above), and the operator opens again with the address the
      node should hold. Each refusal says whether the outcome is known and keeps the store
-     error. The two marker files and `app-addr-fence` are the only files this writes in the
-     folder, besides what an open already creates.
+     error. `app-addr-pending`, `app-addr-pending.new`, `app-addr-fence` and
+     `app-addr-fence.new` are the only four files this writes in the folder, besides what an
+     open already creates.
    - **Reads and checks.** `NodeRecord::decode` reads both node layouts as the declared fields
      alone, and `NodeRecord::decode_with_app` also returns the app address. The declared
      fields are what every check compares: the start check decodes them; declaring a formed

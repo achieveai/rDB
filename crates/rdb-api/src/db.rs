@@ -1026,7 +1026,10 @@ fn mark_app_addr_pending(dir: &Path, revision: u64) -> Result<(), OpenError> {
 /// node's copy new or emptied, before its engine creates any data, and removed only once an
 /// open has fenced. An emptied folder has lost any [`APP_ADDR_PENDING_FILE`] an earlier folder
 /// held, so a write that folder sent may still apply; and an open that fails after the engine
-/// has created data must not leave the next open thinking the folder settled. Leave it alone.
+/// has created data must not leave the next open thinking the folder settled. It is written as
+/// `app-addr-fence.new` first, synced, then renamed ([`write_marker`]), so a crash before the
+/// rename can leave `app-addr-fence.new` behind, and the next such open overwrites it. Leave
+/// both alone.
 pub(crate) const APP_ADDR_FENCE_FILE: &str = "app-addr-fence";
 
 /// Whether [`APP_ADDR_FENCE_FILE`] is there. One that is there and cannot be looked at refuses
