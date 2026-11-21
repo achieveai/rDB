@@ -550,6 +550,41 @@ fn a_stale_delete_leaves_a_later_uploads_chunks() {
     assert_eq!(under(&k, &root), 3, "the new upload's chunks survive");
 }
 
+/// PR #178 review r2 T22: a set of 255 members is one more record than a request deletes. After
+/// one batch it reads as a smaller set: kind `Set`, its count equal to the members read, each
+/// one of the original members. Then the delete finishes with nothing left. Cut:
+/// `partial_delete` answers `None` for a set: red, `CountMismatch`.
+#[test]
+fn a_set_part_deleted_reads_as_a_smaller_set() {
+    use rdb_value::collection::members;
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"set");
+    for from in (0..255).step_by(200) {
+        let s = k.snapshot();
+        let expected = s
+            .version(Namespace::User, root.as_bytes())
+            .map_or(Expected::Absent, Expected::Version);
+        let ops: Vec<_> = (from..(from + 200).min(255)).map(|i| ElemOp::Add(int(i))).collect();
+        let made = compile_collection(&s, &root, CollectionKind::Set, expected, &ops).unwrap();
+        k.commit(&made);
+    }
+    let batch = delete_object(&k.snapshot(), &root, None).unwrap().unwrap();
+    k.commit_any_order(&batch);
+    let read = members(&k.snapshot(), &root, None, 1_000);
+    let page = read.unwrap_or_else(|e| panic!("after one batch the set reads back: {e:?}"));
+    assert_eq!(page.collection.kind, CollectionKind::Set);
+    assert!(page.members.len() < 255, "the batch removed members");
+    assert!(!page.members.is_empty(), "and left some");
+    assert_eq!(page.collection.count, page.members.len() as u64);
+    let original: Vec<_> = (0..255).map(int).collect();
+    for member in &page.members {
+        assert!(original.contains(&member.key), "{:?} is an original member", member.key);
+        assert_eq!(member.value, None, "a set member has no value");
+    }
+    finish_delete(&mut k, &root);
+    assert_eq!(under(&k, &root), 0);
+}
+
 /// PR #178 review r2 T5: a list of three items with 255 upload chunks under it. The first batch
 /// removes the items; the rest delete the chunks, guarded by the root, and keep the empty list's
 /// own records to the last batch. After every batch the list reads and a push compiles; then
