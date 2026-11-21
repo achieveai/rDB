@@ -1014,3 +1014,149 @@ fn t61_s3_r4b_a_caught_up_release_resets_the_count_and_the_give_up() {
         "only caught_up resets"
     );
 }
+
+/// A host over a node holding generation 1 of seqs 1-3, synced through 3, with no boot pin and a
+/// retention that would trim to the head (keep 0, budget 0): only a hold keeps its floor at 0.
+fn trimmable_host(
+    path: &std::path::Path,
+    rt: &tokio::runtime::Runtime,
+    plant: impl FnOnce(&mut RocksEngine),
+) -> Host {
+    {
+        let mut engine = RocksEngine::open(path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 3);
+        synced(&mut engine, Generation(1), 3);
+        plant(&mut engine);
+    }
+    let mut host = host_over(path, rt);
+    host.inventory_pins.clear();
+    host.history_retention = HistoryRetention {
+        keep_millis: 0,
+        budget_bytes: 0,
+    };
+    host
+}
+
+/// One round on `host` must answer `Held(hold)` and leave every lineage's floor where it was.
+fn assert_held(host: &mut Host, hold: RetentionHold) {
+    let floors = |host: &Host| -> Vec<(Generation, Seq)> {
+        host.engine
+            .lineages()
+            .into_iter()
+            .filter(|(p, _)| *p == P)
+            .map(|(_, g)| (g, host.engine.floor_seq(P, g)))
+            .collect()
+    };
+    let before = floors(host);
+    let now = host.clock.now();
+    let round = host.retention_round(P, now.plus_millis(1));
+    assert!(
+        matches!(round, Ok(RetentionDecision::Held(held)) if held == hold),
+        "{hold:?}: {round:?}"
+    );
+    assert_eq!(floors(host), before, "{hold:?} leaves the floor");
+}
+
+/// Issue #61 S3 (design 3.1, "No trim while"): a lineage left mid full copy holds the floor,
+/// `Held(Staging)`. The copy is cut at its last key batch, as a crash leaves it.
+/// Cut: the staging check skipped, red. Unit, planted.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_s3_a_staging_lineage_holds_the_floor() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trimmable_host(&dir.path().join("node"), &rt, |engine| {
+        engine.inject_fault(rdb_storage::InjectedFault::CopyBatch);
+        engine
+            .inherit(P, Generation(1), Generation(2), Seq(2))
+            .expect_err("the copy batch fails");
+        assert!(engine.staging(P, Generation(2)).is_some(), "left staging");
+    });
+    assert_held(&mut host, RetentionHold::Staging);
+}
+
+/// Issue #61 S3 (design 3.1): a snapshot install begun on this node holds the floor,
+/// `Held(Installing)`. It is begun on the running host's engine: a reopen does not keep a
+/// half-done install's lineage.
+/// Cut: the installing check skipped, red. Unit, planted.
+#[config_log::retcd_test]
+fn t61_s3_an_install_in_progress_holds_the_floor() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trimmable_host(&dir.path().join("node"), &rt, |_| {});
+    host.engine
+        .install_begin(P, Generation(2), Seq(3))
+        .expect("the install begins");
+    assert_held(&mut host, RetentionHold::Installing);
+}
+
+/// Issue #61 S3 (design 3.1): a link sync awaited for the partition holds the floor,
+/// `Held(LandingPending)`.
+/// Cut: the landing check skipped, red. Unit, planted.
+#[config_log::retcd_test]
+fn t61_s3_a_pending_landing_holds_the_floor() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trimmable_host(&dir.path().join("node"), &rt, |_| {});
+    host.link_pending.insert((P, Generation(1)), Vec::new());
+    assert_held(&mut host, RetentionHold::LandingPending);
+}
+
+/// Issue #61 S3 (design 3.1): F1 running a recovery on this node holds the floor,
+/// `Held(Recovering)`. Node 3 restarts, so node 1's F1 re-plans; the round is taken while it is
+/// in a phase other than `Idle`, `Committed` or `Rebuilding`, with keep 0 and budget 0.
+/// Cut: the recovering check skipped, red.
+/// Integration (~2 s): bootstrap and node 3's restart.
+#[config_log::retcd_test]
+fn t61_s3_a_running_recovery_holds_the_floor() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), no_duty);
+    trio.bootstrap();
+    trio.ready();
+    restart_three(&mut trio, dir.path(), no_duty);
+    trio.until("node 1's F1 runs a recovery", |trio| {
+        let phase = trio.nodes[0].0.recoveries.get(&P).map(Recovery::phase)?;
+        (!matches!(
+            phase,
+            RecoveryPhase::Idle | RecoveryPhase::Committed | RecoveryPhase::Rebuilding
+        ))
+        .then_some(())
+    });
+    let host = &mut trio.nodes[0].0;
+    host.history_retention = HistoryRetention {
+        keep_millis: 0,
+        budget_bytes: 0,
+    };
+    assert_held(host, RetentionHold::Recovering);
+}
+
+/// Issue #61 S3 (lead ruling R24): a second `Recovered` in the open grace's generation keeps
+/// that grace's start. Node 1's bootstrap grace is planted back to tick 1, so a reset would
+/// show; a repeat of its generation must leave it there and log no second
+/// `history_grace_begun`.
+/// Cut: the same-generation repeat resets the start, red. Integration (~1 s): bootstrap.
+#[config_log::retcd_test]
+fn t61_s3_r24_a_repeat_recovered_in_the_same_generation_keeps_the_grace_start() {
+    const METHOD: &str =
+        "t61_s3_r24_a_repeat_recovered_in_the_same_generation_keeps_the_grace_start";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), no_duty);
+    trio.bootstrap();
+    trio.ready();
+    let first = trio.status(0).recovered.expect("bootstrap committed");
+    let host = &mut trio.nodes[0].0;
+    let state = host
+        .retention
+        .get_mut(&P)
+        .expect("node 1's retention state");
+    assert_eq!(state.grace.map(|(g, _)| g), Some(first), "node 1's grace");
+    state.grace = Some((first, Tick(1)));
+    host.begin_grace(P, first);
+    assert_eq!(
+        host.retention[&P].grace,
+        Some((first, Tick(1))),
+        "the repeat keeps the start"
+    );
+    assert_eq!(logged!(METHOD, "history_grace_begun").len(), 1);
+    assert!(logged!(METHOD, "history_grace_ended").is_empty());
+}
