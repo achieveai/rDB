@@ -476,16 +476,18 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     - **Protocol 10, the owner's setting on the wire** (#170, not on this build): a peer on an
       older build, or with the setting off, can leave a re-added partition read-only until that
       copy restarts.
-    - **A re-add shadow that is never promoted** (M3 exit): nothing gives up on it and nothing
-      is logged; the partition keeps writing with its other copies, and the copy stays a
-      shadow.
+    - **A re-add shadow that is never promoted** (M3 exit): while the owner still has a link to
+      it, nothing gives up on a shadow that stalls and nothing is logged; the partition keeps
+      writing with its other copies, and the copy stays a shadow. A shadow the owner has no
+      link to is different: the owner logs `move_shadow_unreachable`, and after its drop clock
+      (10 s) gives the shadow up, re-plans without it and logs `move_given_up`.
     - **Flatten off the owner's thread** (storage): adoption's flatten runs on the owner's
       thread, so a re-add after a long drop can pause the owner's other partitions while it
       flattens.
     - **The WAL watchdog against a frozen process** (storage): how the watchdog treats a
       process that was frozen and resumed is not yet checked; treat a watchdog fault after a
       freeze as this case.
-    - **Check B at adoption** (#121) and **the #81 failover row** (own81_X2): with automatic
+    - **Check B at adoption** (#121) and **the #81 failover row**: with automatic
       failover on, those paths are not yet proven together with live re-add.
     - **R4, the 512-partition walk**: the cost of many re-adds at once is not measured; expect
       pauses on a node with many partitions blipped together.
