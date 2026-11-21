@@ -502,9 +502,23 @@ impl Net {
             Label::App(_) => None,
         };
         let members: BTreeSet<NodeId> = live.iter().copied().chain(own).collect();
-        let (added, linked) = {
+        // #80 S4 (B-2): the members are set before any link is closed, so a retired node's
+        // dial back is refused by `refusal` and the dial loop here stops dialling it.
+        let changed = {
+            let mut held = lock(&shared.members);
+            let changed = *held != members;
+            held.clone_from(&members);
+            changed
+        };
+        let (added, retired, linked) = {
             let mut routes = lock(&shared.routes);
             let mut added = Vec::new();
+            let retired: Vec<u32> = routes
+                .keys()
+                .filter(|node| !members.contains(node))
+                .map(|node| node.0)
+                .collect();
+            routes.retain(|node, _| members.contains(node));
             for node in members.iter().filter(|node| Some(**node) != own) {
                 if !routes.contains_key(node) {
                     routes.insert(
@@ -525,14 +539,21 @@ impl Net {
                 .filter(|(_, route)| route.conn.is_some())
                 .map(|(node, _)| *node)
                 .collect();
-            (added, linked)
+            (added, retired, linked)
         };
-        let changed = {
-            let mut held = lock(&shared.members);
-            let changed = *held != members;
-            held.clone_from(&members);
-            changed
-        };
+        // Never under the routes lock: `close` takes it.
+        let stale: Vec<Arc<Conn>> = lock(&shared.conns)
+            .values()
+            .filter(|conn| matches!(conn.peer, Label::Node(node) if !members.contains(&node)))
+            .cloned()
+            .collect();
+        for conn in &stale {
+            close(
+                shared,
+                conn,
+                "not a live member: its nodes/ record is removed",
+            );
+        }
         shared.members_revision.store(revision, Ordering::Relaxed);
         let k = members.union(&linked).count();
         if let Some(guard) = shared.clock.guard() {
@@ -541,10 +562,26 @@ impl Net {
                 guard.attach(k);
             }
         }
-        if changed || !added.is_empty() {
+        if changed || !added.is_empty() || !retired.is_empty() {
             let live: Vec<u32> = members.iter().map(|node| node.0).collect();
-            tracing::info!(revision, live = ?live, added = ?added, k, "net_members_set");
+            tracing::info!(
+                revision, live = ?live, added = ?added, retired = ?retired, closed = stale.len(),
+                k, "net_members_set"
+            );
         }
+    }
+
+    /// The nodes this process holds an open link to, whatever its routes say: the
+    /// connections themselves, for rows (#80 S4).
+    #[cfg(test)]
+    pub(crate) fn linked_peers(&self) -> BTreeSet<NodeId> {
+        lock(&self.shared.conns)
+            .values()
+            .filter_map(|conn| match &conn.peer {
+                Label::Node(node) => Some(*node),
+                Label::App(_) => None,
+            })
+            .collect()
     }
 
     /// The live members this process takes links from ([`Self::set_members`]).
@@ -1503,6 +1540,11 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        // #80 S4: a retired node is not dialled; it would be refused at its first frame anyway.
+        if !lock(&shared.members).contains(&node) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);

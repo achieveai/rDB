@@ -811,3 +811,87 @@ fn s80s4_a_remove_is_refused_while_a_live_member_has_sent_no_status_since_its_bo
         "nodes/6 is layout 3"
     );
 }
+
+/// M8 links half and M9 shrink (#80 S4, B-2): five nodes run; node 6 is added, opens and links
+/// to all five, and K is 6. `admin::remove_node(6)` writes `nodes/6` removed (node 6 holds no
+/// copy). Then every node of 1 to 5 drops node 6 from its members, holds no link up to it, and
+/// its clock guard's K is 5 again; and node 6's link to node 1 ends and its dials back are
+/// refused "not a live member". Integration (six node processes).
+///
+/// Cut: `Net::set_members` leaves a retired node's links open: "not within 5s: node 1 holds no
+/// link to removed node 6" (its connection, `Net::linked_peers`, not its route), red, observed
+/// 2026-11-21 at load 40-44.
+#[config_log::retcd_test]
+fn s80s4_a_removed_node_loses_its_links_and_k_shrinks() {
+    let (mut rig, six) = five_ready();
+    rig.rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("node 6 is added");
+    for n in 1..=5 {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} admits node 6"),
+            Duration::from_secs(10),
+            || net.members().contains(&ADDED),
+        );
+    }
+    certs::issue_node(&rig.cert_dir, ADDED).expect("node 6's certificate");
+    let all = rig.addrs.clone();
+    let store = Arc::clone(&rig.store);
+    let proc = open_node(&rig, store, ADDED, six, &all);
+    rig.procs.push(proc);
+    let six_net = Arc::clone(&rig.of(ADDED).net);
+    rig.rt
+        .block_on(six_net.wait_up(
+            &(1..=5).map(NodeId).collect::<Vec<_>>(),
+            crate::host::test_patience(Duration::from_secs(10)),
+        ))
+        .expect("node 6 links to nodes 1 to 5");
+    let guard = |n: u32| {
+        rig.of(NodeId(n))
+            .db
+            .clock
+            .guard()
+            .expect("a node's clock has a guard")
+            .cluster_k()
+    };
+    until("node 1's K counts node 6", Duration::from_secs(10), || {
+        guard(1) == 6
+    });
+
+    rig.rt
+        .block_on(admin::remove_node(&rig.store, ADDED))
+        .expect("node 6 is removed");
+    let five: BTreeSet<NodeId> = (1..=5).map(NodeId).collect();
+    for n in 1..=5 {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} drops removed node 6"),
+            Duration::from_secs(10),
+            || net.members() == five,
+        );
+        until(
+            &format!("node {n} holds no link to removed node 6"),
+            Duration::from_secs(5),
+            || {
+                !matches!(net.states().get(&ADDED), Some(LinkState::Up(_)))
+                    && !net.linked_peers().contains(&ADDED)
+            },
+        );
+        until(
+            &format!("node {n}'s K is 5 again"),
+            Duration::from_secs(5),
+            || guard(n) == 5,
+        );
+    }
+    until(
+        "node 6's dial back to node 1 is refused as not a live member",
+        Duration::from_secs(10),
+        || {
+            matches!(
+                six_net.states().get(&NodeId(1)),
+                Some(LinkState::Refused(reason)) if reason.contains("not a live member")
+            )
+        },
+    );
+}
