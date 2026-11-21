@@ -3776,6 +3776,206 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
     assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
 }
 
+/// The info-level bytes a write costs, summed over every node's lines (#158 ruling 3): `rdb_node`
+/// logs at info in production, and at ~4.8 KB a write a node at 500 writes/s filled ~210 GB a day.
+const INFO_BYTES_PER_WRITE: usize = 300;
+
+/// The writes the burst makes, after the warm-up, one at a time: each is its own batch, the
+/// worst case for per-batch lines.
+const BURST: usize = 200;
+
+/// A log line's size as the production file holds it: the per-test layer adds `testModule`,
+/// `testMethod` and `testRun`, which `rdb_node`'s file never carries.
+fn production_line_bytes(line: &serde_json::Value) -> usize {
+    let mut line = line.clone();
+    if let Some(fields) = line.as_object_mut() {
+        for test_field in ["testModule", "testMethod", "testRun"] {
+            fields.remove(test_field);
+        }
+    }
+    serde_json::to_string(&line).expect("a JSON line").len() + 1
+}
+
+/// Whether a line is at Information or above. Read from `@l`, not from what the test filter let
+/// through: the per-test layer records rdb's debug lines too.
+fn at_info_or_above(line: &serde_json::Value) -> bool {
+    matches!(
+        line["@l"].as_str(),
+        Some("Information" | "Warning" | "Error" | "Fatal")
+    )
+}
+
+/// The writes of one burst through `db` into `group`, after a warm-up: the info-level bytes per
+/// write, all nodes' lines counted, and every line the burst logged at any level.
+fn burst_info_bytes(method: &str, db: &Db, group: AffinityId) -> (usize, Vec<serde_json::Value>) {
+    // Warm-up: the first writes land while the partition finishes recovering, which logs state
+    // changes that are not the per-write cost.
+    for i in 0..5 {
+        put_lands(db, group, format!("warm{i}").as_bytes(), b"v");
+    }
+
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    for i in 0..BURST {
+        put_lands(db, group, format!("k{i}").as_bytes(), b"v");
+    }
+    let mut lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let burst = lines.split_off(before);
+
+    let mut by_event: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut total = 0;
+    for line in burst.iter().filter(|line| at_info_or_above(line)) {
+        let bytes = production_line_bytes(line);
+        total += bytes;
+        let event = line["@m"].as_str().unwrap_or("?").to_owned();
+        let entry = by_event.entry(event).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+    let per_write = total / BURST;
+    let mut top: Vec<(String, (usize, usize))> = by_event.into_iter().collect();
+    top.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    top.truncate(12);
+    // Printed whether or not it passes, so a run records the measured cost.
+    eprintln!(
+        "{method}: {per_write} info bytes per write over {BURST} writes ({total} in all); {top:?}"
+    );
+    assert!(
+        per_write < INFO_BYTES_PER_WRITE,
+        "{per_write} info bytes per write over {BURST} writes ({total} in all, 3 nodes); \
+         bound {INFO_BYTES_PER_WRITE}. Top events (lines, bytes): {top:?}"
+    );
+    (per_write, burst)
+}
+
+/// #158: a steady stream of writes to a 3-node database costs under [`INFO_BYTES_PER_WRITE`]
+/// bytes of info-level log per write, all three nodes' lines counted. Per-write and per-batch
+/// lines are debug; info carries state changes and faults. Integration (~5 s): a formation, then
+/// [`BURST`] writes to one owner's partition.
+/// Cut: any per-write event moved back to info (for example `publication_fact`, `reply` or
+/// `batch_commit`) puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let db = rig.of(owner);
+    let group = group_of(db, partition);
+    burst_info_bytes(METHOD, db, group);
+}
+
+/// Review r1 (PR #182): the bound row above writes through the owner's own handle, so the wire
+/// path is not measured. Here every write goes through another node's handle to the owner over
+/// the network; the bound holds the same. Control: the burst logged a debug
+/// `net_client_request` for each write, so the writes really crossed the wire.
+/// Integration (~5 s): a formation, then [`BURST`] writes through a node that does not own the
+/// partition.
+/// Cut: `net_client_request` back at info puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_remote_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_remote_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let via = NodeId(owner.0 % 3 + 1);
+    let db = rig.of(via);
+    let group = group_of(db, partition);
+    let (_, burst) = burst_info_bytes(METHOD, db, group);
+    let requests: Vec<_> = burst
+        .iter()
+        .filter(|line| line["@m"] == "net_client_request")
+        .collect();
+    assert!(
+        requests.len() >= BURST,
+        "{} net_client_request lines for {BURST} writes from node {} to owner {}",
+        requests.len(),
+        via.0,
+        owner.0
+    );
+    for line in &requests {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
+}
+
+/// `refused` stale-version puts through the owner of a fresh rig, then its shutdown, which
+/// summarises the open refusal window. The info-level bytes they cost, all nodes counted, and
+/// the lines among them (`refusal_first`, `refusal_summary`, and what else the refused writes
+/// logged at info). Left out: the shutdown's own lifecycle lines, and the control link's
+/// `control_*` lines, which the rEtcd watch logs on its own schedule whether or not anything is
+/// written (6 `control_watch_backoff` lines, ~1.8 KB, in each phase on 2026-11-21).
+fn refused_info_bytes(method: &str, refused: usize) -> (usize, Vec<(String, usize)>) {
+    let mut rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let group = group_of(rig.of(owner), partition);
+    put_lands(rig.of(owner), group, b"stale", b"v");
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    for _ in 0..refused {
+        let error = rig
+            .of(owner)
+            .put_in(group, b"stale", b"w", Some(1_000_000))
+            .expect_err("a stale version is refused");
+        assert!(error.error.no_mutation, "{error:?}");
+    }
+    let during = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    rig.shutdown_all();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let counted: Vec<(String, usize)> = lines[before..]
+        .iter()
+        .enumerate()
+        .filter(|(i, line)| {
+            at_info_or_above(line)
+                && !line["@m"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("control_"))
+                && (before + i < during || line["@m"] == "refusal_summary")
+        })
+        .map(|(_, line)| {
+            (
+                line["@m"].as_str().unwrap_or("?").to_owned(),
+                production_line_bytes(line),
+            )
+        })
+        .collect();
+    (counted.iter().map(|(_, bytes)| bytes).sum(), counted)
+}
+
+/// Review r2 (PR #182), the question whether the 300 B budget covers refusals. It is a budget
+/// per steady-state write, and refusals in steady state are well inside it: 200 refused writes
+/// in one window cost one `refusal_first` and one `refusal_summary`, a few bytes each. An
+/// isolated refusal costs those same two lines, about 700 B, by design (#158 option B): the
+/// first says what is refused, and the summary's count is what makes the debug lines add up.
+/// Measured and printed both ways. Integration (~6 s): two rigs, one refused write, then 200.
+/// Cut: a refusal logged at info one line each (the `client_compile` or `reply` at info) puts
+/// the repeated case over the bound.
+#[config_log::retcd_test]
+fn r158_refused_writes_cost_one_first_and_one_summary_at_info() {
+    const METHOD: &str = "r158_refused_writes_cost_one_first_and_one_summary_at_info";
+    let (isolated, isolated_lines) = refused_info_bytes(METHOD, 1);
+    let (repeated, repeated_lines) = refused_info_bytes(METHOD, BURST);
+    eprintln!(
+        "{METHOD}: isolated {isolated} B {isolated_lines:?}; {BURST} repeated {repeated} B, \
+         {} B each {repeated_lines:?}",
+        repeated / BURST
+    );
+    for lines in [&isolated_lines, &repeated_lines] {
+        let names: Vec<&str> = lines.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["refusal_first", "refusal_summary"],
+            "a refusal at info is its first and its window's summary: {lines:?}"
+        );
+    }
+    assert!(
+        repeated / BURST < INFO_BYTES_PER_WRITE,
+        "{repeated} B for {BURST} refused writes"
+    );
+    assert!(isolated < 1_000, "{isolated} B for one refused write");
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 

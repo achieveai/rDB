@@ -13,7 +13,15 @@
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
 //!          [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
+//! every form: [--log-max-mb M] [--log-files N]
 //! ```
+//!
+//! * `--log-dir` is where the JSONL log goes (default `.`), as `rdb_node-N.jsonl`. It rotates
+//!   by size (#158): before a write would take it past `--log-max-mb` (default 256), it becomes
+//!   `rdb_node-N.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at
+//!   least 2) files are kept, the live one included. `--log-max-mb 0` never rotates. A second
+//!   process writing the same log is refused at start (exit 2). At info a node logs state
+//!   changes and faults, not each write; `RUST_LOG` sets the filter.
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
@@ -128,6 +136,10 @@ struct Args {
     faults: Option<PathBuf>,
     stop_file: Option<PathBuf>,
     log_dir: Option<PathBuf>,
+    /// `--log-max-mb`; `None` is `SizeRotation::DEFAULT`'s, 0 never rotates (#158).
+    log_max_mb: Option<u64>,
+    /// `--log-files`; `None` is `SizeRotation::DEFAULT`'s.
+    log_files: Option<usize>,
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
@@ -176,6 +188,7 @@ const USAGE: &str = "usage:
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
            [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
            [--live-readd]
+  every form: [--log-max-mb M] [--log-files N] (default 256 MiB x 8 files; M = 0 never rotates)
   --faults F: a file of lines, each one of
            hold N | hold all | drop-request N | drop-reply N | cut-control | mute
 ";
@@ -279,6 +292,20 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--faults" => args.faults = Some(value("--faults")?.into()),
             "--stop-file" => args.stop_file = Some(value("--stop-file")?.into()),
             "--log-dir" => args.log_dir = Some(value("--log-dir")?.into()),
+            "--log-max-mb" => {
+                args.log_max_mb = Some(
+                    value("--log-max-mb")?
+                        .parse()
+                        .map_err(|_| "--log-max-mb takes whole megabytes".to_owned())?,
+                );
+            }
+            "--log-files" => {
+                args.log_files = Some(
+                    value("--log-files")?
+                        .parse()
+                        .map_err(|_| "--log-files takes a file count".to_owned())?,
+                );
+            }
             "--nodes" => {
                 let k: u32 = value("--nodes")?
                     .parse()
@@ -538,6 +565,13 @@ fn run(
     let mut config = config_log::LogConfig::for_application("rdb_node");
     config.dir.clone_from(&log_dir);
     config.file_name = format!("{name}.jsonl");
+    config.rotate = match config_log::SizeRotation::from_flags(args.log_max_mb, args.log_files) {
+        Ok(rotate) => rotate,
+        Err(e) => {
+            eprintln!("rdb_node: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let guard = match start_logging(config) {
         Ok(guard) => guard,
         Err(e) => {

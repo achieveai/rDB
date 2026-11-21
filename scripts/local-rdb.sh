@@ -64,7 +64,9 @@
 #   drop-reply N    the N-th client call is served and its answer lost
 #   cut-control N   node N's rEtcd calls fail Unavailable and its watches end
 # Every client call is logged `net_client_request{n, client, request}` in that node's log, so a
-# discovery run finds N before a fault run names it.
+# discovery run finds N before a fault run names it. That line is debug under target
+# `rdb_api::net::request` (#158), so nodes start with RUST_LOG=info,rdb_api::net::request=debug;
+# set RUST_LOG to override.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
 # config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
@@ -286,6 +288,7 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
     # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
+    RUST_LOG="${RUST_LOG:-info,rdb_api::net::request=debug}" \
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
