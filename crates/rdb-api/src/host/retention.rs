@@ -26,8 +26,9 @@
 
 use super::*;
 use rdb_core::replication::retention::{
-    cap_seq, retention_floor, RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
-    HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
+    cap_seq, needs_history_budget, overrun_action, retention_floor, OverrunAction,
+    RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
+    HISTORY_BUDGET_GIVE_UP_CLEARED, HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
 };
 
 /// How often the retention duty runs.
@@ -67,6 +68,28 @@ pub(crate) struct RetentionState {
     pub(crate) behind: BTreeSet<CopyId>,
     /// The open grace: the generation whose `Recovered` began it, and when.
     pub(crate) grace: Option<(Generation, Tick)>,
+    /// Per copy, the overruns in a row of its transfers from this node (issue #61 S3-R4 (b),
+    /// owner ruling 2026-11-20, option 1): one more each time the cap ends one
+    /// `budget_overran`, reset by any round for the copy that is not an overrun: a `caught_up`
+    /// release, or a round whose floor stays at or below its open transfer's pin. A held round
+    /// decides no floor, so it neither counts nor resets. The simulator's `overruns` is its twin.
+    pub(crate) overruns: BTreeMap<CopyId, u32>,
+    /// Per copy this node stopped offering at [`OverrunAction::GiveUp`]: the budget and the
+    /// generation in force then, and the overruns counted. Named in `NodeStatus::needs_operator`
+    /// until a caught-up release, a raised budget or a newer generation clears it (lead ruling
+    /// R27).
+    pub(crate) given_up: BTreeMap<CopyId, GivenUp>,
+}
+
+/// A copy this node gave up offering snapshots to (issue #61 S3-R4 (b)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GivenUp {
+    /// `history_budget_bytes` in force at the give-up: a higher one clears it.
+    pub(crate) budget_bytes: u64,
+    /// The generation of the round that gave up: a newer one clears it.
+    pub(crate) generation: Generation,
+    /// The overruns in a row that gave up.
+    pub(crate) attempts: u32,
 }
 
 impl Host {
@@ -105,6 +128,7 @@ impl Host {
         now: Tick,
     ) -> Result<RetentionDecision, String> {
         let generation = self.newest_held(partition).ok_or("no_lineage")?;
+        self.clear_give_ups(partition, generation);
         let prev = self.engine.floor_seq(partition, generation);
         let applied = Seq(self.engine.buffered_applied(partition, generation).0);
         let own_durable = self.engine.durable(partition, generation);
@@ -170,13 +194,35 @@ impl Host {
                 );
             }
         }
+        // A round within budget for a copy's open transfer ends its run of overruns (lead
+        // ruling 2026-11-21): the owner's three are consecutive.
+        for (copy, _) in served.iter().filter(|(_, at)| *at >= floor.floor) {
+            state.overruns.remove(copy);
+        }
         for (copy, at) in served.iter().filter(|(_, at)| *at < floor.floor) {
+            let state = self.retention.entry(partition).or_default();
+            let attempts = state.overruns.entry(*copy).or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            let attempts = *attempts;
+            let gave_up = overrun_action(attempts) == OverrunAction::GiveUp;
+            if gave_up {
+                state.given_up.insert(
+                    *copy,
+                    GivenUp {
+                        budget_bytes: settings.budget_bytes,
+                        generation,
+                        attempts,
+                    },
+                );
+            }
             tracing::warn!(
                 node = self.node.0,
                 partition = partition.0,
                 copy = copy.0,
                 pin = at.0,
                 floor = floor.floor.0,
+                attempts,
+                gave_up,
                 "{HISTORY_BUDGET_OVERRAN_PIN}"
             );
             self.end_transfer(
@@ -185,6 +231,16 @@ impl Host {
                 "budget_overran",
                 "snapshot_transfer_abandoned",
             );
+            if gave_up {
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    attempts,
+                    needs_operator = %needs_history_budget(*copy, self.node, attempts),
+                    "history_budget_gave_up"
+                );
+            }
         }
         if floor.floor > prev {
             self.trim_history_through(partition, floor.floor)?;
@@ -297,6 +353,73 @@ impl Host {
             return false;
         }
         true
+    }
+
+    /// Clear every give-up of `partition` the round at `generation` no longer stands by (lead
+    /// ruling R27): `history_budget_bytes` is now higher than at the give-up (`budget_raised`,
+    /// the operator's remedy, which works without a restart), or the generation is newer
+    /// (`new_generation`, a new plan). The count goes with it, logged
+    /// [`HISTORY_BUDGET_GIVE_UP_CLEARED`], so the copy's next ask is offered again. A lower or
+    /// equal budget clears nothing. The simulator's `clear_give_ups` is its twin.
+    fn clear_give_ups(&mut self, partition: PartitionId, generation: Generation) {
+        let budget_bytes = self.history_retention.budget_bytes;
+        let node = self.node.0;
+        let Some(state) = self.retention.get_mut(&partition) else {
+            return;
+        };
+        let cleared: Vec<_> = state
+            .given_up
+            .iter()
+            .filter_map(|(copy, given)| {
+                if generation > given.generation {
+                    Some((*copy, "new_generation", *given))
+                } else if budget_bytes > given.budget_bytes {
+                    Some((*copy, "budget_raised", *given))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (copy, why, given) in cleared {
+            state.given_up.remove(&copy);
+            state.overruns.remove(&copy);
+            tracing::info!(
+                node,
+                partition = partition.0,
+                copy = copy.0,
+                why,
+                budget_was = given.budget_bytes,
+                budget = budget_bytes,
+                generation_was = given.generation.0,
+                generation = generation.0,
+                "{HISTORY_BUDGET_GIVE_UP_CLEARED}"
+            );
+        }
+    }
+
+    /// A caught-up release of `copy` on `partition`: its run of overruns starts again and a
+    /// give-up of it ends (owner ruling 2026-11-20, option 1).
+    pub(super) fn overruns_caught_up(&mut self, partition: PartitionId, copy: CopyId) {
+        if let Some(state) = self.retention.get_mut(&partition) {
+            state.overruns.remove(&copy);
+            state.given_up.remove(&copy);
+        }
+    }
+
+    /// The give-up of `copy` on `partition`, if this node stopped offering it snapshots.
+    pub(super) fn given_up(&self, partition: PartitionId, copy: CopyId) -> Option<GivenUp> {
+        self.retention
+            .get(&partition)
+            .and_then(|state| state.given_up.get(&copy))
+            .copied()
+    }
+
+    /// `NodeStatus::needs_operator`'s text for the first copy of `partition` this node gave up
+    /// on ([`needs_history_budget`]).
+    pub(super) fn needs_history_budget(&self, partition: PartitionId) -> Option<String> {
+        let state = self.retention.get(&partition)?;
+        let (copy, given) = state.given_up.iter().next()?;
+        Some(needs_history_budget(*copy, self.node, given.attempts))
     }
 
     /// A `Recovered` of `generation` stepped into R1 here: when it leaves this node a primary,

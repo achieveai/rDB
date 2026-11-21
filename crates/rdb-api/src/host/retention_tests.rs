@@ -3,6 +3,7 @@
 use super::catchup_tests::{regular_rejoin, restart_three};
 use super::trio::{current_thread, host_over, logged, write_chain, Trio};
 use super::*;
+use rdb_core::contracts::errors::RetryRule;
 use rdb_core::replication::retention::{RetentionDecision, RetentionHold};
 
 const P: PartitionId = PartitionId(1);
@@ -680,4 +681,324 @@ fn t61_s3_a_grace_on_a_node_with_no_primary_ends_no_primary() {
         .map(|line| line["why"].clone())
         .collect();
     assert_eq!(ends, ["no_primary"]);
+}
+
+/// Ask node 1 to serve copy `three` a snapshot at node 1's head, as R1 does for a copy past the
+/// trim. Answers whether a transfer is open for it afterwards.
+fn offer_snapshot(trio: &mut Trio, three: CopyId) -> bool {
+    let head = trio.head().expect("node 1 holds a head");
+    let site = Site {
+        partition: P,
+        correlation: CorrelationId(u64::MAX),
+    };
+    let host = &mut trio.nodes[0].0;
+    assert_eq!(
+        host.kernel(
+            ModuleName::Replication,
+            &KernelEffect::SnapshotCatchupRequired {
+                copy: three,
+                barrier: Seq(head),
+            },
+            site,
+            &[],
+            &StepFences::default(),
+        ),
+        Ok(())
+    );
+    host.transfers.contains_key(&(P, three))
+}
+
+/// One put through node 1, then wait until node 1 is durable through the new head. A refusal
+/// that wrote nothing and may be retried (a protection pause under a loaded host, say) is sent
+/// again, within the trio's patience; any other answer fails the row.
+fn put_durable(trio: &mut Trio, request: u64) {
+    let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+    loop {
+        match trio.ask(super::seal_tests::put(request, b"k", 5_000)) {
+            Answer::Txn { .. } => break,
+            Answer::Error { error, .. }
+                if error.no_mutation
+                    && !matches!(
+                        error.retry,
+                        RetryRule::Definitive | RetryRule::Quarantine | RetryRule::NotWired
+                    )
+                    && Instant::now() < deadline =>
+            {
+                trio.step();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            answer => panic!("put {request}: {answer:?}"),
+        }
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 1 is durable through the put", |trio| {
+        let host = &trio.nodes[0].0;
+        let generation = host.newest_held(P)?;
+        (host.engine.durable(P, generation).0 >= head).then_some(())
+    });
+}
+
+/// Node 1's overruns in a row for `copy`.
+fn overruns_of(trio: &Trio, copy: CopyId) -> u32 {
+    trio.nodes[0]
+        .0
+        .retention
+        .get(&P)
+        .and_then(|state| state.overruns.get(&copy).copied())
+        .unwrap_or(0)
+}
+
+/// Issue #61 S3-R4 (b) (owner ruling 2026-11-20, option 1; lead rulings R27 and 2026-11-21):
+/// node 1 gives up offering copy 3 after three overruns **in a row**, and clears the give-up when
+/// the budget rises. Node 3 is held after the trio's first three puts and node 1's grace ends.
+/// With `history_budget_bytes` = 0, each overrun is: an offer opens a transfer at the head, one
+/// put moves the head past it, and the round's cap passes the pin.
+///
+/// 1. Overrun, overrun (count 2), then a round within budget: the open transfer's pin is at the
+///    floor, and the count resets to 0. One more overrun is count 1, and the next ask is
+///    re-offered: a transfer opens.
+/// 2. That transfer overruns (count 2). Then a held round (an inventory pin, planted) with the
+///    head past the pin: no floor is decided, so the count stays 2. Its next unheld round is
+///    the third overrun in a row: `history_budget_gave_up` once, and `NodeStatus::needs_operator`
+///    carries `needs_history_budget`. The next ask is refused `snapshot_catchup_given_up`, and
+///    no transfer opens.
+/// 3. The budget rises: the next round logs `history_budget_give_up_cleared{why = budget_raised}`,
+///    `needs_operator` clears, and the next ask opens a transfer. Healed, copy 3 is caught up
+///    from it. (The caught-up reset of a count above 0 is
+///    `t61_s3_r4b_a_caught_up_release_resets_the_count_and_the_give_up`: a further put here
+///    holds copy 3 out long enough, on a loaded host, for the owner to drop it.)
+///
+/// Cuts: no reset on a within-budget round, red (step 1 gives up); a held round counts, red
+/// (step 2 gives up at the held round); a held round resets, red (step 2 never gives up); no
+/// give-up gate on the offer, red (step 2's ask opens a transfer); no `budget_raised` clear, red
+/// (step 3 is still given up). Integration (~5 s): bootstrap, nine puts and a heal.
+#[config_log::retcd_test]
+fn t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises() {
+    const METHOD: &str =
+        "t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises";
+    let dir = config_testkit::fs::temp_dir();
+    // L1 at the spec's ages, not `fast_pause`'s: copy 3 is held for the whole row, and a pause
+    // under a loaded host lets the owner re-plan it out of the configuration
+    // (`snapshot_catchup_unserved{reason = copy_not_in_config}`), which no offer survives.
+    let mut trio = Trio::new(dir.path(), |host| {
+        Trio::fast(host);
+        host.restart_shadow = false;
+        host.next_retention = Tick(u64::MAX);
+        host.inventory_pin_millis = 0;
+    });
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    rounds_until(&mut trio, "node 1's grace ends", |host| {
+        grace_of(host).is_none()
+    });
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), P)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    trio.nodes[0].0.history_retention = HistoryRetention {
+        keep_millis: u64::MAX,
+        budget_bytes: 0,
+    };
+    let mut request = 4;
+    let mut overrun = |trio: &mut Trio, expect: u32, what: &str| {
+        if !trio.nodes[0].0.transfers.contains_key(&(P, three)) {
+            assert!(offer_snapshot(trio, three), "{what}: a transfer opens");
+        }
+        put_durable(trio, request);
+        request += 1;
+        let round = floor_round(trio, what);
+        assert!(round.overran_pins.len() == 1, "{what}: {round:?}");
+        assert_eq!(overruns_of(trio, three), expect, "{what}");
+    };
+
+    // 1. Overrun, overrun, within budget, overrun: still re-offered.
+    overrun(&mut trio, 1, "overrun 1");
+    overrun(&mut trio, 2, "overrun 2");
+    assert!(offer_snapshot(&mut trio, three), "a transfer at the head");
+    let within = floor_round(&mut trio, "the round within budget");
+    assert!(within.overran_pins.is_empty(), "{within:?}");
+    assert_eq!(overruns_of(&trio, three), 0, "a round within budget resets");
+    overrun(&mut trio, 1, "overrun after the reset");
+    assert!(offer_snapshot(&mut trio, three), "re-offered after count 1");
+
+    // 2. Overrun, a held round, overrun: the third in a row gives up.
+    overrun(&mut trio, 2, "overrun 2 again");
+    assert!(offer_snapshot(&mut trio, three), "re-offered after count 2");
+    put_durable(&mut trio, 100);
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    let now = trio.clock.now();
+    let host = &mut trio.nodes[0].0;
+    host.inventory_pin_millis = 600_000;
+    host.inventory_pins.insert(
+        P,
+        InventoryPin {
+            generation,
+            since: now,
+        },
+    );
+    assert_eq!(
+        host.retention_round(P, now),
+        Ok(RetentionDecision::Held(RetentionHold::InventoryPinned))
+    );
+    assert_eq!(
+        overruns_of(&trio, three),
+        2,
+        "a held round neither counts nor resets"
+    );
+    let host = &mut trio.nodes[0].0;
+    host.inventory_pins.remove(&P);
+    host.inventory_pin_millis = 0;
+    let third = floor_round(&mut trio, "the third overrun in a row");
+    assert_eq!(third.overran_pins.len(), 1, "{third:?}");
+    assert_eq!(overruns_of(&trio, three), 3);
+    let needs = rdb_core::replication::retention::needs_history_budget(three, NodeId(1), 3);
+    assert_eq!(trio.status(0).needs_operator, Some(needs.clone()));
+    let gave_up: Vec<_> = logged!(METHOD, "history_budget_gave_up")
+        .into_iter()
+        .map(|line| (line["copy"].clone(), line["needs_operator"].clone()))
+        .collect();
+    assert_eq!(gave_up, [(three.0.into(), needs.into())], "once");
+    assert!(!offer_snapshot(&mut trio, three), "given up: no transfer");
+    assert_eq!(logged!(METHOD, "snapshot_catchup_given_up").len(), 1);
+
+    // 3. A raised budget clears the give-up; the caught-up release resets the count.
+    trio.nodes[0].0.history_retention.budget_bytes = u64::MAX;
+    let _ = floor_round(&mut trio, "the round at the raised budget");
+    let cleared: Vec<_> = logged!(METHOD, "history_budget_give_up_cleared")
+        .into_iter()
+        .map(|line| line["why"].clone())
+        .collect();
+    assert_eq!(cleared, ["budget_raised"]);
+    assert_eq!(trio.status(0).needs_operator, None);
+    assert!(offer_snapshot(&mut trio, three), "offered again");
+    trio.links.heal_all();
+    let past = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applies the head after the heal", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= past)
+            .then_some(())
+    });
+    trio.until("copy 3's transfer is released caught up", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(P, three))).then_some(())
+    });
+    assert_eq!(overruns_of(&trio, three), 0);
+}
+
+/// Issue #61 S3-R4 (b) (lead ruling R27): a give-up recorded in an older generation is cleared
+/// by the first round in a newer one, logged `history_budget_give_up_cleared{why =
+/// new_generation}`, with its count. The give-up is planted at generation 0 on a host holding
+/// generation 1; making one for real and then re-planning takes a failover (the simulator's
+/// `t61_sim_s3_r4b_a_new_generation_clears_the_give_up` does). A give-up at the same generation
+/// and budget stands.
+///
+/// Cut: no `new_generation` clear, red (the give-up stands). Unit.
+#[config_log::retcd_test]
+fn t61_s3_r4b_a_newer_generation_clears_a_give_up() {
+    const METHOD: &str = "t61_s3_r4b_a_newer_generation_clears_a_give_up";
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 3);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    host.history_retention.budget_bytes = 1_000;
+    let given = |generation| super::retention::GivenUp {
+        budget_bytes: 1_000,
+        generation,
+        attempts: 3,
+    };
+    let state = host.retention.entry(P).or_default();
+    state.given_up.insert(CopyId(1), given(Generation(1)));
+    state.given_up.insert(CopyId(2), given(Generation(0)));
+    state.overruns.insert(CopyId(2), 3);
+    let now = host.clock.now();
+    assert!(host.retention_round(P, now).is_ok());
+    let state = &host.retention[&P];
+    assert_eq!(
+        (
+            state.given_up.keys().copied().collect::<Vec<_>>(),
+            state.overruns.get(&CopyId(2))
+        ),
+        (vec![CopyId(1)], None),
+        "only the older generation's give-up is cleared"
+    );
+    let cleared: Vec<_> = logged!(METHOD, "history_budget_give_up_cleared")
+        .into_iter()
+        .map(|line| (line["copy"].clone(), line["why"].clone()))
+        .collect();
+    assert_eq!(cleared, [(2.into(), "new_generation".into())]);
+}
+
+/// Issue #61 S3-R4 (b) (owner ruling 2026-11-20, option 1): a caught-up release of a copy,
+/// `end_transfer(.., "caught_up", ..)` as `CopyCaughtUp` calls it, resets that copy's count
+/// and ends its give-up, whether or not a transfer is open; another copy's stays. The count
+/// and give-up are planted on a host holding generation 1.
+///
+/// Cut: no reset on a caught-up release, red (copy 2's count stays). Unit.
+#[config_log::retcd_test]
+fn t61_s3_r4b_a_caught_up_release_resets_the_count_and_the_give_up() {
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        write_chain(&mut engine, Generation(1), 3);
+    }
+    let rt = current_thread();
+    let mut host = host_over(&path, &rt);
+    let given = super::retention::GivenUp {
+        budget_bytes: 0,
+        generation: Generation(1),
+        attempts: 3,
+    };
+    let state = host.retention.entry(P).or_default();
+    for copy in [CopyId(1), CopyId(2)] {
+        state.overruns.insert(copy, 3);
+        state.given_up.insert(copy, given);
+    }
+    assert!(host.needs_operator(P).is_some());
+    host.end_transfer(P, CopyId(2), "caught_up", "snapshot_transfer_released");
+    let state = &host.retention[&P];
+    assert_eq!(
+        (
+            state.overruns.keys().copied().collect::<Vec<_>>(),
+            state.given_up.keys().copied().collect::<Vec<_>>()
+        ),
+        (vec![CopyId(1)], vec![CopyId(1)]),
+        "copy 2's count and give-up end; copy 1's stay"
+    );
+    host.end_transfer(
+        P,
+        CopyId(1),
+        "budget_overran",
+        "snapshot_transfer_abandoned",
+    );
+    assert_eq!(
+        host.retention[&P].overruns.get(&CopyId(1)),
+        Some(&3),
+        "only caught_up resets"
+    );
 }

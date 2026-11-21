@@ -413,6 +413,20 @@ impl Host {
             );
             return;
         }
+        // Owner ruling 2026-11-20, option 1: after the give-up the copy is offered nothing more
+        // until a caught-up release, a raised budget or a newer generation clears it (R27);
+        // `needs_operator` names it meanwhile.
+        if let Some(given) = self.given_up(partition, copy) {
+            tracing::info!(
+                node = node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                attempts = given.attempts,
+                "snapshot_catchup_given_up"
+            );
+            return;
+        }
         // Only a transfer is deduped: a refill leaves the ladder dense, so R1's next ask for the
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
         // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
@@ -587,6 +601,11 @@ impl Host {
         why: &str,
         event: &'static str,
     ) {
+        // A caught-up copy has its History: its overrun count starts again (owner ruling
+        // 2026-11-20, option 1), whether or not a transfer is still open.
+        if why == "caught_up" {
+            self.overruns_caught_up(partition, copy);
+        }
         let Some(transfer) = self.transfers.remove(&(partition, copy)) else {
             return;
         };
@@ -846,7 +865,9 @@ impl Host {
     }
 
     /// `NodeStatus::needs_operator` for `partition` (rev 5 M1): this copy's own held refusal,
-    /// else the first held copy the owner heard of that no forget-tail has released yet.
+    /// else the first held copy the owner heard of that no forget-tail has released yet, else
+    /// the first copy this node gave up offering after repeated budget overruns (issue #61
+    /// S3-R4 (b)). A forget-tail comes first: acting on it decides what data survives.
     pub(super) fn needs_operator(&self, partition: PartitionId) -> Option<String> {
         if let Some(held) = self.offer_tail_held.get(&partition) {
             return Some(needs_forget_tail(
@@ -854,10 +875,10 @@ impl Host {
             ));
         }
         self.offer_holds
-            .get(&partition)?
-            .iter()
-            .next()
+            .get(&partition)
+            .and_then(|holds| holds.iter().next())
             .map(|(copy, hold)| needs_forget_tail(partition, *copy, hold.node, hold.head))
+            .or_else(|| self.needs_history_budget(partition))
     }
 
     /// An offer reached this target (module docs, "Target").
