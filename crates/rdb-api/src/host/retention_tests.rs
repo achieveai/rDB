@@ -230,6 +230,18 @@ fn t61_s3_a_newer_generation_supersedes_an_open_grace_and_acks_end_the_new_one()
     );
 }
 
+/// The tune of the rows that hold copy 3 out for many steps: [`Trio::fast`], no restart
+/// shadow, no retention duty by itself, and no inventory pin. L1 keeps the spec's ages, not
+/// [`Trio::fast_pause`]'s: under a loaded host a pause lets the owner re-plan the held copy out
+/// of the configuration (`snapshot_catchup_unserved{reason = copy_not_in_config}`, seen
+/// 2026-11-21), which no later step survives.
+fn held_copy_tune(host: &mut Host) {
+    Trio::fast(host);
+    host.restart_shadow = false;
+    host.next_retention = Tick(u64::MAX);
+    host.inventory_pin_millis = 0;
+}
+
 /// Node 1's round on partition 1 at the trio's clock, which must be answered with a floor.
 fn floor_round(trio: &mut Trio, what: &str) -> rdb_core::replication::retention::RetentionFloor {
     let now = trio.clock.now();
@@ -258,17 +270,11 @@ fn floor_round(trio: &mut Trio, what: &str) -> rdb_core::replication::retention:
 fn t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer() {
     const METHOD: &str = "t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer";
     let dir = config_testkit::fs::temp_dir();
-    let mut trio = Trio::new(dir.path(), |host| {
-        no_duty(host);
-        host.inventory_pin_millis = 0;
-    });
+    let mut trio = Trio::new(dir.path(), held_copy_tune);
     trio.bootstrap();
     trio.ready();
     for request in 1..=3 {
-        assert!(matches!(
-            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
-            Answer::Txn { .. }
-        ));
+        put_durable(&mut trio, request);
     }
     let head = trio.head().expect("node 1 holds a head");
     trio.until("node 3 applied the head", |trio| {
@@ -318,10 +324,7 @@ fn t61_s3_the_byte_cap_passes_a_lagging_copy_and_an_open_transfer() {
         "a transfer opened"
     );
     for request in 4..=6 {
-        assert!(matches!(
-            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
-            Answer::Txn { .. }
-        ));
+        put_durable(&mut trio, request);
     }
     let past = trio.head().expect("node 1 holds a head");
     trio.until("node 1 is durable through P", |trio| {
@@ -406,17 +409,11 @@ fn known_durable(trio: &Trio, copy: CopyId) -> u64 {
 fn t61_s3_r3_a_lagging_member_within_budget_holds_the_floor() {
     const METHOD: &str = "t61_s3_r3_a_lagging_member_within_budget_holds_the_floor";
     let dir = config_testkit::fs::temp_dir();
-    let mut trio = Trio::new(dir.path(), |host| {
-        no_duty(host);
-        host.inventory_pin_millis = 0;
-    });
+    let mut trio = Trio::new(dir.path(), held_copy_tune);
     trio.bootstrap();
     trio.ready();
     for request in 1..=3 {
-        assert!(matches!(
-            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
-            Answer::Txn { .. }
-        ));
+        put_durable(&mut trio, request);
     }
     let head = trio.head().expect("node 1 holds a head");
     trio.until("node 3 applied the head", |trio| {
@@ -442,10 +439,7 @@ fn t61_s3_r3_a_lagging_member_within_budget_holds_the_floor() {
     trio.links.hold(NodeId(1), NodeId(3));
     trio.links.hold(NodeId(2), NodeId(3));
     for request in 4..=6 {
-        assert!(matches!(
-            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
-            Answer::Txn { .. }
-        ));
+        put_durable(&mut trio, request);
     }
     let past = trio.head().expect("node 1 holds a head");
     trio.until("node 1 is durable through P", |trio| {
@@ -777,15 +771,7 @@ fn t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises() 
     const METHOD: &str =
         "t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises";
     let dir = config_testkit::fs::temp_dir();
-    // L1 at the spec's ages, not `fast_pause`'s: copy 3 is held for the whole row, and a pause
-    // under a loaded host lets the owner re-plan it out of the configuration
-    // (`snapshot_catchup_unserved{reason = copy_not_in_config}`), which no offer survives.
-    let mut trio = Trio::new(dir.path(), |host| {
-        Trio::fast(host);
-        host.restart_shadow = false;
-        host.next_retention = Tick(u64::MAX);
-        host.inventory_pin_millis = 0;
-    });
+    let mut trio = Trio::new(dir.path(), held_copy_tune);
     trio.bootstrap();
     trio.ready();
     for request in 1..=3 {
