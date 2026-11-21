@@ -22,7 +22,7 @@ use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 use rdb_value::keys::{scope_affinity, scoped_request, Scope};
 use rdb_value::Expected;
 
-use super::async_db::{blocking, put_answer, read_answer};
+use super::async_db::{blocking, put_answer, read_answer, reused_answer};
 use super::{
     app_request_id, ApiError, AsyncDb, Db, GetOk, Limit, ObjectEntry, ObjectPage,
     PrefixDeleteError, PutError, PutOk, ReadOk, TooLarge, TxnPut, MAX_SCOPED_ID,
@@ -319,8 +319,9 @@ impl ScopedDb {
             self.affinity(group),
             self.request_id(group, n),
         );
-        let answer = put_answer(
+        let answer = reused_answer(
             blocking(move || db.write_as_in(affinity, request, &object, change, expect)).await,
+            None,
         );
         self.sealed_change(group, answer)
     }
@@ -362,9 +363,10 @@ impl ScopedDb {
             self.affinity(group),
             self.request_id(group, n),
         );
-        let answer = put_answer(
+        let answer = reused_answer(
             blocking(move || db.txn_as(request, &txn_puts(affinity, &objects, &puts), deadline))
                 .await,
+            None,
         );
         self.sealed(group, answer)
     }
@@ -436,7 +438,11 @@ impl ScopedDb {
         self.own(&sent).map_err(refused)?;
         let (db, group) = (Arc::clone(&self.db), sent.group);
         let request = *sent.request;
-        let answer = put_answer(blocking(move || db.resend_within(request, deadline)).await);
+        let kept = request.clone();
+        let answer = reused_answer(
+            blocking(move || db.resend_within(request, deadline)).await,
+            Some(kept),
+        );
         self.sealed(group, answer)
     }
 

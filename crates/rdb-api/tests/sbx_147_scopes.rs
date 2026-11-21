@@ -979,3 +979,42 @@ fn sbx_147_u_a_stopped_blob_drain_is_found_and_finished_by_a_rerun() {
     assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
     assert_eq!((first, rest), (0, 1), "the blob counts once, on the rerun");
 }
+
+/// PR #178 review r2 T21: a `ScopedDb` call under an id that may have been sent before, which
+/// the blocking pool never ran, answers `no_mutation` false. The calls run on the handle of a
+/// runtime already dropped, so `spawn_blocking` cannot run them. `write_as` and `txn_as` under
+/// the app's number, and `resend_within` of a real write's token, which also hands its token
+/// back. Cut: answer them with `put_answer`: red, `no_mutation` true. Integration (~1-2 s): one
+/// database open.
+#[config_log::retcd_test]
+fn sbx_147_v_a_reused_id_the_pool_never_ran_may_have_applied() {
+    let w = world(false);
+    let [a, ..] = w.pinned();
+    let sent = w.on(async { a.put(0, b(b"doc"), b(b"v"), None).await.expect("put").sent });
+    let gone = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let handle = gone.handle().clone();
+    drop(gone);
+    let doc = Change::Doc(rdb_value::delta::Delta(vec![rdb_value::delta::Op::Replace(
+        Value::Bytes(b"w".to_vec()),
+    )]));
+    let write = handle.block_on(a.write_as(0, 9, b(b"doc"), doc, None));
+    let write = write.expect_err("the pool never ran it");
+    assert!(!write.error.no_mutation, "write_as: {}", write.error);
+    let txn = vec![ScopedWrite {
+        id: b(b"doc"),
+        value: b(b"t"),
+        if_version: None,
+    }];
+    let txn = handle.block_on(a.txn_as(0, 9, txn, DEADLINE));
+    let txn = txn.expect_err("the pool never ran it");
+    assert!(!txn.error.no_mutation, "txn_as: {}", txn.error);
+    let resend = handle.block_on(a.resend_within(sent.clone(), DEADLINE));
+    let resend = resend.expect_err("the pool never ran it");
+    assert!(!resend.error.no_mutation, "resend_within: {}", resend.error);
+    assert!(resend.sent.is_some(), "the token comes back");
+    w.on(async {
+        assert_eq!(value(&a, 0, b"doc").await, Some(b(b"v")), "nothing ran");
+    });
+}
