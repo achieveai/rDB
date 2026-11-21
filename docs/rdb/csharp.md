@@ -117,9 +117,9 @@ answer was lost with no request id (read the object, then decide).
   `NoMutation = true`. The gateway would refuse it with no `RdbError`, which would read as an
   unknown outcome. Reads are not checked.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
-  largest value is **1,048,240 bytes minus the key's length, minus 1 per 0x00 byte in the key**,
-  for a new key; 1 byte more for an existing key; the same with or without `ifVersion` (a 3-byte
-  key with no 0x00 byte: 1,048,237 new, 1,048,238 existing). A transaction's puts share the 1 MiB.
+  largest value is **`MAX_VALUE`, 1,044,480 bytes** (1 MiB less 4 KiB), for any key the server
+  accepts, new or existing, with or without `ifVersion` (#148; it no longer moves with the key).
+  A transaction's puts share the 1 MiB.
   The server checks them, exactly as the embedded API does: a key over 1,024 bytes, a value or a
   whole write over its limit is `TOO_LARGE` (`Kind = TooLarge`, `NoMutation = true`, never
   retried), and the message names the limit, the size and the most it allows.

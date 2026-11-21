@@ -388,7 +388,8 @@ To size a cap, use the upper bound for every put: `value_len + id_len + zero_byt
   ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
 - The largest single value a put takes is `MAX_VALUE`, 1,044,480 bytes, for any id. A byte
   write over the bound is refused by the `Db` with `TOO_LARGE` before it is sent (see
-  [Size limits](#size-limits)).
+  [Size limits](#size-limits)). So is a byte document one byte over: a `Change::Doc` that is
+  one `Op::Replace(Value::Bytes(..))`, the shape a byte put writes.
 
 A `write` (`Change::Doc`, a map, a set or a list) one byte over the record is refused with
 `INVALID_ARGUMENT`, and nothing is written:
@@ -413,7 +414,7 @@ written. The same call fails the same way, so make it smaller. `ApiError::too_la
 |---|---|---|---|
 | `ObjectId` | `MAX_OBJECT_ID` | 1,024 bytes | Every write and read |
 | `Key` | `MAX_KEY` | 1,024 bytes | A map key or set member, and `Look::Members { after }` |
-| `Value` | `MAX_VALUE` | 1,044,480 bytes | Each value of `put`, `put_in`, `put_as`, `txn` and `txn_as` |
+| `Value` | `MAX_VALUE` | 1,044,480 bytes | Each value of `put`, `put_in`, `put_as`, `txn` and `txn_as`, and a byte document (`Change::Doc`) |
 | `Write` | `MAX_WRITE` | 1,048,576 bytes | A whole `put` or `txn`, by the upper-bound sum above |
 | `Ops` | `MAX_OPS` | 255 | The ops of one change, and the puts of one `txn` |
 | `Chunk` | `rdb_value::blob::MAX_CHUNK` | 1,044,480 bytes | One `Change::Chunk` |
