@@ -499,9 +499,11 @@ the old owner's token still equals the record, and its effects are accepted. Tha
 because the new owner restores and acts **after** its register.
 
 - A key prefix or a label alone refuses nothing: a late writer just writes under its old prefix.
-- rDB does not sign tokens. `OwnerToken`'s fields are public, so any code can build one. A
-  destination must take tokens only from your own processes, each stamping the token its
-  `ownership` returned. A made-up high token would lock the real owner out.
+- **An owner token is not a credential.** rDB does not sign tokens. `OwnerToken`'s fields are
+  public, so any code in the process can build one. A token guards against a stale owner, not
+  a hostile caller. So a destination must take tokens only from your own processes, each
+  stamping the token its `ownership` returned. A made-up high token would lock the real owner
+  out.
 - An effect whose destination cannot compare a token is not covered. `still_owner` narrows its
   window but cannot close it.
 

@@ -199,9 +199,9 @@ fn snapshot_dir() -> PathBuf {
 ///
 /// The length is read once and never re-read, so anything appended while the copy runs is
 /// simply not in the snapshot — the point is a file of fixed length, not a current one. The
-/// trailing-newline trim is insurance: `config_log`'s writer thread writes one whole line per
-/// `write_all`, so a torn line should not be reachable, but a snapshot that
-/// cannot end mid-object costs one `set_len` to guarantee.
+/// trailing-newline trim is needed, not insurance: `config_log`'s writer thread writes one whole
+/// line per `write_all`, but on ext4 that one `write` becomes visible a page at a time, so the
+/// length read here can end inside a line still being appended (issue #132).
 fn freeze(src: &Path, dest: &Path) {
     let mut reader = File::open(src)
         .unwrap_or_else(|e| panic!("cannot open test log {} to snapshot it: {e}", src.display()));
@@ -365,18 +365,27 @@ pub fn current_run_filter() -> String {
 /// this process's `testRun`, so a test does not need the glob-and-DuckDB round trip just to
 /// look at its own output.
 ///
+/// The file is read as it stood at the flush ([`config_log::layer::read_test_file`]), not to
+/// its end: the test's own threads may still be appending a line while it reads, and a read to
+/// the end can stop inside that line (issue #132).
+///
 /// Panics if the file cannot be read (i.e. the test never opened `#[retcd_test]`, or nothing
 /// was logged yet) or if a line is not valid JSON — a malformed log file is itself a bug the
 /// test should surface, not silently ignore.
 pub fn lines_for_current_test(module: &str, method: &str) -> Vec<serde_json::Value> {
     let dir = config_log::testing::test_log_dir();
-    let path = config_log::layer::test_file_path(&dir, module, method);
-    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "cannot read test log {}: {e}. Did the test open #[config_log::retcd_test]?",
-            path.display()
-        )
-    });
+    let (path, bytes) = config_log::layer::read_test_file(&dir, module, method);
+    let content = bytes
+        .and_then(|b| {
+            String::from_utf8(b)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .unwrap_or_else(|e| {
+            panic!(
+                "cannot read test log {}: {e}. Did the test open #[config_log::retcd_test]?",
+                path.display()
+            )
+        });
     let run_id = config_log::testing::test_run_id();
     content
         .lines()

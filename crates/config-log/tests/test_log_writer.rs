@@ -112,8 +112,9 @@ fn lines_queued_at_process_exit_are_not_lost() {
     }
 }
 
-fn child_writes_every_line(child: &str) {
-    let root = tempfile::tempdir().expect("temp log root");
+/// Run the ignored test `child` alone in a child process of this binary, logging under `root`,
+/// and fail unless it passed. Returns its stderr.
+fn run_child(child: &str, root: &Path) -> String {
     // `--nocapture`, so a flush error the test guard prints reaches `out.stderr`.
     let out = Command::new(std::env::current_exe().expect("this test binary"))
         .args([
@@ -123,16 +124,22 @@ fn child_writes_every_line(child: &str) {
             "--test-threads=1",
             "--nocapture",
         ])
-        .env("RETCD_TEST_LOG_DIR", root.path())
+        .env("RETCD_TEST_LOG_DIR", root)
         .output()
         .expect("run the child");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success() && stdout.contains("1 passed"),
         "{child} failed or ran no test: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         out.status
     );
+    stderr
+}
+
+fn child_writes_every_line(child: &str) {
+    let root = tempfile::tempdir().expect("temp log root");
+    let stderr = run_child(child, root.path());
 
     // `<root>/<child run id>/<module>/<method>.jsonl`; the child is the only run under `root`.
     let runs: Vec<PathBuf> = std::fs::read_dir(root.path())
@@ -156,8 +163,24 @@ fn child_writes_every_line(child: &str) {
 
 /// A per-test file that cannot be opened loses its own lines and nothing else: the shared
 /// writer keeps going, and the reader of that file is told the path and the cause.
-#[retcd_test]
+///
+/// The body runs in a child process ([`child_with_an_unopenable_log_file`]). The writer keeps a
+/// failed open for the rest of the process, so that [`config_log::layer::flush_test_logs`] can
+/// name it to any later reader, and it panics on one. Run in this binary, the deliberate failure
+/// made every later `flush_test_logs` here panic: `logging_returns_while_the_file_write_is_stalled`
+/// sorts after this row and failed whenever this row had run first, which with one or two
+/// test threads is every run.
+#[test]
 fn an_unopenable_log_file_loses_only_its_own_lines() {
+    let root = tempfile::tempdir().expect("temp log root");
+    run_child("child_with_an_unopenable_log_file", root.path());
+}
+
+/// The body of [`an_unopenable_log_file_loses_only_its_own_lines`], run in a child process so
+/// its deliberate failed open stays in a process of its own.
+#[retcd_test]
+#[ignore = "run in a child process by an_unopenable_log_file_loses_only_its_own_lines"]
+fn child_with_an_unopenable_log_file() {
     const BLOCKED: &str = "an_unopenable_log_file_blocked_twin";
     // A directory where the twin's `<method>.jsonl` should go, so opening it fails.
     let blocker = config_log::layer::test_file_path(&test_log_dir(), module_path!(), BLOCKED);
@@ -184,7 +207,7 @@ fn an_unopenable_log_file_loses_only_its_own_lines() {
     let own = config_log::layer::test_file_path(
         &test_log_dir(),
         module_path!(),
-        "an_unopenable_log_file_loses_only_its_own_lines",
+        "child_with_an_unopenable_log_file",
     );
     let text = std::fs::read_to_string(&own).expect("own log file");
     assert!(

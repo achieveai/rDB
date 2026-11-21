@@ -13,9 +13,6 @@ use config_core::ConfigStore;
 
 type Line = serde_json::Value;
 
-/// A node thread's step longer than this while a sync is held is the stall F4 removes.
-const STEP_LIMIT_MILLIS: u64 = 500;
-
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -147,11 +144,22 @@ fn waited_on_a_sync(lines: &[Line], from: usize) -> Vec<&Line> {
         .collect()
 }
 
-/// Every node-thread step over [`STEP_LIMIT_MILLIS`] logged at or after `from`.
-fn slow_steps(lines: &[Line], from: usize) -> Vec<&Line> {
+/// The held syncs at or after `from` that a thread other than their node's syncer logged: a
+/// held sync on the node's thread, the stall F4 removes (A-R393). Red at any load.
+///
+/// Not a step's length (#142). A node-thread step on Linux/XFS waits in the kernel while its own
+/// syncer's fsync runs: XFS holds the WAL inode's lock (`xfs_ilock`) across the fsync's
+/// journal force, and the node's next WAL append needs it. On a busy disk that is 300-800 ms
+/// (measured with `scripts/thread-waits.py`), with no held sync in the step, so a step bound
+/// fails on the host and not on this code. That wait is real and is #152's to remove
+/// (`manual_wal_flush`); `host_slow_step` still logs every such step.
+fn held_off_their_syncer(lines: &[Line], from: usize) -> Vec<&Line> {
     lines[from..]
         .iter()
-        .filter(|line| is(line, "host_slow_step") && num(line, "millis") > STEP_LIMIT_MILLIS)
+        .filter(|line| {
+            is(line, "test_sync_slowed")
+                && line["thread"] != format!("rdb-sync-{}", num(line, "node")).as_str()
+        })
         .collect()
 }
 
@@ -199,17 +207,8 @@ fn m10_f4_link_and_holder_syncs_answer_only_after_a_held_sync_and_the_node_keeps
 
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
     let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
-    // A-R393: every held sync ran on its node's syncer, as the thread that logged it says. Not
-    // a step's length: a loaded host starves a node thread past 500 ms with no sync in the
-    // step (2 of 25 runs beside 3 suite loops); a held sync on the node thread is red here at
-    // any load.
-    let inline: Vec<&Line> = lines[armed..]
-        .iter()
-        .filter(|line| {
-            is(line, "test_sync_slowed")
-                && line["thread"] != format!("rdb-sync-{}", num(line, "node")).as_str()
-        })
-        .collect();
+    // A-R393: every held sync ran on its node's syncer, as the thread that logged it says.
+    let inline = held_off_their_syncer(&lines, armed);
     assert!(
         inline.is_empty(),
         "held syncs off their node's syncer: {inline:?}"
@@ -416,8 +415,9 @@ fn duties_in(lines: &[Line], held: &[(usize, usize)], node: u64, kind: &str) -> 
 
 /// A-R317 (2), A-R322 (b3): the owner's periodic disk duties, publish marks and the dedup trim
 /// delete, run while a sync is held and neither waits on it. Each stages its write, and the next
-/// sync carries it: no `synced_write_during_sync` or `sync_began_during_sync`, and no node-thread
-/// step over 500 ms. A 2 s retention makes both duties due every 500 ms; node 1's every sync is
+/// sync carries it: no `synced_write_during_sync` or `sync_began_during_sync`, and every held
+/// sync ran on node 1's syncer, not its thread ([`held_off_their_syncer`]; not a step's length,
+/// #142). A 2 s retention makes both duties due every 500 ms; node 1's every sync is
 /// held 700 ms while puts go on at 20/s, so the duties land inside held syncs.
 /// Cut: the periodic marks written synced, red (`synced_write_during_sync`). Cut: the trim
 /// delete synced (`delete_dedup_trimmed`), red (the same line).
@@ -452,10 +452,10 @@ fn m10_f4_mark_and_trim_duties_run_during_a_held_sync_without_waiting_on_it() {
 
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
     let armed = next(&lines, 0, "f4_slow_armed", &|_| true).expect("the marker");
-    let slow = slow_steps(&lines, armed);
+    let inline = held_off_their_syncer(&lines, armed);
     assert!(
-        slow.is_empty(),
-        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+        inline.is_empty(),
+        "held syncs off their node's syncer: {inline:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
     assert!(
@@ -526,8 +526,9 @@ fn fences(lines: &[Line], from: usize) -> Vec<&Line> {
 }
 
 /// A-R317 (4), b1, once: one 3 s sync on all three nodes, under 50 puts/s on product budgets.
-/// The owner keeps its grant (the same grant id, no `authority_fence`), no node-thread step
-/// goes over 500 ms, and nothing waits on the held sync. L1 pauses while the sync is held
+/// The owner keeps its grant (the same grant id, no `authority_fence`), every held sync ran on
+/// its node's syncer ([`held_off_their_syncer`]; not a step's length, #142), and nothing waits
+/// on the held sync. L1 pauses while the sync is held
 /// (durability ages past the 2 s pause age), so some puts are refused: that shows `Flushed`
 /// waited for the held sync (critic-f4 A1). It resumes, and puts publish again, within the
 /// sync (3 s) plus L1's resume hold (5 s) plus 1 s. Durable never runs ahead of a returned
@@ -614,10 +615,10 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
         fenced.is_empty(),
         "fences while the sync was held: {fenced:?}"
     );
-    let slow = slow_steps(&lines, armed);
+    let inline = held_off_their_syncer(&lines, armed);
     assert!(
-        slow.is_empty(),
-        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+        inline.is_empty(),
+        "held syncs off their node's syncer: {inline:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
     assert!(
@@ -634,8 +635,9 @@ fn m10_f4_one_slow_sync_on_every_node_keeps_the_grant_and_l1_resumes_after_its_h
 /// product budgets. Durability then ages past L1's pause age again and again, so puts may be
 /// refused `PROTECTION_PAUSED` for most of the run; that is L1 doing its job, not a stall. What
 /// must hold: the owner keeps its grant (same grant id, no fence), no node faults (3 s is under
-/// the default stuck limit, 30 s since issue #109, scaled as a wait here by A-R395), no
-/// node-thread step goes over 500 ms, and nothing waits on a held sync.
+/// the default stuck limit, 30 s since issue #109, scaled as a wait here by A-R395), every held
+/// sync ran on its node's syncer ([`held_off_their_syncer`]; not a step's length, #142), and
+/// nothing waits on a held sync.
 /// Cut: every sync inline on the node thread, red (node 1 lost its grant: grant 1, then 2).
 /// Integration (~15 s): a fresh open, 12 s of held syncs (more under load, until 3 begin on
 /// each node, A-R395), then a stop that waits the last out.
@@ -705,10 +707,10 @@ fn m10_f4_every_sync_slow_on_every_node_never_stalls_a_node_thread_or_costs_the_
         fenced.is_empty(),
         "fences while syncs were held: {fenced:?}"
     );
-    let slow = slow_steps(&lines, armed);
+    let inline = held_off_their_syncer(&lines, armed);
     assert!(
-        slow.is_empty(),
-        "node-thread steps over {STEP_LIMIT_MILLIS} ms: {slow:?}"
+        inline.is_empty(),
+        "held syncs off their node's syncer: {inline:?}"
     );
     let waited = waited_on_a_sync(&lines, armed);
     assert!(
