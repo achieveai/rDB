@@ -2633,9 +2633,12 @@ const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
 /// [`LEAVE_OUT_EVERY`], whether the heal may go on without it. Its first answer and each change
 /// of it are logged once per attempt (each [`heal_retrying`] attempt logs its own first):
 /// `heal_proceed_without` per partition when it may, `heal_wait_all{reason}` while it may not.
-/// An answer that arrives at or past `deadline` is not acted on (`heal_leave_out_expired`): the
-/// attempt ends [`HealError::PeersUnknown`] so the next one decides with a whole budget for the
-/// clear, rather than reaching it with none. `rooted` and `forming` are the members each of the
+/// An answer that arrives at or past `deadline` is not acted on: the attempt ends
+/// [`HealError::PeersUnknown`] at once, before it reads the links again, so the next one
+/// decides with a whole budget for the clear, rather than reaching it with none. A late
+/// decision logs `heal_leave_out_expired` and ends with reason `decided_past_deadline`; a late
+/// wait ends with its own `heal_wait_all` reason. A link that came up during the late read is
+/// found by the next attempt. `rooted` and `forming` are the members each of the
 /// heal's partitions pins, by partition, in `ctx.partitions` and `ctx.bootstrap` order.
 async fn member_boots(
     ctx: &HealCtx,
@@ -2681,10 +2684,11 @@ async fn member_boots(
                 &mut failed,
             )
             .await;
+            // PR #181 review: the grant reads may have used up the attempt's budget; acting
+            // now would leave `clear_until` none, and its `NotCleared` ends the heal.
+            let answered_late = tokio::time::Instant::now() >= deadline;
             match asked {
-                // PR #181 review: the grant reads may have used up the attempt's budget; acting
-                // now would leave `clear_until` none, and its `NotCleared` ends the heal.
-                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                Ok(_) if answered_late => {
                     reason = "decided_past_deadline";
                     tracing::info!(
                         owner = ctx.owner_node.0,
@@ -2706,6 +2710,17 @@ async fn member_boots(
                         );
                     }
                 }
+            }
+            // PR #181 review round 2: a late answer, a decision or a wait, ends the attempt
+            // here, before the links are read again. A link that came up during the read would
+            // otherwise make every copy known and reach `clear_until` with no budget left.
+            if answered_late {
+                tracing::warn!(missing = ?missing, reason, "heal_peers_unknown");
+                return Err(HealError::PeersUnknown {
+                    nodes: missing,
+                    within_ms: ctx.within.as_millis(),
+                    reason,
+                });
             }
         }
         if missing.is_empty() || !left.is_empty() {
@@ -9519,10 +9534,27 @@ mod tests {
             match step {
                 None => self.inner.get(request),
                 Some(GetStep {
-                    fail: Some(reason), ..
+                    fail: Some(reason),
+                    delay: Duration::ZERO,
+                    ..
                 }) => Box::pin(std::future::ready(Err(ConfigError::Unavailable {
                     reason: reason.to_owned(),
                 }))),
+                Some(GetStep {
+                    fail: Some(reason),
+                    delay,
+                    ..
+                }) => {
+                    let in_delay = Arc::clone(&self.in_delay);
+                    Box::pin(async move {
+                        in_delay.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        in_delay.store(false, Ordering::SeqCst);
+                        Err(ConfigError::Unavailable {
+                            reason: reason.to_owned(),
+                        })
+                    })
+                }
                 Some(GetStep { delay, .. }) => {
                     let in_delay = Arc::clone(&self.in_delay);
                     let read = self.inner.get(request);
@@ -9770,6 +9802,142 @@ mod tests {
             assert_eq!(notes, 1, "{case}: only the attempt that went on sent");
         }
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
+    }
+
+    /// A heal of [`r5_heal_in`] through [`heal_retrying`] over `store`, `live_readd` on, the
+    /// same OS boot, in which node 3's link comes up `link_at` after `started`.
+    fn r5_link_at(
+        store: Arc<GrantGets>,
+        started: std::time::Instant,
+        link_at: Duration,
+        grants: &[GrantRecord],
+        window: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
+        let boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+            (node != NodeId(3) || started.elapsed() >= link_at).then_some(OPEN_2)
+        });
+        r5_heal_in(
+            store,
+            Arc::default(),
+            true,
+            true,
+            OsBoot::Same,
+            OWNER,
+            boot_of,
+            grants,
+            HostClock::start(),
+            window,
+        )
+    }
+
+    /// Asserts the heal that `sent` ends planned nodes 1 to 3 at their boots, in one plan, and
+    /// left nothing out: no late attempt sent anything.
+    fn r5_one_full_plan(case: &str, sent: &[Msg]) {
+        assert_eq!(
+            r5_planned(sent),
+            [(1, OPEN_2), (2, OPEN_2), (3, OPEN_2)],
+            "{case}: node 3 is pinned at its boot"
+        );
+        assert!(r5_left_out(sent).is_none(), "{case}: nothing is left out");
+        let plans = sent
+            .iter()
+            .filter(|msg| {
+                matches!(
+                    msg,
+                    Msg::Inject {
+                        kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(_))),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(plans, 1, "{case}: one plan");
+    }
+
+    /// PR #181 review round 2, blocker 1: node 3's link comes up while a grant read that ends
+    /// past the attempt's deadline is still running. The read answers frozen, expired, absent
+    /// (in the attempt after the window, the one that may first go on without node 3), or
+    /// fails. The late attempt ends `PeersUnknown` and sends nothing; the next one finds node 3
+    /// and plans it at its boot. Unit (~8 s). Cut: no return after a late answer: the late
+    /// attempt reads the links again, finds every copy, and reaches `clear_until` with no
+    /// budget: `NotCleared`, red.
+    #[config_log::retcd_test]
+    fn r5_w_a_link_up_during_a_late_grant_read_is_planned_by_the_next_attempt() {
+        const METHOD: &str =
+            "r5_w_a_link_up_during_a_late_grant_read_is_planned_by_the_next_attempt";
+        let window = Duration::from_millis(600);
+        let held = window + Duration::from_millis(300);
+        let far = utc_now() + 3_600_000;
+        let held_then_lost = GetStep {
+            not_before: Duration::ZERO,
+            delay: held,
+            fail: Some("held, then lost"),
+        };
+        let ms = Duration::from_millis;
+        let cases: [(&str, Vec<GrantRecord>, GetStep, Duration); 4] = [
+            (
+                "frozen",
+                vec![r5_grant(3, far, true)],
+                r5_delay(ms(0), held),
+                ms(700),
+            ),
+            (
+                "expired",
+                vec![r5_grant(3, 0, false)],
+                r5_delay(ms(0), held),
+                ms(700),
+            ),
+            ("absent", Vec::new(), r5_delay(ms(1_000), held), ms(1_500)),
+            (
+                "failed",
+                vec![r5_grant(3, far, false)],
+                held_then_lost,
+                ms(700),
+            ),
+        ];
+        for (case, grants, step, link_at) in cases {
+            let store = Arc::new(GrantGets::new(NodeId(3), vec![step]));
+            let (healed, sent, _) =
+                r5_link_at(store, std::time::Instant::now(), link_at, &grants, window);
+            healed.unwrap_or_else(|e| panic!("{case}: the next attempt plans node 3: {e}"));
+            r5_one_full_plan(case, &sent);
+        }
+        assert_eq!(
+            r5_lines(METHOD, "heal_leave_out_expired").len(),
+            3,
+            "the frozen, expired and absent decisions came late"
+        );
+    }
+
+    /// PR #181 review round 2, blocker 1: two attempts in a row each get a grant read that ends
+    /// past their deadline, and node 3's link comes up during the second. Each late attempt ends
+    /// `PeersUnknown`; the third plans node 3 at its boot. Unit (~4 s). Cut: no return after a
+    /// late answer: the second attempt reaches `clear_until` with no budget: `NotCleared`, red.
+    #[config_log::retcd_test]
+    fn r5_x_a_late_grant_read_twice_then_a_link_is_planned_once() {
+        const METHOD: &str = "r5_x_a_late_grant_read_twice_then_a_link_is_planned_once";
+        let window = Duration::from_millis(600);
+        let held = window + Duration::from_millis(300);
+        let store = Arc::new(GrantGets::new(
+            NodeId(3),
+            vec![
+                r5_delay(Duration::ZERO, held),
+                r5_delay(Duration::ZERO, held),
+            ],
+        ));
+        let grants = [r5_grant(3, utc_now() + 3_600_000, true)];
+        // Attempt 1 reads 0 to 0.9 s; attempt 2, 0.5 s later, reads 1.4 to 2.3 s.
+        let (healed, sent, _) = r5_link_at(
+            store,
+            std::time::Instant::now(),
+            Duration::from_millis(2_100),
+            &grants,
+            window,
+        );
+        healed.unwrap_or_else(|e| panic!("the third attempt plans node 3: {e}"));
+        r5_one_full_plan("twice late", &sent);
+        assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
+        assert_eq!(r5_lines(METHOD, "heal_retry").len(), 2, "two late attempts");
     }
 
     /// PR #181 review (threads on the link-wait text): once an attempt has every link, the
