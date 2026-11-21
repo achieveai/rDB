@@ -49,12 +49,13 @@ fn synced(engine: &mut RocksEngine, generation: Generation, through: u64) {
 ///
 /// Issue #149: the ladder duty first warms node 2's inventory ladder, reported as
 /// `IndexLengths::inventory_rungs`, and the row warms a dormant ladder (as a move's shadow
-/// does). After step 3 each holds the floor's rung only, and the block cache's usage is
-/// reported.
+/// does). After step 3 each holds the floor's rung only, `history_bytes` has fallen, and the
+/// block cache's usage is reported, above 0 once the reads have loaded blocks.
 ///
 /// Cuts: the inventory-pin gate off, red (step 1 trims); `keep` ignored, red (step 2 trims);
 /// the inventory ladder left untrimmed, red (`inventory_rungs` stays); the dormant ladder left
-/// untrimmed, red (its rungs stay).
+/// untrimmed, red (its rungs stay); `inventory_rungs` reported 0, red; `history_bytes` reported
+/// 0, red; `block_cache_bytes` reported `None` or 0, red.
 /// Unit.
 #[config_log::retcd_test]
 fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
@@ -74,10 +75,10 @@ fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
         budget_bytes: u64::MAX,
     };
     host.ladder_duty();
-    let lengths = host.status(P).lengths.expect("node 2's lengths");
+    let warmed = host.status(P).lengths.expect("node 2's lengths");
     assert!(
-        lengths.inventory_rungs > 1,
-        "the warmed ladder: {lengths:?}"
+        warmed.inventory_rungs > 1 && warmed.history_bytes > 0,
+        "the warmed ladder and the History held: {warmed:?}"
     );
     host.warm_dormant_ladder(P, Generation(1), Some((NodeId(1), BootId(1))));
     let dormant = |host: &Host| {
@@ -122,7 +123,14 @@ fn t61_s3_the_duty_keeps_the_window_and_waits_for_the_boot_pin() {
         Some(1),
         "the trim bounds the kept dormant ladder to the floor"
     );
-    assert!(lengths.block_cache_bytes.is_some(), "{lengths:?}");
+    assert!(
+        lengths.history_bytes < warmed.history_bytes,
+        "the trim shrinks history_bytes: {warmed:?} then {lengths:?}"
+    );
+    assert!(
+        lengths.block_cache_bytes.is_some_and(|bytes| bytes > 0),
+        "the block cache holds what the reads loaded: {lengths:?}"
+    );
     assert_eq!(logged!(METHOD, "inventory_pin_expired").len(), 1);
     assert_eq!(logged!(METHOD, "host_history_trimmed").len(), 1);
 }
