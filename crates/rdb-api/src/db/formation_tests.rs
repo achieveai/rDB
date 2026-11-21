@@ -3805,36 +3805,25 @@ fn at_info_or_above(line: &serde_json::Value) -> bool {
     )
 }
 
-/// #158: a steady stream of writes to a 3-node database costs under [`INFO_BYTES_PER_WRITE`]
-/// bytes of info-level log per write, all three nodes' lines counted. Per-write and per-batch
-/// lines are debug; info carries state changes and faults. Integration (~5 s): a formation, then
-/// [`BURST`] writes to one owner's partition.
-/// Cut: any per-write event moved back to info (for example `net_client_request`,
-/// `publication_fact`, `reply` or `batch_commit`) puts the row over the bound.
-#[config_log::retcd_test]
-fn r158_info_log_bytes_per_write_stay_under_the_bound() {
-    const METHOD: &str = "r158_info_log_bytes_per_write_stay_under_the_bound";
-    let rig = declared_rig();
-    rig.wait_ready();
-    let partition = 1;
-    let owner = admin::initial_owner(PartitionId(partition));
-    let db = rig.of(owner);
-    let group = group_of(db, partition);
+/// The writes of one burst through `db` into `group`, after a warm-up: the info-level bytes per
+/// write, all nodes' lines counted, and every line the burst logged at any level.
+fn burst_info_bytes(method: &str, db: &Db, group: AffinityId) -> (usize, Vec<serde_json::Value>) {
     // Warm-up: the first writes land while the partition finishes recovering, which logs state
     // changes that are not the per-write cost.
     for i in 0..5 {
         put_lands(db, group, format!("warm{i}").as_bytes(), b"v");
     }
 
-    let before = config_testkit::logs::lines_for_current_test(module_path!(), METHOD).len();
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
     for i in 0..BURST {
         put_lands(db, group, format!("k{i}").as_bytes(), b"v");
     }
-    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let mut lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let burst = lines.split_off(before);
 
     let mut by_event: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut total = 0;
-    for line in lines[before..].iter().filter(|line| at_info_or_above(line)) {
+    for line in burst.iter().filter(|line| at_info_or_above(line)) {
         let bytes = production_line_bytes(line);
         total += bytes;
         let event = line["@m"].as_str().unwrap_or("?").to_owned();
@@ -3848,13 +3837,66 @@ fn r158_info_log_bytes_per_write_stay_under_the_bound() {
     top.truncate(12);
     // Printed whether or not it passes, so a run records the measured cost.
     eprintln!(
-        "r158: {per_write} info bytes per write over {BURST} writes ({total} in all); {top:?}"
+        "{method}: {per_write} info bytes per write over {BURST} writes ({total} in all); {top:?}"
     );
     assert!(
         per_write < INFO_BYTES_PER_WRITE,
         "{per_write} info bytes per write over {BURST} writes ({total} in all, 3 nodes); \
          bound {INFO_BYTES_PER_WRITE}. Top events (lines, bytes): {top:?}"
     );
+    (per_write, burst)
+}
+
+/// #158: a steady stream of writes to a 3-node database costs under [`INFO_BYTES_PER_WRITE`]
+/// bytes of info-level log per write, all three nodes' lines counted. Per-write and per-batch
+/// lines are debug; info carries state changes and faults. Integration (~5 s): a formation, then
+/// [`BURST`] writes to one owner's partition.
+/// Cut: any per-write event moved back to info (for example `publication_fact`, `reply` or
+/// `batch_commit`) puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let db = rig.of(owner);
+    let group = group_of(db, partition);
+    burst_info_bytes(METHOD, db, group);
+}
+
+/// Review r1 (PR #182): the bound row above writes through the owner's own handle, so the wire
+/// path is not measured. Here every write goes through another node's handle to the owner over
+/// the network; the bound holds the same. Control: the burst logged a debug
+/// `net_client_request` for each write, so the writes really crossed the wire.
+/// Integration (~5 s): a formation, then [`BURST`] writes through a node that does not own the
+/// partition.
+/// Cut: `net_client_request` back at info puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_remote_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_remote_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let via = NodeId(owner.0 % 3 + 1);
+    let db = rig.of(via);
+    let group = group_of(db, partition);
+    let (_, burst) = burst_info_bytes(METHOD, db, group);
+    let requests: Vec<_> = burst
+        .iter()
+        .filter(|line| line["@m"] == "net_client_request")
+        .collect();
+    assert!(
+        requests.len() >= BURST,
+        "{} net_client_request lines for {BURST} writes from node {} to owner {}",
+        requests.len(),
+        via.0,
+        owner.0
+    );
+    for line in &requests {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
 }
 
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
