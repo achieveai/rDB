@@ -15662,4 +15662,116 @@ mod tests {
         assert!(with(2, false).is_ok(), "the floor off takes cap 2");
         assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
     }
+
+    /// A `Db` built by hand whose heal stands at `heal`, with one OS boot id queued for a node
+    /// folder in `dir`; and that folder's `os_boot` file.
+    fn r5_queued(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        heal: HealState,
+    ) -> (Db, PathBuf) {
+        let db = Db::by_hand(
+            Vec::new(),
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        );
+        *lock(&db.opened.heal) = heal;
+        *lock(&db.opened.os_boot_record) = vec![(dir.to_path_buf(), "boot-a".to_owned())];
+        (db, dir.join(crate::os_boot::OS_BOOT_FILE))
+    }
+
+    /// The heal states this test's `os_boot_record_deferred` lines name, in order.
+    fn r5_deferred(method: &str) -> Vec<String> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "os_boot_record_deferred")
+            .map(|line| line["heal"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// The heal a [`r5_queued`] `Db` is handed once its owner is ready.
+    const R5_HANDED: admin::Healed = admin::Healed {
+        cleared: admin::GrantCleared::Absent(rdb_core::contracts::ids::Revision(1)),
+        read_revision: rdb_core::contracts::ids::Revision(1),
+        control_revision: rdb_core::contracts::ids::Revision(1),
+    };
+
+    /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal still `Running` past
+    /// its deadline writes no marker, logs `os_boot_record_deferred{heal=running}` and keeps
+    /// the queued id; once the heal is `Handed`, the next call writes it, and a call after that
+    /// does not write it again. Unit (~10 ms). Cut: the queue emptied when the write is
+    /// deferred: the id is not kept, red (in `r5_z` too).
+    #[config_log::retcd_test]
+    fn r5_y_a_running_heal_past_its_deadline_defers_the_marker_and_keeps_its_id() {
+        const METHOD: &str =
+            "r5_y_a_running_heal_past_its_deadline_defers_the_marker_and_keeps_its_id";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let (db, marker) = r5_queued(&rt, dir.path(), HealState::Running);
+        db.record_os_boot(std::time::Instant::now());
+        assert!(!marker.exists(), "no marker while the heal runs");
+        assert_eq!(lock(&db.opened.os_boot_record).len(), 1, "the id is kept");
+        assert_eq!(r5_deferred(METHOD), ["running"]);
+
+        *lock(&db.opened.heal) = HealState::Handed(R5_HANDED);
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker").trim(),
+            "boot-a"
+        );
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
+        // A later ready answer writes nothing: the file is left as it is.
+        std::fs::write(&marker, "left alone").expect("overwrite");
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker"),
+            "left alone",
+            "written once"
+        );
+    }
+
+    /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal `Failed` writes no
+    /// marker, at once (a failed heal is not waited for), logs
+    /// `os_boot_record_deferred{heal=failed}` and keeps the queued id; a later call with the
+    /// heal `Handed` writes the queued id once. Unit (~10 ms). Cut: `Failed` taken as done:
+    /// the marker is written, red.
+    #[config_log::retcd_test]
+    fn r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id() {
+        const METHOD: &str = "r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let failed = HealState::Failed(admin::HealError::PeersUnknown {
+            nodes: vec![3],
+            within_ms: 1,
+            reason: "copy_not_proven_down",
+        });
+        let (db, marker) = r5_queued(&rt, dir.path(), failed);
+        let started = std::time::Instant::now();
+        db.record_os_boot(started + Duration::from_secs(60));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a failed heal is not waited for: {:?}",
+            started.elapsed()
+        );
+        assert!(!marker.exists(), "no marker after a failed heal");
+        assert_eq!(lock(&db.opened.os_boot_record).len(), 1, "the id is kept");
+        assert_eq!(r5_deferred(METHOD), ["failed"]);
+
+        *lock(&db.opened.heal) = HealState::Handed(R5_HANDED);
+        db.record_os_boot(std::time::Instant::now());
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker").trim(),
+            "boot-a"
+        );
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
+    }
 }
