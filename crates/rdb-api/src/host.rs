@@ -7662,18 +7662,32 @@ impl Host {
     /// change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
-        // later revives none.
+        // later revives none. R5 (PR #181): a partition with no commit here yet is the reopen's
+        // heal still committing, after its `HealLeftOut` and before its `Plan` lands; its
+        // entries wait for that commit instead of being forgotten in the gap.
+        let pending: BTreeSet<PartitionId> = self
+            .live_readd
+            .clocked
+            .keys()
+            .map(|(partition, _)| *partition)
+            .filter(|partition| !self.committed.contains_key(partition))
+            .collect();
         let owned: BTreeSet<PartitionId> = self
             .live_readd
             .clocked
             .keys()
             .map(|(partition, _)| *partition)
-            .filter(|partition| self.is_pinned_primary(*partition))
+            .filter(|partition| pending.contains(partition) || self.is_pinned_primary(*partition))
             .collect();
         let live = &mut self.live_readd;
         live.clocked
             .retain(|(partition, _), _| owned.contains(partition));
-        let keys: Vec<(PartitionId, NodeId)> = live.clocked.keys().copied().collect();
+        let keys: Vec<(PartitionId, NodeId)> = live
+            .clocked
+            .keys()
+            .copied()
+            .filter(|(partition, _)| !pending.contains(partition))
+            .collect();
         live.links.retain(|key, _| keys.contains(key));
         live.refusals_logged
             .retain(|(partition, node, _)| keys.contains(&(*partition, *node)));
