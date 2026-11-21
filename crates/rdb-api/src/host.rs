@@ -1267,19 +1267,25 @@ pub enum TailAdoption {
     /// A proof failed, named by one of [`ADOPTION_REFUSALS`]. The tail cannot come back.
     Refused(&'static str),
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
-    /// survivor's own check). The next landing scan replaces it.
+    /// survivor's own check), or by one whose reason is not in [`ADOPTION_REFUSALS`]: check B's
+    /// `tail_has_no_floor` and `tail_history_read_failed` (#121), or a write that failed after
+    /// the proofs held. The next landing scan replaces it.
     Unchecked,
 }
 
 impl TailAdoption {
-    /// The state [`Host::adoption`]'s answer names.
+    /// The state [`Host::adoption`]'s answer names. A reason outside [`ADOPTION_REFUSALS`], the
+    /// wire vocabulary, is `Unchecked`, at adoption and at landing alike (#153 lead ruling): as
+    /// `Refused` it would not decode on a peer, so a status naming it would close the link, and
+    /// a bare `forget-tail` over it would need no `--give-up-live-copy`.
     pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
             Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
                 Self::NotReady(reason)
             }
-            Err(reason) => Self::Refused(reason),
+            Err(reason) if ADOPTION_REFUSALS.contains(reason) => Self::Refused(reason),
+            Err(_) => Self::Unchecked,
         }
     }
 
@@ -1300,8 +1306,10 @@ impl TailAdoption {
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
 pub const ADOPTION_NOT_READY: usize = 3;
 
-/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first
-/// ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Every reason [`Host::adoption`] answers that crosses the wire, [`TailAdoption::NotReady`]'s
+/// first ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Check B's two (`tail_has_no_floor`, `tail_history_read_failed`, #121) are not: a peer on an
+/// older build would refuse them, so they hold the tail [`TailAdoption::Unchecked`].
 pub const ADOPTION_REFUSALS: [&str; 11] = [
     "replay_not_ready",
     "tail_parent_copying",
@@ -2605,7 +2613,8 @@ enum PendingKind {
 }
 
 /// Why a node faulted, typed (A-R178): every waiter is refused with [`Fault::error`], and every
-/// call after with [`Fault::refusal`]. A view that read stored damage refuses as
+/// call after with [`Fault::refusal`], except a status query, which gets [`Fault::error`] (#136).
+/// A view that read stored damage refuses as
 /// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
 /// fault is [`ApiError::host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2625,7 +2634,9 @@ impl Fault {
 
     /// [`Self::error`] for a call that reached the node after it faulted: refused before
     /// admission, so it mutated nothing (#124, ruling Q15 (b)). Its retry rule is unchanged.
-    /// A call admitted before the fault keeps [`Self::error`].
+    /// A call admitted before the fault keeps [`Self::error`], and so does a status query after
+    /// it: it is about an earlier write that may have applied (#136). A resend takes this
+    /// refusal, as `Db::put`'s first send; `Db::resend` clears `no_mutation` itself.
     fn refusal(&self) -> ApiError {
         let mut error = self.error();
         error.no_mutation = true;
@@ -3910,8 +3921,17 @@ impl Host {
     fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
+                // A status query is about an earlier write, which may have applied before the
+                // fault: its refusal must not say nothing was applied, or the step sends that
+                // write again as a new one (#136). A resend keeps the refusal: `Db::put` sends
+                // a compiled request first as a resend, and that first send was never admitted
+                // (#124, `m10_124_...`); `Db::resend` clears `no_mutation` for a real resend.
+                let error = match client.call {
+                    ClientCall::Status { .. } => fault.error(),
+                    _ => fault.refusal(),
+                };
                 let _ = client.reply.send(Answer::Error {
-                    error: fault.refusal(),
+                    error,
                     request: None,
                 });
             }
@@ -12963,13 +12983,10 @@ impl Host {
                                 reason = refusal,
                                 "tail_not_adoptable"
                             );
-                            // A write that failed after the proofs held proves nothing
-                            // about the tail: it stays `Unchecked`.
-                            let adoption = if ADOPTION_REFUSALS.contains(&refusal) {
-                                TailAdoption::of::<()>(&Err(refusal))
-                            } else {
-                                TailAdoption::Unchecked
-                            };
+                            // A write that failed after the proofs held, or check B's
+                            // refusal, proves nothing the wire can name: `of` holds it
+                            // `Unchecked`.
+                            let adoption = TailAdoption::of::<()>(&Err(refusal));
                             return self.tail_held(partition, copy, anchor, hit, adoption);
                         }
                     },
@@ -13460,7 +13477,11 @@ impl Host {
     /// * P2: every record from the base through the head reads, verifies, and chains from that
     ///   digest ([`Self::chain`]).
     /// * No lineage at the anchor's generation, or one staging a copy of the whole tail (G4):
-    ///   [`Adopt::Link`], or [`Adopt::Resume`], once [`Self::link_preconditions`] hold (G3).
+    ///   [`Adopt::Link`], or [`Adopt::Resume`], once check B and [`Self::link_preconditions`]
+    ///   hold (G3). Check B (#121): the tail's lineage reaches seq 1 ([`Self::has_floor`]); a
+    ///   hole is `tail_has_no_floor`, a failed seq 1 read `tail_history_read_failed`, logged
+    ///   `adopt_floor_read_failed`. Neither is in [`ADOPTION_REFUSALS`], so
+    ///   [`TailAdoption::of`] holds the tail `Unchecked`.
     ///   One held (walk A's shape):
     ///   [`Adopt::Replay`], only when it is linked and not staging, its head is at or above the
     ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first
@@ -13528,6 +13549,26 @@ impl Host {
         if !self.engine.generations(partition).contains(&to)
             || self.engine.staging(partition, to) == Some((hit.from, hit.head))
         {
+            // Check B at adoption (#121, ADR-rdb-0026): a link or a resume puts the
+            // anchor's generation onto the tail's lineage, so that lineage must reach seq 1, as
+            // landing and the inventory link require. Neither reason is in
+            // `ADOPTION_REFUSALS`, a wire vocabulary: `TailAdoption::of` holds the tail
+            // `Unchecked`, at adoption and at a landing's scan alike.
+            match self.has_floor(partition, hit.from) {
+                Ok(true) => {}
+                Ok(false) => return Err("tail_has_no_floor"),
+                Err(fault) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        from = hit.from.0,
+                        to = to.0,
+                        ?fault,
+                        "adopt_floor_read_failed"
+                    );
+                    return Err("tail_history_read_failed");
+                }
+            }
             return self.link_preconditions(partition, to, hit);
         }
         if self.engine.staging(partition, to).is_some() || self.engine.link(partition, to).is_none()

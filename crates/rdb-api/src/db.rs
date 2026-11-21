@@ -260,8 +260,9 @@ pub struct DbConfig {
     /// M10.
     pub ack_floor: bool,
     /// Automatic failover (#81 slice C1): this node process runs a planner that, while it holds
-    /// `planner/grant`, promotes each partition of a node whose process is silent and whose
-    /// grant has run out ([`crate::planner`]). Only a node process may set it: exactly one node
+    /// `planner/grant`, promotes each partition of a node whose grant has run out and whose
+    /// process is silent, or whose host answers the planner's look with a fault (#122: a host
+    /// fault lasts the boot, so that node serves nothing more) ([`crate::planner`]). Only a node process may set it: exactly one node
     /// in [`Self::local`], else the open is refused with [`OpenError::Config`]. `None`, the
     /// default, never promotes: failover stays the operator's `promote`.
     pub failover: Option<crate::planner::Failover>,
@@ -1601,7 +1602,7 @@ impl Db {
             .clone()
             .expect("an open with a node has a control store");
         self.opened.planner_task = Some(rt.spawn(tracing::Instrument::instrument(
-            planner.run(),
+            planner.run_logged(),
             tracing::Span::current(),
         )));
     }
@@ -2133,7 +2134,37 @@ impl Db {
                         forming_step(declared.is_some())
                     )));
                 };
-                return Err(empty_owner_refusal(store, &instance, &record, &root).await);
+                // PR #156 review: partitions/1 was read twice, by `formed_member` and here. The
+                // instance comes from the first read and the root from the second, so they must
+                // agree, as `check_others` requires of every later partition.
+                if root.instance != instance {
+                    return Err(OpenError::Mismatch(error::not_this_store_text(&format!(
+                        "partitions/{} named instance {} and then {} while this open read it",
+                        PARTITION.0,
+                        admin::instance_hex(&instance),
+                        admin::instance_hex(&root.instance)
+                    ))));
+                }
+                // #137: the owner's empty copy of a declared partition 1 whose root no host
+                // activated rolls forward onto that copy; anything else is still refused, and a
+                // refused open binds nothing.
+                let decided = Self::decide_partition(
+                    engines, store, &instance, partial, PARTITION, &record, &root,
+                )
+                .await?;
+                for (node, engine) in engines.iter_mut() {
+                    engine
+                        .bind_instance(instance)
+                        .map_err(|error| OpenError::Node(format!("node {}: {error}", node.0)))?;
+                }
+                return Ok(Found {
+                    instance,
+                    fresh: false,
+                    owner: record.owner,
+                    roll: decided.roll,
+                    others: Vec::new(),
+                    forms_first: false,
+                });
             }
             for (node, engine) in engines.iter_mut() {
                 engine
@@ -2494,8 +2525,10 @@ impl Db {
             .filter(|(held, _)| *held == partition)
             .map(|(_, held)| held.0)
             .collect();
+        // #137: the owner's empty copy falls through to the roll-forward below only when
+        // `empty_owner` proves its root is a declared partition's first, never activated.
         if partial && behind.is_empty() && engines.contains_key(&record.owner) {
-            return Err(empty_owner_refusal(store, instance, record, root).await);
+            empty_owner(store, instance, record, root).await?;
         }
         if !holds
             && partial
@@ -6044,55 +6077,57 @@ async fn read_mark(
     }
 }
 
-/// Why a node process cannot run the empty copy of the owner of `record`'s partition. A formation
-/// that stopped right after the partition's first commit (design 7.2 row 4) is finished by running
-/// `--form` again; a declared database's is not, and its refusal says so (issue #137). Anything
-/// else needs another owner.
-async fn empty_owner_refusal(
+/// Whether a node process may run the empty copy of the owner of `record`'s partition, and why
+/// not. A formation that stopped right after the partition's first commit (design 7.2 row 4),
+/// which no host activated, so no write was admitted: a declared database's owner rolls that
+/// root forward onto its empty copy (#137), and the caller's roll-forward reads the mark again
+/// and claims it; an undeclared one is finished by running `--form` again. Anything else, a
+/// copy that may have admitted writes included, needs another owner.
+async fn empty_owner(
     store: &Arc<dyn ConfigStore>,
     instance: &[u8; INSTANCE_LEN],
     record: &PartitionRecord,
     root: &PartitionRoot,
-) -> OpenError {
+) -> Result<(), OpenError> {
     let count = match read_mark(store, instance, record.partition).await {
         Ok((count, _)) => count,
-        Err(error) => return counter_refused(instance, error),
+        Err(error) => return Err(counter_refused(instance, error)),
     };
     if root.predecessor_generation == Generation(0)
         && root.predecessor_cutoff == Seq::ZERO
         && !count.may_have_admitted(record.generation)
     {
         return match admin::read_formation(&**store).await {
-            Ok(Some(_)) => OpenError::Config(format!(
-                "partition {} has not finished forming: its owner's copy is empty after the \
-                 partition's first root, and a declared database does not form a partition \
-                 again, so running rdb_node --declare again does not finish it (issue #137)",
-                record.partition.0
-            )),
-            Ok(None) => OpenError::Config(format!(
+            Ok(Some(_)) => {
+                tracing::info!(
+                    partition = record.partition.0,
+                    generation = record.generation.0,
+                    owner = record.owner.0,
+                    "db_open_empty_owner_rolls_forward"
+                );
+                Ok(())
+            }
+            Ok(None) => Err(OpenError::Config(format!(
                 "partition {} has not finished forming; {RERUN_FORM}",
                 record.partition.0
-            )),
-            Err(error) => formation_refused(error),
+            ))),
+            Err(error) => Err(formation_refused(error)),
         };
     }
-    match read_partition_count(store).await {
-        Ok(Some(partitions)) if partitions > 1 => {
-            return OpenError::Config(format!(
-                "the copy of node {} holds no data, and partition {} names it owner: from a peer, \
-                 move it with `admin promote <the node you chose> --partition {}`, then start \
-                 node {} again",
-                record.owner.0, record.partition.0, record.partition.0, record.owner.0
-            ));
-        }
-        Ok(_) => {}
-        Err(error) => return error,
-    }
-    OpenError::Config(format!(
-        "the copy of node {} holds no data, and partition {} names it owner: promote another node \
-         first (lr promote), then start node {} again",
-        record.owner.0, record.partition.0, record.owner.0
-    ))
+    Err(match read_partition_count(store).await {
+        Ok(Some(partitions)) if partitions > 1 => OpenError::Config(format!(
+            "the copy of node {} holds no data, and partition {} names it owner: from a peer, \
+             move it with `admin promote <the node you chose> --partition {}`, then start node \
+             {} again",
+            record.owner.0, record.partition.0, record.partition.0, record.owner.0
+        )),
+        Ok(_) => OpenError::Config(format!(
+            "the copy of node {} holds no data, and partition {} names it owner: promote another \
+             node first (lr promote), then start node {} again",
+            record.owner.0, record.partition.0, record.owner.0
+        )),
+        Err(error) => error,
+    })
 }
 
 /// Ruling A-R184 (arch R3b check 4, critic-rollfwd F2): the copies a reopen may roll forward to
