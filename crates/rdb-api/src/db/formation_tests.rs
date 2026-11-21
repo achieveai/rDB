@@ -4927,10 +4927,13 @@ fn own83_b2_14_a_no_address_rejoin_on_an_emptied_folder_fences() {
 /// host starts, each leaving `CURRENT` behind. The next open with A still fences (the fence file
 /// says so, not `CURRENT`), and the late B is refused. A restart then writes nothing. Cut: the
 /// fence file not consulted once `CURRENT` exists, red at "the recovery wrote A again, past r".
-/// Integration (~3 s).
+/// The fence file's name is pinned: it is on disk, so renaming it would miss a fence an older
+/// build left owed. Integration (~3 s).
 #[config_log::retcd_test]
 fn own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence() {
     const A: &str = "gw-1.a:8443";
+    // The name is persisted: a folder an older build left owes its fence under it (T53).
+    assert_eq!(APP_ADDR_FENCE_FILE, "app-addr-fence");
     let (fence, r) = fence_with_late_b(A);
     std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
     std::fs::create_dir_all(fence.dir.0.join("nodes")).expect("an empty nodes/");
