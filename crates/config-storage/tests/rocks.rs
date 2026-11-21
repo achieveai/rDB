@@ -1951,6 +1951,19 @@ async fn i194_journal_stats_stay_old_until_the_compaction_is_written() {
     assert_eq!(before.oldest_revision, Some(1));
     assert_eq!(before.newest_revision, Some(5));
     assert_eq!(reader.retention_inputs().unwrap(), (before, 0));
+    // The byte oracle, taken from the events on disk before the compaction and measured the
+    // way the store writes them. Only revisions 4 and 5 survive `Compact { up_to: 3 }`.
+    let on_disk = reader.read_events(0, 5, b"", usize::MAX).unwrap();
+    assert_eq!(
+        on_disk.iter().map(config_storage::event_bytes).sum::<u64>(),
+        before.bytes,
+        "the stats count every event's encoded bytes"
+    );
+    let kept_bytes: u64 = on_disk
+        .iter()
+        .filter(|e| e.revision > 3)
+        .map(config_storage::event_bytes)
+        .sum();
 
     let (reached, release) = park.arm();
     let mut sm = s.state_machine();
@@ -2001,12 +2014,9 @@ async fn i194_journal_stats_stay_old_until_the_compaction_is_written() {
             oldest_revision: Some(4),
             newest_revision: Some(5),
             count: 2,
-            bytes: after.bytes,
-        }
-    );
-    assert!(
-        after.bytes < before.bytes,
-        "the deleted events' bytes are gone"
+            bytes: kept_bytes,
+        },
+        "after the compaction the stats hold exactly revisions 4 and 5"
     );
     assert_eq!(
         reader.read_events(3, 5, b"", usize::MAX).unwrap().len() as u64,

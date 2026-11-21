@@ -255,9 +255,11 @@ pub trait StateReader: Send + Sync {
     /// * the target it proposes is at most the copy's `newest_revision`, which is at most the
     ///   applied revision, and `Compact` clamps to the applied revision anyway, so a stale
     ///   floor can never compact past what is applied;
-    /// * a target at or below the real floor applies as a `Compact` no-op (monotonic rule,
-    ///   M4-25), and its `dedup_trim_below = target + 1` is at most the real floor + 1 — no
-    ///   higher than the trim the next tick proposes from the fresh floor;
+    /// * a target at or below the real floor is a history no-op, with a bounded dedup trim.
+    ///   History does not move (monotonic rule, M4-25). The dedup trim still runs first,
+    ///   because `apply_compact` trims before its monotonic short-circuit. Its watermark,
+    ///   `dedup_trim_below = target + 1`, is at most the real floor + 1, so it is no higher
+    ///   than the trim the next tick proposes from the fresh floor;
     /// * the stats and the floor come from the same batch, so the tick never pairs new stats
     ///   with an old floor or the reverse.
     ///

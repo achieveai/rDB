@@ -128,6 +128,9 @@ pub(crate) struct NodeInner {
     /// see arrive (test plan M4-28, M4-29).
     receipts: Mutex<Vec<(u64, u64)>>,
     retention_task: Mutex<Option<JoinHandle<()>>>,
+    /// Seams for in-crate rows only (#192 review); compiled out of every real build.
+    #[cfg(test)]
+    test_hooks: TestHooks,
     /// Observed leadership transitions, and the leader they were observed against
     /// (`retcd_raft_leader_changes_total`, ADR-0026).
     ///
@@ -311,6 +314,8 @@ impl ConfigNode {
             watch,
             receipts: Mutex::new(Vec::new()),
             retention_task: Mutex::new(None),
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
             leader_changes: AtomicU64::new(0),
             last_seen_leader: Mutex::new(None),
             gossip_endpoint_mismatch: AtomicU64::new(0),
@@ -1017,6 +1022,12 @@ impl ConfigNode {
         self.inner.evaluate_retention().await;
     }
 
+    /// The in-crate seams on this node (#192 review).
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> &TestHooks {
+        &self.inner.test_hooks
+    }
+
     /// A digest over retained journal events above `from_exclusive` (test plan TA-31).
     ///
     /// Separate from [`ConfigNode::state_hash`], which keeps its M1/M2 definition: a
@@ -1288,6 +1299,10 @@ impl NodeInner {
     /// and sees the retirement, as it did before #186. This is a rare admin path, so a wait of
     /// one fsync here is fine; the per-RPC peer-plane check keeps `is_retired`.
     fn is_retired_for_readmission(&self, node_id: NodeId) -> bool {
+        #[cfg(test)]
+        self.test_hooks
+            .readmission_checks
+            .fetch_add(1, Ordering::SeqCst);
         let mut retired = false;
         self.reader
             .with_state(&mut |s| retired = s.is_retired(node_id));
@@ -2350,7 +2365,14 @@ impl NodeInner {
         // One read of the store's last durable batch, not the state-machine lock, so this tick
         // on a Tokio worker never waits out an apply's fsync (#194). Its floor can lag a
         // compaction still writing; `StateReader::retention_inputs` says why that is safe.
-        let Ok((stats, compact_revision)) = self.reader.retention_inputs() else {
+        let inputs = self.reader.retention_inputs();
+        #[cfg(test)]
+        let inputs = if self.test_hooks.fail_retention_inputs.load(Ordering::SeqCst) {
+            Err(config_storage::StorageReadError::Poisoned)
+        } else {
+            inputs
+        };
+        let Ok((stats, compact_revision)) = inputs else {
             return;
         };
         let view = JournalView {
@@ -2722,6 +2744,17 @@ fn write_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
 ///
 /// Holds a `Weak`, so it never keeps the node alive, and is aborted outright by
 /// [`ConfigNode::stop`].
+/// Seams the in-crate rows use to fence or fail one step (#192 review). Test builds only.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    /// Readmission checks started. Bumped before the check takes the state-machine lock, so
+    /// a row can wait until an `add_learner` or `promote_voter` is inside it.
+    pub(crate) readmission_checks: AtomicU64,
+    /// While set, the retention tick sees `retention_inputs` fail.
+    pub(crate) fail_retention_inputs: AtomicBool,
+}
+
 async fn retention_loop(inner: Weak<NodeInner>) {
     let interval = match inner.upgrade() {
         Some(node) => node.retention.check_interval,

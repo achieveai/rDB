@@ -96,6 +96,15 @@ async fn wait_reached(reached: mpsc::Receiver<()>) {
 
 /// A formed single-voter node on a RocksStore that `park` can hold.
 async fn start_node(dir: &Path, park: Arc<ParkWrite>) -> ConfigNode {
+    start_node_with(dir, park, |_| {}).await
+}
+
+/// [`start_node`], with `configure` applied to the node's config before it starts.
+async fn start_node_with(
+    dir: &Path,
+    park: Arc<ParkWrite>,
+    configure: impl FnOnce(&mut NodeConfig),
+) -> ConfigNode {
     let identity = ClusterIdentity {
         cluster_id: ClusterId::from_bytes([7u8; 16]),
         recovery_epoch: RecoveryEpoch(0),
@@ -113,7 +122,8 @@ async fn start_node(dir: &Path, park: Arc<ParkWrite>) -> ConfigNode {
     )
     .expect("store opens");
     let endpoint = InProcTransport::endpoint(identity.node_id);
-    let cfg = NodeConfig::new(identity, endpoint.clone());
+    let mut cfg = NodeConfig::new(identity, endpoint.clone());
+    configure(&mut cfg);
     let timers = cfg.raft;
     let transport = Arc::new(InProcTransport::new(NetFault::new()));
     let node = ConfigNode::start(
@@ -253,16 +263,17 @@ async fn i194_engine_journal_view_and_retention_answer_during_an_apply_write() {
     node.stop().await.expect("stop");
 }
 
-/// #192 review blocker: a same-id `add_learner` issued while the `RetireNode` apply for that
-/// id is parked inside its write is refused as `Retired`, never proposed.
+/// #192 review blocker: a same-id `add_learner` or `promote_voter` issued while the
+/// `RetireNode` apply for that id is parked inside its write is refused as `Retired`, never
+/// proposed.
 ///
 /// Node ids are never reused: that is a safety rule, so the readmission check must not read
 /// the mirror, which still says "not retired" until the write lands. With the check on the
-/// mirror (1d0ad90) the learner was proposed and the call answered `Ok`.
+/// mirror (1d0ad90) the learner was proposed and `add_learner` answered `Ok`; `promote_voter`
+/// got past the check and answered `NotAMember`.
 ///
-/// The add is given 300 ms to reach its check before the write is released. On a host so
-/// slow that it reaches the check only after the release, the row passes on either code; it
-/// can be falsely green, never falsely red.
+/// Fenced, not timed: the write is released only after both calls have entered the check
+/// (`TestHooks::readmission_checks`), so a slow host cannot let either start after the release.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn i192_add_learner_during_a_parked_retire_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -292,7 +303,22 @@ async fn i192_add_learner_during_a_parked_retire_is_refused() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await; // testkit:allow-sleep
+    let promoting = {
+        let node = node.clone();
+        tokio::spawn(async move { node.promote_voter(NodeId(9)).await })
+    };
+    let started = std::time::Instant::now();
+    while node.test_hooks().readmission_checks.load(Ordering::SeqCst) < 2 {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "add_learner and promote_voter never reached the readmission check"
+        );
+        assert!(
+            !adding.is_finished() && !promoting.is_finished(),
+            "a readmission call answered while the retirement was still parked"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await; // testkit:allow-sleep: bounded poll for the fence
+    }
     release.send(()).unwrap();
 
     retiring
@@ -307,10 +333,69 @@ async fn i192_add_learner_during_a_parked_retire_is_refused() {
         matches!(added, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
         "a same-id add_learner during the parked retirement must be refused, got {added:?}"
     );
+    let promoted = tokio::time::timeout(PATIENCE, promoting)
+        .await
+        .expect("promote_voter answers")
+        .expect("promote task joins");
+    assert!(
+        matches!(promoted, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
+        "a same-id promote_voter during the parked retirement must be refused, got {promoted:?}"
+    );
     let report = node.membership_report();
     assert!(
         !report.learners.contains(&NodeId(9)) && !report.membership.voters.contains(&NodeId(9)),
         "the retired id must not have re-entered membership"
+    );
+    node.stop().await.expect("stop");
+}
+
+/// #192 review: when `retention_inputs` fails, the leader's retention tick returns without
+/// proposing a `Compact`.
+///
+/// The policy keeps 2 revisions and the journal holds 4, so a tick that read its inputs would
+/// propose `Compact { up_to: 2 }`. The same tick with the inputs readable is the positive
+/// control: it does compact to 2, so the first half cannot pass because nothing was due.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn i192_retention_proposes_nothing_when_its_inputs_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_node_with(dir.path(), Arc::new(ParkWrite::default()), |cfg| {
+        cfg.watch_retention = config_core::WatchRetention {
+            max_revisions: 2,
+            ..config_core::WatchRetention::DEFAULT
+        };
+    })
+    .await;
+    let principal = Principal::development();
+    for i in 0..4 {
+        node.put(&principal, put(&format!("/i192/retention/{i}")))
+            .await
+            .expect("put");
+    }
+    let applied = node.metrics().last_applied;
+
+    node.test_hooks()
+        .fail_retention_inputs
+        .store(true, Ordering::SeqCst);
+    node.evaluate_retention_once().await;
+    assert_eq!(
+        node.compact_revision(),
+        0,
+        "a tick whose retention_inputs failed compacted anyway"
+    );
+    assert_eq!(
+        node.metrics().last_applied,
+        applied,
+        "a tick whose retention_inputs failed proposed an entry"
+    );
+
+    node.test_hooks()
+        .fail_retention_inputs
+        .store(false, Ordering::SeqCst);
+    node.evaluate_retention_once().await;
+    assert_eq!(
+        node.compact_revision(),
+        2,
+        "positive control: with its inputs readable the same tick compacts to newest - 2"
     );
     node.stop().await.expect("stop");
 }
