@@ -442,7 +442,7 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     so while it renews and its link to the owner is missing there is no fixed wait. The wait
     ends when the link comes up, or when the copy stops renewing and the owner proves its grant
     expired. A copy with no grant record
-    (one that never owned a partition) is waited for one heal window (`no_grant_record`), then
+    is waited for one heal window (`no_grant_record`), then
     left out too (`evidence=no_grant_after_window`). That costs availability only, never an
     acknowledged write.
   - **How a left-out copy comes back:** by #107's live re-add, once its link has been up for
