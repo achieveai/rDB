@@ -935,7 +935,12 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 - An app connected over a network link is not scoped by the node. **rDB's client and peer ports
   must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
   your gateway. A node-side check of the certificate's app against the id is owed (#154).
-  rDB ships no deployment config, so until #154 that boundary is the embedder's network policy.
+  rDB ships development and multihost-test config only: `docker/` (the `rdb-bf-node` image,
+  whose Dockerfile `EXPOSE`s 7001-7004: the rEtcd voter's peer, client and gossip ports and its
+  health port, which the voter binds to loopback only) and `scripts/docker-multihost.sh`, which
+  runs voters and data nodes (peer port 7101) on one private Docker network and publishes no
+  port to the host. Neither is a production deployment, so until #154 that boundary is the
+  embedder's network policy.
   For SBX (checked 2026-11-20): rDB is embedded in-process only, its ports are firewalled from
   the sandbox and app networks, and gateways talk to each other over their own mTLS.
 - `route`, `ownership` and ownership events return partition and node facts only, never a
