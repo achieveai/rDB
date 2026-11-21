@@ -2464,19 +2464,32 @@ fn take_partition<'a>(rest: &[&'a str]) -> Result<(Option<PartitionId>, Vec<&'a 
 
 /// `admin readiness`: one line per partition, then how many are ready.
 fn readiness_lines(db: &Db) -> Vec<String> {
-    let seen = db.readiness();
+    readiness_text(&db.readiness())
+}
+
+/// [`readiness_lines`]' words for what `Db::readiness` saw. A partition that needs an operator
+/// (issue #61, `PartitionReady::degraded`) gets a second line, `degraded: <command>`, whether or
+/// not it is ready, so the operator sees it without reading logs.
+fn readiness_text(seen: &[rdb_api::PartitionReady]) -> Vec<String> {
     let ready = seen.iter().filter(|partition| partition.ready).count();
     let total = seen.len();
     seen.iter()
-        .map(|partition| match &partition.reason {
-            None => format!(
-                "partition {} owner {} ready",
-                partition.partition.0, partition.owner.0
-            ),
-            Some(reason) => format!(
-                "partition {} owner {} not ready: {reason:?}",
-                partition.partition.0, partition.owner.0
-            ),
+        .flat_map(|partition| {
+            let state = match &partition.reason {
+                None => format!(
+                    "partition {} owner {} ready",
+                    partition.partition.0, partition.owner.0
+                ),
+                Some(reason) => format!(
+                    "partition {} owner {} not ready: {reason:?}",
+                    partition.partition.0, partition.owner.0
+                ),
+            };
+            let degraded = partition
+                .degraded
+                .as_ref()
+                .map(|needs| format!("partition {} degraded: {needs}", partition.partition.0));
+            std::iter::once(state).chain(degraded)
         })
         .chain(std::iter::once(format!(
             "readiness: {ready} of {total} partitions ready"
@@ -5892,6 +5905,41 @@ mod tests {
         }
         let why = needs_group(&["read", "k"], 2).expect("refused");
         assert!(why.contains("no --group form"), "{why}");
+    }
+
+    /// Issue #61 A8c (lead ask): `admin readiness` prints a partition's `degraded` command on a
+    /// line of its own, ready or not, so an operator sees it without reading logs. Unit.
+    /// Cut: `degraded` not printed, red.
+    #[test]
+    fn t61_readiness_prints_a_degraded_partitions_command() {
+        use rdb_api::{NotReady, PartitionReady};
+        let needs = "copy 3 on node 3 holds a tail through seq 40 past the history floor; run: \
+                     admin forget-tail --group 1 --copy 3 --through 40";
+        let seen = [
+            PartitionReady {
+                partition: PartitionId(1),
+                owner: NodeId(2),
+                ready: true,
+                reason: None,
+                degraded: Some(needs.to_owned()),
+            },
+            PartitionReady {
+                partition: PartitionId(2),
+                owner: NodeId(1),
+                ready: false,
+                reason: Some(NotReady::NoLink),
+                degraded: None,
+            },
+        ];
+        assert_eq!(
+            super::readiness_text(&seen),
+            vec![
+                "partition 1 owner 2 ready".to_owned(),
+                format!("partition 1 degraded: {needs}"),
+                "partition 2 owner 1 not ready: NoLink".to_owned(),
+                "readiness: 1 of 2 partitions ready".to_owned(),
+            ]
+        );
     }
 
     use super::*;

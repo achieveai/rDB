@@ -226,6 +226,11 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
+/// Issue #61 (design N3): the "not before" poll hint on a write refused read-only while this
+/// owner rebuilds a copy from a snapshot. Fixed, and not an estimate: the source knows how much
+/// it has sent, not how much is left.
+pub const REBUILD_RETRY_HINT: Duration = Duration::from_secs(5);
+
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
 /// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282): the paused
 /// clock of the host's drop duty. A reachable copy's clock starts at the later of the last
@@ -696,7 +701,7 @@ pub enum Msg {
         reply: Sender<Result<Seq, String>>,
     },
     /// **Dev tool only**, debug builds (issue #61, design section 2 A5): trim this node's copy
-    /// of `partition` to `through` ([`Host::trim_history_through`]) and answer the new floor,
+    /// of `partition` to `through` (`Host::trim_history_through`) and answer the new floor,
     /// or why not. Local only, like [`Msg::Damage`]. `rdb_dev admin trim-history` uses it
     /// through [`crate::db::Db::trim_history`].
     #[cfg(debug_assertions)]
@@ -797,7 +802,7 @@ pub enum PeerAsk {
     },
     /// Issue #61 (design rev 4 N4, rev 5e): F1's `ProbeDigestAt` for one copy, under the plan's
     /// anchor. The holder answers in the anchor's generation, the one its inventory reported
-    /// ([`Host::probe`]): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
+    /// (`Host::probe`): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
     /// when it holds no record there (below its trim floor, or above its head), and nothing
     /// when its read fails, so F1's probe deadline drops the copy.
     Probe {
@@ -1299,7 +1304,7 @@ pub enum TailAdoption {
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
     /// survivor's own check). The next landing scan replaces it.
     Unchecked,
-    /// Issue #61 (lead rulings R10 and R16, protocol 12): the proofs could not run because the
+    /// Issue #61 (lead rulings R10 and R16, #61's protocol version): the proofs could not run because the
     /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
     /// back by adoption, yet giving it up still takes `--give-up-live-copy`: the copy may hold
     /// the only record of an acknowledged write (design rev 5a).
@@ -1341,9 +1346,9 @@ impl TailAdoption {
     }
 }
 
-/// Issue #61 (lead ruling R16, protocol 12): the reasons [`TailAdoption::Trimmed`] names. Each
+/// Issue #61 (lead ruling R16, #61's protocol version): the reasons [`TailAdoption::Trimmed`] names. Each
 /// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
-/// `base_below_floor` from [`Host::chain`].
+/// `base_below_floor` from `Host::chain`.
 pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
 
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
@@ -1844,6 +1849,9 @@ struct CatchUp {
     low: u64,
     /// What the shadow had acknowledged at the last duty.
     acked: u64,
+    /// Issue #61 (design M5): entries this owner's snapshot transfer to the shadow had served
+    /// at the last duty, 0 with none. The owner is the source, so the copy advancing counts.
+    pulled: u64,
 }
 
 /// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
@@ -2962,6 +2970,11 @@ struct Host {
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
+    /// Issue #61 R26 (b): per partition, the copy a `ReadOnly` commit left outside that R1 has
+    /// since caught up, with its node and the commit's generation. The repair re-plans with it
+    /// at the next check, and until then a refused write names it
+    /// ([`Self::rebuilding_read_only`]). Read only while the commit's generation is current.
+    caught_up_outside: BTreeMap<PartitionId, (Generation, CopyId, NodeId)>,
     /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
     /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
     /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
@@ -2980,12 +2993,13 @@ struct Host {
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
     /// Issue #61 (design rev 5b): per partition and copy, a `tail_held` refusal of this
-    /// primary's offer, and the `--through` an accepted forget-tail released it with. In
-    /// memory: an owner restart loses it, and the next refused offer records it again.
-    /// Cleared on that copy's `CopyCaughtUp` or when a commit pins it as a member again.
+    /// primary's offer, with the tail's head. In memory: an owner restart loses it, and the
+    /// next refused offer records it again. Dropped by an accepted forget-tail whose `--through`
+    /// covers it, on that copy's `CopyCaughtUp`, or when a commit pins it as a member again.
     offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
     /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
-    /// warned `copy_needs_forget_tail` once. Cleared by an install or a release mark.
+    /// warned `copy_needs_forget_tail` once. Cleared by an install, or when an inventory ask
+    /// gives the tail up (`Host::tail_released`).
     offer_tail_held: BTreeMap<PartitionId, snapshot::OfferTailHeld>,
     /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
     /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
@@ -3233,6 +3247,7 @@ impl Host {
             #[cfg(test)]
             hold_repairs: false,
             repair_since: BTreeMap::new(),
+            caught_up_outside: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
@@ -5553,10 +5568,13 @@ impl Host {
     }
 
     /// A read-only refusal's detail, with the copies a held repair names and the step this owner
-    /// can actually give (#79 S4d), when that is why it stays read-only. Unchanged otherwise.
+    /// can actually give (#79 S4d), when that is why it stays read-only. Issue #61 (design N3):
+    /// else, while this owner rebuilds a copy from a snapshot, the copy and the transfer's
+    /// progress, [`crate::db::error::REBUILDING_STEP`], and a "not before" poll hint of
+    /// [`REBUILD_RETRY_HINT`], which is not an estimate. Unchanged otherwise.
     fn named_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
         let Some(holds) = self.tail_holds.get(&partition) else {
-            return refused;
+            return self.rebuilding_read_only(partition, refused);
         };
         let named = holds
             .iter()
@@ -5590,6 +5608,57 @@ impl Host {
             (false, false) => crate::db::error::TAIL_HELD_RESEND,
         };
         refused.detail = format!("{}: {named}; {step}", refused.detail);
+        refused
+    }
+
+    /// [`Self::named_read_only`]'s rebuild arm (issue #61, design N3): the first transfer this
+    /// node serves for `partition`, by copy, named with its progress. Unchanged with none.
+    fn rebuilding_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let Some(((_, copy), transfer)) = self
+            .transfers
+            .range((partition, CopyId(0))..)
+            .find(|((at, _), _)| *at == partition)
+        else {
+            return self.caught_up_read_only(partition, refused);
+        };
+        let millis = transfer.opened.millis_until(self.clock.now());
+        refused.detail = format!(
+            "{}: copy {} on node {} is being rebuilt from a snapshot: {} entries ({:.1} MiB) sent \
+             in {}.{} s; writes resume when it is caught up",
+            refused.detail,
+            copy.0,
+            transfer.node.0,
+            transfer.pulled,
+            transfer.bytes as f64 / f64::from(1u32 << 20),
+            millis / 1000,
+            (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
+        refused
+    }
+
+    /// [`Self::rebuilding_read_only`] once the transfer has ended (issue #61 R26): a copy the
+    /// `ReadOnly` commit left outside is caught up, and writes wait for the owner's re-plan with
+    /// it ([`Self::repair_on_caught_up`]). Unchanged when none is, or for an older commit.
+    fn caught_up_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let current = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.new_generation);
+        let Some((_, copy, node)) = self
+            .caught_up_outside
+            .get(&partition)
+            .filter(|(generation, _, _)| Some(*generation) == current)
+        else {
+            return refused;
+        };
+        refused.detail = format!(
+            "{}: copy {} on node {} is caught up; writes resume when the owner re-plans with it",
+            refused.detail, copy.0, node.0,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
         refused
     }
 
@@ -6805,6 +6874,7 @@ impl Host {
                     "caught_up",
                     "snapshot_transfer_released",
                 );
+                self.repair_on_caught_up(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -8703,6 +8773,50 @@ impl Host {
         self.revoke(partition, epoch, None, None);
     }
 
+    /// Issue #61 R26 (b): `copy` caught up. When it is a member this node's `ReadOnly` commit
+    /// left outside and F1 armed no rebuild (a two-copy plan never arms one, arch-s2 R2-M2),
+    /// nothing else ends the window: the repair would first wait for the member's link to age
+    /// `resume_hold_millis`. A caught-up copy has just proved it answers, so that wait is
+    /// skipped: the next check probes it, and the one after re-plans (A-R350's probe still
+    /// applies). Logged `read_only_repair_on_caught_up`.
+    fn repair_on_caught_up(&mut self, partition: PartitionId, copy: CopyId) {
+        let Some((generation, node)) = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.copy == copy)
+                .map(|member| (committed.new_generation, member.node))
+        }) else {
+            return;
+        };
+        if !self.read_only_outside(partition).contains(&node) {
+            return;
+        }
+        let armed = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| f1.phase() == RecoveryPhase::Rebuilding);
+        if armed {
+            return;
+        }
+        let now = self.clock.now();
+        let aged = Tick(now.0.saturating_sub(self.budgets.resume_hold_millis));
+        let since = self.repair_since.entry(partition).or_insert(aged);
+        *since = (*since).min(aged);
+        self.caught_up_outside
+            .insert(partition, (generation, copy, node));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            copy = copy.0,
+            holder = node.0,
+            "read_only_repair_on_caught_up"
+        );
+    }
+
     /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
     /// `reason`: logged once, `membership_repair_rebuild_hold_ended`. Nothing when none was held.
     fn end_rebuild_hold(&mut self, partition: PartitionId, reason: &'static str) {
@@ -9507,11 +9621,19 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
+                let pulled = Self::transfer_pulled(
+                    self.transfers
+                        .iter()
+                        .map(|(key, transfer)| (*key, transfer.node, transfer.pulled)),
+                    (partition, shadow.copy),
+                    shadow.node,
+                );
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
                     low: behind,
                     acked,
+                    pulled,
                 };
                 self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
             }
@@ -9540,11 +9662,26 @@ impl Host {
         self.start_revoke(partition, epoch, replan);
     }
 
+    /// Issue #61 (design M5): the entries this owner's snapshot transfer to copy `at` on `node`
+    /// has served, 0 with no such transfer or one to another node. Over `(key, node, pulled)`
+    /// projections of the transfers, so a unit row needs no snapshot.
+    fn transfer_pulled(
+        transfers: impl IntoIterator<Item = ((PartitionId, CopyId), NodeId, u64)>,
+        at: (PartitionId, CopyId),
+        node: NodeId,
+    ) -> u64 {
+        transfers
+            .into_iter()
+            .find(|(key, to, _)| *key == at && *to == node)
+            .map_or(0, |(_, _, pulled)| pulled)
+    }
+
     /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records
     /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
     /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
     /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
-    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// advancing (`lagging` is the entry this duty took), or this owner's snapshot transfer to
+    /// the shadow serving more entries (issue #61, M5). Any of them starts it again. Past
     /// `move_catch_up_millis` with no progress the move is given up as
     /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
     /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
@@ -9560,8 +9697,9 @@ impl Host {
         let (to, behind, now) = (seen.to, seen.low, seen.since);
         let clock = match lagging {
             Some(last) if last.to == to => {
-                let progress =
-                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                let progress = behind < last.low
+                    || (last.acked < cutoff && seen.acked > last.acked)
+                    || seen.pulled > last.pulled;
                 CatchUp {
                     since: if progress { now } else { last.since },
                     low: last.low.min(behind),
@@ -14035,7 +14173,7 @@ impl Host {
     /// `tail_below_floor` (the history P1 and P2 read is gone; the copy is rebuilt by snapshot).
     /// That reason and [`Self::chain`]'s `base_below_floor` are [`ADOPTION_TRIMMED`], not
     /// [`ADOPTION_REFUSALS`]: they answer [`TailAdoption::Trimmed`] ([`TailAdoption::of`]), which
-    /// crosses the wire from protocol 12 (lead ruling R16). t4's check-B reasons stay
+    /// crosses the wire from the protocol version #61 introduces (lead ruling R16). t4's check-B reasons stay
     /// [`TailAdoption::Unchecked`].
     fn adoption(
         &self,
@@ -14309,11 +14447,14 @@ impl Host {
     /// too (D8, A-R337). A link above the base is an adopted tail's (issue #105 unit 2, design
     /// section 5.1, M1): it passes only when the chain from the base through the link verifies
     /// record by record from the anchor's digest ([`Self::chain`]), and is refused
-    /// `base_differs` otherwise. A copy missing the anchor's generation, or holding it staged
-    /// under a release, links it first ([`Self::inherit_missed_link`]). A copy holding a newer
-    /// generation of the partition is ahead of the plan and answers nothing; roll-forward is
-    /// decided before the plan is made, never here. Its ladder is the kept one, extended through
-    /// the head ([`Self::inventory_ladder`], A-R461), cut at the base.
+    /// `base_differs` otherwise. A lineage a snapshot installed has no link: it answers when its
+    /// own trim mark roots it at or below the anchor's base, and is refused
+    /// `anchor_generation_unlinked` otherwise, as any other unlinked lineage (issue #61 R26). A
+    /// copy missing the anchor's generation, or holding it staged under a release, links it
+    /// first ([`Self::inherit_missed_link`]). A copy holding a newer generation of the partition
+    /// is ahead of the plan and answers nothing; roll-forward is decided before the plan is
+    /// made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -14345,10 +14486,22 @@ impl Host {
                 "inventory_link_inherited"
             );
         }
-        let link = self
-            .engine
-            .link(partition, generation)
-            .ok_or("anchor_generation_unlinked")?;
+        // Issue #61 R26 (A8): a lineage a snapshot installed has no link (a link names an older
+        // parent); its own trim mark roots it at the barrier instead (B1). It answers when that
+        // mark is the anchor generation's own and is rooted at or below the anchor's base; the
+        // base digest check below then proves the prefix as for any lineage. Anything else
+        // unlinked is refused as before.
+        let link = self.engine.link(partition, generation);
+        if link.is_none()
+            && !self
+                .engine
+                .floor(partition, generation)
+                .is_some_and(|(level, mark)| {
+                    level == generation && mark.root_base <= anchor.base_seq
+                })
+        {
+            return Err("anchor_generation_unlinked");
+        }
         // Issue #61 (design section 3.5, rev 4 m-e): History below the trim floor is gone, so a
         // base under it is proved by the mark the trim wrote, never by a record. The mark
         // counts only when it is the anchor generation's own and names the anchor's base as
@@ -14372,7 +14525,7 @@ impl Host {
             // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
             // tail's. It passes only when the chain from the base through the link verifies,
             // record by record, from the anchor's digest; anything else is refused as before.
-            if link.base > anchor.base_seq {
+            if let Some(link) = link.filter(|link| link.base > anchor.base_seq) {
                 self.chain(
                     partition,
                     generation,

@@ -7,7 +7,9 @@ and the full-copy fallback (scope ruling 2026-10-02).
 **Decided by:** Gautam, HITL 2026-10-02 (L-R182k fall-through; L-R182pp edits, chain, full-copy ruling).
 **Amends:** spec §7.2, one sentence (decision 9). ADR-rdb-0007 decision 1, decision 5 and its row
 "Late old dispatch leaves quarantine only" (decision 10). Fixes `FORMAT_VERSION`, provisional since M8 S0.
-**Extended by:** [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md) (check B).
+**Extended by:** [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md) (check B);
+[ADR-rdb-0027](0027-history-trim-floor-and-snapshot-rebuild.md) (the trim floor and the snapshot
+install).
 
 ## Context
 
@@ -97,6 +99,31 @@ and the full-copy fallback (scope ruling 2026-10-02).
 11. **`FORMAT_VERSION = 1`:** key layout, value frame with a tombstone kind, lineage record with the
    `copied` flag. A lineage with no parent has **no lineage record**, never "parent = 0": generation 0
    and partition 0 are legal (L-R182w). Open refuses S0's provisional `0` and any unknown value.
+
+**Amended by issue #61 (History trim), 2026-11-20.** A lineage's History may now start at a trim
+floor F (ADR-rdb-0027, spec §4.1). Three things here change. Decision 4 is unchanged.
+
+- **The trim walk follows every link, `copied` ones included.** History falls through a copied
+  level for `seq ≤ base` (decisions 5 and 6), so a trim must cut there too.
+  `RocksEngine::stage_trim_history` deletes `[0, F)` on the lineage's own level and
+  `[0, min(F, b+1))` on each level reached through a link at base `b`, in one unsynced batch, and
+  writes a `TrimFloor` on every level it cuts. A mark never goes down. A parent's records above
+  `base` are never touched. `RocksEngine::floor` walks the same chain and answers the highest
+  mark that cuts what the lineage reads.
+- **`as_of_base` is bounded by F, with a landing refusal as the fallback.** Decision 6's full copy
+  rebuilds a touched key from `History` by a backward scan. On a trimmed parent that scan stops at
+  F. A key still open there has no after-image left, so the copy is refused
+  `HistoryMissing{below_floor:<F-1>}` instead of reading it as absent. A `base` below F is refused
+  `below_floor:<base>`. On a landing, `Host::inherit` turns that refusal into a refused landing:
+  the copy links nothing, logs `land_inherit_refused{reason="inherit_below_floor"}`, marks its
+  receiver refused for the generation, anchors at the root, and is rebuilt by snapshot. Any other
+  `inherit` refusal still faults the node.
+- **The `installing` record.** A snapshot install writes a new engine-private record,
+  `installing` (generation and barrier seq), on the new lineage in `install_begin`'s batch, and
+  `install_finish` deletes it in its synced batch. `inherit` refuses a parent that is installing
+  (`ParentInstalling`, logged `installing_inherit_refused`): its view is half written. A trim of
+  an installing lineage is refused. A lineage still installing at open is cleared, and the copy
+  rejoins empty.
 
 ## Scenarios
 

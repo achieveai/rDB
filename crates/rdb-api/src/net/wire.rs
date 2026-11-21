@@ -1918,7 +1918,7 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
-    /// Added under version 12 (#61 rev 5 M1): the command an operator must run.
+    /// Added by #61's protocol version (rev 5 M1): the command an operator must run.
     pub needs_operator: Option<String>,
 }
 
