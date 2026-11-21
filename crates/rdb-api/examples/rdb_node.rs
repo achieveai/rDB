@@ -19,8 +19,9 @@
 //! * `--log-dir` is where the JSONL log goes (default `.`), as `rdb_node-N.jsonl`. It rotates
 //!   by size (#158): before a write would take it past `--log-max-mb` (default 256), it becomes
 //!   `rdb_node-N.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at
-//!   least 2) files are kept, the live one included. `--log-max-mb 0` never rotates. At info a
-//!   node logs state changes and faults, not each write; `RUST_LOG` sets the filter.
+//!   least 2) files are kept, the live one included. `--log-max-mb 0` never rotates. A second
+//!   process writing the same log is refused at start (exit 2). At info a node logs state
+//!   changes and faults, not each write; `RUST_LOG` sets the filter.
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's

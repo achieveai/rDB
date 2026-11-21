@@ -9,7 +9,10 @@
 //! Its log is `--log-dir`/`rdb-server.jsonl` (default folder `rdb-server.logs`). It rotates by
 //! size (#158): before a write would take it past `--log-max-mb` (default 256) it becomes
 //! `rdb-server.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at least
-//! 2) files are kept, the live one included. `--log-max-mb 0` never rotates.
+//! 2) files are kept, the live one included. `--log-max-mb 0` never rotates. A restart with a
+//! smaller `--log-files` removes the files past the count. A second rdb-server on the same
+//! `--log-dir` is refused at start (exit 2, `log init`): two would rename and remove each
+//! other's files, so give each its own folder.
 //!
 //! `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
 //! `T/client.key`, the cluster id read from the client certificate (#80 S2, ADR-rdb-0024).

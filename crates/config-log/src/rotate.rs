@@ -11,11 +11,25 @@
 //! reaches this writer as one `write`, and rotation happens only between writes. A single line
 //! longer than `max_bytes` goes into a file of its own.
 //!
-//! Opening an existing file counts its size, so a restarted process keeps the same budget.
+//! Opening an existing file counts its size, so a restarted process keeps the same budget. The
+//! open also removes this log's numbered files at or past `max_files`, so a restart with fewer
+//! files keeps only as many as it was asked to.
+//!
+//! One writer per log. The open takes an exclusive OS lock on `<dir>/.<name>.lock` and holds it
+//! until the writer drops; a second writer of the same log, in this process or another, is
+//! refused with `WouldBlock` naming the log. Two writers would rename and remove each other's
+//! files. The lock goes with the process, so a crash leaves nothing to clear; the lock file
+//! itself stays, empty, and is hidden from a `<name>*` glob.
 //!
 //! The non-blocking worker discards writer errors without a word. So a rotation that fails (a
-//! rename or open refused) prints the path and the error on stderr, and the writer goes on
-//! appending to the file it has. No line is lost; the cap is exceeded, and says so.
+//! remove, rename or open refused) prints the path and the error on stderr, best effort, and the
+//! writer goes on appending to the file it holds. No line is lost; the cap is exceeded, and says
+//! so. A retry repeats only the step that failed:
+//! - The shift moves files up into the lowest free index, removing the oldest only when every
+//!   index is taken, so a shift or live rename that failed is retried without removing more.
+//! - When the new live file cannot be opened after the rename, the writer keeps the renamed
+//!   handle, now `<name>.1`, does not rotate, and opens `<name>` again on each later write
+//!   until one succeeds.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -74,14 +88,27 @@ pub struct SizeRotatingFile {
     rotation: SizeRotation,
     file: File,
     written: u64,
+    /// False after the rename when the new live file could not be opened: `file` is then
+    /// `<name>.1`, nothing rotates, and each write tries to open `<name>` first.
+    live: bool,
+    /// Held for the writer's life: the OS lock on `.<name>.lock` that keeps this log to one
+    /// writer.
+    _lock: File,
+    /// Test-only faults: the next this many renames of the live file, or opens of a new live
+    /// file, fail as if the OS refused them.
+    #[cfg(test)]
+    fail_live_rename: u32,
+    #[cfg(test)]
+    fail_live_open: u32,
 }
 
 impl SizeRotatingFile {
-    /// Open `dir/name` for appending, counting what it already holds.
+    /// Open `dir/name` for appending, counting what it already holds, and remove its numbered
+    /// files at or past `max_files`.
     ///
     /// # Errors
-    /// `max_files` under 2 or `max_bytes` of 0 is `InvalidInput`; a file that cannot be opened is
-    /// that error.
+    /// `max_files` under 2 or `max_bytes` of 0 is `InvalidInput`; another writer holding this
+    /// log is `WouldBlock`; a file that cannot be opened or removed is that error.
     pub fn open(dir: &Path, name: &str, rotation: SizeRotation) -> io::Result<Self> {
         if rotation.max_files < 2 || rotation.max_bytes == 0 {
             return Err(io::Error::new(
@@ -89,6 +116,8 @@ impl SizeRotatingFile {
                 format!("log rotation needs max_files >= 2 and max_bytes > 0, got {rotation:?}"),
             ));
         }
+        let lock = lock(dir, name)?;
+        prune(dir, name, rotation.max_files)?;
         let path = dir.join(name);
         let file = open_append(&path)?;
         let written = file.metadata()?.len();
@@ -98,7 +127,35 @@ impl SizeRotatingFile {
             rotation,
             file,
             written,
+            live: true,
+            _lock: lock,
+            #[cfg(test)]
+            fail_live_rename: 0,
+            #[cfg(test)]
+            fail_live_open: 0,
         })
+    }
+
+    /// Rename the live file to `<name>.1`.
+    fn rename_live(&mut self) -> io::Result<()> {
+        let live = self.path(0);
+        #[cfg(test)]
+        if self.fail_live_rename > 0 {
+            self.fail_live_rename -= 1;
+            return Err(with_path(io::Error::other("injected"), "rename", &live));
+        }
+        std::fs::rename(&live, self.path(1)).map_err(|e| with_path(e, "rename", &live))
+    }
+
+    /// Open (create) the live file for appending.
+    fn open_live(&mut self) -> io::Result<File> {
+        let live = self.path(0);
+        #[cfg(test)]
+        if self.fail_live_open > 0 {
+            self.fail_live_open -= 1;
+            return Err(with_path(io::Error::other("injected"), "open", &live));
+        }
+        open_append(&live)
     }
 
     /// `dir/name` for `index` 0, `dir/name.<index>` otherwise.
@@ -110,44 +167,96 @@ impl SizeRotatingFile {
         }
     }
 
+    /// Free `<name>.1`: shift the files below the lowest free index up one, removing the oldest
+    /// only when no index is free. Done again after a failure, it removes nothing more: the
+    /// index the failed step left free is found first.
+    fn free_first_index(&self) -> io::Result<()> {
+        let oldest = self.rotation.max_files - 1;
+        let mut free = None;
+        for index in 1..=oldest {
+            match std::fs::symlink_metadata(self.path(index)) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    free = Some(index);
+                    break;
+                }
+                Err(e) => return Err(with_path(e, "stat", &self.path(index))),
+            }
+        }
+        let free = match free {
+            Some(index) => index,
+            None => {
+                let path = self.path(oldest);
+                std::fs::remove_file(&path).map_err(|e| with_path(e, "remove", &path))?;
+                oldest
+            }
+        };
+        for index in (1..free).rev() {
+            let from = self.path(index);
+            std::fs::rename(&from, self.path(index + 1))
+                .map_err(|e| with_path(e, "rename", &from))?;
+        }
+        Ok(())
+    }
+
     /// Shift every kept file up one, drop the oldest, and open a new live file.
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        let oldest = self.path(self.rotation.max_files - 1);
-        match std::fs::remove_file(&oldest) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(with_path(e, "remove", &oldest)),
-        }
-        for index in (1..self.rotation.max_files - 1).rev() {
-            let from = self.path(index);
-            match std::fs::rename(&from, self.path(index + 1)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(with_path(e, "rename", &from)),
-            }
-        }
+        self.free_first_index()?;
         // The live file is renamed while still open (std opens with FILE_SHARE_DELETE on
         // Windows, and Unix allows it), and its handle is kept until the new file opens: if the
-        // open fails, the writer goes on appending to the old handle, now named `<name>.1`.
-        let live = self.path(0);
-        std::fs::rename(&live, self.path(1)).map_err(|e| with_path(e, "rename", &live))?;
-        self.file = open_append(&live)?;
-        self.written = 0;
-        Ok(())
+        // open fails, the writer goes on appending to the old handle, now `<name>.1`.
+        self.rename_live()?;
+        match self.open_live() {
+            Ok(file) => {
+                self.file = file;
+                self.written = 0;
+                Ok(())
+            }
+            Err(e) => {
+                self.live = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// After a failed open: open `<name>` again. True when it opened.
+    fn reopen_live(&mut self) -> bool {
+        match self.open_live() {
+            Ok(file) => {
+                self.file = file;
+                self.written = self.file.metadata().map_or(0, |meta| meta.len());
+                self.live = true;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Best effort: a stderr that cannot be written must not stop the line being appended.
+    fn say(&self, what: &str) {
+        let _ = writeln!(
+            io::stderr(),
+            "config-log: log rotation of {}: {what}",
+            self.path(0).display()
+        );
     }
 }
 
 impl Write for SizeRotatingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = buf.len() as u64;
-        if self.written > 0 && self.written + len > self.rotation.max_bytes {
+        if !self.live {
+            if self.reopen_live() {
+                self.say("live file open again");
+            }
+        } else if self.written > 0 && self.written + len > self.rotation.max_bytes {
             if let Err(e) = self.rotate() {
-                eprintln!(
-                    "config-log: log rotation of {} failed, still writing to the current \
-                     file: {e}",
-                    self.path(0).display()
-                );
+                let held = if self.live { 0 } else { 1 };
+                self.say(&format!(
+                    "failed, still writing to {}: {e}",
+                    self.path(held).display()
+                ));
             }
         }
         self.file.write_all(buf)?;
@@ -158,6 +267,52 @@ impl Write for SizeRotatingFile {
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+/// Take the exclusive lock that keeps `dir/name` to one writer.
+fn lock(dir: &Path, name: &str) -> io::Result<File> {
+    let path = dir.join(format!(".{name}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| with_path(e, "open", &path))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "{} is already written by another process (or writer): {} is locked; give \
+                 each process its own log directory",
+                dir.join(name).display(),
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(with_path(e, "lock", &path)),
+    }
+}
+
+/// Remove `dir/name.<k>` for every `k` at or past `max_files`: a restart with fewer files.
+fn prune(dir: &Path, name: &str, max_files: usize) -> io::Result<()> {
+    let prefix = format!("{name}.");
+    for entry in std::fs::read_dir(dir).map_err(|e| with_path(e, "read", dir))? {
+        let entry = entry.map_err(|e| with_path(e, "read", dir))?;
+        let file_name = entry.file_name();
+        let Some(index) = file_name
+            .to_str()
+            .and_then(|text| text.strip_prefix(&prefix))
+            .filter(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if index >= max_files {
+            let path = entry.path();
+            std::fs::remove_file(&path).map_err(|e| with_path(e, "remove", &path))?;
+        }
+    }
+    Ok(())
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -181,10 +336,12 @@ mod tests {
         max_files: 3,
     };
 
+    /// The files in `dir`, sorted, leaving out the hidden lock file.
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
             .collect();
         names.sort();
         names
@@ -193,6 +350,157 @@ mod tests {
     fn line(i: usize) -> Vec<u8> {
         // 43 bytes a line, so two fit in 100 and the third rotates.
         format!("{{\"n\":\"{i:04}\",\"pad\":\"xxxxxxxxxxxxxxxxxxxxx\"}}\n").into_bytes()
+    }
+
+    /// Every line number held by any log file in `dir`, sorted.
+    fn lines_on_disk(dir: &Path) -> Vec<usize> {
+        let mut found: Vec<usize> = names(dir)
+            .iter()
+            .flat_map(|name| {
+                std::fs::read_to_string(dir.join(name))
+                    .expect("read")
+                    .lines()
+                    .map(|l| {
+                        let v: serde_json::Value = serde_json::from_str(l).expect("a json line");
+                        v["n"]
+                            .as_str()
+                            .expect("n")
+                            .parse::<usize>()
+                            .expect("a number")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// Review r1 (PR #182): a restart with a smaller `--log-files` kept `.2` to `.7`, because
+    /// rotation removes only the one oldest index. The open now removes this log's numbered
+    /// files at or past the count, and nothing else.
+    #[test]
+    fn r158_an_open_with_fewer_files_removes_the_numbered_files_past_the_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "n.jsonl",
+            "n.jsonl.1",
+            "n.jsonl.2",
+            "n.jsonl.3",
+            "n.jsonl.7",
+            "n.jsonl.notes",
+            "n.jsonl.2.bak",
+            "other.jsonl.5",
+        ] {
+            std::fs::write(dir.path().join(name), b"{}\n").expect("seed");
+        }
+        let _file = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("open");
+        assert_eq!(
+            names(dir.path()),
+            [
+                "n.jsonl",
+                "n.jsonl.1",
+                "n.jsonl.2",
+                "n.jsonl.2.bak",
+                "n.jsonl.notes",
+                "other.jsonl.5"
+            ]
+        );
+    }
+
+    /// Review r1 (PR #182): when the new live file could not be opened after the rename, the
+    /// writer kept the renamed handle, the next rotations shifted it up, and the last one removed
+    /// it: every later line went to a deleted file. Now the writer opens the live file again on
+    /// the next write, and no line is lost.
+    #[test]
+    fn r158_a_failed_open_after_the_rename_loses_no_line() {
+        let rotation = SizeRotation {
+            max_bytes: 100,
+            max_files: 20,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", rotation).expect("open");
+        file.write_all(&line(0)).expect("write");
+        file.write_all(&line(1)).expect("write");
+        file.fail_live_open = 1;
+        for i in 2..30 {
+            file.write_all(&line(i)).expect("write");
+        }
+        file.flush().expect("flush");
+        assert_eq!(lines_on_disk(dir.path()), (0..30).collect::<Vec<_>>());
+        let live = std::fs::read_to_string(dir.path().join("n.jsonl")).expect("a live file");
+        assert!(live.contains("\"n\":\"0029\""), "{live}");
+    }
+
+    /// Review r1 (PR #182): a live rename that failed ran after the oldest file was removed and
+    /// the rest shifted, and every later over-cap write did both again while the live file never
+    /// turned over, so three failures used up the history. Now a retry finds the slot already
+    /// free and only renames: one rotation removes one file, however often it is retried.
+    #[test]
+    fn r158_a_failed_live_rename_is_retried_without_removing_more_files() {
+        let rotation = SizeRotation {
+            max_bytes: 100,
+            max_files: 4,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", rotation).expect("open");
+        for i in 0..8 {
+            file.write_all(&line(i)).expect("write");
+        }
+        assert_eq!(lines_on_disk(dir.path()), (0..8).collect::<Vec<_>>());
+        file.fail_live_rename = 3;
+        for i in 8..12 {
+            file.write_all(&line(i)).expect("write");
+        }
+        file.flush().expect("flush");
+        // One rotation went through, so lines 0 and 1, the oldest file, are the only loss.
+        assert_eq!(lines_on_disk(dir.path()), (2..12).collect::<Vec<_>>());
+        assert_eq!(
+            names(dir.path()),
+            ["n.jsonl", "n.jsonl.1", "n.jsonl.2", "n.jsonl.3"]
+        );
+    }
+
+    /// Review r1 (PR #182): two processes on one log directory renamed and removed each other's
+    /// files. A second writer of the same log is refused while the first holds it, with an
+    /// error that names the log; another log in the same directory is not affected.
+    #[test]
+    fn r158_a_second_writer_of_the_same_log_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("open");
+        let refused = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION)
+            .err()
+            .expect("a second writer is refused");
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
+        let text = refused.to_string();
+        assert!(
+            text.contains("n.jsonl") && text.contains("another"),
+            "{text}"
+        );
+        let _other = SizeRotatingFile::open(dir.path(), "m.jsonl", ROTATION).expect("other log");
+        drop(first);
+        let _again = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("reopen");
+    }
+
+    /// Review r1 (PR #182): a write that brings the file to exactly `max_bytes` stays in it; one
+    /// more byte rotates.
+    #[test]
+    fn r158_exactly_max_bytes_stays_and_one_byte_more_rotates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("open");
+        file.write_all(&[b'a'; 60]).expect("write");
+        file.write_all(&[b'b'; 40]).expect("write");
+        file.flush().expect("flush");
+        assert_eq!(names(dir.path()), ["n.jsonl"]);
+        let len = |name: &str| {
+            std::fs::metadata(dir.path().join(name))
+                .expect("meta")
+                .len()
+        };
+        assert_eq!(len("n.jsonl"), ROTATION.max_bytes);
+        file.write_all(b"c").expect("write");
+        file.flush().expect("flush");
+        assert_eq!(names(dir.path()), ["n.jsonl", "n.jsonl.1"]);
+        assert_eq!((len("n.jsonl.1"), len("n.jsonl")), (ROTATION.max_bytes, 1));
     }
 
     #[test]
