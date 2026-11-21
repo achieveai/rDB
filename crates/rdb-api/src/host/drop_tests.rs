@@ -7631,6 +7631,82 @@ fn r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot() {
     }
 }
 
+/// R5, the gap 29da0e0 closes: the reopen's heal sends `HealLeftOut` before its `Plan`, so the
+/// owner records the left-out copy while it holds no commit for the partition yet, and so is not
+/// its pinned primary. A drop check that runs in that gap must keep the entry, or the copy's
+/// link comes back to nothing recorded and it waits for a restart. As [`r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot`],
+/// but node 1's commit for the partition is taken out while `HealLeftOut` lands and one
+/// `live_readd_duty` runs, then put back, as the heal's commit would land. No step runs in the
+/// gap, so the row does not depend on how long a commit takes, which
+/// `db::formation_tests::r5_b` does (red only when the commit is slower than a drop check).
+/// Cut: drop the pending filter in `live_readd_duty`, red: the entry is forgotten in the gap.
+/// Integration (~5 s).
+#[config_log::retcd_test]
+fn r5_pending_a_copy_left_out_before_the_heals_commit_survives_a_drop_check_in_the_gap() {
+    const METHOD: &str =
+        "r5_pending_a_copy_left_out_before_the_heals_commit_survives_a_drop_check_in_the_gap";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let copy = copy_of(&trio, 3);
+    hold_three(&trio);
+    let after = dropped_three(&mut trio, before);
+    owner_forgets_left_out(&mut trio);
+    trio.nodes[0].0.live_readd.clocked.clear();
+    trio.nodes[0].0.live_readd.links.clear();
+
+    // The gap: no commit here yet for P1.
+    let commit = trio.nodes[0]
+        .0
+        .committed
+        .remove(&P1)
+        .expect("node 1 committed P1");
+    trio.nodes[0].0.handle(Msg::HealLeftOut {
+        partition: P1,
+        left: vec![Member {
+            copy,
+            node: NodeId(3),
+            boot: crate::admin::UNLINKED_BOOT,
+            role: ReplicaRole::RegularSecondary,
+        }],
+    });
+    let now = trio.clock.now();
+    trio.nodes[0].0.live_readd_duty(now);
+    assert!(
+        trio.nodes[0]
+            .0
+            .live_readd
+            .clocked
+            .contains_key(&(P1, NodeId(3))),
+        "a drop check before the heal's commit forgot the left-out copy"
+    );
+    trio.nodes[0].0.committed.insert(P1, commit);
+
+    trio.ready();
+    let mut request = 1;
+    for _ in 0..3 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    trio.links.heal_all();
+    let shadowed = trio.until("node 1 pinned node 3 as a shadow", |trio| {
+        let committed = trio.nodes[0].0.committed.get(&P1)?;
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+            .map(|member| (committed.new_generation, member.boot))
+    });
+    assert_eq!(shadowed.1, boot, "re-added at the boot it still runs");
+    active_with_three(&mut trio, shadowed.0);
+    assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+}
+
 /// Issue #113 with #107 slice 2a: the live re-add's shadow is promoted at catch-up too, not
 /// only a move's. Node 3 is dropped on the unreachable clock while idle, 100 records land
 /// without it, and its link comes back at the boot it still runs, so the live re-add pins it
