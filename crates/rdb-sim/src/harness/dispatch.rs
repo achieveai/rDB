@@ -326,7 +326,8 @@ pub struct Dispatcher {
     behind_floor: BTreeSet<(NodeId, PartitionId, CopyId)>,
     /// Per `(source, partition, copy)`, the overruns in a row of that copy's transfers (issue
     /// #61 S3-R4 (b), owner ruling 2026-11-20, option 1): one more each time the cap ends one
-    /// `budget_overran`, reset when a transfer of the copy is released `caught_up`. At
+    /// `budget_overran`, reset by any round for the copy that is not an overrun: a `caught_up`
+    /// release, or a duty round whose floor stays at or below its open transfer's pin. At
     /// [`overrun_action`]'s give-up the source offers that copy no more. Process memory.
     overruns: BTreeMap<(NodeId, PartitionId, CopyId), u32>,
     /// Per `(source, partition, copy)`, the operator text of a copy the source gave up on
@@ -2357,7 +2358,7 @@ impl Dispatcher {
     }
 
     /// The overruns in a row of `copy`'s transfers from `node` on `partition` (owner ruling
-    /// 2026-11-20, option 1): 0 when none, or since a caught-up release.
+    /// 2026-11-20, option 1): 0 when none, or since a round for it that was not an overrun.
     #[must_use]
     pub fn overruns(&self, node: NodeId, partition: PartitionId, copy: CopyId) -> u32 {
         self.overruns
@@ -3651,6 +3652,11 @@ impl Dispatcher {
                     "{HISTORY_COPY_BEHIND_FLOOR}"
                 );
             }
+        }
+        // A round within budget for a copy's open transfer ends its run of overruns (lead
+        // ruling 2026-11-21): the owner's three are consecutive.
+        for (key, _) in served.iter().filter(|(_, at)| *at >= floor.floor) {
+            self.overruns.remove(key);
         }
         for (key, at) in served.iter().filter(|(_, at)| *at < floor.floor) {
             let attempts = self.overruns.entry(*key).or_insert(0);
@@ -7150,6 +7156,65 @@ mod dormant_twin_tests {
             ]
         );
         assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
+    }
+
+    /// Issue #61 S3-R4 part (b), lead ruling 2026-11-21: the owner's three overruns are
+    /// consecutive, so a round for the copy that is not an overrun resets the count, a round
+    /// within budget as much as a caught-up release.
+    ///
+    /// **Asserted.** Two overruns of copy 2's transfers, warned `attempts` 1 and 2. Node 1
+    /// opens a third transfer and a duty round with no cap keeps it: the floor stays at or below
+    /// its pin, nothing is overrun, the transfer is still open, and the count is 0. That
+    /// transfer's overrun then warns `attempts` 1, `gave_up` false; nobody needs the operator,
+    /// and node 3's next ask opens a transfer again.
+    ///
+    /// Cut: no reset on a within-budget round, red (the count stays 2, and the third overrun
+    /// gives up). Unit, under a second.
+    #[config_log::retcd_test]
+    fn t61_sim_s3_r4b_a_round_within_budget_resets_the_overrun_count() {
+        const METHOD: &str = "t61_sim_s3_r4b_a_round_within_budget_resets_the_overrun_count";
+        let (mut dispatcher, seed, _) = held_transfer_world();
+        let mut scheduler = Scheduler::new();
+        for round in 1..=2 {
+            copy_2_asks(&mut dispatcher, &mut scheduler).expect("re-offered");
+            overrun_copy_2(&mut dispatcher, &seed, Tick(round));
+        }
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 2);
+
+        let at = copy_2_asks(&mut dispatcher, &mut scheduler).expect("a third transfer");
+        let roomy = super::RetentionConfig {
+            keep_millis: 3_600_000,
+            ..RETAIN
+        };
+        let decision = dispatcher
+            .retention_duty(OWNER, P, Tick(3), roomy)
+            .expect("duty");
+        let RetentionDecision::Floor(floor) = decision else {
+            panic!("held: {decision:?}");
+        };
+        assert!(floor.floor <= at, "the floor stays at or below the pin");
+        assert_eq!(floor.overran_pins, Vec::<Seq>::new(), "within budget");
+        assert_eq!(
+            copy_2_transfer(&dispatcher),
+            Some(at),
+            "the transfer stays open"
+        );
+        assert_eq!(dispatcher.overruns(OWNER, P, CopyId(2)), 0, "reset");
+
+        overrun_copy_2(&mut dispatcher, &seed, Tick(4));
+        assert_eq!(
+            overran_attempts(METHOD),
+            vec![
+                (Some(1), Some(false)),
+                (Some(2), Some(false)),
+                (Some(1), Some(false))
+            ]
+        );
+        assert_eq!(dispatcher.needs_operator(OWNER, P, CopyId(2)), None);
+        assert!(
+            copy_2_asks(&mut dispatcher, &mut scheduler).is_some(),
+            "still re-offered"
+        );
     }
 
     /// Issue #61 S3-R4, part (a), as the lead settled it (2026-11-20): a transfer the cap

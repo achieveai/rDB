@@ -60,7 +60,9 @@ pub enum OverrunAction {
 /// The one seam for repeated overruns (owner ruling 2026-11-20, option 1): re-offer until
 /// [`HISTORY_BUDGET_OVERRUN_ATTEMPTS`] overruns in a row, then give up. `consecutive` counts
 /// the overrun just seen, so the first is 1. The caller keeps the count per (source, partition,
-/// copy) and resets it when that copy's transfer is released caught up.
+/// copy) and resets it on any round for that copy that is not an overrun: a caught-up release,
+/// or a retention round that keeps the copy's open transfer within budget (lead ruling
+/// 2026-11-21).
 #[must_use]
 pub const fn overrun_action(consecutive: u32) -> OverrunAction {
     if consecutive >= HISTORY_BUDGET_OVERRUN_ATTEMPTS {
