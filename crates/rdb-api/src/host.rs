@@ -15281,13 +15281,12 @@ impl Host {
         // without it.
         let call = self
             .changes(partition, waiter.identity, waiter.from, waiter.max, wait)
-            .map_err(|fault| {
+            .inspect_err(|fault| {
                 self.owner_views.revoke();
                 let _ = waiter.reply.send(Answer::Error {
                     error: fault.feed_error(),
                     request: None,
                 });
-                fault
             })?;
         match call {
             FeedCall::Answer(answer) => {
