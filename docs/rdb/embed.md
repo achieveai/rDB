@@ -454,7 +454,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   - Every wait logs `heal_wait_all` with its reason: `os_boot_changed`, `os_boot_unknown`,
     `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
     `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
-    `no_clock_bound`. A `wait_ready` that times out names it.
+    `no_clock_bound`. One more reason is not a wait: `decided_past_deadline`, when the heal's
+    answer came only after its attempt's deadline. That attempt acts on nothing, logs
+    `heal_leave_out_expired` instead of `heal_wait_all`, and the next attempt decides again by
+    itself. A `wait_ready` that times out names the latest reason.
   - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
     (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
     done. Node processes that share one folder each keep their own. A first open, a missing,

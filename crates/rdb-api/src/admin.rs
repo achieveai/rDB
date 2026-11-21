@@ -2087,7 +2087,10 @@ pub enum HealError {
         nodes: Vec<u32>,
         /// The heal's bound.
         within_ms: u128,
-        /// Why the heal did not go on without them (R5): the last `heal_wait_all` reason.
+        /// Why the heal did not go on without them (R5): the last `heal_wait_all` reason, or
+        /// `decided_past_deadline` when the attempt's answer came at or past its deadline and
+        /// was not acted on, logged `heal_leave_out_expired` instead ([`heal_retrying`] then
+        /// tries again with a whole budget).
         reason: &'static str,
     },
 }
@@ -9778,7 +9781,8 @@ mod tests {
     /// with a whole budget: one `HealLeftOut` and one plan, never `NotCleared`. Only the
     /// accepted decision logs `heal_proceed_without`: two in all (review round 2). Unit (~3 s).
     /// Cuts: the deadline recheck removed: `clear_until` gets no budget and ends the heal
-    /// `NotCleared`, red; `leave_out` logs the proceed itself, before the recheck: four, red.
+    /// `NotCleared`, red; `leave_out` logs the proceed itself, before the recheck: four, red;
+    /// the late attempt's reason left at the wait's: no `decided_past_deadline` retry, red.
     #[config_log::retcd_test]
     fn r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed() {
         const METHOD: &str = "r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed";
@@ -9826,6 +9830,19 @@ mod tests {
             r5_lines(METHOD, "heal_proceed_without").len(),
             2,
             "one accepted decision per case; a late one logs no proceed"
+        );
+        let late: Vec<_> = r5_lines(METHOD, "heal_retry")
+            .into_iter()
+            .filter(|line| {
+                line["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("decided_past_deadline"))
+            })
+            .collect();
+        assert_eq!(
+            late.len(),
+            2,
+            "each late attempt ends decided_past_deadline"
         );
     }
 
