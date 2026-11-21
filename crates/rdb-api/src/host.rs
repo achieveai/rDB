@@ -15196,10 +15196,24 @@ impl Host {
             match envelope.compute_record_digest() {
                 Ok(digest) if digest == envelope.record_digest => {}
                 computed => {
+                    // Round 3: both digests go to this local line only, never into the fault's
+                    // detail. That detail is shared: every later call and every status read,
+                    // over the links too, carries it, and the admin gate guards only `Changes`.
+                    tracing::error!(
+                        node,
+                        partition = p,
+                        seq = seq.0,
+                        stored = %envelope.record_digest,
+                        computed = %computed.as_ref().map_or_else(
+                            |error| format!("{error:?}"),
+                            ToString::to_string
+                        ),
+                        "feed_record_digest_mismatch"
+                    );
                     return Err(feed_damage(format!(
-                        "feed: the record at seq {} does not match its digest {} ({computed:?})",
-                        seq.0, envelope.record_digest
-                    )))
+                        "feed: the record at seq {} does not match its digest",
+                        seq.0
+                    )));
                 }
             }
             Ok(Some((envelope, record.len())))

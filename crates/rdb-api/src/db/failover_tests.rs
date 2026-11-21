@@ -1955,3 +1955,63 @@ fn pr156_a_spawned_planner_logs_its_panic() {
         "the planner stopped at its panic"
     );
 }
+
+/// Round 3 (thread 4654331880, lead ask): a record whose digest no longer matches faults its
+/// owner. The stored and computed digests go to the owner's local `feed_record_digest_mismatch`
+/// line only, never into the shared fault. Three node processes: the owner's process damages
+/// the last byte of a landed put's `History` record and reads its own feed into it. Then an app
+/// `Db` in another process reads the owner's status over the links (`WireMsg::Inspect`,
+/// answered as `WireNodeStatus`). Its `fault` names the seq and holds neither digest.
+/// Cut: the digests back in the mismatch's fault detail, red (the stored digest is in the
+/// status the app read).
+/// Integration (~5 s): three processes and one fault.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links() {
+    const METHOD: &str = "f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links";
+    let rig = rig(1, None);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let owner = rig.owner(1);
+    let at = usize::try_from(owner.0 - 1).expect("a node index");
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    let put = put_lands(&app, group_of(&app, 1), lifetimes(3));
+    let local = &rig.procs[at].db;
+    local
+        .damage_record_as(
+            owner,
+            put.generation,
+            rdb_core::contracts::storage::Namespace::History,
+            &put.seq.0.to_be_bytes(),
+            rdb_storage::RecordDamage::LastByte,
+        )
+        .expect("damaged");
+    let read = local
+        .changes(PartitionId(1), FeedCursor::START, 10, Source::Owner)
+        .expect_err("the damaged record faults the owner");
+    assert_eq!(read.kind, ErrorKind::CorruptHistory, "{read:?}");
+
+    let lines = logged_at_least_within(METHOD, "feed_record_digest_mismatch", 1, lifetimes(1));
+    let digests: Vec<String> = ["stored", "computed"]
+        .iter()
+        .map(|field| {
+            let digest = lines[0][field].as_str().expect("a digest");
+            assert_eq!(digest.len(), 64, "{field}: {lines:?}");
+            digest[..8].to_owned()
+        })
+        .collect();
+    let mut fault = None;
+    until("the app read the owner's fault", lifetimes(3), || {
+        fault = app.inspect(owner).and_then(|status| status.fault);
+        fault.is_some()
+    });
+    let fault = fault.expect("a fault");
+    assert!(
+        fault.contains(&format!("the record at seq {} does not match its digest", put.seq.0)),
+        "{fault}"
+    );
+    for digest in &digests {
+        assert!(!fault.contains(digest.as_str()), "{digest} in {fault}");
+    }
+    assert!(!read.detail.contains(digests[0].as_str()), "{read:?}");
+}

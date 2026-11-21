@@ -1654,9 +1654,14 @@ fn changes_settled(db: &Db, from: FeedCursor, source: Source) -> Result<FeedPage
 ///   seq k1).
 ///
 /// Each answer names the damage ("does not match its digest", "names seq"), not "another
-/// digest", and a second call to that node hears the same fault.
+/// digest", and a second call to that node hears the same fault. Round 3 (thread
+/// 4654331880): the stored and computed digests are only in the local
+/// `feed_record_digest_mismatch` line. Neither is in the shared fault: not in the feed replies
+/// of nodes 2 and 3, nor in their `node_status` fault. The over-the-links read is
+/// `f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links`.
 /// Cuts: no digest check in `Host::changes`'s read, red (node 3 served, node 2 diverged); no
-/// seq check, red (node 1 served k1 at k2).
+/// seq check, red (node 1 served k1 at k2); the digests back in the mismatch's fault detail,
+/// red (a digest in the shared fault).
 /// Integration (~3 s): a fresh open.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
@@ -1702,6 +1707,7 @@ fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
     ];
     // Every case is judged before the row fails, so a cut shows each case's answer.
     let mut wrong = Vec::new();
+    let mut replies = Vec::new();
     for (who, from, node, says) in cases {
         let source = if node == 1 {
             Source::Owner
@@ -1710,6 +1716,9 @@ fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
         };
         for call in ["first", "again"] {
             let answer = changes_settled(&db, from, source);
+            if let (Err(error), true) = (&answer, node != 1) {
+                replies.push(error.detail.clone());
+            }
             let ok = matches!(&answer, Err(error) if error.kind == ErrorKind::CorruptHistory
                 && error.detail.contains(says)
                 && !error.detail.contains("another digest")
@@ -1720,6 +1729,42 @@ fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+
+    // Round 3 (thread 4654331880): the digests are in the local trace only, never in the shared
+    // fault: not in a put's or a get's answer, nor in node status.
+    let mismatches: Vec<_> = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence",
+    )
+    .into_iter()
+    .filter(|line| line["@m"] == "feed_record_digest_mismatch")
+    .collect();
+    let mut digests = Vec::new();
+    for node in [2_u64, 3] {
+        let line = mismatches
+            .iter()
+            .find(|line| line["node"] == node)
+            .unwrap_or_else(|| panic!("node {node} logged the mismatch: {mismatches:#?}"));
+        for field in ["stored", "computed"] {
+            let digest = line[field].as_str().expect("a digest").to_owned();
+            assert_eq!(digest.len(), 64, "node {node} {field}: {digest}");
+            digests.push(digest[..8].to_owned());
+        }
+    }
+    let statuses = db.node_status();
+    let mut shared: Vec<String> = statuses
+        .iter()
+        .filter(|status| status.node != NodeId(1))
+        .map(|status| status.fault.clone().expect("nodes 2 and 3 faulted"))
+        .collect();
+    assert_eq!(shared.len(), 2, "{statuses:?}");
+    shared.extend(replies);
+    for detail in &shared {
+        assert!(detail.contains("does not match its digest"), "{detail}");
+        for digest in &digests {
+            assert!(!detail.contains(digest.as_str()), "{digest} in {detail}");
+        }
+    }
 }
 
 /// Review r2 (threads 4647111507 and 4647111500): the owner's `History` keeps its floor, its
