@@ -9817,10 +9817,13 @@ mod tests {
     /// past the window of the attempt that may first go on (no-grant case); that attempt logs
     /// `heal_leave_out_expired`, sends nothing and ends `PeersUnknown`, and the next one goes on
     /// with a whole budget: one `HealLeftOut` and one plan, never `NotCleared`. Only the
-    /// accepted decision logs `heal_proceed_without`: two in all (review round 2). Unit (~3 s).
-    /// Cuts: the deadline recheck removed: `clear_until` gets no budget and ends the heal
-    /// `NotCleared`, red; `leave_out` logs the proceed itself, before the recheck: four, red;
-    /// the late attempt's reason left at the wait's: no `decided_past_deadline` retry, red.
+    /// accepted decision logs `heal_proceed_without`: two in all (review round 2), each with
+    /// its owner, partition, missing and present copies, majority, reason and evidence (round
+    /// 3). Unit (~3 s). Cuts: the deadline recheck removed: no `heal_leave_out_expired`, red
+    /// (since round 3 the late decision's clear has a window of its own, so it no longer ends
+    /// `NotCleared`); `leave_out` logs the proceed itself, before the recheck: four, red; the
+    /// late attempt's reason left at the wait's: no `decided_past_deadline` retry, red; the
+    /// present copies logged as the missing ones: red at `present`.
     #[config_log::retcd_test]
     fn r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed() {
         const METHOD: &str = "r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed";
@@ -9864,11 +9867,25 @@ mod tests {
             assert_eq!(notes, 1, "{case}: only the attempt that went on sent");
         }
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
+        let proceeds = r5_lines(METHOD, "heal_proceed_without");
         assert_eq!(
-            r5_lines(METHOD, "heal_proceed_without").len(),
+            proceeds.len(),
             2,
             "one accepted decision per case; a late one logs no proceed"
         );
+        // Review round 3: what each accepted line says, frozen evidence first, then absent.
+        for (line, evidence) in proceeds
+            .iter()
+            .zip(["grant_frozen", "no_grant_after_window"])
+        {
+            assert_eq!(line["owner"].as_u64(), Some(1), "{line}");
+            assert_eq!(line["partition"].as_u64(), Some(1), "{line}");
+            assert_eq!(line["missing"], "[3]", "{line}");
+            assert_eq!(line["present"], "[1, 2]", "{line}");
+            assert_eq!(line["majority"].as_u64(), Some(2), "{line}");
+            assert_eq!(line["reason"], "same_os_boot", "{line}");
+            assert_eq!(line["evidence"], evidence, "{line}");
+        }
         let late: Vec<_> = r5_lines(METHOD, "heal_retry")
             .into_iter()
             .filter(|line| {
