@@ -503,10 +503,83 @@ fn a_blob_part_deleted_reads_as_absent() {
     });
     let read = read.unwrap_or_else(|e| panic!("after one batch the blob reads back: {e:?}"));
     assert_eq!(read, None, "absent after its root went first");
-    // The chunks left go on under `expect`, since the blob it named is deleted.
-    let rest = delete_object(&k.snapshot(), &root, Some(version))
+    // PR #178 review r2 T18: with the root gone, `expect` is stale even over chunks only; the
+    // chunks the blob left are finished with no `expect`.
+    let stale = delete_object(&k.snapshot(), &root, Some(version));
+    assert!(
+        matches!(stale, Err(ValueError::Apply(ApplyError::ObjectAbsent))),
+        "{stale:?}"
+    );
+    finish_delete(&mut k, &root);
+}
+
+/// The records stored under `root`'s object.
+fn under(k: &Kernel, root: &RootKey) -> usize {
+    k.records
+        .keys()
+        .filter(|key| key.starts_with(root.object_prefix()))
+        .count()
+}
+
+/// PR #178 review r2 T18: a delete at a stale version, with the root gone, is refused, even when
+/// only chunks are stored: they are a later upload's, which no chunk write guards with the root.
+/// A blob is deleted at version `v`; a new upload writes 3 chunks under the id; a delete at `v`
+/// is `ObjectAbsent` and the 3 chunks survive. Cut: let that refusal pass when only chunks are
+/// left (round 1's continuation), and the stale delete removes them.
+#[test]
+fn a_stale_delete_leaves_a_later_uploads_chunks() {
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"blob");
+    blob(&mut k, &root);
+    let version = k
+        .snapshot()
+        .version(Namespace::User, root.as_bytes())
+        .unwrap();
+    let batch = delete_object(&k.snapshot(), &root, Some(version))
         .unwrap()
         .unwrap();
-    assert!(!rest.mutations.is_empty());
+    k.commit_any_order(&batch);
+    assert_eq!(under(&k, &root), 0, "control: the blob is deleted in one batch");
+    chunks(&mut k, &root, &[8; 16]);
+    assert_eq!(under(&k, &root), 3, "the new upload's chunks");
+    let stale = delete_object(&k.snapshot(), &root, Some(version));
+    assert!(
+        matches!(stale, Err(ValueError::Apply(ApplyError::ObjectAbsent))),
+        "{stale:?}"
+    );
+    assert_eq!(under(&k, &root), 3, "the new upload's chunks survive");
+}
+
+/// PR #178 review r2 T5: a list of three items with 255 upload chunks under it. The first batch
+/// removes the items; the rest delete the chunks, guarded by the root, and keep the empty list's
+/// own records to the last batch. After every batch the list reads and a push compiles; then
+/// nothing is left. Cut: drop the empty-list path, and the raw batch deletes the list's base
+/// ahead of its chunks: the push is `BlockMissing`.
+#[test]
+fn a_list_with_255_upload_chunks_reads_and_takes_a_push_at_every_stop() {
+    use rdb_value::list::{compile_list, items, Start};
+    let mut k = Kernel::new();
+    let root = root_key(T, A, b"list");
+    list(&mut k, &root);
+    for index in 0..255 {
+        k.commit(&put_chunk(&k.snapshot(), &root, &[6; 16], index, b"c").unwrap());
+    }
+    let mut batches = 0;
+    while let Some(batch) = delete_object(&k.snapshot(), &root, None).unwrap() {
+        batches += 1;
+        assert!(batches < 20, "the delete ends");
+        k.commit_any_order(&batch);
+        let s = k.snapshot();
+        let Some(version) = s.version(Namespace::User, root.as_bytes()) else {
+            break;
+        };
+        items(&s, &root, Start::Position(0), 1_000)
+            .unwrap_or_else(|e| panic!("after batch {batches} the list reads: {e:?}"));
+        let push = [ListOp::Push(int(1))];
+        compile_list(&s, &root, Expected::Version(version), DEFAULT_BLOCK_MAX, &push)
+            .unwrap_or_else(|e| panic!("after batch {batches} a push compiles: {e:?}"));
+    }
+    assert!(batches >= 3, "the items, then the chunks over two batches: {batches}");
     finish_delete(&mut k, &root);
+    assert_eq!(under(&k, &root), 0);
 }

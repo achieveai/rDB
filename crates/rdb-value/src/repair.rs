@@ -629,7 +629,8 @@ fn batch(
 /// - A map or set that does not fit: up to [`MAX_CLEAR_DELETES`] of its elements removed by
 ///   [`compile_collection`], which rewrites the root's count. A smaller map.
 /// - A list that does not fit: its first items removed by [`compile_list`], which relinks its
-///   blocks and rewrites the root. A shorter list.
+///   blocks and rewrites the root. A shorter list. Once it has no items, the upload chunks under
+///   it go first, guarded by the root, and its own records stay to the last batch.
 /// - A blob that does not fit: its root first, with chunks up to the limit. What is left is
 ///   chunks with no root, which reads as absent and is what an upload never published leaves.
 /// - Any other object (a document with upload chunks, or a root that does not open): up to
@@ -639,14 +640,15 @@ fn batch(
 /// - With no root, up to [`MAX_CLEAR_DELETES`] records, guarded by the root's absence.
 /// - `Ok(None)`: nothing is stored under the object. Call again until then.
 ///
-/// With `expect`, the root must be at that version: every batch is a CAS. Once a blob's root has
-/// gone, the chunks left behind go on under the root's absence with `expect` still given, since
-/// the object it named is deleted.
+/// With `expect`, the root must be at that version: every batch is a CAS. No root under `expect`
+/// is [`ApplyError::ObjectAbsent`], even when only chunks are left (PR #178 review r2, T18): a
+/// chunk write never guards the root, so they may be a later upload's. Once a blob's root has
+/// gone, finish the chunks it left with no `expect`.
 ///
 /// # Errors
 /// [`ApplyError::VersionConflict`] when the root is at another version than `expect`, and
-/// [`ApplyError::ObjectAbsent`] when `expect` names a version and there is no root but records
-/// other than chunks are stored. [`Corrupt::VersionWithoutValue`] for a record with no version.
+/// [`ApplyError::ObjectAbsent`] when `expect` names a version, there is no root and records are
+/// stored. [`Corrupt::VersionWithoutValue`] for a record with no version.
 /// A map's, set's or list's own compile errors for a damaged element, item or block.
 pub fn delete_object(
     snapshot: &dyn SnapshotRead,
@@ -698,7 +700,9 @@ pub fn delete_object(
         (Some(expected), Some(found)) if expected != found => {
             return Err(ApplyError::VersionConflict { expected, found }.into());
         }
-        (Some(_), None) if !only_chunks(&mutations) => return Err(ApplyError::ObjectAbsent.into()),
+        // PR #178 review r2 T18: no root under `expect` is a stale delete, even when only chunks
+        // are left. A chunk write never guards the root, so they may be a later upload's.
+        (Some(_), None) => return Err(ApplyError::ObjectAbsent.into()),
         _ => {}
     }
     if let Some(version) = root_version {
@@ -734,13 +738,13 @@ pub fn delete_object(
     }))
 }
 
-/// Whether every record in `mutations` is a blob chunk (its key parses as [`Sub::Chunk`]).
-fn only_chunks(mutations: &[Mutation]) -> bool {
-    mutations.iter().all(|mutation| match mutation {
+/// Whether `mutation`'s record is a blob chunk (its key parses as [`Sub::Chunk`]).
+fn is_chunk(mutation: &Mutation) -> bool {
+    match mutation {
         Mutation::Delete { key, .. } | Mutation::Put { key, .. } => {
             matches!(parse(key).map(|parsed| parsed.sub), Ok(Sub::Chunk))
         }
-    })
+    }
 }
 
 /// A batch of [`delete_object`] for an object at root version `version` that does not fit one
@@ -797,6 +801,22 @@ fn partial_delete(
         }
         Kind::List => {
             let count = list(snapshot, root)?.map_or(0, |found| found.count);
+            if count == 0 {
+                // PR #178 review r2 T5: an empty list with upload chunks under it. The chunks go
+                // first; its own blocks and slots stay for the last batch, so the list still
+                // reads, and takes a push, at every stop.
+                scanned.retain(is_chunk);
+                if scanned.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Compiled {
+                    mutations: std::mem::take(scanned),
+                    conditions: vec![Condition::VersionEquals {
+                        key: root.to_bytes(),
+                        version,
+                    }],
+                }));
+            }
             let mut take = count.min(MAX_CLEAR_DELETES as u64);
             while take > 0 {
                 let ops =
