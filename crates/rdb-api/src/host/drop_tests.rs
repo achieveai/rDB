@@ -10008,8 +10008,12 @@ fn stepped(owner_dead: bool) -> &'static [usize] {
 /// one every ~10 ms. The first lands within one F1 recovery window plus 1 s (scaled), through
 /// `read_only_repair_on_caught_up`, on a new `DegradedRf2` commit holding copies 2 and 3.
 /// Every refusal before it is `no_mutation` with a retry rule that retries (the contract, not a
-/// list of kinds). Every `RECOVERY_READ_ONLY` among them, and there is one, names copy 3 as
-/// caught up and the owner's re-plan, with `retry_after` 5 s and `REBUILDING_STEP`. Every
+/// list of kinds). Every `RECOVERY_READ_ONLY` among them names copy 3 as caught up and the
+/// owner's re-plan, with `retry_after` 5 s and `REBUILDING_STEP`. There may be none: when the
+/// re-plan's revoke reaches node 2 before it has installed the `ReadOnly` commit
+/// (`revoke_asked_unheld`), every write in the window is refused `UNAVAILABLE` "no generation
+/// adopted yet" (seen under the whole suite's load, 2026-11-20). The detail is pinned by
+/// [`t61_r26_b_a_caught_up_copy_names_the_owners_re_plan_in_the_refusal`]. Every
 /// re-plan's inventory from node 3 answers (R26's installed lineage). Logged
 /// `r26_writable{read_only_after_caught_up_ms, interim}`.
 /// Observed (2026-11-20, scale 3, bound 9 s): first write 591 ms (live owner) and 681 ms (dead
@@ -10111,10 +10115,6 @@ fn caught_up_copy_ends_the_read_only_window(method: &str, owner_dead: bool) {
         members.contains(&2) && members.contains(&3),
         "copies 2 and 3: {members:?}"
     );
-    assert!(
-        !read_only.is_empty(),
-        "a write met the read-only commit after caught_up: {interim:?}"
-    );
     for error in &read_only {
         assert!(
             error.detail.contains(&format!(
@@ -10138,6 +10138,60 @@ fn caught_up_copy_ends_the_read_only_window(method: &str, owner_dead: bool) {
         unlinked.is_empty(),
         "the rebuilt copy answers every re-plan: {unlinked:?}"
     );
+}
+
+/// Issue #61 R26 (b): the refusal detail once a copy the `ReadOnly` commit left outside has
+/// caught up, set up directly on node 1's host over its bootstrap commit. With
+/// `caught_up_outside` naming copy 3 on node 3 in the current generation, a
+/// `RECOVERY_READ_ONLY` refusal names it and the owner's re-plan, with `retry_after` 5 s and
+/// `REBUILDING_STEP`. Recorded for an older generation, the refusal is unchanged.
+/// Cut: `rebuilding_read_only` returns the refusal as it was, without `caught_up_read_only`,
+/// red.
+/// Unit (a trio bootstrap for the commit).
+#[config_log::retcd_test]
+fn t61_r26_b_a_caught_up_copy_names_the_owners_re_plan_in_the_refusal() {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    let generation = trio.until("node 1 committed", |trio| {
+        trio.nodes[0]
+            .0
+            .committed
+            .get(&p)
+            .map(|committed| committed.new_generation)
+    });
+    let host = &mut trio.nodes[0].0;
+    let refused = || {
+        ApiError::from_kernel(&RdbError::RecoveryReadOnly {
+            partition: p,
+            generation,
+        })
+    };
+    host.caught_up_outside
+        .insert(p, (generation, CopyId(3), NodeId(3)));
+    let named = host.rebuilding_read_only(p, refused());
+    assert_eq!(named.kind, ErrorKind::RecoveryReadOnly, "{named:?}");
+    assert!(
+        named.detail.contains(
+            "copy 3 on node 3 is caught up; writes resume when the owner re-plans with it"
+        ),
+        "{named:?}"
+    );
+    assert!(
+        named.detail.ends_with(crate::db::error::REBUILDING_STEP),
+        "{named:?}"
+    );
+    assert_eq!(named.retry_after, Some(REBUILD_RETRY_HINT), "{named:?}");
+    host.caught_up_outside
+        .insert(p, (Generation(generation.0 - 1), CopyId(3), NodeId(3)));
+    let older = host.rebuilding_read_only(p, refused());
+    assert_eq!(
+        older.detail,
+        refused().detail,
+        "an older commit's copy is not named"
+    );
+    assert_eq!(older.retry_after, None, "{older:?}");
 }
 
 /// Issue #61 R26 (b), the real failover: [`caught_up_copy_ends_the_read_only_window`] with
