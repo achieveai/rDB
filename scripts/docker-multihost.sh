@@ -11,7 +11,7 @@
 #   scripts/docker-multihost.sh failover N [--with-voter-leader] [--rejoin-s 120] [--name rdbmh]
 #   scripts/docker-multihost.sh kill N | restart N | restart-voter V | pause N   [--name rdbmh]
 #   scripts/docker-multihost.sh d1       [--name rdbd1] [--subnet 10.180.81.0/24] [--image ..]
-#                                        [--no-build] [--restart-on-exit] [--live-readd]
+#                                        [--no-build] [--restart-on-exit] [--live-readd] [--basis SHA]
 #
 # `up` builds the image (unless --no-build), checks that nothing it would create exists yet
 # (the network <name>-net, the volumes <name>-init, <name>-vN and <name>-dN, any container
@@ -93,6 +93,15 @@
 # Docker's restart policy, which keep those arguments. Before it creates anything, `up` asks
 # the image's `rdb_node --help` and refuses an image whose usage does not list --live-readd,
 # rather than start nodes that would exit 2 (and, with --restart-on-exit, be restarted).
+# The flag is older than #181, which changes how the heal behaves with it on, so this check
+# only refuses an image too old to have the flag. RUN NOTE: the d1 --live-readd result counts
+# only from an image whose basis includes #181's merged sha.
+#
+# The basis (d1). Every d1 result names its source in its first lines: the image id and
+# `EXPORT_BASIS=<sha>`, with where the sha came from. A d1 that builds labels the image
+# org.rdb.basis=<HEAD>, or <HEAD>-dirty when the tree has changes git reports. --basis SHA (7
+# to 40 hex digits) names the source of an image built elsewhere. d1 refuses, before it creates
+# anything, an image with neither, and a --basis that disagrees with the label.
 #
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
 # --subnet must be a /24 that overlaps no Docker network and no host route; `up` checks.
@@ -102,7 +111,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 NODES=5 VOTERS=3 PARTITIONS=16 SUBNET=10.180.80.0/24 NAME=rdbmh IMAGE=rdb-bf-node:dev BUILD=1
-WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0 LIVE_READD=0
+WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0 LIVE_READD=0 BASIS=""
 [ "$CMD" = selftest ] && NAME=rdbst
 [ "$CMD" = d1 ] && NAME=rdbd1 SUBNET=10.180.81.0/24
 case "$CMD" in
@@ -128,6 +137,14 @@ while [ $# -gt 0 ]; do
         --no-docker) NO_DOCKER=1; shift ;;
         --restart-on-exit) RESTART_ON_EXIT=1; shift ;;
         --live-readd) LIVE_READD=1; shift ;;
+        --basis)
+            case "${2:-}" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+                *) echo "docker-multihost: --basis takes a commit sha, 7 to 40 hex digits" >&2; exit 2 ;;
+            esac
+            case "$2" in *[!0-9a-f]*) echo "docker-multihost: --basis takes a commit sha, 7 to 40 hex digits" >&2; exit 2 ;; esac
+            [ "${#2}" -le 40 ] || { echo "docker-multihost: --basis takes a commit sha, 7 to 40 hex digits" >&2; exit 2; }
+            BASIS="$2"; shift 2 ;;
         *) echo "docker-multihost: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -141,6 +158,8 @@ done
     || { echo "docker-multihost: --restart-on-exit is read only by up and d1" >&2; exit 2; }
 [ "$LIVE_READD" = 0 ] || [ "$CMD" = up ] || [ "$CMD" = d1 ] \
     || { echo "docker-multihost: --live-readd is read only by up and d1" >&2; exit 2; }
+[ -z "$BASIS" ] || [ "$CMD" = d1 ] \
+    || { echo "docker-multihost: --basis is read only by d1" >&2; exit 2; }
 LABEL="org.rdb.multihost=$NAME"
 NET="$NAME-net"
 HELPER="$NAME-x"
@@ -1313,11 +1332,36 @@ d1_teardown() {
     "$0" down --name "$NAME" || true
     "$0" clean --name "$NAME" || true
 }
+# The source the image was built from: --basis, the image's org.rdb.basis label, or both when
+# they agree. Prints the image id and EXPORT_BASIS; refuses an unknown or disputed basis.
+d1_basis() {
+    local id label
+    id="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" || die "image: $IMAGE does not exist"
+    label="$(docker image inspect -f '{{index .Config.Labels "org.rdb.basis"}}' "$IMAGE" 2>/dev/null)" || label=""
+    [ "$label" = "<no value>" ] && label=""
+    say "d1: image $IMAGE id=$id"
+    if [ -n "$BASIS" ] && [ -n "$label" ] && [ "$BASIS" != "$label" ]; then
+        die "basis: --basis $BASIS disagrees with $IMAGE's label org.rdb.basis=$label; nothing was created"
+    fi
+    if [ -n "$BASIS" ]; then
+        echo "EXPORT_BASIS=$BASIS (from --basis${label:+, matching the image label})"
+    elif [ -n "$label" ]; then
+        echo "EXPORT_BASIS=$label (from the image label org.rdb.basis)"
+    else
+        die "basis: $IMAGE has no org.rdb.basis label; pass --basis <sha> naming its source; nothing was created"
+    fi
+}
+
 d1() {
     if [ "$BUILD" = 1 ]; then
-        say "building $IMAGE"
-        (cd "$REPO" && docker build -f docker/Dockerfile -t "$IMAGE" .) || die "build"
+        local built
+        built="$(git -C "$REPO" rev-parse HEAD)" || die "build: cannot read the tree's HEAD"
+        [ -z "$(git -C "$REPO" status --porcelain)" ] || built="$built-dirty"
+        say "building $IMAGE from $built"
+        (cd "$REPO" && docker build -f docker/Dockerfile --label "org.rdb.basis=$built" -t "$IMAGE" .) \
+            || die "build"
     fi
+    d1_basis
     preflight
     D1_ARMED=1
     trap d1_teardown EXIT
@@ -1721,7 +1765,9 @@ selftest_args() {
     for args in "failover" "failover x" "failover 0" "failover 03" "kill 2 --with-voter-leader" \
                 "restart-voter 1 --rejoin-s 5" "up --no-docker" "failover 2 --rejoin-s soon" \
                 "pause" "pause x" "check --restart-on-exit" "failover 2 --restart-on-exit" \
-                "check --live-readd" "failover 2 --live-readd" "pause 2 --live-readd"; do
+                "check --live-readd" "failover 2 --live-readd" "pause 2 --live-readd" \
+                "d1 --basis 12345" "d1 --basis 5524c9G" "d1 --basis" "failover 2 --basis 5524c9d" \
+                "d1 --basis 5524c9d5524c9d5524c9d5524c9d5524c9d5524c9d1"; do
         : > "$t/calls"
         # shellcheck disable=SC2086 # the case's words
         PATH="$t/bin:$PATH" "$0" $args > /dev/null 2>&1; rc=$?
@@ -1741,7 +1787,13 @@ selftest_d1_teardown() {
 #!/bin/sh
 echo "$*" >> "$CALLS"
 case "$1 $2" in
-    "image inspect") exit 0 ;;
+    "image inspect")
+        case "$*" in
+            *".Id"*) echo sha256:5eed ;;
+            *org.rdb.basis*) echo "${BASIS_LABEL:-<no value>}" ;;
+        esac
+        exit 0 ;;
+    "build -f") exit 0 ;;
     "network inspect")
         [ "$NET_EXISTS" = 1 ] && exit 0
         echo "Error response from daemon: network $3 not found" >&2; exit 1 ;;
@@ -1757,14 +1809,14 @@ SH
     local rc
     : > "$t/calls"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=1 MULTIHOST_IP_CMD="$t/ip" \
-        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -q "FAILED at network: rdbst-d1-net exists" "$t/out" \
         && ! grep -qE '^(ps |rm |volume rm|network rm)' "$t/calls"
     st "d1 on a name another run holds refuses and removes nothing (exit $rc)" $?
     grep -E '^(ps |rm |volume rm|network rm)' "$t/calls" | sed 's/^/  called: docker /'
     : > "$t/calls"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" \
-        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -q "FAILED at network create" "$t/out" \
         && grep -q "^volume ls -q --filter label=org.rdb.multihost=rdbst-d1\$" "$t/calls" \
         && grep -q "clean: removed" "$t/out"
@@ -1779,7 +1831,7 @@ SH
     : > "$t/calls"; : > "$t/steps"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
         MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs" \
-        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 7 ] \
         && grep -q "^failover 3 --with-voter-leader --name rdbst-d1\$" "$t/steps" \
         && grep -q "d1 step 'failover 1' exit 1" "$t/out" && grep -q "d1: 1 steps failed" "$t/out" \
@@ -1791,7 +1843,7 @@ SH
     : > "$t/calls"; : > "$t/steps"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
         MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs2" \
-        "$0" d1 --no-build --name rdbst-d1 --restart-on-exit > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d --restart-on-exit > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 8 ] \
         && [ "$(tail -n 1 "$t/steps")" = "pause 2 --name rdbst-d1" ] \
         && grep -qE '^up .* --restart-on-exit$' "$t/steps" && [ -d "$t/logs2/logs-8-pause_2" ]
@@ -1801,17 +1853,49 @@ SH
     : > "$t/steps"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
         MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs3" \
-        "$0" d1 --no-build --name rdbst-d1 --live-readd > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d --live-readd > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 7 ] \
         && grep -qE '^up .* --live-readd$' "$t/steps" && ! grep -q '^pause ' "$t/steps"
     st "d1 --live-readd passes it to up and adds no step (exit $rc)" $?
     : > "$t/steps"
     PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
         MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs4" \
-        "$0" d1 --no-build --name rdbst-d1 --live-readd --restart-on-exit > "$t/out" 2>&1; rc=$?
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d --live-readd --restart-on-exit > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -qE '^up .* --restart-on-exit --live-readd$' "$t/steps" \
         && [ "$(tail -n 1 "$t/steps")" = "pause 2 --name rdbst-d1" ]
     st "d1 --live-readd --restart-on-exit passes both to up and runs pause 2 (exit $rc)" $?
+    # The basis: named in d1's first lines, or d1 refuses before it creates anything.
+    head -n 2 "$t/out" | grep -q '^multihost: d1: image rdb-bf-node:dev id=sha256:5eed$' \
+        && sed -n 2p "$t/out" | grep -qx 'EXPORT_BASIS=5524c9d (from --basis)'
+    st "d1 --basis prints the image id and EXPORT_BASIS in its first two lines" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" BASIS_LABEL=abc1234 \
+        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    sed -n 2p "$t/out" | grep -qx 'EXPORT_BASIS=abc1234 (from the image label org.rdb.basis)'
+    st "d1 with no --basis takes the image's org.rdb.basis label (exit $rc)" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" BASIS_LABEL=abc1234 \
+        "$0" d1 --no-build --name rdbst-d1 --basis 5524c9d > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at basis: --basis 5524c9d disagrees with" "$t/out" \
+        && ! grep -qE '^(network create|volume create|run )' "$t/calls"
+    st "d1 whose --basis disagrees with the image label is refused before anything is created (exit $rc)" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" \
+        "$0" d1 --no-build --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at basis: rdb-bf-node:dev has no org.rdb.basis label; pass --basis" "$t/out" \
+        && ! grep -qE '^(network create|volume create|run )' "$t/calls"
+    st "d1 on an image with no basis and no --basis is refused before anything is created (exit $rc)" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=1 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" BASIS_LABEL=abc1234 \
+        "$0" d1 --name rdbst-d1 > "$t/out" 2>&1; rc=$?
+    local head
+    head="$(git -C "$REPO" rev-parse HEAD)"
+    grep -qE "^build -f docker/Dockerfile --label org.rdb.basis=$head(-dirty)? -t rdb-bf-node:dev \.\$" "$t/calls"
+    st "d1 that builds labels the image org.rdb.basis with the tree's HEAD" $?
     rm -rf "$t"
 }
 
