@@ -385,3 +385,45 @@ fn f87_4_a_failed_read_is_repeated_as_at_most_200_characters() {
     land(&mut trio, &mut held, Some(Err(exact.clone())));
     assert_eq!(failure_named(answer.try_recv()), exact);
 }
+
+/// Review r5 (thread 4655340438): a read that answers clears the failure saved before it. A
+/// read fails (the parked call hears it), the next one answers (its call is served), and once
+/// that read is a whole grant old a call parks on a read that never lands: its refusal at
+/// [`FEED_READ_WAIT_MILLIS`] says "call again" and names no failure.
+/// Cut: no `entry.failed = None` on a read that answers, red (the old failure is named).
+/// Integration (~2 s): bootstrap's discovery window, then steps on a held clock.
+#[config_log::retcd_test]
+fn f87_4_a_read_that_answers_clears_the_saved_failure() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _, _) = serving(dir.path());
+    let hold = trio.clock.hold();
+    let mut held = Vec::new();
+
+    let failed = call_two(&trio, changes(10));
+    until_held(&mut trio, &mut held, 1);
+    land(&mut trio, &mut held, Some(Err("the store refused".to_owned())));
+    assert_eq!(failure_named(failed.try_recv()), "the store refused");
+
+    let served = call_two(&trio, changes(11));
+    until_held(&mut trio, &mut held, 1);
+    land(&mut trio, &mut held, None);
+    assert!(
+        matches!(served.try_recv(), Ok(Answer::Changes(_))),
+        "served once a read answers"
+    );
+
+    hold.advance(trio.nodes[1].0.budgets.grant_millis);
+    let expired = call_two(&trio, changes(12));
+    step_two(&mut trio, &mut held);
+    assert_eq!(feed_state(&trio), (true, 1), "parked on a new read");
+    hold.advance(FEED_READ_WAIT_MILLIS);
+    step_two(&mut trio, &mut held);
+    match expired.try_recv() {
+        Ok(Answer::Error { error, .. }) => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(error.detail.contains("so call again"), "{error:?}");
+            assert!(!error.detail.contains("the last read failed"), "{error:?}");
+        }
+        other => panic!("not refused at the wait: {other:?}"),
+    }
+}
