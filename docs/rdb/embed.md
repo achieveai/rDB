@@ -517,10 +517,18 @@ what the lost host was to it. These are the expected times at the default settin
 - If a host hangs while it is the last reachable copy of a partition, and the partition's
   other copies are also down, restarting that host does not bring the partition back; it
   returns when one of its other copies returns. See #168 and #172.
-- **Tested on one machine.** Five node processes, each in its own Docker container, are the
-  closest run so far.
+- **Tested on one machine.** See "Docker run" below.
 
-<!-- #176: the Docker d1 result goes here: per-class outage times and the host load. -->
+**Docker run (#176).** `scripts/docker-multihost.sh d1` runs five data nodes and three rEtcd
+voters, each in its own container, on one host. It kills one data node at a time, back to
+back, and restarts each one.
+
+- **Run 2, without #171: failed.** The first kill passed: owner 6.7 s, copy 10.9 s, load 10.8.
+  The next two did not. The node restarted after the first kill kept a frozen grant, so its
+  copies did not count. Later failovers then stopped as `lone_survivor`. #171 fixes this.
+- **Re-run with #171: passed.** All four back-to-back kills passed, and so did two voter
+  restarts. Writes came back within 7.3 s for an owner's partitions and 10.6 s for a copy's.
+  Each restarted node's frozen grant was cleared about 1 s after it restarted. Load was 2 to 3.
 
 <!-- S4 (membership, dev-s4): adding and removing a node goes here, with its limits: layout 3,
 the start check, the N-3 mixed-version rule, the R8-7 ruling, one change at a time. -->
