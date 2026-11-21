@@ -102,6 +102,8 @@ holds at the same stamp and digest is served, even when a later generation linke
 max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
 envelope that does not decode) is `CORRUPT_HISTORY` with the feed's step, for every caller waiting
 on that copy. `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
+(Corrected in r2: `Trimmed` does not wait for retention. A copy that does not hold the
+cursor's record answers it today.)
 
 **Amended 2026-11-20 (#170 review r2): the feed fails closed for apps.** The owner ruled on
 2026-11-20 to fail closed until a certificate binds an app to its tenants (#151). Over the links a

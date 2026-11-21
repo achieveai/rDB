@@ -255,8 +255,13 @@ pub struct Scanned {
 /// The records after `after` up to `cap`, read one seq at a time by `read`, stopped by `max`,
 /// [`FEED_PAGE_RECORDS`], [`FEED_PAGE_BYTES`], [`FEED_SCAN_RECORDS`] and [`FEED_SCAN_BYTES`].
 /// Whole records only, and at least one when any is due. `next` is after the last record
-/// examined, so skipped records still move it, and `more` is set whenever a cap stopped the
-/// call below `cap`.
+/// consumed: returned, or skipped (no write under the caller's tenant), so skipped records
+/// move it. A returnable record read and then left out because it would pass
+/// [`FEED_PAGE_BYTES`] is not consumed: `next` stays before it, and the next call returns it
+/// first. The scan caps count every record read, consumed or not; they can stop a call before
+/// it reaches any returnable record, giving no records and a `next` past the skipped ones.
+/// [`FEED_SCAN_BYTES`] is checked before each read, so the last read can pass it by one whole
+/// record. `more` is set whenever a cap stopped the call below `cap`.
 ///
 /// # Errors
 ///

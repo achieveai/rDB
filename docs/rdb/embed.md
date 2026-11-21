@@ -1675,23 +1675,29 @@ loop {
 - **The answers.**
   - `Records`: whole records after the cursor, and `next`. A page returns at most `max`
     records (your argument, itself at most 256) and 4 MiB of them, but always at least one
-    when one is due. Apart from that, a call examines at most 1024 records and 8 MiB of
-    record bytes, counting the records it skips (other tenants' writes). With `more` set,
-    one of those caps stopped the page: call again at once from `next`. A page with no
-    records can still have `more` set and a `next` that moved past skipped records; it is not
-    the end. Only `more` unset means nothing more is held now.
+    when one is due. Apart from that, a call examines at most 1024 records, counting the
+    records it skips (other tenants' writes), and stops once the record bytes it has examined
+    reach 8 MiB. It checks that before each read, so its last read can pass 8 MiB by one
+    whole record. With `more` set, one of those caps stopped the page: call again at once
+    from `next`. `next` is after the last record returned or skipped; a record left out
+    because it would pass 4 MiB comes first on the next call. A page with no records can
+    still have `more` set and a `next` that moved past skipped records; it is not the end.
+    Only `more` unset means nothing more is held now.
   - `Behind`: the copy you asked has not got that far yet, or not that generation. Keep the
     cursor; wait, or ask another copy.
   - `Trimmed`: the copy does not hold the record you need (`floor` is the lowest it serves).
-    Ask another copy, which may still hold it, or rebuild from your own source. Today no
-    copy trims its `History`, so this answer comes only once the retention work (#61) lands;
-    handle it anyway.
+    Ask another copy, which may still hold it, or rebuild from your own source. No copy
+    trims its `History` on a schedule yet (#61), but this answer can come today: a copy
+    that does not hold your cursor's record answers it. Handle it.
   - `Rewound`: **a promote cut records you have already applied.** Undo what you applied above
     `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB has lost.
-  - `CORRUPT_HISTORY` error: the cursor's record has another digest on this copy, or a record
-    there does not parse. The history at this copy is unreadable from this cursor: read from
-    another copy (the owner or another member), or rebuild from your own source, and report
-    it.
+  - `CORRUPT_HISTORY` error: this copy holds your cursor's position with another digest
+    (the cursor may come from another partition, the copies may have diverged, or the record
+    may be damaged), or a record due to you does not parse; or the copy's stored history is
+    damaged (a record unreadable, misplaced, not matching its digest, or missing below what
+    it serves), and then that node stops serving and every call to it hears the fault. The
+    history at this copy is unreadable from this cursor: read from another copy (the owner or
+    another member), or rebuild from your own source, and report it.
 - **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
   reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
   applied, which can be ahead of the owner's published position.
