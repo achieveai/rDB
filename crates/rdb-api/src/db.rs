@@ -1011,14 +1011,54 @@ fn app_addr_settled(dir: &Path) -> Result<(), OpenError> {
 /// Record durably that an app-address write sent at `revision` may still apply: the file is
 /// written beside, synced, renamed over, and its folder synced, all before the write is sent.
 fn mark_app_addr_pending(dir: &Path, revision: u64) -> Result<(), OpenError> {
+    write_marker(dir, APP_ADDR_PENDING_FILE, &revision.to_string())
+}
+
+/// The file in a node process's folder that says this node's next open must fence its
+/// `nodes/{id}` record (#83 B2, PR #159 review r3): written durably when an open finds the
+/// node's copy new or emptied, before its engine creates any data, and removed only once an
+/// open has fenced. An emptied folder has lost any [`APP_ADDR_PENDING_FILE`] an earlier folder
+/// held, so a write that folder sent may still apply; and an open that fails after the engine
+/// has created data must not leave the next open thinking the folder settled. Leave it alone.
+pub(crate) const APP_ADDR_FENCE_FILE: &str = "app-addr-fence";
+
+/// Whether [`APP_ADDR_FENCE_FILE`] is there. One that is there and cannot be looked at refuses
+/// the open, since it may say a fence is owed.
+fn app_addr_fence_owed(dir: &Path) -> Result<bool, OpenError> {
+    let file = dir.join(APP_ADDR_FENCE_FILE);
+    match std::fs::symlink_metadata(&file) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OpenError::Config(format!(
+            "{} could not be looked at ({error}): it may say this node's record must be fenced, \
+             and this open cannot tell. Leave it in place, make it readable by this process, \
+             then open this node again. Nothing was started",
+            file.display()
+        ))),
+    }
+}
+
+/// The fence [`APP_ADDR_FENCE_FILE`] asked for is done: no write an earlier folder sent can
+/// still apply.
+fn clear_app_addr_fence(dir: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(dir.join(APP_ADDR_FENCE_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpenError::Io(error)),
+    }
+}
+
+/// Write `name` in `dir` holding `text`, durably: staged as `name.new`, synced, renamed over,
+/// and the folder synced.
+fn write_marker(dir: &Path, name: &str, text: &str) -> Result<(), OpenError> {
     use std::io::Write as _;
-    let staged = dir.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    let staged = dir.join(format!("{name}.new"));
     {
         let mut out = std::fs::File::create(&staged)?;
-        writeln!(out, "{revision}")?;
+        writeln!(out, "{text}")?;
         out.sync_all()?;
     }
-    std::fs::rename(&staged, dir.join(APP_ADDR_PENDING_FILE))?;
+    std::fs::rename(&staged, dir.join(name))?;
     // The rename is a change of the folder: sync it too, or a crash can lose the marker after
     // the write went out. Windows cannot open a folder as a file; there NTFS journals the
     // rename itself.
@@ -1044,8 +1084,9 @@ fn clear_app_addr_pending(dir: &Path) -> Result<(), OpenError> {
 /// changes nothing, unless an earlier open's write may still apply at the revision it read, and
 /// replace this open's address after this open returned. Two things say it may: `dir` holds
 /// [`APP_ADDR_PENDING_FILE`] (present at all, whatever its text), or `new_folder`, this node's
-/// folder had no data before this open (new or emptied), so a marker an earlier folder held is
-/// gone. Then this open writes anyway, a fence: the revision moves on, and no write sent at an
+/// folder had no data before this open (new or emptied) or still holds the
+/// [`APP_ADDR_FENCE_FILE`] such an open wrote, so a marker an earlier folder held is gone.
+/// Then this open writes anyway, a fence: the revision moves on, and no write sent at an
 /// older one can apply (PR #159 review, r2). The marker is written durably before every write
 /// and removed only once its outcome is known: applied, or the record moved on. A write whose
 /// outcome stays unknown, an open dropped mid-write, and a crash leave it, so the next open
@@ -1161,6 +1202,63 @@ async fn register_app_addr(
         written = true,
         fenced,
         "db_app_addr_registered"
+    );
+    Ok(())
+}
+
+/// Fence `node`'s `nodes/{id}` record for an open given no app address whose folder owes a
+/// fence ([`APP_ADDR_FENCE_FILE`]; PR #159 review r3): write the record's own bytes back at the
+/// revision they were read at. Nothing in the record changes, but the revision moves on, so no
+/// app-address write an earlier folder of this node sent at an older revision can apply and
+/// replace the address the record holds. Then the fence file is removed.
+///
+/// Every refusal is before any host starts, and keeps the fence file, so the next open fences
+/// again: a record that changed after this open read it (another writer, or such a late write
+/// landing first), or a write whose outcome is unknown. A late arrival of this write is
+/// harmless: it holds the bytes the record held at its revision. Logged
+/// `db_app_addr_fenced{node, revision}`.
+async fn fence_app_addr(
+    store: &dyn ConfigStore,
+    dir: &Path,
+    node: NodeId,
+) -> Result<(), OpenError> {
+    let key = ControlKey::Node(node).encode();
+    let refused = |why: String| {
+        OpenError::Control(format!(
+            "{key}: {why}; this node's folder is new or emptied, so an earlier folder's \
+             app-address write may still apply, and the open fences it first. Open this node \
+             again; nothing was started"
+        ))
+    };
+    let found = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| refused(format!("read before the fence: {error}")))?
+        .record
+        .ok_or_else(|| refused("absent, so it cannot be fenced".to_owned()))?;
+    let at = found.mod_revision;
+    let written = store
+        .put(config_core::PutRequest {
+            key: Bytes::from(key.clone()),
+            value: found.value,
+            expected_mod_revision: Some(at),
+            dedup: None,
+        })
+        .await
+        .map_err(|error| refused(format!("the fence's outcome is unknown ({error})")))?;
+    if written.outcome != config_core::MutationOutcome::Applied {
+        return Err(refused(format!(
+            "changed after this open read it at revision {at} (the fence answered {:?})",
+            written.outcome
+        )));
+    }
+    clear_app_addr_fence(dir)?;
+    tracing::info!(
+        node = node.0,
+        revision = written.revision,
+        "db_app_addr_fenced"
     );
     Ok(())
 }
@@ -2148,9 +2246,18 @@ impl Db {
             }
         }
         // #83 B2, PR #159 review r2: a node folder with no data yet holds no marker, whatever
-        // an earlier folder of this node left in flight, so its registration fences.
+        // an earlier folder of this node left in flight, so its open fences. r3: that is made
+        // durable before the engine creates `CURRENT`, so an open that fails after it does not
+        // leave the next one thinking the folder settled; only a fence removes it.
         let new_folder = match config.local.as_slice() {
-            [node] => !nodes_dir.join(node.0.to_string()).join("CURRENT").exists(),
+            [node] if formation.is_some() => {
+                if nodes_dir.join(node.0.to_string()).join("CURRENT").exists() {
+                    app_addr_fence_owed(&config.dir)?
+                } else {
+                    write_marker(&config.dir, APP_ADDR_FENCE_FILE, "")?;
+                    true
+                }
+            }
             _ => false,
         };
         let created = match std::fs::create_dir(&nodes_dir) {
@@ -2214,9 +2321,14 @@ impl Db {
         // #83 B2: after the engines' `LOCK`s, so of two opens of one folder only one writes,
         // and before any host starts, so no boot leads a partition before its address is in.
         // An open given no address writes none, so it is refused while a write may be pending.
+        // A new or emptied folder fences either way (r3): with an address, here, by writing it;
+        // with none, below, by writing the record's own bytes back.
         match (app, config.local.as_slice()) {
             (Some(app), [node]) => {
                 register_app_addr(&*store, &config.dir, *node, app, new_folder).await?;
+                if new_folder {
+                    clear_app_addr_fence(&config.dir)?;
+                }
             }
             (None, _) => app_addr_settled(&config.dir)?,
             (Some(_), _) => {}
@@ -2288,6 +2400,11 @@ impl Db {
                 copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
                 "db_open_rolled_forward"
             );
+        }
+        // PR #159 review r3: the no-address fence of a new or emptied folder, the last check
+        // before any host starts, so an open refused by an earlier one writes nothing.
+        if let (None, [node], true) = (app, config.local.as_slice(), new_folder) {
+            fence_app_addr(&*store, &config.dir, *node).await?;
         }
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();

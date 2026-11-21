@@ -4740,6 +4740,81 @@ fn own83_b2_13_a_lone_staged_marker_is_not_a_marker() {
     assert!(staged.exists(), "the staged file is left in place");
 }
 
+/// own83_b2_14 (#83 B2, PR #159 review r3, T42): B's write may still apply, and node 1's
+/// folder is emptied, its marker with it. A rejoin given no app address on the emptied folder
+/// cannot write an address, so it fences by writing the record's own bytes back: it opens, the
+/// record still holds A at a later revision, and the late B is refused. The fence file is gone
+/// once it has fenced. A restart with no address and one with A, on the rejoined folder, write
+/// nothing. Cut: `fence_app_addr` skipped before the hosts start, red at "the recovery wrote A
+/// again, past r" (no write, and the late B then applies). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_14_a_no_address_rejoin_on_an_emptied_folder_fences() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    fence
+        .open_on(&fence.rig.rt, None)
+        .expect("the no-address rejoin opens");
+    late_b_is_refused(&fence, A, r);
+    assert!(
+        !fence.dir.0.join(APP_ADDR_FENCE_FILE).exists(),
+        "fenced: the fence file is removed"
+    );
+    let (_, rejoined) = fence.record();
+    fence
+        .open_on(&fence.rig.rt, None)
+        .expect("a no-address restart");
+    fence.open(A).expect("a restart with A");
+    assert_eq!(
+        fence.record(),
+        (Some(A.to_owned()), rejoined),
+        "settled: nothing written"
+    );
+}
+
+/// own83_b2_15 (#83 B2, PR #159 review r3, T43): the new-folder fence survives a first open that
+/// fails after the engine has created data. B's write may still apply; node 1's folder is
+/// emptied but keeps an empty `nodes/`, so a failed open does not remove what its engine
+/// created. Two opens with A on it fail at the read before the address is written, before any
+/// host starts, each leaving `CURRENT` behind. The next open with A still fences (the fence file
+/// says so, not `CURRENT`), and the late B is refused. A restart then writes nothing. Cut: the
+/// fence file not consulted once `CURRENT` exists, red at "the recovery wrote A again, past r".
+/// Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir_all(fence.dir.0.join("nodes")).expect("an empty nodes/");
+    let current = fence.dir.0.join("nodes").join("1").join("CURRENT");
+    for attempt in 1..=2 {
+        fence.store.failing_reads.store(1, Ordering::SeqCst);
+        let refused = fence.open(A).expect_err("the read before the write fails");
+        assert!(
+            refused
+                .to_string()
+                .contains("read before the app address is written"),
+            "{attempt}: {refused}"
+        );
+        assert!(current.exists(), "{attempt}: the engine left CURRENT");
+        assert!(
+            fence.dir.0.join(APP_ADDR_FENCE_FILE).exists(),
+            "{attempt}: the fence is still owed"
+        );
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    fence.open(A).expect("the healthy retry opens");
+    late_b_is_refused(&fence, A, r);
+    let (_, settled) = fence.record();
+    fence.open(A).expect("a restart");
+    assert_eq!(fence.record().1, settled, "settled: nothing written");
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 
