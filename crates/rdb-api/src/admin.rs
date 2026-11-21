@@ -2628,7 +2628,9 @@ const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
 /// [`LEAVE_OUT_EVERY`], whether the heal may go on without it. Its first answer and each change
 /// of it are logged once per attempt (each [`heal_retrying`] attempt logs its own first):
 /// `heal_proceed_without` per partition when it may, `heal_wait_all{reason}` while it may not.
-/// `rooted` and `forming` are the members each of the
+/// An answer that arrives at or past `deadline` is not acted on (`heal_leave_out_expired`): the
+/// attempt ends [`HealError::PeersUnknown`] so the next one decides with a whole budget for the
+/// clear, rather than reaching it with none. `rooted` and `forming` are the members each of the
 /// heal's partitions pins, by partition, in `ctx.partitions` and `ctx.bootstrap` order.
 async fn member_boots(
     ctx: &HealCtx,
@@ -2657,12 +2659,13 @@ async fn member_boots(
             .map(|(member, _)| member.node.0)
             .collect();
         let mut left = Vec::new();
-        if !missing.is_empty() && tokio::time::Instant::now() >= next_ask {
+        // Past the deadline nothing is asked: an answer could no longer be acted on.
+        if !missing.is_empty() && !late && tokio::time::Instant::now() >= next_ask {
             next_ask = tokio::time::Instant::now() + LEAVE_OUT_EVERY;
             // The first attempt's window ends at its own deadline, so it never counts there:
             // that attempt ends `PeersUnknown`, and [`heal_retrying`]'s next one goes on with a
             // whole budget left for the rest of the heal.
-            let window_passed = !late && tokio::time::Instant::now() >= since + ctx.within;
+            let window_passed = tokio::time::Instant::now() >= since + ctx.within;
             let asked = leave_out(
                 ctx,
                 &found,
@@ -2674,6 +2677,16 @@ async fn member_boots(
             )
             .await;
             match asked {
+                // PR #181 review: the grant reads may have used up the attempt's budget; acting
+                // now would leave `clear_until` none, and its `NotCleared` ends the heal.
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    reason = "decided_past_deadline";
+                    tracing::info!(
+                        owner = ctx.owner_node.0,
+                        missing = ?missing,
+                        "heal_leave_out_expired"
+                    );
+                }
                 Ok(down) => left = down,
                 Err(why) => {
                     reason = why;
@@ -9561,6 +9574,15 @@ mod tests {
         }
     }
 
+    /// A delayed read of `node`'s grant from `not_before`.
+    const fn r5_delay(not_before: Duration, delay: Duration) -> GetStep {
+        GetStep {
+            not_before,
+            delay,
+            fail: None,
+        }
+    }
+
     /// A failed read of a grant with `reason`, due at once.
     const fn r5_fail(reason: &'static str) -> GetStep {
         GetStep {
@@ -9636,6 +9658,58 @@ mod tests {
             "one heal_wait_all per attempt that waited"
         );
         assert!(r5_lines(METHOD, "heal_proceed_without").is_empty());
+    }
+
+    /// PR #181 review, blocker 2: a leave-out answer that arrives past the attempt's deadline
+    /// is not acted on. Node 3's grant read is held past the first window (frozen case) or
+    /// past the window of the attempt that may first go on (no-grant case); that attempt logs
+    /// `heal_leave_out_expired`, sends nothing and ends `PeersUnknown`, and the next one goes on
+    /// with a whole budget: one `HealLeftOut` and one plan, never `NotCleared`. Unit (~3 s).
+    /// Cut: the deadline recheck removed: `clear_until` gets no budget and ends the heal
+    /// `NotCleared`, red.
+    #[config_log::retcd_test]
+    fn r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed() {
+        const METHOD: &str = "r5_q_a_leave_out_answer_past_the_deadline_is_retried_not_failed";
+        let window = Duration::from_millis(600);
+        let far = utc_now() + 3_600_000;
+        let cases: [(&str, Vec<GrantRecord>, GetStep); 2] = [
+            (
+                "frozen",
+                vec![r5_grant(3, far, true)],
+                r5_delay(Duration::ZERO, window + Duration::from_millis(300)),
+            ),
+            (
+                "absent",
+                Vec::new(),
+                r5_delay(
+                    Duration::from_millis(1_000),
+                    window + Duration::from_millis(300),
+                ),
+            ),
+        ];
+        for (case, grants, step) in cases {
+            let store = Arc::new(GrantGets::new(NodeId(3), vec![step]));
+            let (healed, sent, _) = r5_heal_in(
+                store,
+                Arc::default(),
+                true,
+                true,
+                OsBoot::Same,
+                OWNER,
+                r5_up_but(&[3]),
+                &grants,
+                HostClock::start(),
+                window,
+            );
+            healed.unwrap_or_else(|e| panic!("{case}: a later attempt goes on: {e}"));
+            assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)], "{case}");
+            let notes = sent
+                .iter()
+                .filter(|msg| matches!(msg, Msg::HealLeftOut { .. }))
+                .count();
+            assert_eq!(notes, 1, "{case}: only the attempt that went on sent");
+        }
+        assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
     }
 
     /// PR #181 review: a grant read that fails keeps its cause and its own reason,
