@@ -1285,7 +1285,10 @@ pub enum ReadyError {
         /// after a promote (A-R256).
         owner: NodeId,
         /// The owner's last recovery phase, in words: `unknown` when it answered no status
-        /// look in the time, `none` when it runs no recovery.
+        /// look in the time, `unreachable` when no link to it was up, `none` when it runs no
+        /// recovery. With more than one partition it starts `partition <p>: `. While the
+        /// reopen's heal is waiting (R5), the phase is followed by [`HEAL_WAITING`] and the
+        /// heal's latest wait in words; split on [`HEAL_WAITING`] to get each part.
         phase: String,
     },
     /// Node 1 restarted, or its restart failed: the owner stays out until the folder is opened
@@ -6450,8 +6453,25 @@ const NO_LINK: &str = "unreachable";
 /// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
 /// What joins [`ReadyError::TimedOut`]'s phase to the reopen's heal wait, when one is waiting
-/// (R5): `wait_ready` writes it, and [`timed_out_text`] splits on it.
-const HEAL_WAITING: &str = "; the reopen's heal is waiting: ";
+/// (R5): `wait_ready` writes it, and the error's text splits on it. Public so an app can split
+/// the phase the same way:
+///
+/// ```
+/// use rdb_api::db::{ReadyError, HEAL_WAITING};
+/// use rdb_api::NodeId;
+///
+/// let timed_out = ReadyError::TimedOut {
+///     within_ms: 300,
+///     owner: NodeId(1),
+///     phase: format!("unreachable{HEAL_WAITING}no link to node 3 came up"),
+/// };
+/// let ReadyError::TimedOut { phase, .. } = &timed_out else { unreachable!() };
+/// let (seen, heal) = phase
+///     .split_once(HEAL_WAITING)
+///     .map_or((phase.as_str(), None), |(seen, heal)| (seen, Some(heal)));
+/// assert_eq!((seen, heal), ("unreachable", Some("no link to node 3 came up")));
+/// ```
+pub const HEAL_WAITING: &str = "; the reopen's heal is waiting: ";
 
 /// Why [`Db::look`] has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
