@@ -3326,8 +3326,9 @@ impl Db {
     /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
     /// `UNAVAILABLE` also when no answer came within the read timeout, or
     /// `Source::Node(n)` names a node in another process this one has no link up to
-    /// (`RetryAfterRecovery`); a node in this process whose thread has stopped is a host fault
-    /// instead (`NotWired`). `INCOMPATIBLE_VERSION` when
+    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped (also
+    /// `RetryAfterRecovery`: read another copy now, or that node once it has restarted).
+    /// `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
     /// write's admission would, `LEASE_EXPIRED` (or `PROTECTION_PAUSED`, `GENERATION_CHANGED`),
@@ -3415,12 +3416,25 @@ impl Db {
                         request: None,
                     }),
                 },
-                // Review r3/r4 (thread 4654680317): the cause and its recovery rule, as
-                // `Self::call` keeps them. A local node whose thread has stopped is a host
-                // fault; a node in another process with no link up can come back.
+                // Review r3/r4/r5 (thread 4654680317): the cause kept, local or remote. A local
+                // node whose thread has stopped serves the feed again once it has restarted,
+                // and another copy can serve now, so a feed reader gets that step, not a host
+                // fault's owner-takeover step; a node in another process with no link up can
+                // come back.
                 Err(_) => Some(Answer::Error {
                     error: if lock(&self.nodes).iter().any(|handle| handle.node == node) {
-                        ApiError::host(&format!("node {}'s node thread has stopped", node.0))
+                        let mut error = ApiError::new(
+                            ErrorKind::Unavailable,
+                            format!(
+                                "node {}'s node thread has stopped, in this process; nothing \
+                                 was read; next: {}",
+                                node.0,
+                                error::FEED_STOPPED_STEP
+                            ),
+                        );
+                        error.retry = RetryRule::RetryAfterRecovery;
+                        error.no_mutation = true;
+                        error
                     } else {
                         let mut error = ApiError::new(
                             ErrorKind::Unavailable,

@@ -1984,13 +1984,15 @@ fn f87_3_a_seam_on_a_faulted_node_says_why_not_that_it_timed_out() {
     );
 }
 
-/// Review r3/r4 (thread 4654680317): a feed call to a member that cannot take it keeps the
-/// cause and its recovery rule, as `Db::call` does. Node 2's thread stops while its process
-/// stays up. From node 2's own process it is a host fault: "node 2's node thread has
-/// stopped", `NotWired`. From the app, another process, node 2 is unreachable: a retry helps
-/// once it is back (`RetryAfterRecovery`), and nothing was read.
-/// Cut: the send failure never taken for a local node, red (node 2's own process hears the
-/// remote "not reachable" reply, not the stopped thread).
+/// Review r3/r4/r5 (thread 4654680317): a feed call to a member that cannot take it keeps the
+/// cause, and gives a feed reader a step it can act on. Node 2's thread stops while its process
+/// stays up. From node 2's own process: "node 2's node thread has stopped", `UNAVAILABLE`,
+/// `RetryAfterRecovery`, ending with the stop step (another copy now, or node 2 once it has
+/// restarted), not a host fault. From the app, another process, node 2 is unreachable: a retry
+/// helps once it is back (`RetryAfterRecovery`). Nothing was read either way.
+/// Cuts: the send failure never taken for a local node, red (node 2's own process hears the
+/// remote "not reachable" reply, not the stopped thread); the local branch a host fault again,
+/// red (`NotWired`, the owner-takeover step).
 /// Integration (~5 s): processes, one stopped thread.
 #[config_log::retcd_test]
 fn f87_3_a_feed_call_to_a_stopped_member_names_why() {
@@ -2017,9 +2019,18 @@ fn f87_3_a_feed_call_to_a_stopped_member_names_why() {
         }
     };
     let local = refused(&procs.nodes[1], "node 2's node thread has stopped");
-    assert!(local.is_host_fault(), "{local:?}");
-    assert_eq!(local.retry, RetryRule::NotWired, "{local:?}");
+    assert!(!local.is_host_fault(), "{local:?}");
+    assert_eq!(
+        (local.kind, local.retry),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery),
+        "{local:?}"
+    );
     assert!(local.no_mutation, "{local:?}");
+    assert!(
+        local.detail.ends_with(crate::db::error::FEED_STOPPED_STEP),
+        "{local:?}"
+    );
+    assert_eq!(local.next_step(), None, "its own step only: {local:?}");
     let remote = refused(&procs.app, "node 2 is not reachable from this process");
     assert!(!remote.is_host_fault(), "{remote:?}");
     assert_eq!(
