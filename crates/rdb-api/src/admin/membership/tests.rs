@@ -351,3 +351,79 @@ fn s80s4_start_check_accepts_an_added_node_and_a_missing_higher_peer() {
         assert!(text.ends_with("nothing was started"), "{what}: {text}");
     }
 }
+
+fn remove_refusal(answer: Result<NodeRecord, super::RemoveNodeError>) -> String {
+    match answer {
+        Err(super::RemoveNodeError::Refused(why)) => why,
+        other => panic!("refused, not {other:?}"),
+    }
+}
+
+/// M5 (#80 S4, N-2 and S-2). On a database declared with 5 nodes:
+/// - node 2, which the generation-0 records pin, is refused "run admin drain 2";
+/// - node 7, never added, is refused as not a live member;
+/// - node 6, added and pinned by nothing, is removed: `nodes/6` becomes layout 3 at node 6's
+///   address and machine, and every other key keeps its bytes and revisions;
+/// - node 6 again is refused as already removed, and the next add takes id 7.
+///
+/// On a database declared with 3 nodes, node 3 is refused: 2 distinct live machines would be
+/// left. Every refusal writes nothing. Unit.
+///
+/// Cut: drop the pin check, so node 2 is written removed ("refused, not Ok"), red, observed
+/// 2026-11-21.
+#[test]
+fn s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_machines() {
+    let rt = runtime();
+    let store = declared(&rt, 5);
+    let six = rt
+        .block_on(add_node(&store, "127.0.0.6:7100", None))
+        .expect("node 6 is added");
+    let before = snapshot(&rt, &*store);
+
+    let why = remove_refusal(rt.block_on(super::remove_node(&store, NodeId(2))));
+    assert!(why.contains("run admin drain 2"), "{why}");
+    let why = remove_refusal(rt.block_on(super::remove_node(&store, NodeId(7))));
+    assert!(why.contains("node 7 is not a live member"), "{why}");
+    assert_eq!(snapshot(&rt, &*store), before, "a refusal writes nothing");
+
+    let removed = rt
+        .block_on(super::remove_node(&store, NodeId(6)))
+        .expect("node 6 is removed");
+    assert_eq!(removed, six);
+    let after = snapshot(&rt, &*store);
+    let key = Bytes::from(rdb_core::contracts::control::ControlKey::Node(NodeId(6)).encode());
+    for (k, v, created, modified) in &before {
+        let now = after
+            .iter()
+            .find(|(key, ..)| key == k)
+            .expect("still there");
+        if *k == key {
+            assert_eq!(
+                NodeRecord::decode_removed(&now.1),
+                Some((six.clone(), None)),
+                "nodes/6 is layout 3"
+            );
+            assert_eq!(now.2, *created);
+        } else {
+            assert_eq!(
+                (&now.1, now.2, now.3),
+                (v, *created, *modified),
+                "{k:?} kept"
+            );
+        }
+    }
+    assert_eq!(after.len(), before.len());
+
+    let why = remove_refusal(rt.block_on(super::remove_node(&store, NodeId(6))));
+    assert!(why.contains("node 6 is already removed"), "{why}");
+    let seven = rt
+        .block_on(add_node(&store, "127.0.0.7:7100", None))
+        .expect("an add after the remove");
+    assert_eq!(seven.node, NodeId(7), "the removed id 6 is not reused");
+
+    let three = declared(&rt, 3);
+    let before = snapshot(&rt, &*three);
+    let why = remove_refusal(rt.block_on(super::remove_node(&three, NodeId(3))));
+    assert!(why.contains("leaves 2 distinct live machines"), "{why}");
+    assert_eq!(snapshot(&rt, &*three), before, "a refusal writes nothing");
+}

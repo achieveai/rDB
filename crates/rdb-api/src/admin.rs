@@ -4699,7 +4699,10 @@ async fn freeze(
 pub mod membership;
 pub(crate) mod rebuild;
 
-pub use membership::{add_node, watch_members, AddNodeError};
+pub use membership::{
+    add_member, add_node, membership_settled, remove_member, remove_node, watch_members,
+    AddNodeError, RemoveNodeError, MIN_MACHINES,
+};
 
 #[cfg(test)]
 mod tests {

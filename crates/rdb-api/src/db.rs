@@ -4991,13 +4991,44 @@ impl Db {
         self.look_in(PARTITION, node)
     }
 
+    /// A fresh status request to each of `nodes`, each answered within `within` (#80 S4, for
+    /// [`admin::membership_settled`]): its status, or why not, naming `within`.
+    #[must_use]
+    pub fn fresh_looks(
+        &self,
+        nodes: &[NodeId],
+        within: Duration,
+    ) -> BTreeMap<NodeId, Result<NodeStatus, String>> {
+        nodes
+            .iter()
+            .map(|node| {
+                let looked = match self.look_within(PARTITION, *node, within) {
+                    Ok(status) => Ok(status),
+                    Err(Unlooked::NoLink) => Err("no link to it is up".to_owned()),
+                    Err(Unlooked::NoAnswer) => Err(format!("it did not answer within {within:?}")),
+                };
+                (*node, looked)
+            })
+            .collect()
+    }
+
     /// [`Self::look`] at `partition`'s state on `node`.
     fn look_in(&self, partition: PartitionId, node: NodeId) -> Result<NodeStatus, Unlooked> {
+        self.look_within(partition, node, self.timeouts.read)
+    }
+
+    /// [`Self::look_in`], answered within `within`.
+    fn look_within(
+        &self,
+        partition: PartitionId,
+        node: NodeId,
+        within: Duration,
+    ) -> Result<NodeStatus, Unlooked> {
         let (reply, answer) = mpsc::channel();
         self.send_to(node, Msg::Inspect { partition, reply })
             .map_err(|_| Unlooked::NoLink)?;
         let status = answer
-            .recv_timeout(self.timeouts.read)
+            .recv_timeout(within)
             .map_err(|_| Unlooked::NoAnswer)?;
         if partition == PARTITION && node == self.route.owner() {
             // review-s2 F-005: an owner in another process is not ended by a blocked recovery;

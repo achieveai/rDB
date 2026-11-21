@@ -682,3 +682,132 @@ fn s80s4_a_nodes_status_reports_its_members_revision_and_it_moves_after_an_add()
     );
     tracing::info!(before, six, after = ?after, "s80s4_members_revision_moved");
 }
+
+/// The `nodes/{node}` record's mod revision.
+fn node_revision(rig: &Rig, node: NodeId) -> u64 {
+    rig.rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Node(node).encode()),
+        }))
+        .expect("a read")
+        .record
+        .expect("the node's record")
+        .mod_revision
+}
+
+/// M5c (#80 S4, S-3: one membership change at a time). Five nodes run and node 3's `nodes/`
+/// lists are cut, so its watcher is held. `admin::add_node` writes `nodes/6` (node 6 does not
+/// start, so it is named in `unreachable_ok`). `membership_settled` then refuses, naming live
+/// member 3 and its older revision; once node 3's cut is lifted it settles, every other member
+/// having applied `nodes/6`. Integration (five node processes).
+///
+/// Cut: `membership_settled` takes any reported revision as current, so it settles while node
+/// 3 is held ("node 3's held watcher blocks"), red, observed 2026-11-21.
+#[config_log::retcd_test]
+fn s80s4_membership_changes_refuse_until_every_live_node_has_applied_the_last() {
+    let within = Duration::from_millis(500);
+    let (rig, _six) = five_ready();
+    rig.held.recut();
+    let added = rig
+        .rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("node 6 is added");
+    let six = node_revision(&rig, added.node);
+    let one = &rig.of(NodeId(1)).db;
+    for n in [1, 2, 4, 5] {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} applies nodes/6"),
+            Duration::from_secs(10),
+            || net.members_revision() >= six,
+        );
+    }
+    let why = admin::membership_settled(one, rig.rt.handle(), &*rig.store, &[ADDED], within)
+        .expect_err("node 3's held watcher blocks");
+    assert!(
+        why.contains("live member 3 has applied nodes/ revision")
+            && why.contains("below the newest"),
+        "{why}"
+    );
+    rig.held.lift();
+    let mut last = Ok(());
+    until(
+        "membership settles once node 3 applies nodes/6",
+        Duration::from_secs(10),
+        || {
+            last = admin::membership_settled(one, rig.rt.handle(), &*rig.store, &[ADDED], within);
+            last.is_ok()
+        },
+    );
+}
+
+/// #80 S4 T11b, the mixed-version guard: five nodes run, node 6 is added (pinned by nothing,
+/// named in `unreachable_ok` since it never starts), every running node applies `nodes/6`, and
+/// node 4 stops. `admin::remove_member`
+/// of node 6, its fresh status requests answered within 500 ms, is refused naming live member
+/// 4 ("has sent no status since its boot", "500ms") and writes nothing: a member that has not
+/// answered at this build's protocol version may run a build that cannot read a removed
+/// record. With node 4 also named in `unreachable_ok`, the same call writes `nodes/6` removed.
+/// Integration (five node processes).
+///
+/// Cut: `membership_settled` takes an unanswered request as current, so the first remove
+/// writes ("node 4's silence refuses the remove"), red, observed 2026-11-21.
+#[config_log::retcd_test]
+fn s80s4_a_remove_is_refused_while_a_live_member_has_sent_no_status_since_its_boot() {
+    const STOPPED: NodeId = NodeId(4);
+    let within = Duration::from_millis(500);
+    let (mut rig, _six) = five_ready();
+    rig.rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("node 6 is added");
+    let six = node_revision(&rig, ADDED);
+    for n in 1..=5 {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} applies nodes/6"),
+            Duration::from_secs(10),
+            || net.members_revision() >= six,
+        );
+    }
+    rig.procs
+        .iter_mut()
+        .find(|proc| proc.node == STOPPED)
+        .expect("node 4 runs")
+        .db
+        .shutdown();
+    let before = node_revision(&rig, ADDED);
+    let one = &rig.of(NodeId(1)).db;
+    let answer = admin::remove_member(one, rig.rt.handle(), &rig.store, ADDED, &[ADDED], within);
+    let why = match answer {
+        Err(admin::RemoveNodeError::Refused(why)) => why,
+        other => panic!("node 4's silence refuses the remove, not {other:?}"),
+    };
+    assert!(
+        why.contains("live member 4 has sent no status since its boot") && why.contains("500ms"),
+        "{why}"
+    );
+    assert_eq!(node_revision(&rig, ADDED), before, "nothing is written");
+
+    let removed = admin::remove_member(
+        one,
+        rig.rt.handle(),
+        &rig.store,
+        ADDED,
+        &[ADDED, STOPPED],
+        within,
+    )
+    .expect("node 6 is removed with node 4 named unreachable");
+    assert_eq!(removed.node, ADDED);
+    let found = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Node(ADDED).encode()),
+        }))
+        .expect("a read")
+        .record
+        .expect("nodes/6");
+    assert!(
+        rdb_core::authority::node::NodeRecord::decode_removed(&found.value).is_some(),
+        "nodes/6 is layout 3"
+    );
+}
