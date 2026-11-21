@@ -2129,6 +2129,9 @@ pub(crate) struct HealCtx {
     /// first look, kept across [`heal_retrying`]'s attempts. A copy with no grant record may be
     /// left out once one full window (`within`) has passed since.
     pub(crate) links_since: Arc<std::sync::OnceLock<tokio::time::Instant>>,
+    /// `Timeouts::live_readd` of this open (R5, PR #181 ruling A): without it the heal waits
+    /// for every copy ([`may_leave_out`]).
+    pub(crate) live_readd: bool,
     /// What the heal waits for now, in words, for `wait_ready`'s time-out to name (R5): set by
     /// [`heal_retrying`] when an attempt ends waiting for links.
     pub(crate) waiting: Arc<std::sync::Mutex<Option<String>>>,
@@ -2234,8 +2237,8 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         |plan| plan.0,
     );
     for ((_, partition, events), was) in planned.into_iter().zip(&pinned) {
-        // R5: each copy the heal went on without is left out at the boot its grant names, as a
-        // drop records it, so it is re-added once it starts at a newer boot.
+        // R5: each copy the heal went on without is left out at `UNLINKED_BOOT`: no record
+        // proves the boot it runs now, so its first link is a live return (#107).
         let left_here: Vec<Member> = was
             .iter()
             .filter_map(|member| {
@@ -2606,7 +2609,7 @@ fn pinned_of(partition: PartitionId, body: &[u8]) -> Result<Option<Vec<RecordMem
 }
 
 /// What [`member_boots`] settled: each member at its boot, and the down copies the heal goes on
-/// without (R5), each with the boot its grant names.
+/// without (R5), each at [`UNLINKED_BOOT`].
 struct Boots {
     members: Vec<Member>,
     left: Vec<(NodeId, BootId)>,
@@ -2714,7 +2717,7 @@ async fn member_boots(
 }
 
 /// R5: may the reopen's heal go on without the regular copies on `missing`, whose nodes have
-/// no link yet? `Ok` with each such node, the boot its grant names and the evidence, or `Err`
+/// no link yet? `Ok` with each such node, at [`UNLINKED_BOOT`], and the evidence, or `Err`
 /// with the `heal_wait_all` reason. Logs `heal_proceed_without` for each partition it leaves a
 /// copy out of.
 ///
@@ -2728,7 +2731,8 @@ async fn member_boots(
 /// folder's last ready open ran under the OS boot running now.
 ///
 /// It goes on only when all of these hold:
-/// - the OS did not reboot: `os_boot_changed`, `os_boot_unknown` or `unsupported_platform`;
+/// - [`may_leave_out`]: the OS did not reboot (`os_boot_changed`, `os_boot_unknown` or
+///   `unsupported_platform`), and `Timeouts::live_readd` is on (`live_readd_off`);
 /// - no partition still to form pins the copy: `partition_forming` (nothing written there, and
 ///   its formation pins every placed member);
 /// - each partition that pins a missing copy has a majority of its non-shadow members, the
@@ -2746,7 +2750,7 @@ async fn leave_out(
     missing: &[u32],
     window_passed: bool,
 ) -> Result<Vec<(NodeId, BootId, &'static str)>, &'static str> {
-    if let Some(reason) = ctx.os_boot.wait_reason() {
+    if let Some(reason) = may_leave_out(ctx.os_boot, ctx.live_readd) {
         return Err(reason);
     }
     let is_missing = |member: &RecordMember| missing.contains(&member.node.0);
@@ -2785,8 +2789,8 @@ async fn leave_out(
     }
     let mut down = Vec::with_capacity(missing.len());
     for node in missing {
-        let (evidence, boot) = copy_down(ctx, NodeId(*node), window_passed).await?;
-        down.push((NodeId(*node), boot, evidence));
+        let evidence = copy_down(ctx, NodeId(*node), window_passed).await?;
+        down.push((NodeId(*node), UNLINKED_BOOT, evidence));
     }
     for (partition, gone, present, majority) in short {
         let evidence: Vec<&str> = down
@@ -2808,13 +2812,34 @@ async fn leave_out(
     Ok(down)
 }
 
+/// R5 (PR #181 ruling A): whether the reopen's heal may go on without a down copy at all, or
+/// the `heal_wait_all` reason it waits for every copy. Every leave-out path asks this one
+/// function, so a change of policy (live re-add on by default, say) is an edit here.
+///
+/// - The OS rebooted, or that is not known: the owner's unsynced WAL tail may be gone, so the
+///   down copy may hold acknowledged writes no other copy has ([`OsBoot::wait_reason`]).
+/// - `Timeouts::live_readd` is off: `live_readd_off`. A left-out copy is noted at
+///   [`UNLINKED_BOOT`], since no record proves the boot it runs now: a frozen or expired grant
+///   can name an older process of a node that already runs again. Its first link is then a
+///   live return, which only #107's live re-add takes back; without it the copy would stay
+///   out until it restarted once more.
+const fn may_leave_out(os_boot: OsBoot, live_readd: bool) -> Option<&'static str> {
+    if let Some(reason) = os_boot.wait_reason() {
+        return Some(reason);
+    }
+    if live_readd {
+        None
+    } else {
+        Some("live_readd_off")
+    }
+}
+
 /// R5 (lead ruling (a)): what a copy with no `grants/{C}` record proves. Only an owner takes a
 /// grant, and only a node's own next process deletes one, so a copy that never owned a
 /// partition has none while it is alive. Nothing is proven before the heal's first full window
 /// has passed, counted from when it began to wait for links: it waits, `no_grant_record`. After
-/// it the copy is left out, `no_grant_after_window`, at [`UNLINKED_BOOT`]: the owner records the
-/// first boot it sees for it (`Host::restore_left_out`), so a copy still alive at that boot can
-/// come back by #107's live re-add, and one that restarts by the restart path.
+/// it the copy is left out, `no_grant_after_window`, at [`UNLINKED_BOOT`], as every copy the
+/// heal leaves out is ([`may_leave_out`]).
 ///
 /// Why leaving out a copy that may be alive loses nothing (same OS boot, checked before this):
 /// - the owner's WAL holds every write it acknowledged, its unsynced tail included;
@@ -2824,22 +2849,24 @@ async fn leave_out(
 ///   keeps renewing.
 ///
 /// The cost is availability only: the partition runs on fewer copies until it is back.
-const fn no_grant_record(window_passed: bool) -> Result<(&'static str, BootId), &'static str> {
+const fn no_grant_record(window_passed: bool) -> Result<&'static str, &'static str> {
     if window_passed {
-        Ok(("no_grant_after_window", UNLINKED_BOOT))
+        Ok("no_grant_after_window")
     } else {
         Err("no_grant_record")
     }
 }
 
 /// R5: whether the copy on `node` is proven down: its `grants/{node}` frozen (`grant_frozen`),
-/// or its expiry proven past on this node's clock (`grant_expired`), with the boot the record
-/// names. Read only: nothing is cleared, unlike [`judge`]. `Err` is a [`leave_out`] reason.
+/// or its expiry proven past on this node's clock (`grant_expired`). The boot the record names
+/// is not used: a frozen or expired record can outlive the process it names while a newer one
+/// of the same node runs (PR #181 review). Read only: nothing is cleared, unlike [`judge`].
+/// `Err` is a [`leave_out`] reason.
 async fn copy_down(
     ctx: &HealCtx,
     node: NodeId,
     window_passed: bool,
-) -> Result<(&'static str, BootId), &'static str> {
+) -> Result<&'static str, &'static str> {
     const NOT_PROVEN: &str = "copy_not_proven_down";
     let key = ControlKey::Grant(node).encode();
     let read = match ctx
@@ -2867,7 +2894,7 @@ async fn copy_down(
         return Err(NOT_PROVEN);
     };
     if record.frozen {
-        return Ok(("grant_frozen", record.boot));
+        return Ok("grant_frozen");
     }
     let now = ctx.clock.now();
     let sample = ctx.clock.sample(now, &ctx.budgets);
@@ -2877,7 +2904,7 @@ async fn copy_down(
     let mut clock = ClockView::new();
     clock.accept(sample);
     if expiry_proven(&clock, record.expiry_utc_ms, now, &ctx.budgets).is_some() {
-        Ok(("grant_expired", record.boot))
+        Ok("grant_expired")
     } else {
         Err(NOT_PROVEN)
     }
@@ -5373,6 +5400,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            live_readd: false,
             waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
@@ -6160,6 +6188,7 @@ mod tests {
             let ctx = HealCtx {
                 os_boot: crate::os_boot::OsBoot::Unknown,
                 links_since: Default::default(),
+                live_readd: false,
                 waiting: Default::default(),
                 partition_count: 2,
                 nodes: crate::db::ALL_NODES.into(),
@@ -7577,6 +7606,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            live_readd: false,
             waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
@@ -8019,6 +8049,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            live_readd: false,
             waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
@@ -8919,6 +8950,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot: crate::os_boot::OsBoot::Unknown,
             links_since: Default::default(),
+            live_readd: false,
             waiting: Default::default(),
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
@@ -8996,12 +9028,17 @@ mod tests {
         clock: HostClock,
         within: Duration,
     ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
-        r5_heal_by(false, os_boot, owner_node, boot_of, grants, clock, within)
+        r5_heal_by(
+            false, true, os_boot, owner_node, boot_of, grants, clock, within,
+        )
     }
 
-    /// [`r5_heal`], through [`heal_retrying`] when `retrying`, as an open runs it.
+    /// [`r5_heal`], through [`heal_retrying`] when `retrying`, as an open runs it, with
+    /// `Timeouts::live_readd` at `live_readd` ([`r5_heal`] has it on).
+    #[allow(clippy::too_many_arguments)]
     fn r5_heal_by(
         retrying: bool,
+        live_readd: bool,
         os_boot: OsBoot,
         owner_node: NodeId,
         boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
@@ -9013,6 +9050,7 @@ mod tests {
             Arc::new(config_testkit::MemStore::new()),
             Arc::default(),
             retrying,
+            live_readd,
             os_boot,
             owner_node,
             boot_of,
@@ -9030,6 +9068,7 @@ mod tests {
         store: Arc<dyn ConfigStore>,
         waiting: Arc<std::sync::Mutex<Option<String>>>,
         retrying: bool,
+        live_readd: bool,
         os_boot: OsBoot,
         owner_node: NodeId,
         boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
@@ -9052,6 +9091,7 @@ mod tests {
         let ctx = HealCtx {
             os_boot,
             links_since: Default::default(),
+            live_readd,
             waiting,
             partition_count: 1,
             nodes: crate::db::ALL_NODES.into(),
@@ -9114,11 +9154,13 @@ mod tests {
         })
     }
 
-    /// R5 rows 2 and (frozen) evidence: same OS boot, node 3 (a regular copy) has no boot and
-    /// its grant is proven expired, or frozen; nodes 1 and 2 are a majority. The heal does not
-    /// wait: the plan pins nodes 1 and 2 only, and before it a `HealLeftOut` names node 3 at the
-    /// boot its grant names, a regular copy. Unit (~100 ms each). Cut: `member_boots` never asks
-    /// `leave_out`: `PeersUnknown` after the budget, red.
+    /// R5 rows 2 and (frozen) evidence: same OS boot, `live_readd` on, node 3 (a regular copy)
+    /// has no boot and its grant is proven expired, or frozen; nodes 1 and 2 are a majority. The
+    /// heal does not wait: the plan pins nodes 1 and 2 only, and before it a `HealLeftOut` names
+    /// node 3 at `UNLINKED_BOOT`, not the boot its grant names, a regular copy (PR #181 ruling
+    /// A: that record may name an older process of a node that already runs again). Unit (~100 ms
+    /// each). Cuts: `member_boots` never asks `leave_out`: `PeersUnknown` after the budget, red;
+    /// `leave_out` notes the boot the grant names: red at the `UNLINKED_BOOT` assert.
     #[test]
     fn r5_b_same_os_boot_leaves_out_a_copy_proven_down() {
         let far = utc_now() + 3_600_000;
@@ -9141,7 +9183,10 @@ mod tests {
             assert_eq!(at, 0, "noted before the plan");
             assert_eq!(left.len(), 1, "{left:?}");
             assert_eq!(left[0].node, NodeId(3));
-            assert_eq!(left[0].boot, C_BOOT, "at the boot its grant names");
+            assert_eq!(
+                left[0].boot, UNLINKED_BOOT,
+                "frozen {frozen}: not at the boot its grant names"
+            );
             assert_eq!(left[0].role, ReplicaRole::RegularSecondary);
         }
     }
@@ -9320,6 +9365,7 @@ mod tests {
         let window = Duration::from_millis(800);
         let (healed, sent, took) = r5_heal_by(
             true,
+            true,
             OsBoot::Same,
             OWNER,
             r5_up_but(&[3]),
@@ -9366,5 +9412,75 @@ mod tests {
             other => panic!("the owner check refuses: {other:?}"),
         }
         assert!(sent.is_empty(), "{} sent", sent.len());
+    }
+
+    // ---- PR #181 review round 1 ----
+
+    /// This test's lines named `message`.
+    fn r5_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .collect()
+    }
+
+    /// The `heal_wait_all` reasons this test logged, in order.
+    fn r5_wait_reasons(method: &str) -> Vec<String> {
+        r5_lines(method, "heal_wait_all")
+            .iter()
+            .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// PR #181 review, blocker 1 (ruling A): with `Timeouts::live_readd` off, the heal leaves no
+    /// copy out, whatever its grant: expired, frozen (a record that may name an older process of
+    /// a node already running again), or absent. It waits, `live_readd_off`, and when node 3
+    /// starts late the plan pins it at its boot, nothing left out. Each attempt that waited logs
+    /// `heal_wait_all` once (once per attempt, review): as many as `heal_retry`. Unit (~2 s per
+    /// case). Cut: `may_leave_out` ignores `live_readd`: node 3 is planned out, red.
+    #[config_log::retcd_test]
+    fn r5_o_with_live_readd_off_the_heal_waits_and_a_late_start_is_pinned() {
+        const METHOD: &str = "r5_o_with_live_readd_off_the_heal_waits_and_a_late_start_is_pinned";
+        let far = utc_now() + 3_600_000;
+        let cases: [(&str, Vec<GrantRecord>); 3] = [
+            ("expired", vec![r5_grant(3, 0, false)]),
+            ("frozen", vec![r5_grant(3, far, true)]),
+            ("absent", Vec::new()),
+        ];
+        for (case, grants) in cases {
+            let started = std::time::Instant::now();
+            let late: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+                (node != NodeId(3) || started.elapsed() >= Duration::from_millis(1_200))
+                    .then_some(OPEN_2)
+            });
+            let (healed, sent, _) = r5_heal_by(
+                true,
+                false,
+                OsBoot::Same,
+                OWNER,
+                late,
+                &grants,
+                HostClock::start(),
+                Duration::from_millis(300),
+            );
+            healed.unwrap_or_else(|e| panic!("{case}: the heal ends once node 3 starts: {e}"));
+            assert_eq!(
+                r5_planned(&sent),
+                [(1, OPEN_2), (2, OPEN_2), (3, OPEN_2)],
+                "{case}: node 3 is pinned at its boot"
+            );
+            assert!(r5_left_out(&sent).is_none(), "{case}: nothing is left out");
+        }
+        let reasons = r5_wait_reasons(METHOD);
+        assert!(
+            !reasons.is_empty() && reasons.iter().all(|reason| reason == "live_readd_off"),
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons.len(),
+            r5_lines(METHOD, "heal_retry").len(),
+            "one heal_wait_all per attempt that waited"
+        );
+        assert!(r5_lines(METHOD, "heal_proceed_without").is_empty());
     }
 }

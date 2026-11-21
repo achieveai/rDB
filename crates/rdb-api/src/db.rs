@@ -2015,7 +2015,15 @@ impl Db {
                 // The owner's process heals (arch-s2 B1): this one only runs its copy.
                 tracing::info!(owner = found.owner.0, "db_open_not_owner");
             } else {
-                db.start_heal(&store, &rt, budgets, boot, heals, &config.local)?;
+                db.start_heal(
+                    &store,
+                    &rt,
+                    budgets,
+                    boot,
+                    heals,
+                    &config.local,
+                    config.timeouts.live_readd,
+                )?;
             }
         }
         db.unwind = None;
@@ -2567,6 +2575,7 @@ impl Db {
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
     /// logs how many had started.
+    #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -2575,6 +2584,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        live_readd: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
             let nodes = lock(&self.nodes);
@@ -2624,6 +2634,7 @@ impl Db {
                 bootstrap,
                 os_boot: self.opened.os_boot,
                 links_since: Default::default(),
+                live_readd,
                 waiting: Arc::clone(&self.opened.heal_waiting),
             });
         }

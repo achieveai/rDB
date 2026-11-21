@@ -2726,6 +2726,14 @@ fn same_os_boot(rig: &Rig, node: NodeId, id: &str) {
     crate::os_boot::inject(dir, Ok(id));
 }
 
+/// R5 (PR #181 ruling A): the heal leaves a copy out only with `Timeouts::live_readd` on.
+fn live_readd_on() -> Timeouts {
+    Timeouts {
+        live_readd: true,
+        ..Timeouts::default()
+    }
+}
+
 /// The heal-decision lines of this row's own log: `heal_proceed_without`, `heal_wait_all` and
 /// `heal_peers_unknown`.
 fn heal_decisions(method: &str) -> Vec<serde_json::Value> {
@@ -2754,7 +2762,7 @@ fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
     same_os_boot(&rig, R5_OWNER, "os-boot-a");
     rig.stop(copy);
     rig.stop(R5_OWNER);
-    rig.restart(R5_OWNER, Timeouts::default());
+    rig.restart(R5_OWNER, live_readd_on());
     rig.of(R5_OWNER)
         .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
         .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
@@ -2798,21 +2806,19 @@ fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
 }
 
 /// R5 row 4 (b): after row 1's heal went on without copy `C`, `C` starts again at a newer
-/// boot. Owner node 2 re-adds it through the left-out path, the boot the heal noted (its
-/// grant's) being older: `partitions/{p}` pins `C` again, the record still names node 2 as
-/// owner, `C`'s process leads none of them, and the values read back. Integration (~45 s).
-/// Node 2's new net never saw `C`'s old boot, so `C`'s start posts it no `PeerBooted`; the
-/// host's `readd_heal_noted` starts the re-plan instead. Cuts: the host ignores
-/// `Msg::HealLeftOut`: `restore_left_out` records `C` at its new live boot, so it waits for yet
-/// another restart (`copy_left_out_until_restart`), red at the pins; no `readd_heal_noted` in
-/// the drop duty: nothing re-plans, red at the pins (red before it was written, 2026-11-20).
+/// boot. Owner node 2 re-adds it: `partitions/{p}` pins `C` again, the record still names
+/// node 2 as owner, `C`'s process leads none of them, and the values read back. Integration
+/// (~45 s). The heal noted `C` at `UNLINKED_BOOT` (PR #181 ruling A), so its first link is a
+/// #107 live return, taken back by `live_readd_duty`. Cut: the host ignores
+/// `Msg::HealLeftOut`: no clocked return, and `restore_left_out` records `C` at its new live
+/// boot, so it waits for yet another restart (`copy_left_out_until_restart`), red at the pins.
 #[config_log::retcd_test]
 fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
     let (mut rig, owned, copy) = r5_scene();
     same_os_boot(&rig, R5_OWNER, "os-boot-a");
     rig.stop(copy);
     rig.stop(R5_OWNER);
-    rig.restart(R5_OWNER, Timeouts::default());
+    rig.restart(R5_OWNER, live_readd_on());
     rig.of(R5_OWNER)
         .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
         .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
@@ -2827,7 +2833,7 @@ fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
             copy.0
         );
     }
-    rig.restart(copy, Timeouts::default());
+    rig.restart(copy, live_readd_on());
     for (partition, group) in &shared {
         pins_until(
             &rig,
