@@ -1030,3 +1030,156 @@ fn s80s4_a_re_add_racing_a_remove_does_not_pin_the_removed_node() {
         "s80s4_readd_race_done"
     );
 }
+
+/// Writes `node`'s `nodes/` record removed with a CAS, as [`admin::remove_node`] does but with
+/// none of its checks: the record a remove writes after a late commit pinned the node again
+/// (the plan-to-CAS window M5b leaves open).
+fn write_removed(rig: &Rig, node: NodeId) {
+    use rdb_core::authority::node::NodeRecord;
+    let key = ControlKey::Node(node).encode();
+    let found = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        }))
+        .expect("the store answers")
+        .record
+        .unwrap_or_else(|| panic!("{key} exists"));
+    let (record, app) = NodeRecord::decode_with_app(&found.value).expect("a node record");
+    let written = rig
+        .rt
+        .block_on(rig.store.put(config_core::PutRequest {
+            key: Bytes::from(key.clone()),
+            value: record.encode_removed(app.as_deref()),
+            expected_mod_revision: Some(found.mod_revision),
+            dedup: None,
+        }))
+        .expect("the store answers");
+    assert_eq!(
+        written.outcome,
+        config_core::MutationOutcome::Applied,
+        "{key} written removed"
+    );
+    tracing::info!(
+        node = node.0,
+        revision = written.revision,
+        "s80s4_removed_while_pinned"
+    );
+}
+
+/// #80 S4 (S-2 follow-up to M5b): a removed node that a late commit still pins heals by itself.
+/// Node X is killed and restarted, so it is pinned regular again in every partition its ring
+/// seat names and owns none. Its `nodes/` record is then written removed directly, which is
+/// where `admin::remove_node` leaves a node when a re-plan committed between its check and its
+/// CAS (`remove_node_still_pinned`). Every live `Net` retires X and closes its links, so each
+/// owner counts X unreachable and its existing unreachable clock drops it: within
+/// `Timeouts::unreachable_drop_after` (scaled, plus the re-plan) no `partitions/` record pins X.
+/// X stays out for five more drop checks ([`crate::host::DROP_CHECK_EVERY_MILLIS`]), since
+/// `Host::pinnable` refuses to pin it again; and a put to each of those partitions keeps
+/// landing. Writes pause until the drop, within the same 15 s bound as a lost host (ADR-0025):
+/// each put lands within the S3 acceptance bound (`OutageBound::acceptance`, scaled). Observed
+/// heal 10.8 s and slowest put 4.6-10.8 s, at the default 10 s clocks.
+/// Integration (~35 s).
+/// Cut: `Host::drop_duty` runs no drop clock for a partition that pins a node outside its
+/// `Net`'s members: "partition 1: a put lands while node 1 is removed: .. ProtectionPaused ..",
+/// red, observed 2026-11-21 at load 31-33. Skipping only the unreachable clock is no cut: the
+/// paused clock drops the copy as well, and it also breaks [`after_loss`].
+#[config_log::retcd_test]
+fn s80s4_a_removed_node_still_pinned_is_dropped_by_the_unreachable_clock() {
+    const TEST: &str = "s80s4_a_removed_node_still_pinned_is_dropped_by_the_unreachable_clock";
+    let timeouts = probe_timeouts();
+    let mut lost = lose_one(Loss::Kill, timeouts, Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let dead = lost.dead;
+    lost.rig.restart(dead, timeouts);
+    lost.rig
+        .of(dead)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .unwrap_or_else(|e| panic!("node {} is ready again: {e}", dead.0));
+    let seats: Vec<u32> = (1..=S1B_P)
+        .filter(|p| ring(S1B_K, *p).copies.contains(&dead.0))
+        .collect();
+    for p in &seats {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+        while pinned_roles(&lost.rig, *p).get(&dead.0) != Some(&ReplicaRole::RegularSecondary) {
+            assert!(
+                Instant::now() < deadline,
+                "partition {p} never pins node {} regular again: {:?}",
+                dead.0,
+                pinned_roles(&lost.rig, *p)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_ne!(
+            token_of(&lost.rig, *p).1,
+            dead,
+            "partition {p} did not fail back"
+        );
+    }
+    write_removed(&lost.rig, dead);
+    let removed_at = Instant::now();
+    let writer = lost.rig.of(survivor(&lost));
+    let (acceptance, _) =
+        write_outage_bound(&fast(), &timeouts, &Failover::default(), timeouts.put).acceptance();
+    let put_patience = crate::host::test_patience(acceptance);
+    let mut slowest = Duration::ZERO;
+    let put_all = |slowest: &mut Duration| {
+        for p in &seats {
+            let started = Instant::now();
+            put_within(writer, lost.groups[p], put_patience).unwrap_or_else(|e| {
+                panic!(
+                    "partition {p}: a put lands while node {} is removed: {e}",
+                    dead.0
+                )
+            });
+            *slowest = (*slowest).max(started.elapsed());
+        }
+    };
+    let healed =
+        crate::host::test_patience(timeouts.unreachable_drop_after + Duration::from_secs(10));
+    loop {
+        put_all(&mut slowest);
+        let pinning: Vec<u32> = seats
+            .iter()
+            .copied()
+            .filter(|p| pinned_roles(&lost.rig, *p).contains_key(&dead.0))
+            .collect();
+        if pinning.is_empty() {
+            break;
+        }
+        assert!(
+            removed_at.elapsed() < healed,
+            "partitions {pinning:?} still pin removed node {} after {healed:?}",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let heal_ms = ms(removed_at.elapsed());
+    let watch = Instant::now() + Duration::from_millis(5 * crate::host::DROP_CHECK_EVERY_MILLIS);
+    loop {
+        for p in 1..=S1B_P {
+            let roles = pinned_roles(&lost.rig, p);
+            assert!(
+                !roles.contains_key(&dead.0),
+                "partitions/{p} pins removed node {} again: {roles:?}",
+                dead.0
+            );
+        }
+        put_all(&mut slowest);
+        if Instant::now() >= watch {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        slowest <= put_patience,
+        "the slowest put took {slowest:?}, over the lost-host bound {put_patience:?}"
+    );
+    tracing::info!(
+        node = dead.0,
+        heal_ms,
+        slowest_put_ms = ms(slowest),
+        seats = ?seats,
+        "s80s4_removed_pin_healed"
+    );
+}
