@@ -3258,6 +3258,87 @@ fn r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_
     left_nothing_out(METHOD, from);
 }
 
+/// PR #181 review round 3, blocker 4: copy `C`'s grant has expired and names its old boot
+/// `b1`, while `C` already runs again at a new boot `b2` and its own heal is blocked, so that
+/// grant is never cleared. `C`'s heal waits for node `D`, which `C`'s partitions pin and node
+/// 2's do not, kept down (live re-add off, the default, on every node). Node 2 reopens under
+/// the same OS boot with live re-add off while `C` is down, waits past the grant's expiry, and
+/// is not ready; `C` then starts at `b2`. Node 2's heal pins it: node 2 is ready, each shared
+/// partition pins every placed copy with `C` regular, reads back and takes a put, nothing is
+/// left out and `C` is never restarted. At the end `grants/C` still names `b1` and `C`'s heal
+/// still runs. Integration (~60 s).
+/// Cut: `may_leave_out` ignores `live_readd`: node 2 leaves `C` out on its expired grant and is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned() {
+    const METHOD: &str =
+        "r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned";
+    let (mut rig, owned, copy) = r5_scene();
+    let copy_owns: Vec<u32> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == copy.0)
+        .collect();
+    assert!(!copy_owns.is_empty(), "node {} owns a partition", copy.0);
+    let blocker = (1..=S1B_K)
+        .map(NodeId)
+        .find(|node| {
+            *node != R5_OWNER
+                && *node != copy
+                && copy_owns
+                    .iter()
+                    .any(|p| ring(S1B_K, *p).copies.contains(&node.0))
+                && owned
+                    .iter()
+                    .all(|(p, _)| !ring(S1B_K, *p).copies.contains(&node.0))
+        })
+        .expect("a node in C's partitions and in none of node 2's");
+    let b1 = grant_of(&rig, copy)
+        .expect("node {copy} holds a grant: it owns a partition")
+        .boot;
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    let from = log_mark(METHOD);
+    rig.stop(blocker);
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    // Past C's grant: its expiry, the clock margins and a second more.
+    let budgets = fast();
+    let expiry = grant_of(&rig, copy).expect("grants/C is kept").expiry_utc_ms;
+    let past = expiry
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("margins fit")
+        + 1_000;
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("now fits")
+    };
+    let wait = Duration::from_millis(u64::try_from((past - now_ms()).max(1_000)).expect("ms"));
+    let waited = rig.of(R5_OWNER).wait_ready(wait);
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} past its grant: {waited:?}",
+        copy.0
+    );
+    assert!(now_ms() > past, "C's grant has expired");
+    rig.restart(copy, Timeouts::default());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} links: {e}", copy.0));
+    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    left_nothing_out(METHOD, from);
+    let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
+    assert_eq!(kept.boot, b1, "grants/C still names the old boot");
+    assert!(
+        matches!(rig.of(copy).heal_state(), HealState::Running),
+        "C's own heal is still blocked: {:?}",
+        rig.of(copy).heal_state()
+    );
+}
+
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
 fn pinned_nodes(rig: &Rig, partition: u32) -> BTreeSet<u32> {
     let read = rig
