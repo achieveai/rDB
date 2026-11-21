@@ -6331,3 +6331,93 @@ fn t61_empty_owner_with_every_copy_below_floor_refuses_open() {
         other => panic!("Stale: {other:?}"),
     }
 }
+
+/// Issue #61 S3: open with `history_keep` and `history_budget_bytes` set, check the open hands
+/// them to the restart path (`Respawn::retention`), write six records, and wait until every copy's
+/// retention duty has trimmed (`history_floor` above 0). Answers the floors. With the spec's
+/// defaults (30 min, 20 GiB) no copy trims in the row's patience, so a floor above 0 is the
+/// setting reaching each host.
+/// Cuts on both rows: the open's `Respawn` given the defaults, red (the restart path's retention
+/// differs); the open's `spawn_on` given the defaults, red (no copy trims).
+fn trimmed_by_settings(method: &str, keep: Option<Duration>, budget: Option<u64>) -> Vec<u64> {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let config = DbConfig {
+        history_keep: keep,
+        history_budget_bytes: budget,
+        ..config(dir.path())
+    };
+    let expected = history_retention(&config);
+    let mut db = rt
+        .block_on(Db::open_with(
+            config,
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    assert_eq!(
+        db.respawn.as_ref().map(|respawn| respawn.retention),
+        Some(expected),
+        "a restarted node keeps the open's retention"
+    );
+    db.wait_ready(patience).expect("the fresh open is ready");
+    for n in 1..=6 {
+        put_through_pauses(&db, format!("k{n}").as_bytes(), b"v", "a write");
+    }
+    let floors = |db: &Db| -> Vec<u64> {
+        db.node_status()
+            .iter()
+            .map(|status| status.lengths.map_or(0, |lengths| lengths.history_floor))
+            .collect()
+    };
+    let deadline = Instant::now() + patience;
+    while floors(&db).contains(&0) {
+        assert!(
+            Instant::now() < deadline,
+            "every copy's duty trims: {:?}",
+            floors(&db)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let trimmed = config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "host_history_trimmed")
+        .count();
+    assert!(trimmed >= 3, "each node logged its trim: {trimmed}");
+    let floors = floors(&db);
+    db.shutdown();
+    floors
+}
+
+/// Issue #61 S3: `DbConfig::history_keep` reaches every host. Keep 0 and the default budget:
+/// each copy's duty trims to what every copy has acknowledged.
+/// Cut: `history_retention` ignores `history_keep`, red (no copy trims, and the restart path's
+/// retention differs).
+/// Integration (~2-4 s): one open.
+#[config_log::retcd_test]
+fn t61_s3_db_config_history_keep_reaches_every_host() {
+    let floors = trimmed_by_settings(
+        "t61_s3_db_config_history_keep_reaches_every_host",
+        Some(Duration::ZERO),
+        None,
+    );
+    assert!(floors.iter().all(|floor| *floor > 0), "{floors:?}");
+}
+
+/// Issue #61 S3: `DbConfig::history_budget_bytes` reaches every host. The default keep (30 min)
+/// and a 1-byte budget: the cap trims each copy although the keep window holds everything.
+/// Cut: `history_retention` ignores `history_budget_bytes`, red (no copy trims, and the
+/// restart path's retention differs).
+/// Integration (~2-4 s): one open.
+#[config_log::retcd_test]
+fn t61_s3_db_config_history_budget_bytes_reaches_every_host() {
+    let floors = trimmed_by_settings(
+        "t61_s3_db_config_history_budget_bytes_reaches_every_host",
+        None,
+        Some(1),
+    );
+    assert!(floors.iter().all(|floor| *floor > 0), "{floors:?}");
+}
