@@ -1861,3 +1861,75 @@ fn f87_2_r2_a_malformed_first_history_key_faults_the_node_typed() {
         );
     }
 }
+
+/// Review r4 (blocker; threads 4647111500, 4654680328): a put admitted at the owner and still
+/// pending when a feed read faults the owner on damaged history hears the owner-fault step:
+/// ask `Db::status` with the same request id, never a new id, and nothing about writing over
+/// a damaged entry (`CORRUPT_HISTORY`'s own step), which is the node's damage, not the app's.
+/// Nodes 2 and 3 are cut off from node 1, so the put applies and cannot publish; the app hears
+/// the fault over the links.
+/// Cut: `ApiError::next_step` giving the owner-fault step only to `NotWired` host faults, red
+/// ("write over its key").
+/// Integration (~6 s): processes, one pending put.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn f87_3_a_put_pending_when_feed_damage_faults_the_owner_asks_its_status() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let app_dir = config_testkit::fs::temp_dir();
+    let procs = procs(&rt, dir.path(), app_dir.path(), &store, fast());
+    let owner = &procs.nodes[0];
+    let k1 = procs.app.put(b"k1", b"one", None).expect("k1");
+    procs
+        .app
+        .wait_durable(DEFAULT_GROUP, (k1.generation, k1.seq), patience())
+        .expect("k1 on every disk");
+    procs.links.hold(NodeId(1), NodeId(2));
+    procs.links.hold(NodeId(1), NodeId(3));
+
+    let put = std::thread::scope(|scope| {
+        let pending = scope.spawn(|| procs.app.put(b"k2", b"two", None));
+        let deadline = Instant::now() + crate::host::test_patience(patience());
+        while !owner
+            .node_status()
+            .iter()
+            .any(|status| status.node == NodeId(1) && status.in_flight.is_some())
+        {
+            assert!(Instant::now() < deadline, "k2 never applied at node 1");
+            assert!(!pending.is_finished(), "k2 answered before it applied");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        owner
+            .damage_record_as(
+                NodeId(1),
+                k1.generation,
+                Namespace::History,
+                &k1.seq.0.to_be_bytes(),
+                rdb_storage::RecordDamage::LastByte,
+            )
+            .expect("damaged");
+        let read = owner
+            .changes(PARTITION, FeedCursor::START, 10, Source::Owner)
+            .expect_err("damaged history faults node 1");
+        assert_eq!(read.kind, ErrorKind::CorruptHistory, "{read:?}");
+        pending.join().expect("the put thread")
+    });
+    let refused = put.expect_err("k2 hears node 1's fault");
+    assert!(refused.request.is_some(), "k2 was sent: {refused:?}");
+    let error = refused.error;
+    let text = error.explain();
+    assert!(error.is_host_fault(), "{error:?}");
+    assert!(!error.no_mutation, "k2 applied, so it may have: {error:?}");
+    assert!(text.contains("does not match its digest"), "{text}");
+    assert!(
+        text.contains("ask `Db::status` with its request id"),
+        "{text}"
+    );
+    assert!(
+        text.contains("never send it under a new request id"),
+        "{text}"
+    );
+    assert!(!text.contains("write over"), "{text}");
+    drop(procs.nodes);
+}

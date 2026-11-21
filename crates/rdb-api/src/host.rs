@@ -2773,14 +2773,19 @@ impl Fault {
 
     /// [`Self::error`] for a feed call (#87), which writes nothing, so it claims no mutation.
     /// Stored history damage carries the feed's step, read another copy or rebuild from your
-    /// own source, which suits a cursor and not a put or a get (review r2).
+    /// own source, which suits a cursor and not a put or a get (review r2). A fault that names
+    /// no damage carries the other-copy step (review r4): a feed reads, so another member can
+    /// serve it while this node is faulted. Other damage keeps the owner-fault step.
     fn feed_error(&self) -> ApiError {
         let mut error = self.error();
         error.no_mutation = true;
-        if self.damage == Some(ErrorKind::CorruptHistory)
-            && !error.detail.ends_with(FEED_HISTORY_STEP)
-        {
-            error.detail = format!("{}; next: {FEED_HISTORY_STEP}", error.detail);
+        let step = match self.damage {
+            Some(ErrorKind::CorruptHistory) => Some(FEED_HISTORY_STEP),
+            None => Some(FEED_OTHER_COPY_STEP),
+            Some(_) => None,
+        };
+        if let Some(step) = step.filter(|step| !error.detail.ends_with(step)) {
+            error.detail = format!("{}; next: {step}", error.detail);
         }
         error
     }

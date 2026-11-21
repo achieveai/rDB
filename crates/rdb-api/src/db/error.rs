@@ -24,9 +24,10 @@ pub struct ApiError {
     pub retry_after: Option<Duration>,
 }
 
-/// How the detail of a host fault ([`ApiError::host`]) starts. A `NotWired` error whose detail
-/// starts with it is an owner fault, and gets [`owner_fault_step`]; the other `NotWired`
-/// refusals (admin, an undecodable call) keep `step_for`'s (#134).
+/// How the detail of a host fault ([`ApiError::host`], or the host's typed damage) starts. An
+/// error whose detail starts with it is an owner fault, and gets [`owner_fault_step`] whatever
+/// its kind (#170 review r4); the other `NotWired` refusals (admin, an undecodable call) keep
+/// `step_for`'s (#134).
 const HOST_FAULT: &str = "host fault: ";
 
 /// The tail every "open the folder again" step in `db.rs` ends with ([`super::REOPEN_STEP`] and
@@ -337,6 +338,14 @@ impl ApiError {
         self.retry_after
     }
 
+    /// Whether this is a host fault: the node that answered faulted ([`Self::host`], or a fault
+    /// that names stored damage, whose detail starts the same way). Retrying at that node will
+    /// not help, whatever the kind and retry rule; [`Self::next_step`] says so (#170 review r4).
+    #[must_use]
+    pub fn is_host_fault(&self) -> bool {
+        self.detail.starts_with(HOST_FAULT)
+    }
+
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
     #[must_use]
     pub fn name(&self) -> String {
@@ -382,7 +391,10 @@ impl ApiError {
         {
             return None;
         }
-        if self.retry == RetryRule::NotWired && self.detail.starts_with(HOST_FAULT) {
+        // #170 review r4: every host fault, typed damage included. A damaged node's fault is
+        // not a damaged entry of the caller's (`step_for(CorruptHistory)` says to write over
+        // its key): only a takeover helps, so it gets the owner-fault step whatever its kind.
+        if self.is_host_fault() {
             return Some(owner_fault_step(self.no_mutation));
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))
