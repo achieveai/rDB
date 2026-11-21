@@ -180,16 +180,32 @@ does not test a hang, and it does not test separate machines.
   (`planner_frozen_grant_cleared`). Row R3 shows the in-process case: after a kill and a
   restart, a second kill still fails over every partition.
 
-**Re-run with #171.** <!-- #176 re-run: fill the image commit, the date, the load and the
-cells below, then replace this comment with one verdict sentence. -->
+**Re-run with #171, 2026-11-21: passed.** All 7 steps passed, and every failover passed K1 to
+K5 and J1 to J3. So back-to-back failovers work once a restarted node's frozen grant is
+cleared.
 
-| Step | Owner | Secondary kill | Result |
-|---|---|---|---|
-| failover 3 | _pending_ | _pending_ | _pending_ |
-| failover 1 | _pending_ | _pending_ | _pending_ |
-| failover 5 | _pending_ | _pending_ | _pending_ |
+| Step | Owner | Secondary kill | Promotes after the kill | Frozen grant cleared |
+|---|---|---|---|---|
+| failover 3 | 6.57 s | 10.38 s | 3, at 6.15 to 6.20 s | node 3, 0.65 s after its restart |
+| failover 1 | 7.02 s | 10.43 s | 4, at 6.56 to 6.62 s | node 1, 1.23 s after its restart |
+| failover 5 | 7.22 s | 10.34 s | 5, at 6.53 to 6.60 s | node 5, 0.55 s after its restart |
+| failover 3, with the voter leader | 7.05 s | 10.55 s | 2, at 6.68 to 6.71 s | node 3, 1.35 s after its restart |
 
-Image commit: _pending_. Load: _pending_ at the start, _pending_ at the end.
+- Image `rdb-bf-node:s34b-5524c9d`, built from 5524c9d, which contains #171's f640fd1. Wall
+  time 371 s. Load 2.25 at the start, 2.97 at the end.
+- The two `restart-voter 1` steps passed too. No partition went unwritten for more than 15 s
+  while the voter restarted.
+- Owner and secondary times are the K1 maxima. Promote times are `planner_promoted`, from the
+  kill. The clear is `planner_frozen_grant_cleared`, from the restarted node's new boot. The
+  script restarts the node about 58 s after the kill.
+- **The run 2 failure is gone.** In failover 1, partitions 11 and 1 were promoted to node 3,
+  whose grant had been cleared after failover 3. In failover 5, partitions 3 and 13 were
+  promoted to node 4. `heal_grant_frozen` never appears.
+- There are 4 distinct `planner_frozen_grant_cleared` events, one per failover. A plain grep
+  of the captures counts 26, because the per-step and mid-failover captures repeat the same
+  lines.
+- Evidence: `/data/gb_build_temp_data/tmp/team/t1-multihost/s4a/t6e/` (`d1.txt`, `load.*`,
+  `wall.*`, the `logs-*` captures).
 
 <!-- S4 (membership, dev-s4): the membership rows go here. -->
 

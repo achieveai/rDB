@@ -526,8 +526,9 @@ back, and restarts each one.
 - **Run 2, without #171: failed.** The first kill passed: owner 6.7 s, copy 10.9 s, load 10.8.
   The next two did not. The node restarted after the first kill kept a frozen grant, so its
   copies did not count. Later failovers then stopped as `lone_survivor`. #171 fixes this.
-- **Re-run with #171:** <!-- #176 re-run: one verdict sentence, then owner and copy times and
-  the load. --> _pending_.
+- **Re-run with #171: passed.** All four back-to-back kills passed, and so did two voter
+  restarts. Writes came back within 7.3 s for an owner's partitions and 10.6 s for a copy's.
+  Each restarted node's frozen grant was cleared about 1 s after it restarted. Load was 2 to 3.
 
 <!-- S4 (membership, dev-s4): adding and removing a node goes here, with its limits: layout 3,
 the start check, the N-3 mixed-version rule, the R8-7 ruling, one change at a time. -->
