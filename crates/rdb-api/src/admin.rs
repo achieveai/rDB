@@ -2125,9 +2125,9 @@ pub(crate) struct HealCtx {
     /// Whether the OS rebooted since this folder's last ready open (R5, [`crate::os_boot`]):
     /// only [`OsBoot::Same`] lets the heal go on without a copy that is down.
     pub(crate) os_boot: OsBoot,
-    /// When this heal first began to wait for its members' links (R5): its first attempt's
-    /// first look, kept across [`heal_retrying`]'s attempts. A copy with no grant record may be
-    /// left out once one full window (`within`) has passed since.
+    /// When this heal began (R5): its first attempt's start, before its control reads, kept
+    /// across [`heal_retrying`]'s attempts. A copy with no grant record may be left out once
+    /// one full window (`within`) has passed since.
     pub(crate) links_since: Arc<std::sync::OnceLock<tokio::time::Instant>>,
     /// `Timeouts::live_readd` of this open (R5, PR #181 ruling A): without it the heal waits
     /// for every copy ([`may_leave_out`]).
@@ -2838,9 +2838,9 @@ const fn may_leave_out(os_boot: OsBoot, live_readd: bool) -> Option<&'static str
 /// R5 (lead ruling (a)): what a copy with no `grants/{C}` record proves. Only an owner takes a
 /// grant, and only a node's own next process deletes one, so a copy that never owned a
 /// partition has none while it is alive. Nothing is proven before the heal's first full window
-/// has passed, counted from when it began to wait for links: it waits, `no_grant_record`. After
-/// it the copy is left out, `no_grant_after_window`, at [`UNLINKED_BOOT`], as every copy the
-/// heal leaves out is ([`may_leave_out`]).
+/// has passed, counted from the heal's start ([`HealCtx::links_since`]): it waits,
+/// `no_grant_record`. After it the copy is left out, `no_grant_after_window`, at
+/// [`UNLINKED_BOOT`], as every copy the heal leaves out is ([`may_leave_out`]).
 ///
 /// Why leaving out a copy that may be alive loses nothing (same OS boot, checked before this):
 /// - the owner's WAL holds every write it acknowledged, its unsynced tail included;
