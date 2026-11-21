@@ -435,11 +435,13 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     owner included, is up and the down copy's grant (`grants/{node}`) is frozen or proven
     expired on the owner's clock. It logs `heal_proceed_without` and leaves that copy out. A
     copy with a live grant is waited for: it may be alive with a slow link. A copy that has
-    stopped no longer renews its grant: its expiry is proven on the owner's clock at most one
-    grant lifetime plus the clock margins after it stopped, and the heal's next look after that
-    leaves it out. A copy that is alive keeps renewing
-    its grant, so while its link to the owner is missing the wait has no bound: it ends when
-    the link comes up or the copy stops. A copy with no grant record
+    stopped no longer renews its grant. Its expiry can be proven only while the owner's clock
+    has an admissible bound (otherwise the heal waits, `no_clock_bound`); with one, it is
+    proven at most one grant lifetime plus the clock margins after the copy stopped, and the
+    heal's next look after that leaves it out. A copy that is alive keeps renewing its grant,
+    so while it renews and its link to the owner is missing there is no fixed wait. The wait
+    ends when the link comes up, or when the copy stops renewing and the owner proves its grant
+    expired. A copy with no grant record
     (one that never owned a partition) is waited for one heal window (`no_grant_record`), then
     left out too (`evidence=no_grant_after_window`). That costs availability only, never an
     acknowledged write.
