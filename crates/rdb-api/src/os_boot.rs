@@ -107,7 +107,15 @@ pub(crate) fn observe(dir: &Path) -> std::io::Result<Seen> {
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    file = %file.display(),
+                    verdict = ?verdict,
+                    %error,
+                    "os_boot_remove_failed"
+                );
+                return Err(error);
+            }
         }
     }
     tracing::info!(
@@ -323,5 +331,32 @@ mod tests {
         assert_eq!(warned.len(), 1, "only the unreadable id: {lines:?}");
         assert_eq!(warned[0]["@l"], "Warning");
         assert_eq!(warned[0]["error"], "no proc");
+    }
+
+    /// PR #181 review: a stale file that cannot be removed refuses the open as before, and logs
+    /// why first, with the path. Unit (~5 ms). Cut: the `os_boot_remove_failed` warn removed,
+    /// red.
+    #[config_log::retcd_test]
+    fn r5_n_a_stale_file_that_cannot_be_removed_is_logged_and_refuses() {
+        const METHOD: &str = "r5_n_a_stale_file_that_cannot_be_removed_is_logged_and_refuses";
+        let dir = config_testkit::fs::temp_dir();
+        // A directory in the file's place: `remove_file` fails, and not with NotFound.
+        std::fs::create_dir(dir.path().join(OS_BOOT_FILE)).expect("dir in the way");
+        std::fs::write(dir.path().join(OS_BOOT_FILE).join("x"), "x").expect("filled");
+        inject(dir.path(), Ok("boot-a"));
+        observe(dir.path()).expect_err("the open is refused");
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "os_boot_remove_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{lines:?}");
+        assert_eq!(failed[0]["@l"], "Warning");
+        assert!(
+            failed[0]["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with(OS_BOOT_FILE)),
+            "{lines:?}"
+        );
     }
 }
