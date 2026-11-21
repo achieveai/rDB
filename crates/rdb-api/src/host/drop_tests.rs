@@ -7639,7 +7639,11 @@ fn r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot() {
 /// `live_readd_duty` runs, then put back, as the heal's commit would land. No step runs in the
 /// gap, so the row does not depend on how long a commit takes, which
 /// `db::formation_tests::r5_b` does (red only when the commit is slower than a drop check).
-/// Cut: drop the pending filter in `live_readd_duty`, red: the entry is forgotten in the gap.
+/// Once node 3 is promoted, it holds the owner's record at the promote's cutoff (review round 3:
+/// its role and generation alone do not test what it returned with).
+/// Cuts: drop the pending filter in `live_readd_duty`, red: the entry is forgotten in the gap;
+/// the promoted shadow skips `inherit` in its landing, red at the cutoff only: it is regular,
+/// `Active` and at the promoted generation, without the record.
 /// Integration (~5 s).
 #[config_log::retcd_test]
 fn r5_pending_a_copy_left_out_before_the_heals_commit_survives_a_drop_check_in_the_gap() {
@@ -7701,7 +7705,9 @@ fn r5_pending_a_copy_left_out_before_the_heals_commit_survives_a_drop_check_in_t
             .map(|member| (committed.new_generation, member.boot))
     });
     assert_eq!(shadowed.1, boot, "re-added at the boot it still runs");
-    active_with_three(&mut trio, shadowed.0);
+    let promoted = active_with_three(&mut trio, shadowed.0);
+    // Review round 3: what node 3 holds, not only its role and generation.
+    holds_the_cutoff(&mut trio, promoted);
     assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
 }
 
