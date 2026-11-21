@@ -922,3 +922,60 @@ fn sbx_147_t_a_stopped_delete_prefix_counts_its_pages_and_a_rerun_finishes() {
         assert!(listed.entries.is_empty(), "{} left", listed.entries.len());
     });
 }
+
+/// PR #178 review r2 T19: a delete prefix stopped while it drains a published 255-chunk blob.
+/// The blob's first batch takes its root and 254 chunks, which leaves one chunk with no root: an
+/// object a prefix list still finds, as it finds an upload never published. With no ack floor
+/// every answer holds a dedup slot for the retention, and the cap leaves room for the setup's
+/// 256 writes and that first batch only, so the second batch is `OVERLOADED` and the run stops
+/// with nothing counted. Once the retention frees the slots, a rerun finds the rootless chunk,
+/// counts the blob, and leaves no record. Cut: list roots only in `delete_prefix_in` (`rootless`
+/// false), and the rerun answers 0 with the chunk left. Integration (~10-20 s): one database
+/// open and one retention.
+#[config_log::retcd_test]
+fn sbx_147_u_a_stopped_blob_drain_is_found_and_finished_by_a_rerun() {
+    let setup = 255 + 1;
+    let retention = Duration::from_secs(4) * scale();
+    let w = world_retaining(false, Some(setup + 1), Some(retention));
+    let [_, _, c, _] = w.pinned();
+    let bytes: Vec<u8> = (0..255_u8).collect();
+    let sha: [u8; 32] = Sha256::digest(&bytes).into();
+    let (first, rest) = w.on(async {
+        for (index, piece) in (0..).zip(bytes.chunks(1)) {
+            let chunk = Change::Chunk {
+                upload: [5; 16],
+                index,
+                bytes: b(piece),
+            };
+            c.write(0, b(b"blob"), chunk, None).await.expect("a chunk");
+        }
+        let publish = Change::Publish {
+            upload: [5; 16],
+            size: 255,
+            chunk_size: 1,
+            sha256: sha,
+        };
+        c.write(0, b(b"blob"), publish, None).await.expect("publish");
+        let stopped = c
+            .delete_prefix(0, Bytes::new(), DEADLINE)
+            .await
+            .expect_err("the cap stops the blob's second batch");
+        assert_eq!(stopped.error.error.kind, ErrorKind::Overloaded, "{stopped}");
+        let until = Instant::now() + retention * 4 + Duration::from_secs(10);
+        let rest = loop {
+            match c.delete_prefix(0, Bytes::new(), DEADLINE).await {
+                Ok(rest) => break rest,
+                Err(e) if e.error.error.kind == ErrorKind::Overloaded && Instant::now() < until => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("rerun: {e}"),
+            }
+        };
+        (stopped.deleted, rest)
+    });
+    drop(c);
+    let [_, _, scope_c, _] = scopes();
+    let left = left_after(w, &scope_c, 0);
+    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert_eq!((first, rest), (0, 1), "the blob counts once, on the rerun");
+}
