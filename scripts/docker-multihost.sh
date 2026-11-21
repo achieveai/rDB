@@ -3,15 +3,15 @@
 #
 #   scripts/docker-multihost.sh up       [--nodes 5] [--voters 3] [--partitions 16]
 #                                        [--subnet 10.180.80.0/24] [--name rdbmh]
-#                                        [--image rdb-bf-node:dev] [--no-build]
+#                                        [--image rdb-bf-node:dev] [--no-build] [--restart-on-exit]
 #   scripts/docker-multihost.sh check    [--name rdbmh]
 #   scripts/docker-multihost.sh down     [--name rdbmh]
 #   scripts/docker-multihost.sh clean    [--name rdbmh]
 #   scripts/docker-multihost.sh selftest [--name rdbst] [--image rdb-bf-node:dev] [--no-docker]
 #   scripts/docker-multihost.sh failover N [--with-voter-leader] [--rejoin-s 120] [--name rdbmh]
-#   scripts/docker-multihost.sh kill N | restart N | restart-voter V   [--name rdbmh]
+#   scripts/docker-multihost.sh kill N | restart N | restart-voter V | pause N   [--name rdbmh]
 #   scripts/docker-multihost.sh d1       [--name rdbd1] [--subnet 10.180.81.0/24] [--image ..]
-#                                        [--no-build]
+#                                        [--no-build] [--restart-on-exit]
 #
 # `up` builds the image (unless --no-build), checks that nothing it would create exists yet
 # (the network <name>-net, the volumes <name>-init, <name>-vN and <name>-dN, any container
@@ -67,6 +67,21 @@
 #                so it never removes a rig it did not create.
 # Every probe runs in an rdb_dev with --put-timeout-ms 1000, the put timeout the bound assumes.
 #
+# --restart-on-exit (up, d1; off by default): each data node container gets Docker's
+# `--restart on-failure:3`, recorded on the network as the label org.rdb.multihost.restart.
+# It stands in for the supervisor #81 V10 asks for: rdb_node exits 75 when it wants a restart.
+# `docker kill` does not trigger it: the kill cancels the container's restart manager (moby
+# `killWithSignal` calls `ExitOnNext`), and `docker start` gives it a fresh one. With the
+# label set, failover judges that too (K6). Any other non-zero exit is restarted as well, which
+# a supervisor should report instead; P2 below accepts only 75.
+#   pause N      needs --restart-on-exit. `docker pause` node N, an owner, until it owns no
+#                partition; then `docker unpause`. P1 within 60 s of the pause N owns nothing;
+#                P2 within 60 s of the unpause N printed `rdb_node restart-wanted node=N
+#                reason=replace_stopped`, exited 75, and Docker restarted it once; P3 N is
+#                ready again within 60 s; P4 a planner_frozen_grant_cleared for N after the
+#                unpause, within 60 s; P5 a 5 s probe writes every partition.
+#                d1 --restart-on-exit runs `pause 2` after its other steps.
+#
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
 # --subnet must be a /24 that overlaps no Docker network and no host route; `up` checks.
 set -euo pipefail
@@ -75,11 +90,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 NODES=5 VOTERS=3 PARTITIONS=16 SUBNET=10.180.80.0/24 NAME=rdbmh IMAGE=rdb-bf-node:dev BUILD=1
-WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET=""
+WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0
 [ "$CMD" = selftest ] && NAME=rdbst
 [ "$CMD" = d1 ] && NAME=rdbd1 SUBNET=10.180.81.0/24
 case "$CMD" in
-    failover|kill|restart|restart-voter)
+    failover|kill|restart|restart-voter|pause)
         case "${1:-}" in
             ''|*[!0-9]*|0*) echo "docker-multihost: $CMD takes a node number from 1, not '${1:-}'" >&2; exit 2 ;;
         esac
@@ -99,6 +114,7 @@ while [ $# -gt 0 ]; do
             case "${2:-}" in ''|*[!0-9]*) echo "docker-multihost: --rejoin-s takes whole seconds" >&2; exit 2 ;; esac
             REJOIN_S="$2"; shift 2 ;;
         --no-docker) NO_DOCKER=1; shift ;;
+        --restart-on-exit) RESTART_ON_EXIT=1; shift ;;
         *) echo "docker-multihost: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -108,6 +124,8 @@ done
     || { echo "docker-multihost: --rejoin-s is read only by failover" >&2; exit 2; }
 [ "$NO_DOCKER" = 0 ] || [ "$CMD" = selftest ] \
     || { echo "docker-multihost: --no-docker is read only by selftest" >&2; exit 2; }
+[ "$RESTART_ON_EXIT" = 0 ] || [ "$CMD" = up ] || [ "$CMD" = d1 ] \
+    || { echo "docker-multihost: --restart-on-exit is read only by up and d1" >&2; exit 2; }
 LABEL="org.rdb.multihost=$NAME"
 NET="$NAME-net"
 HELPER="$NAME-x"
@@ -248,11 +266,14 @@ up() {
     fi
     preflight
     CLUSTER="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    local restart=() policy=none
+    if [ "$RESTART_ON_EXIT" = 1 ]; then policy=on-failure:3; restart=(--restart "$policy"); fi
     docker network create --subnet "$SUBNET" --label "$LABEL" \
         --label "org.rdb.multihost.nodes=$NODES" --label "org.rdb.multihost.voters=$VOTERS" \
         --label "org.rdb.multihost.partitions=$PARTITIONS" \
         --label "org.rdb.multihost.subnet=$SUBNET" --label "org.rdb.multihost.image=$IMAGE" \
-        --label "org.rdb.multihost.cluster=$CLUSTER" "$NET" >/dev/null || die "network create"
+        --label "org.rdb.multihost.cluster=$CLUSTER" --label "org.rdb.multihost.restart=$policy" \
+        "$NET" >/dev/null || die "network create"
     say "network $NET $SUBNET cluster=$CLUSTER"
 
     own_volume "$NAME-init"
@@ -297,7 +318,7 @@ up() {
     for n in $(seq 1 "$NODES"); do
         own_volume "$NAME-d$n"
         docker run -d --name "$NAME-d$n" --label "$LABEL" --network "$NET" --ip "$(node_ip "$n")" \
-            -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
+            "${restart[@]}" -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
             --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers)" --control "$(control)" \
             --control-tls /init/certs/control --cert-dir /init/certs --admin-apps admin \
             --failover --log-dir /data/logs >/dev/null || die "node $n start"
@@ -306,7 +327,7 @@ up() {
     for n in $(seq 1 "$NODES"); do
         wait_for "node $n ready" 120 sh -c "docker logs $NAME-d$n 2>&1 | grep -q 'rdb_node ready node=$n'"
     done
-    say "up: $VOTERS voters, $NODES nodes, $PARTITIONS partitions"
+    say "up: $VOTERS voters, $NODES nodes, $PARTITIONS partitions, node restart policy $policy"
 }
 
 # The throwaway voter <name>-x. start_helper creates it only when no container has that name
@@ -556,6 +577,10 @@ clean() {
 #   owned N STATUS             J4: the partitions N owns, as a line
 #   voter PARTITIONS PROBE     restart-voter's claim
 #   leader HEALTH..            the voter every answering voter names as leader, or exit 1
+#   killheld N R0 INSPECT      K6: after `docker kill`, N stayed exited 137 with R0 restarts
+#   restarted N R0 INSPECT EVENTS STDOUT   P2
+#   cleared N SINCE_MS LOGS    P4
+#   written PARTITIONS PROBE   P5
 analyze() {
     python3 -I - "$@" <<'PY'
 import calendar, json, re, statistics, sys
@@ -792,6 +817,58 @@ elif mode == "voter":
         elif t["gap"] > 15000:
             bad.append(f"partition {p}: max_gap_ms={t['gap']}")
     verdict(not bad, "R-V every partition written, none over 15000 ms unwritten, while the voter restarted", bad)
+elif mode == "killheld":
+    n, r0 = int(args[0]), int(args[1])
+    seen = open(args[2], encoding="utf-8", errors="replace").read().split()
+    if len(seen) != 3 or not seen[1].isdigit() or not seen[2].isdigit():
+        die(f"cannot read the inspect line {' '.join(seen)!r}")
+    bad = []
+    if seen[0] != "exited" or seen[1] != "137" or int(seen[2]) != r0:
+        bad.append(f"state {seen[0]}, exit code {seen[1]}, restarts {r0} -> {seen[2]}")
+    verdict(not bad, f"K6 docker kill did not trigger node {n}'s restart policy: exited 137, restarts {r0}", bad)
+elif mode == "restarted":
+    n, r0 = int(args[0]), int(args[1])
+    seen = open(args[2], encoding="utf-8", errors="replace").read().split()
+    if len(seen) != 2 or not seen[1].isdigit():
+        die(f"cannot read the inspect line {' '.join(seen)!r}")
+    codes = [l.strip() for l in lines(args[3]) if l.strip()]
+    if any(not c.isdigit() for c in codes):
+        die(f"cannot read the die events {codes!r}")
+    wanted = f"rdb_node restart-wanted node={n} reason=replace_stopped"
+    said = any(l == wanted or l.startswith(wanted + " ") for l in lines(args[4]))
+    bad = []
+    if not said:
+        bad.append(f"no line '{wanted}'")
+    if codes != ["75"]:
+        bad.append(f"exit codes since the unpause: {' '.join(codes) or '-'}")
+    if seen[0] != "running" or int(seen[1]) != r0 + 1:
+        bad.append(f"state {seen[0]}, restarts {r0} -> {seen[1]}")
+    verdict(not bad, f"P2 node {n} asked for a restart (replace_stopped), exited 75, and Docker restarted it once", bad)
+elif mode == "cleared":
+    n, since = int(args[0]), int(args[1])
+    hits, others = [], 0
+    for line in lines(args[2]):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            die(f"cannot read a log line: {line[:200]}")
+        if event.get("@m") != "planner_frozen_grant_cleared":
+            continue
+        if event.get("node") == n and millis(event.get("@t")) >= since:
+            hits.append(event)
+        else:
+            others += 1
+    detail = [f"{e['@t']} record_boot={e.get('record_boot')} live_boot={e.get('live_boot')}" for e in hits[:1]]
+    if not hits:
+        detail = [f"{others} other planner_frozen_grant_cleared lines (another node, or before the unpause)"]
+    verdict(bool(hits), f"P4 planner_frozen_grant_cleared for node {n} after the unpause", detail)
+elif mode == "written":
+    tallies, partitions = probe(args[1]), int(args[0])
+    bad = [f"partition {p}: not written" for p in range(1, partitions + 1)
+           if p not in tallies or tallies[p]["ok"] == 0]
+    verdict(not bad, "P5 a 5 s probe writes every partition", bad)
 elif mode == "leader":
     named = set()
     for path in args:
@@ -821,10 +898,15 @@ target_in() { # kind, count
 # The run's scratch folder and its live session, removed and closed whatever ends the run; a
 # container this run killed and has not started yet is started again, so an interrupted run
 # does not leave the rig short of a host.
-SESSION_PID="" KILLED=""
+SESSION_PID="" KILLED="" PAUSED=""
 run_cleanup() {
     session_close
     local c
+    for c in $PAUSED; do
+        echo "multihost: unpausing $c, which this run paused" >&2
+        docker unpause "$c" >/dev/null 2>&1 || echo "multihost: could not unpause $c" >&2
+    done
+    PAUSED=""
     for c in $KILLED; do
         echo "multihost: starting $c again, which this run killed" >&2
         docker start "$c" >/dev/null 2>&1 || echo "multihost: could not start $c" >&2
@@ -965,8 +1047,12 @@ failover() {
     # Kill at T0, with a probe session already linked.
     session_open "$tmp/run.out"
     session_ready "$tmp/run.out" || die "failover: the probe session did not become ready with every link up"
-    local t0 victims="$NAME-d$n"
+    local t0 victims="$NAME-d$n" policy restarts0=""
     [ -z "$leader" ] || victims="$victims $NAME-v$leader"
+    policy="$(setting restart)" || die "failover: the restart setting could not be read"
+    if [ "$policy" = on-failure:3 ]; then
+        restarts0="$(docker inspect -f '{{.RestartCount}}' "$NAME-d$n")" || die "failover: inspect $NAME-d$n"
+    fi
     t0="$(date +%s%3N)"
     # shellcheck disable=SC2086 # one argument per container
     docker kill $victims >/dev/null || die "failover: docker kill $victims"
@@ -987,6 +1073,13 @@ failover() {
         "$tmp/post.out" "$tmp/promoted.jsonl" "$tmp/reads.out" > "$tmp/k.txt" \
         || die "failover: the claims could not be read"
     claims < "$tmp/k.txt"
+    if [ -n "$restarts0" ]; then
+        # K6: under on-failure, the kill must leave the node down until this run starts it.
+        docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$NAME-d$n" \
+            > "$tmp/k6.inspect" || die "failover: inspect $NAME-d$n"
+        analyze killheld "$n" "$restarts0" "$tmp/k6.inspect" > "$tmp/k6.txt" || die "failover: K6 could not be read"
+        claims < "$tmp/k6.txt"
+    fi
     failover_capture "failover$n-$t0-mid" "$tmp"
 
     # Restart: J1 ready, J2 pinned again, J3 still readable, J4 printed.
@@ -1061,6 +1154,94 @@ restart_voter() {
     [ "$FAILS" = 0 ]
 }
 
+# Node N's partitions, from an `admin status` with no `wait ready` (a paused owner keeps an
+# open from being ready): the count, or exit 1 when the status could not be read.
+owned_now() { # node, out
+    printf 'admin status\nquit\n' | dev --put-timeout-ms 1000 > "$2" 2>&1
+    grep -q '^partitions/' "$2" || return 1
+    analyze owned "$1" "$2" | sed -E 's/^J4 node [0-9]+ owns ([0-9]+) partitions.*/\1/'
+}
+
+pause_node() {
+    load
+    target_in "data nodes" "$NODES"
+    local n="$TARGET" c="$NAME-d$TARGET" tmp policy
+    policy="$(setting restart)" || die "pause: the restart setting could not be read"
+    [ "$policy" = on-failure:3 ] \
+        || die "pause: up ran without --restart-on-exit (restart policy '${policy:-none}'); nothing was paused"
+    set +e
+    run_scratch
+    tmp="$CHECK_TMP"
+    local owned restarts0
+    owned="$(owned_now "$n" "$tmp/pre.out")" || die "pause: the admin status could not be read"
+    [ "$owned" -gt 0 ] || die "pause: node $n owns no partition, so a pause moves nothing; nothing was paused"
+    restarts0="$(docker inspect -f '{{.RestartCount}}' "$c")" || die "pause: inspect $c"
+    local t0
+    t0="$(date +%s%3N)"
+    docker pause "$c" >/dev/null || die "pause: docker pause $c"
+    PAUSED="$c"
+    say "pause $n: paused $c at T0=$t0, owning $owned partitions, restarts $restarts0"
+
+    # P1: the planner moves every partition off it.
+    local rc=1 left="$owned" deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        left="$(owned_now "$n" "$tmp/paused.out")" && [ "$left" = 0 ] && { rc=0; break; }
+        sleep 1
+    done
+    verdict "P1 within 60 s of the pause node $n owns no partition" "$rc"
+    [ "$rc" = 0 ] || echo "  node $n still owns ${left:-an unread number of} partitions"
+
+    # P2: unpaused, it asks for a restart, exits 75, and Docker starts it again.
+    local un un_ms
+    un="$(date +%s)"; un_ms="$(date +%s%3N)"
+    docker unpause "$c" >/dev/null || die "pause: docker unpause $c"
+    PAUSED=""
+    say "pause $n: unpaused $c at $un_ms"
+    deadline=$((SECONDS + 60))
+    while :; do
+        docker events --since "$un" --until "$(date +%s)" --filter "container=$c" --filter event=die \
+            --format '{{.Actor.Attributes.exitCode}}' > "$tmp/p2.events" 2>&1
+        docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$c" > "$tmp/p2.inspect" 2>&1
+        docker logs --since "$un" "$c" > "$tmp/p2.stdout" 2>&1
+        analyze restarted "$n" "$restarts0" "$tmp/p2.inspect" "$tmp/p2.events" "$tmp/p2.stdout" \
+            > "$tmp/p2.txt" || die "pause: P2 could not be read"
+        grep -q '^PASS' "$tmp/p2.txt" && break
+        [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 1
+    done
+    claims < "$tmp/p2.txt"
+
+    # P3: the new boot is ready.
+    rc=0
+    node_ready_since "$n" "$un" 60 || rc=1
+    verdict "P3 node $n ready again within 60 s of its restart" "$rc"
+
+    # P4: the planner clears the old boot's frozen grant.
+    deadline=$((SECONDS + 60))
+    while :; do
+        local m
+        : > "$tmp/cleared.jsonl"
+        for m in $(seq 1 "$NODES"); do
+            docker exec "$NAME-d$m" sh -c 'grep -rh planner_frozen_grant_cleared /data/logs; [ $? -le 1 ]' \
+                >> "$tmp/cleared.jsonl" 2>/dev/null || true
+        done
+        analyze cleared "$n" "$un_ms" "$tmp/cleared.jsonl" > "$tmp/p4.txt" || die "pause: P4 could not be read"
+        grep -q '^PASS' "$tmp/p4.txt" && break
+        [ "$SECONDS" -ge "$deadline" ] && break
+        sleep 1
+    done
+    claims < "$tmp/p4.txt"
+
+    # P5: every partition takes writes.
+    session_run "$tmp/after.out" "probe-all 5000 200 s3-pause"; local after_rc=$?
+    analyze written "$PARTITIONS" "$tmp/after.out" > "$tmp/p5.txt" || die "pause: P5 could not be read"
+    [ "$after_rc" = 0 ] || echo "FAIL P5 the probe session exited $after_rc" >> "$tmp/p5.txt"
+    claims < "$tmp/p5.txt"
+    failover_capture "pause$n-$t0" "$tmp"
+    if [ "$FAILS" = 0 ]; then say "pause $n: all passed"; else say "pause $n: $FAILS failed"; fi
+    [ "$FAILS" = 0 ]
+}
+
 # The whole D1 run on this --name and --subnet. Teardown is armed only after this run's own
 # preflight has passed: a name another run holds is refused, and nothing of it is removed.
 D1_ARMED=0
@@ -1112,11 +1293,13 @@ d1() {
     D1_ARMED=1
     trap d1_teardown EXIT
     trap 'exit 130' INT TERM
-    local common=(--name "$NAME") step rc failed=0 results="" i=0
+    local common=(--name "$NAME") step rc failed=0 results="" i=0 restart=() steps
+    steps=("check" "failover 3" "failover 1" "failover 5" "restart-voter 1" "restart-voter 1"
+           "failover 3 --with-voter-leader")
+    if [ "$RESTART_ON_EXIT" = 1 ]; then restart=(--restart-on-exit); steps+=("pause 2"); fi
     "$D1_SELF" up --no-build --name "$NAME" --subnet "$SUBNET" --image "$IMAGE" --nodes "$NODES" \
-        --voters "$VOTERS" --partitions "$PARTITIONS" || die "d1: up"
-    for step in "check" "failover 3" "failover 1" "failover 5" "restart-voter 1" "restart-voter 1" \
-                "failover 3 --with-voter-leader"; do
+        --voters "$VOTERS" --partitions "$PARTITIONS" "${restart[@]}" || die "d1: up"
+    for step in "${steps[@]}"; do
         say "d1: === $step"
         # Not `cmd; rc=$?`: under `set -e` a failing step would end d1 there (d1 run 1, #176).
         rc=0
@@ -1506,7 +1689,8 @@ selftest_args() {
     chmod +x "$t/bin/docker"
     local args rc
     for args in "failover" "failover x" "failover 0" "failover 03" "kill 2 --with-voter-leader" \
-                "restart-voter 1 --rejoin-s 5" "up --no-docker" "failover 2 --rejoin-s soon"; do
+                "restart-voter 1 --rejoin-s 5" "up --no-docker" "failover 2 --rejoin-s soon" \
+                "pause" "pause x" "check --restart-on-exit" "failover 2 --restart-on-exit"; do
         : > "$t/calls"
         # shellcheck disable=SC2086 # the case's words
         PATH="$t/bin:$PATH" "$0" $args > /dev/null 2>&1; rc=$?
@@ -1571,6 +1755,123 @@ SH
         && [ -d "$t/logs/logs-3-failover_1" ] && [ -d "$t/logs/logs-7-failover_3_--with-voter-leader" ] \
         && [ -d "$t/logs/logs-teardown" ]
     st "d1 runs every step past a failing one, keeps each step's logs, and exits 1 (exit $rc)" $?
+    grep -qE -- '--restart-on-exit|^pause ' "$t/steps"; [ $? = 1 ]
+    st "d1 without --restart-on-exit runs no pause step and passes up no restart flag" $?
+    : > "$t/calls"; : > "$t/steps"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs2" \
+        "$0" d1 --no-build --name rdbst-d1 --restart-on-exit > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 8 ] \
+        && [ "$(tail -n 1 "$t/steps")" = "pause 2 --name rdbst-d1" ] \
+        && grep -qE '^up .* --restart-on-exit$' "$t/steps" && [ -d "$t/logs2/logs-8-pause_2" ]
+    st "d1 --restart-on-exit passes the flag to up and runs pause 2 last (exit $rc)" $?
+    rm -rf "$t"
+}
+
+# up's restart policy, with a docker stub that answers every call `up` makes: only with
+# --restart-on-exit do the data node containers, and not the voters, get on-failure:3, and the
+# network records the policy either way.
+selftest_up_restart() {
+    local t; t="$(mktemp -d)"
+    mkdir -p "$t/bin"
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$1 $2" in
+    "image inspect") exit 0 ;;
+    "network inspect") echo "Error response from daemon: network $3 not found" >&2; exit 1 ;;
+    "volume inspect")
+        [ "$3" = -f ] && { echo rdbst-u; exit 0; }
+        echo "Error response from daemon: get $3: no such volume" >&2; exit 1 ;;
+    "container inspect") echo "Error response from daemon: No such container: $3" >&2; exit 1 ;;
+    "network ls"|"ps -aq") exit 0 ;;
+    "exec "*) echo '{"ready":true}'; exit 0 ;;
+    "logs "*) for n in 1 2 3 4 5; do echo "rdb_node ready node=$n"; done; exit 0 ;;
+esac
+exit 0
+SH
+    printf '#!/bin/sh\necho "10.1.0.0/16 dev eth0"\n' > "$t/ip"
+    chmod +x "$t/bin/docker" "$t/ip"
+    local rc flag
+    for flag in "" --restart-on-exit; do
+        : > "$t/calls"
+        # shellcheck disable=SC2086 # the flag, or nothing
+        PATH="$t/bin:$PATH" CALLS="$t/calls" MULTIHOST_IP_CMD="$t/ip" \
+            "$0" up --no-build --name rdbst-u --subnet 10.180.89.0/24 $flag > "$t/out" 2>&1; rc=$?
+        local nodes voters policy
+        nodes="$(grep -c '^run -d --name rdbst-u-d.* --restart on-failure:3 ' "$t/calls")"
+        voters="$(grep -c '^run -d --name rdbst-u-v.*--restart' "$t/calls")"
+        policy="$(grep '^network create' "$t/calls" | grep -oE 'org.rdb.multihost.restart=[^ ]+')"
+        if [ -n "$flag" ]; then
+            [ "$rc" = 0 ] && [ "$nodes" = 5 ] && [ "$voters" = 0 ] \
+                && [ "$policy" = org.rdb.multihost.restart=on-failure:3 ]
+            st "up --restart-on-exit gives the 5 data nodes on-failure:3 and no voter (exit $rc)" $?
+        else
+            [ "$rc" = 0 ] && [ "$(grep -c -- '--restart' "$t/calls")" = 0 ] \
+                && [ "$policy" = org.rdb.multihost.restart=none ]
+            st "up without the flag gives no container a restart policy (exit $rc)" $?
+        fi
+    done
+    # pause on a rig up made without the flag: refused before anything is paused.
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$*" in
+    *org.rdb.multihost.restart*) echo none; exit 0 ;;
+    "network inspect -f"*) echo 5; exit 0 ;;
+    "network inspect "*) exit 0 ;;
+esac
+exit 1
+SH
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" pause 2 --name rdbst-u > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at pause: up ran without --restart-on-exit" "$t/out" \
+        && ! grep -qE '^(pause|unpause|run|exec) ' "$t/calls"
+    st "pause on a rig without the restart policy is refused and pauses nothing (exit $rc)" $?
+    rm -rf "$t"
+}
+
+# K6 and P2 to P5 over hand-made inspect, event, stdout and log files, no Docker.
+selftest_restart_claims() {
+    local t; t="$(mktemp -d)"
+    echo "exited 137 0" > "$t/i"
+    analyze killheld 3 0 "$t/i" > "$t/out"; grep -q '^PASS K6' "$t/out"
+    st "K6 passes a killed node left exited 137 with its restart count" $?
+    echo "running 0 1" > "$t/i"
+    analyze killheld 3 0 "$t/i" > "$t/out"; grep -q '^FAIL K6' "$t/out" && grep -qF "restarts 0 -> 1" "$t/out"
+    st "K6 fails a killed node that Docker restarted" $?
+    echo "running 1" > "$t/i"; echo 75 > "$t/e"
+    printf 'rdb_node restart-wanted node=2 reason=replace_stopped\nrdb_node stopped node=2\n' > "$t/o"
+    analyze restarted 2 0 "$t/i" "$t/e" "$t/o" > "$t/out"; grep -q '^PASS P2' "$t/out"
+    st "P2 passes restart-wanted, one exit 75 and one restart" $?
+    echo 137 > "$t/e"
+    analyze restarted 2 0 "$t/i" "$t/e" "$t/o" > "$t/out"
+    grep -q '^FAIL P2' "$t/out" && grep -qF "exit codes since the unpause: 137" "$t/out"
+    st "P2 fails an exit other than 75" $?
+    echo 75 > "$t/e"; echo "exited 0" > "$t/i"
+    analyze restarted 2 0 "$t/i" "$t/e" "$t/o" > "$t/out"
+    grep -q '^FAIL P2' "$t/out" && grep -qF "state exited, restarts 0 -> 0" "$t/out"
+    st "P2 fails when Docker did not restart it" $?
+    echo "running 1" > "$t/i"; echo "rdb_node restart-wanted node=2 reason=host_faulted" > "$t/o"
+    analyze restarted 2 0 "$t/i" "$t/e" "$t/o" > "$t/out"
+    grep -q '^FAIL P2' "$t/out" && grep -qF "no line 'rdb_node restart-wanted node=2 reason=replace_stopped'" "$t/out"
+    st "P2 fails a restart wanted for another reason" $?
+    { echo '{"@m":"planner_frozen_grant_cleared","@t":"2026-11-21T17:31:53.380Z","node":3,"record_boot":1,"live_boot":2}'
+      echo '{"@m":"planner_frozen_grant_cleared","@t":"2026-11-21T17:40:00.000Z","node":2,"record_boot":1,"live_boot":2}'
+    } > "$t/l"
+    analyze cleared 2 1795282800000 "$t/l" > "$t/out"; grep -q '^PASS P4' "$t/out"
+    st "P4 passes a frozen-grant clear for the node after the unpause" $?
+    analyze cleared 3 1795282800000 "$t/l" > "$t/out"
+    grep -q '^FAIL P4' "$t/out" && grep -qF "2 other planner_frozen_grant_cleared lines" "$t/out"
+    st "P4 fails a clear of another node, or one before the unpause" $?
+    pr() { echo "probe partition=$1 group=$1 ok=$2 err=0 max_gap_ms=200 first_err_at_ms=- first_ok_after_err_at_ms=- last_ok_i=$2 owner=1 token=1.0 errs=-"; }
+    { pr 1 5; pr 2 5; } > "$t/p"
+    analyze written 2 "$t/p" > "$t/out"; grep -q '^PASS P5' "$t/out"
+    st "P5 passes when every partition is written" $?
+    { pr 1 5; pr 2 0; } > "$t/p"
+    analyze written 3 "$t/p" > "$t/out"
+    grep -q '^FAIL P5' "$t/out" && grep -qF "partition 2: not written" "$t/out" && grep -qF "partition 3: not written" "$t/out"
+    st "P5 fails a partition not written, or missing from the probe" $?
     rm -rf "$t"
 }
 
@@ -1587,6 +1888,8 @@ selftest() {
     selftest_failover_claims
     selftest_args
     selftest_d1_teardown
+    selftest_up_restart
+    selftest_restart_claims
     if [ "$NO_DOCKER" = 1 ]; then echo "SKIP selftest docker part (--no-docker)"; else selftest_docker; fi
     if [ "$ST_FAILS" = 0 ]; then say "selftest: all passed"; else say "selftest: $ST_FAILS failed"; fi
     [ "$ST_FAILS" = 0 ]
@@ -1602,6 +1905,7 @@ case "$CMD" in
     kill) kill_node ;;
     restart) restart_node ;;
     restart-voter) restart_voter ;;
+    pause) pause_node ;;
     d1) d1 ;;
     *) sed -n '2,15p' "$0"; exit 2 ;;
 esac
