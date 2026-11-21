@@ -9022,7 +9022,9 @@ mod tests {
         )
     }
 
-    /// [`r5_heal_by`] over `store`, the heal's [`HealCtx::waiting`] being `waiting`.
+    /// [`r5_heal_by`] over `store`, the heal's [`HealCtx::waiting`] being `waiting`. Through
+    /// [`heal_retrying`], the whole run is bounded by the test's patience, so a heal that never
+    /// ends fails here instead of hanging the binary (AGENTS.md, Running the gate).
     #[allow(clippy::too_many_arguments)]
     fn r5_heal_in(
         store: Arc<dyn ConfigStore>,
@@ -9066,7 +9068,12 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let healed = if retrying {
-            rt.block_on(heal_retrying(ctx))
+            let patience = crate::host::test_patience(within * 4 + Duration::from_secs(10));
+            rt.block_on(async {
+                tokio::time::timeout(patience, heal_retrying(ctx))
+                    .await
+                    .unwrap_or_else(|_| panic!("heal_retrying did not end within {patience:?}"))
+            })
         } else {
             rt.block_on(heal(ctx))
         };
