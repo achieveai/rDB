@@ -34,7 +34,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The file, beside `boot`, that holds the OS boot id this folder's tail is intact under.
+/// The file in each copy's own folder, `nodes/<n>/os_boot`, that holds the OS boot id that
+/// copy's WAL tail is intact under. Each node keeps its own, not one beside the root's `boot`.
 pub(crate) const OS_BOOT_FILE: &str = "os_boot";
 
 /// What the open found of the OS boot, against the folder's file.
