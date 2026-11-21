@@ -175,6 +175,7 @@ const fn promote_cause(error: &PromoteError) -> &'static str {
         PromoteError::TargetFrozen { .. } => "target_frozen",
         PromoteError::OwnerAlive { .. } => "owner_alive",
         PromoteError::NoSuchPartition { .. } => "no_such_partition",
+        PromoteError::Removed { .. } => "removed",
         PromoteError::NoControlStore => "no_control_store",
         PromoteError::ClockUnbounded => "clock_unbounded",
         PromoteError::Unanswered { .. } => "unanswered",

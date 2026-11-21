@@ -117,8 +117,11 @@
 //! prints `rdb_node stopped node=N` and exits 75: its supervisor should start it again, at a new
 //! boot, and the owner re-adds it. A failed list keeps it up (`db_restart_check_unread`). The
 //! rule is `Db::restart_wanted`'s, which an embedder polls the same way.
-//! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
-//! step failed, 2 bad arguments, 75 restart wanted (V10).
+//! #80 S4: in the same check, once `nodes/N` is removed (`Db::removed`) it prints
+//! `rdb_node removed node=N` (logged `rdb_node_removed`), shuts down and exits 0: its id is never
+//! used again, so it asks for no restart.
+//! Errors go to stderr with the step that failed. Exit codes: 0 stopped, formed or removed, 1 a
+//! start step failed, 2 bad arguments, 75 restart wanted (V10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -688,7 +691,7 @@ fn run(
                 serve(&args, &rt)
             };
             match result {
-                Ok(Served::Stopped) => ExitCode::SUCCESS,
+                Ok(Served::Stopped | Served::Removed) => ExitCode::SUCCESS,
                 Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
                 Err(message) => {
                     tracing::error!(%message, "rdb_node_failed");
@@ -1234,6 +1237,13 @@ fn serve_on_ready(
             // read timeout.
             if checked.elapsed() >= RESTART_CHECK_EVERY {
                 checked = std::time::Instant::now();
+                // #80 S4 (S-5): a removed node is done for good, so no restart is asked for.
+                if db.removed() {
+                    tracing::warn!(node = node.0, "rdb_node_removed");
+                    println!("rdb_node removed node={}", node.0);
+                    served = Served::Removed;
+                    break;
+                }
                 if let Some(reason) = db.restart_wanted() {
                     tracing::warn!(node = node.0, %reason, "rdb_node_restart_wanted");
                     println!("rdb_node restart-wanted node={} reason={reason}", node.0);
@@ -1278,6 +1288,9 @@ fn serve_on_ready(
 enum Served {
     /// `--stop-file` appeared: exit 0.
     Stopped,
+    /// #80 S4 (S-5): this node's `nodes/` record was removed (`Db::removed`), so it serves
+    /// nothing again and its id is never reused: exit 0, and a supervisor should not start it.
+    Removed,
     /// V10 (#81): this boot can serve nothing again, so it asks its supervisor for a restart,
     /// [`RESTART_EXIT`]. The reason `Db::restart_wanted` gave.
     Restart(RestartReason),

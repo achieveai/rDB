@@ -895,3 +895,94 @@ fn s80s4_a_removed_node_loses_its_links_and_k_shrinks() {
         },
     );
 }
+
+/// M8 embedded-`Db` half (#80 S4, S-5): five nodes run; node 6 is added, opens and links to all
+/// five, and its own host answers. `admin::remove_node(6)` writes `nodes/6` removed. Then node
+/// 6's `Db` reports `removed()`, its host no longer answers, and every kind of call through it
+/// is refused `INVALID_ARGUMENT`, `no_mutation`, naming the removal: a put, a get, a route, a
+/// restart of node 6 and a promote. Integration (six node processes).
+///
+/// Cuts: (a) `admin::watch_members` never marks its own node removed: "not within 10s: node
+/// 6's Db reports removed"; (b) `Db::removed` stops no node: "node 6's host has stopped". Both
+/// red, observed 2026-11-21 at load 28-34.
+#[config_log::retcd_test]
+fn s80s4_a_removed_nodes_db_stops_its_host_and_refuses_every_call() {
+    let (mut rig, six) = five_ready();
+    rig.rt
+        .block_on(admin::add_node(&rig.store, &rig.addrs[&ADDED], None))
+        .expect("node 6 is added");
+    for n in 1..=5 {
+        let net = Arc::clone(&rig.of(NodeId(n)).net);
+        until(
+            &format!("node {n} admits node 6"),
+            Duration::from_secs(10),
+            || net.members().contains(&ADDED),
+        );
+    }
+    certs::issue_node(&rig.cert_dir, ADDED).expect("node 6's certificate");
+    let all = rig.addrs.clone();
+    let store = Arc::clone(&rig.store);
+    let proc = open_node(&rig, store, ADDED, six, &all);
+    rig.procs.push(proc);
+    rig.rt
+        .block_on(rig.of(ADDED).net.wait_up(
+            &(1..=5).map(NodeId).collect::<Vec<_>>(),
+            crate::host::test_patience(Duration::from_secs(10)),
+        ))
+        .expect("node 6 links to nodes 1 to 5");
+    let db = &rig.of(ADDED).db;
+    assert!(!db.removed(), "node 6 is live");
+    assert!(db.inspect(ADDED).is_some(), "node 6's own host answers");
+
+    rig.rt
+        .block_on(admin::remove_node(&rig.store, ADDED))
+        .expect("node 6 is removed");
+    let db = &rig.of(ADDED).db;
+    until(
+        "node 6's Db reports removed",
+        Duration::from_secs(10),
+        || db.removed(),
+    );
+    assert!(db.inspect(ADDED).is_none(), "node 6's host has stopped");
+    let refused = |what: &str, error: &ApiError| {
+        assert_eq!(error.kind, ErrorKind::InvalidArgument, "{what}: {error:?}");
+        assert!(error.no_mutation, "{what}: {error:?}");
+        assert!(
+            error
+                .detail
+                .contains("node 6 was removed; ids are never reused"),
+            "{what}: {error:?}"
+        );
+    };
+    let group = AffinityId(1);
+    refused(
+        "a put",
+        &db.put_in(group, b"k", b"v", None)
+            .expect_err("a removed Db writes nothing")
+            .error,
+    );
+    refused(
+        "a get",
+        &db.get_in(group, b"k")
+            .expect_err("a removed Db reads nothing"),
+    );
+    refused(
+        "a route",
+        &db.route(group).expect_err("a removed Db routes nothing"),
+    );
+    refused(
+        "a restart",
+        &db.restart_node(ADDED)
+            .expect_err("a removed Db restarts nothing"),
+    );
+    let promote = db
+        .promote_partition(PartitionId(1), NodeId(1), None)
+        .expect_err("a removed Db promotes nothing");
+    assert!(promote.no_mutation(), "a promote: {promote:?}");
+    assert!(
+        promote
+            .to_string()
+            .contains("node 6 was removed; ids are never reused"),
+        "a promote: {promote:?}"
+    );
+}

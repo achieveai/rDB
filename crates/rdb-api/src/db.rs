@@ -608,6 +608,11 @@ struct Opened {
     /// The `nodes/` watcher of a declared node process (#80 S4, [`admin::watch_members`]),
     /// aborted at shutdown.
     members_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set by the watcher to this process's node once its `nodes/` record is removed: the `Db`
+    /// is then [`Db::removed`] for good (#80 S4, S-5).
+    removed: Arc<std::sync::OnceLock<NodeId>>,
+    /// Whether [`Db::removed`] has stopped this process's nodes and tasks, so it does so once.
+    removed_stopped: AtomicBool,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
@@ -666,6 +671,8 @@ impl Default for Opened {
             heal_task: None,
             planner_task: None,
             members_task: None,
+            removed: Arc::new(std::sync::OnceLock::new()),
+            removed_stopped: AtomicBool::new(false),
             stuck: Mutex::new(None),
             control: None,
             instance: None,
@@ -1846,8 +1853,9 @@ impl Db {
         let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
             return;
         };
+        let own = lock(&self.nodes).iter().map(|handle| handle.node).collect();
         self.opened.members_task = Some(rt.spawn(tracing::Instrument::instrument(
-            admin::watch_members(store, net),
+            admin::watch_members(store, net, own, Arc::clone(&self.opened.removed)),
             tracing::Span::current(),
         )));
     }
@@ -3549,6 +3557,9 @@ impl Db {
         written: (Generation, Seq),
         timeout: Duration,
     ) -> Result<(), ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let (generation, through) = written;
         let call = ClientCall::WaitDurable {
             generation,
@@ -3884,6 +3895,7 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        self.removed_write_refusal()?;
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
         if let Some(error) = write_refusal(&puts, identity) {
@@ -3998,6 +4010,7 @@ impl Db {
 
     /// Send a write and wait `wait` for its answer.
     fn send(&self, call: ClientCall, wait: Duration) -> Result<PutOk, PutError> {
+        self.removed_write_refusal()?;
         let sent = match &call {
             ClientCall::Resend { request } => Some(request.clone()),
             _ => None,
@@ -4145,6 +4158,9 @@ impl Db {
     }
 
     fn read_call(&self, call: ClientCall) -> Result<ReadOk, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         // A read over a limit is refused before it reaches the owner's thread (M9 S5).
         if let Some(error) = read_refusal(&call) {
             return Err(error);
@@ -4240,6 +4256,9 @@ impl Db {
         request: RequestId,
         generation: Option<Generation>,
     ) -> Result<TxnStatus, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let identity = RequestIdentity {
             tenant: TENANT,
             client: self.client,
@@ -4399,6 +4418,9 @@ impl Db {
     }
 
     fn route_partition(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let mut info = self.route_record(partition)?;
         info.owner_address = self.app_address_of(info.owner)?;
         Ok(info)
@@ -4661,6 +4683,9 @@ impl Db {
     /// `INVALID_ARGUMENT` for a partition this `Db` does not have, as
     /// [`Self::promote_partition`] refuses one. An empty list never means no such partition.
     pub fn node_status_in(&self, partition: PartitionId) -> Result<Vec<NodeStatus>, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if self.owner_of(partition).is_none() {
             return Err(ApiError::invalid(format!(
                 "partition {} is not one of this database's {} partitions",
@@ -5252,6 +5277,13 @@ impl Db {
         to: NodeId,
         drop: Option<NodeId>,
     ) -> Result<admin::Promoted, admin::PromoteError> {
+        if let Some(node) = self
+            .removed()
+            .then(|| self.opened.removed.get().copied())
+            .flatten()
+        {
+            return Err(admin::PromoteError::Removed { node: node.0 });
+        }
         if self.owner_of(partition).is_none() {
             return Err(admin::PromoteError::NoSuchPartition {
                 partition: partition.0,
@@ -5401,6 +5433,9 @@ impl Db {
         node: NodeId,
         aside: Option<Aside>,
     ) -> Result<BootId, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
@@ -5709,6 +5744,9 @@ impl Db {
     /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
     /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("rebuild", "it runs on one partition only") {
             return Err(error);
         }
@@ -5763,6 +5801,9 @@ impl Db {
     /// As [`Self::rebuild`]'s guards, and `UNAVAILABLE` with the fence's reason when it does
     /// not hold. Nothing is moved either way; the folder stays where it is.
     pub fn rebuild_fence(&self, node: NodeId) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let (owner, generation) = self.left_out(node)?;
         if let Some(refused) = self.wipe_fenced(node, generation, None) {
             return Err(rebuild_refused(admin::rebuild::Refused {
@@ -5799,6 +5840,9 @@ impl Db {
     /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
     /// the read timeout.
     pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("move_copy", "it runs on one partition only") {
             return Err(error);
         }
@@ -5838,6 +5882,9 @@ impl Db {
         from: NodeId,
         to: NodeId,
     ) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let partitions = self.route.partitions();
         if partition.0 == 0 || partition.0 > partitions {
             let mut error = ApiError::invalid(format!(
@@ -5887,6 +5934,9 @@ impl Db {
         release: rdb_core::contracts::recovery::TailRelease,
         give_up_live_copy: bool,
     ) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("forget_tail", "it runs on one partition only") {
             return Err(error);
         }
@@ -5920,6 +5970,9 @@ impl Db {
     pub fn pinned_members(
         &self,
     ) -> Result<(NodeId, Vec<rdb_core::contracts::membership::Member>), ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("pinned_members", "it reads one partition only")
         {
             return Err(error);
@@ -6204,6 +6257,57 @@ impl Db {
                 ));
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Whether this process's node was removed from the database (#80 S4, S-5): its `nodes/`
+    /// record is removed, as the `nodes/` watcher of a declared node process saw it. Terminal:
+    /// it never turns false, and the id is never used again. The first call that finds it,
+    /// this one or any refused call, stops this process's nodes, planner and heal (logged
+    /// `db_removed`); from then on every call is refused `INVALID_ARGUMENT` with nothing sent.
+    /// So the host stops at the first call after the removal, and an embedder should poll
+    /// `removed()` or handle the refusal. Always false for a `Db` that runs no declared node.
+    pub fn removed(&self) -> bool {
+        let Some(node) = self.opened.removed.get().copied() else {
+            return false;
+        };
+        if !self.opened.removed_stopped.swap(true, Ordering::AcqRel) {
+            for task in [&self.opened.planner_task, &self.opened.heal_task]
+                .into_iter()
+                .flatten()
+            {
+                task.abort();
+            }
+            for handle in lock(&self.nodes).iter_mut() {
+                handle.stop();
+            }
+            tracing::warn!(node = node.0, "db_removed");
+        }
+        true
+    }
+
+    /// The refusal of every call once [`Self::removed`]: `INVALID_ARGUMENT`, nothing sent.
+    fn removed_refusal(&self) -> Option<ApiError> {
+        if !self.removed() {
+            return None;
+        }
+        let node = self.opened.removed.get().map_or(0, |node| node.0);
+        let mut error = ApiError::invalid(format!(
+            "node {node} was removed; ids are never reused: this Db serves nothing again, and \
+             nothing was sent"
+        ));
+        error.no_mutation = true;
+        Some(error)
+    }
+
+    /// [`Self::removed_refusal`] as a write's refusal, with no request.
+    fn removed_write_refusal(&self) -> Result<(), PutError> {
+        match self.removed_refusal() {
+            Some(error) => Err(PutError {
+                error,
+                request: None,
+            }),
+            None => Ok(()),
         }
     }
 

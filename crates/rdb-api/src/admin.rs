@@ -3225,6 +3225,16 @@ pub enum PromoteError {
         /// The partition.
         partition: u32,
     },
+    /// This process's node was removed from the database (#80 S4, S-5), so its `Db` promotes
+    /// nothing again. Nothing was changed.
+    #[error(
+        "node {node} was removed; ids are never reused: this Db serves nothing again, and \
+         nothing was changed"
+    )]
+    Removed {
+        /// The removed node.
+        node: u32,
+    },
     /// The node to drop is the node to promote.
     #[error(
         "the node to drop is the node to promote; drop another member, or name none to drop the \
@@ -3390,6 +3400,7 @@ impl PromoteError {
                 | Self::NotAMember { .. }
                 | Self::AlreadyOwner { .. }
                 | Self::DropIsTarget
+                | Self::Removed { .. }
                 | Self::PeersUnknown { .. }
                 | Self::Unconfigured { .. }
                 | Self::StaleMembers { .. }
@@ -3415,6 +3426,7 @@ impl From<PromoteError> for ApiError {
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
             | PromoteError::DropIsTarget
+            | PromoteError::Removed { .. }
             | PromoteError::NoSuchPartition { .. } => return Self::invalid(error.to_string()),
             PromoteError::Record(_)
             | PromoteError::Unconfigured { .. }

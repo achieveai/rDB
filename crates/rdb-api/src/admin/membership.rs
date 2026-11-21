@@ -3,7 +3,7 @@
 //! `routes/0` and generation-0 placement never change; the records are the membership.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -32,9 +32,16 @@ const WATCH_RETRY: Duration = Duration::from_millis(250);
 /// [`Net::set_members`] with every record's id at the list's revision, then watch the prefix
 /// from that revision and list again on any event, and again after a failed list or a watch
 /// that fails or ends (a store outage: the re-list catches what the watch missed, R11). Runs
-/// until its task is aborted. An empty `nodes/` (an undeclared database) admits nothing new.
-/// Logged `members_list_failed` and `members_watch_failed` at warn, once per run of failures.
-pub async fn watch_members(store: Arc<dyn ConfigStore>, net: Arc<Net>) {
+/// until its task is aborted, or until a list finds the record of a node in `own` removed: it
+/// then sets `removed` to that node and ends (S-5, logged `members_own_node_removed`). An empty
+/// `nodes/` (an undeclared database) admits nothing new. Logged `members_list_failed` and
+/// `members_watch_failed` at warn, once per run of failures.
+pub async fn watch_members(
+    store: Arc<dyn ConfigStore>,
+    net: Arc<Net>,
+    own: BTreeSet<NodeId>,
+    removed: Arc<OnceLock<NodeId>>,
+) {
     let prefix = Bytes::from_static(ControlPrefix::Nodes.encode().as_bytes());
     let mut failing = false;
     loop {
@@ -43,6 +50,13 @@ pub async fn watch_members(store: Arc<dyn ConfigStore>, net: Arc<Net>) {
                 if !records.is_empty() {
                     let live: BTreeSet<NodeId> = records.keys().copied().collect();
                     net.set_members(&live, revision);
+                    // A record is never deleted, so an own id that is not live is removed: the
+                    // `Db` is done for good (S-5), and so is this watch.
+                    if let Some(node) = own_removed(&*store, &own, &live).await {
+                        tracing::warn!(node = node.0, revision, "members_own_node_removed");
+                        let _ = removed.set(node);
+                        return;
+                    }
                 }
                 failing = false;
                 revision
@@ -85,6 +99,25 @@ pub async fn watch_members(store: Arc<dyn ConfigStore>, net: Arc<Net>) {
                     break;
                 }
             }
+        }
+    }
+}
+
+/// The first of `own` whose `nodes/` record is removed, when one of them is not `live`. A failed
+/// read is logged and answers `None`: the next list asks again.
+async fn own_removed(
+    store: &dyn ConfigStore,
+    own: &BTreeSet<NodeId>,
+    live: &BTreeSet<NodeId>,
+) -> Option<NodeId> {
+    if own.is_subset(live) {
+        return None;
+    }
+    match read_removed_nodes(store).await {
+        Ok(removed) => own.intersection(&removed).next().copied(),
+        Err(error) => {
+            tracing::warn!(%error, "members_list_failed");
+            None
         }
     }
 }
