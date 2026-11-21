@@ -2133,7 +2133,8 @@ pub(crate) struct HealCtx {
     /// for every copy ([`may_leave_out`]).
     pub(crate) live_readd: bool,
     /// What the heal waits for now, in words, for `wait_ready`'s time-out to name (R5): set by
-    /// [`heal_retrying`] when an attempt ends waiting for links.
+    /// [`heal_retrying`] when an attempt ends waiting for links, and cleared as soon as an
+    /// attempt has every boot it needs, so a later step's wait never says to start a node.
     pub(crate) waiting: Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -2192,6 +2193,10 @@ pub(crate) async fn heal(ctx: HealCtx) -> Result<Healed, HealError> {
         members: boots,
         left,
     } = member_boots(&ctx, &union, &pinned, &forming, deadline).await?;
+    // PR #181 review: every link this attempt needs is up, so a wait for one is over.
+    *ctx.waiting
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     // The owner's grant alone (arch-s2 B1): another node's is either absent, or frozen by the
     // promote that moved the partition off it, which only that promote may settle. Once, for
     // every partition this node owns (issue #79).
@@ -9710,6 +9715,67 @@ mod tests {
             assert_eq!(notes, 1, "{case}: only the attempt that went on sent");
         }
         assert_eq!(r5_lines(METHOD, "heal_leave_out_expired").len(), 2);
+    }
+
+    /// PR #181 review (threads on the link-wait text): once an attempt has every link, the
+    /// text saying to start a node is gone, while a later step of that attempt still waits
+    /// (here the owner's own grant read, held 1 s); and a heal that ends leaves none, so the
+    /// next owner's first window names no finished one. Unit (~2 s). Cut: the clear after
+    /// `member_boots` removed: the old text stands through the held read, red.
+    #[test]
+    fn r5_r_the_link_wait_text_ends_once_every_link_is_up() {
+        let store = Arc::new(GrantGets::new(
+            OWNER,
+            vec![r5_delay(Duration::ZERO, Duration::from_secs(1))],
+        ));
+        let in_delay = Arc::clone(&store.in_delay);
+        let waiting: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let started = std::time::Instant::now();
+        let late: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+            (node != NodeId(3) || started.elapsed() >= Duration::from_millis(700)).then_some(OPEN_2)
+        });
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (waiting, done) = (Arc::clone(&waiting), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let (mut ever, mut held) = (false, Vec::new());
+                while !done.load(Ordering::SeqCst) {
+                    let now = waiting.lock().expect("waiting").clone();
+                    ever |= now.is_some();
+                    if in_delay.load(Ordering::SeqCst) {
+                        held.push(now);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                (ever, held)
+            })
+        };
+        let (healed, _, _) = r5_heal_in(
+            store,
+            Arc::clone(&waiting),
+            true,
+            false,
+            OsBoot::Same,
+            OWNER,
+            late,
+            &[],
+            HostClock::start(),
+            Duration::from_millis(300),
+        );
+        done.store(true, Ordering::SeqCst);
+        let (ever, held) = watcher.join().expect("the watcher");
+        healed.expect("the heal goes on once node 3 is linked");
+        assert!(ever, "the first attempt waited for node 3's link");
+        assert!(!held.is_empty(), "the owner's grant read was held");
+        assert!(
+            held.iter().all(Option::is_none),
+            "no link wait is named while the clear waits: {held:?}"
+        );
+        assert_eq!(
+            *waiting.lock().expect("waiting"),
+            None,
+            "nothing after it ends"
+        );
     }
 
     /// PR #181 review: a grant read that fails keeps its cause and its own reason,
