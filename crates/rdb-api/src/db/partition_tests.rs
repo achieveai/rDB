@@ -3125,10 +3125,10 @@ fn own83_27_a_failed_partition_read_is_unavailable_and_recovers() {
 /// address; after the second, two calls whose `nodes/1` read fails succeed with the owner, its
 /// token and the last good address, the stale one, with no `partitions/` read (the owner is
 /// cached) and nothing refreshed (each call reads `nodes/1` again). Each failure is logged
-/// `db_route_app_addr_unreadable` with `served: last_good`. Then the store answers and the next
-/// call names the new address. Cuts: the failed read answering `None`, red at the first
-/// failure ("the last good address"); the failure refreshing the stamp, red at the second
-/// ("read again, nothing refreshed"). Unit (~1.1 s: the second is wall time).
+/// `db_route_app_addr_unreadable` with `served: last_good`, at WARN. Then the store answers and
+/// the next call names the new address. Cuts: the failed read answering `None`, red at the
+/// first failure ("the last good address"); the failure refreshing the stamp, red at the second
+/// ("read again, nothing refreshed"); the warning logged at INFO, red at "WARN". Unit (~1.1 s: the second is wall time).
 #[config_log::retcd_test]
 fn own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_recovers() {
     let rt = runtime();
@@ -3178,6 +3178,7 @@ fn own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_rec
             ),
             "{line}"
         );
+        assert_eq!(line["@l"], "Warning", "WARN: {line}");
     }
     let route = db.route(G1).expect("the store answers again");
     assert_eq!(route.app_address(), Some("gw-1:9443"));
@@ -3360,9 +3361,10 @@ fn own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters() {
 
 /// own83_33 (#83 B2, SBX answer, 2026-11-20): an owner whose address no read of this `Db` has
 /// returned yet, and whose read fails, gives the owner and token with no address, twice, each
-/// call reading `nodes/1` again, and logged `db_route_app_addr_unreadable` with `served: none`.
-/// The next read that succeeds names the address. Cut: the error returned again, red at the
-/// first failure (as are own83_31 and own83_32). Unit (~0.1 s).
+/// call reading `nodes/1` again, and logged `db_route_app_addr_unreadable` with `served: none`,
+/// at WARN. The next read that succeeds names the address. Cuts: the error returned again, red
+/// at the first failure (as are own83_31 and own83_32); the warning logged at INFO, red at
+/// "WARN". Unit (~0.1 s).
 #[config_log::retcd_test]
 fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
     let rt = runtime();
@@ -3387,13 +3389,19 @@ fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
         module_path!(),
         "own83_33_a_failed_first_address_read_gives_no_address_and_recovers",
     );
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line["@m"] == "db_route_app_addr_unreadable" && line["served"] == "none")
-            .count(),
-        2
-    );
+    let unreadable: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+    for line in &unreadable {
+        assert_eq!(
+            (&line["node"], &line["served"]),
+            (&serde_json::json!(1), &serde_json::json!("none")),
+            "{line}"
+        );
+        assert_eq!(line["@l"], "Warning", "WARN: {line}");
+    }
     let route = db.route(G1).expect("the store answers again");
     assert_eq!(route.app_address(), Some("gw-1:8443"), "recovered");
     db.shutdown();
