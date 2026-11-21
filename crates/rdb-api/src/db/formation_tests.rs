@@ -4965,6 +4965,123 @@ fn own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence() {
     assert_eq!(fence.record().1, settled, "settled: nothing written");
 }
 
+/// What meets the no-address fence's write in [`none_fence_refuses_until_it_fences`].
+enum FenceMeets {
+    /// Another write lands first: the fence meets a record that moved.
+    Rival,
+    /// Its reply is lost and it has not applied: it may still apply later.
+    Late,
+    /// It applies and its reply is lost.
+    AppliedLost,
+}
+
+/// The no-address fence's refusals (PR #159 review r4, T28): B's write may still apply and node
+/// 1's folder is emptied, its marker with it, so an open given no app address owes the fence.
+/// Twice that fence's write meets `meets`: each open is refused `OpenError::Control`, before any
+/// host starts ([`Fence::open_on`] counts them), its write having reached the store, and the
+/// fence file is kept, so the next open fences again. Then a no-address open whose fence
+/// applies opens: the fence file is gone, and every write still delayed (B, and any fence write
+/// kept back) is refused when it arrives. A restart with no address writes nothing.
+fn none_fence_refuses_until_it_fences(meets: FenceMeets) {
+    const A: &str = "gw-1.a:8443";
+    const C: &str = "gw-1.c:7443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    let owed = fence.dir.0.join(APP_ADDR_FENCE_FILE);
+    let rt = &fence.rig.rt;
+    let mut held = (Some(A.to_owned()), r);
+    for attempt in 1..=2 {
+        let (step, why) = match meets {
+            FenceMeets::Rival => (
+                NodePut::Rival(fence.bytes_with(C)),
+                "changed after this open read it",
+            ),
+            FenceMeets::Late => (NodePut::Late, "the fence's outcome is unknown"),
+            FenceMeets::AppliedLost => (NodePut::AppliedLost, "the fence's outcome is unknown"),
+        };
+        fence.store.next(step);
+        let puts = fence.node_puts();
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("the fence did not settle");
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, OpenError::Control(_))
+                && text.contains(why)
+                && text.contains("nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert_eq!(fence.node_puts(), puts + 1, "{attempt}: the fence was sent");
+        assert!(owed.exists(), "{attempt}: the fence is still owed");
+        let now = fence.record();
+        match meets {
+            FenceMeets::Late => assert_eq!(now, held, "{attempt}: not applied"),
+            FenceMeets::Rival => {
+                assert_eq!(now.0.as_deref(), Some(C), "{attempt}: the rival's bytes");
+                assert!(now.1 > held.1, "{attempt}: the rival moved it");
+            }
+            FenceMeets::AppliedLost => {
+                assert_eq!(
+                    now.0.as_deref(),
+                    Some(A),
+                    "{attempt}: the record's own bytes"
+                );
+                assert!(now.1 > held.1, "{attempt}: the fence applied");
+            }
+        }
+        held = now;
+    }
+    fence
+        .open_on(rt, None)
+        .expect("a no-address open whose fence applies");
+    assert!(!owed.exists(), "fenced: the debt is cleared");
+    let (app, fenced) = fence.record();
+    assert_eq!(app, held.0, "the fence wrote the record's own bytes");
+    assert!(fenced > held.1, "the fence moved the revision on");
+    let delayed = match meets {
+        FenceMeets::Late => 3,
+        FenceMeets::Rival | FenceMeets::AppliedLost => 1,
+    };
+    assert_eq!(
+        fence.store.deliver(rt),
+        vec![config_core::MutationOutcome::Conflict; delayed],
+        "every delayed write is refused"
+    );
+    assert_eq!(
+        fence.record(),
+        (app.clone(), fenced),
+        "nothing delayed applied"
+    );
+    fence.open_on(rt, None).expect("a no-address restart");
+    assert_eq!(fence.record(), (app, fenced), "settled: nothing written");
+}
+
+/// own83_b2_16 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence meeting a rival write that moved the record. Cut: the fence's `Conflict` accepted
+/// (the outcome check skipped), red at "the fence did not settle". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_16_a_no_address_fence_met_by_a_rival_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::Rival);
+}
+
+/// own83_b2_17 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence's reply lost before it applied. Accepting that unknown outcome would let an older
+/// write land after startup. Cut: an unknown outcome accepted as fenced, red at "the fence did
+/// not settle". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_17_a_no_address_fence_whose_outcome_is_unknown_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::Late);
+}
+
+/// own83_b2_18 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence applied and its reply lost. Cut: the fence file removed before the write is sent, red
+/// at "the fence is still owed". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_18_a_no_address_fence_applied_and_unanswered_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::AppliedLost);
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 
