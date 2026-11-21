@@ -1014,3 +1014,137 @@ async fn m2_29_crash_matrix_loses_no_acknowledged_mutation() {
 
     cluster.shutdown().await;
 }
+
+/// #186 companion row: **pins openraft 0.9.25 behaviour, not a property rEtcd wants.** While
+/// the leader's own Raft log flush is held, the leader sends no AppendEntries at all: no
+/// `Replicate` of the new entry and no heartbeat.
+///
+/// Why: in openraft 0.9.25 `RaftCore::append_to_log` awaits `RaftLogStorage::append` and then
+/// the `LogFlushed` oneshot inline, so the core task runs nothing else, ticks and heartbeats
+/// included, until the leader's own flush lands. In #186 that is a second cause of m4_69's
+/// `NotLeader`: one 2.5-2.9 s leader log fsync stopped heartbeats long enough for a follower
+/// to campaign.
+///
+/// The fix (openraft 0.10 plus an async append with group commit) decouples the two, and must
+/// change this row **on purpose**: once it lands, followers keep hearing from the leader while
+/// its flush is held, and this row goes red. Invert or retire it in that change, and say so.
+///
+/// Signal: the follower-side openraft event `Raft::append_entries`, which each receiver logs
+/// with `from` = the sender, counted from this test's own log. It covers heartbeats and
+/// replication alike. The followers' `last_log_index` not moving is the second, coarser check.
+///
+/// The hold is derived from the Raft timers, not from the deadline scale: those timers run at
+/// their real values (the scale stretches deadlines only), so a hold scaled by 3 would let the
+/// followers' election timers fire and the row would test an election instead.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn i186b_a_held_leader_log_flush_stops_replication_and_heartbeats_on_openraft_0_9() {
+    const METHOD: &str =
+        "i186b_a_held_leader_log_flush_stops_replication_and_heartbeats_on_openraft_0_9";
+    let (cluster, scripts) = rocks_cluster_with_scripts(3).await;
+    cluster
+        .wait_formed(cluster.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    let leader = cluster.leader().await;
+    let followers: Vec<NodeId> = cluster
+        .ids()
+        .into_iter()
+        .filter(|&id| id != leader)
+        .collect();
+    let seed = put_n(&*cluster.client(leader), 1, "/i186b/seed").await;
+    cluster
+        .wait_revision_all(seed, cluster.deadline(10))
+        .await
+        .expect("the seed reaches every node, so the followers start level with the leader");
+    let term = cluster.metrics(leader).current_term;
+
+    let append_entries_from_leader = || {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .filter(|row| {
+                row.get("@m").and_then(serde_json::Value::as_str) == Some("Raft::append_entries")
+                    && row.get("from").and_then(serde_json::Value::as_u64) == Some(leader.0)
+            })
+            .count()
+    };
+    let follower_logs = || -> Vec<Option<u64>> {
+        followers
+            .iter()
+            .map(|&f| cluster.metrics(f).last_log_index)
+            .collect()
+    };
+
+    let pause = scripts[&leader].pause_on_nth(Boundary::BeforeLogFlush, 1);
+    let client = cluster.client(leader);
+    let put = tokio::spawn(async move { client.put(put_req("/i186b/held", "v")).await });
+    tokio::time::timeout(cluster.deadline(10), pause.reached())
+        .await
+        .expect("the put's append reaches the leader's BeforeLogFlush");
+
+    // A message the leader sent just before its core stalled may still be on the wire. Let it
+    // land before the baseline, so the window below counts only what the stalled leader sends.
+    let timers = cluster.timers();
+    let settle = std::time::Duration::from_millis(50);
+    tokio::time::sleep(settle).await; // testkit:allow-sleep: bounded hold, the row's subject
+    let ae_before = append_entries_from_leader();
+    let logs_before = follower_logs();
+
+    // The followers last heard from the leader at most one heartbeat before the stall. Keep
+    // the whole stall under the shortest election timeout, with 50 ms to spare, so nobody
+    // campaigns: 750 - 250 - 50 - 50 = 400 ms at the harness default. That is still longer
+    // than one heartbeat interval, so a leader that kept its heartbeats would show one here.
+    let hold = timers
+        .election_timeout_min
+        .saturating_sub(timers.heartbeat + settle + std::time::Duration::from_millis(50));
+    assert!(
+        hold > timers.heartbeat,
+        "the hold ({hold:?}) must outlast one heartbeat ({:?}) or the row cannot see one",
+        timers.heartbeat
+    );
+    tokio::time::sleep(hold).await; // testkit:allow-sleep: bounded hold, the row's subject
+    let ae_after = append_entries_from_leader();
+    let logs_after = follower_logs();
+    let held_term = cluster.metrics(leader).current_term;
+
+    pause.release();
+    let resp = tokio::time::timeout(cluster.deadline(10), put)
+        .await
+        .expect("the put answers once the flush is released")
+        .expect("the put task joins")
+        .unwrap_or_else(|e| panic!("the held put commits once released: {e}"));
+
+    assert_eq!(
+        ae_after - ae_before,
+        0,
+        "followers received {} AppendEntries from leader {leader} during a {hold:?} hold of its \
+         log flush. openraft 0.9.25 sends none while append_to_log awaits LogFlushed; if \
+         replication and heartbeats are now decoupled from the leader's flush (#186's fix), \
+         change this row on purpose",
+        ae_after - ae_before
+    );
+    assert_eq!(
+        logs_after, logs_before,
+        "the followers' logs moved while the leader's own flush was held: the new entry was \
+         replicated before the leader's flush landed"
+    );
+    assert_eq!(
+        held_term, term,
+        "an election fired during the hold, so the row measured an election, not the stall"
+    );
+    assert_eq!(
+        resp.revision,
+        seed + 1,
+        "the held put commits exactly once after the release"
+    );
+    cluster
+        .wait_revision_all(seed + 1, cluster.deadline(10))
+        .await
+        .expect("the released put reaches every node");
+    assert_eq!(
+        cluster.leader().await,
+        leader,
+        "the leader kept its leadership across the hold"
+    );
+
+    cluster.shutdown().await;
+}
