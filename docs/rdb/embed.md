@@ -797,9 +797,10 @@ record. Use it to send a request to the right node.
     way: `app-addr-fence.new` first, then renamed (a crash before the rename can leave
     `app-addr-fence.new` behind, and the next such open overwrites it). The open then fences
     the record: given an app address, it writes that address even if the record already
-    holds it; given none, it writes the record's own bytes back, which changes
-    nothing in it but moves its revision on. Either way no earlier write can apply after it,
-    and the address the record held stays. The file is removed only once the fence is
+    holds it, so the record then holds the address supplied; given none, it writes the
+    record's own bytes back, which changes nothing in it but moves its revision on, so only
+    then does the record keep the address it held. Either way no earlier write can apply
+    after it. The file is removed only once the fence is
     written, so an open that fails after the node's data was created leaves it, and the next
     open on that folder fences too. You need not supply the address for this: an open with
     none fences on its own. Supply it only when an open refuses for `app-addr-pending`

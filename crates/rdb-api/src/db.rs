@@ -1989,8 +1989,10 @@ impl Db {
     /// - [`OpenError::Config`] for an address that is empty or over [`crate::MAX_APP_ADDR_LEN`]
     ///   bytes, or given on a database no declaration made; for an open given no address while
     ///   the folder's `app-addr-pending` file says an earlier write may still apply (open again
-    ///   with the address the node should hold); and for an `app-addr-pending` or
-    ///   `app-addr-fence` file that is there but cannot be read.
+    ///   with the address the node should hold); for an `app-addr-pending` file whose
+    ///   contents cannot be read; and for `app-addr-fence` metadata that cannot be looked at
+    ///   for any reason other than `NotFound`. The fence file's contents are never read: it
+    ///   counts by being there.
     /// - [`OpenError::Control`] when the node's `nodes/{id}` record cannot be read or written,
     ///   is absent or does not decode, changed after this open read it, or the write's outcome
     ///   stays unknown; the same for the fence a new or emptied folder writes. Opening again

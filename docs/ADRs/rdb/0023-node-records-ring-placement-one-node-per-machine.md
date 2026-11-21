@@ -166,10 +166,11 @@
      as the marker (`app-addr-fence.new` written, synced and renamed into place; a crash
      before the rename can leave `app-addr-fence.new` behind, and the next such open
      overwrites it), and only a fence removes it, so an open that fails after the data exists still leaves the next open
-     fencing. Given an app address, the fence is that address's write; given none, it is the
-     record's own bytes written back at the revision they were read at, which moves the
-     revision on and changes nothing else. So a no-address rejoin on an emptied folder needs
-     no address from the operator, and a late put cannot replace the address the record holds.
+     fencing. Given an app address, the fence is that address's write, so the record then
+     holds the address supplied; given none, it is the record's own bytes written back at the
+     revision they were read at, which moves the revision on and changes nothing else, so only
+     then does the record keep the address it held. So a no-address rejoin on an emptied
+     folder needs no address from the operator, and no late put can apply after the fence.
      An open given no app address while the marker is there cannot tell which address should
      win, so the marker refuses it (above), and the operator opens again with the address the
      node should hold. Each refusal says whether the outcome is known and keeps the store
