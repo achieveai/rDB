@@ -105,12 +105,15 @@ holds at the same stamp and digest is served, even when a later generation linke
 max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
 envelope that does not decode) faults that copy, so every caller waiting on it hears
 `CORRUPT_HISTORY`; only a feed reply carries the feed's step (read another copy, or rebuild).
-A put, a get or a status read hears the shared fault with the owner-fault step (#170 review r4:
-ask the write's status with its request id once another node takes over, never "write over its
-key"). The fault's detail names the seq, never a digest: both digests go only to the copy's
-local log line `feed_record_digest_mismatch` (#170 review r3). `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
-(Corrected in r2: `Trimmed` does not wait for retention. A copy that does not hold the
-cursor's record answers it today.)
+A put, a get or a status read hears the shared fault with the owner-fault step, which says
+what to do once another node takes over, by what the call did (#170 review r4 and r5). A write
+the node admitted before the fault may have applied: ask its status with its request id, never
+a new id and never "write over its key". A call refused after the fault wrote nothing: a write
+is sent again as a new write. A read has no request to ask about: it reads again. The fault's
+detail names the seq, never a digest: both digests go only to the copy's local log line
+`feed_record_digest_mismatch` (#170 review r3). `Trimmed` asks another copy or a rebuild; no
+copy trims `History` yet. (Corrected in r2: `Trimmed` does not wait for retention. A copy that
+does not hold the cursor's record answers it today.)
 
 **Amended 2026-11-20 (#170 review r2): the feed fails closed for apps.** The owner ruled on
 2026-11-20 to fail closed until a certificate binds an app to its tenants (#151). Over the links a
