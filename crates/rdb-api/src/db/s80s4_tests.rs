@@ -221,7 +221,12 @@ fn group_in(db: &Db, partition: PartitionId) -> AffinityId {
 /// Put `object` in `group` through `db` until it lands. Just after a commit re-plans the
 /// partition, its owner refuses with nothing written (`UNAVAILABLE` or `PROTECTION_PAUSED`,
 /// `no_mutation`) until the new generation serves, and the retry rule says send again; as
-/// `reopen_tests` does after a promote. Any other refusal, or one past 10 s, fails the row.
+/// `reopen_tests` does after a promote. A move's epoch revocation opens the same gap on the old
+/// owner, which answers `LEASE_EXPIRED` there (observed in M10, 2026-11-21): that is retried
+/// too, only with `no_mutation` and `RetryAfterRecovery`, because the 2026-10-24 amendment
+/// (lead rulings A-R342 and A-R343, spec §5.4) makes every `LEASE_EXPIRED` a refusal before
+/// apply that proves no mutation, retried after recovery. Any other refusal, or one past 10 s,
+/// fails the row.
 fn put_landing(db: &Db, group: AffinityId, object: &[u8], value: &[u8]) {
     let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
     loop {
@@ -229,10 +234,11 @@ fn put_landing(db: &Db, group: AffinityId, object: &[u8], value: &[u8]) {
             Ok(_) => return,
             Err(refused)
                 if refused.error.no_mutation
-                    && matches!(
+                    && (matches!(
                         refused.error.kind,
                         ErrorKind::Unavailable | ErrorKind::ProtectionPaused
-                    )
+                    ) || (refused.error.kind == ErrorKind::LeaseExpired
+                        && refused.error.retry == RetryRule::RetryAfterRecovery))
                     && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(50));
@@ -1006,5 +1012,112 @@ fn s80s4_a_removed_nodes_db_stops_its_host_and_refuses_every_call() {
             .to_string()
             .contains("node 6 was removed; ids are never reused"),
         "a promote: {promote:?}"
+    );
+}
+
+/// #80 S4 M10 (T12, N-5's add case): after M7 adds node 6 and moves one copy onto it,
+/// `admin::rebalance` moves copies until copy skew is at most 1: node 6 ends with as many copies
+/// as the others, within one. Throughout, every `partitions/` record pins three regular copies
+/// on three distinct machines, sampled every 50 ms while the moves run; a put lands in every
+/// partition through node 1 during and after. Copies only (Q4 a): node 6 owns nothing, so primary
+/// skew stays 2 and the report names the primary steps `no_live_handoff`. Integration (six node
+/// processes, real TLS).
+/// Cut: `rebalance` stops after its first copy move: the skew assert fails with copy counts
+/// {1: 5, 2: 6, 3: 5, 4: 6, 5: 6, 6: 2}, copy skew 4, red, observed 2026-11-21 at load 21.9.
+#[config_log::retcd_test]
+fn s80s4_rebalance_after_adding_a_node_ends_with_copy_skew_at_most_one() {
+    let Admitted { rig, .. } = admitted();
+    let machines: BTreeMap<NodeId, String> = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("nodes/ reads")
+        .into_iter()
+        .map(|(node, record)| (node, record.machine))
+        .collect();
+    assert_eq!(machines.len(), 6, "six live nodes: {machines:?}");
+    let one = &rig.of(NodeId(1)).db;
+    let groups: BTreeMap<u32, AffinityId> = (1..=PARTITIONS)
+        .map(|p| (p, group_in(one, PartitionId(p))))
+        .collect();
+    let check = |phase: &str| {
+        for p in 1..=PARTITIONS {
+            let (_, members) = rig.record(PartitionId(p));
+            let regular: Vec<NodeId> = members
+                .iter()
+                .filter(|(_, role)| *role != ReplicaRole::Shadow)
+                .map(|(node, _)| *node)
+                .collect();
+            let on: BTreeSet<&str> = regular.iter().map(|node| machines[node].as_str()).collect();
+            assert!(
+                regular.len() == 3 && on.len() == 3,
+                "{phase}: partitions/{p} pins {members:?}, not three regular copies on three \
+                 machines"
+            );
+        }
+    };
+    check("before");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (report, samples, puts) = std::thread::scope(|scope| {
+        let balancer = scope.spawn(|| {
+            let report = admin::rebalance(
+                one,
+                rig.rt.handle(),
+                &*rig.store,
+                &admin::RebalanceOpts {
+                    max_moves: 32,
+                    draining: BTreeSet::new(),
+                },
+            );
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            report
+        });
+        let (mut samples, mut puts) = (0u32, 0u32);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            check("during");
+            samples += 1;
+            let p = puts % PARTITIONS + 1;
+            put_landing(one, groups[&p], b"m10", b"during");
+            puts += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (
+            balancer.join().expect("the rebalance thread"),
+            samples,
+            puts,
+        )
+    });
+    let report = report.unwrap_or_else(|e| panic!("the rebalance runs: {e}"));
+    check("after");
+    for (p, group) in &groups {
+        put_landing(one, *group, b"m10", p.to_string().as_bytes());
+    }
+    let inventory = rig
+        .rt
+        .block_on(admin::inventory(&*rig.store, &BTreeSet::new()))
+        .expect("the inventory reads");
+    let counts = rdb_core::placement::copy_counts(&inventory);
+    assert!(
+        rdb_core::placement::copy_skew(&inventory) <= 1 && report.copy_skew <= 1,
+        "copy skew at most 1: {counts:?}, report {report:?}"
+    );
+    assert!(!report.moved.is_empty(), "node 6 took copies: {report:?}");
+    assert!(
+        report.moved.iter().all(|step| !step.primary),
+        "copies only: {report:?}"
+    );
+    assert!(
+        report
+            .residuals
+            .iter()
+            .any(|why| why.starts_with("no_live_handoff")),
+        "the primary steps are reported, not run: {report:?}"
+    );
+    tracing::info!(
+        moved = report.moved.len(),
+        counts = ?counts,
+        primary_skew = report.primary_skew,
+        samples,
+        puts,
+        "s80s4_m10_done"
     );
 }

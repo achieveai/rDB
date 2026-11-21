@@ -4752,8 +4752,11 @@ async fn freeze(
     }
 }
 
+pub mod balance;
 pub mod membership;
 pub(crate) mod rebuild;
+
+pub use balance::{inventory, rebalance, RebalanceOpts, RebalanceReport};
 
 pub use membership::{
     add_member, add_node, membership_settled, remove_member, remove_node, watch_members,

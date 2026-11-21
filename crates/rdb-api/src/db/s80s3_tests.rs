@@ -1353,3 +1353,95 @@ fn s80s4_a_removed_node_pinned_as_a_shadow_late_is_given_up() {
         "s80s4_late_shadow_healed"
     );
 }
+
+/// The partitions M10b declares on five nodes: 17 = 5 x 3 + 2, so the ring's two leftover
+/// windows leave copies 10, 11, 11, 10, 9 (copy skew 2).
+const M10B_P: u32 = 17;
+
+/// Copy skew of `rig`'s records, counted from `partitions/` without `admin::inventory`: max -
+/// min regular copies over nodes 1 to `k`.
+fn records_copy_skew(rig: &Rig, k: u32, partitions: u32) -> (usize, BTreeMap<u32, usize>) {
+    let mut counts: BTreeMap<u32, usize> = (1..=k).map(|n| (n, 0)).collect();
+    for p in 1..=partitions {
+        for (node, role) in pinned_roles(rig, p) {
+            if role != ReplicaRole::Shadow {
+                *counts.entry(node).or_default() += 1;
+            }
+        }
+    }
+    let max = counts.values().copied().max().unwrap_or(0);
+    let min = counts.values().copied().min().unwrap_or(0);
+    (max - min, counts)
+}
+
+/// #80 S4 M10b (T12, N-5, Q6 a): on a formed five-node ring with no add, `admin::rebalance`
+/// brings copy skew to at most 1. The shape is uneven to start: 17 partitions leave copy skew 2,
+/// asserted from the records before the run. After it: copy skew at most 1 from a fresh
+/// inventory and in the report, at least one move, copies only, every `partitions/` record pins
+/// three regular copies on three machines, and a put lands in every partition. Integration
+/// (~20-40 s).
+/// Cut: `rebalance` plans but runs no copy step: the skew assert fails with the records at
+/// {1: 10, 2: 11, 3: 11, 4: 10, 5: 9}, copy skew 2, red, observed 2026-11-21 at load 15.9.
+#[config_log::retcd_test]
+fn s80s4_rebalance_on_the_formed_ring_ends_with_copy_skew_at_most_one() {
+    let rig = declared_rig_opts(S1B_K, M10B_P, true, probe_timeouts(), None);
+    rig.wait_ready();
+    let (before, counts) = records_copy_skew(&rig, S1B_K, M10B_P);
+    assert_eq!(before, 2, "the ring starts at copy skew 2: {counts:?}");
+    let machines: BTreeMap<NodeId, String> = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("nodes/ reads")
+        .into_iter()
+        .map(|(node, record)| (node, record.machine))
+        .collect();
+    let db = rig.of(NodeId(1));
+    let report = admin::rebalance(
+        db,
+        rig.rt.handle(),
+        &*rig.store,
+        &admin::RebalanceOpts {
+            max_moves: 32,
+            draining: BTreeSet::new(),
+        },
+    )
+    .unwrap_or_else(|e| panic!("the rebalance runs: {e}"));
+    let inventory = rig
+        .rt
+        .block_on(admin::inventory(&*rig.store, &BTreeSet::new()))
+        .expect("the inventory reads");
+    let (after, counts) = records_copy_skew(&rig, S1B_K, M10B_P);
+    assert!(
+        after <= 1 && rdb_core::placement::copy_skew(&inventory) <= 1 && report.copy_skew <= 1,
+        "copy skew at most 1: records {counts:?}, report {report:?}"
+    );
+    assert!(!report.moved.is_empty(), "a copy moved: {report:?}");
+    assert!(
+        report.moved.iter().all(|step| !step.primary),
+        "copies only: {report:?}"
+    );
+    for p in 1..=M10B_P {
+        let roles = pinned_roles(&rig, p);
+        let regular: Vec<u32> = roles
+            .iter()
+            .filter(|(_, role)| **role != ReplicaRole::Shadow)
+            .map(|(node, _)| *node)
+            .collect();
+        let on: BTreeSet<&str> = regular
+            .iter()
+            .map(|node| machines[&NodeId(*node)].as_str())
+            .collect();
+        assert!(
+            regular.len() == 3 && on.len() == 3,
+            "partitions/{p} pins {roles:?}, not three regular copies on three machines"
+        );
+        put_lands(db, group_of(db, p), b"m10b", p.to_string().as_bytes());
+    }
+    tracing::info!(
+        moved = report.moved.len(),
+        counts = ?counts,
+        primary_skew = report.primary_skew,
+        residuals = ?report.residuals,
+        "s80s4_m10b_done"
+    );
+}
