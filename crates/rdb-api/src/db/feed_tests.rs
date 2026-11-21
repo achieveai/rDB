@@ -1454,20 +1454,46 @@ fn trimmed_from(db: &Db, from: FeedCursor, source: Source, who: &str) -> Seq {
     }
 }
 
-/// A put that lands in a generation newer than `than`, retried with fresh keys while node 2's
-/// rejoin commits one.
+/// Waits, bounded by [`patience`], until node 2's rejoin has settled, and returns the
+/// generation the owner then serves. Settled means the owner (R1 role `primary`):
+/// - pins node 2 as a regular secondary, and no member as a shadow;
+/// - has adopted a generation newer than `than`;
+/// - admits writes.
+///
+/// A restart's rejoin moves the generation twice, by design. The re-add commits one generation
+/// that pins node 2 as a shadow. Once that shadow catches up, `shadow_duty`'s promote (A-R329)
+/// re-plans and commits the next, which pins it regular. A put landed in between waited for
+/// durability in a generation that the promote then replaced (`GENERATION_CHANGED`). Same
+/// pattern as #191; #181's `owner_serves` is the shared form of this helper.
 #[cfg(debug_assertions)]
-fn put_in_newer(db: &Db, than: Generation) -> PutOk {
+fn owner_serves(db: &Db, than: Generation) -> Generation {
     let deadline = Instant::now() + patience();
-    let mut tries = 0_u32;
     loop {
-        tries += 1;
-        match db.put(format!("newer-{tries}").as_bytes(), b"v", None) {
-            Ok(put) if put.generation > than => return put,
-            Ok(_) => {}
-            Err(_) if Instant::now() < deadline => {}
-            Err(error) => panic!("no newer generation: {error:?}"),
+        let statuses = db
+            .node_status_in(PARTITION)
+            .expect("the partition's status");
+        let served = statuses.iter().find_map(|status| {
+            let held = status.holds.as_ref()?.generation;
+            let settled = status.role == "primary"
+                && held > than
+                && status.admits == Some(true)
+                && status.pinned.iter().any(|member| {
+                    member.node == NodeId(2)
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+                && status
+                    .pinned
+                    .iter()
+                    .all(|member| member.role != rdb_core::contracts::ids::ReplicaRole::Shadow);
+            settled.then_some(held)
+        });
+        if let Some(generation) = served {
+            return generation;
         }
+        assert!(
+            Instant::now() < deadline,
+            "node 2's rejoin never settled past {than:?}: {statuses:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1477,7 +1503,9 @@ fn put_in_newer(db: &Db, than: Generation) -> PutOk {
 /// `Db::drop_history` deletes one copy's records below a seq through its lineage's chain,
 /// as a history trim (#61) would; `applied`, `Progress` and state stay.
 /// Node 2 restarts first, so the newest generation is an inherited lineage linked to the level
-/// that holds k1-k4; then records below k3 are dropped on the owner and on node 3.
+/// that holds k1-k4; the row writes only once the rejoin's two designed generation moves
+/// (re-add as shadow, then the promote) are done ([`owner_serves`]). Then records below k3 are
+/// dropped on the owner and on node 3.
 /// (a) Owner and secondary: `START` and a cursor at k1 answer exactly `Trimmed { floor: k3 }`,
 /// found through the link; a retained cursor at k3 resumes across the link. Node 2, untouched,
 /// still serves from `START`: the floor is per copy.
@@ -1502,7 +1530,11 @@ fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
     }
     let (k1, k3, k4) = (&acks[0], &acks[2], &acks[3]);
     db.restart_node(NodeId(2)).expect("node 2 restarts");
-    let newer = put_in_newer(&db, k4.generation);
+    let serves = owner_serves(&db, k4.generation);
+    let newer = db
+        .put(b"newer", b"v", None)
+        .expect("a put once node 2's rejoin settled");
+    assert_eq!(newer.generation, serves, "{newer:?}");
     db.wait_durable(DEFAULT_GROUP, (newer.generation, newer.seq), patience())
         .expect("the newer put on every disk");
     let (all, _) = tail(&db, FeedCursor::START, Source::Owner, newer.seq);
