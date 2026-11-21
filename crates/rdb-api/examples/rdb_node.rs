@@ -75,7 +75,10 @@
 //!   a declared database has the record: a node of a database made by `--form` is refused it at
 //!   open. `--form`, `--declare` and `--gen-certs` each refuse the flag, since none of them starts
 //!   a node that would write it. Unset, the record keeps what an earlier start wrote; an address
-//!   cannot be cleared.
+//!   cannot be cleared. Unset is refused while the folder's `app-addr-pending` file says an
+//!   earlier start's write may still apply: start again with `--app-addr` and the address the
+//!   node should hold, which settles it. On a new or emptied `--dir`, an unset start fences the
+//!   record (it writes the record's own bytes back), so no late write replaces its address.
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -127,7 +130,8 @@ struct Args {
     node: Option<u32>,
     dir: Option<PathBuf>,
     listen: Option<String>,
-    /// #83 B2: `--app-addr`, the address this node's app takes forwarded requests on.
+    /// #83 B2: `--app-addr`, the address this node's app takes forwarded requests on. Unset is
+    /// refused while an earlier start's write may still apply (`app-addr-pending`).
     app_addr: Option<String>,
     peers: BTreeMap<NodeId, String>,
     control: Vec<String>,

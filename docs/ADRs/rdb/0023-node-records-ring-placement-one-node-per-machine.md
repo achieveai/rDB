@@ -161,10 +161,18 @@
      never replaced by a late one. The marker's presence is what counts: one whose text is
      damaged fences the same, and one that is there but cannot be read refuses the open with
      a step that keeps it. A node folder with no data yet (new, or emptied to rejoin) has lost
-     any marker an earlier folder held, so its open fences too. An open given no app address
-     cannot fence, so the marker refuses it (above). Each refusal says whether the outcome is
-     known and keeps the store error. The two marker files are the only files this writes in
-     the folder, besides what an open already creates.
+     any marker an earlier folder held, so its open fences too (PR #159 review r3): before the
+     engine creates the node's data, the open writes `app-addr-fence` durably, and only a
+     fence removes it, so an open that fails after the data exists still leaves the next open
+     fencing. Given an app address, the fence is that address's write; given none, it is the
+     record's own bytes written back at the revision they were read at, which moves the
+     revision on and changes nothing else. So a no-address rejoin on an emptied folder needs
+     no address from the operator, and a late put cannot replace the address the record holds.
+     An open given no app address while the marker is there cannot tell which address should
+     win, so the marker refuses it (above), and the operator opens again with the address the
+     node should hold. Each refusal says whether the outcome is known and keeps the store
+     error. The two marker files and `app-addr-fence` are the only files this writes in the
+     folder, besides what an open already creates.
    - **Reads and checks.** `NodeRecord::decode` reads both node layouts as the declared fields
      alone, and `NodeRecord::decode_with_app` also returns the app address. The declared
      fields are what every check compares: the start check decodes them; declaring a formed
@@ -281,13 +289,18 @@ every rig open passes the address check it would meet in use.
   `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`,
   `own83_b2_8_a_no_address_restart_is_refused_while_a_write_may_apply`,
   `own83_b2_9_an_emptied_folder_fences_an_equal_address_rejoin`,
-  `own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses`;
+  `own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses`,
+  `own83_b2_12_a_marker_that_cannot_be_staged_refuses_until_it_can`,
+  `own83_b2_13_a_lone_staged_marker_is_not_a_marker`,
+  `own83_b2_14_a_no_address_rejoin_on_an_emptied_folder_fences`,
+  `own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence`;
   `crates/rdb-api/src/db/partition_tests.rs`:
   `own83_25_a_changed_app_address_is_seen_within_the_gap` to
   `own83_30_no_log_line_holds_an_app_address`,
   `own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout`,
   `own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters`,
-  `own83_33_a_failed_first_address_read_gives_no_address_and_recovers`; `rdb_node`'s
+  `own83_33_a_failed_first_address_read_gives_no_address_and_recovers`,
+  `own83_34_a_reader_dropped_unfinished_ends_its_read`; `rdb_node`'s
   `own83_b2_app_addr_parses_and_form_refuses_it`; `rdb_dev`'s
   `route_line_names_the_owners_app_address_on_one_line`.
 

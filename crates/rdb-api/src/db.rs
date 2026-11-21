@@ -299,7 +299,13 @@ pub struct NodeAddresses {
     /// so). Only the app address is written; the declared address and machine never change.
     ///
     /// `None` keeps whatever the record holds: an earlier boot's address, or none. An address
-    /// cannot be cleared: `None` keeps it and an empty string is refused at open.
+    /// cannot be cleared: `None` keeps it and an empty string is refused at open. Two cases
+    /// differ (PR #159 review r3). While the folder's `app-addr-pending` file says an earlier
+    /// write may still apply, an open given `None` is refused with [`OpenError::Config`], and
+    /// the next open must give the address the node should hold, which settles it. And an open
+    /// on a new or emptied folder (no data yet, or an earlier such open that did not finish)
+    /// fences the record with `None` too: it writes the record's own bytes back, so a late
+    /// write cannot replace the address it holds. See [`Db::open`]'s errors.
     pub app: Option<String>,
 }
 
@@ -1973,6 +1979,19 @@ impl Db {
     /// but whose reply was lost can be run again against the same store;
     /// [`admin::BootstrapError::AlreadyExists`] is left for a record that changes between that
     /// check and the bootstrap.
+    ///
+    /// The app address ([`NodeAddresses::app`], #83 B2), each before any host starts:
+    ///
+    /// - [`OpenError::Config`] for an address that is empty or over [`crate::MAX_APP_ADDR_LEN`]
+    ///   bytes, or given on a database no declaration made; for an open given no address while
+    ///   the folder's `app-addr-pending` file says an earlier write may still apply (open again
+    ///   with the address the node should hold); and for an `app-addr-pending` or
+    ///   `app-addr-fence` file that is there but cannot be read.
+    /// - [`OpenError::Control`] when the node's `nodes/{id}` record cannot be read or written,
+    ///   is absent or does not decode, changed after this open read it, or the write's outcome
+    ///   stays unknown; the same for the fence a new or emptied folder writes. Opening again
+    ///   settles it: the folder's files make the next open write again.
+    /// - [`OpenError::Io`] when one of those files cannot be written.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
