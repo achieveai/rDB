@@ -327,3 +327,61 @@ fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
         "feed_waiter_stopped is not logged"
     );
 }
+
+/// Hand node 2 its held control-read answers, each replaced by `read` when that is given.
+fn land(trio: &mut Trio, held: &mut Vec<Msg>, read: Option<Result<FeedControlRead, String>>) {
+    for mut msg in held.drain(..) {
+        if let (Msg::FeedRead { read: landed, .. }, Some(read)) = (&mut msg, &read) {
+            *landed = read.clone();
+        }
+        trio.nodes[1].0.handle(msg);
+    }
+}
+
+/// The failure a refusal repeats, between "the last read failed: " and its step.
+fn failure_named(answer: Result<Answer, mpsc::TryRecvError>) -> String {
+    match answer {
+        Ok(Answer::Error { error, .. }) => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(error.detail.contains("so call again"), "{error:?}");
+            error
+                .detail
+                .split("the last read failed: ")
+                .nth(1)
+                .and_then(|rest| rest.split("; next: ").next())
+                .unwrap_or_else(|| panic!("names no failure: {error:?}"))
+                .to_owned()
+        }
+        other => panic!("not refused: {other:?}"),
+    }
+}
+
+/// Review r5 (thread 4655340435): a failed control read's error is repeated to the parked
+/// feed call as its first [`FEED_READ_FAILURE_CHARS`] characters, counted as characters, not
+/// bytes, then "..." when anything was left out. 200 two-byte `é` then 50 `x` give the 200 `é`
+/// and "..."; exactly 200 `ü` give all 200 and no "...".
+/// Cuts: no `take` (the whole error), red (the `x`s are repeated); `...` always appended, red
+/// (the 200-character error gains one).
+/// Integration (~2 s): bootstrap's discovery window, then steps on a held clock.
+#[config_log::retcd_test]
+fn f87_4_a_failed_read_is_repeated_as_at_most_200_characters() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _, _) = serving(dir.path());
+    let _hold = trio.clock.hold();
+    let mut held = Vec::new();
+
+    let long = format!("{}{}", "é".repeat(200), "x".repeat(50));
+    let answer = call_two(&trio, changes(10));
+    until_held(&mut trio, &mut held, 1);
+    land(&mut trio, &mut held, Some(Err(long)));
+    assert_eq!(
+        failure_named(answer.try_recv()),
+        format!("{}...", "é".repeat(200))
+    );
+
+    let exact = "ü".repeat(200);
+    let answer = call_two(&trio, changes(11));
+    until_held(&mut trio, &mut held, 1);
+    land(&mut trio, &mut held, Some(Err(exact.clone())));
+    assert_eq!(failure_named(answer.try_recv()), exact);
+}
