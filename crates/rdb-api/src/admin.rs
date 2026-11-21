@@ -9972,7 +9972,8 @@ mod tests {
         // every copy.
         let text = healed.expect_err("PeersUnknown").to_string();
         assert!(
-            text.ends_with("(the heal is waiting: grant_undecodable)") && !text.contains("every copy"),
+            text.ends_with("(the heal is waiting: grant_undecodable)")
+                && !text.contains("every copy"),
             "{text}"
         );
         assert!(sent.is_empty(), "{} sent", sent.len());
