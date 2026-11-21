@@ -664,7 +664,10 @@ fn sbx_147_n_real_hash_spreads_a_scopes_groups() {
 /// as row g does: the engine's own range read, not a list.
 fn left_after(w: World, scope: &Scope, group: u64) -> Vec<Bytes> {
     let partition = w.on(async { w.async_db.route(PIN).await.expect("route").partition });
-    let generation = w.db.list_in(PIN, &scope.prefix(group), None, 1).expect("list").generation;
+    let generation =
+        w.db.list_in(PIN, &scope.prefix(group), None, 1)
+            .expect("list")
+            .generation;
     let World {
         db,
         async_db,
@@ -682,7 +685,9 @@ fn left_after(w: World, scope: &Scope, group: u64) -> Vec<Bytes> {
 
 /// Write `chunks` one-byte upload chunks under document `id` of scope `c`, workspace 0.
 async fn chunked_doc(c: &ScopedDb, id: &[u8], chunks: u32) {
-    c.put(0, b(id), b(b"doc"), None).await.expect("the document");
+    c.put(0, b(id), b(b"doc"), None)
+        .await
+        .expect("the document");
     for index in 0..chunks {
         let chunk = Change::Chunk {
             upload: [7; 16],
@@ -710,7 +715,11 @@ fn sbx_147_o_delete_prefix_drains_a_document_with_255_chunks() {
     drop(c);
     let [_, _, scope_c, _] = scopes();
     let left = left_after(w, &scope_c, 0);
-    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert!(
+        left.is_empty(),
+        "{} records survive: {left:02x?}",
+        left.len()
+    );
     assert_eq!(deleted, 1, "one document");
 }
 
@@ -731,7 +740,11 @@ fn sbx_147_p_delete_prefix_splits_documents_by_their_cost() {
     drop(c);
     let [_, _, scope_c, _] = scopes();
     let left = left_after(w, &scope_c, 0);
-    assert!(left.is_empty(), "{} records survive: {left:02x?}", left.len());
+    assert!(
+        left.is_empty(),
+        "{} records survive: {left:02x?}",
+        left.len()
+    );
     assert_eq!(deleted, 2, "two documents");
 }
 
@@ -746,7 +759,10 @@ fn sbx_147_q_delete_prefix_finishes_every_write_id_it_takes() {
     let [_, _, c, _] = w.pinned();
     w.on(async {
         for i in 0..6 {
-            let put = vec![ElemOp::Put(Value::Text("k".into()), Value::Text("v".into()))];
+            let put = vec![ElemOp::Put(
+                Value::Text("k".into()),
+                Value::Text("v".into()),
+            )];
             c.write(0, Bytes::from(format!("map{i}")), Change::Map(put), None)
                 .await
                 .unwrap_or_else(|e| panic!("control: map {i} under the cap: {:?}", e));
@@ -801,15 +817,31 @@ fn sbx_147_s_write_as_replays_in_its_scope_and_is_isolated_from_another() {
         let first = first.expect("A n=5").expect("sent");
         let again = a.resend_within(first.sent.clone(), DEADLINE).await;
         let again = again.expect("A's token resent");
-        assert_eq!(again.ok.seq, first.ok.seq, "the resend replays the first answer");
-        match a.status(1, 5, Some(first.ok.generation)).await.expect("status") {
+        assert_eq!(
+            again.ok.seq, first.ok.seq,
+            "the resend replays the first answer"
+        );
+        match a
+            .status(1, 5, Some(first.ok.generation))
+            .await
+            .expect("status")
+        {
             TxnStatus::Resolved(result) => assert_eq!(result.seq, first.ok.seq),
             other => panic!("n=5 is resolved: {other:?}"),
         }
         let reused = a.write_as(1, 5, b(b"doc"), doc(b"A2"), None).await;
         let reused = reused.expect_err("n=5 compiled again");
-        assert_eq!(reused.error.kind, ErrorKind::RequestIdReuse, "{}", reused.error);
-        assert_eq!(value(&a, 1, b"doc").await, Some(b(b"A1")), "nothing new written");
+        assert_eq!(
+            reused.error.kind,
+            ErrorKind::RequestIdReuse,
+            "{}",
+            reused.error
+        );
+        assert_eq!(
+            value(&a, 1, b"doc").await,
+            Some(b(b"A1")),
+            "nothing new written"
+        );
         let other = c.write_as(1, 5, b(b"doc"), doc(b"C1"), None).await;
         let other = other.expect("C n=5").expect("sent");
         assert_ne!(other.ok.seq, first.ok.seq, "C's n=5 is its own request");
@@ -851,9 +883,16 @@ fn sbx_147_t_a_stopped_delete_prefix_counts_its_pages_and_a_rerun_finishes() {
             .expect_err("the cap stops it on page 2");
         assert_eq!(stopped.error.error.kind, ErrorKind::Overloaded, "{stopped}");
         let first = stopped.deleted;
-        assert!(first > 1_000 && first < DOCS as u64, "first run counted {first}");
+        assert!(
+            first > 1_000 && first < DOCS as u64,
+            "first run counted {first}"
+        );
         let listed = a.list(0, Bytes::new(), None, MAX_PAGE).await.expect("list");
-        assert_eq!(listed.entries.len() as u64, DOCS as u64 - first, "count matches the store");
+        assert_eq!(
+            listed.entries.len() as u64,
+            DOCS as u64 - first,
+            "count matches the store"
+        );
         let until = Instant::now() + retention * 4 + Duration::from_secs(10);
         let rest = loop {
             match a.delete_prefix(0, Bytes::new(), DEADLINE).await {
@@ -865,7 +904,11 @@ fn sbx_147_t_a_stopped_delete_prefix_counts_its_pages_and_a_rerun_finishes() {
                 Err(e) => panic!("rerun: {e}"),
             }
         };
-        assert_eq!(first + rest, DOCS as u64, "the rerun counts exactly the rest");
+        assert_eq!(
+            first + rest,
+            DOCS as u64,
+            "the rerun counts exactly the rest"
+        );
         let listed = a.list(0, Bytes::new(), None, MAX_PAGE).await.expect("list");
         assert!(listed.entries.is_empty(), "{} left", listed.entries.len());
     });

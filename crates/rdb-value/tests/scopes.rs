@@ -437,8 +437,14 @@ fn a_list_part_deleted_reads_as_a_shorter_list() {
         let s = k.snapshot();
         let version = s.version(Namespace::User, root.as_bytes()).unwrap();
         let ops = push(at, (at + 50).min(255));
-        let made =
-            compile_list(&s, &root, Expected::Version(version), DEFAULT_BLOCK_MAX, &ops).unwrap();
+        let made = compile_list(
+            &s,
+            &root,
+            Expected::Version(version),
+            DEFAULT_BLOCK_MAX,
+            &ops,
+        )
+        .unwrap();
         k.commit(made.compiled());
     }
     let full = items(&k.snapshot(), &root, Start::Position(0), 1_000).unwrap();
@@ -477,16 +483,30 @@ fn a_blob_part_deleted_reads_as_absent() {
     )
     .unwrap();
     k.commit(&made);
-    assert_eq!(read_range(&k.snapshot(), &root, 0, 255).unwrap(), bytes, "control");
-    let version = k.snapshot().version(Namespace::User, root.as_bytes()).unwrap();
-    let batch = delete_object(&k.snapshot(), &root, Some(version)).unwrap().unwrap();
+    assert_eq!(
+        read_range(&k.snapshot(), &root, 0, 255).unwrap(),
+        bytes,
+        "control"
+    );
+    let version = k
+        .snapshot()
+        .version(Namespace::User, root.as_bytes())
+        .unwrap();
+    let batch = delete_object(&k.snapshot(), &root, Some(version))
+        .unwrap()
+        .unwrap();
     k.commit_any_order(&batch);
-    let read = read_blob(&k.snapshot(), &root)
-        .and_then(|found| found.map(|blob| read_range(&k.snapshot(), &root, 0, blob.manifest.size)).transpose());
+    let read = read_blob(&k.snapshot(), &root).and_then(|found| {
+        found
+            .map(|blob| read_range(&k.snapshot(), &root, 0, blob.manifest.size))
+            .transpose()
+    });
     let read = read.unwrap_or_else(|e| panic!("after one batch the blob reads back: {e:?}"));
     assert_eq!(read, None, "absent after its root went first");
     // The chunks left go on under `expect`, since the blob it named is deleted.
-    let rest = delete_object(&k.snapshot(), &root, Some(version)).unwrap().unwrap();
+    let rest = delete_object(&k.snapshot(), &root, Some(version))
+        .unwrap()
+        .unwrap();
     assert!(!rest.mutations.is_empty());
     finish_delete(&mut k, &root);
 }

@@ -698,9 +698,7 @@ pub fn delete_object(
         (Some(expected), Some(found)) if expected != found => {
             return Err(ApplyError::VersionConflict { expected, found }.into());
         }
-        (Some(_), None) if !only_chunks(&mutations) => {
-            return Err(ApplyError::ObjectAbsent.into())
-        }
+        (Some(_), None) if !only_chunks(&mutations) => return Err(ApplyError::ObjectAbsent.into()),
         _ => {}
     }
     if let Some(version) = root_version {
@@ -780,9 +778,18 @@ fn partial_delete(
                 .collect();
             let mut take = ops.len();
             while take > 0 {
-                match compile_collection(snapshot, root, kind, Expected::Version(version), &ops[..take]) {
+                match compile_collection(
+                    snapshot,
+                    root,
+                    kind,
+                    Expected::Version(version),
+                    &ops[..take],
+                ) {
                     Ok(compiled) if fits(&compiled) => return Ok(Some(compiled)),
-                    Ok(_) | Err(ValueError::Apply(ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. })) => take /= 2,
+                    Ok(_)
+                    | Err(ValueError::Apply(
+                        ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. },
+                    )) => take /= 2,
                     Err(error) => return Err(error),
                 }
             }
@@ -792,12 +799,22 @@ fn partial_delete(
             let count = list(snapshot, root)?.map_or(0, |found| found.count);
             let mut take = count.min(MAX_CLEAR_DELETES as u64);
             while take > 0 {
-                let ops = vec![ListOp::Remove { at: 0 }; usize::try_from(take).unwrap_or(usize::MAX)];
-                match compile_list(snapshot, root, Expected::Version(version), DEFAULT_BLOCK_MAX, &ops) {
+                let ops =
+                    vec![ListOp::Remove { at: 0 }; usize::try_from(take).unwrap_or(usize::MAX)];
+                match compile_list(
+                    snapshot,
+                    root,
+                    Expected::Version(version),
+                    DEFAULT_BLOCK_MAX,
+                    &ops,
+                ) {
                     Ok(compiled) if fits(compiled.compiled()) => {
                         return Ok(Some(compiled.compiled().clone()))
                     }
-                    Ok(_) | Err(ValueError::Apply(ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. })) => take /= 2,
+                    Ok(_)
+                    | Err(ValueError::Apply(
+                        ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. },
+                    )) => take /= 2,
                     Err(error) => return Err(error),
                 }
             }
