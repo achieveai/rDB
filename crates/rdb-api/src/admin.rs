@@ -2078,7 +2078,7 @@ pub enum HealError {
     /// No handshake from these nodes within the heal's time, so the plan cannot pin their boots.
     #[error(
         "no link to node {who} came up within {secs} seconds, so the heal cannot pin its \
-         boot: start node {who}, then open again (it waits for every copy: {reason})",
+         boot: start node {who}, then open again (the heal is waiting: {reason})",
         who = names_in_words(.nodes),
         secs = seconds_in_words(*.within_ms)
     )]
@@ -9719,6 +9719,13 @@ mod tests {
         assert!(
             matches!(&healed, Err(HealError::PeersUnknown { reason, .. }) if *reason == "grant_undecodable"),
             "{healed:?}"
+        );
+        // Thread 13: a reason that may clear by itself is said neutrally, never as a wait for
+        // every copy.
+        let text = healed.expect_err("PeersUnknown").to_string();
+        assert!(
+            text.ends_with("(the heal is waiting: grant_undecodable)") && !text.contains("every copy"),
+            "{text}"
         );
         assert!(sent.is_empty(), "{} sent", sent.len());
         let warned = r5_lines(METHOD, "heal_copy_grant_unreadable");
