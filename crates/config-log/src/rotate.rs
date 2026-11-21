@@ -18,8 +18,11 @@
 //! One writer per log. The open takes an exclusive OS lock on `<dir>/.<name>.lock` and holds it
 //! until the writer drops; a second writer of the same log, in this process or another, is
 //! refused with `WouldBlock` naming the log. Two writers would rename and remove each other's
-//! files. The lock goes with the process, so a crash leaves nothing to clear; the lock file
-//! itself stays, empty, and is hidden from a `<name>*` glob.
+//! files. [`crate::init`] takes the same lock for a log that does not rotate, so a rotating and
+//! a non-rotating writer cannot share one either. The lock goes with the process, so a crash
+//! leaves nothing to clear; the lock file itself stays, empty, and is hidden from a `<name>*`
+//! glob. `name` must be a plain file name, with no separator and not `.` or `..`, so the log,
+//! its rotations and its lock all stay in `dir`.
 //!
 //! The non-blocking worker discards writer errors without a word. So a rotation that fails (a
 //! remove, rename or open refused) prints the path and the error on stderr, best effort, and the
@@ -91,9 +94,10 @@ pub struct SizeRotatingFile {
     /// False after the rename when the new live file could not be opened: `file` is then
     /// `<name>.1`, nothing rotates, and each write tries to open `<name>` first.
     live: bool,
-    /// Held for the writer's life: the OS lock on `.<name>.lock` that keeps this log to one
-    /// writer.
-    _lock: File,
+    /// Held for the writer's life: the lock that keeps this log to one writer.
+    _lock: LogLock,
+    /// Where a failed rotation is reported: stderr, or a test's failing sink.
+    diagnostics: Box<dyn Write + Send>,
     /// Test-only faults: the next this many renames of the live file, or opens of a new live
     /// file, fail as if the OS refused them.
     #[cfg(test)]
@@ -107,16 +111,18 @@ impl SizeRotatingFile {
     /// files at or past `max_files`.
     ///
     /// # Errors
-    /// `max_files` under 2 or `max_bytes` of 0 is `InvalidInput`; another writer holding this
-    /// log is `WouldBlock`; a file that cannot be opened or removed is that error.
+    /// `max_files` under 2, `max_bytes` of 0 or a `name` that is not a plain file name is
+    /// `InvalidInput`; another writer holding this log is `WouldBlock`; a file that cannot be
+    /// opened or removed is that error.
     pub fn open(dir: &Path, name: &str, rotation: SizeRotation) -> io::Result<Self> {
+        check_name(name)?;
         if rotation.max_files < 2 || rotation.max_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("log rotation needs max_files >= 2 and max_bytes > 0, got {rotation:?}"),
             ));
         }
-        let lock = lock(dir, name)?;
+        let lock = lock_log(dir, name)?;
         prune(dir, name, rotation.max_files)?;
         let path = dir.join(name);
         let file = open_append(&path)?;
@@ -129,6 +135,7 @@ impl SizeRotatingFile {
             written,
             live: true,
             _lock: lock,
+            diagnostics: Box::new(io::stderr()),
             #[cfg(test)]
             fail_live_rename: 0,
             #[cfg(test)]
@@ -234,11 +241,12 @@ impl SizeRotatingFile {
     }
 
     /// Best effort: a stderr that cannot be written must not stop the line being appended.
-    fn say(&self, what: &str) {
+    fn say(&mut self, what: &str) {
+        let live = self.path(0);
         let _ = writeln!(
-            io::stderr(),
+            self.diagnostics,
             "config-log: log rotation of {}: {what}",
-            self.path(0).display()
+            live.display()
         );
     }
 }
@@ -269,8 +277,31 @@ impl Write for SizeRotatingFile {
     }
 }
 
-/// Take the exclusive lock that keeps `dir/name` to one writer.
-fn lock(dir: &Path, name: &str) -> io::Result<File> {
+/// `name` as a plain file name: not empty, not `.` or `..`, and no `/` or `\\` (either is a
+/// separator on Windows).
+fn check_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log file name {name:?} must be a plain file name, with no folder in it"),
+        ));
+    }
+    Ok(())
+}
+
+/// The OS lock on `<dir>/.<name>.lock`, held while a process writes `<dir>/<name>`; dropping it
+/// releases the lock.
+pub(crate) struct LogLock {
+    _file: File,
+}
+
+/// Take the exclusive lock that keeps `dir/name` to one writer, rotating or not.
+///
+/// # Errors
+/// A `name` that is not a plain file name is `InvalidInput`; another writer holding it is
+/// `WouldBlock`, naming the log; a lock file that cannot be opened or locked is that error.
+pub(crate) fn lock_log(dir: &Path, name: &str) -> io::Result<LogLock> {
+    check_name(name)?;
     let path = dir.join(format!(".{name}.lock"));
     let file = OpenOptions::new()
         .create(true)
@@ -279,7 +310,7 @@ fn lock(dir: &Path, name: &str) -> io::Result<File> {
         .open(&path)
         .map_err(|e| with_path(e, "open", &path))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(LogLock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
@@ -479,6 +510,72 @@ mod tests {
         let _other = SizeRotatingFile::open(dir.path(), "m.jsonl", ROTATION).expect("other log");
         drop(first);
         let _again = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("reopen");
+    }
+
+    /// A diagnostics sink that refuses every write, as a closed or full stderr does.
+    struct Unwritable;
+
+    impl Write for Unwritable {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("stderr is gone"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("stderr is gone"))
+        }
+    }
+
+    /// Review r2 (PR #182): a failed rotation reports on stderr, best effort. With stderr
+    /// unwritable, the writer does not panic or fail, and every line still reaches the file:
+    /// through a failed rename (the cap exceeded) and a failed open (the renamed file).
+    #[test]
+    fn r158_a_failed_rotation_with_stderr_unwritable_still_writes_every_line() {
+        let rotation = SizeRotation {
+            max_bytes: 100,
+            max_files: 20,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", rotation).expect("open");
+        file.diagnostics = Box::new(Unwritable);
+        file.write_all(&line(0)).expect("write");
+        file.write_all(&line(1)).expect("write");
+        file.fail_live_rename = 2;
+        for i in 2..5 {
+            file.write_all(&line(i))
+                .expect("a write through a failed rename");
+        }
+        file.fail_live_open = 1;
+        for i in 5..10 {
+            file.write_all(&line(i))
+                .expect("a write through a failed open");
+        }
+        file.flush().expect("flush");
+        assert_eq!(lines_on_disk(dir.path()), (0..10).collect::<Vec<_>>());
+    }
+
+    /// Review r2 (PR #182): the name is a plain file name. A name with a separator or `..`
+    /// would put the log, its rotations and its lock outside `dir`; it is refused.
+    #[test]
+    fn r158_a_name_that_is_not_a_plain_file_name_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "./n.jsonl",
+            "a/n.jsonl",
+            "../n.jsonl",
+            "..",
+            ".",
+            "",
+            "a\\n.jsonl",
+        ] {
+            let error = SizeRotatingFile::open(dir.path(), bad, ROTATION)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} was accepted"));
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 
     /// Review r1 (PR #182): a write that brings the file to exactly `max_bytes` stays in it; one
