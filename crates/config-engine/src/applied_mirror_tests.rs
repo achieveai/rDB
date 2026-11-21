@@ -25,7 +25,9 @@ use config_storage::{
 use futures::StreamExt;
 
 use crate::watch::WatchHub;
-use crate::{ConfigNode, FormationPlan, InProcTransport, NetFault, NodeConfig, StorageHandle};
+use crate::{
+    AdminError, ConfigNode, FormationPlan, InProcTransport, NetFault, NodeConfig, StorageHandle,
+};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -197,6 +199,119 @@ async fn i186_engine_cheap_reads_answer_during_an_apply_write() {
         .await
         .expect("put task joins")
         .expect("the parked put completes");
+    node.stop().await.expect("stop");
+}
+
+/// #194: `journal_view` and one pass of the leader's retention tick answer while an apply is
+/// inside its write. Both run on Tokio workers; before #194 each took the state-machine lock
+/// through `journal_stats` (and the tick through `compact_revision` too), and a leader whose
+/// tick waited out its own fsync stalled the worker its heartbeats were sent from.
+///
+/// The tick runs on its own thread under `block_on`: a pass that blocks on the lock never
+/// yields, so a Tokio timeout could not fail it.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn i194_engine_journal_view_and_retention_answer_during_an_apply_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let node = start_node(dir.path(), Arc::clone(&park)).await;
+    let principal = Principal::development();
+    node.put(&principal, put("/i194/a"))
+        .await
+        .expect("the seed put applies");
+    let before = node.journal_view();
+    assert_eq!(before.count, 1, "the seed put is journaled");
+
+    let (reached, release) = park.arm();
+    let writing = {
+        let node = node.clone();
+        let principal = principal.clone();
+        tokio::spawn(async move { node.put(&principal, put("/i194/b")).await })
+    };
+    wait_reached(reached).await;
+
+    let n = node.clone();
+    let during = promptly("journal_view", move || n.journal_view());
+    assert_eq!(
+        during, before,
+        "the parked batch is not on disk, so the journal view must not count it"
+    );
+    let n = node.clone();
+    promptly("evaluate_retention", move || {
+        futures::executor::block_on(n.evaluate_retention_once());
+    });
+
+    release.send(()).unwrap();
+    writing
+        .await
+        .expect("put task joins")
+        .expect("the parked put completes");
+    assert_eq!(
+        node.journal_view().count,
+        2,
+        "the released batch is counted"
+    );
+    node.stop().await.expect("stop");
+}
+
+/// #192 review blocker: a same-id `add_learner` issued while the `RetireNode` apply for that
+/// id is parked inside its write is refused as `Retired`, never proposed.
+///
+/// Node ids are never reused: that is a safety rule, so the readmission check must not read
+/// the mirror, which still says "not retired" until the write lands. With the check on the
+/// mirror (1d0ad90) the learner was proposed and the call answered `Ok`.
+///
+/// The add is given 300 ms to reach its check before the write is released. On a host so
+/// slow that it reaches the check only after the release, the row passes on either code; it
+/// can be falsely green, never falsely red.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn i192_add_learner_during_a_parked_retire_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let node = start_node(dir.path(), Arc::clone(&park)).await;
+
+    // Id 9 was never a member, so `remove_member` goes straight to step 3, `RetireNode`.
+    let (reached, release) = park.arm();
+    let retiring = {
+        let node = node.clone();
+        tokio::spawn(async move { node.remove_member(NodeId(9)).await })
+    };
+    wait_reached(reached).await;
+    assert!(
+        !node.retired_nodes().contains(&NodeId(9)),
+        "the mirror does not yet show the parked retirement"
+    );
+
+    let adding = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            node.add_learner(
+                NodeId(9),
+                "inproc://9".to_string(),
+                "inproc://9-client".to_string(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await; // testkit:allow-sleep
+    release.send(()).unwrap();
+
+    retiring
+        .await
+        .expect("retire task joins")
+        .expect("the retirement completes");
+    let added = tokio::time::timeout(PATIENCE, adding)
+        .await
+        .expect("add_learner answers")
+        .expect("add task joins");
+    assert!(
+        matches!(added, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
+        "a same-id add_learner during the parked retirement must be refused, got {added:?}"
+    );
+    let report = node.membership_report();
+    assert!(
+        !report.learners.contains(&NodeId(9)) && !report.membership.voters.contains(&NodeId(9)),
+        "the retired id must not have re-entered membership"
+    );
     node.stop().await.expect("stop");
 }
 

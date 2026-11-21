@@ -1010,6 +1010,13 @@ impl ConfigNode {
         self.inner.reader.compact_revision().unwrap_or(0)
     }
 
+    /// One pass of the leader's retention tick, for the #194 row that holds an apply inside
+    /// its write and shows the tick does not wait for it.
+    #[cfg(test)]
+    pub(crate) async fn evaluate_retention_once(&self) {
+        self.inner.evaluate_retention().await;
+    }
+
     /// A digest over retained journal events above `from_exclusive` (test plan TA-31).
     ///
     /// Separate from [`ConfigNode::state_hash`], which keeps its M1/M2 definition: a
@@ -1271,6 +1278,22 @@ impl NodeInner {
         self.reader.is_retired(node_id)
     }
 
+    /// The readmission fence for `add_learner` and `promote_voter`, read under the
+    /// state-machine lock, never from the applied mirror.
+    ///
+    /// "A node id is never reused" is a safety rule, so it must not depend on the mirror. The
+    /// mirror moves only after a `RetireNode` batch is written, so while that write is in
+    /// flight it still says "not retired", and a same-id `add_learner` issued in that window
+    /// would pass and be proposed (#192 review). Under the lock, the check waits for the apply
+    /// and sees the retirement, as it did before #186. This is a rare admin path, so a wait of
+    /// one fsync here is fine; the per-RPC peer-plane check keeps `is_retired`.
+    fn is_retired_for_readmission(&self, node_id: NodeId) -> bool {
+        let mut retired = false;
+        self.reader
+            .with_state(&mut |s| retired = s.is_retired(node_id));
+        retired
+    }
+
     /// Refuse unless this node is the leader *now*, with the best hint it can prove.
     ///
     /// A pre-check, not the authority: `change_membership` re-checks on the core task and
@@ -1441,8 +1464,9 @@ impl NodeInner {
             });
         }
         // Before anything is proposed: a retired id must never re-enter membership, not even
-        // as a learner (M5-62).
-        if self.is_retired(node_id) {
+        // as a learner (M5-62). Under the state-machine lock, not the mirror: see
+        // `is_retired_for_readmission`.
+        if self.is_retired_for_readmission(node_id) {
             return Err(AdminError::Retired { node_id });
         }
         if self
@@ -1473,7 +1497,7 @@ impl NodeInner {
 
     async fn promote_voter_inner(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
         self.require_leader()?;
-        if self.is_retired(node_id) {
+        if self.is_retired_for_readmission(node_id) {
             return Err(AdminError::Retired { node_id });
         }
         let report = self.membership_report();
@@ -2323,7 +2347,10 @@ impl NodeInner {
                 .map_or(0, |(rev, _)| rev.saturating_add(1))
         };
 
-        let Ok(stats) = self.reader.journal_stats() else {
+        // One read of the store's last durable batch, not the state-machine lock, so this tick
+        // on a Tokio worker never waits out an apply's fsync (#194). Its floor can lag a
+        // compaction still writing; `StateReader::retention_inputs` says why that is safe.
+        let Ok((stats, compact_revision)) = self.reader.retention_inputs() else {
             return;
         };
         let view = JournalView {
@@ -2332,7 +2359,6 @@ impl NodeInner {
             count: stats.count,
             bytes: stats.bytes,
         };
-        let compact_revision = self.reader.compact_revision().unwrap_or(0);
         let Some((up_to, reason)) = retention_target(
             view,
             &self.retention,
