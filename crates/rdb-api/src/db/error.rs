@@ -125,8 +125,11 @@ pub(crate) const DAMAGED_OBJECT_STEP: &str =
      (in rdb_dev: `admin clear <object>`), then write it again";
 
 /// The step of a feed read's `CORRUPT_HISTORY` (#87): the cursor's record has another digest
-/// here, or a record does not parse. "Write over its key" is a map entry's step, which a feed
-/// caller cannot act on.
+/// here, or a stored `User` key the call scans does not parse; or the copy's stored history is
+/// missing or damaged (a record unreadable, not decoding, not matching its digest, naming
+/// another seq, or missing between the floor and the cap), or a read of its floor finds it
+/// corrupt, which faults the node, and then only feed replies carry this step (review r3).
+/// "Write over its key" is a map entry's step, which a feed caller cannot act on.
 pub(crate) const FEED_HISTORY_STEP: &str = "the history at this copy is unreadable from this \
      cursor: read from another copy (the owner or another member), or rebuild from your own \
      source";

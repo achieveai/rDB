@@ -15197,8 +15197,9 @@ impl Host {
         };
         let engine = &self.engine;
         // Stored damage faults the node as any history read that finds it does, typed
-        // `CORRUPT_HISTORY` with the feed's step, so every caller answered with the fault knows
-        // to read another copy (review r1). Any other storage fault stays a generic host fault.
+        // `CORRUPT_HISTORY` (review r1). Only a feed caller's answer carries the feed's step,
+        // read another copy ([`Fault::feed_error`]); a put, a get or a status read hears the
+        // owner-fault step (review r3/r4). Any other storage fault stays a generic host fault.
         let read = |seq: Seq| -> Result<Option<(ReplicationEnvelope, usize)>, Fault> {
             let Some((_, _, record)) = engine
                 .get(partition, newest, Namespace::History, &seq.0.to_be_bytes())
@@ -16582,7 +16583,8 @@ fn feed_no_copy(node: NodeId, partition: PartitionId, why: &str) -> ApiError {
 
 /// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`. A feed
 /// call answered with it hears [`Fault::feed_error`], which adds the feed's step
-/// ([`FEED_HISTORY_STEP`]); a put or a get hears [`Fault::error`] without it (review r2).
+/// ([`FEED_HISTORY_STEP`]); a put or a get hears [`Fault::error`] without it (review r2), and
+/// with the owner-fault step (review r4).
 fn feed_damage(detail: String) -> Fault {
     Fault {
         damage: Some(ErrorKind::CorruptHistory),

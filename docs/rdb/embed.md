@@ -1110,7 +1110,8 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** A build with this setting speaks wire version 10. An older build speaks 9,
+- **Mixed builds.** A build with this setting speaks the wire version in `PROTOCOL_VERSION` (10
+  at this commit; set at merge). An older build speaks 9,
   and the two refuse each other when they connect, each logging `net_handshake_refused` with
   both versions. So an older node is never added back live, and it cannot link at all. The
   same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
@@ -1394,7 +1395,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 10 (issues #107 and #87), and the handshake
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (10 at this commit; set
+  at merge; issues #107 and #87), and the handshake
   refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
@@ -1695,16 +1697,28 @@ loop {
   - `Trimmed`: the copy does not hold the record you need (`floor` is the lowest it serves).
     Ask another copy, which may still hold it, or rebuild from your own source. No copy
     trims its `History` on a schedule yet (#61), but this answer can come today: a copy
-    that does not hold your cursor's record answers it. Handle it.
-  - `Rewound`: **a promote cut records you have already applied.** Undo what you applied above
-    `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB has lost.
+    that does not hold your cursor's record, or the record a cut leaves you at, answers it,
+    and that does not fault the copy. Handle it. (A record missing between the lowest the copy
+    serves and what it may serve, met while paging, is damage instead: see below.)
+  - `Rewound`: **records above `to` are not on this copy's history**, usually because a
+    promote cut records you have already applied. It can also mean the copy cannot place your
+    cursor's generation on its chain; `to` is then `FeedCursor::START`, a longer replay than
+    needed, never a gap. A cursor whose record the copy still holds, at the same stamp and
+    digest, is served instead, even after a later generation linked above it. Undo what you
+    applied above `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB
+    has lost.
   - `CORRUPT_HISTORY` error: this copy holds your cursor's position with another digest
     (the cursor may come from another partition, the copies may have diverged, or the record
-    may be damaged), or a record due to you does not parse; or the copy's stored history is
-    damaged (a record unreadable, misplaced, not matching its digest, or missing below what
-    it serves), and then that node stops serving and every call to it hears the fault. The
-    history at this copy is unreadable from this cursor: read from another copy (the owner or
-    another member), or rebuild from your own source, and report it.
+    may be damaged), or a stored key in any record the call scans does not parse (keys are
+    parsed before the tenant filter, so another tenant's record counts too); or the copy's
+    stored history is damaged (a record unreadable, misplaced, not matching its digest, or
+    missing below what it serves), and then that node stops serving and every call to it
+    hears the fault. The history at this copy is unreadable from this cursor: read from
+    another copy (the owner or another member), or rebuild from your own source, and report
+    it. Only a feed reply says that; a put, a get or a status read at that node hears the
+    owner-fault step (ask the write's status once another node takes over). The fault names
+    the record's seq, never its digests: those are only in that node's local log line
+    `feed_record_digest_mismatch`.
 - **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
   reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
   applied, which can be ahead of the owner's published position.
@@ -1723,9 +1737,10 @@ loop {
   answers the same until it is a member again. An owner whose grant does not admit refuses
   as a write's admission would, usually `LEASE_EXPIRED`, with no hint naming the new owner.
   Right after a promote the new owner answers `LEASE_EXPIRED` until it holds its grant: call
-  again. An old owner the promote left out keeps answering so: `Source::Owner` re-reads who
-  owns the partition and asks the new owner; with `Source::Node` of the old owner, switch to
-  `Source::Owner` or another copy.
+  again. An old owner the promote left out keeps answering so: on that answer, `Source::Owner`
+  re-reads who owns the partition for the next call only, so call again and that call reaches
+  the new owner; with `Source::Node` of the old owner, switch to `Source::Owner` or another
+  copy.
 - **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
   may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
   undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last

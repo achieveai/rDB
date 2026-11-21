@@ -3302,9 +3302,13 @@ impl Db {
     ///
     /// The other answers say what to do: [`FeedPage::Behind`] keeps the cursor (wait, or ask
     /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
-    /// rebuild from the app's own source); [`FeedPage::Rewound`] means the cursor's record was
-    /// cut: retract what was applied above `to` and resume from `to`. See `docs/rdb/embed.md`,
-    /// "Change feed".
+    /// rebuild from the app's own source): the cursor's record, or the record a cut leaves you
+    /// at, that this copy no longer holds answers `Trimmed` and does not fault the node (only a
+    /// record missing between the floor and the cap, met while paging, does);
+    /// [`FeedPage::Rewound`] means records above `to` are not on this copy's history: a promote
+    /// cut them, or this copy cannot place the cursor's generation on its chain and `to` is
+    /// [`FeedCursor::START`] (a longer replay than needed, never a gap). Retract what was
+    /// applied above `to` and resume from `to`. See `docs/rdb/embed.md`, "Change feed".
     ///
     /// # Errors
     ///
@@ -3317,19 +3321,23 @@ impl Db {
     /// fails or names another generation or membership. Follow the returned error: its retry
     /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
     /// copy is left out). `UNAVAILABLE` also when no answer came within the read timeout, or
-    /// `Source::Node(n)` names a node this process has no link to. `INCOMPATIBLE_VERSION` when
+    /// `Source::Node(n)` names a node in another process this one has no link up to
+    /// (`RetryAfterRecovery`); a node in this process whose thread has stopped is a host fault
+    /// instead (`NotWired`). `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
     /// write's admission would, `LEASE_EXPIRED` (or `PROTECTION_PAUSED`, `GENERATION_CHANGED`),
-    /// with no redirect hint: `Source::Owner` re-reads the owner route on `LEASE_EXPIRED` and
-    /// calls the new owner, so a caller of `Source::Node` of the old owner switches to
+    /// with no redirect hint. On `LEASE_EXPIRED` (or `NOT_PRIMARY`), `Source::Owner` re-reads
+    /// the owner route for the next call only: this call answers the refusal, and calling again
+    /// reaches the new owner. A caller of `Source::Node` of the old owner switches to
     /// `Source::Owner` or another member.
     /// `CORRUPT_HISTORY`, in two ways, both with the feed's step (read another copy, or
     /// rebuild from your own source):
     /// - refused to this caller, the node unaffected: the copy holds the cursor's seq on that
     ///   lineage with another digest (the cursor may come from another partition's history,
     ///   the copies' histories may have diverged, or the record may be damaged), or a stored
-    ///   `User` key in a record due to be returned does not parse;
+    ///   `User` key in any record the call scans does not parse: keys are parsed before the
+    ///   tenant filter, so another tenant's record counts too;
     /// - the node faults: a storage read fails as corrupt, a record does not decode, does not
     ///   match its digest or names another seq, a record is missing between the floor and the
     ///   cap, or the first `History` key does not parse. Every feed call waiting on the node,

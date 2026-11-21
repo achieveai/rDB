@@ -96,12 +96,17 @@ The app does the undo. The database only supplies the record.
 
 **Amended 2026-11-20 (#170 review r1).** Paging: a page returns at most `max` records (at most
 256) and 4 MiB of them, at least one record when one is due, and a call examines at most 1024
-records and 8 MiB of record bytes, counting skipped records; `more` says a cap stopped it, and a
+records and 8 MiB of record bytes, counting skipped records (the byte bound is checked before
+each read, so the last read can pass 8 MiB by one record); `more` says a cap stopped it, and a
 page with no records may still move `next` with `more` set. A cursor whose record the copy still
 holds at the same stamp and digest is served, even when a later generation linked above it (a
 max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
-envelope that does not decode) is `CORRUPT_HISTORY` with the feed's step, for every caller waiting
-on that copy. `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
+envelope that does not decode) faults that copy, so every caller waiting on it hears
+`CORRUPT_HISTORY`; only a feed reply carries the feed's step (read another copy, or rebuild).
+A put, a get or a status read hears the shared fault with the owner-fault step (#170 review r4:
+ask the write's status with its request id once another node takes over, never "write over its
+key"). The fault's detail names the seq, never a digest: both digests go only to the copy's
+local log line `feed_record_digest_mismatch` (#170 review r3). `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
 (Corrected in r2: `Trimmed` does not wait for retention. A copy that does not hold the
 cursor's record answers it today.)
 
@@ -126,7 +131,8 @@ plain apps, comes with #151. This replaces slice 2's "any authenticated app may 
 > partition, capped at the owner's published position or a secondary's applied one; a cursor of
 > `(generation, seq, digest)`, not `(generation, seq)`; `Rewound { to }` in place of a marker
 > carrying `base`; `Trimmed` defined but retention deferred (#61); physical writes, no
-> before-images and no previous version; any app may call it, scoped to the caller's tenant.
+> before-images and no previous version; scoped to the caller's tenant, and over the links served
+> only to nodes and admin apps (the 2026-11-20 r2 amendment; "any app may call it" is replaced).
 
 **Provisional. Nothing is decided.** This section records options and a leaning. Whoever picks this
 up decides, after a critic.
