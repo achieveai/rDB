@@ -416,10 +416,10 @@ impl ApiError {
 
 /// The next step of a host fault, in the gateway's words (`rdb_server::wire_step`, PR #129
 /// review, #134). Retrying at this node will not help, but another node can take a faulted
-/// owner's partition over (an operator promote today, #122 later), so the takeover clause opens
-/// "if the owner faulted": a host fault also covers a node that answered nonsense. This `Db`
-/// keeps routing to the old owner until it reads the owner again, which `Db::wait_ready` does,
-/// so that comes first. `no_mutation` true: the send wrote nothing, so a write goes again as a
+/// owner's partition over (an operator promote, or the planner when `DbConfig::failover` is
+/// configured), so the takeover clause opens "if the owner faulted": a host fault also covers
+/// a node that answered nonsense. This `Db` keeps routing to the old owner until it reads the
+/// owner again, which `Db::wait_ready` does, so that comes first. `no_mutation` true: the send wrote nothing, so a write goes again as a
 /// new write. False: it may have applied, so a write asks its status first and a read, which
 /// has no request, reads again.
 const fn owner_fault_step(no_mutation: bool) -> &'static str {
