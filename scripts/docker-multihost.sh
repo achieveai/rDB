@@ -3,7 +3,7 @@
 #
 #   scripts/docker-multihost.sh up       [--nodes 5] [--voters 3] [--partitions 16]
 #                                        [--subnet 10.180.80.0/24] [--name rdbmh]
-#                                        [--image rdb-bf-node:dev] [--no-build] [--restart-on-exit]
+#                                        [--image rdb-bf-node:dev] [--no-build] [--restart-on-exit] [--live-readd]
 #   scripts/docker-multihost.sh check    [--name rdbmh]
 #   scripts/docker-multihost.sh down     [--name rdbmh]
 #   scripts/docker-multihost.sh clean    [--name rdbmh]
@@ -11,7 +11,7 @@
 #   scripts/docker-multihost.sh failover N [--with-voter-leader] [--rejoin-s 120] [--name rdbmh]
 #   scripts/docker-multihost.sh kill N | restart N | restart-voter V | pause N   [--name rdbmh]
 #   scripts/docker-multihost.sh d1       [--name rdbd1] [--subnet 10.180.81.0/24] [--image ..]
-#                                        [--no-build] [--restart-on-exit]
+#                                        [--no-build] [--restart-on-exit] [--live-readd]
 #
 # `up` builds the image (unless --no-build), checks that nothing it would create exists yet
 # (the network <name>-net, the volumes <name>-init, <name>-vN and <name>-dN, any container
@@ -70,17 +70,29 @@
 # --restart-on-exit (up, d1; off by default): each data node container gets Docker's
 # `--restart on-failure:3`, recorded on the network as the label org.rdb.multihost.restart.
 # It stands in for the supervisor #81 V10 asks for: rdb_node exits 75 when it wants a restart.
-# `docker kill` does not trigger it: the kill cancels the container's restart manager (moby
-# `killWithSignal` calls `ExitOnNext`), and `docker start` gives it a fresh one. With the
-# label set, failover judges that too (K6). Any other non-zero exit is restarted as well, which
-# a supervisor should report instead; P2 below accepts only 75.
+# Any other non-zero exit is restarted as well, which a supervisor should report instead; P2
+# below accepts only 75.
+# OPEN, for the first run with the policy: "docker kill does not restart the node" is read from
+# moby's source (v28.3.3), not yet seen. `killWithSignal` calls `ExitOnNext`, which cancels the
+# container's restart manager, and `docker start` makes a fresh one. K6 is what proves it: with
+# the label set, failover checks that the killed node is still exited 137, with the restart
+# count it had before the kill, when its probe ends. A K6 FAIL means every failover measured
+# a node Docker brought back on its own.
 #   pause N      needs --restart-on-exit. `docker pause` node N, an owner, until it owns no
 #                partition; then `docker unpause`. P1 within 60 s of the pause N owns nothing;
 #                P2 within 60 s of the unpause N printed `rdb_node restart-wanted node=N
 #                reason=replace_stopped`, exited 75, and Docker restarted it once; P3 N is
 #                ready again within 60 s; P4 a planner_frozen_grant_cleared for N after the
 #                unpause, within 60 s; P5 a 5 s probe writes every partition.
-#                d1 --restart-on-exit runs `pause 2` after its other steps.
+#                d1 --restart-on-exit runs `pause 2` after its other steps. P1 reads the owners
+#                from rEtcd's partitions/ records, in `admin status` sessions of at most 20 s
+#                each, so a session that stalls on the paused node's open sockets ends there.
+#
+# --live-readd (up, d1; off by default): every data node runs `rdb_node --live-readd` (#107).
+# `up` puts it on each node's `docker run`; restart, failover and pause use `docker start` or
+# Docker's restart policy, which keep those arguments. Before it creates anything, `up` asks
+# the image's `rdb_node --help` and refuses an image whose usage does not list --live-readd,
+# rather than start nodes that would exit 2 (and, with --restart-on-exit, be restarted).
 #
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
 # --subnet must be a /24 that overlaps no Docker network and no host route; `up` checks.
@@ -90,7 +102,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 NODES=5 VOTERS=3 PARTITIONS=16 SUBNET=10.180.80.0/24 NAME=rdbmh IMAGE=rdb-bf-node:dev BUILD=1
-WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0
+WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0 LIVE_READD=0
 [ "$CMD" = selftest ] && NAME=rdbst
 [ "$CMD" = d1 ] && NAME=rdbd1 SUBNET=10.180.81.0/24
 case "$CMD" in
@@ -115,6 +127,7 @@ while [ $# -gt 0 ]; do
             REJOIN_S="$2"; shift 2 ;;
         --no-docker) NO_DOCKER=1; shift ;;
         --restart-on-exit) RESTART_ON_EXIT=1; shift ;;
+        --live-readd) LIVE_READD=1; shift ;;
         *) echo "docker-multihost: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -126,6 +139,8 @@ done
     || { echo "docker-multihost: --no-docker is read only by selftest" >&2; exit 2; }
 [ "$RESTART_ON_EXIT" = 0 ] || [ "$CMD" = up ] || [ "$CMD" = d1 ] \
     || { echo "docker-multihost: --restart-on-exit is read only by up and d1" >&2; exit 2; }
+[ "$LIVE_READD" = 0 ] || [ "$CMD" = up ] || [ "$CMD" = d1 ] \
+    || { echo "docker-multihost: --live-readd is read only by up and d1" >&2; exit 2; }
 LABEL="org.rdb.multihost=$NAME"
 NET="$NAME-net"
 HELPER="$NAME-x"
@@ -265,6 +280,15 @@ up() {
         (cd "$REPO" && docker build -f docker/Dockerfile -t "$IMAGE" .) || die "build"
     fi
     preflight
+    local readd=() readd_label=0
+    if [ "$LIVE_READD" = 1 ]; then
+        # rdb_node --help exits 2 after its usage, so its output is read, not its exit code.
+        local usage
+        usage="$(docker run --rm --label "$LABEL" "$IMAGE" data --help 2>&1)" || true
+        grep -qF -- '[--live-readd]' <<< "$usage" \
+            || die "image: $IMAGE's rdb_node does not list --live-readd in its usage (first line: $(head -n 1 <<< "$usage")); nothing was created"
+        readd=(--live-readd); readd_label=1
+    fi
     CLUSTER="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     local restart=() policy=none
     if [ "$RESTART_ON_EXIT" = 1 ]; then policy=on-failure:3; restart=(--restart "$policy"); fi
@@ -273,7 +297,7 @@ up() {
         --label "org.rdb.multihost.partitions=$PARTITIONS" \
         --label "org.rdb.multihost.subnet=$SUBNET" --label "org.rdb.multihost.image=$IMAGE" \
         --label "org.rdb.multihost.cluster=$CLUSTER" --label "org.rdb.multihost.restart=$policy" \
-        "$NET" >/dev/null || die "network create"
+        --label "org.rdb.multihost.live_readd=$readd_label" "$NET" >/dev/null || die "network create"
     say "network $NET $SUBNET cluster=$CLUSTER"
 
     own_volume "$NAME-init"
@@ -321,13 +345,13 @@ up() {
             "${restart[@]}" -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
             --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers)" --control "$(control)" \
             --control-tls /init/certs/control --cert-dir /init/certs --admin-apps admin \
-            --failover --log-dir /data/logs >/dev/null || die "node $n start"
+            --failover "${readd[@]}" --log-dir /data/logs >/dev/null || die "node $n start"
         say "node $n at $(node_ip "$n")"
     done
     for n in $(seq 1 "$NODES"); do
         wait_for "node $n ready" 120 sh -c "docker logs $NAME-d$n 2>&1 | grep -q 'rdb_node ready node=$n'"
     done
-    say "up: $VOTERS voters, $NODES nodes, $PARTITIONS partitions, node restart policy $policy"
+    say "up: $VOTERS voters, $NODES nodes, $PARTITIONS partitions, node restart policy $policy, live readd $readd_label"
 }
 
 # The throwaway voter <name>-x. start_helper creates it only when no container has that name
@@ -397,8 +421,10 @@ verdict() { # name, then 0 or not
 }
 
 # One rdb_dev app session over the nodes' links: lines on stdin, as app admin.
-dev() { # extra rdb_dev flags...
-    docker run --rm -i --label "$LABEL" --network "$NET" -v "$NAME-init:/init:ro" "$IMAGE" dev \
+dev() { # extra rdb_dev flags...; DEV_WITHIN=S ends the session after S seconds (exit 124)
+    local limit=()
+    [ -z "${DEV_WITHIN:-}" ] || limit=(timeout -k 5 "$DEV_WITHIN")
+    "${limit[@]}" docker run --rm -i --label "$LABEL" --network "$NET" -v "$NAME-init:/init:ro" "$IMAGE" dev \
         --dir /tmp/dev --log-dir /tmp/dev-logs --control "$(control)" --nodes "$(peers)" \
         --cert-dir /init/certs --app admin --control-tls /init/certs/control "$@"
 }
@@ -1155,9 +1181,12 @@ restart_voter() {
 }
 
 # Node N's partitions, from an `admin status` with no `wait ready` (a paused owner keeps an
-# open from being ready): the count, or exit 1 when the status could not be read.
+# open from being ready): the count, or exit 1 when the status could not be read. The owners
+# are rEtcd's partitions/ records. The session is given MULTIHOST_POLL_SECS (20): its links
+# dial every node, the paused one too, and that one's sockets stay open, so a stalled session
+# is ended rather than left to hang the poll.
 owned_now() { # node, out
-    printf 'admin status\nquit\n' | dev --put-timeout-ms 1000 > "$2" 2>&1
+    printf 'admin status\nquit\n' | DEV_WITHIN="${MULTIHOST_POLL_SECS:-20}" dev --put-timeout-ms 1000 > "$2" 2>&1
     grep -q '^partitions/' "$2" || return 1
     analyze owned "$1" "$2" | sed -E 's/^J4 node [0-9]+ owns ([0-9]+) partitions.*/\1/'
 }
@@ -1297,6 +1326,7 @@ d1() {
     steps=("check" "failover 3" "failover 1" "failover 5" "restart-voter 1" "restart-voter 1"
            "failover 3 --with-voter-leader")
     if [ "$RESTART_ON_EXIT" = 1 ]; then restart=(--restart-on-exit); steps+=("pause 2"); fi
+    [ "$LIVE_READD" = 0 ] || restart+=(--live-readd)
     "$D1_SELF" up --no-build --name "$NAME" --subnet "$SUBNET" --image "$IMAGE" --nodes "$NODES" \
         --voters "$VOTERS" --partitions "$PARTITIONS" "${restart[@]}" || die "d1: up"
     for step in "${steps[@]}"; do
@@ -1690,7 +1720,8 @@ selftest_args() {
     local args rc
     for args in "failover" "failover x" "failover 0" "failover 03" "kill 2 --with-voter-leader" \
                 "restart-voter 1 --rejoin-s 5" "up --no-docker" "failover 2 --rejoin-s soon" \
-                "pause" "pause x" "check --restart-on-exit" "failover 2 --restart-on-exit"; do
+                "pause" "pause x" "check --restart-on-exit" "failover 2 --restart-on-exit" \
+                "check --live-readd" "failover 2 --live-readd" "pause 2 --live-readd"; do
         : > "$t/calls"
         # shellcheck disable=SC2086 # the case's words
         PATH="$t/bin:$PATH" "$0" $args > /dev/null 2>&1; rc=$?
@@ -1765,6 +1796,22 @@ SH
         && [ "$(tail -n 1 "$t/steps")" = "pause 2 --name rdbst-d1" ] \
         && grep -qE '^up .* --restart-on-exit$' "$t/steps" && [ -d "$t/logs2/logs-8-pause_2" ]
     st "d1 --restart-on-exit passes the flag to up and runs pause 2 last (exit $rc)" $?
+    grep -q -- '--live-readd' "$t/steps"; [ $? = 1 ]
+    st "d1 without --live-readd passes up no --live-readd" $?
+    : > "$t/steps"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs3" \
+        "$0" d1 --no-build --name rdbst-d1 --live-readd > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && [ "$(grep -c ' --name rdbst-d1$' "$t/steps")" = 7 ] \
+        && grep -qE '^up .* --live-readd$' "$t/steps" && ! grep -q '^pause ' "$t/steps"
+    st "d1 --live-readd passes it to up and adds no step (exit $rc)" $?
+    : > "$t/steps"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" NET_EXISTS=0 MULTIHOST_IP_CMD="$t/ip" STEPS="$t/steps" \
+        MULTIHOST_D1_SELF="$t/self" D1_LOG_OUT="$t/logs4" \
+        "$0" d1 --no-build --name rdbst-d1 --live-readd --restart-on-exit > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -qE '^up .* --restart-on-exit --live-readd$' "$t/steps" \
+        && [ "$(tail -n 1 "$t/steps")" = "pause 2 --name rdbst-d1" ]
+    st "d1 --live-readd --restart-on-exit passes both to up and runs pause 2 (exit $rc)" $?
     rm -rf "$t"
 }
 
@@ -1788,6 +1835,12 @@ case "$1 $2" in
     "exec "*) echo '{"ready":true}'; exit 0 ;;
     "logs "*) for n in 1 2 3 4 5; do echo "rdb_node ready node=$n"; done; exit 0 ;;
 esac
+case "$*" in
+    *" data --help")
+        echo "usage:" >&2
+        [ "$KNOWS" = 1 ] && echo "           [--live-readd] [--app-addr A]" >&2
+        exit 2 ;;
+esac
 exit 0
 SH
     printf '#!/bin/sh\necho "10.1.0.0/16 dev eth0"\n' > "$t/ip"
@@ -1808,10 +1861,26 @@ SH
             st "up --restart-on-exit gives the 5 data nodes on-failure:3 and no voter (exit $rc)" $?
         else
             [ "$rc" = 0 ] && [ "$(grep -c -- '--restart' "$t/calls")" = 0 ] \
-                && [ "$policy" = org.rdb.multihost.restart=none ]
-            st "up without the flag gives no container a restart policy (exit $rc)" $?
+                && [ "$policy" = org.rdb.multihost.restart=none ] \
+                && ! grep -qE -- '--live-readd|data --help' "$t/calls" \
+                && grep -q 'org.rdb.multihost.live_readd=0 ' "$t/calls"
+            st "up without the flags gives no container a restart policy or --live-readd, and asks no --help (exit $rc)" $?
         fi
     done
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" MULTIHOST_IP_CMD="$t/ip" KNOWS=1 \
+        "$0" up --no-build --name rdbst-u --subnet 10.180.89.0/24 --live-readd --restart-on-exit \
+        > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 0 ] && [ "$(grep -c '^run -d --name rdbst-u-d.* --restart on-failure:3 .* --failover --live-readd ' "$t/calls")" = 5 ] \
+        && [ "$(grep -c '^run -d --name rdbst-u-v.*--live-readd' "$t/calls")" = 0 ] \
+        && grep -q 'org.rdb.multihost.live_readd=1 ' "$t/calls"
+    st "up --live-readd --restart-on-exit starts the 5 data nodes with both, and no voter with --live-readd (exit $rc)" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" MULTIHOST_IP_CMD="$t/ip" KNOWS=0 \
+        "$0" up --no-build --name rdbst-u --subnet 10.180.89.0/24 --live-readd > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at image: rdb-bf-node:dev's rdb_node does not list --live-readd" "$t/out" \
+        && ! grep -qE '^(network create|volume create|run -d)' "$t/calls"
+    st "up --live-readd on an image whose rdb_node lacks it is refused before anything is created (exit $rc)" $?
     # pause on a rig up made without the flag: refused before anything is paused.
     cat > "$t/bin/docker" <<'SH'
 #!/bin/sh
@@ -1872,6 +1941,23 @@ selftest_restart_claims() {
     analyze written 3 "$t/p" > "$t/out"
     grep -q '^FAIL P5' "$t/out" && grep -qF "partition 2: not written" "$t/out" && grep -qF "partition 3: not written" "$t/out"
     st "P5 fails a partition not written, or missing from the probe" $?
+    # P1's poll: a session that stalls is ended within MULTIHOST_POLL_SECS.
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\nexec sleep 8\n' > "$t/bin/docker"; chmod +x "$t/bin/docker"
+    local start took rc
+    start=$SECONDS
+    ( PATH="$t/bin:$PATH" MULTIHOST_POLL_SECS=1 owned_now 2 "$t/s" ) > /dev/null 2>&1; rc=$?
+    took=$((SECONDS - start))
+    [ "$rc" != 0 ] && [ "$took" -le 4 ]
+    st "P1's poll ends a stalled admin status session within its limit (rc $rc, ${took}s)" $?
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+cat > /dev/null
+echo "partitions/1 rev=5 PartitionRecord { partition: PartitionId(1), owner: NodeId(2), generation: Generation(1), owner_epoch: OwnerEpoch(0), config_version: ConfigVersion(1), lifecycle: Serving } root=- members=[2:owner,1:regular,3:regular]"
+echo "partitions/2 rev=5 PartitionRecord { partition: PartitionId(2), owner: NodeId(1), generation: Generation(1), owner_epoch: OwnerEpoch(0), config_version: ConfigVersion(1), lifecycle: Serving } root=- members=[1:owner,2:regular,3:regular]"
+SH
+    [ "$(PATH="$t/bin:$PATH" MULTIHOST_POLL_SECS=1 owned_now 2 "$t/s" 2>/dev/null)" = 1 ]
+    st "P1's poll counts the partitions the records name the node owner of" $?
     rm -rf "$t"
 }
 
