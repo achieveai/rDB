@@ -212,6 +212,7 @@ fn f87_2_r2_at_half_the_grant_the_next_read_starts_and_the_caller_is_served_cach
 /// Cuts: `answer_feed_waiters` dropping the rest at the fault, red (caller 1 hears nothing);
 /// no `feed_reads` drain in `Host::set_fault`, red (the same).
 /// Integration (~2 s): bootstrap's discovery window, then steps on a held clock.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_r2_two_parked_feed_callers_both_hear_the_damage_fault() {
     let dir = config_testkit::fs::temp_dir();

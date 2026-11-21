@@ -7,8 +7,10 @@ use crate::feed::{FeedRecord, FEED_PAGE_RECORDS};
 use crate::net::faults::{CutStore, Faults};
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::envelope::ReplicationEnvelope;
+#[cfg(debug_assertions)]
 use rdb_core::contracts::storage::Namespace;
 
+#[cfg(debug_assertions)]
 use super::error::FEED_HISTORY_STEP;
 
 fn store() -> Arc<dyn ConfigStore> {
@@ -1249,6 +1251,7 @@ fn f87_2_replay_from_start_rebuilds_user_state() {
 /// red (caller 1: "node 2 dropped the feed call unanswered"); no `feed_reads` drain in
 /// `Host::set_fault`, red (caller 1: the same).
 /// Integration (~3 s): a fresh open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_damaged_history_answers_every_feed_caller_corrupt_history() {
     let rt = runtime();
@@ -1443,6 +1446,7 @@ fn f87_2_a_held_control_read_refuses_within_the_wait_shared_and_fenced_by_boot()
 }
 
 /// `source`'s answer from `from`, which must be `Trimmed`; its floor.
+#[cfg(debug_assertions)]
 fn trimmed_from(db: &Db, from: FeedCursor, source: Source, who: &str) -> Seq {
     match page_from(db, from, source) {
         FeedPage::Trimmed { floor } => floor,
@@ -1452,6 +1456,7 @@ fn trimmed_from(db: &Db, from: FeedCursor, source: Source, who: &str) -> Seq {
 
 /// A put that lands in a generation newer than `than`, retried with fresh keys while node 2's
 /// rejoin commits one.
+#[cfg(debug_assertions)]
 fn put_in_newer(db: &Db, than: Generation) -> PutOk {
     let deadline = Instant::now() + patience();
     let mut tries = 0_u32;
@@ -1484,6 +1489,7 @@ fn put_in_newer(db: &Db, than: Generation) -> PutOk {
 /// hole, `CORRUPT_HISTORY`, not `Trimmed`); `RocksEngine::history_floor`'s empty-lineage
 /// fallback answering `Seq(1)`, red ((b)).
 /// Integration (~10 s): one restart's rejoin.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
     let rt = runtime();
@@ -1558,6 +1564,7 @@ fn f87_2_a_trimmed_history_answers_exactly_trimmed_below_its_floor() {
 
 /// One feed call's answer once it is not `UNAVAILABLE` or `LEASE_EXPIRED`, retried as in
 /// [`page_from`] until `patience` ends.
+#[cfg(debug_assertions)]
 fn changes_settled(db: &Db, from: FeedCursor, source: Source) -> Result<FeedPage, ApiError> {
     let deadline = Instant::now() + patience();
     loop {
@@ -1587,6 +1594,7 @@ fn changes_settled(db: &Db, from: FeedCursor, source: Source) -> Result<FeedPage
 /// Cuts: no digest check in `Host::changes`'s read, red (node 3 served, node 2 diverged); no
 /// seq check, red (node 1 served k1 at k2).
 /// Integration (~3 s): a fresh open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
     let rt = runtime();
@@ -1660,6 +1668,7 @@ fn f87_2_r2_decodable_damage_is_damage_not_a_page_or_divergence() {
 /// `CORRUPT_HISTORY`); `feed_damage` keeping the step in the node's fault, red (the put carries
 /// it); `answer_faulted` answering a feed call as any other, red (the later feed call lacks it).
 /// Integration (~2 s): a fresh open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_r2_a_hole_in_history_faults_the_node_with_the_step_on_feed_replies_only() {
     let rt = runtime();
@@ -1714,6 +1723,7 @@ fn f87_2_r2_a_hole_in_history_faults_the_node_with_the_step_on_feed_replies_only
 /// Cut: the floor call site mapping to a generic fault (`Fault::from`), red (not
 /// `CORRUPT_HISTORY`).
 /// Integration (~2 s): a fresh open.
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn f87_2_r2_a_malformed_first_history_key_faults_the_node_typed() {
     let rt = runtime();
