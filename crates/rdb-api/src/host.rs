@@ -2156,6 +2156,48 @@ const fn slow_sync_pause(_path: &std::path::Path) -> Option<Duration> {
     None
 }
 
+/// #170 review r5: node directories whose next WAL sync is held at its fsync until the row lets
+/// it go: `(dir, entered, release)`. The sync says `entered` once it is held, then waits until
+/// `release` hears or its sender drops, so a row that panics never leaves it held. Once.
+/// Crate tests only.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static HOLD_SYNC: Mutex<Vec<(PathBuf, Sender<()>, Receiver<()>)>> = Mutex::new(Vec::new());
+
+/// Arm [`HOLD_SYNC`] for the host on `node_dir`: the receiver hears once its next WAL sync is
+/// held, and that sync returns once the sender sends or drops.
+#[cfg(test)]
+pub(crate) fn hold_sync(node_dir: &std::path::Path) -> (Receiver<()>, Sender<()>) {
+    let (entered, held) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    HOLD_SYNC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((node_dir.to_path_buf(), entered, released));
+    (held, release)
+}
+
+/// The [`HOLD_SYNC`] hold armed for the engine at `path`, if any: wait there, once.
+#[cfg(test)]
+fn held_sync(node: NodeId, path: &std::path::Path) {
+    let armed = {
+        let mut armed = HOLD_SYNC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed
+            .iter()
+            .position(|(dir, _, _)| path.starts_with(dir))
+            .map(|at| armed.remove(at))
+    };
+    let Some((_, entered, released)) = armed else {
+        return;
+    };
+    tracing::info!(node = node.0, "test_sync_held");
+    let _ = entered.send(());
+    let _ = released.recv();
+    tracing::info!(node = node.0, "test_sync_released");
+}
+
 /// The WAL lengths recorded just before each fsync, by watched node directory (row 44 of #80
 /// S5d). Each file keeps its last recorded length.
 #[cfg(test)]
@@ -2238,6 +2280,8 @@ fn run_wal_sync(
     sync: &rdb_storage::WalSync,
 ) -> (Result<(), String>, u64) {
     let started = Instant::now();
+    #[cfg(test)]
+    held_sync(node, path);
     if let Some(pause) = slow_sync_pause(path) {
         let millis = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX);
         tracing::info!(node = node.0, millis, "test_sync_slowed");

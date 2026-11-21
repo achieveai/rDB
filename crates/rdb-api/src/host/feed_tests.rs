@@ -436,3 +436,50 @@ fn f87_4_a_read_that_answers_clears_the_saved_failure() {
         other => panic!("not refused at the wait: {other:?}"),
     }
 }
+
+/// Review r5 (thread 4655340428): a clean stop answers its parked feed calls before it waits on
+/// the disk. Node 2 is given a real syncer, and a WAL sync begun on it is held at its fsync
+/// ([`hold_sync`]). Two feed calls park on a control read that never lands; node 2's stop tail
+/// then runs on another thread. Both calls hear the stop while that sync is still held and the
+/// stop has not returned; once the sync is let go the stop finishes, with no fault.
+/// Cut: `stop_feed_waiters` after the syncer stop, red (no answer while the sync is held).
+/// Integration (~3 s): bootstrap's discovery window, then one stop.
+#[config_log::retcd_test]
+fn f87_4_a_stop_answers_parked_feed_calls_while_its_sync_is_held() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _, _) = serving(dir.path());
+    let _hold = trio.clock.hold();
+    let mut held = Vec::new();
+    let path = trio.nodes[1].0.engine.path().to_path_buf();
+    let mailbox = trio.nodes[1].1.clone();
+    trio.nodes[1].0.syncer = Some(Syncer::start(NodeId(2), path.clone(), mailbox).expect("syncer"));
+    let (entered, release) = hold_sync(&path);
+    trio.nodes[1].0.start_sync(Vec::new()).expect("a sync begun");
+    entered
+        .recv_timeout(test_patience(Trio::PATIENCE))
+        .expect("the sync is held at its fsync");
+
+    let answers = [call_two(&trio, changes(11)), call_two(&trio, changes(12))];
+    step_two(&mut trio, &mut held);
+    assert_eq!(feed_state(&trio), (true, 2), "two calls parked on one read");
+
+    let (host, _, rx) = &mut trio.nodes[1];
+    std::thread::scope(|scope| {
+        let release = release;
+        let stop = scope.spawn(move || host.stop_tail(rx));
+        for (index, answer) in answers.iter().enumerate() {
+            let heard = answer.recv_timeout(test_patience(Trio::PATIENCE));
+            assert!(!stop.is_finished(), "caller {index}: the stop had returned");
+            stopped(
+                &format!("caller {index}"),
+                heard.map_err(|_| mpsc::TryRecvError::Empty),
+            );
+        }
+        assert!(!stop.is_finished(), "the stop returned with its sync held");
+        release.send(()).expect("the held sync waits");
+        stop.join().expect("the stop tail");
+    });
+    let host = &trio.nodes[1].0;
+    assert!(host.fault.is_none(), "{:?}", host.fault);
+    assert!(host.syncer.is_none(), "the syncer stopped");
+}
