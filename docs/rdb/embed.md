@@ -997,6 +997,24 @@ floor), so the table above no longer limits it.
 - **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.
 
+### How much history a partition keeps
+
+Each copy keeps the history it applied, so a copy that was down can catch up record by record.
+A duty trims it about once a second. Two `DbConfig` options set how much is kept:
+
+- `history_keep`: how long each copy keeps history, at least. Default 30 min (`None`). A copy
+  down for longer may be rebuilt from a snapshot instead.
+- `history_budget_bytes`: the most history each copy keeps. Default 20 GiB (`None`). It is a
+  hard cap: it trims past a copy that has not acknowledged, and past a snapshot transfer, which
+  then starts again (`history_budget_overran_pin`).
+
+A copy keeps more than `history_keep` while something still needs it: a copy that has not
+acknowledged, a snapshot transfer, a recovery, or an answered inventory (at most 10 minutes).
+After a failover the new primary also trims nothing past its copies until each has
+acknowledged, or `max(history_keep, 10 minutes)` has passed. Before a partition's first trim, a
+copy that never acks holds history until the history budget (`history_budget_bytes`, default
+20 GiB) is reached; after that, a grace that expires releases it.
+
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
