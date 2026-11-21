@@ -106,10 +106,13 @@ process root span, so they appear on every line, same as `node_id`.
 past the new count. One process per log: a second writer of the same `<dir>/<name>` is refused
 at start, whether either one rotates (`--log-max-mb 0` takes the same lock), because two would
 rename and remove each other's files; give each its own `--log-dir`. The file name must be a
-plain name, with no folder in it. The lock is `<dir>/.<name>.lock`, which a `<name>*` glob
-does not match. To read every file of a log, glob `<name>*` (for example
-`rdb_node-1.jsonl*`). The rEtcd daemon (`config-server`) has its own writer and does not rotate
-or take the lock; test binaries do not rotate either.
+plain name with no folder, drive or stream: not `.` or `..`, and no `/`, `\` or `:` (on
+Windows `C:x` is drive-relative and `name:stream` is a hidden stream). The lock is
+`<dir>/.<name>.lock`, which a `<name>*` glob does not match. It is an OS lock that goes with
+the process, so the lock file a killed process leaves behind does not block the restart. To
+read every file of a log, glob `<name>*` (for example `rdb_node-1.jsonl*`). The rEtcd daemon
+(`config-server`) has its own writer and does not rotate or take the lock; test binaries do not
+rotate either.
 
 ## Level policy
 

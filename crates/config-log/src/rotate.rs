@@ -21,8 +21,9 @@
 //! files. [`crate::init`] takes the same lock for a log that does not rotate, so a rotating and
 //! a non-rotating writer cannot share one either. The lock goes with the process, so a crash
 //! leaves nothing to clear; the lock file itself stays, empty, and is hidden from a `<name>*`
-//! glob. `name` must be a plain file name, with no separator and not `.` or `..`, so the log,
-//! its rotations and its lock all stay in `dir`.
+//! glob. `name` must be a plain file name: not `.` or `..`, and no `/`, `\\` or `:`, so the
+//! log, its rotations and its lock all stay in `dir` (on Windows `C:x` names a file in another
+//! folder and `name:stream` a hidden stream of `name`).
 //!
 //! The non-blocking worker discards writer errors without a word. So a rotation that fails (a
 //! remove, rename or open refused) prints the path and the error on stderr, best effort, and the
@@ -240,14 +241,14 @@ impl SizeRotatingFile {
         }
     }
 
-    /// Best effort: a stderr that cannot be written must not stop the line being appended.
+    /// Best effort: a stderr that cannot be written must not stop the line being appended. The
+    /// line goes to the sink as one write, so a partial write cannot interleave two reports.
     fn say(&mut self, what: &str) {
-        let live = self.path(0);
-        let _ = writeln!(
-            self.diagnostics,
-            "config-log: log rotation of {}: {what}",
-            live.display()
+        let report = format!(
+            "config-log: log rotation of {}: {what}\n",
+            self.path(0).display()
         );
+        let _ = self.diagnostics.write_all(report.as_bytes());
     }
 }
 
@@ -278,12 +279,16 @@ impl Write for SizeRotatingFile {
 }
 
 /// `name` as a plain file name: not empty, not `.` or `..`, and no `/` or `\\` (either is a
-/// separator on Windows).
+/// separator on Windows) or `:` (on Windows `C:x` is drive-relative, a file in that drive's
+/// current folder, and `name:stream` is an alternate data stream of `name`).
 fn check_name(name: &str) -> io::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("log file name {name:?} must be a plain file name, with no folder in it"),
+            format!(
+                "log file name {name:?} must be a plain file name: no folder, drive or stream \
+                 (no `/`, `\\` or `:`)"
+            ),
         ));
     }
     Ok(())
@@ -512,11 +517,13 @@ mod tests {
         let _again = SizeRotatingFile::open(dir.path(), "n.jsonl", ROTATION).expect("reopen");
     }
 
-    /// A diagnostics sink that refuses every write, as a closed or full stderr does.
-    struct Unwritable;
+    /// A diagnostics sink that refuses every write, as a closed or full stderr does, and keeps
+    /// what it was offered so a row can see the report went to the sink.
+    struct Unwritable(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl Write for Unwritable {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("offered").extend_from_slice(buf);
             Err(io::Error::other("stderr is gone"))
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -526,7 +533,8 @@ mod tests {
 
     /// Review r2 (PR #182): a failed rotation reports on stderr, best effort. With stderr
     /// unwritable, the writer does not panic or fail, and every line still reaches the file:
-    /// through a failed rename (the cap exceeded) and a failed open (the renamed file).
+    /// through a failed rename (the cap exceeded) and a failed open (the renamed file). Review r3:
+    /// each report was offered to the sink, so a report sent straight to stderr is red here.
     #[test]
     fn r158_a_failed_rotation_with_stderr_unwritable_still_writes_every_line() {
         let rotation = SizeRotation {
@@ -535,7 +543,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", rotation).expect("open");
-        file.diagnostics = Box::new(Unwritable);
+        let offered = std::sync::Arc::default();
+        file.diagnostics = Box::new(Unwritable(std::sync::Arc::clone(&offered)));
         file.write_all(&line(0)).expect("write");
         file.write_all(&line(1)).expect("write");
         file.fail_live_rename = 2;
@@ -550,10 +559,27 @@ mod tests {
         }
         file.flush().expect("flush");
         assert_eq!(lines_on_disk(dir.path()), (0..10).collect::<Vec<_>>());
+        let offered = String::from_utf8(offered.lock().expect("offered").clone()).expect("utf8");
+        let live = dir.path().join("n.jsonl");
+        let failed = format!(
+            "config-log: log rotation of {}: failed, still writing to",
+            live.display()
+        );
+        // Two failed renames, then one failed open, then the open that worked.
+        assert_eq!(offered.matches(&failed).count(), 3, "{offered}");
+        assert!(offered.contains("injected"), "{offered}");
+        assert!(
+            offered.contains(&format!(
+                "config-log: log rotation of {}: live file open again\n",
+                live.display()
+            )),
+            "{offered}"
+        );
     }
 
     /// Review r2 (PR #182): the name is a plain file name. A name with a separator or `..`
-    /// would put the log, its rotations and its lock outside `dir`; it is refused.
+    /// would put the log, its rotations and its lock outside `dir`; it is refused. Review r3: so
+    /// is a `:`, which on Windows makes `C:x` drive-relative and `n:s` a stream of `n`.
     #[test]
     fn r158_a_name_that_is_not_a_plain_file_name_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -565,6 +591,9 @@ mod tests {
             ".",
             "",
             "a\\n.jsonl",
+            "C:n.jsonl",
+            "n.jsonl:stream",
+            "n.jsonl:stream:$DATA",
         ] {
             let error = SizeRotatingFile::open(dir.path(), bad, ROTATION)
                 .err()
