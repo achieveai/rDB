@@ -281,12 +281,14 @@ fn f87_2_r2_two_parked_feed_callers_both_hear_the_damage_fault() {
     }
 }
 
-/// Review r3/r4 (threads 4654331881, 4654676431): a feed call parked on node 2's control read,
-/// which never lands, is answered by node 2's clean stop: `UNAVAILABLE`, `BoundedJitter`,
+/// Review r3/r4/r5 (threads 4654331881, 4654676431, 4655340430): two feed calls parked on node
+/// 2's control read, which never lands, are both answered by node 2's clean stop, each: `UNAVAILABLE`, `BoundedJitter`,
 /// nothing written, the feed's other-copy step; node 2 is not faulted, and logs
-/// `feed_waiter_stopped`. Runs the run loop's own stop tail, [`Host::stop_tail`]. Not shown here:
-/// that the answer precedes the stop's disk work (this trio's final marks write nothing).
-/// Cut: no `stop_feed_waiters` in the stop tail, red (the call is never answered).
+/// `feed_waiter_stopped` once per call. Runs the run loop's own stop tail, [`Host::stop_tail`].
+/// That the answers precede the stop's disk work is
+/// `f87_4_a_stop_answers_parked_feed_calls_while_its_sync_is_held`.
+/// Cuts: no `stop_feed_waiters` in the stop tail, red (no call is answered); only the first
+/// waiter answered, red (the second hears nothing).
 /// Integration (~2 s): bootstrap's discovery window, then one stop.
 #[config_log::retcd_test]
 fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
@@ -295,9 +297,9 @@ fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
     let (mut trio, _, _) = serving(dir.path());
     let _hold = trio.clock.hold();
     let mut held = Vec::new();
-    let answer = call_two(&trio, changes(11));
+    let answers = [call_two(&trio, changes(11)), call_two(&trio, changes(12))];
     step_two(&mut trio, &mut held);
-    assert_eq!(feed_state(&trio), (true, 1), "one call parked on one read");
+    assert_eq!(feed_state(&trio), (true, 2), "two calls parked on one read");
 
     let (host, _, rx) = &mut trio.nodes[1];
     host.stop_tail(rx);
@@ -306,26 +308,33 @@ fn f87_3_a_clean_stop_answers_a_parked_feed_call() {
         "a clean stop faulted node 2: {:?}",
         host.fault
     );
-    match answer.try_recv() {
-        Ok(Answer::Error { error, request }) => {
-            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
-            assert_eq!(error.retry, RetryRule::BoundedJitter, "{error:?}");
-            assert!(error.no_mutation, "{error:?}");
-            assert!(request.is_none(), "{request:?}");
-            assert!(error.detail.contains("node 2 is stopping"), "{error:?}");
-            assert!(error.detail.ends_with(FEED_OTHER_COPY_STEP), "{error:?}");
-        }
-        other => panic!("the stop left the parked call unanswered: {other:?}"),
+    for (index, answer) in answers.iter().enumerate() {
+        stopped(&format!("caller {index}"), answer.try_recv());
     }
     assert_eq!(feed_state(&trio).1, 0, "nothing still waits");
 
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line["@m"] == "feed_waiter_stopped" && line["node"] == 2),
-        "feed_waiter_stopped is not logged"
-    );
+    let logged = lines
+        .iter()
+        .filter(|line| line["@m"] == "feed_waiter_stopped" && line["node"] == 2)
+        .count();
+    assert_eq!(logged, 2, "feed_waiter_stopped once per call");
+}
+
+/// A parked feed call's answer from a clean stop: `UNAVAILABLE`, nothing written, no request,
+/// naming the stop, with the feed's other-copy step.
+fn stopped(who: &str, answer: Result<Answer, mpsc::TryRecvError>) {
+    match answer {
+        Ok(Answer::Error { error, request }) => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{who}: {error:?}");
+            assert_eq!(error.retry, RetryRule::BoundedJitter, "{who}: {error:?}");
+            assert!(error.no_mutation, "{who}: {error:?}");
+            assert!(request.is_none(), "{who}: {request:?}");
+            assert!(error.detail.contains("node 2 is stopping"), "{who}: {error:?}");
+            assert!(error.detail.ends_with(FEED_OTHER_COPY_STEP), "{who}: {error:?}");
+        }
+        other => panic!("{who}: the stop left the parked call unanswered: {other:?}"),
+    }
 }
 
 /// Hand node 2 its held control-read answers, each replaced by `read` when that is given.
