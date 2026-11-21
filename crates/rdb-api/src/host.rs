@@ -383,6 +383,10 @@ pub(crate) struct ReplanHold {
 #[cfg(test)]
 static REPLAN_HOLDS: Mutex<Vec<Arc<ReplanHold>>> = Mutex::new(Vec::new());
 
+/// Test-only: the (instance, node) pairs whose next not-live pin [`Host::pinnable`] allows.
+#[cfg(test)]
+static PIN_ONCE: Mutex<Vec<([u8; INSTANCE_LEN], NodeId)>> = Mutex::new(Vec::new());
+
 #[cfg(test)]
 impl ReplanHold {
     /// Hold every re-plan of `instance` that re-adds `rejoiner` from now on.
@@ -398,6 +402,15 @@ impl ReplanHold {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Arc::clone(&hold));
         hold
+    }
+
+    /// Let the first re-plan of `instance` that finds `rejoiner` not live pin it all the same,
+    /// once: the late commit `admin::remove_node`'s re-list reports.
+    pub(crate) fn pin_once(instance: [u8; INSTANCE_LEN], rejoiner: NodeId) {
+        PIN_ONCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((instance, rejoiner));
     }
 
     /// How many re-plans have reached the hold.
@@ -7088,6 +7101,10 @@ impl Host {
         if net.members().contains(&node) {
             return true;
         }
+        #[cfg(test)]
+        if self.pin_anyway(partition, node) {
+            return true;
+        }
         tracing::warn!(
             node = self.node.0,
             partition = partition.0,
@@ -7096,6 +7113,30 @@ impl Host {
             "replan_member_not_live"
         );
         false
+    }
+
+    /// [`ReplanHold::pin_once`]: the first re-plan of this instance to ask pins `node` although
+    /// it is not live, as a re-plan built before the remove would (the plan-to-CAS window).
+    #[cfg(test)]
+    fn pin_anyway(&self, partition: PartitionId, node: NodeId) -> bool {
+        let Some(instance) = self.instance else {
+            return false;
+        };
+        let mut once = PIN_ONCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = once.len();
+        once.retain(|armed| *armed != (instance, node));
+        if once.len() == before {
+            return false;
+        }
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            member = node.0,
+            "test_pinned_not_live"
+        );
+        true
     }
 
     /// [`ReplanHold`]: a re-plan of this instance that re-adds the held node waits here, before

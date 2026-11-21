@@ -1183,3 +1183,173 @@ fn s80s4_a_removed_node_still_pinned_is_dropped_by_the_unreachable_clock() {
         "s80s4_removed_pin_healed"
     );
 }
+
+/// #80 S4 (S-2 follow-up to M5b): the late commit M5b leaves open, a removed node pinned as a
+/// shadow, heals by itself. The M5b race: node X is killed and dropped, restarted, and a
+/// re-add's re-plan is held ([`crate::host::ReplanHold`]) while `admin::remove_node(X)` lands
+/// and every survivor's `Net` retires X; [`crate::host::ReplanHold::pin_once`] lets that one
+/// re-plan pin X although it is not live, as a plan built before the remove would. Released,
+/// its commit pins X as a shadow. The owner has no link to it, so `Host::shadow_give_up_duty`
+/// gives it up: within `PEER_DROP_AFTER_MILLIS` plus a drop check plus 10 s (scaled) no
+/// `partitions/` record pins X, and X stays out for five more drop checks. A put to each of
+/// X's ring partitions keeps landing within the S3 acceptance bound
+/// (`OutageBound::acceptance`, scaled) throughout: a shadow is never counted for a write, so
+/// they do not pause. Observed heal 10.5-16.0 s and slowest put 0.2-5.0 s, green 4/4 at load
+/// 21-98. Integration (~30-60 s).
+/// Cut: `Host::shadow_give_up_duty` gives nothing up: "partitions [2] still pin removed node 2
+/// after 60.6s", red, observed 2026-11-21 at load 86.
+#[config_log::retcd_test]
+fn s80s4_a_removed_node_pinned_as_a_shadow_late_is_given_up() {
+    const TEST: &str = "s80s4_a_removed_node_pinned_as_a_shadow_late_is_given_up";
+    let timeouts = probe_timeouts();
+    let mut lost = lose_one(Loss::Kill, timeouts, Some(Failover::default()));
+    after_loss(&lost, TEST);
+    let dead = lost.dead;
+    for p in 1..=S1B_P {
+        pins_until(
+            &lost.rig,
+            p,
+            Duration::from_secs(60),
+            "every partition drops the dead node",
+            |pins| !pins.contains(&dead.0),
+        );
+    }
+    let instance = lost
+        .rig
+        .rt
+        .block_on(admin::read_formation(&*lost.rig.store))
+        .expect("the formation reads")
+        .expect("a formation")
+        .instance;
+    let hold = crate::host::ReplanHold::arm(instance, dead);
+    crate::host::ReplanHold::pin_once(instance, dead);
+    lost.rig.restart(dead, timeouts);
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    while hold.reached() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no owner started a re-add of node {} after its restart",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    lost.rig
+        .rt
+        .block_on(admin::remove_node(&lost.rig.store, dead))
+        .unwrap_or_else(|e| panic!("node {} is removed: {e:?}", dead.0));
+    for node in (1..=S1B_K).map(NodeId).filter(|n| *n != dead) {
+        let net = lost
+            .rig
+            .of(node)
+            .links
+            .net()
+            .unwrap_or_else(|| panic!("node {} runs a net", node.0));
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        while net.members().contains(&dead) {
+            assert!(
+                Instant::now() < deadline,
+                "node {}'s net still names removed node {} live",
+                node.0,
+                dead.0
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    hold.release();
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    let late = loop {
+        let shadowed: Vec<u32> = (1..=S1B_P)
+            .filter(|p| pinned_roles(&lost.rig, *p).get(&dead.0) == Some(&ReplicaRole::Shadow))
+            .collect();
+        if let Some(p) = shadowed.first() {
+            break *p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup: the released re-plan never pinned removed node {} as a shadow, so the late \
+             commit never happened and there is nothing to heal",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let pinned_at = Instant::now();
+    tracing::info!(partition = late, node = dead.0, "s80s4_late_shadow_pinned");
+    let seats: Vec<u32> = (1..=S1B_P)
+        .filter(|p| ring(S1B_K, *p).copies.contains(&dead.0))
+        .collect();
+    let writer = lost.rig.of(survivor(&lost));
+    let (acceptance, _) =
+        write_outage_bound(&fast(), &timeouts, &Failover::default(), timeouts.put).acceptance();
+    let put_patience = crate::host::test_patience(acceptance);
+    let mut slowest = Duration::ZERO;
+    let put_all = |slowest: &mut Duration| {
+        for p in &seats {
+            let started = Instant::now();
+            put_within(writer, lost.groups[p], put_patience).unwrap_or_else(|e| {
+                panic!(
+                    "partition {p}: a put lands while node {} is removed: {e}",
+                    dead.0
+                )
+            });
+            *slowest = (*slowest).max(started.elapsed());
+        }
+    };
+    let healed = crate::host::test_patience(
+        Duration::from_millis(
+            crate::host::PEER_DROP_AFTER_MILLIS + crate::host::DROP_CHECK_EVERY_MILLIS,
+        ) + Duration::from_secs(10),
+    );
+    loop {
+        put_all(&mut slowest);
+        let pinning: Vec<u32> = (1..=S1B_P)
+            .filter(|p| pinned_roles(&lost.rig, *p).contains_key(&dead.0))
+            .collect();
+        if pinning.is_empty() {
+            break;
+        }
+        assert!(
+            pinned_at.elapsed() < healed,
+            "partitions {pinning:?} still pin removed node {} after {healed:?}",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let heal_ms = ms(pinned_at.elapsed());
+    let watch = Instant::now() + Duration::from_millis(5 * crate::host::DROP_CHECK_EVERY_MILLIS);
+    loop {
+        for p in 1..=S1B_P {
+            let roles = pinned_roles(&lost.rig, p);
+            assert!(
+                !roles.contains_key(&dead.0),
+                "partitions/{p} pins removed node {} again: {roles:?}",
+                dead.0
+            );
+        }
+        put_all(&mut slowest);
+        if Instant::now() >= watch {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        slowest <= put_patience,
+        "the slowest put took {slowest:?}, over the lost-host bound {put_patience:?}"
+    );
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), TEST);
+    let given_up = lines
+        .iter()
+        .filter(|line| line["@m"] == "move_given_up" && line["partition"] == late)
+        .count();
+    assert!(
+        given_up >= 1,
+        "partition {late}'s owner gave the shadow up (move_given_up)"
+    );
+    tracing::info!(
+        node = dead.0,
+        late,
+        heal_ms,
+        slowest_put_ms = ms(slowest),
+        given_up,
+        "s80s4_late_shadow_healed"
+    );
+}
