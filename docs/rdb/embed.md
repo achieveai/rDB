@@ -411,38 +411,73 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
 - **While a node is down, a surviving node that restarts cannot finish opening until the dead
   node returns or the partitions it co-owns are promoted with `--drop`, which costs that
-  surviving node its leadership.** Its open keeps logging `heal_retry` for the dead node. The
+  surviving node its leadership** — after a host crash or reboot. A process restart on the same
+  OS boot can heal without the dead node: see the amendment below. Its open keeps logging `heal_retry` for the dead node. The
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
-- **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271): after a process restart, an
-  owner heals with a majority of its copies.** The bullet above still holds after a host crash.
-  - **Process restart, same OS boot (Linux):** the owner's open does not wait for a copy that
-    is down, when a majority of the partition's copies, the owner included, is up and the down
-    copy's grant (`grants/{node}`) is frozen or proven expired on the owner's clock. It logs
-    `heal_proceed_without` and leaves that copy out; the copy rejoins by itself when it starts
-    again. A copy with a live grant is waited for: it may be alive with a slow link. The wait is
-    at most one grant lifetime plus the clock margins, never a fixed delay. A copy with no grant
-    record (one that never owned a partition) is waited for one heal window
-    (`no_grant_record`), then left out too (`evidence=no_grant_after_window`); if it was alive
-    with a late link, it is re-added once its link is back (with `Timeouts::live_readd`), else when it
-    starts again. That costs availability only, never an acknowledged write.
+- **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
+  ADR-rdb-0025): after a process restart, an owner with `Timeouts::live_readd` on heals with
+  a majority of its copies.** The bullet above still holds after a host crash, and it holds
+  whenever `live_readd` is off.
+  - **Issue #169 (a restarted owner waits for a down copy) is fixed only with
+    `Timeouts::live_readd` on** (`rdb_node --live-readd`). With it off, the default, the reopen
+    waits for every copy, as before R5, and logs `heal_wait_all` with reason `live_readd_off`.
+    Each open logs the setting as `db_open_live_readd{enabled}`.
+  - **Process restart, same OS boot (Linux), `live_readd` on:** the owner's open does not wait
+    for a copy that is down, when a majority of the partition's pinned non-shadow members, the
+    owner included, is up and the down copy's grant (`grants/{node}`) is frozen or proven
+    expired on the owner's clock. It logs `heal_proceed_without` and leaves that copy out. A
+    copy with a live grant is waited for: it may be alive with a slow link. The wait is at most
+    one grant lifetime plus the clock margins, never a fixed delay. A copy with no grant record
+    (one that never owned a partition) is waited for one heal window (`no_grant_record`), then
+    left out too (`evidence=no_grant_after_window`). That costs availability only, never an
+    acknowledged write.
+  - **How a left-out copy comes back:** by #107's live re-add, once its link has been up for
+    5 s, whether it never stopped or started again. No record proves which boot a left-out
+    copy runs: a frozen or expired grant can name an older process of a node that already runs
+    again. Memory only: if the owner restarts again before the copy is back, the copy returns
+    only when its own node restarts, as after any drop.
+  - **Set `live_readd` the same on every node.** Each step is the owner's: its setting decides
+    whether the heal leaves a copy out and whether it re-adds it. On this build the returning
+    copy marks a refused landing only with its own setting on, so a copy with it off can leave a
+    re-added partition read-only until that copy restarts. It never loses a write.
   - **Host crash or reboot:** the owner waits for every copy, as above, or for
     `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
     steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
   - Every wait logs `heal_wait_all` with its reason: `os_boot_changed`, `os_boot_unknown`,
-    `unsupported_platform`, `no_majority`, `copy_not_proven_down`, `no_grant_record` or `no_clock_bound`. A
-    `wait_ready` that times out names it.
-  - How it tells: the node folder's `os_boot` file, beside `boot`, holds the OS boot id
-    (`/proc/sys/kernel/random/boot_id`) once an open has been ready. A first open, a missing or
-    unreadable id, and macOS or Windows all count as a host crash.
+    `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
+    `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
+    `no_clock_bound`. A `wait_ready` that times out names it.
+  - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
+    (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
+    done. Node processes that share one folder each keep their own. A first open, a missing,
+    empty or unreadable id, and macOS or Windows all count as a host crash.
   - **Containers:** the boot id is the host kernel's, so restarting a container is the same boot.
     That is correct: the host kept the unsynced data.
   - **Known limits:** restoring a VM or disk snapshot, or network storage that drops its write
     cache without a reboot, keeps the boot id but loses data. Before starting a node on a
-    restored snapshot, delete `os_boot` from its folder; it then waits for every copy.
+    restored snapshot, delete `nodes/<n>/os_boot` from its folder; it then waits for every copy.
+  - **What is still open before `live_readd` is on by default** (#107's table). If one is hit
+    with it on, this is what you see:
+    - **Protocol 10, the owner's setting on the wire** (#170, not on this build): a peer on an
+      older build, or with the setting off, can leave a re-added partition read-only until that
+      copy restarts.
+    - **A re-add shadow that is never promoted** (M3 exit): nothing gives up on it and nothing
+      is logged; the partition keeps writing with its other copies, and the copy stays a
+      shadow.
+    - **Flatten off the owner's thread** (storage): adoption's flatten runs on the owner's
+      thread, so a re-add after a long drop can pause the owner's other partitions while it
+      flattens.
+    - **The WAL watchdog against a frozen process** (storage): how the watchdog treats a
+      process that was frozen and resumed is not yet checked; treat a watchdog fault after a
+      freeze as this case.
+    - **Check B at adoption** (#121) and **the #81 failover row** (own81_X2): with automatic
+      failover on, those paths are not yet proven together with live re-add.
+    - **R4, the 512-partition walk**: the cost of many re-adds at once is not measured; expect
+      pauses on a node with many partitions blipped together.
 
 ### Fencing your own side effects
 
