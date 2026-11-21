@@ -1045,11 +1045,25 @@ fn own81_d1_v9_off_by_default_then_a_planner_started_after_the_owner_died_fails_
 }
 
 /// R3 over real links: two planners that both believe they hold the grant sweep at once
-/// after node 1 stops. Each partition commits once: one sweep's promote lands, the other's
-/// reports it lost the race, and the generation rose by one.
+/// after node 1 stops. Each partition commits once and the generation rises by one. One
+/// sweep's promote lands. The other either reports it lost the race, or, when both promotes
+/// dropped the same node, answers Ok for that same commit (A-R448 case 3: "both answer Ok,
+/// each with the commit's generation and revision"). So the row counts the distinct
+/// generations of the Ok answers, not Ok answers (seen once under load in a full `--lib` run:
+/// two Ok answers, both at generation 3 and revision 51). Not the revision too: for one commit
+/// `control_revision` can be a later write at the same generation, so two answers to one
+/// commit may differ there. A second commit raises the generation again, so the distinct
+/// generations, the record's generation and the +1 below each catch it.
+/// Three guards stand between two sweeps and a second commit: the promote's `Fencing` CAS, F1's
+/// commit CAS on `partitions/` at the fence revision, and the node's lineage, which refuses a
+/// plan for a lineage it has moved past.
 /// Integration (~10 s): waits out the grant, then two sweeps.
-/// Cut: none in C1 code: the `Fencing` CAS in `promote_looked` decides it, and its own rows pin
-/// that. This row pins that the planner adds no second write around it.
+/// Cuts (PR #171 round 2): the `Fencing` CAS made unconditional: 3 of 3 green, one commit both
+/// sweeps answered Ok for. That CAS and F1's commit CAS both made unconditional: 6 of 9 red, every
+/// one at the record-equals-answers check (the late `Fencing` write put the record back to
+/// generation 2 while the answers named 3). So that check catches a double write. No cut short
+/// of the lineage refusal made a second commit. This row pins that the planner adds no second
+/// write around them.
 #[config_log::retcd_test]
 fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
     let rig = rig(3, None);
@@ -1080,13 +1094,20 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
         assert!(Instant::now() < deadline, "no sweep acted");
         std::thread::sleep(Duration::from_millis(200));
     };
-    let committed: Vec<_> = answers
+    let commits: std::collections::BTreeSet<_> = answers
         .iter()
         .flatten()
-        .filter(|(partition, answer)| *partition == PartitionId(1) && answer.is_ok())
+        .filter(|(partition, _)| *partition == PartitionId(1))
+        .filter_map(|(_, answer)| answer.as_ref().ok())
+        .map(|promoted| promoted.generation)
         .collect();
-    assert_eq!(committed.len(), 1, "one commit: {answers:?}");
+    assert_eq!(commits.len(), 1, "one commit: {answers:?}");
     let after = rig.record(1);
+    let generation = commits.first().copied().expect("one commit");
+    assert_eq!(
+        after.generation, generation,
+        "the Ok answers name the commit: {after:?}"
+    );
     assert_ne!(after.owner, NodeId(1), "{after:?}");
     assert_eq!(
         after.generation.0,
