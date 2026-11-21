@@ -1264,17 +1264,11 @@ impl NodeInner {
     /// hold on every node a retired node might dial, including one that was partitioned while
     /// the removal happened, so the fence travels through the log like any other fact.
     fn retired_nodes(&self) -> BTreeSet<NodeId> {
-        let mut out = BTreeSet::new();
-        self.reader
-            .with_state(&mut |s| out = s.retired_nodes().clone());
-        out
+        self.reader.retired_nodes()
     }
 
     fn is_retired(&self, node_id: NodeId) -> bool {
-        let mut retired = false;
-        self.reader
-            .with_state(&mut |s| retired = s.is_retired(node_id));
-        retired
+        self.reader.is_retired(node_id)
     }
 
     /// Refuse unless this node is the leader *now*, with the best hint it can prove.
@@ -2425,10 +2419,7 @@ impl NodeInner {
     /// untrue. Read from the state machine rather than cached, because a snapshot install can
     /// raise it without this process applying anything.
     fn max_applied_command_schema(&self) -> u16 {
-        let mut out: u16 = config_core::COMMAND_SCHEMA_V1;
-        self.reader
-            .with_state(&mut |s| out = s.max_applied_command_schema());
-        out
+        self.reader.max_applied_command_schema()
     }
 
     /// Whether a committed voter has *answered* naming a schema below `command_schema`.

@@ -253,6 +253,15 @@ pub trait FaultInjector: Send + Sync {
     /// do not wait for it (A-R279).
     fn during_snapshot_capture(&self) {}
 
+    /// Called once per apply batch, on the store's blocking thread, with the state-machine lock
+    /// held, after the batch is built and immediately before its synced write. Does nothing by
+    /// default.
+    ///
+    /// Not a [`Boundary`]: nothing can fail here, and no boundary sits inside the batch. It
+    /// exists so a test can hold an apply inside its write and show that the cheap readers
+    /// (membership, last applied, revision, the retired set) do not wait for it (#186).
+    fn before_state_write(&self) {}
+
     /// Called once per export that published or was superseded, on the store's blocking
     /// thread, after the state-machine lock is released and before the build opens the file it
     /// hands OpenRaft. Does nothing by default.

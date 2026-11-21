@@ -1599,3 +1599,205 @@ async fn m2_storage_29_missing_format_version_on_non_empty_store_refused() {
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
 }
+
+// --- #186: readers answer from the applied mirror, never ahead of the disk ----------------
+
+/// What the cheap readers report, gathered in one place so "before" and "during" compare
+/// as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheapReads {
+    last_applied: Option<LogId<RaftNodeId>>,
+    membership_log_id: Option<LogId<RaftNodeId>>,
+    voters: Vec<u64>,
+    cluster_revision: u64,
+    retired_9: bool,
+    retired: Vec<NodeId>,
+    max_applied_command_schema: u16,
+}
+
+fn cheap_reads(r: &dyn config_storage::StateReader) -> CheapReads {
+    let membership = r.membership();
+    CheapReads {
+        last_applied: r.last_applied(),
+        membership_log_id: *membership.log_id(),
+        voters: membership.voter_ids().collect(),
+        cluster_revision: r.cluster_revision(),
+        retired_9: r.is_retired(NodeId(9)),
+        retired: r.retired_nodes().into_iter().collect(),
+        max_applied_command_schema: r.max_applied_command_schema(),
+    }
+}
+
+/// [`cheap_reads`] on its own thread, failing if it does not answer within one second.
+///
+/// The thread is left behind on failure rather than joined: joining a reader that is stuck on
+/// the lock the test is holding would hang the test instead of failing it.
+fn cheap_reads_promptly(r: Arc<dyn config_storage::StateReader>) -> CheapReads {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cheap_reads(&*r));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the cheap readers waited for the apply's write")
+}
+
+fn membership_entry(index: u64, voters: &[u64]) -> Entry<TypeConfig> {
+    use config_storage::RaftNode;
+    let voters: std::collections::BTreeSet<u64> = voters.iter().copied().collect();
+    let nodes: BTreeMap<u64, RaftNode> = voters
+        .iter()
+        .map(|id| (*id, RaftNode::same(format!("inproc://{id}"))))
+        .collect();
+    Entry {
+        log_id: log_id(1, index),
+        payload: EntryPayload::Membership(openraft::Membership::new(vec![voters], nodes)),
+    }
+}
+
+fn retire(index: u64, node: u64) -> Entry<TypeConfig> {
+    Entry {
+        log_id: log_id(1, index),
+        payload: EntryPayload::Normal(Command::RetireNode {
+            node_id: NodeId(node),
+        }),
+    }
+}
+
+/// Holds the first apply after [`ParkWrite::arm`] at `before_state_write`: the batch is built,
+/// the state-machine lock is held, and nothing has been written.
+#[derive(Default)]
+struct ParkWrite {
+    armed: std::sync::atomic::AtomicBool,
+    reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl ParkWrite {
+    /// Arm the next write; returns (reached, release).
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.reached.lock().unwrap() = Some(reached_tx);
+        *self.release.lock().unwrap() = Some(release_rx);
+        self.armed.store(true, Ordering::SeqCst);
+        (reached_rx, release_tx)
+    }
+}
+
+impl FaultInjector for ParkWrite {
+    fn before(&self, _boundary: Boundary) -> FaultAction {
+        FaultAction::Proceed
+    }
+
+    fn before_state_write(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(reached) = self.reached.lock().unwrap().take() {
+            let _ = reached.send(());
+        }
+        if let Some(release) = self.release.lock().unwrap().take() {
+            release
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the test releases the write");
+        }
+    }
+}
+
+/// #186 row 2: an apply parked under the state-machine lock, just before its synced write,
+/// does not hold up the cheap readers — and they report the values from before the batch,
+/// because the mirror moves only once the batch is on disk.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i186_readers_report_the_old_state_while_an_apply_is_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let s = open_at(tmp.path(), park.clone());
+    s.state_machine()
+        .apply(vec![membership_entry(1, &[1]), put(1, 2, "/a", "1")])
+        .await
+        .unwrap();
+    let reader = s.reader();
+    let before = cheap_reads(&*reader);
+    assert_eq!(before.last_applied, Some(log_id(1, 2)));
+    assert_eq!(before.cluster_revision, 1);
+
+    let (reached, release) = park.arm();
+    let mut sm = s.state_machine();
+    let applying = tokio::spawn(async move {
+        sm.apply(vec![
+            membership_entry(3, &[1, 2, 3]),
+            put(1, 4, "/b", "2"),
+            retire(5, 9),
+        ])
+        .await
+    });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the apply reaches its write");
+
+    let during = cheap_reads_promptly(Arc::clone(&reader));
+    assert_eq!(
+        during, before,
+        "while the batch is not yet on disk the readers must report the state before it"
+    );
+
+    release.send(()).unwrap();
+    applying.await.unwrap().expect("the apply completes");
+    let after = cheap_reads(&*reader);
+    assert_eq!(after.last_applied, Some(log_id(1, 5)));
+    assert_eq!(after.membership_log_id, Some(log_id(1, 3)));
+    assert_eq!(after.voters, vec![1, 2, 3]);
+    assert_eq!(after.cluster_revision, 2);
+    assert!(
+        after.retired_9,
+        "the retire in the batch is visible once it is durable"
+    );
+    assert_eq!(after.retired, vec![NodeId(9)]);
+}
+
+/// #186 row 4 (TA-14): a crash before the batch leaves the mirror as it was, and a crash after
+/// it leaves a mirror that agrees with what a reopen reads back from disk.
+#[retcd_test]
+async fn i186_mirror_agrees_with_the_disk_across_a_state_batch_crash() {
+    for boundary in [Boundary::BeforeStateBatch, Boundary::AfterStateBatch] {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let s = open_plain(tmp.path());
+            s.state_machine()
+                .apply(vec![membership_entry(1, &[1]), put(1, 2, "/a", "1")])
+                .await
+                .unwrap();
+        }
+        let (seeded, at_crash) = {
+            let s = open_at(tmp.path(), FailAt::new(boundary, FaultAction::Crash));
+            let reader = s.reader();
+            let seeded = cheap_reads(&*reader);
+            let _ = s
+                .state_machine()
+                .apply(vec![
+                    membership_entry(3, &[1, 2, 3]),
+                    put(1, 4, "/b", "2"),
+                    retire(5, 9),
+                ])
+                .await;
+            assert!(s.is_poisoned(), "{boundary}: Crash must poison the store");
+            assert_eq!(s.counters().get(boundary), 1, "{boundary}: was reached");
+            (seeded, cheap_reads(&*reader))
+        };
+        if boundary == Boundary::BeforeStateBatch {
+            assert_eq!(
+                at_crash, seeded,
+                "{boundary}: nothing was written, nothing moved"
+            );
+        } else {
+            assert_eq!(at_crash.last_applied, Some(log_id(1, 5)), "{boundary}");
+        }
+        let reopened = open_plain(tmp.path());
+        assert_eq!(
+            cheap_reads(&*reopened.reader()),
+            at_crash,
+            "{boundary}: what the readers said before the crash is what the disk holds"
+        );
+    }
+}
