@@ -7559,9 +7559,10 @@ fn issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot() {
 /// `admin::tests::r5_i_a_copy_with_no_grant_is_left_out_after_one_heal_window`; the trio has
 /// no open, so no heal of its own. At the trio layer because on this base the Db rig cannot
 /// keep one link down at the same boot (`mute` still handshakes until PR #170); a Db-rig
-/// variant using `mute` follows once #170 is on main. Cuts: the heal names node 3 at its live
-/// boot instead of `UNLINKED_BOOT`, red (no `heal_left_out_clocked`, so no live re-add); the
-/// host notes `HealLeftOut` without recording it for the live re-add, red (the same).
+/// variant using `mute` follows once #170 is on main. This row sends `HealLeftOut` by hand and
+/// runs no heal, so it pins the host's half only. Cut: the host ignores `HealLeftOut` (records
+/// nothing for the live re-add), red: no `heal_left_out_clocked`, and node 3 is never pinned.
+/// The heal's choice of `UNLINKED_BOOT` is pinned by `admin::tests::r5_b` and `r5_i`.
 /// Integration (~5 s).
 #[config_log::retcd_test]
 fn r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot() {
