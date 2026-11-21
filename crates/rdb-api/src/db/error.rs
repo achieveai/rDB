@@ -123,6 +123,21 @@ pub(crate) const DAMAGED_OBJECT_STEP: &str =
     "the object's own stored value is damaged, so delete the whole object with `Change::Clear` \
      (in rdb_dev: `admin clear <object>`), then write it again";
 
+/// The step of a feed read's `CORRUPT_HISTORY` (#87): the cursor's record has another digest
+/// here, or a record does not parse. "Write over its key" is a map entry's step, which a feed
+/// caller cannot act on.
+pub(crate) const FEED_HISTORY_STEP: &str = "the history at this copy is unreadable from this \
+     cursor: read from another copy (the owner or another member), or rebuild from your own \
+     source";
+
+/// The step of a feed read refused by a copy that holds no current copy of the partition (#87):
+/// left out of the generation `partitions/{p}` names, or never a member. Its rule is
+/// `Definitive`: calling this copy again answers the same until it is a member again, so the
+/// caller switches source rather than retrying here.
+pub(crate) const FEED_OTHER_COPY_STEP: &str = "read from the owner or another member \
+     (`Source::Owner`, or `Source::Node` of a member); calling this copy again will not help \
+     while it holds no current copy";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -356,6 +371,8 @@ impl ApiError {
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
+            || self.detail.ends_with(FEED_HISTORY_STEP)
+            || self.detail.ends_with(FEED_OTHER_COPY_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)

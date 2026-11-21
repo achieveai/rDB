@@ -30,10 +30,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::db::error::{FEED_HISTORY_STEP, FEED_OTHER_COPY_STEP};
 use bytes::Bytes;
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::GrantRecord;
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, INSTANCE_LEN};
+use rdb_core::authority::partition::{
+    PartitionLifecycle, PartitionRecord, RecordMember, INSTANCE_LEN,
+};
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityView, BlockReason, Boundary,
@@ -94,6 +97,7 @@ use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 use crate::clock::{ClockGuard, HostClock};
 use crate::control::ControlAdapter;
 use crate::db::ApiError;
+use crate::feed::{self, FeedCursor, FeedPage};
 use crate::ownership::{
     deactivating_lead_millis, ownership_due, ownership_step, Judged, OwnState, OwnerToken,
     OwnerViews, OwnershipEvent, Step, Subscriber,
@@ -112,6 +116,11 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 
 /// #90: how often a primary looks for copies a barrier can now ask.
 const BARRIER_DUTY_MILLIS: u64 = 5;
+
+/// #87: how long a feed call waits for the control read it started, at most, before it is
+/// refused "call again". A read of `partitions/{p}` takes milliseconds; this is under the
+/// default `Timeouts::read` (1 s), so a caller hears the refusal rather than its own timeout.
+const FEED_READ_WAIT_MILLIS: u64 = 500;
 
 /// #90: the most barriers one node holds at once: 256 partitions at a 5 s timeout hold 1280. A
 /// bound, so a stalled disk cannot grow the table without limit.
@@ -245,6 +254,14 @@ pub const MIN_UNREACHABLE_DROP_AFTER_MILLIS: u64 = 2_000;
 /// this costs nothing. The same 5 s as L1's `resume_hold_millis`, but its own value, since L1
 /// reads that budget. Crate tests set the host field directly.
 pub const LIVE_READD_HOLD_MILLIS: u64 = 5_000;
+
+/// #107 M3 exit: how long a shadow the live re-add pinned may stay unpromoted, counted from the
+/// commit that pinned it. Past it the owner gives the shadow up ([`Host::live_readd_shadow_duty`]).
+pub const LIVE_READD_SHADOW_GIVE_UP_MILLIS: u64 = 30 * 60 * 1_000;
+
+/// #107 M3 exit: how many promote re-plans for a shadow the live re-add pinned may end without
+/// committing the promote before the owner gives it up ([`Host::live_readd_promote_ended`]).
+pub const LIVE_READD_SHADOW_GIVE_UP_BLOCKS: u32 = 3;
 
 /// Critic M2 (A-R442): how many records behind the primary's head a shadow may be when the owner
 /// promotes it. The promote's barrier replays the rest inside the fence, where writes pause, so
@@ -484,6 +501,19 @@ pub enum Msg {
         /// this node's barriers below it.
         generation: Option<Generation>,
     },
+    /// #87 (R2): what `partitions/{partition}` said when this node read it for the change feed
+    /// ([`ControlAdapter::read_partition_for_feed`]). A secondary serves the feed only while
+    /// such a read, begun at `started`, is fresh. Dropped unless `boot` is the node's own.
+    FeedRead {
+        /// The boot of the node process that asked.
+        boot: BootId,
+        /// The partition.
+        partition: PartitionId,
+        /// When the read began, on this node's clock.
+        started: Tick,
+        /// What the record says, or why it could not be read.
+        read: Result<FeedControlRead, String>,
+    },
     /// A-R446: a routed `FenceProven` and what `partitions/1` and its owner's grant said when
     /// this node read them for it ([`ControlAdapter::read_fence_facts`]). F1 is given the proof
     /// only when [`bind_routed_fence`] holds; dropped unless `boot` is the node's own, as
@@ -626,6 +656,10 @@ pub enum Msg {
         emitter: NodeId,
         /// Not before this tick.
         not_before: Tick,
+        /// `Timeouts::live_readd` on the owner whose F1 committed it (#107 slice 2b). A re-post
+        /// ([`Host::copy_ahead`]) relays that owner's value, never the relaying node's. A copy
+        /// refused this landing marks its receiver only when it is on ([`Host::land_link`]).
+        owner_live_readd: bool,
     },
     /// A client call.
     Client(Client),
@@ -661,8 +695,25 @@ pub enum Msg {
         ns: Namespace,
         /// The key in `ns`, as stored: a `History` record's is its seq, u64 big-endian.
         key: Vec<u8>,
+        /// How ([`RocksEngine::damage_record_as`]).
+        how: rdb_storage::RecordDamage,
         /// Where the answer goes.
         reply: Sender<Result<(), rdb_storage::DamageRefused>>,
+    },
+    /// **Dev tool only**, debug builds (#170 review r1): delete this node's `History` records
+    /// with a seq in `seqs` through lineage `(partition, generation)`'s chain
+    /// ([`RocksEngine::drop_history`]): a raised floor, or a hole. Local only, like
+    /// [`Msg::Damage`]. Answers how many it deleted.
+    #[cfg(debug_assertions)]
+    DropHistory {
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage's generation.
+        generation: Generation,
+        /// The seqs dropped.
+        seqs: std::ops::Range<u64>,
+        /// Where the answer goes.
+        reply: Sender<Result<u64, String>>,
     },
     /// **Dev tool only**, debug builds (#65, critic-bb §3 mode C): replace the head `History`
     /// record of lineage `(partition, generation)` in this node's own copy with a different one
@@ -924,6 +975,17 @@ pub enum ClientCall {
         /// How long the barrier may wait.
         remaining_millis: u64,
     },
+    /// #87: the committed transactions after `from`, read from this node's copy
+    /// ([`Answer::Changes`]). Answered in the step that takes it; the identity only names the
+    /// caller in logs, so it never queues behind a call.
+    Changes {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The cursor after the last record the caller has.
+        from: FeedCursor,
+        /// The most records to return, at most [`crate::feed::FEED_PAGE_RECORDS`].
+        max: u32,
+    },
 }
 
 /// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
@@ -1153,6 +1215,8 @@ pub enum Answer {
     TailForgotten(String),
     /// A [`ClientCall::WaitDurable`] was proved on every regular copy.
     Durable,
+    /// A [`ClientCall::Changes`] page.
+    Changes(FeedPage),
     /// The call failed.
     Error {
         /// Why.
@@ -1719,6 +1783,27 @@ struct LiveReadd {
     /// Each gate refusal ([`Host::live_readd_refusal`]) logged `live_readd_refused`, so the
     /// line comes once per partition, node and reason while the copy's entry lasts.
     refusals_logged: BTreeSet<(PartitionId, NodeId, &'static str)>,
+    /// M3 exit: the re-add re-plan the duty started, per partition, with the node and the boot
+    /// it pins. Read and cleared by the next commit of this owner's own re-plan.
+    readding: BTreeMap<PartitionId, (NodeId, BootId)>,
+    /// M3 exit: each shadow a live re-add pinned, from that commit until a commit pins it
+    /// regular or leaves it out. One entry per drop: the re-add is spent, so the give-up is
+    /// final until a restart.
+    shadows: BTreeMap<(PartitionId, NodeId), ReaddShadow>,
+}
+
+/// #107 M3 exit: a shadow a live re-add pinned, as the owner keeps it until the promote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReaddShadow {
+    /// The commit that pinned it: the drop it is the one re-add of.
+    generation: Generation,
+    /// When this owner saw that commit; [`LIVE_READD_SHADOW_GIVE_UP_MILLIS`] counts from here.
+    since: Tick,
+    /// Promote re-plans for it that ended without committing the promote.
+    blocks: u32,
+    /// The boot the commit pinned it at. Its clock and blocks belong to that process: once a
+    /// newer boot of the node is pinned (it restarted), the tracking is cleared (review r1).
+    boot: BootId,
 }
 
 impl LiveReadd {
@@ -1731,6 +1816,8 @@ impl LiveReadd {
             probe: None,
             armed: None,
             refusals_logged: BTreeSet::new(),
+            readding: BTreeMap::new(),
+            shadows: BTreeMap::new(),
         }
     }
 }
@@ -2414,6 +2501,60 @@ struct Adopted {
     config_version: ConfigVersion,
 }
 
+/// #87 (R2): what one read of `partitions/{p}` said, for the change feed
+/// ([`Msg::FeedRead`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedControlRead {
+    /// The generation the record names.
+    pub generation: Generation,
+    /// The owner it names.
+    pub owner: NodeId,
+    /// The members it pins, `None` for a layout that pins none.
+    pub members: Option<Vec<RecordMember>>,
+}
+
+/// #87 (R2): what a secondary knows of `partitions/{p}` for the change feed.
+#[derive(Debug, Default)]
+struct FeedFreshness {
+    /// The last read that answered, and when it began.
+    read: Option<(Tick, FeedControlRead)>,
+    /// A read is in flight.
+    in_flight: bool,
+    /// Feed calls waiting for that read: answered when it lands, or at their `until`
+    /// ([`FEED_READ_WAIT_MILLIS`]), whichever is first. A call is never refused only because
+    /// it started the read: a consumer that calls less often than once a grant was refused at
+    /// every call (#87 lr walk).
+    waiting: Vec<FeedWaiter>,
+}
+
+/// A feed call parked on its partition's control read ([`FeedFreshness::waiting`]).
+#[derive(Debug)]
+struct FeedWaiter {
+    identity: RequestIdentity,
+    from: FeedCursor,
+    max: u32,
+    reply: Sender<Answer>,
+    until: Tick,
+}
+
+/// What [`Host::feed_fresh`] found.
+#[derive(Debug)]
+enum Freshness {
+    /// This secondary may serve.
+    Fresh,
+    /// No read answered within the grant and one is in flight: the call may wait for it.
+    Reading,
+    /// Refused, with the caller's error.
+    Refused(ApiError),
+}
+
+/// What [`Host::changes`] answers: a page or a refusal, or wait for the control read.
+#[derive(Debug)]
+enum FeedCall {
+    Answer(Result<FeedPage, ApiError>),
+    WaitForRead,
+}
+
 /// Where a completion goes: the partition and correlation of the effect that asked.
 #[derive(Debug, Clone, Copy)]
 struct Site {
@@ -2439,6 +2580,7 @@ enum Delayed {
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
+        owner_live_readd: bool,
     },
     RebuildCheck {
         partition: PartitionId,
@@ -2628,6 +2770,20 @@ impl Fault {
         error.no_mutation = true;
         error
     }
+
+    /// [`Self::error`] for a feed call (#87), which writes nothing, so it claims no mutation.
+    /// Stored history damage carries the feed's step, read another copy or rebuild from your
+    /// own source, which suits a cursor and not a put or a get (review r2).
+    fn feed_error(&self) -> ApiError {
+        let mut error = self.error();
+        error.no_mutation = true;
+        if self.damage == Some(ErrorKind::CorruptHistory)
+            && !error.detail.ends_with(FEED_HISTORY_STEP)
+        {
+            error.detail = format!("{}; next: {FEED_HISTORY_STEP}", error.detail);
+        }
+        error
+    }
 }
 
 /// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
@@ -2794,8 +2950,10 @@ struct Host {
     /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
     /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
     snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
-    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
-    committed_correlation: BTreeMap<PartitionId, CorrelationId>,
+    /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root,
+    /// with the committing owner's `live_readd` it came with, which the re-post relays (#107
+    /// slice 2b). Inserted with `committed`, always.
+    committed_correlation: BTreeMap<PartitionId, (CorrelationId, bool)>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
     land_linked: BTreeSet<(PartitionId, Generation)>,
     /// #59 item 4: the `CopyCaughtUp` each such link answered, re-sent until F1 has it.
@@ -2843,6 +3001,9 @@ struct Host {
     /// How many node fences this node has had: each one's owner reads carry it, so a read
     /// begun under an earlier fence, answering late, is dropped (critic-d3 A3).
     owner_fence: u64,
+    /// #87 (R2): per partition a change-feed call asked about, this node's last good read of
+    /// `partitions/{p}` and whether another is in flight.
+    feed_reads: BTreeMap<PartitionId, FeedFreshness>,
     /// Per partition, the copy this owner holds responsible for L1 refusing writes (M10 S2 (b)).
     blamed: BTreeMap<PartitionId, Blame>,
     /// How many of A1's next `DrainProof`s this host loses, as if A1 never answered. Crate
@@ -3086,6 +3247,7 @@ impl Host {
             rebuild_asks: BTreeMap::new(),
             revocation_persisted: None,
             owner_after_fence: BTreeMap::new(),
+            feed_reads: BTreeMap::new(),
             owner_fence: 0,
             blamed: BTreeMap::new(),
             #[cfg(test)]
@@ -3384,6 +3546,7 @@ impl Host {
             Msg::Fault { kind, .. } => format!("fault/{kind}"),
             Msg::Activated { generation, .. } => format!("activated/{}", generation.0),
             Msg::OwnerLearned { .. } => "owner_learned".to_owned(),
+            Msg::FeedRead { .. } => "feed_read".to_owned(),
             Msg::FenceBound { .. } => "fence_bound".to_owned(),
             Msg::ReplanNote { .. } => "replan_note".to_owned(),
             _ => "other".to_owned(),
@@ -3439,6 +3602,7 @@ impl Host {
             | Msg::Fault { boot, .. }
             | Msg::Activated { boot, .. }
             | Msg::OwnerLearned { boot, .. }
+            | Msg::FeedRead { boot, .. }
             | Msg::FenceBound { boot, .. }
             | Msg::ReplanNote { boot, .. }
                 if boot != self.boot =>
@@ -3525,6 +3689,12 @@ impl Host {
                 }
                 Ok(())
             }
+            Msg::FeedRead {
+                partition,
+                started,
+                read,
+                ..
+            } => self.feed_read(partition, started, read),
             Msg::Inject {
                 partition,
                 correlation,
@@ -3779,6 +3949,7 @@ impl Host {
                 correlation,
                 emitter,
                 not_before,
+                owner_live_readd,
             } => {
                 let site = Site {
                     partition,
@@ -3790,6 +3961,7 @@ impl Host {
                         result,
                         site,
                         emitter,
+                        owner_live_readd,
                     },
                 );
                 Ok(())
@@ -3804,14 +3976,39 @@ impl Host {
                 Ok(())
             }
             #[cfg(debug_assertions)]
+            Msg::DropHistory {
+                partition,
+                generation,
+                seqs,
+                reply,
+            } => {
+                let answer = self
+                    .engine
+                    .drop_history(partition, generation, seqs.clone());
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    from = seqs.start,
+                    below = seqs.end,
+                    answer = ?answer,
+                    "host_history_dropped"
+                );
+                let _ = reply.send(answer);
+                Ok(())
+            }
+            #[cfg(debug_assertions)]
             Msg::Damage {
                 partition,
                 generation,
                 ns,
                 key,
+                how,
                 reply,
             } => {
-                let answer = self.engine.damage_record(partition, generation, ns, &key);
+                let answer = self
+                    .engine
+                    .damage_record_as(partition, generation, ns, &key, how);
                 tracing::warn!(
                     node = self.node.0,
                     partition = partition.0,
@@ -3873,9 +4070,12 @@ impl Host {
                 // fault: its refusal must not say nothing was applied, or the step sends that
                 // write again as a new one (#136). A resend keeps the refusal: `Db::put` sends
                 // a compiled request first as a resend, and that first send was never admitted
-                // (#124, `m10_124_...`); `Db::resend` clears `no_mutation` for a real resend.
+                // (#124, `m10_124_...`); `Db::resend` clears `no_mutation` for a real resend. A
+                // feed read gets `feed_error`, which names the step when the history is damaged
+                // (#87).
                 let error = match client.call {
                     ClientCall::Status { .. } => fault.error(),
+                    ClientCall::Changes { .. } => fault.feed_error(),
                     _ => fault.refusal(),
                 };
                 let _ = client.reply.send(Answer::Error {
@@ -3936,6 +4136,22 @@ impl Host {
                 );
                 let _ = client.reply.send(Answer::Error {
                     error: fault.error(),
+                    request: None,
+                });
+            }
+        }
+        // #87 review r1: feed calls parked on a control read, answered now rather than at their
+        // `until`, which a faulted node never reaches.
+        for (partition, entry) in &mut self.feed_reads {
+            for waiter in std::mem::take(&mut entry.waiting) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    client = waiter.identity.client.0,
+                    "feed_waiter_failed_by_fault"
+                );
+                let _ = waiter.reply.send(Answer::Error {
+                    error: fault.feed_error(),
                     request: None,
                 });
             }
@@ -4020,6 +4236,10 @@ impl Host {
                 return;
             }
         }
+        if let Err(fault) = self.feed_duty(now) {
+            self.set_fault(fault);
+            return;
+        }
         if self.next_flush <= now {
             self.next_flush = now.plus_millis(HOST_FLUSH_EVERY_MILLIS);
             let started = Instant::now();
@@ -4062,7 +4282,8 @@ impl Host {
                     result,
                     site,
                     emitter,
-                } => self.land(result, site, emitter),
+                    owner_live_readd,
+                } => self.land(result, site, emitter, owner_live_readd),
                 Delayed::RebuildCheck {
                     partition,
                     generation,
@@ -6706,7 +6927,7 @@ impl Host {
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
         self.committed_correlation
-            .insert(partition, site.correlation);
+            .insert(partition, (site.correlation, self.live_readd.on));
         if self.landed.insert((partition, result.new_generation)) {
             self.stamp_retirement(partition, result.new_generation);
         }
@@ -6737,6 +6958,7 @@ impl Host {
                 correlation: site.correlation,
                 emitter: self.node,
                 not_before,
+                owner_live_readd: self.live_readd.on,
             };
             if let Err(fault) = self.links.post(member, msg) {
                 tracing::warn!(
@@ -7502,6 +7724,19 @@ impl Host {
                         .any(|pin| pin.node == *node && pin.role == ReplicaRole::RegularSecondary)
             });
         }
+        // M3 exit: a re-added shadow promoted, left out or restarted (a newer boot pinned) is
+        // no longer held; its clock and blocks belonged to the process the re-add pinned.
+        if let Some(committed) = self.committed.get(&partition) {
+            let pinned = &committed.committed.pinned_config.members;
+            self.live_readd.shadows.retain(|(at, node), held| {
+                *at != partition
+                    || pinned.iter().any(|pin| {
+                        pin.node == *node
+                            && pin.role == ReplicaRole::Shadow
+                            && pin.boot == held.boot
+                    })
+            });
+        }
         let Some(Rejoin::Planned {
             generation: planned,
             replan,
@@ -7513,6 +7748,7 @@ impl Host {
             return;
         }
         self.rejoins.remove(&partition);
+        self.readd_shadow_pinned(partition, generation, replan);
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         self.move_committed(partition, generation, waited_ms);
         tracing::info!(
@@ -7555,6 +7791,7 @@ impl Host {
             self.repair_duty(partition, now);
             self.shadow_duty(partition, now);
             self.shadow_give_up_duty(partition, now);
+            self.live_readd_shadow_duty(partition, now);
             self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
@@ -7608,16 +7845,13 @@ impl Host {
     /// One attempt per drop: the plan's start spends the entry, so a re-add F1 blocks, or a
     /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
     ///
-    /// Protocol (Rev 5 m5, ADR-rdb-0009 section 7): every peer that completes a handshake at
-    /// [`crate::net::PROTOCOL_VERSION`] 9 has check A in [`Self::land_link`]: a refused landing
-    /// in a commit that takes writes drops the live receiver, so the copy is walked from the root
-    /// and never turns regular over a hole. That covers a writable commit only. A `ReadOnly`
-    /// return keeps the receiver, and is safe only with the copy's refusal mark
-    /// (`AppendReceiver::refuse_landing`) and check B (`from_has_no_floor`), which a peer of
-    /// 1eb3fe0 lacks at the same protocol. Hence the prerequisites there: the setting goes on
-    /// only once every node runs a build with both, on every node (an operator rule while it is
-    /// off by default), and a bump to 10 or a capability bit before it is on by default. Any
-    /// change that weakens check A takes a bump.
+    /// Protocol (Rev 5 m5, #107 slice 2b, ADR-rdb-0009 section 7): every peer that completes a
+    /// handshake at [`crate::net::PROTOCOL_VERSION`] 10 has check A in [`Self::land_link`] (a
+    /// refused landing in a commit that takes writes drops the live receiver), check B
+    /// (`from_has_no_floor`) and the refusal mark (`AppendReceiver::refuse_landing`), which a
+    /// `ReadOnly` return needs. A peer at 9 never links, so it is never probed or re-added
+    /// here. The copy marks by this owner's setting, carried on the `Landed`, not by its own.
+    /// Any change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none.
@@ -7691,7 +7925,7 @@ impl Host {
                 self.live_readd_unanswered(partition, node, now, "send_failed");
                 return;
             }
-            tracing::debug!(
+            tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 probed = node.0,
@@ -7744,6 +7978,9 @@ impl Host {
             return;
         }
         let key = (partition, node);
+        if let Some(boot) = self.links.boot_of(node) {
+            self.live_readd.readding.insert(partition, (node, boot));
+        }
         let cause = self.live_readd.clocked.remove(&key);
         self.live_readd.links.remove(&key);
         self.live_readd
@@ -9156,6 +9393,157 @@ impl Host {
         );
     }
 
+    /// #107 M3 exit: the commit of this owner's re-plan `replan` for `generation`. When it is the
+    /// live re-add's ([`LiveReadd::readding`]) and pins the node as a shadow at the boot the
+    /// re-add saw, the shadow is held from now ([`LiveReadd::shadows`]). A restart's re-add pins
+    /// a newer boot, so it is never held.
+    fn readd_shadow_pinned(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        replan: Replan,
+    ) {
+        let Some((node, boot)) = self.live_readd.readding.remove(&partition) else {
+            return;
+        };
+        if replan.promote || replan.rejoiner != Some(node) {
+            return;
+        }
+        let pinned = self.committed.get(&partition).is_some_and(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| {
+                    member.node == node && member.role == ReplicaRole::Shadow && member.boot == boot
+                })
+        });
+        if pinned {
+            let since = self.clock.now();
+            self.live_readd.shadows.insert(
+                (partition, node),
+                ReaddShadow {
+                    generation,
+                    since,
+                    blocks: 0,
+                    boot,
+                },
+            );
+        }
+    }
+
+    /// #107 M3 exit: a promote re-plan `replan` ended without committing, at F1's block
+    /// ([`Self::rejoin_blocked`]) or at a revocation A1 left unanswered
+    /// ([`Self::retry_blocked_rejoin`]). For a shadow the live re-add pinned, it counts one
+    /// block, and at [`LIVE_READD_SHADOW_GIVE_UP_BLOCKS`] the shadow is given up. `true` when
+    /// it was, so the caller does nothing more.
+    fn live_readd_promote_ended(
+        &mut self,
+        partition: PartitionId,
+        replan: Replan,
+        ended: &str,
+    ) -> bool {
+        let Some(node) = replan.rejoiner.filter(|_| replan.promote) else {
+            return false;
+        };
+        let Some(held) = self.live_readd.shadows.get_mut(&(partition, node)) else {
+            return false;
+        };
+        held.blocks += 1;
+        let blocks = held.blocks;
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            blocks,
+            ended,
+            "live_readd_shadow_block"
+        );
+        if blocks < LIVE_READD_SHADOW_GIVE_UP_BLOCKS {
+            return false;
+        }
+        let now = self.clock.now();
+        self.live_readd_shadow_give_up(partition, node, now, "blocks");
+        true
+    }
+
+    /// #107 M3 exit: a shadow the live re-add pinned that is still unpromoted
+    /// [`LIVE_READD_SHADOW_GIVE_UP_MILLIS`] after its commit is given up. Only between re-plans,
+    /// on the commit's pinned primary.
+    fn live_readd_shadow_duty(&mut self, partition: PartitionId, now: Tick) {
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let due = self
+            .live_readd
+            .shadows
+            .iter()
+            .find(|((at, _), held)| {
+                *at == partition
+                    && HostClock::millis_until(held.since, now) >= LIVE_READD_SHADOW_GIVE_UP_MILLIS
+            })
+            .map(|((_, node), _)| *node);
+        if let Some(node) = due {
+            self.live_readd_shadow_give_up(partition, node, now, "clock");
+        }
+    }
+
+    /// #107 M3 exit: give up the shadow the live re-add pinned for `node`: re-plan without it,
+    /// so it is left out at the boot it runs, with no cause, and only a restart re-adds it.
+    /// Logged once, `live_readd_shadow_unpromoted` (warn), with `reason` (`clock` or `blocks`).
+    fn live_readd_shadow_give_up(
+        &mut self,
+        partition: PartitionId,
+        node: NodeId,
+        now: Tick,
+        reason: &str,
+    ) {
+        let Some(held) = self.live_readd.shadows.remove(&(partition, node)) else {
+            return;
+        };
+        let Some(committed) = self.committed.get(&partition) else {
+            return;
+        };
+        let owner = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == self.node && member.role == ReplicaRole::Primary);
+        if !owner {
+            return;
+        }
+        let epoch = committed.selected.root.owner_epoch;
+        let copy = committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == node)
+            .map(|member| member.copy);
+        let acked = copy.and_then(|copy| {
+            let primary = self.replication.primary(self.node, partition)?;
+            primary
+                .tracker()
+                .peer(copy)
+                .map(|peer| peer.progress.buffered_applied.0)
+        });
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            shadow = node.0,
+            generation = held.generation.0,
+            held_ms = HostClock::millis_until(held.since, now),
+            blocks = held.blocks,
+            acked = ?acked,
+            reason,
+            "live_readd_shadow_unpromoted"
+        );
+        self.blamed.remove(&partition);
+        self.revoke(partition, epoch, Some(node), None);
+    }
+
     /// Issue #113 (owner's ruling 2026-11-15, promote at catch-up): `copy` sent `CopyCaughtUp`
     /// for `partition`, so if the commit pins it as the shadow, judge its promote now with
     /// [`Self::shadow_duty`] and every guard there: the owner, no re-plan running, the link,
@@ -9609,6 +9997,9 @@ impl Host {
         if self.move_blocked(partition, replan, reason, members, epoch) {
             return;
         }
+        if self.live_readd_promote_ended(partition, replan, "f1_blocked") {
+            return;
+        }
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         // A-R329: a re-add F1 blocks on is given up, and the commit's members are planned
         // again. The member stays left out at the boot it was planned at, so only another
@@ -9730,6 +10121,9 @@ impl Host {
                     return;
                 }
                 if waited_ms >= self.peer_drop_after_millis {
+                    if self.live_readd_promote_ended(partition, replan, "revoke_unanswered") {
+                        return;
+                    }
                     tracing::warn!(
                         node = self.node.0,
                         partition = partition.0,
@@ -10821,12 +11215,14 @@ impl Host {
         }
     }
 
-    /// A member hears a committed recovery (the sim's `run_due_watches`).
+    /// A member hears a committed recovery (the sim's `run_due_watches`). `owner_live_readd` is
+    /// the committing owner's setting, carried on the `Landed` (#107 slice 2b).
     fn land(
         &mut self,
         result: Box<RecoveryResult>,
         site: Site,
         emitter: NodeId,
+        owner_live_readd: bool,
     ) -> Result<(), Fault> {
         let partition = site.partition;
         let landed_generation = result.new_generation;
@@ -10853,7 +11249,7 @@ impl Host {
         // A-R217: that link is synced before `schedule_acquire` below, as `inherit`'s is: the
         // acquire waits for the link's sync on the syncer (A-R326).
         let caught_up = if first && !barrier {
-            let caught_up = self.land_link(partition, &result)?;
+            let caught_up = self.land_link(partition, &result, owner_live_readd)?;
             self.sync_link(partition, result.new_generation)?;
             caught_up
         } else {
@@ -10878,7 +11274,7 @@ impl Host {
         self.acquire_after_link(&result, site);
         self.committed.insert(partition, result.clone());
         self.committed_correlation
-            .insert(partition, site.correlation);
+            .insert(partition, (site.correlation, owner_live_readd));
         self.push(
             site,
             EventKind::Kernel(KernelEvent::Recovered(result)),
@@ -10943,10 +11339,13 @@ impl Host {
     /// handling and keeps whatever receiver it holds. For the refusals after those, in a commit
     /// that takes writes it also drops any live receiver it holds (check A), so it walks up from
     /// seq 1 and no hole forms under the new generation; in a `ReadOnly` commit the receiver
-    /// stays, as the held tail does; with `live_readd` on it is marked so it never anchors below
+    /// stays, as the held tail does; with `owner_live_readd` on (the committing owner's
+    /// `live_readd`, #107 slice 2b) it is marked so it never anchors below
     /// the cutoff on this generation's `Recovered` (`AppendReceiver::refuse_landing`, #107 row
     /// 31b): at the cutoff it holds, or at the root, so it is never walked from inside the new
-    /// prefix. A copy
+    /// prefix. Every landing reaches here through `Msg::Landed`, which carries that flag; a
+    /// future path that lands from the stored `partitions/{id}` record would have to carry it
+    /// on the record. A copy
     /// refused past the cutoff whose tail is
     /// stamped below the last writable generation holds nothing (issue #105) and does not stall
     /// writes: the drop duty leaves it out, and it is re-added as a shadow and walked up from the
@@ -10967,6 +11366,7 @@ impl Host {
         &mut self,
         partition: PartitionId,
         result: &RecoveryResult,
+        owner_live_readd: bool,
     ) -> Result<Option<RecoveryEvent>, Fault> {
         // The new generation's lineage, spelled once (review-r185 ADV1).
         let lineage = result.selected.root;
@@ -11156,11 +11556,11 @@ impl Host {
                 // receiver does, so R1 never walks it from inside the new generation's prefix.
                 // Which of the two is known only at the `Recovered`, so the line says marked,
                 // not where it anchors. Review round 2: only with `live_readd` on. Off, nothing
-                // new happens here, and the receiver anchors as before slice 2a. The owner that
-                // re-adds a copy cannot tell it its own setting (neither the plan nor the result
-                // carries one), so this copy's setting stands in for it: set it the same on
-                // every node (ADR-rdb-0009 section 7).
-                if self.live_readd.on
+                // new happens here, and the receiver anchors as before slice 2a. Slice 2b: the
+                // setting is the committing owner's, carried on the landing, since only that
+                // owner re-adds a copy at the boot it still runs. This copy's own setting does
+                // not count (ADR-rdb-0009 section 7).
+                if owner_live_readd
                     && self
                         .replication
                         .refuse_landing(self.node, partition, generation)
@@ -12594,7 +12994,7 @@ impl Host {
     /// `copy_ahead_unknown_copy`, and an unreachable node `copy_ahead_unreachable` (all warn).
     fn copy_ahead(&mut self, partition: PartitionId, copy: CopyId) {
         let node = self.node.0;
-        let (Some(result), Some(&correlation)) = (
+        let (Some(result), Some(&(correlation, owner_live_readd))) = (
             self.committed.get(&partition),
             self.committed_correlation.get(&partition),
         ) else {
@@ -12629,6 +13029,8 @@ impl Host {
             correlation,
             emitter: self.node,
             not_before: self.clock.now().plus_millis(CONTROL_WATCH_MILLIS),
+            // The committing owner's setting as heard, never this node's (#107 slice 2b).
+            owner_live_readd,
         };
         match self.links.send(self.node, member, msg) {
             Ok(()) => tracing::info!(
@@ -14239,7 +14641,8 @@ impl Host {
             | ClientCall::Move { .. }
             | ClientCall::Rebuild { .. }
             | ClientCall::ForgetTail { .. }
-            | ClientCall::WaitDurable { .. } => None,
+            | ClientCall::WaitDurable { .. }
+            | ClientCall::Changes { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
             | ClientCall::GetPrevious { identity, .. } => Some(*identity),
@@ -14412,6 +14815,22 @@ impl Host {
                 let _ = reply.send(answer);
                 return Ok(());
             }
+            // #87: answered from this node's own copy, in this step or, on a secondary whose
+            // control read is in flight, when that read lands ([`FeedFreshness::waiting`]).
+            ClientCall::Changes {
+                identity,
+                from,
+                max,
+            } => {
+                let waiter = FeedWaiter {
+                    identity,
+                    from,
+                    max,
+                    reply,
+                    until: self.clock.now().plus_millis(FEED_READ_WAIT_MILLIS),
+                };
+                return self.answer_feed(partition, waiter, true);
+            }
             // #90: recorded and left; nothing here waits, so a later write is never held.
             ClientCall::WaitDurable {
                 generation,
@@ -14574,6 +14993,519 @@ impl Host {
             group.0, right.0, partition.0
         );
         Some(error)
+    }
+
+    /// #87: the page of `partition`'s committed transactions after `from` this copy may serve
+    /// (design-87 section 2). The owner serves up to what P1 published; a regular secondary up to
+    /// what it applied, while its own read of `partitions/{p}` is fresh ([`Self::feed_fresh`]).
+    /// The cursor is checked against this copy's `Link` chain by [`feed::resume`]. Each record
+    /// is one `History` read through the chain. The outer error faults the node: a read failed
+    /// or a stored record does not decode.
+    ///
+    /// With `wait`, a secondary whose control read is in flight answers
+    /// [`FeedCall::WaitForRead`] rather than refusing the call; without it, it refuses.
+    fn changes(
+        &mut self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        from: FeedCursor,
+        max: u32,
+        wait: bool,
+    ) -> Result<FeedCall, Fault> {
+        let refused = |kind: ErrorKind, detail: String| {
+            let mut error = ApiError::new(kind, detail);
+            error.no_mutation = true;
+            Ok(FeedCall::Answer(Err(error)))
+        };
+        let (node, p) = (self.node.0, partition.0);
+        // A copy that holds no current copy of the partition: definitive, so the caller reads
+        // another copy rather than calling this one again.
+        let no_copy = |why: String| {
+            Ok(FeedCall::Answer(Err(feed_no_copy(
+                self.node, partition, &why,
+            ))))
+        };
+        if max == 0 {
+            return refused(
+                ErrorKind::InvalidArgument,
+                "max is 0: ask for at least one record".to_owned(),
+            );
+        }
+        let Some(result) = self.committed.get(&partition) else {
+            return no_copy("it holds no generation of it".to_owned());
+        };
+        let newest = result.new_generation;
+        let role = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == self.node)
+            .map(|member| member.role);
+        if self.engine.staging(partition, newest).is_some() {
+            return refused(
+                ErrorKind::Unavailable,
+                format!(
+                    "node {node} is still copying generation {} of partition {p}",
+                    newest.0
+                ),
+            );
+        }
+        let mut chain = vec![feed::Level {
+            generation: newest,
+            exit: None,
+        }];
+        let mut level = newest;
+        while let Some(link) = self.engine.link(partition, level) {
+            chain.push(feed::Level {
+                generation: link.parent,
+                exit: Some(link.base),
+            });
+            level = link.parent;
+        }
+        let (source, cap) = if let Some(primary) = self.replication.primary(self.node, partition) {
+            // The grant bounds the owner's cap (design-87 section 2). A promote that leaves this
+            // node out keeps its tracker here, fenced: it is refused as a write's admission
+            // would be (`LEASE_EXPIRED` for a lost grant), with no redirect hint, which
+            // `answer_feed` does not add. `Source::Owner` re-reads the owner route on
+            // `LEASE_EXPIRED`.
+            let lineage = primary.tracker().lineage();
+            if let Verdict::Deny(reason) =
+                self.authority
+                    .may_admit_at(lineage, self.clock.now(), &self.budgets)
+            {
+                let mut error =
+                    crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+                error.detail = format!(
+                    "node {node} may not serve partition {p}'s feed now ({reason:?}); call the \
+                     owner"
+                );
+                error.no_mutation = true;
+                tracing::info!(node, partition = p, ?reason, "feed_owner_refused");
+                return Ok(FeedCall::Answer(Err(error)));
+            }
+            if lineage.generation != newest {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} is landing generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            }
+            // Never applied-but-unpublished (spec section 5.3). A new owner's published position
+            // may still name the generation it was promoted from, at or below the cutoff.
+            let published = self
+                .publication
+                .kernel(self.node, partition)
+                .map(|kernel| (kernel.published().generation, kernel.published().seq));
+            let cap = published.and_then(|(generation, seq)| {
+                let at = chain
+                    .iter()
+                    .position(|level| level.generation == generation)?;
+                let exit = chain[1..=at].iter().filter_map(|level| level.exit).min();
+                Some(exit.map_or(seq, |exit| seq.min(exit)))
+            });
+            let Some(cap) = cap else {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} has published nothing on generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            };
+            ("owner", cap)
+        } else if let Some(receiver) = self.replication.receiver(self.node, partition) {
+            // A shadow may yet become regular: transient. A copy the landed generation leaves
+            // out holds no current copy.
+            let Some(role) = role else {
+                return no_copy(format!(
+                    "generation {}, as it landed here, leaves it out",
+                    newest.0
+                ));
+            };
+            if role != ReplicaRole::RegularSecondary {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} holds no regular copy of partition {p} in generation {} \
+                         ({role:?})",
+                        newest.0,
+                    ),
+                );
+            }
+            if receiver.lineage().generation != newest {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "node {node} is landing generation {} of partition {p}",
+                        newest.0
+                    ),
+                );
+            }
+            match self.feed_fresh(partition, newest, wait) {
+                Freshness::Fresh => {}
+                Freshness::Reading => return Ok(FeedCall::WaitForRead),
+                Freshness::Refused(error) => {
+                    tracing::info!(
+                        node,
+                        partition = p,
+                        why = %error.detail,
+                        retry = ?error.retry,
+                        "feed_secondary_refused"
+                    );
+                    return Ok(FeedCall::Answer(Err(error)));
+                }
+            }
+            (
+                "secondary",
+                Seq(self.engine.buffered_applied(partition, newest).0),
+            )
+        } else {
+            return no_copy("it serves none".to_owned());
+        };
+        let engine = &self.engine;
+        // Stored damage faults the node as any history read that finds it does, typed
+        // `CORRUPT_HISTORY` with the feed's step, so every caller answered with the fault knows
+        // to read another copy (review r1). Any other storage fault stays a generic host fault.
+        let read = |seq: Seq| -> Result<Option<(ReplicationEnvelope, usize)>, Fault> {
+            let Some((_, _, record)) = engine
+                .get(partition, newest, Namespace::History, &seq.0.to_be_bytes())
+                .map_err(|fault| {
+                    feed_storage_fault(format!("feed: history read at seq {}", seq.0), fault)
+                })?
+            else {
+                return Ok(None);
+            };
+            let envelope = ReplicationEnvelope::decode(&record).map_err(|error| {
+                feed_damage(format!(
+                    "feed: the record at seq {} does not decode: {error:?}",
+                    seq.0
+                ))
+            })?;
+            // Damage that still decodes (review r2): a record stored under another seq, or one
+            // whose content no longer hashes to its digest, is not served, and a cursor naming
+            // it hears damage, not divergence.
+            if envelope.header.seq != seq {
+                return Err(feed_damage(format!(
+                    "feed: the record stored at seq {} names seq {}",
+                    seq.0, envelope.header.seq.0
+                )));
+            }
+            match envelope.compute_record_digest() {
+                Ok(digest) if digest == envelope.record_digest => {}
+                computed => {
+                    return Err(feed_damage(format!(
+                        "feed: the record at seq {} does not match its digest {} ({computed:?})",
+                        seq.0, envelope.record_digest
+                    )))
+                }
+            }
+            Ok(Some((envelope, record.len())))
+        };
+        let floor = engine
+            .history_floor(partition, newest)
+            .map_err(|fault| feed_storage_fault("feed: history floor".to_owned(), fault))?;
+        let resumed = feed::resume(from, &chain, cap, floor, |seq| {
+            Ok::<_, Fault>(
+                read(seq)?
+                    .map(|(envelope, _)| (envelope.header.generation, envelope.record_digest)),
+            )
+        })?;
+        let after = match resumed {
+            feed::Resume::Serve(after) => after,
+            feed::Resume::Answer(page) => {
+                tracing::info!(
+                    node,
+                    partition = p,
+                    client = identity.client.0,
+                    source,
+                    from_generation = from.generation.0,
+                    from_seq = from.seq.0,
+                    cap = cap.0,
+                    floor = floor.0,
+                    answer = ?page,
+                    "feed_answered"
+                );
+                return Ok(FeedCall::Answer(Ok(page)));
+            }
+            // The cursor's record is held at its seq with another digest. That can be the
+            // caller's cursor (from another partition's history), copies whose histories
+            // diverged, or damage that decodes and still matches its own digest; this node
+            // cannot tell which. Refused to this caller without faulting the node, and logged
+            // at warn.
+            feed::Resume::Diverged { seq, held } => {
+                tracing::warn!(
+                    node,
+                    partition = p,
+                    client = identity.client.0,
+                    generation = from.generation.0,
+                    seq = seq.0,
+                    cursor_digest = %from.digest,
+                    held_digest = %held,
+                    why = "the cursor may not belong to this partition's history, or the \
+                           histories diverged",
+                    "feed_cursor_diverged"
+                );
+                return refused(
+                    ErrorKind::CorruptHistory,
+                    format!(
+                        "the cursor's record at seq {} of generation {} has another digest on \
+                         node {node}: the cursor may not belong to partition {p}'s history, or \
+                         the histories diverged; next: {FEED_HISTORY_STEP}",
+                        seq.0, from.generation.0
+                    ),
+                );
+            }
+        };
+        // A hole below the cap faults the node, as any history read that finds damage does; a
+        // key that does not parse is refused to the caller.
+        let page = feed::page(after, cap, max, |seq| {
+            let Some((envelope, bytes)) = read(seq).map_err(Err)? else {
+                return Err(Err(feed_damage(format!(
+                    "feed: no record at seq {} below the cap {} of generation {}",
+                    seq.0, cap.0, newest.0
+                ))));
+            };
+            let record = feed::record_of(&envelope, identity.tenant).map_err(Ok)?;
+            Ok(feed::Scanned {
+                at: FeedCursor::after(&envelope),
+                bytes,
+                record,
+            })
+        });
+        let page = match page {
+            Ok(page) => page,
+            Err(Ok(detail)) => {
+                return refused(
+                    ErrorKind::CorruptHistory,
+                    format!("{detail}; next: {FEED_HISTORY_STEP}"),
+                )
+            }
+            Err(Err(fault)) => return Err(fault),
+        };
+        if let FeedPage::Records {
+            records,
+            next,
+            more,
+        } = &page
+        {
+            tracing::debug!(
+                node,
+                partition = p,
+                client = identity.client.0,
+                source,
+                from_seq = from.seq.0,
+                records = records.len(),
+                next_generation = next.generation.0,
+                next_seq = next.seq.0,
+                more,
+                cap = cap.0,
+                "feed_page"
+            );
+        }
+        Ok(FeedCall::Answer(Ok(page)))
+    }
+
+    /// Answer `waiter`'s feed call, or, with `wait`, park it on the control read in flight
+    /// ([`FeedFreshness::waiting`]). A fault answers the caller with it and faults the node.
+    fn answer_feed(
+        &mut self,
+        partition: PartitionId,
+        waiter: FeedWaiter,
+        wait: bool,
+    ) -> Result<(), Fault> {
+        // The caller hears the fault now, with the feed's step; `fail_waiter` is the shared form
+        // without it.
+        let call = self
+            .changes(partition, waiter.identity, waiter.from, waiter.max, wait)
+            .inspect_err(|fault| {
+                self.owner_views.revoke();
+                let _ = waiter.reply.send(Answer::Error {
+                    error: fault.feed_error(),
+                    request: None,
+                });
+            })?;
+        match call {
+            FeedCall::Answer(answer) => {
+                let answer = match answer {
+                    Ok(page) => Answer::Changes(page),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = waiter.reply.send(answer);
+            }
+            FeedCall::WaitForRead => {
+                // Info: at most one per call that finds no read within the grant, and the
+                // event a row waits on (review r2).
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    client = waiter.identity.client.0,
+                    "feed_waits_for_control_read"
+                );
+                self.feed_reads
+                    .entry(partition)
+                    .or_default()
+                    .waiting
+                    .push(waiter);
+            }
+        }
+        Ok(())
+    }
+
+    /// Answer every feed call waiting on `partition`'s control read, without waiting again. A
+    /// fault answering one puts the rest back in [`FeedFreshness::waiting`], where the caller's
+    /// [`Self::set_fault`] answers them with that fault (review r1): none is dropped unanswered.
+    fn answer_feed_waiters(
+        &mut self,
+        partition: PartitionId,
+        due: impl Fn(&FeedWaiter) -> bool,
+    ) -> Result<(), Fault> {
+        let Some(entry) = self.feed_reads.get_mut(&partition) else {
+            return Ok(());
+        };
+        let (answer, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.waiting)
+            .into_iter()
+            .partition(&due);
+        entry.waiting = keep;
+        let mut answer = answer.into_iter();
+        while let Some(waiter) = answer.next() {
+            if let Err(fault) = self.answer_feed(partition, waiter, false) {
+                self.feed_reads
+                    .entry(partition)
+                    .or_default()
+                    .waiting
+                    .extend(answer);
+                return Err(fault);
+            }
+        }
+        Ok(())
+    }
+
+    /// #87: the feed calls whose control read has not landed by their `until` are answered
+    /// now, refused "call again" ([`FEED_READ_WAIT_MILLIS`]).
+    fn feed_duty(&mut self, now: Tick) -> Result<(), Fault> {
+        let due: Vec<PartitionId> = self
+            .feed_reads
+            .iter()
+            .filter(|(_, entry)| entry.waiting.iter().any(|waiter| waiter.until <= now))
+            .map(|(partition, _)| *partition)
+            .collect();
+        for partition in due {
+            self.answer_feed_waiters(partition, |waiter| waiter.until <= now)?;
+        }
+        Ok(())
+    }
+
+    /// #87 (R2): whether this secondary may serve `partition`'s feed in `newest`. It may while
+    /// its own read of `partitions/{p}`, begun within `grant_millis`, names `newest` with this
+    /// node pinned regular. A deposed owner cannot keep that read fresh: a promote elsewhere
+    /// commits a newer generation to the record. A read older than half the grant starts the
+    /// next one, at most one in flight per partition, and the call is answered from the cache
+    /// meanwhile. Partitions no feed call asks about are never read.
+    ///
+    /// With no read within the grant, `wait` answers [`Freshness::Reading`]: the call waits for
+    /// the read just started or in flight. A record that leaves this node out, of `newest` or
+    /// of a newer generation, is definitive ([`feed_no_copy`]); a newer generation that still
+    /// pins it is one this copy has yet to land, and is refused "call again".
+    fn feed_fresh(&mut self, partition: PartitionId, newest: Generation, wait: bool) -> Freshness {
+        let now = self.clock.now();
+        let grant = self.budgets.grant_millis;
+        let entry = self.feed_reads.entry(partition).or_default();
+        let age = entry
+            .read
+            .as_ref()
+            .map(|(started, _)| now.0.saturating_sub(started.0));
+        if age.is_none_or(|age| age >= grant / 2) && !entry.in_flight {
+            entry.in_flight = true;
+            self.control
+                .read_partition_for_feed(self.node, self.boot, partition, now);
+        }
+        let (node, p) = (self.node, partition.0);
+        let transient = |detail: String| {
+            let mut error = ApiError::new(
+                ErrorKind::Unavailable,
+                format!("node {}, partition {p}: {detail}", node.0),
+            );
+            error.no_mutation = true;
+            Freshness::Refused(error)
+        };
+        let entry = &self.feed_reads[&partition];
+        let Some((_, read)) = entry
+            .read
+            .as_ref()
+            .filter(|_| age.is_some_and(|age| age < grant))
+        else {
+            if wait {
+                return Freshness::Reading;
+            }
+            return transient(format!(
+                "no control read of partitions/{p} within the grant ({grant} ms); one is under \
+                 way, so call again"
+            ));
+        };
+        // `None`: a layout that pins no members leaves the landed configuration as the only
+        // membership, which the caller checked.
+        let pinned = read.members.as_ref().map(|members| {
+            members
+                .iter()
+                .any(|member| member.node == node && member.role == ReplicaRole::RegularSecondary)
+        });
+        if pinned == Some(false) && read.generation >= newest {
+            return Freshness::Refused(feed_no_copy(
+                node,
+                partition,
+                &format!(
+                    "it is left out at generation {} of partitions/{p} (owner node {})",
+                    read.generation.0, read.owner.0
+                ),
+            ));
+        }
+        if read.generation != newest {
+            return transient(format!(
+                "the partition is at generation {}, not {} landed here",
+                read.generation.0, newest.0
+            ));
+        }
+        Freshness::Fresh
+    }
+
+    /// [`Msg::FeedRead`]: keep a read that answered, newest start first, then answer the feed
+    /// calls waiting on it.
+    fn feed_read(
+        &mut self,
+        partition: PartitionId,
+        started: Tick,
+        read: Result<FeedControlRead, String>,
+    ) -> Result<(), Fault> {
+        let entry = self.feed_reads.entry(partition).or_default();
+        entry.in_flight = false;
+        match read {
+            Ok(read) => {
+                tracing::debug!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = read.generation.0,
+                    owner = read.owner.0,
+                    started = started.0,
+                    "feed_control_read"
+                );
+                if entry.read.as_ref().is_none_or(|(at, _)| *at <= started) {
+                    entry.read = Some((started, read));
+                }
+            }
+            Err(error) => tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                %error,
+                "feed_control_read_failed"
+            ),
+        }
+        self.answer_feed_waiters(partition, |_| true)
     }
 
     fn compile(
@@ -15538,6 +16470,49 @@ fn unsupported(node: NodeId, kind: &str) -> Fault {
     format!("host_unsupported: {kind}").into()
 }
 
+/// #87: the feed refusal of a copy that holds no current copy of `partition`: left out of the
+/// generation `partitions/{p}` names, or never a member. `UNAVAILABLE`, as ADR-rdb-0020 names a
+/// copy that cannot serve, with rule `Definitive`: this copy answers the same until it is a
+/// member again, so the caller switches source ([`FEED_OTHER_COPY_STEP`]) rather than retrying.
+fn feed_no_copy(node: NodeId, partition: PartitionId, why: &str) -> ApiError {
+    tracing::info!(
+        node = node.0,
+        partition = partition.0,
+        why,
+        "feed_no_current_copy"
+    );
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "node {} holds no current copy of partition {}: {why}; next: {FEED_OTHER_COPY_STEP}",
+            node.0, partition.0
+        ),
+    );
+    error.retry = rdb_core::RetryRule::Definitive;
+    error.no_mutation = true;
+    error
+}
+
+/// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`. A feed
+/// call answered with it hears [`Fault::feed_error`], which adds the feed's step
+/// ([`FEED_HISTORY_STEP`]); a put or a get hears [`Fault::error`] without it (review r2).
+fn feed_damage(detail: String) -> Fault {
+    Fault {
+        damage: Some(ErrorKind::CorruptHistory),
+        detail,
+    }
+}
+
+/// #87 review r1: a storage fault a feed read met. `Corrupt` is stored damage
+/// ([`feed_damage`]); any other is a generic host fault, as before.
+fn feed_storage_fault(what: String, fault: StorageFault) -> Fault {
+    if fault == StorageFault::Corrupt {
+        feed_damage(format!("{what}: {fault:?}"))
+    } else {
+        Fault::from(format!("{what}: {fault:?}"))
+    }
+}
+
 /// Tell a call's waiter, now, that the node faults on `fault`, as `set_fault` tells every
 /// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
 /// `fault`, for the node. `owner_views` is revoked first, as `set_fault` does, so a waiter that
@@ -16053,6 +17028,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "fault",
         Msg::Activated { .. } => "activated",
         Msg::OwnerLearned { .. } => "owner_learned",
+        Msg::FeedRead { .. } => "feed_read",
         Msg::FenceBound { .. } => "fence_bound",
         Msg::ReplanNote { .. } => "replan_note",
         Msg::Inject { .. } => "inject",
@@ -16069,6 +17045,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",
+        #[cfg(debug_assertions)]
+        Msg::DropHistory { .. } => "drop_history",
         #[cfg(debug_assertions)]
         Msg::Fork { .. } => "fork",
         Msg::Rebuild { .. } => "rebuild",
@@ -16310,6 +17288,8 @@ mod barrier_tests;
 mod catchup_tests;
 #[cfg(test)]
 mod drop_tests;
+#[cfg(test)]
+mod feed_tests;
 #[cfg(test)]
 mod note_tests;
 #[cfg(test)]

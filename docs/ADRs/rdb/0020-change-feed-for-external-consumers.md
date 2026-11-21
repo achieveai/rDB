@@ -1,11 +1,45 @@
 # ADR-rdb-0020: A change feed for external apps — read every committed change, in order
 
-**Status:** Proposed. **Not scheduled. No code in M10.** A future item picks this up.
+**Status:** Accepted, option A (issue #87, 2026-11-19). Built: slice 1 (in process) and slice 2
+(the wire, protocol 10). **The current contract is the dated amendments below, newest last**
+(2026-11-20, #170 review r1 and r2). Deferred: retention (`History` is not trimmed yet, #61) and
+long-poll (slice 4). The prefix filter (slice 3) is dropped from #87: shared config stays in
+rEtcd (lead, 2026-11-19). The Decision, Consequences and Verification sections below are
+historical: they were written on 2026-10-23, while this ADR was Proposed.
 **Date:** 2026-10-23
 **Spec:** `docs/rdb/design-specification.md` §4.1, §4.3, §5.1–§5.3, §6.1, §6.3, §8.1, §8.4, §10.1, §11
 **Raised by:** Gautam, 2026-10-23: "whenever you make a write and change the data, we may want to
 create a log for that change in data … if some external application wants to consume this, and undo
 some of the changes rather than the database itself figuring all that thing out."
+
+**Amended 2026-11-19 (#87 slice 1).** What exists now (slice 1 was in process only):
+
+- `Db::changes(partition, from, max, source)` reads one partition's committed `History` after a
+  `FeedCursor` (the record's header stamp, its seq and its `record_digest`), from the owner
+  (`Source::Owner`) or from one node's copy (`Source::Node(n)`), which may be a regular secondary.
+- Answers: `Records { records, next, more }`, `Behind { head }`, `Trimmed { floor }` and
+  `Rewound { to }` (`crates/rdb-api/src/feed.rs`). The cursor is checked against the serving copy's
+  `Link` chain by `feed::resume`, using the lowest `Link.base` on the path from the cursor's level
+  (the effective exit), so a cut is reported even when no write followed it.
+- The owner serves up to its published position; a regular secondary up to what it applied, while
+  its own read of `partitions/{p}` is fresh (the R2 bound: started within `grant_millis`, naming
+  its generation and pinning it regular).
+- No key filter. Only `User` writes under the caller's tenant are returned (Q3); a record with
+  none is skipped and `next` moves past it.
+
+**Amended 2026-11-20 (#87 slice 2).** The feed crosses the wire in protocol 10, the same bump as
+#107: `WireCall::Changes` and `WireAnswer::Changes(WireFeedPage)`, added last. A page carries
+`format` 1, physical writes (Q5a); another format lands as `INCOMPATIBLE_VERSION`. Any
+authenticated app may call it. `Source::Node(n)` reaches node `n` over the links from any host; a
+node with no copy answers `UNAVAILABLE`.
+
+**Amended 2026-11-20 (#87, lr walk).** A secondary's feed call that finds no control read within
+the grant waits for the one it starts (at most 500 ms) instead of answering "call again": before,
+a consumer polling less often than once a grant was refused at every call. A copy that
+`partitions/{p}` leaves out, or that holds no generation, answers `UNAVAILABLE` with rule
+`Definitive` and the step "read from the owner or another member". The kind stays the one this
+ADR names; the rule says switch source, not retry here. A feed's `CORRUPT_HISTORY` carries the
+feed's own step: read another copy, or rebuild from your own source.
 
 ## Context
 
@@ -60,7 +94,39 @@ The app does the undo. The database only supplies the record.
 - **No answer for loss.** A recovery can drop acknowledged writes (spec §6.3, §8.4). A consumer may
   already have read them. Nothing tells it.
 
+**Amended 2026-11-20 (#170 review r1).** Paging: a page returns at most `max` records (at most
+256) and 4 MiB of them, at least one record when one is due, and a call examines at most 1024
+records and 8 MiB of record bytes, counting skipped records; `more` says a cap stopped it, and a
+page with no records may still move `next` with `more` set. A cursor whose record the copy still
+holds at the same stamp and digest is served, even when a later generation linked above it (a
+max-1 walk no longer rewinds). Stored damage the feed reads (a frame that does not read, an
+envelope that does not decode) is `CORRUPT_HISTORY` with the feed's step, for every caller waiting
+on that copy. `Trimmed` asks another copy or a rebuild; no copy trims `History` yet.
+(Corrected in r2: `Trimmed` does not wait for retention. A copy that does not hold the
+cursor's record answers it today.)
+
+**Amended 2026-11-20 (#170 review r2): the feed fails closed for apps.** The owner ruled on
+2026-11-20 to fail closed until a certificate binds an app to its tenants (#151). Over the links a
+node serves `Changes` only to a node (`Label::Node`) or to an app on its `admin_apps`
+(`rdb_node --admin-apps`, `NetConfig::admin_apps`), which the operator trusts with every tenant,
+whatever tenant the call names. Any other app is refused `INVALID_ARGUMENT` with `no_mutation`,
+the reason "the change feed needs the admin certificate until tenants are bound to certificates
+(#151)". That is the refusal kind `sender_refused` already gives the admin-only calls: rdb has no
+`PERMISSION_DENIED`, and adding one changes the contracts surface; a dedicated kind can come with
+#151. A `Db` in the process that runs the nodes is trusted, as for every other call. The rule
+also covers what the tenant filter alone leaves visible in a shared partition: a page's `next`
+and a cursor's digest name positions and digests of records written by other tenants, so a
+plain app could map their write boundaries. Per-app tenant binding, and with it feed access for
+plain apps, comes with #151. This replaces slice 2's "any authenticated app may call it".
+
 ## Decision
+
+> **Historical (2026-10-23, written while Proposed).** Kept as the reasoning; the amendments at
+> the top are the current contract. The leaning below was replaced by: option A, pull per
+> partition, capped at the owner's published position or a secondary's applied one; a cursor of
+> `(generation, seq, digest)`, not `(generation, seq)`; `Rewound { to }` in place of a marker
+> carrying `base`; `Trimmed` defined but retention deferred (#61); physical writes, no
+> before-images and no previous version; any app may call it, scoped to the caller's tenant.
 
 **Provisional. Nothing is decided.** This section records options and a leaning. Whoever picks this
 up decides, after a critic.
@@ -146,6 +212,9 @@ rule anyway. B and C cost bytes and format changes before anyone has asked for t
 
 ## Consequences
 
+> **Historical (2026-10-23).** Written while Proposed; "no code in M10" no longer holds. Retention
+> and the feed's IO budget are still open.
+
 - If A is chosen, `History` becomes a public contract. Its encoding can no longer change freely;
   the feed needs its own version.
 - History retention stops being only an internal catch-up concern (§10.1, ADR-rdb-0010 O4). The
@@ -157,6 +226,9 @@ rule anyway. B and C cost bytes and format changes before anyone has asked for t
 - Nothing changes for current callers. No code, test or format changes in M10.
 
 ## Verification
+
+> **Historical (2026-10-23).** The built feed's rows are named in the amendments' PRs (#87, #170);
+> retention and the dead-consumer budget are not built.
 
 For this document:
 

@@ -120,11 +120,24 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
 /// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
-/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
-/// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// ADR-rdb-0009 section 7 sets the prerequisites. `10` settles that (below). Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// `10` came with issue #107 slice 2b: `WireMsg::Landed::owner_live_readd`, the committing
+/// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
+/// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
+/// refused at the handshake. That includes an app process with no copy (`--nodes`): an app at
+/// 9 is refused by nodes at 10. Upgrade: stop every node and every app process that links to
+/// them, upgrade them all, start the nodes, then the apps.
+///
+/// `10` also carries issue #87's change feed, in the same bump: `WireCall::Changes`,
+/// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,
+/// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
+/// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
+/// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
+/// until tenants are bound to certificates (#151; [`sender_refused`]). Split from #107's bump,
+/// it would take `11`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1079,6 +1092,8 @@ const DEFAULT_LR_ADMIN: &str = "admin";
 /// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
 ///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
 ///   reason is the whole refusal, which [`receive`] answers the call with;
+/// - a change feed call (`Changes`) names a tenant no certificate binds yet (#151), so only an
+///   app on `admin_apps` may send one (owner ruling 2026-11-20, fail closed);
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
 fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
@@ -1113,6 +1128,25 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                  rebuild a copy or forget a tail, and the node's operator names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",
+                to.0
+            ));
+        }
+        // #170 review (owner ruling 2026-11-20, fail closed): a feed call names its tenant but
+        // no certificate binds an app to one yet (#151), so only an app on `admin_apps`, whom
+        // the operator trusts with every tenant, may read the feed. Nodes are trusted (below).
+        (
+            Label::App(app),
+            WireMsg::Client {
+                call: wire::WireCall::Changes { .. },
+                to,
+                ..
+            },
+        ) if !admin_apps.contains(app) => {
+            return Some(format!(
+                "app {app} may not read the change feed on node {}: the change feed needs the \
+                 admin certificate until tenants are bound to certificates (#151); add {app} to \
+                 the node's admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) only if \
+                 it may read every tenant",
                 to.0
             ));
         }
@@ -1371,6 +1405,7 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        unmuted(&shared, node).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);
@@ -1392,6 +1427,18 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Wait while this node is muted: a stopped process dials nobody, so its links stay down for
+/// as long as the fault lasts (#107 slice 2b manual walk).
+async fn unmuted(shared: &Shared, node: NodeId) {
+    if !shared.faults.muted() {
+        return;
+    }
+    tracing::info!(peer = node.0, "net_dial_muted");
+    while shared.faults.muted() {
+        tokio::time::sleep(faults::POLL).await;
     }
 }
 
@@ -1629,6 +1676,12 @@ impl RdbNet for Service {
                     return;
                 }
             };
+            // Mute: a stopped process answers no handshake, so the dialler's link stays down.
+            if shared.faults.muted() {
+                // Debug: the dialler retries about once a second for as long as the mute lasts.
+                tracing::debug!(peer = %label, "net_handshake_muted");
+                return;
+            }
             if let Some(reason) = refusal(&shared, &label, &hello) {
                 tracing::warn!(peer = %label, %reason, "net_handshake_refused");
                 let _ = tx.send(envelope(&Frame::Refused { reason }));

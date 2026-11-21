@@ -46,6 +46,7 @@ use tokio::runtime::Handle;
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
+use crate::feed::{FeedCursor, FeedPage};
 use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
@@ -62,6 +63,15 @@ const OWNER: NodeId = admin::OWNER;
 /// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 pub const TENANT: TenantId = TenantId(1);
+
+/// Which copy [`Db::changes`] reads (#87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The partition's owner, as this `Db` routes to it.
+    Owner,
+    /// Node `n`'s copy alone: the owner, or a regular secondary serving what it applied.
+    Node(NodeId),
+}
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
 /// as its `group` to write where `put` and `get` do.
@@ -140,15 +150,13 @@ pub struct Timeouts {
     /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
     /// operator, a move or a promote still returns only when its node restarts. One attempt per
     /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
-    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
-    /// owner and as a returning copy (which marks a refused landing only with it on).
+    /// until the 512-partition acceptance run passes. Each node process reads its own, for its
+    /// duty as an owner. A returning copy follows the setting of the owner that re-adds it,
+    /// which rides on the landing, not its own (ADR-rdb-0009 section 7, #107 slice 2b).
     ///
-    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
-    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
-    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
-    /// setting off, a read-only return can leave the partition read-only until that copy
-    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
-    /// moves to 10, or a capability bit gates the re-add.
+    /// Every build that speaks protocol 10 has check B and the refused-receiver mark, and an
+    /// older build is refused at the handshake, so it is never re-added. Set it on every node
+    /// anyway, so whichever node owns a partition re-adds its copies the same way.
     pub live_readd: bool,
 }
 
@@ -3283,6 +3291,144 @@ impl Db {
         answered.map_err(ApiError::for_barrier)
     }
 
+    /// #87 (ADR-rdb-0020): `partition`'s committed transactions after `from`, read from
+    /// `source`'s copy, at most `max` of them (and at most [`crate::feed::FEED_PAGE_RECORDS`]).
+    /// Start at [`FeedCursor::START`]; store each page's `next` with the effect it had, and call
+    /// again at once while `more` is set. A page never passes what the copy may serve: the
+    /// owner's published position, or what a regular secondary applied. `Source::Owner` goes to
+    /// the owner this `Db` routes to, re-routed as any call is; `Source::Node(n)` goes to node
+    /// `n` alone, so the owner does no work. Either works from any host: a node in this process
+    /// or one over the links, from an app that holds no copy as well as from a node.
+    ///
+    /// The other answers say what to do: [`FeedPage::Behind`] keeps the cursor (wait, or ask
+    /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
+    /// rebuild from the app's own source); [`FeedPage::Rewound`] means the cursor's record was
+    /// cut: retract what was applied above `to` and resume from `to`. See `docs/rdb/embed.md`,
+    /// "Change feed".
+    ///
+    /// # Errors
+    ///
+    /// Every error claims `no_mutation`: a feed call writes nothing. `UNAVAILABLE` when the copy
+    /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
+    /// nothing in its generation, or (a secondary) has not established freshness: no read of
+    /// `partitions/{p}` within the grant naming its generation with it pinned. A call to a
+    /// secondary without one starts that read, or joins the one in flight, and waits for it up
+    /// to 500 ms; it is refused when the read has not landed by then, and sooner when the read
+    /// fails or names another generation or membership. Follow the returned error: its retry
+    /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
+    /// copy is left out). `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// `Source::Node(n)` names a node this process has no link to. `INCOMPATIBLE_VERSION` when
+    /// this build refuses the node's records because their format is one it does not read.
+    /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
+    /// write's admission would, `LEASE_EXPIRED` (or `PROTECTION_PAUSED`, `GENERATION_CHANGED`),
+    /// with no redirect hint: `Source::Owner` re-reads the owner route on `LEASE_EXPIRED` and
+    /// calls the new owner, so a caller of `Source::Node` of the old owner switches to
+    /// `Source::Owner` or another member.
+    /// `CORRUPT_HISTORY`, in two ways, both with the feed's step (read another copy, or
+    /// rebuild from your own source):
+    /// - refused to this caller, the node unaffected: the copy holds the cursor's seq on that
+    ///   lineage with another digest (the cursor may come from another partition's history,
+    ///   the copies' histories may have diverged, or the record may be damaged), or a stored
+    ///   `User` key in a record due to be returned does not parse;
+    /// - the node faults: a storage read fails as corrupt, a record does not decode, does not
+    ///   match its digest or names another seq, a record is missing between the floor and the
+    ///   cap, or the first `History` key does not parse. Every feed call waiting on the node,
+    ///   and every later one, hears the same error; a put or a get hears the fault without the
+    ///   feed's step.
+    ///
+    /// A cursor from another partition's history is not sure to be `CORRUPT_HISTORY`: it is
+    /// judged against what this copy holds at its position, so it can read as `Behind`,
+    /// `Trimmed` or `Rewound` too. `INVALID_ARGUMENT` for `max` 0 or a partition this database
+    /// does not have, and over the links for an app not on the node's admin apps (#151).
+    pub fn changes(
+        &self,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        self.changes_under(self.identity(), partition, from, max, source)
+    }
+
+    /// [`Self::changes`] under another tenant's identity, as an app over the wire may claim
+    /// one (#170 review: the tenant rows).
+    #[cfg(test)]
+    pub(crate) fn changes_as(
+        &self,
+        tenant: TenantId,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        let identity = RequestIdentity {
+            tenant,
+            ..self.identity()
+        };
+        self.changes_under(identity, partition, from, max, source)
+    }
+
+    fn changes_under(
+        &self,
+        identity: RequestIdentity,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        if partition.0 == 0 || partition.0 > self.route.partitions() {
+            return Err(ApiError::invalid(format!(
+                "partition {} is not one of this database's {}",
+                partition.0,
+                self.route.partitions()
+            )));
+        }
+        let call = ClientCall::Changes {
+            identity,
+            from,
+            max,
+        };
+        let wait = self.timeouts.read;
+        let answer = match source {
+            Source::Owner => self.call(partition, call, wait),
+            Source::Node(node) => match self.send_call(node, partition, call) {
+                Ok(answer) => match answer.recv_timeout(wait) {
+                    Ok(answer) => Some(answer),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
+                        error: ApiError::new(
+                            ErrorKind::Unavailable,
+                            format!("node {} dropped the feed call unanswered", node.0),
+                        ),
+                        request: None,
+                    }),
+                },
+                Err(_) => Some(Answer::Error {
+                    error: ApiError::new(
+                        ErrorKind::Unavailable,
+                        format!("node {} cannot be reached from this process", node.0),
+                    ),
+                    request: None,
+                }),
+            },
+        };
+        let answered = match answer {
+            Some(Answer::Changes(page)) => Ok(page),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a feed call was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no feed answer in {wait:?}"),
+            )),
+        };
+        answered.map_err(|mut error| {
+            error.no_mutation = true;
+            self.explained(error)
+        })
+    }
+
     /// [`Self::put`] under the app's request id `request`, which this client may have used
     /// already. A fresh compile, so a changed payload under a used id meets the dedup rules
     /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
@@ -4232,6 +4378,30 @@ impl Db {
         ns: rdb_core::contracts::storage::Namespace,
         key: &[u8],
     ) -> Result<(), String> {
+        self.damage_record_as(
+            node,
+            generation,
+            ns,
+            key,
+            rdb_storage::RecordDamage::LastByte,
+        )
+    }
+
+    /// **Dev tool only**, debug builds: [`Self::damage_record`] with the damage `how` names
+    /// ([`rdb_storage::RocksEngine::damage_record_as`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`].
+    #[cfg(debug_assertions)]
+    pub fn damage_record_as(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+        how: rdb_storage::RecordDamage,
+    ) -> Result<(), String> {
         if let Some(error) = self.refuse_groupless("damage_record", "it runs on partition 1 only") {
             return Err(error.detail);
         }
@@ -4241,6 +4411,7 @@ impl Db {
             generation,
             ns,
             key: key.to_vec(),
+            how,
             reply,
         };
         let sent = lock(&self.nodes)
@@ -4254,6 +4425,51 @@ impl Db {
                     node.0
                 ))
             }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
+        }
+    }
+
+    /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete `node`'s
+    /// `History` records of partition 1 with a seq in `seqs`, through lineage `generation`'s
+    /// chain ([`Msg::DropHistory`]). From seq 1 up, as a history trim (#61) would on that one
+    /// copy, its change feed floor rises; higher up it leaves a hole. Returns how many it
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, or
+    /// not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn drop_history(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        seqs: std::ops::Range<u64>,
+    ) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("drop_history", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::DropHistory {
+            partition: PARTITION,
+            generation,
+            seqs,
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => return Err(format!("node {} is not run by this process", node.0)),
             Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
             Some(Ok(())) => {}
         }
@@ -4411,7 +4627,16 @@ impl Db {
     /// `Quarantined`, also names that state and the one step that helps, as the latest look at
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
+    ///
+    /// A feed refusal whose detail already ends with the feed's own step (read another copy, or
+    /// rebuild) is left as it is (review r1): a note after it would hide that step and add the
+    /// kind's generic "call again", which contradicts it.
     fn explained(&self, mut error: ApiError) -> ApiError {
+        if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
+            || error.detail.ends_with(error::FEED_HISTORY_STEP)
+        {
+            return error;
+        }
         // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
         // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
         // that does. That text ends with its step, so it goes last, after any restart note,
@@ -5779,7 +6004,8 @@ fn carries(call: &ClientCall) -> Carries {
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
         | ClientCall::GetPrevious { .. }
-        | ClientCall::WaitDurable { .. } => Carries::Nothing,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => Carries::Nothing,
     }
 }
 
@@ -6838,7 +7064,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Move { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
-        | ClientCall::WaitDurable { .. } => return None,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
@@ -6988,6 +7215,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod feed_tests;
 
 #[cfg(test)]
 mod tests {
