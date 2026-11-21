@@ -421,8 +421,8 @@ mod tests {
     /// the `no_mutation = true` line: red.
     #[test]
     fn a_put_the_pool_never_ran_wrote_nothing() {
-        let refused = put_answer::<()>(Err("the blocking call did not run".to_owned()))
-            .expect_err("refused");
+        let refused =
+            put_answer::<()>(Err("the blocking call did not run".to_owned())).expect_err("refused");
         assert!(refused.request.is_none(), "{refused:?}");
         assert!(refused.error.no_mutation, "{refused:?}");
     }

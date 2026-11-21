@@ -237,7 +237,10 @@ fn sbx_146_a_current_thread_runtime_serves_calls_concurrently_under_load() {
         assert!(most >= 2, "calls overlapped: at most {most} in flight");
         let retries = retries.load(Ordering::SeqCst);
         tracing::info!(retries, reads = 32 * 20, "sbx_146_a_read_retries");
-        assert!(retries < 32, "{retries} of 640 reads were refused and asked again");
+        assert!(
+            retries < 32,
+            "{retries} of 640 reads were refused and asked again"
+        );
         let bound = Duration::from_millis(250) * scale();
         assert!(
             ticker.longest() < bound,
@@ -329,7 +332,10 @@ where
 fn did_not_block(wrapper: &str, (most, longest): (usize, Duration)) {
     assert!(most >= 2, "{wrapper}: at most {most} in flight");
     let bound = Duration::from_millis(250) * scale();
-    assert!(longest < bound, "{wrapper}: the runtime stalled {longest:?} (bound {bound:?})");
+    assert!(
+        longest < bound,
+        "{wrapper}: the runtime stalled {longest:?} (bound {bound:?})"
+    );
 }
 
 /// Eight byte documents in group 1, written before a T9 row's calls; their answers.
@@ -337,7 +343,9 @@ async fn eight_puts(db: &AsyncDb) -> Vec<rdb_api::PutOk> {
     let mut puts = Vec::new();
     for i in 0..8 {
         let object = Bytes::from(format!("o{i}"));
-        let put = db.put(AffinityId(1), object, Bytes::from_static(b"v"), None).await;
+        let put = db
+            .put(AffinityId(1), object, Bytes::from_static(b"v"), None)
+            .await;
         puts.push(put.unwrap_or_else(|e| panic!("put {i}: {e}")));
     }
     puts
