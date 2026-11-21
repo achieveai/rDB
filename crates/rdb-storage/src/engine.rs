@@ -1339,7 +1339,8 @@ impl RocksEngine {
 
     /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete every
     /// `History` record with a seq in `seqs` that lineage `(partition, generation)` reaches
-    /// through its chain, from this copy only. From seq 1 up it is a history trim (#61) would
+    /// through its chain ([`Self::history_reach`]), from this copy only: an ancestor's records
+    /// above the reach belong to the ancestor and stay. From seq 1 up it is a history trim (#61) would
     /// make: [`Self::history_floor`] rises to the lowest record left, or to the applied head
     /// plus one when none is left. Higher up it leaves a hole. Nothing else moves: no `applied`
     /// mark, no state. A synced write. Answers how many records it deleted.
@@ -1354,16 +1355,11 @@ impl RocksEngine {
         generation: Generation,
         seqs: std::ops::Range<u64>,
     ) -> Result<u64, String> {
-        let mut levels = vec![generation];
-        let mut level = generation;
-        while let Some(link) = self.link(partition, level) {
-            levels.push(link.parent);
-            level = link.parent;
-        }
+        let levels = self.history_reach(partition, generation);
         let cf = self.cf(keys::cf_for(Namespace::History));
         let mut write = WriteBatch::default();
         let mut dropped = 0_u64;
-        for level in levels {
+        for (level, reach) in levels {
             let prefix = encode_key(partition, level, Namespace::History, &[]);
             for item in self
                 .db
@@ -1375,7 +1371,7 @@ impl RocksEngine {
                 }
                 let seq = decode_mark(&raw[keys::PREFIX_LEN..])
                     .ok_or_else(|| format!("a History key does not decode: {}", hex(&raw)))?;
-                if seq >= seqs.end {
+                if seq >= seqs.end || reach.is_some_and(|reach| seq > reach) {
                     break;
                 }
                 if seqs.contains(&seq) {
@@ -1974,10 +1970,32 @@ impl RocksEngine {
         Ok(Some((record, progress)))
     }
 
+    /// The levels whose `History` lineage `(partition, generation)` reads, own level first, each
+    /// with its reach: `None` for the own level, else the lowest [`Link::base`] on the path to it.
+    /// A read falls through a link only for `seq <= base` ([`Self::get`]), so an ancestor's
+    /// records above its reach are not this lineage's (#170 review r3/r4).
+    fn history_reach(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Vec<(Generation, Option<u64>)> {
+        let mut levels = vec![(generation, None)];
+        let mut level = generation;
+        let mut reach: Option<u64> = None;
+        while let Some(link) = self.link(partition, level) {
+            let base = reach.map_or(link.base.0, |reach| reach.min(link.base.0));
+            reach = Some(base);
+            levels.push((link.parent, reach));
+            level = link.parent;
+        }
+        levels
+    }
+
     /// The lowest `History` seq lineage `(partition, generation)` serves through its chain
-    /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one,
-    /// or the lineage's applied head plus one when no level holds any (1 for an empty copy). It
-    /// assumes no hole above that record: a history trim (#61) must revisit it.
+    /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one
+    /// within that level's reach ([`Self::history_reach`]), or the lineage's applied head plus
+    /// one when none does (1 for an empty copy). It assumes no hole above that record: a history
+    /// trim (#61) must revisit it.
     ///
     /// # Errors
     ///
@@ -1987,14 +2005,9 @@ impl RocksEngine {
         partition: PartitionId,
         generation: Generation,
     ) -> Result<Seq, StorageFault> {
-        let mut levels = vec![generation];
-        let mut level = generation;
-        while let Some(link) = self.link(partition, level) {
-            levels.push(link.parent);
-            level = link.parent;
-        }
+        let levels = self.history_reach(partition, generation);
         let cf = self.cf(keys::cf_for(Namespace::History));
-        for level in levels.into_iter().rev() {
+        for (level, reach) in levels.into_iter().rev() {
             let prefix = encode_key(partition, level, Namespace::History, &[]);
             let first = self
                 .db
@@ -2008,18 +2021,21 @@ impl RocksEngine {
             if !raw.starts_with(&prefix) {
                 continue;
             }
-            return decode_mark(&raw[keys::PREFIX_LEN..])
-                .map(Seq)
-                .ok_or_else(|| {
-                    tracing::error!(
-                        target: LOG_TARGET,
-                        partition = partition.0,
-                        generation = level.0,
-                        key_hex = %hex(&raw),
-                        "history_floor_key_undecodable"
-                    );
-                    StorageFault::Corrupt
-                });
+            let first = decode_mark(&raw[keys::PREFIX_LEN..]).ok_or_else(|| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    generation = level.0,
+                    key_hex = %hex(&raw),
+                    "history_floor_key_undecodable"
+                );
+                StorageFault::Corrupt
+            })?;
+            // #170 review r3/r4: an ancestor's record above the reach is not this lineage's.
+            if reach.is_some_and(|reach| first > reach) {
+                continue;
+            }
+            return Ok(Seq(first));
         }
         Ok(Seq(self.buffered_applied(partition, generation).0 + 1))
     }

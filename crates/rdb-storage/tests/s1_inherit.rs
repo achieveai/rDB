@@ -1424,3 +1424,45 @@ fn m10_s2_an_empty_dedup_trim_does_not_count_as_synced() {
         "an empty trim is not counted"
     );
 }
+
+/// #170 review r3/r4 (thread 4654331883): a lineage's history floor and the dev tool
+/// `drop_history` see only what its chain reaches. G2 inherits G1 at base 2 (copied), so it
+/// reaches G1's records 1..=2 and holds its own 3..=5; G1's records 3..=10 are G1's.
+/// - The floor is 1 (G1's record 1, within reach).
+/// - Dropping 0..8 through G2 deletes 5 records (G1's 1..=2 and G2's 3..=5), not G1's 3..=7.
+/// - The floor is then G2's applied head plus one, 6, not G1's record 3, and stays 6 once G2
+///   appends seq 6.
+///
+/// Cuts: `history_floor` ignores the reach, red (floor 3 after the drop); `drop_history`
+/// ignores it, red (10 dropped).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn f87_3_the_history_floor_and_drop_stop_at_the_link_base() {
+    let dir = data_dir("f87-3-reach");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 10);
+    assert!(matches!(
+        engine.inherit(P, G1, G2, Seq(2)),
+        Ok(Inherited::Copied { .. })
+    ));
+    write_after(&mut engine, G2, (2, &g1), 5);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(1)));
+
+    assert_eq!(engine.drop_history(P, G2, 0..8), Ok(5));
+    for seq in 3..=10 {
+        assert_eq!(
+            history_from(&engine, G1, seq),
+            Some(G1),
+            "G1's record {seq}"
+        );
+    }
+    for seq in 1..=5 {
+        assert_eq!(history_from(&engine, G2, seq), None, "G2 still reads {seq}");
+    }
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+
+    let g2 = chain(P, G2, (Seq(2), g1.digest(2)), 6);
+    commit_through(&mut engine, &g2, 6);
+    assert_eq!(engine.buffered_applied(P, G2).0, 6);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+}
