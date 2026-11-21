@@ -485,6 +485,46 @@ struct SmInner {
     last_built: Option<StoredSnapshot>,
 }
 
+/// A copy of the applied fields that the cheap [`StateReader`] calls answer from, so they never
+/// wait on the state-machine lock (#186).
+///
+/// The apply path holds [`SmInner`]'s lock across its synced write. A reader on a Tokio worker
+/// that took that lock waited out the fsync, and the peer plane checks `is_retired` on every
+/// inbound call, heartbeats included: a follower in an fsync missed the leader's peer deadline
+/// and an election followed.
+///
+/// The fsync must stay under the lock. `WatchHub::register_locked` subscribes, reads
+/// `high_water = cluster_revision()` from memory, then replays `(R, H]` from disk. If memory
+/// were ahead of disk — mutate, release the lock, then write — that replay would miss the
+/// revisions not yet written, and the live drain would then drop them as `<= high_water`:
+/// events lost with no error (the C4-08 class). Writing first and mutating after would need a
+/// `KvState` clone per batch, because `apply_with_effects` mutates in place and later commands
+/// in a batch read earlier ones.
+///
+/// So this copy is updated only **after** the write succeeds, still under the state-machine
+/// lock and before the batch is published: it is never ahead of the disk, and a subscriber that
+/// sees the publish also sees the revision here. Lock order is `sm` then `applied`; readers
+/// take `applied` alone, and it is never held across I/O.
+struct AppliedView {
+    last_applied: Option<LogId<RaftNodeId>>,
+    membership: StoredMembership<RaftNodeId, RaftNode>,
+    cluster_revision: u64,
+    retired: BTreeSet<NodeId>,
+    max_applied_command_schema: u16,
+}
+
+impl AppliedView {
+    fn of(sm: &SmInner) -> Self {
+        Self {
+            last_applied: sm.last_applied,
+            membership: sm.membership.clone(),
+            cluster_revision: sm.kv.cluster_revision(),
+            retired: sm.kv.retired_nodes().clone(),
+            max_applied_command_schema: sm.kv.max_applied_command_schema(),
+        }
+    }
+}
+
 struct RocksShared {
     db: DB,
     path: PathBuf,
@@ -562,6 +602,8 @@ struct RocksShared {
     pending_purge: Mutex<Option<LogId<RaftNodeId>>>,
     log: Mutex<LogMeta>,
     sm: Mutex<SmInner>,
+    /// See [`AppliedView`]. Written only with `sm` held; read without it.
+    applied: Mutex<AppliedView>,
 }
 
 impl Drop for RocksShared {
@@ -601,6 +643,18 @@ impl RocksShared {
                 guard
             }
         }
+    }
+
+    /// The reader-side copy of the applied state. Never held across I/O or with `sm` taken
+    /// after it.
+    fn applied(&self) -> MutexGuard<'_, AppliedView> {
+        self.applied.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Refresh [`AppliedView`] from `sm`. The caller holds the state-machine lock and has
+    /// already made `sm` durable.
+    fn mirror_applied(&self, sm: &SmInner) {
+        *self.applied() = AppliedView::of(sm);
     }
 
     fn recv(&self) -> MutexGuard<'_, Option<PathBuf>> {
@@ -1260,6 +1314,17 @@ impl RocksStore {
             tracing::warn!(reason = "sync_disabled", "durability_unverified");
         }
 
+        let sm = SmInner {
+            kv: loaded.kv,
+            last_applied: loaded.last_applied,
+            membership: loaded.membership,
+            journal: loaded.journal_stats,
+            current_snapshot: loaded.current_snapshot,
+            install_in_progress: loaded.install_in_progress,
+            last_built: None,
+        };
+        let applied = AppliedView::of(&sm);
+
         tracing::info!(
             identity = %identity,
             cluster_id = %identity.cluster_id,
@@ -1272,8 +1337,8 @@ impl RocksStore {
             last_applied = loaded.last_applied.map(|l| l.index),
             last_log_index = loaded.last_log_id.map(|l| l.index),
             committed = loaded.committed.map(|l| l.index),
-            cluster_revision = loaded.kv.cluster_revision(),
-            records = loaded.kv.len(),
+            cluster_revision = sm.kv.cluster_revision(),
+            records = sm.kv.len(),
             "store_opened"
         );
 
@@ -1318,15 +1383,8 @@ impl RocksStore {
                     last_purged: loaded.last_purged,
                     last_log_id: loaded.last_log_id,
                 }),
-                sm: Mutex::new(SmInner {
-                    kv: loaded.kv,
-                    last_applied: loaded.last_applied,
-                    membership: loaded.membership,
-                    journal: loaded.journal_stats,
-                    current_snapshot: loaded.current_snapshot,
-                    install_in_progress: loaded.install_in_progress,
-                    last_built: None,
-                }),
+                sm: Mutex::new(sm),
+                applied: Mutex::new(applied),
             }),
         })
     }
@@ -3035,9 +3093,13 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
                         );
                     }
 
+                    s.faults.before_state_write();
                     s.write(batch, true, ErrorSubject::StateMachine, ErrorVerb::Write)?;
                     sm.last_applied = last_applied;
                     applied_revision = sm.kv.cluster_revision();
+                    // After the write, before the publish: see `AppliedView` for why the
+                    // reader copy may never run ahead of the disk.
+                    s.mirror_applied(&sm);
                     // Inside the critical section, with `last_applied`: an observer that has
                     // seen the applied index move must also see the command that moved it.
                     s.applied_commands.fetch_add(commands, Ordering::SeqCst);
@@ -4452,6 +4514,7 @@ fn install_received(
         sm.journal = installed.journal;
         sm.current_snapshot = Some(stored.clone());
         sm.install_in_progress = None;
+        s.mirror_applied(&sm);
     }
     if let Some(log_id) = pending {
         let mut log = s.log();
@@ -4646,12 +4709,34 @@ impl StateReader for RocksReader {
         Ok(Some(MapPin::view(revision, records)))
     }
 
+    // These six answer from `AppliedView`, never from the state-machine lock, so a reader
+    // on a Tokio worker does not wait out an apply's fsync (#186). `compact_revision`,
+    // `with_state`, `pin` and `journal_stats` stay on the lock: M4-32's watch replay needs the
+    // compaction watermark to move before the deletion lands, which only the lock orders.
+    // `journal_stats` is in the same position: a compacting apply's `compact_journal` changes
+    // the stats in memory ahead of the `delete_range` that the same batch carries.
     fn last_applied(&self) -> Option<LogId<RaftNodeId>> {
-        self.shared.sm().last_applied
+        self.shared.applied().last_applied
     }
 
     fn membership(&self) -> StoredMembership<RaftNodeId, RaftNode> {
-        self.shared.sm().membership.clone()
+        self.shared.applied().membership.clone()
+    }
+
+    fn cluster_revision(&self) -> u64 {
+        self.shared.applied().cluster_revision
+    }
+
+    fn retired_nodes(&self) -> BTreeSet<NodeId> {
+        self.shared.applied().retired.clone()
+    }
+
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        self.shared.applied().retired.contains(&node_id)
+    }
+
+    fn max_applied_command_schema(&self) -> u16 {
+        self.shared.applied().max_applied_command_schema
     }
 
     fn snapshot_meta(&self) -> Option<SnapshotMeta<RaftNodeId, RaftNode>> {
@@ -4729,5 +4814,71 @@ impl StateReader for RocksReader {
         // suffix is not known until the scan finishes.
         let events = self.read_events(from_exclusive, u64::MAX, &[], usize::MAX)?;
         Ok(journal_hash(events.iter()))
+    }
+}
+
+#[cfg(test)]
+mod applied_view_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use config_core::{ClusterId, RecoveryEpoch};
+
+    use super::*;
+    use crate::fault::NoFaults;
+
+    /// #186 row 1: the cheap readers answer while another thread holds the state-machine lock,
+    /// which is what an apply does across its fsync.
+    ///
+    /// Each answer is sent as soon as it returns, so a timeout names the reader that waited.
+    #[config_log::retcd_test]
+    fn i186_cheap_readers_do_not_take_the_state_machine_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = ClusterIdentity {
+            cluster_id: ClusterId::from_bytes([7u8; 16]),
+            recovery_epoch: RecoveryEpoch(0),
+            node_id: NodeId(1),
+        };
+        let store = RocksStore::open(
+            tmp.path(),
+            identity,
+            Limits::DEFAULT,
+            Arc::new(NoFaults),
+            Span::none(),
+        )
+        .expect("store opens");
+        let reader = store.reader();
+
+        let held = store.shared.sm();
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let readers = std::thread::spawn(move || {
+            let _ = reader.membership();
+            tx.send("membership").unwrap();
+            let _ = reader.last_applied();
+            tx.send("last_applied").unwrap();
+            let _ = reader.cluster_revision();
+            tx.send("cluster_revision").unwrap();
+            let _ = reader.is_retired(NodeId(9));
+            tx.send("is_retired").unwrap();
+            let _ = reader.retired_nodes();
+            tx.send("retired_nodes").unwrap();
+            let _ = reader.max_applied_command_schema();
+            tx.send("max_applied_command_schema").unwrap();
+        });
+        for want in [
+            "membership",
+            "last_applied",
+            "cluster_revision",
+            "is_retired",
+            "retired_nodes",
+            "max_applied_command_schema",
+        ] {
+            let got = rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("{want} waited on the state-machine lock"));
+            assert_eq!(got, want);
+        }
+        drop(held);
+        readers.join().expect("reader thread");
     }
 }

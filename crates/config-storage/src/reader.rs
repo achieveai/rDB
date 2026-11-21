@@ -294,6 +294,23 @@ pub trait StateReader: Send + Sync {
         retired
     }
 
+    /// Whether `node_id` is in [`StateReader::retired_nodes`].
+    ///
+    /// Its own method because the peer plane asks it on every inbound call, heartbeats
+    /// included, so a store can answer it without the lock its apply path holds (#186).
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        let mut retired = false;
+        self.with_state(&mut |s| retired = s.is_retired(node_id));
+        retired
+    }
+
+    /// The highest `command_schema` the applied state has ever carried (ADR-0030, M6-R15).
+    fn max_applied_command_schema(&self) -> u16 {
+        let mut schema = config_core::COMMAND_SCHEMA_V1;
+        self.with_state(&mut |s| schema = s.max_applied_command_schema());
+        schema
+    }
+
     /// The provenance of a restored data directory, if this one was restored (M5, ADR-0026).
     ///
     /// Defaulted to `None`: a directory that grew its own state has no marker to report, which
