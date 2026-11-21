@@ -339,12 +339,18 @@ impl ConfigNode {
             .watch
             .attach(&inner.reader, Arc::clone(&inner.authorizer), span.clone());
 
-        let retention_handle =
-            tokio::spawn(retention_loop(Arc::downgrade(&inner)).instrument(span.clone()));
-        *inner
-            .retention_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(retention_handle);
+        #[cfg(not(test))]
+        let periodic_retention = true;
+        #[cfg(test)]
+        let periodic_retention = inner.cfg.periodic_retention;
+        if periodic_retention {
+            let retention_handle =
+                tokio::spawn(retention_loop(Arc::downgrade(&inner)).instrument(span.clone()));
+            *inner
+                .retention_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(retention_handle);
+        }
 
         let handle = tokio::spawn(
             background_loop(
@@ -1304,8 +1310,13 @@ impl NodeInner {
             .readmission_checks
             .fetch_add(1, Ordering::SeqCst);
         let mut retired = false;
-        self.reader
-            .with_state(&mut |s| retired = s.is_retired(node_id));
+        self.reader.with_state(&mut |s| {
+            retired = s.is_retired(node_id);
+            #[cfg(test)]
+            self.test_hooks
+                .readmission_reads_under_sm
+                .fetch_add(1, Ordering::SeqCst);
+        });
         retired
     }
 
@@ -2740,10 +2751,6 @@ fn write_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
     }
 }
 
-/// The leader-only retention task (ADR-0019).
-///
-/// Holds a `Weak`, so it never keeps the node alive, and is aborted outright by
-/// [`ConfigNode::stop`].
 /// Seams the in-crate rows use to fence or fail one step (#192 review). Test builds only.
 #[cfg(test)]
 #[derive(Default)]
@@ -2751,10 +2758,18 @@ pub(crate) struct TestHooks {
     /// Readmission checks started. Bumped before the check takes the state-machine lock, so
     /// a row can wait until an `add_learner` or `promote_voter` is inside it.
     pub(crate) readmission_checks: AtomicU64,
+    /// Readmission reads that ran inside `with_state`, i.e. under the state-machine lock.
+    /// Bumped inside the read itself, so a check that reads the applied mirror instead never
+    /// bumps it, however late its read lands.
+    pub(crate) readmission_reads_under_sm: AtomicU64,
     /// While set, the retention tick sees `retention_inputs` fail.
     pub(crate) fail_retention_inputs: AtomicBool,
 }
 
+/// The leader-only retention task (ADR-0019).
+///
+/// Holds a `Weak`, so it never keeps the node alive, and is aborted outright by
+/// [`ConfigNode::stop`].
 async fn retention_loop(inner: Weak<NodeInner>) {
     let interval = match inner.upgrade() {
         Some(node) => node.retention.check_interval,

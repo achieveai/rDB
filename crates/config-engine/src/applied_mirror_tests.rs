@@ -273,7 +273,14 @@ async fn i194_engine_journal_view_and_retention_answer_during_an_apply_write() {
 /// got past the check and answered `NotAMember`.
 ///
 /// Fenced, not timed: the write is released only after both calls have entered the check
-/// (`TestHooks::readmission_checks`), so a slow host cannot let either start after the release.
+/// (`TestHooks::readmission_checks`), so neither call can start after the release.
+///
+/// Entry alone does not prove where the read went: a check that read the mirror could be
+/// preempted after entry, read after the write landed, and pass. So the row also counts reads
+/// made inside `with_state` (`TestHooks::readmission_reads_under_sm`), bumped by the read
+/// itself. A mirror read never bumps it, however late it lands. A "read completed before
+/// release" fence is not usable here: under the lock the read waits for the parked write, so
+/// that fence would deadlock the correct code.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn i192_add_learner_during_a_parked_retire_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -329,14 +336,22 @@ async fn i192_add_learner_during_a_parked_retire_is_refused() {
         .await
         .expect("add_learner answers")
         .expect("add task joins");
-    assert!(
-        matches!(added, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
-        "a same-id add_learner during the parked retirement must be refused, got {added:?}"
-    );
     let promoted = tokio::time::timeout(PATIENCE, promoting)
         .await
         .expect("promote_voter answers")
         .expect("promote task joins");
+    assert_eq!(
+        node.test_hooks()
+            .readmission_reads_under_sm
+            .load(Ordering::SeqCst),
+        2,
+        "each readmission check must read the retired set under the state-machine lock, \
+         not from the applied mirror"
+    );
+    assert!(
+        matches!(added, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
+        "a same-id add_learner during the parked retirement must be refused, got {added:?}"
+    );
     assert!(
         matches!(promoted, Err(AdminError::Retired { node_id }) if node_id == NodeId(9)),
         "a same-id promote_voter during the parked retirement must be refused, got {promoted:?}"
@@ -355,10 +370,15 @@ async fn i192_add_learner_during_a_parked_retire_is_refused() {
 /// The policy keeps 2 revisions and the journal holds 4, so a tick that read its inputs would
 /// propose `Compact { up_to: 2 }`. The same tick with the inputs readable is the positive
 /// control: it does compact to 2, so the first half cannot pass because nothing was due.
+///
+/// The periodic retention task is off (`NodeConfig::periodic_retention`), so only the two
+/// ticks this row drives can run. A tick of its own during a slow seed would compact before
+/// the failure hook is set, and the first half would fail on a compaction it did not make.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn i192_retention_proposes_nothing_when_its_inputs_fail() {
     let dir = tempfile::tempdir().unwrap();
     let node = start_node_with(dir.path(), Arc::new(ParkWrite::default()), |cfg| {
+        cfg.periodic_retention = false;
         cfg.watch_retention = config_core::WatchRetention {
             max_revisions: 2,
             ..config_core::WatchRetention::DEFAULT
@@ -371,7 +391,9 @@ async fn i192_retention_proposes_nothing_when_its_inputs_fail() {
             .await
             .expect("put");
     }
-    let applied = node.metrics().last_applied;
+    // The store's applied index, not `metrics().last_applied`: OpenRaft's metrics can trail
+    // the apply that answered the last put, and the catch-up would read as a proposal.
+    let applied = node.applied_index();
 
     node.test_hooks()
         .fail_retention_inputs
@@ -383,7 +405,7 @@ async fn i192_retention_proposes_nothing_when_its_inputs_fail() {
         "a tick whose retention_inputs failed compacted anyway"
     );
     assert_eq!(
-        node.metrics().last_applied,
+        node.applied_index(),
         applied,
         "a tick whose retention_inputs failed proposed an entry"
     );
