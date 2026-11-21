@@ -3307,7 +3307,9 @@ impl Db {
     /// record missing between the floor and the cap, met while paging, does);
     /// [`FeedPage::Rewound`] means records above `to` are not on this copy's history: a promote
     /// cut them, or this copy cannot place the cursor's generation on its chain and `to` is
-    /// [`FeedCursor::START`] (a longer replay than needed, never a gap). Retract what was
+    /// [`FeedCursor::START`] (a longer replay than needed, never a gap). That last holds only
+    /// while the copy's floor is 1: with a floor above 1 it answers `Trimmed { floor }` instead,
+    /// as a replay from the start would have a gap. Retract what was
     /// applied above `to` and resume from `to`. See `docs/rdb/embed.md`, "Change feed".
     ///
     /// # Errors

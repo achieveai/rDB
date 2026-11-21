@@ -1703,7 +1703,9 @@ loop {
   - `Rewound`: **records above `to` are not on this copy's history**, usually because a
     promote cut records you have already applied. It can also mean the copy cannot place your
     cursor's generation on its chain; `to` is then `FeedCursor::START`, a longer replay than
-    needed, never a gap. A cursor whose record the copy still holds, at the same stamp and
+    needed, never a gap. That holds only while the copy still holds seq 1: when its `floor` is
+    above 1 it answers `Trimmed { floor }` instead, since a replay from the start would have a
+    gap. A cursor whose record the copy still holds, at the same stamp and
     digest, is served instead, even after a later generation linked above it. Undo what you
     applied above `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB
     has lost.
