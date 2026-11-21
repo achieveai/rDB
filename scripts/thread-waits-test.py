@@ -150,6 +150,28 @@ class CliTests(unittest.TestCase):
                 self.assertIn(f"pgrep: fake failure {status}", done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
 
+    def test_a_pgrep_failure_on_a_later_poll_exits_1_with_its_message(self):
+        # The first poll matches a process that is gone at once, so the sampler polls again;
+        # that second poll fails.
+        bin_dir = os.path.join(self.dir.name, "bin")
+        os.mkdir(bin_dir)
+        calls = os.path.join(self.dir.name, "calls")
+        stub = pathlib.Path(bin_dir) / "pgrep"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"echo poll >> '{calls}'\n"
+            f"if [ \"$(wc -l < '{calls}')\" -eq 1 ]; then echo 999999999; exit 0; fi\n"
+            "echo 'pgrep: later poll failure' >&2\n"
+            "exit 3\n"
+        )
+        stub.chmod(0o755)
+        done = cli("--pattern", "^x$", "--out", self.out, "--seconds", "5",
+                   env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+        self.assertEqual(pathlib.Path(calls).read_text().count("poll"), 2, done.stderr)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("pgrep: later poll failure", done.stderr)
+        self.assertNotIn("Traceback", done.stderr)
+
     def test_a_bad_regex_fails_with_pgreps_diagnostic(self):
         done = cli("--pattern", "[", "--out", self.out, "--seconds", "5")
         self.assertEqual(done.returncode, 1)
