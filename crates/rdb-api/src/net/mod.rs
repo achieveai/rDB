@@ -155,7 +155,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// answers it today; the type changed all the same. The number is main's version + 1, set by the
 /// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
 /// as for `10`: every node and every linked app process together.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
