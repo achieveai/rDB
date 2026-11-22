@@ -127,6 +127,11 @@
 #                the owner most often sharing a partition with the new node; where the new node
 #                is chosen owner, a fresh session writes and reads back; A9 a node from the
 #                other CA is never linked, an add at d3's IP is refused, ids run out at 8.
+#                D2's run list puts a `rebalance` between any two removes or losses: up,
+#                check, add, rebalance, remove 2, rebalance, kill 4, remove 4, rebalance,
+#                check-members. Two losses with no refill between them are outside the design
+#                (D2 run 3, 2026-11-22: partitions node 2 had owned fell to one copy, and node
+#                4 stayed pinned).
 #   check, failover and pause count nodes 1..N, so they refuse a rig after add or remove.
 #
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
@@ -1728,7 +1733,7 @@ check_members() {
     added="$(awk -v k="$NODES" '$2 == "live" && $1 > k { print $1 }' <<< "$NODES_TXT")"
     removed="$(awk '$2 == "removed" { print $1 }' <<< "$NODES_TXT")"
     [ -n "$added" ]; verdict "A1 the rig has a node added after up (${added:-none})" $?
-    [ -n "$removed" ]; verdict "A7 the rig has a removed node (${removed:-none})" $?
+    [ -n "$removed" ]; verdict "A7 the rig has a removed node ($(paste -sd, - <<< "${removed:-none}"))" $?
 
     # A1, A2: the new node is ready, and its record is at its own IP and machine.
     for n in $added; do
