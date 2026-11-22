@@ -55,6 +55,10 @@ use crate::keys::{
 /// The `tracing` target of every event this crate emits.
 pub(crate) const LOG_TARGET: &str = "rdb_storage";
 
+/// The target of `batch_commit`, one line per committed batch (#158): debug, under a target of
+/// its own so a filter can turn it on without every other debug line of `rdb_storage`.
+pub const BATCH_LOG_TARGET: &str = "rdb_storage::engine::batch";
+
 /// RocksDB 0.23's own memtable budget per column family, which an engine keeps when
 /// [`StorageOptions::write_buffer_bytes`] is `None` (64 MiB).
 pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 << 20;
@@ -1648,8 +1652,10 @@ impl RocksEngine {
             );
             self.format = FORMAT_VERSION;
         }
-        tracing::info!(
-            target: LOG_TARGET,
+        // One per batch, so debug (#158). A batch that fails is `batch_commit_failed` at error;
+        // a slow WAL sync is the host's `wal_sync_slow` at warn.
+        tracing::debug!(
+            target: BATCH_LOG_TARGET,
             partition = batch.partition.0,
             generation = batch.generation.0,
             seq = batch.seq.0,

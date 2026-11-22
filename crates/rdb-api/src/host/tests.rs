@@ -5537,6 +5537,63 @@ fn m9_close_a_refused_write_answers_its_key_and_never_logs_it() {
     assert!(leaks.is_empty(), "log lines carry a key's text: {leaks:#?}");
 }
 
+/// Review r1 (PR #182): a refused compile logged `client_compile` at info on every attempt and
+/// returned before the reply, so the refusal log never counted it. Now its `client_compile` is
+/// debug, like a compile that worked, and the refusal is counted: one `refusal_first` at info
+/// for its key, and the host's summary counts every attempt.
+/// Integration (~1 s): Trio, one write and five refused compiles.
+#[config_log::retcd_test]
+fn r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug() {
+    const METHOD: &str = "r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let doc = Change::Doc(Delta(vec![Op::Replace(json_map(&[("a", int(1))]))]));
+    assert_eq!(
+        trio.write(compile_change(1, b"doc", doc, Some(Expected::Absent))),
+        Ok(2)
+    );
+    let refused: Vec<u64> = (10..15).collect();
+    for &request in &refused {
+        let missing = Change::Doc(Delta(vec![Op::Remove(path("/missing"))]));
+        match trio.ask(compile_change(request, b"doc", missing, None)) {
+            Answer::Error { error, .. } => assert_eq!(error.kind, ErrorKind::InvalidArgument),
+            other => panic!("request {request} not refused: {other:?}"),
+        }
+    }
+
+    let compiles: Vec<_> = logged!(METHOD, "client_compile")
+        .into_iter()
+        .filter(|line| {
+            line["request"]
+                .as_u64()
+                .is_some_and(|request| refused.contains(&request))
+        })
+        .collect();
+    assert_eq!(compiles.len(), refused.len(), "{compiles:#?}");
+    for line in &compiles {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
+    let firsts: Vec<_> = logged!(METHOD, "refusal_first")
+        .into_iter()
+        .filter(|line| line["reason"] == "InvalidArgument")
+        .collect();
+    assert_eq!(firsts.len(), 1, "one first for the key: {firsts:#?}");
+    assert_eq!(firsts[0]["@l"], "Information", "{}", firsts[0]);
+    let counted: u64 = trio
+        .nodes
+        .iter_mut()
+        .flat_map(|(host, _, _)| host.refusals.stop())
+        .map(|summary| summary.refusals)
+        .sum();
+    assert_eq!(
+        counted,
+        refused.len() as u64,
+        "every refused compile is counted"
+    );
+}
+
 /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
 /// given without sending are reads, so a node gives them only while a read would be given.
 /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a

@@ -252,14 +252,15 @@ scripts/local-rdb.sh clean
 - A node's own words: `out/node-N.err`, and the last `rdb_node not-ready` line in
   `out/node-N.out`.
 - Its full log: `logs/rdb_node-N.jsonl` in the run folder. One JSON object per line, with `@t`
-  (time), `@l` (level) and `@m` (message).
+  (time), `@l` (level) and `@m` (message). Past 256 MiB it rotates: the older lines are in
+  `rdb_node-N.jsonl.1` to `.7` (`docs/logging.md`).
 
 Query a copy, never a file a node is still writing. Warnings and errors from all three nodes:
 
 ```bash
 vars="$(scripts/local-rdb.sh env)" && eval "$vars" &&
-  mkdir -p "$RUN/logs-copy" && cp "$RUN"/logs/rdb_node-*.jsonl "$RUN/logs-copy/"
-duckdb -c "SELECT json->>'@t' AS t, json->>'@l' AS level, json->>'@m' AS message, filename FROM read_ndjson_objects('$RUN/logs-copy/*.jsonl', filename=true) WHERE (json->>'@l') IN ('Warning','Error') ORDER BY t DESC LIMIT 20"
+  mkdir -p "$RUN/logs-copy" && cp "$RUN"/logs/rdb_node-*.jsonl* "$RUN/logs-copy/"
+duckdb -c "SELECT json->>'@t' AS t, json->>'@l' AS level, json->>'@m' AS message, filename FROM read_ndjson_objects('$RUN/logs-copy/*.jsonl*', filename=true) WHERE (json->>'@l') IN ('Warning','Error') ORDER BY t DESC LIMIT 20"
 ```
 
 Warnings a healthy run shows, most often while the machine is busy (a cargo build, say):

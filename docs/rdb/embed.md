@@ -576,6 +576,12 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
   partition's primary and the work it guards (for SBX, its sandbox) live together. If the node
   stops, that work stops with it and is moved elsewhere with the partition. An effect made by
   another process or machine is not covered by `still_owner`, only by the destination's fence.
+- From **any** process, `db.route(group).token` (or `db.leader_of(partition).token`) is the
+  token the partition's record names: the one its owner stamps (#84). In a node's process it
+  can be a cached answer, kept while the control watch is open: a change of the record is
+  seen once its watch event arrives (see `route`, below). Use it to see that a
+  new owner took over (its token is higher), or to check what a destination holds. It is a hint
+  read from rEtcd, never ownership: only `still_owner`, in the owner's process, says you may act.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
 
 **What `still_owner` promises.** It mirrors admission check 6 (the grant's horizon and the
@@ -892,21 +898,160 @@ For SBX, subscribe once at start-up, then:
 
 ### Which node owns a group: `route`
 
-`db.route(group)` returns `RouteInfo { partition, owner, token }`: the group's partition, the
-node that owns it, and the owner's token, read from the partition's control record. Use it to
-send a request to the right node.
+`db.route(group)` returns a `RouteInfo`: `partition`, `owner` and `token`, read from the
+partition's control record, and the owner's app address, read from the owner's `nodes/{id}`
+record. Use it to send a request to the right node.
+
+- `route.app_address()` is where the owner's app takes forwarded requests. Each node registers
+  its own at open: `NodeAddresses::app` (in `rdb_node`, `--app-addr A`), 1 to
+  `rdb_api::MAX_APP_ADDR_LEN` (512) bytes, opaque to rDB, so a URL, `host:port` or anything
+  your gateway dials works. rDB returns it byte for byte and never logs it, since it may
+  carry a credential: its logs give only its length (`app_len`).
+- Each open given an app address makes sure the node's record holds it before the node
+  starts, so a node never leads a partition before its address is there. A record that
+  already holds it is not written again, unless an earlier open's write may still be in
+  flight (below). An open with no app address keeps the one stored before, unless such a
+  write may still be in flight: then it is refused with `OpenError::Config`, and the next
+  open must give the address the node should hold (below). **An address
+  cannot be cleared:** no app address keeps it, and an empty one is refused. Only the app
+  address is written; the node's declared address and machine never change.
+- **A write whose answer was lost.** Before it writes, the open puts a small file,
+  `app-addr-pending`, in its folder. It writes `app-addr-pending.new` first, then renames it;
+  a crash before the rename can leave `app-addr-pending.new` behind, and the next write
+  overwrites it. The file stays while the write's outcome is unknown: its answer was lost
+  and the read back failed or showed no change, the open was dropped, or the process
+  crashed. Such an open is refused, saying so, and nothing is started. The next open that
+  finds the file writes its address even if the record already holds it, so the old write
+  can no longer apply and never replaces the address of an open that succeeded.
+  - The file counts by being there: one whose text is damaged works the same. One that is
+    there but cannot be read refuses the open; make it readable and open again.
+  - While the file is there, an open with no app address is refused.
+    Open the node again with the address it should hold; that settles it, and later opens
+    can leave the address out.
+  - **A new or emptied folder fences.** A node folder with no data yet, new or emptied to
+    rejoin, has lost any such file, so an earlier folder's write may still apply. Its open
+    first writes another file, `app-addr-fence`, before the node's data is created, the same
+    way: `app-addr-fence.new` first, then renamed (a crash before the rename can leave
+    `app-addr-fence.new` behind, and the next such open overwrites it). The open then fences
+    the record: given an app address, it writes that address even if the record already
+    holds it, so the record then holds the address supplied; given none, it writes the
+    record's own bytes back, which changes nothing in it but moves its revision on, so only
+    then does the record keep the address it held. Either way no earlier write can apply
+    after it. The file is removed only once the fence is
+    written, so an open that fails after the node's data was created leaves it, and the next
+    open on that folder fences too. You need not supply the address for this: an open with
+    none fences on its own. Supply it only when an open refuses for `app-addr-pending`
+    (above).
+  - **Leave these files alone.** `app-addr-pending`, `app-addr-pending.new`,
+    `app-addr-fence` and `app-addr-fence.new` are the only four files this writes in the
+    folder, besides what an open already creates.
+- An open is also refused, with nothing started, when the record changed after it read it,
+  even to the same bytes. The declaration, another process that claims the node, or a
+  delayed write of an earlier open of this node can change it, and the open cannot tell
+  which.
+- It is `None` when the owner registered none, or on a database made by `rdb_node --form`,
+  which has no `nodes/` records, or when no read of that owner's record has succeeded yet in
+  this `Db` (below). An app address on such a database is refused at open, and
+  `rdb_node --form --app-addr` is refused while parsing.
+- `route` keeps an owner's address for a second after a read that succeeds, then reads it
+  again, so a node restarted with a new address is seen within about a second. Calls that
+  need the same owner's address while it is being read wait for that read and take its
+  answer, success or failure.
+- A node's `Db` keeps the partition answer while its control watch is open, until the watch
+  delivers a change to that partition or ends. It opens no new watch. An app-only `Db` (no
+  local node) reads rEtcd on every call.
+- **A failed address read does not fail `route` or `leader_of`** (SBX answer, 2026-11-20).
+  When the owner's `nodes/{id}` read fails or does not answer in time, the answer still names
+  the owner and token, with the last address a read of that owner returned in this `Db`,
+  however old, or `None` if no read of it has succeeded yet. So the address can be stale.
+  That is safe because the sender checks the receiver's TLS identity before it sends
+  anything (below). The failure refreshes nothing, so the next call reads again at once. It
+  is logged `db_route_app_addr_unreadable{node, reason, served}` (warn), where `served` is
+  `last_good` or `none`.
+- **How long a call can take.** At most two read timeouts (`Timeouts::read`) in all, however
+  many calls run at once: one for the partition's record and one for the owner's address,
+  waiting for another call's read of it included. A cached owner still needs its address
+  read once its second is up, and that read can be slow or fail too: the call then answers
+  as above, with the last good address.
+- `db.partition_of(group)` names the group's partition without reading anything. The count is
+  fixed when the database is formed (at most 512), by its declaration or by `rdb_node --form`, so a group stays in its partition, and
+  every group of a partition moves with it, while the database has its original partitions:
+  a partition that later splits can move a group to another partition (see the key map,
+  above).
+- `db.leader_of(partition)` is `route` by partition: what rEtcd's records say, from any
+  process, cached the same way, so in a node's process a change is seen once its watch event
+  arrives. A partition the database does not have is `INVALID_ARGUMENT`. It is not
+  `db.owner_of(partition)`, which reads nothing and names the node this `Db` sends the
+  partition's calls to; during a move the two can differ until this `Db` learns of it.
+- A record this build cannot decode is `INCOMPATIBLE_VERSION` (retry `Quarantine`): a newer
+  build may have written it, or it is damaged, and a retry cannot help. Run the build the
+  nodes run, or a newer one. If the nodes' own build cannot read it either, it is damaged:
+  stop sending that partition's calls, keep the store as it is, never edit the record by
+  hand, and report it with the message. A partition record that cannot be read right now
+  is `UNAVAILABLE`, and a later call can succeed; an owner's record that cannot be read right
+  now is not an error (above).
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.
-- A node's `Db` keeps the answer while its control watch is open, until the watch delivers a
-  change to that partition or ends. It opens no new watch. An app-only `Db` (no local node)
-  reads rEtcd on every call.
-- It does not yet return the owner's network address.
+
+**The app address is only a dial hint** (SBX answer, 2026-11-20). The SBX gateway consumes
+`route.app_address()` to forward a request to the owner's gateway. rDB does not bind the
+address to the node, so the address alone proves nothing:
+
+- rDB runs embedded in the app's process only. Its ports must not be reachable from sandbox
+  or app networks.
+- A gateway forwards to another gateway over its own mutual TLS, on the private network.
+- **The sender** checks the receiver's TLS certificate identity against the route's owner
+  node id (`route.owner`) before it sends any data or credentials. A wrong or stale address
+  then fails the handshake, and nothing is sent.
+- **The receiver** checks `db.still_owner(partition, token)` (#84) before it accepts
+  forwarded data, so a request that reaches a former owner is refused. That check says only
+  that the token is the present local authority for the partition, in the receiver's own
+  process, at the moment of the check. It does not check the sender's TLS identity, and it
+  says nothing about an effect that happens later: a pause after the check (a GC pause, a VM
+  suspend) still needs the destination's token fence. See "`still_owner` alone is not
+  enough" and "The destination's fence" under
+  [Fencing your own side effects](#fencing-your-own-side-effects).
+
+**Upgrading from an earlier build.** `NodeAddresses` gained `app`: add `app: None` to an
+existing `NodeAddresses { listen, peers }`. That behaves as before, with no address write, only
+on a settled folder: the node's data exists and the folder holds neither `app-addr-pending`
+(pending debt) nor `app-addr-fence` (fence debt). On a new, wiped or owed folder (no data yet,
+or `app-addr-fence` still there), an open with `app: None` writes the node's record: it CASes
+the record's own bytes back at the revision it read (an own-bytes fence, above), so it keeps the
+stored address but moves the revision on. An absent record is refused with `OpenError::Config`
+before the fence (the node is not declared). The fence can be refused with
+`OpenError::Control` (the record cannot be read, it changed after that check, or the fence's
+outcome is unknown; open again). While `app-addr-pending` is there, it is refused with
+`OpenError::Config` (above). `RouteInfo` is no longer
+`Copy` (it owns the address): add `.clone()` where an answer is used after it moved, and
+match it with `..`. It can no longer be built with a struct literal outside rDB, since the
+address field is private: take it from `route` or `leader_of`. Its equality now includes the
+address.
+
+**No rollback after an app address is registered.** The first open with an app address
+rewrites the node's record in a newer layout (2), which an earlier build cannot read: it
+refuses to start on that store. No store of such a build is in use, so no rollback is
+supported. To run an earlier build, start over:
+
+- Declare a new database on a new, empty control store.
+- Give every node a new, empty folder. Keeping the node folders while changing only the
+  control store is refused (`Mismatch`): the folders belong to the old database.
+- The old data is not carried over.
+- Keep the old folders and the old store intact; do not delete them.
+
+Never hand-edit a record in a live store.
 
 **Try it.** `rdb_node` prints each event as
 `rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
-`admin route G` prints `route group G partition P owner node N token G.E`.
+`admin route G` prints `route group G partition P owner node N token G.E addr ADDRESS`
+(`addr none` when the owner's record holds no address, or when no read of that owner's
+address has succeeded yet in this `Db`, so `addr none` does not prove that none is recorded). The address is shown with each control character
+and backslash escaped (`\r`, `\n`, `\u{1b}`, `\\`), and each Unicode line separator and bidi
+control as a visible escape (`\u{2028}`, `\u{202e}`), so it stays on one line in its stored
+order;
+`RouteInfo::app_address` still returns the stored bytes.
 
 ## 5. Reopening your folder
 
@@ -1407,7 +1552,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (`[0:0:0:0:0:0:0:1]` gives `::1`, `DB-A.example.` gives `db-a.example`). Two nodes on one
     machine are refused: the same label, or the same host whatever the labels say (two
     spellings of one IP, such as `[::1]` and `[0:0:0:0:0:0:0:1]`, are one host).
-  - An address must be one a peer can dial, since a record is never rewritten. The port is 1
+  - An address must be one a peer can dial, since a node's declared address and machine are
+    never rewritten (only the node's own app address can change, at its open: see `route`
+    below). The port is 1
     to 65535. The host is one of:
     - a four-octet IPv4 address, or an IPv6 address in brackets, that is not unspecified,
       broadcast or multicast;

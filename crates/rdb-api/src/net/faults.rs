@@ -23,8 +23,10 @@
 //!   dial; a refused dial through the dial loop's `net_dial_failed{reason}` with reason
 //!   `fault refuse-links: ...`, once until its reason changes.
 //!
-//! Every client call is logged `net_client_request{n, client, request}`, so a discovery run
-//! maps `N` to a request before a fault run names it. Blank lines and `#` comments are
+//! Every client call is logged `net_client_request{n, client, request}` at debug under target
+//! `rdb_api::net::request` ([`super::REQUEST_LOG_TARGET`], #158), so a discovery run started
+//! with `RUST_LOG=info,rdb_api::net::request=debug` maps `N` to a request before a fault run
+//! names it. `scripts/local-rdb.sh` starts nodes with that filter. Blank lines and `#` comments are
 //! skipped; any other line is refused by name in the log (`net_fault_line_refused`), never
 //! guessed at.
 
