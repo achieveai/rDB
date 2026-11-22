@@ -12,6 +12,7 @@
 //! * [`control`] — [`control::ControlAdapter`], `ControlEffect` onto a `config_core::ConfigStore`.
 //! * [`admin`] — bootstrap of partition 1 through F1. It never injects `Recovered`.
 //! * [`db`] — [`Db`]: identities, deadlines, compiles and the §5.4 error mapping.
+//! * [`feed`] — the change feed's cursor, pages and resume rule (#87, ADR-rdb-0020).
 //! * [`ownership`] — [`OwnerToken`] and [`Ownership`]: the owner token an app fences its own
 //!   side effects with (#84).
 //!
@@ -39,6 +40,7 @@ pub mod admin;
 pub mod clock;
 pub mod control;
 pub mod db;
+pub mod feed;
 pub mod host;
 pub mod net;
 pub mod ownership;
@@ -51,10 +53,11 @@ mod test_store;
 pub use db::{
     app_request_id, ApiError, AsyncDb, Db, DbConfig, GetOk, Limit, NodeAddresses, NotReady,
     ObjectEntry, ObjectPage, OpenError, PartitionReady, PrefixDeleteError, PutError, PutOk, ReadOk,
-    RestartReason, ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite, StorageOptions,
-    Timeouts, TooLarge, TxnPut, TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_SCOPED_ID,
-    MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE, TENANT,
+    RestartReason, ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite, Source,
+    StorageOptions, Timeouts, TooLarge, TxnPut, TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS,
+    MAX_PAGE, MAX_SCOPED_ID, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE, TENANT,
 };
+pub use feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
 pub use host::{Change, ListEdit, Look, Seen};
 pub use ownership::{
     OwnerToken, Ownership, OwnershipEvent, OwnershipEvents, RouteInfo, DEACTIVATING_LEAD_MILLIS,

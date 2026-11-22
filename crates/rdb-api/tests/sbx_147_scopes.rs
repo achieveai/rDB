@@ -765,7 +765,7 @@ fn sbx_147_p_delete_prefix_splits_documents_by_their_cost() {
 
 /// PR #178 review r1 T3: every write id delete prefix takes is finished, so the ack floor
 /// passes it and the owner frees its dedup slot. With a cap of 3, six maps cost six delete
-/// batches and six unchanged ends, and puts go on afterwards. Cut: `changes` returns
+/// batches and six unchanged ends, and puts go on afterwards. Cut: `put_changes` returns
 /// `compile_and_send`'s answer without `finished`: red, the floor stays at the first delete
 /// and the fourth batch or a later put is OVERLOADED.
 #[config_log::retcd_test]

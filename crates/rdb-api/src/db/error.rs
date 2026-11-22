@@ -64,9 +64,11 @@ pub struct TooLarge {
     pub max: usize,
 }
 
-/// How the detail of an owner fault ([`ApiError::owner_fault`]) starts. It is what marks one on
-/// the wire: an answer that crossed a link is an owner fault when it is `NotWired` and its
-/// detail starts with this ([`ApiError::fault_from_wire`], #134).
+/// How the detail of an owner fault ([`ApiError::owner_fault`], or the host's typed damage)
+/// starts. It is what marks one on the wire: an answer that crossed a link is an owner fault
+/// when it is `NotWired` and its detail starts with this ([`ApiError::fault_from_wire`], #134).
+/// Typed damage keeps its own kind and still gets [`owner_fault_step`] whatever that kind is
+/// ([`ApiError::is_host_fault`], #170 review r4).
 pub(crate) const HOST_FAULT: &str = "host fault: ";
 
 /// How the detail of [`ApiError::host`] starts: a node error that no takeover fixes.
@@ -174,6 +176,39 @@ pub(crate) const QUARANTINED_STEP: &str =
 pub(crate) const DAMAGED_OBJECT_STEP: &str =
     "the object's own stored value is damaged, so delete the whole object with `Change::Clear` \
      (in rdb_dev: `admin clear <object>`), then write it again";
+
+/// The step of a feed read's `CORRUPT_HISTORY` (#87): the cursor's record has another digest
+/// here, or a stored `User` key the call scans does not parse; or the copy's stored history is
+/// missing or damaged (a record unreadable, not decoding, not matching its digest, naming
+/// another seq, or missing between the retained floor and what the copy may serve), or a read
+/// of its floor finds it corrupt, which faults the node, and then only feed replies carry this
+/// step (review r3).
+/// "Write over its key" is a map entry's step, which a feed caller cannot act on.
+pub(crate) const FEED_HISTORY_STEP: &str = "the history at this copy is unreadable from this \
+     cursor: read from another copy (the owner or another member), or rebuild from your own \
+     source";
+
+/// The step of a feed read refused by a copy that holds no current copy of the partition (#87):
+/// left out of the generation `partitions/{p}` names, or never a member. Its rule is
+/// `Definitive`: calling this copy again answers the same until it is a member again, so the
+/// caller switches source rather than retrying here.
+pub(crate) const FEED_OTHER_COPY_STEP: &str = "read from the owner or another member \
+     (`Source::Owner`, or `Source::Node` of a member); calling this copy again will not help \
+     while it holds no current copy";
+
+/// The step of a feed call that a node stopping or stopped could not answer (#170 review r5): a
+/// clean stop's answer to a call parked on its control read. Its rule is `RetryAfterRecovery`:
+/// this node serves again once it has restarted, and another copy can serve now.
+pub(crate) const FEED_STOPPED_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once it has \
+     restarted";
+
+/// The step of a feed call whose link to a node in another process closed before the answer
+/// came (#170 review r7): the node may have read, but a feed call changes nothing. Its rule is
+/// `RetryAfterRecovery`: another copy can serve now, and this node once its link is up again.
+pub(crate) const FEED_LINK_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once its link \
+     is up again";
 
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
@@ -430,6 +465,16 @@ impl ApiError {
         self.retry_after
     }
 
+    /// Whether this is a host fault: the owner's node faulted ([`Self::owner_fault`], or a fault
+    /// that names stored damage, whose detail starts the same way). Retrying at that node will
+    /// not help, whatever the kind and retry rule, but a takeover can; [`Self::next_step`] says
+    /// so (#170 review r4). [`Self::host`]'s errors are not host faults: their detail starts
+    /// `"host error: "` and no takeover fixes them (#134).
+    #[must_use]
+    pub fn is_host_fault(&self) -> bool {
+        self.owner_fault || self.detail.starts_with(HOST_FAULT)
+    }
+
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
     #[must_use]
     pub fn name(&self) -> String {
@@ -464,6 +509,10 @@ impl ApiError {
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
+            || self.detail.ends_with(FEED_HISTORY_STEP)
+            || self.detail.ends_with(FEED_OTHER_COPY_STEP)
+            || self.detail.ends_with(FEED_STOPPED_STEP)
+            || self.detail.ends_with(FEED_LINK_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
             || self.detail.ends_with(PROMOTE_UNANSWERED_STEP)
@@ -477,7 +526,10 @@ impl ApiError {
         {
             return None;
         }
-        if self.retry == RetryRule::NotWired && self.owner_fault {
+        // #170 review r4: every host fault, typed damage included. A damaged node's fault is
+        // not a damaged entry of the caller's (`step_for(CorruptHistory)` says to write over
+        // its key): only a takeover helps, so it gets the owner-fault step whatever its kind.
+        if self.is_host_fault() {
             return Some(owner_fault_step(self.no_mutation));
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))

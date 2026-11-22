@@ -14,7 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
-    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity, Seq,
+    BootId, ClientId, Generation, NodeId, PartitionId, RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
 use rdb_core::contracts::recovery::{CommittedRoot, DurableProof, RecoveryBarrier, RecoveryResult};
@@ -363,7 +363,111 @@ fn calls() -> Vec<ClientCall> {
         },
         give_up_live_copy: true,
     });
+    // Issue #87: a feed call, its cursor's three parts and its cap carried.
+    calls.push(ClientCall::Changes {
+        identity: identity(4, 36),
+        from: feed_cursor(7),
+        max: 12,
+    });
     calls
+}
+
+/// A feed cursor with every part set: stamp 3, seq `seq`, a digest of `seq` bytes.
+fn feed_cursor(seq: u64) -> crate::feed::FeedCursor {
+    crate::feed::FeedCursor {
+        generation: Generation(3),
+        seq: Seq(seq),
+        digest: Digest([seq as u8; 32]),
+    }
+}
+
+/// Every [`crate::feed::FeedPage`] kind: records with a write and a delete in two groups, and
+/// each answer that is not records.
+fn feed_pages() -> Vec<crate::feed::FeedPage> {
+    use crate::feed::{FeedPage, FeedRecord, FeedWrite};
+    use rdb_core::contracts::ids::AffinityId;
+    vec![
+        FeedPage::Records {
+            records: vec![
+                FeedRecord {
+                    at: feed_cursor(5),
+                    request: identity(2, 9),
+                    writes: vec![
+                        FeedWrite {
+                            group: AffinityId(1),
+                            object: Bytes::from_static(b"a\0b"),
+                            key: Bytes::from_static(b"key-a"),
+                            value: Some(Bytes::from_static(b"sealed")),
+                        },
+                        FeedWrite {
+                            group: AffinityId(4),
+                            object: Bytes::from_static(b"c"),
+                            key: Bytes::from_static(b"key-c"),
+                            value: None,
+                        },
+                    ],
+                },
+                FeedRecord {
+                    at: feed_cursor(6),
+                    request: identity(2, 10),
+                    writes: Vec::new(),
+                },
+            ],
+            next: feed_cursor(8),
+            more: true,
+        },
+        FeedPage::Records {
+            records: Vec::new(),
+            next: crate::feed::FeedCursor::START,
+            more: false,
+        },
+        FeedPage::Behind { head: Seq(4) },
+        FeedPage::Trimmed { floor: Seq(2) },
+        FeedPage::Rewound { to: feed_cursor(3) },
+    ]
+}
+
+/// Issue #87 slice 2: a feed page names its records' format, and a page of a format this build
+/// does not read lands as `INCOMPATIBLE_VERSION` naming both formats, never as records read in
+/// the wrong shape. Format 1 lands as the page it was.
+/// Cut: `FeedPage::try_from` skips the format check, red (the page lands as records).
+/// Unit (~1 ms): encode and decode only.
+#[test]
+fn f87_2_a_feed_page_of_another_record_format_is_refused_incompatible_version() {
+    for page in feed_pages() {
+        let WireAnswer::Changes(mut wired) = WireAnswer::carry(&Answer::Changes(page.clone()))
+        else {
+            panic!("a feed page is carried as a feed page");
+        };
+        assert_eq!(wired.format, wire::FEED_RECORD_FORMAT);
+        assert_eq!(wired.format, 1, "format 1 is physical writes");
+        let same = WireAnswer::Changes(wired.clone()).land();
+        assert_eq!(format!("{same:?}"), format!("{:?}", Answer::Changes(page)));
+        wired.format = 2;
+        let bytes = wire::encode(&Frame::Reply {
+            correlation: 1,
+            reply: WireReply::Answer(WireAnswer::Changes(wired)),
+        });
+        let Ok(Frame::Reply {
+            reply: WireReply::Answer(back),
+            ..
+        }) = wire::decode(&bytes)
+        else {
+            panic!("a format-2 page still decodes as a reply");
+        };
+        match back.land() {
+            Answer::Error { error, request } => {
+                assert_eq!(
+                    error.kind,
+                    rdb_core::contracts::errors::ErrorKind::IncompatibleVersion
+                );
+                assert!(error.to_string().contains("format 2"), "{error}");
+                assert!(error.to_string().contains("format 1 only"), "{error}");
+                assert_eq!(request, None);
+            }
+            other => panic!("a format-2 page landed as {other:?}"),
+        }
+    }
 }
 
 /// Every answer shape a node sends back: each `Seen`, and an error with a retry hint.
@@ -478,6 +582,9 @@ fn answers() -> Vec<Answer> {
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::TailForgotten("forget-tail: partition 1 re-plans from generation 4".to_owned()),
         Answer::Durable,
+    ]);
+    answers.extend(feed_pages().into_iter().map(Answer::Changes));
+    answers.extend([
         Answer::Moved(MoveAnswer {
             done: true,
             line: "already moved: node 3 to node 4".to_owned(),
@@ -638,6 +745,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             correlation: zero(),
             emitter: NodeId(2),
             not_before: zero(),
+            owner_live_readd: true,
         },
     ];
     for msg in plain {
@@ -725,6 +833,28 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         request: None,
     });
     assert_eq!(index(&error), 5);
+    // Issue #87: the feed's call and answer went last, after #105's.
+    let forgotten = WireAnswer::carry(&Answer::TailForgotten(String::new()));
+    assert_eq!(index(&forgotten), 9);
+    let page = WireAnswer::carry(&Answer::Changes(crate::feed::FeedPage::Behind {
+        head: Seq(1),
+    }));
+    assert_eq!(index(&page), 10);
+    let call = wire::WireCall::try_from(&ClientCall::Changes {
+        identity: identity(1, 1),
+        from: crate::feed::FeedCursor::START,
+        max: 1,
+    })
+    .expect("a feed call crosses");
+    let forget = wire::WireCall::ForgetTail {
+        identity: identity(1, 2),
+        through: None,
+        no_intact_copy: false,
+        give_up_live_copy: false,
+    };
+    let call_index = |call: &wire::WireCall| postcard::to_stdvec(call).expect("encodes")[0];
+    assert_eq!(call_index(&forget), 9);
+    assert_eq!(call_index(&call), 10);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
@@ -1797,6 +1927,7 @@ fn a_sender_is_held_to_its_certificate_label() {
         correlation: zero(),
         emitter: NodeId(2),
         not_before: zero(),
+        owner_live_readd: true,
     });
     for peer in [
         on_wire(frame_from(2)),
@@ -1909,6 +2040,71 @@ fn pr74_r3_the_admin_list_names_who_may_move_not_the_name_admin() {
     }
 }
 
+/// #170 review (owner ruling 2026-11-20, fail closed): a change feed call passes only from an
+/// app on the admin list, or from a node, whatever tenant it names; any other app is refused
+/// with the reason naming #151, for its own tenant and for another. Other calls from that app
+/// are untouched. Round 3: membership of the configured list decides, not the name: `ops`
+/// passes under an ops-only list, and `admin` is refused under that list and under an empty one.
+/// Cuts: no `Changes` arm in `sender_refused`, red (app `gw` passes); the arm's guard
+/// `!admin_apps.contains(app)` as `app != "admin"`, red (`ops` refused, `admin` passes).
+/// Unit.
+#[test]
+fn f87_2_r2_only_an_admin_app_may_read_the_change_feed() {
+    let changes = |tenant: u32| WireMsg::Client {
+        to: NodeId(2),
+        partition: PartitionId(1),
+        call: wire::WireCall::Changes {
+            identity: RequestIdentity {
+                tenant: TenantId(tenant),
+                ..identity(1, 1)
+            },
+            from: crate::feed::FeedCursor::START.into(),
+            max: 10,
+        },
+        reply: 1,
+    };
+    let admin = Label::App("admin".to_owned());
+    let gw = Label::App("gw".to_owned());
+    let node1 = Label::Node(NodeId(1));
+    for tenant in [1, 2] {
+        let msg = changes(tenant);
+        assert_eq!(super::sender_refused(&admin, &msg, &admin_apps()), None);
+        assert_eq!(super::sender_refused(&node1, &msg, &BTreeSet::new()), None);
+        let reason = super::sender_refused(&gw, &msg, &admin_apps()).expect("gw refused");
+        assert!(
+            reason.contains("app gw may not read the change feed on node 2")
+                && reason.contains("needs the admin certificate")
+                && reason.contains("(#151)"),
+            "{reason}"
+        );
+    }
+    // Round 3 (r3 blocker 1, r4): membership of the configured list decides, not the name
+    // `admin`. A configured non-default admin reads; `admin` left off that list, or off an
+    // empty list, is refused.
+    let ops = Label::App("ops".to_owned());
+    let ops_only = BTreeSet::from(["ops".to_owned()]);
+    let msg = changes(1);
+    assert_eq!(super::sender_refused(&ops, &msg, &ops_only), None);
+    for (list, which) in [(&ops_only, "ops-only"), (&BTreeSet::new(), "empty")] {
+        let reason = super::sender_refused(&admin, &msg, list)
+            .unwrap_or_else(|| panic!("admin read the feed under the {which} list"));
+        assert!(
+            reason.contains("app admin may not read the change feed on node 2"),
+            "{which}: {reason}"
+        );
+    }
+    let status = WireMsg::Client {
+        to: NodeId(2),
+        partition: PartitionId(1),
+        call: wire::WireCall::Status {
+            identity: identity(1, 1),
+            generation: None,
+        },
+        reply: 1,
+    };
+    assert_eq!(super::sender_refused(&gw, &status, &admin_apps()), None);
+}
+
 /// The reason node 1's dialler holds for node `to`, once it is refused. Polls until the link is
 /// refused or up, within 3 s scaled by `RETCD_TEST_DEADLINE_SCALE`: under load the handshake
 /// alone took longer than a fixed 3 s (A-R257), and the row read `Waiting(None)` as a fault.
@@ -1994,6 +2190,34 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     assert_eq!(
         reason,
         format!("node-2 speaks protocol_version 3, node-1 speaks {PROTOCOL_VERSION}")
+    );
+}
+
+/// Issue #107 slice 2b: a build one protocol_version behind this one is refused at the
+/// handshake naming both versions. Written when that was 9, which may lack check B and the
+/// refusal mark (ADR-rdb-0009 section 7) and cannot read `WireMsg::Landed::owner_live_readd`,
+/// so it never links, and an owner's live re-add never probes it. Both versions are read from
+/// `PROTOCOL_VERSION`, so the bump at merge keeps this row (lead rule, 2026-11-21).
+/// Cut: the peer at `PROTOCOL_VERSION` → the link comes up.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_peer_one_protocol_version_behind_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let older = Spec {
+        version: PROTOCOL_VERSION - 1,
+        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(
+        reason,
+        format!(
+            "node-2 speaks protocol_version {}, node-1 speaks {PROTOCOL_VERSION}",
+            PROTOCOL_VERSION - 1
+        )
     );
 }
 
@@ -2953,6 +3177,63 @@ async fn row_13f_a_link_held_on_both_ends_outlives_the_silence_limit() {
     assert!(closed.is_empty(), "a hold is a delay: {closed:?}");
 }
 
+/// #107 slice 2b manual walk: `mute` holds a link down, as a stopped process does. Node 2 dials
+/// node 1. Once node `muted` goes mute, the link closes on silence (`PROBE_SILENCE`), and it
+/// then stays down for longer than the shortest `unreachable_drop_after` a node accepts
+/// ([`crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS`]), so the owner's unreachable clock can
+/// fire. Both ends: a muted dialler (2) dials nobody, and a muted listener (1) answers no
+/// handshake. Before the fix the handshake ran while muted and the link was back in ~100 ms.
+/// Cuts: drop the dial loop's `unmuted` wait, red (case 2); answer a hello while muted, red
+/// (case 1).
+/// Integration (~9 s): the silence limit, then the watch; the two cases run at once.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue107_a_muted_node_keeps_its_link_down_past_the_drop_clock() {
+    async fn case(muted: u32) {
+        let dir = config_testkit::fs::temp_dir();
+        certs_for(dir.path(), &[1, 2]);
+        let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+        let addr = one.net.addr().expect("listening");
+        let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+        one.net
+            .wait_up(&[NodeId(2)], PATIENCE)
+            .await
+            .expect("the link comes up");
+        // The side that is not muted watches the link, as the owner's drop clock does.
+        let (silent, watcher, peer) = if muted == 1 {
+            (&one, &two, NodeId(1))
+        } else {
+            (&two, &one, NodeId(2))
+        };
+        silent.faults.apply("mute\n");
+        let up = |side: &Side| matches!(side.net.states().get(&peer), Some(LinkState::Up(_)));
+        let patience = crate::host::test_patience(super::PROBE_SILENCE + PATIENCE);
+        let deadline = tokio::time::Instant::now() + patience;
+        while up(watcher) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {muted} muted: the link never closed within {patience:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let hold = Duration::from_millis(crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS + 500);
+        let until = tokio::time::Instant::now() + hold;
+        while tokio::time::Instant::now() < until {
+            assert!(
+                !up(watcher),
+                "node {muted} muted: the link came back up while muted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        silent.faults.apply("");
+        watcher
+            .net
+            .wait_up(&[peer], crate::host::test_patience(PATIENCE))
+            .await
+            .expect("the link comes back once the mute lifts");
+    }
+    tokio::join!(case(1), case(2));
+}
+
 /// PR #103 review: a hold on one end only, longer than `PROBE_SILENCE`, is still a delay. Node
 /// 1 holds node 2; node 2 holds nothing, so its silence timer runs. An `Inspect` node 2 sends
 /// waits in node 1's hold past the silence limit, is delivered when the hold lifts, and is
@@ -3240,6 +3521,242 @@ async fn an_accepted_socket_has_nodelay_set() {
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
     );
+}
+
+/// Issue #87 slice 2, design S-D from any host: an app that holds no copy, linked over mutual
+/// TLS as `admin` (on the nodes' admin apps), reads node 2's feed through `Db::changes` with
+/// `Source::Node(2)`. Node 2 is a secondary in another process. It answers the owner's puts in
+/// order, with their object ids and request ids; a refusal is `UNAVAILABLE` claiming no
+/// mutation. Node 4, a spare process that holds no copy, answers `UNAVAILABLE` with rule
+/// `Definitive` and the step to read another copy, claiming no mutation.
+/// #170 review (owner ruling 2026-11-20, fail closed): `admin` is served for tenant 2 as well
+/// (empty pages past every record: tenant 2 wrote nothing). App `gw`, linked the same way but
+/// not on the admin apps, is refused `INVALID_ARGUMENT` with no mutation and the reason naming
+/// #151, for tenant 1 and tenant 2, from node 2 and from the owner.
+/// Cut: no `Changes` arm in `sender_refused`, red (`gw` is served).
+/// Integration (~10 s): a formation, four node opens, the app's open, real TLS on loopback.
+#[config_log::retcd_test]
+fn f87_2_an_app_tails_a_secondary_in_another_process_over_links() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    let certs_dir = dir.path().join("certs");
+    let app_label = Label::App("admin".to_owned());
+    let gw_label = Label::App("gw".to_owned());
+    let mut labels: Vec<Label> = (1..=4).map(|n| Label::Node(NodeId(n))).collect();
+    labels.push(app_label.clone());
+    labels.push(gw_label.clone());
+    certs::generate(&certs_dir, &labels).expect("certs generate");
+    let data = dir.path().join("db");
+    let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    {
+        let mut formed = rt
+            .block_on(crate::db::Db::open(
+                db_config(&data),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("formation opens");
+        formed.wait_ready(patience).expect("formation is ready");
+        formed.shutdown();
+    }
+
+    const PEERS: [u32; 4] = [1, 2, 3, 4];
+    let mut listeners: BTreeMap<NodeId, tokio::net::TcpListener> = BTreeMap::new();
+    let mut addrs = BTreeMap::new();
+    for node in PEERS {
+        let (listener, addr) = rt.block_on(config_testkit::ports::ephemeral_listener());
+        listeners.insert(NodeId(node), listener);
+        addrs.insert(NodeId(node), addr.to_string());
+    }
+    let start = |node: u32, listener: tokio::net::TcpListener| {
+        node_process(&rt, &data, &certs_dir, &store, node, listener, &addrs)
+    };
+    let mut four = start(4, listeners.remove(&NodeId(4)).expect("a listener"));
+    let mut three = start(3, listeners.remove(&NodeId(3)).expect("a listener"));
+    let mut two = start(2, listeners.remove(&NodeId(2)).expect("a listener"));
+    let mut one = start(1, listeners.remove(&NodeId(1)).expect("a listener"));
+    one.db
+        .wait_ready(patience)
+        .expect("node 1's process is ready");
+    let puts: Vec<crate::db::PutOk> = [b"x", b"y", b"z"]
+        .iter()
+        .map(|object| one.db.put(*object, b"v", None).expect("a put on node 1"))
+        .collect();
+    let last = puts.last().expect("three puts").seq;
+
+    let app_dirs = [
+        config_testkit::fs::temp_dir(),
+        config_testkit::fs::temp_dir(),
+    ];
+    let open_app = |label: &Label, client: u32, app_dir: &std::path::Path| {
+        let app_links = Links::new();
+        let app_net = {
+            let _entered = rt.enter();
+            Net::start(
+                NetConfig {
+                    label: label.clone(),
+                    boot: BootId(0),
+                    tls: certs::load(&certs_dir, label).expect("app certs"),
+                    peers: PEERS.iter().map(|n| NodeId(*n)).collect(),
+                    dial: addrs.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    faults: Faults::new(),
+                    admin_apps: BTreeSet::new(),
+                },
+                &app_links,
+                None,
+            )
+            .expect("the app's net starts")
+        };
+        let up: Vec<NodeId> = PEERS.map(NodeId).to_vec();
+        rt.block_on(app_net.wait_up(&up, patience))
+            .expect("the app links every node");
+        let app = rt
+            .block_on(crate::db::Db::open(
+                crate::db::DbConfig {
+                    local: Vec::new(),
+                    links: Some(app_links),
+                    client: ClientId(client),
+                    ..db_config(app_dir)
+                },
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("the app-only open");
+        (app_net, app)
+    };
+    let (app_net, mut app) = open_app(&app_label, 9, app_dirs[0].path());
+    let (gw_net, mut gw) = open_app(&gw_label, 10, app_dirs[1].path());
+
+    let (mut records, mut at) = (Vec::new(), crate::feed::FeedCursor::START);
+    let (mut refused, deadline) = (0, std::time::Instant::now() + patience);
+    while at.seq < last {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2's feed never reached {last:?} from the app: at {at:?}, {refused} refused"
+        );
+        match app.changes(PartitionId(1), at, 256, crate::db::Source::Node(NodeId(2))) {
+            Ok(crate::feed::FeedPage::Records {
+                records: page,
+                next,
+                ..
+            }) => {
+                records.extend(page);
+                at = next;
+            }
+            Ok(other) => panic!("node 2 answered the app {other:?}"),
+            Err(error) if error.kind == rdb_core::contracts::errors::ErrorKind::Unavailable => {
+                assert!(error.no_mutation, "{error:?}");
+                refused += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("node 2 refused the app: {error:?}"),
+        }
+    }
+    let seqs: Vec<Seq> = records.iter().map(|record| record.at.seq).collect();
+    assert_eq!(seqs, puts.iter().map(|put| put.seq).collect::<Vec<_>>());
+    for (record, put) in records.iter().zip(&puts) {
+        assert_eq!(record.request.request, put.request, "{record:?}");
+        assert_eq!(record.at.generation, put.generation, "{record:?}");
+    }
+    let objects: Vec<&[u8]> = records
+        .iter()
+        .flat_map(|record| record.writes.iter().map(|write| write.object.as_ref()))
+        .collect();
+    assert_eq!(objects, [b"x".as_slice(), b"y", b"z"]);
+
+    // #170 review: the admin app is served for another tenant too; tenant 2 wrote nothing.
+    let deadline = std::time::Instant::now() + patience;
+    let mut at = crate::feed::FeedCursor::START;
+    while at.seq < last {
+        assert!(std::time::Instant::now() < deadline, "tenant 2 at {at:?}");
+        match app.changes_as(
+            TenantId(2),
+            PartitionId(1),
+            at,
+            256,
+            crate::db::Source::Node(NodeId(2)),
+        ) {
+            Ok(crate::feed::FeedPage::Records { records, next, .. }) => {
+                assert!(records.is_empty(), "tenant 2 sees {records:?}");
+                at = next;
+            }
+            Ok(other) => panic!("node 2 answered admin for tenant 2: {other:?}"),
+            Err(error) if error.kind == rdb_core::contracts::errors::ErrorKind::Unavailable => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("node 2 refused admin for tenant 2: {error:?}"),
+        }
+    }
+    // An app not on the admin apps is refused, for its own tenant and another, whichever copy.
+    for tenant in [1, 2] {
+        for source in [crate::db::Source::Node(NodeId(2)), crate::db::Source::Owner] {
+            let error = gw
+                .changes_as(
+                    TenantId(tenant),
+                    PartitionId(1),
+                    crate::feed::FeedCursor::START,
+                    256,
+                    source,
+                )
+                .expect_err("gw is not an admin app");
+            assert_eq!(
+                (error.kind, error.no_mutation),
+                (
+                    rdb_core::contracts::errors::ErrorKind::InvalidArgument,
+                    true
+                ),
+                "tenant {tenant} from {source:?}: {error:?}"
+            );
+            assert!(
+                error.detail.contains("app gw may not read the change feed")
+                    && error.detail.contains("(#151)"),
+                "{error:?}"
+            );
+        }
+    }
+
+    let error = app
+        .changes(
+            PartitionId(1),
+            crate::feed::FeedCursor::START,
+            256,
+            crate::db::Source::Node(NodeId(4)),
+        )
+        .expect_err("node 4 holds no copy");
+    assert_eq!(
+        error.kind,
+        rdb_core::contracts::errors::ErrorKind::Unavailable,
+        "{error:?}"
+    );
+    assert!(error.no_mutation, "{error:?}");
+    assert!(error.to_string().contains("node 4"), "{error}");
+    // Definitive over the wire too: the app switches source rather than calling node 4 again.
+    assert_eq!(
+        error.retry,
+        rdb_core::contracts::errors::RetryRule::Definitive,
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read from the owner or another member"),
+        "{error}"
+    );
+
+    app.shutdown();
+    gw.shutdown();
+    drop(app_net);
+    drop(gw_net);
+    four.db.shutdown();
+    three.db.shutdown();
+    two.db.shutdown();
+    one.db.shutdown();
 }
 
 /// `Net::shutdown` rows (#81, PR #171 review): node 1's `Net` with no sockets and a route to

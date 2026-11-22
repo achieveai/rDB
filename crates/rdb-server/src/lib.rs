@@ -179,15 +179,23 @@ pub const fn wire_retry(rule: RetryRule) -> pb::RetryRule {
 /// `error`'s text for an app on the wire: `NAME (detail; next: step)`, with the step from
 /// [`wire_step`] in place of the embedded API's, which names Rust calls (`Db::status`,
 /// `Db::resend`) an app in another language has not got. When the detail already ends with its
-/// own step ([`ApiError::next_step`] is `None`), the text is `error`'s `Display` unchanged.
+/// own step ([`ApiError::next_step`] is `None`), the text is `error`'s `Display` unchanged. A
+/// host fault ([`ApiError::is_host_fault`]) takes the `NotWired` step whatever its kind.
 #[must_use]
 pub fn wire_message(error: &ApiError) -> String {
+    // #170 review r4: a host fault takes the `NotWired` step whatever its kind and retry rule, as
+    // `ApiError::next_step` does: typed damage at the node is not the app's to repair.
+    let retry = if error.is_host_fault() {
+        RetryRule::NotWired
+    } else {
+        error.retry
+    };
     match error.next_step() {
         Some(_) => format!(
             "{} ({}; next: {})",
             error.name(),
             error.detail,
-            wire_step(error.kind, error.retry, error.no_mutation)
+            wire_step(error.kind, retry, error.no_mutation)
         ),
         None => error.to_string(),
     }

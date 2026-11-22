@@ -1340,8 +1340,8 @@ on (below).
 
 **`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
 it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
-its own, both as an owner (to re-add a copy it dropped) and as a returning copy (to mark a
-landing it refused, see below). With it on, a copy the owner dropped on one of the two clocks
+its own, as an owner, to re-add a copy it dropped. A returning copy follows the setting of the
+owner that re-adds it, not its own (see below). With it on, a copy the owner dropped on one of the two clocks
 above comes back by itself once its link is back:
 
 - **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
@@ -1357,23 +1357,29 @@ above comes back by itself once its link is back:
   again once that clears. A copy that does not answer (`live_readd_unanswered`), answers with a
   fault, or is not taken (`live_readd_not_planned`) waits another 5 s. Each drop gets one
   re-add: if that re-add fails, the copy stays out until its node restarts.
+- **A standby that never becomes a full copy.** If the re-added standby is still not a full
+  copy 30 min after it was added back, or 3 attempts to make it one fail, the owner gives it
+  up. It logs `live_readd_shadow_unpromoted` (warn) once, naming the copy (`shadow`), how long
+  it waited (`held_ms`), the failed attempts (`blocks`), how far it got (`acked`) and why
+  (`reason`: `clock` or `blocks`). The copy stays out until its node restarts.
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. A build without it can speak the same wire version, so nothing
-  refuses the pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
-  older build. The re-add itself needs a partition that takes writes. But if the partition goes
-  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
-  and the partition can then stay read-only until that copy's node restarts. A build older than
-  check B can also be left holding a lineage with a hole in it, which nothing refuses
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (11 at this commit;
+  set at merge), whether or not this setting is on. A build older than 10 speaks 9, even one
+  that has this setting, and the two refuse each other when they connect, each logging
+  `net_handshake_refused` with both versions. So an older node is never added back live, and it cannot link at all. The
+  same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
+  10. To upgrade (to 10, or to 11): stop every node and every app process that links to them, upgrade
+  them all, start the nodes, then the apps. A rolling upgrade, with processes at different
+  versions, does not link.
+- **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
+  whose node has the setting off is still protected when an owner with it on adds it back. A
+  copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
+  the same on every node anyway, so a partition behaves the same whichever node owns it
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Some builds without these guards speak the same protocol
-  version as builds with them (main at 1eb3fe0 has neither), and the version alone cannot tell
-  them apart. Each merge that changes a wire type sets the next version in its merge commit.
-  Turning it on by default first needs a protocol bump that no such build shares, or a
-  capability bit that gates the re-add, so a node without these guards is refused or never re-added live
-  (ADR-rdb-0009 section 7). Until then it stays off by default.
+- **Default off.** The wire guard is now in place. The setting still stays off by default
+  until the 512-partition acceptance run passes.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1644,8 +1650,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol version is the one its merge commit sets
-  (`PROTOCOL_VERSION`), and the handshake refuses any other version.
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (11 at this commit; set
+  at merge; issues #107, #87, #147 and #148), and the handshake
+  refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
@@ -1877,3 +1884,149 @@ docker run --rm rdb-bf-node:dev help
   IP.
 - The build needs `build-essential` and `libclang-dev` in the builder stage and sets no
   `LIBCLANG_PATH`. See `docker/README.md` for a worked run.
+
+## 9. Change feed (read every committed change, in order)
+
+`Db::changes` lets your app read one partition's committed transactions in order. It works from
+any host: a node in your process, or one over the links, from an app that holds no copy as well as
+from a node. **Over the links only an admin app may call it** (`rdb_node --admin-apps`,
+`NetConfig::admin_apps`; `lr` runs as `admin`) until tenants are bound to certificates (#151); see
+"Tenants" below. In the process that runs the nodes, any `Db` may. Every write of the call's
+tenant comes back; a key-prefix filter is not offered yet.
+
+Each write is physical: the stored key, with its group and object id parsed out, and the stored
+value bytes. `FeedWrite.value` is `Some(bytes)`, the stored after-image, when the write stored a
+value, and `None` when it deleted that stored key: remove that one key from your destination;
+there is nothing to decode. A physical delete removes one stored key, not necessarily the whole
+object, which may keep other keys. Decode a value with `rdb-value`: `envelope::open`, then
+`cbor::decode` the payload. A `Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
+not read that format is answered `INCOMPATIBLE_VERSION` (upgrade the client) rather than misreading
+it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]` (over the links it
+runs as app `admin` by default).
+
+Two uses it is built for:
+
+- **Warm standby.** A process beside a secondary tails that node's copy (`Source::Node(n)`) and
+  lays the partition's files out from the journal as it goes, so a standby is ready without
+  asking the owner for anything.
+- **The compactor.** It reads the feed into packs and uploads each pack once it is durable (see
+  "Lasting effects" below).
+
+```rust
+use rdb_api::{FeedCursor, FeedPage, Source};
+
+let mut cursor = FeedCursor::START; // or the cursor you stored last time
+loop {
+    match db.changes(partition, cursor, 256, Source::Owner)? {
+        FeedPage::Records { records, next, more } => {
+            for record in &records {
+                apply_somewhere(record); // record.writes: group, object, key, value
+            }
+            store_with_your_effects(next); // the cursor, in the same write as the effect
+            cursor = next;
+            if !more {
+                std::thread::sleep(poll_interval); // nothing new yet
+            }
+        }
+        FeedPage::Behind { .. } => std::thread::sleep(poll_interval), // keep the cursor
+        FeedPage::Trimmed { .. } => ask_another_copy_or_rebuild(),
+        FeedPage::Rewound { to } => {
+            retract_everything_above(to.seq); // rDB lost those records
+            cursor = to;
+        }
+    }
+}
+```
+
+- **The cursor.** A `FeedCursor` is the last record you applied: the generation stamped in its
+  header, its `seq` and its digest. Store it with your effect, in one write, and pass it back
+  unchanged. `FeedCursor::START` reads from the first record.
+- **The answers.**
+  - `Records`: whole records after the cursor, and `next`. A page returns at most `max`
+    records (your argument, itself at most 256) and 4 MiB of them, but always at least one
+    when one is due. Apart from that, a call examines at most 1024 records, counting the
+    records it skips (other tenants' writes), and stops once the record bytes it has examined
+    reach 8 MiB. It checks that before each read, so its last read can pass 8 MiB by one
+    whole record. With `more` set, one of those caps stopped the page: call again at once
+    from `next`. `next` is after the last record returned or skipped; a record left out
+    because it would pass 4 MiB comes first on the next call. A page with no records can
+    still have `more` set and a `next` that moved past skipped records; it is not the end.
+    Only `more` unset means nothing more is held now.
+  - `Behind`: the copy you asked has not got that far yet, or not that generation. Keep the
+    cursor; wait, or ask another copy.
+  - `Trimmed`: the copy does not hold the record you need (`floor` is the lowest it serves).
+    Ask another copy, which may still hold it, or rebuild from your own source. No copy
+    trims its `History` on a schedule yet (#61), but this answer can come today: a copy
+    that does not hold your cursor's record, or the record a cut leaves you at, answers it,
+    and that does not fault the copy. Handle it. (A record missing between the lowest the copy
+    serves and what it may serve, met while paging, is damage instead: see below.)
+  - `Rewound`: **records above `to` are not on this copy's history**, usually because a
+    promote cut records you have already applied. It can also mean the copy cannot place your
+    cursor's generation on its chain; `to` is then `FeedCursor::START`, a longer replay than
+    needed, never a gap. That holds only while the copy still holds seq 1: when its `floor` is
+    above 1 it answers `Trimmed { floor }` instead, since a replay from the start would have a
+    gap. A cursor whose record the copy still holds, at the same stamp and
+    digest, is served instead, even after a later generation linked above it. Undo what you
+    applied above `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB
+    has lost.
+  - `CORRUPT_HISTORY` error: this copy holds your cursor's position with another digest
+    (the cursor may come from another partition, the copies may have diverged, or the record
+    may be damaged), or a stored key in any record the call scans does not parse (keys are
+    parsed before the tenant filter, so another tenant's record counts too); or the copy's
+    stored history is damaged (a record unreadable, misplaced, not matching its digest, or
+    missing below what it serves), and then that node stops serving and every call to it
+    hears the fault. The history at this copy is unreadable from this cursor: read from
+    another copy (the owner or another member), or rebuild from your own source, and report
+    it. Only a feed reply says that; a put, a get or a status read at that node hears the
+    owner-fault step (ask the write's status once another node takes over). The fault names
+    the record's seq, never its digests: those are only in that node's local log line
+    `feed_record_digest_mismatch`.
+- **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
+  reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
+  applied, which can be ahead of the owner's published position.
+- **The secondary's bound (R2).** A secondary serves only while its own read of
+  `partitions/{p}` in rEtcd began within the grant (`grant_millis`, 6 s by default), names the
+  generation it holds and pins it as a regular copy. Cut off from rEtcd, it stops within about
+  one grant, even while its old owner still talks to it. A call that finds no read within the
+  grant starts one and waits for it, up to half a second, so a consumer that polls less often
+  than once a grant is still served; only if rEtcd does not answer in that time is it refused
+  `UNAVAILABLE`: call again. A shadow, or a copy still landing a new generation, answers
+  `UNAVAILABLE` too: call again.
+- **A copy that holds no current copy says so, for good.** A node that `partitions/{p}` leaves
+  out (dropped while it was cut off from the owner, say) or that never held the partition
+  answers `UNAVAILABLE` with rule `Definitive`, naming the generation that left it out and the
+  owner: "read from the owner or another member". Switch source; calling that node again
+  answers the same until it is a member again. An owner whose grant does not admit refuses
+  as a write's admission would, usually `LEASE_EXPIRED`, with no hint naming the new owner.
+  Right after a promote the new owner answers `LEASE_EXPIRED` until it holds its grant: call
+  again. An old owner the promote left out keeps answering so: on that answer, `Source::Owner`
+  re-reads who owns the partition for the next call only, so call again and that call reaches
+  the new owner; with `Source::Node` of the old owner, switch to `Source::Owner` or another
+  copy.
+- **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
+  may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
+  undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last
+  record before uploading it.
+- **One feed per partition.** A feed is one partition's order. Reading several partitions means
+  one cursor each, and there is no order between them.
+- **Tenants (Q3).** The feed returns only the writes of the call's tenant, the tenant of its
+  identity, as every other call uses. A record with none of them is skipped, and `next` still
+  moves past it. **Over the wire a tenant is asserted by the caller, not proved** (#151 tracks
+  binding it to a certificate). So, by the owner's ruling of 2026-11-20, a node fails closed:
+  it serves the feed over the links only to another node or an admin app, which may read every
+  tenant. Any other app is refused `INVALID_ARGUMENT` (no mutation) with "the change feed needs
+  the admin certificate until tenants are bound to certificates (#151)", whatever tenant it
+  names. This also keeps a plain app from mapping other tenants' write positions and digests
+  through `next` and cursors. Do not give an app the admin certificate unless it may read every
+  tenant.
+- **A fault shows seq positions to any app.** A failed History read, an undecodable stored
+  record, a record stored under another seq than its own, a stored record that does not match
+  its digest, or a record missing between the retained floor and what the copy may serve faults
+  the node. A malformed User key is different: it is refused to that caller only and faults
+  nothing. The fault names the offending sequence positions, never a digest or a value. The
+  fault is the node's, not one partition's: its status carries the same text whichever
+  partition is asked about. Any authenticated app may read status over the links, by
+  `WireMsg::Inspect`. `Db::node_status()` and `Db::node_status_in(partition)` ask only the nodes
+  this process runs, so in an app-only process they return no nodes. So an app can learn sequence positions in other
+  tenants' history, but no content. That holds until #154 scopes apps to their certificates (owner
+  ruling R-Q3 on #87: the caller's tenant, with this warning).

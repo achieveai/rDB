@@ -116,6 +116,16 @@
 //! put <object> <value> [--if-version N]   write a byte string
 //! barrier [--group G] <generation> <seq> [<timeout-ms>]
 //!                                         `Db::wait_durable` on a put's position
+//! changes <partition> [--from G:S:HEX] [--at N] [--max K]
+//!                                         one page of the change feed (#87) after the
+//!                                         cursor (default the start), from the owner or node
+//!                                         N: `seq= gen= digest= writes=` per record, then
+//!                                         `next=G:S:HEX more=`; or one `behind`, `trimmed`
+//!                                         or `rewound to=G:S:HEX` line. In process or against
+//!                                         a running cluster (`lr do`); `--at N` reaches any
+//!                                         node, in this process or over the links. Over
+//!                                         the links only an admin app may read it (#151);
+//!                                         `lr` runs as `admin`
 //! put --as <n> <object> <value> [--if-version N]
 //!                                         the same put under request id app_request_id(n),
 //!                                         your own number n below 2^63, used once; recorded
@@ -2067,6 +2077,8 @@ fn repl<'scope, 'env>(
                     .map(|ok| bad |= !ok)
             }
             ["barrier", ..] => Err(BARRIER_USAGE.to_owned()),
+            ["changes", partition, rest @ ..] => changes_line(db, partition, rest).map(|ok| bad |= !ok),
+            ["changes", ..] => Err(CHANGES_USAGE.to_owned()),
             ["client", "drop-reply"] => {
                 say(drop_reply_line(drop_reply));
                 drop_reply = true;
@@ -2975,10 +2987,10 @@ fn log_command(line: &str) {
 /// A command's verb as the grammar names it (`put`, `blob upload`, `wait ready`), and the
 /// object it writes or reads, when it names one. A line `split_words` refuses names no object.
 fn command_fields(line: &str) -> (&'static str, Option<String>) {
-    const VERBS: [&str; 28] = [
+    const VERBS: [&str; 29] = [
         "put", "put&", "txn", "txn&", "retry", "doc", "map", "set", "members", "list", "items",
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
-        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier",
+        "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier", "changes",
     ];
     const SUBVERBS: [&str; 28] = [
         "put --as",
@@ -4842,6 +4854,108 @@ fn barrier_line(
                 "durable generation={} seq={} millis={millis}",
                 position.0 .0, position.1 .0
             ));
+            Ok(true)
+        }
+        Err(error) => {
+            say(&format!("err {} ({})", error.name(), error.explain()));
+            Ok(false)
+        }
+    }
+}
+
+const CHANGES_USAGE: &str = "changes <partition> [--from G:S:HEX] [--at N] [--max K]";
+
+/// A cursor as `changes` prints it: `generation:seq:digest-hex`.
+fn cursor_text(cursor: &rdb_api::FeedCursor) -> String {
+    format!(
+        "{}:{}:{}",
+        cursor.generation.0,
+        cursor.seq.0,
+        cursor.digest.to_hex()
+    )
+}
+
+fn parse_cursor(text: &str) -> Result<rdb_api::FeedCursor, String> {
+    let bad = || format!("--from {text:?}: want G:S:HEX, as `next=` prints it");
+    let mut parts = text.split(':');
+    let (Some(generation), Some(seq), Some(digest), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    let digest: [u8; 32] = hex::decode(digest)
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(bad)?;
+    Ok(rdb_api::FeedCursor {
+        generation: rdb_api::Generation(generation.parse().map_err(|_| bad())?),
+        seq: rdb_api::Seq(seq.parse().map_err(|_| bad())?),
+        digest: rdb_core::contracts::digest::Digest(digest),
+    })
+}
+
+/// `changes`: one page of `Db::changes`, printed record by record. `false` when refused.
+/// `changes`'s flags after the partition: the cursor (default `START`), the copy to read
+/// (`--at N`, any node; default the owner) and the most records (default a full page).
+fn changes_args(rest: &[&str]) -> Result<(rdb_api::FeedCursor, rdb_api::Source, u32), String> {
+    let (mut from, mut source, mut max) = (
+        rdb_api::FeedCursor::START,
+        rdb_api::Source::Owner,
+        rdb_api::feed::FEED_PAGE_RECORDS,
+    );
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let value = words.next().ok_or_else(|| CHANGES_USAGE.to_owned())?;
+        match *word {
+            "--from" => from = parse_cursor(value)?,
+            "--at" => source = rdb_api::Source::Node(parse_any_node(value)?),
+            "--max" => max = value.parse().map_err(|_| CHANGES_USAGE.to_owned())?,
+            _ => return Err(CHANGES_USAGE.to_owned()),
+        }
+    }
+    Ok((from, source, max))
+}
+
+fn changes_line(db: &Db, partition: &str, rest: &[&str]) -> Result<bool, String> {
+    let partition = rdb_api::PartitionId(
+        partition
+            .parse()
+            .map_err(|_| format!("{CHANGES_USAGE}: the partition is a number"))?,
+    );
+    let (from, source, max) = changes_args(rest)?;
+    match db.changes(partition, from, max, source) {
+        Ok(rdb_api::FeedPage::Records {
+            records,
+            next,
+            more,
+        }) => {
+            for record in &records {
+                let writes: Vec<String> = record
+                    .writes
+                    .iter()
+                    .map(|write| String::from_utf8_lossy(&write.object).into_owned())
+                    .collect();
+                say(&format!(
+                    "seq={} gen={} digest={} writes={}",
+                    record.at.seq.0,
+                    record.at.generation.0,
+                    record.at.digest.to_hex(),
+                    writes.join(",")
+                ));
+            }
+            say(&format!("next={} more={more}", cursor_text(&next)));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Behind { head }) => {
+            say(&format!("behind head={}", head.0));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Trimmed { floor }) => {
+            say(&format!("trimmed floor={}", floor.0));
+            Ok(true)
+        }
+        Ok(rdb_api::FeedPage::Rewound { to }) => {
+            say(&format!("rewound to={}", cursor_text(&to)));
             Ok(true)
         }
         Err(error) => {
@@ -9937,6 +10051,57 @@ mod tests {
         };
         let line = put_text(&Ok(ok));
         assert!(line.starts_with("ok p=2 "), "{line}");
+    }
+
+    /// #87 slice 2 (lr walk on a four-node run): `changes --at 4` was refused "a node is 1, 2
+    /// or 3" before any call, so a copy that a move put on node 4 could not be tailed, nor a
+    /// spare asked. `--at` takes any node to `MAX_NODES`; the other flags keep their defaults.
+    /// Cut: `--at` parsed with `parse_node`, red at `--at 4`. Unit.
+    #[test]
+    fn f87_2_changes_at_takes_any_node() {
+        let (from, source, max) = changes_args(&["--at", "4"]).expect("--at 4");
+        assert_eq!(source, rdb_api::Source::Node(NodeId(4)));
+        assert_eq!(from, rdb_api::FeedCursor::START);
+        assert_eq!(max, rdb_api::feed::FEED_PAGE_RECORDS);
+        let max_node = rdb_api::db::MAX_NODES;
+        let at = max_node.to_string();
+        let (_, source, max) = changes_args(&["--max", "2", "--at", &at]).expect("--at max");
+        assert_eq!(source, rdb_api::Source::Node(NodeId(max_node)));
+        assert_eq!(max, 2);
+        let past = (max_node + 1).to_string();
+        for bad in [vec!["--at", "0"], vec!["--at", past.as_str()], vec!["--at"]] {
+            assert!(changes_args(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            changes_args(&[]).expect("no flags").1,
+            rdb_api::Source::Owner
+        );
+    }
+
+    /// #87 review r1: what `changes` prints as `next=` is usable as `--from`. `START` and a full
+    /// cursor round-trip through `cursor_text` and `parse_cursor`; a digest of the wrong hex
+    /// length and a fourth component are refused.
+    /// Cut: `parse_cursor` without its fourth-component check (`None`), red (`1:2:<hex>:9`
+    /// accepted). Unit.
+    #[test]
+    fn f87_2_a_printed_cursor_parses_back() {
+        let full = rdb_api::FeedCursor {
+            generation: rdb_api::Generation(7),
+            seq: rdb_api::Seq(42),
+            digest: rdb_core::contracts::digest::Digest([0xA5; 32]),
+        };
+        for cursor in [rdb_api::FeedCursor::START, full] {
+            let text = cursor_text(&cursor);
+            assert_eq!(parse_cursor(&text), Ok(cursor), "{text}");
+        }
+        let hex = "a5".repeat(32);
+        for bad in [
+            format!("7:42:{}", &hex[..62]),
+            format!("7:42:{hex}00"),
+            format!("7:42:{hex}:9"),
+        ] {
+            assert!(parse_cursor(&bad).is_err(), "{bad}");
+        }
     }
 
     /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a

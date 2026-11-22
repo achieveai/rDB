@@ -54,7 +54,8 @@ pub struct FaultSet {
     /// `cut-control`.
     pub cut_control: bool,
     /// `mute`: every link reads nothing, answers no probe and writes nothing, as a stopped
-    /// process looks from outside (#81: the planner's silence test). Pair it with
+    /// process looks from outside (#81: the planner's silence test). It dials nobody and
+    /// answers no handshake, so a link it closed stays down until the line goes. Pair it with
     /// `cut-control` so the grant stops renewing too.
     pub mute: bool,
 }
