@@ -417,11 +417,11 @@ impl Host {
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
         // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
+        // Written only beside the transfer, after every fallible step below (PR #204 review):
+        // a step that fails leaves no marker, so R1's next ask at this barrier is served.
         if self.snapshots_served.get(&(partition, copy)) == Some(&(generation, barrier)) {
             return;
         }
-        self.snapshots_served
-            .insert((partition, copy), (generation, barrier));
         let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
             return unserved("copy_not_in_config");
         };
@@ -450,6 +450,10 @@ impl Host {
                 return unserved("barrier_read_failed");
             }
         };
+        #[cfg(debug_assertions)]
+        if std::mem::take(&mut self.snapshot_export_fault) {
+            return unserved("view_failed");
+        }
         let view = match self.engine.snapshot(
             partition,
             generation,
@@ -476,6 +480,8 @@ impl Host {
             root,
             barrier: barrier_record,
         };
+        self.snapshots_served
+            .insert((partition, copy), (generation, barrier));
         let replaced = self
             .transfers
             .insert(

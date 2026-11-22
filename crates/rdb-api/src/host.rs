@@ -2909,6 +2909,11 @@ struct Host {
     /// can land writes past `S` first. Rows only.
     #[cfg(debug_assertions)]
     snapshot_offer_held: bool,
+    /// Issue #61 PR #204 review: while set, this source's next export fails once at its view
+    /// read (`snapshot_catchup_unserved{reason = view_failed}`), as a storage fault there would.
+    /// Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_export_fault: bool,
     /// Issue #61 S2-R2b: while set, this source answers no pull for a page at or past this
     /// index (0 is the first), so a row can stop a target mid-install. Rows only.
     #[cfg(debug_assertions)]
@@ -3231,6 +3236,8 @@ impl Host {
             snapshot_chunk_fault: None,
             #[cfg(debug_assertions)]
             snapshot_offer_held: false,
+            #[cfg(debug_assertions)]
+            snapshot_export_fault: false,
             #[cfg(debug_assertions)]
             snapshot_pages_held_from: None,
             committed_correlation: BTreeMap::new(),

@@ -8987,6 +8987,37 @@ fn rebuilt(trio: &mut Trio, method: &str, floor: u64) -> u64 {
     at
 }
 
+/// Issue #61 PR #204 review, the dedup marker: as S2-R1, but node 1's first export fails at its
+/// view read (`snapshot_export_fault`, once), after the barrier check. No write lands, so R1
+/// asks again at the same barrier, and that ask is served: one
+/// `snapshot_catchup_unserved{reason = view_failed}`, then a transfer opened at that same
+/// barrier, and node 3 is rebuilt.
+/// Cut: `snapshots_served` written before the fallible export steps (as at 67d028c), red (the
+/// retry at the same barrier is dropped and no transfer opens).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier() {
+    const METHOD: &str =
+        "t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| host.snapshot_export_fault = true);
+    let three = copy_of(&trio, 3);
+    trio.until("node 3 was rebuilt and released the transfer", |_| {
+        logged!(METHOD, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let unserved = logged!(METHOD, "snapshot_catchup_unserved");
+    assert_eq!(unserved.len(), 1, "{unserved:?}");
+    assert_eq!(unserved[0]["reason"], "view_failed", "{unserved:?}");
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(opened[0]["barrier"], unserved[0]["barrier"], "the same barrier");
+    assert_eq!(logged!(METHOD, "snapshot_transfer_installed").len(), 1);
+}
+
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
 #[cfg(debug_assertions)]
 fn promoted_and_durable(trio: &mut Trio, request: u64) {

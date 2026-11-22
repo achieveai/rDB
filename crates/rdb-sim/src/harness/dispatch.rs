@@ -2084,10 +2084,10 @@ impl Dispatcher {
         }
         // Keyed by generation too (lead ruling R18), as the host's: a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
+        // Written only beside the transfer, after every fallible step below, as the host's.
         if self.snapshots_served.get(&key) == Some(&(generation, barrier)) {
             return Ok(());
         }
-        self.snapshots_served.insert(key, (generation, barrier));
         let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
             return unserved("copy_not_in_config");
         };
@@ -2118,6 +2118,7 @@ impl Dispatcher {
             root,
             barrier: barrier_record,
         };
+        self.snapshots_served.insert(key, (generation, barrier));
         let replaced = self
             .snapshot_transfers
             .insert(
