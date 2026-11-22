@@ -245,6 +245,30 @@ pub trait StateReader: Send + Sync {
     /// What the retained journal currently holds (TA-29).
     fn journal_stats(&self) -> Result<JournalStats, StorageReadError>;
 
+    /// [`StateReader::journal_stats`] and the compaction watermark, for the leader's retention
+    /// tick only (#194). A store may answer both from one copy of its last durable batch, so
+    /// the tick does not wait on the lock its apply path holds across a write.
+    ///
+    /// That copy's watermark can lag a compaction that is still writing. Retention stays
+    /// correct with a lagging floor:
+    ///
+    /// * the target it proposes is at most the copy's `newest_revision`, which is at most the
+    ///   applied revision, and `Compact` clamps to the applied revision anyway, so a stale
+    ///   floor can never compact past what is applied;
+    /// * a target at or below the real floor is a history no-op, with a bounded dedup trim.
+    ///   History does not move (monotonic rule, M4-25). The dedup trim still runs first,
+    ///   because `apply_compact` trims before its monotonic short-circuit. Its watermark,
+    ///   `dedup_trim_below = target + 1`, is at most the real floor + 1, so it is no higher
+    ///   than the trim the next tick proposes from the fresh floor;
+    /// * the stats and the floor come from the same batch, so the tick never pairs new stats
+    ///   with an old floor or the reverse.
+    ///
+    /// Never use it as M4-32's replay witness: that needs [`StateReader::compact_revision`],
+    /// which moves before the deletion lands.
+    fn retention_inputs(&self) -> Result<(JournalStats, u64), StorageReadError> {
+        Ok((self.journal_stats()?, self.compact_revision()?))
+    }
+
     /// Digest of the retained events with `revision > from_exclusive` (TA-31, ruling R1).
     ///
     /// The cross-node journal-equality oracle. Callers compare nodes above a *common* lower
@@ -292,6 +316,23 @@ pub trait StateReader: Send + Sync {
         let mut retired = BTreeSet::new();
         self.with_state(&mut |s| retired = s.retired_nodes().clone());
         retired
+    }
+
+    /// Whether `node_id` is in [`StateReader::retired_nodes`].
+    ///
+    /// Its own method because the peer plane asks it on every inbound call, heartbeats
+    /// included, so a store can answer it without the lock its apply path holds (#186).
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        let mut retired = false;
+        self.with_state(&mut |s| retired = s.is_retired(node_id));
+        retired
+    }
+
+    /// The highest `command_schema` the applied state has ever carried (ADR-0030, M6-R15).
+    fn max_applied_command_schema(&self) -> u16 {
+        let mut schema = config_core::COMMAND_SCHEMA_V1;
+        self.with_state(&mut |s| schema = s.max_applied_command_schema());
+        schema
     }
 
     /// The provenance of a restored data directory, if this one was restored (M5, ADR-0026).

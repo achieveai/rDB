@@ -136,42 +136,79 @@
      it, and no earlier write may still be in flight (below), nothing is written, so a
      restart with the same address changes nothing. Otherwise it puts node layout 2 at the
      revision it read: node, declared address and machine as they are. An open with no app
-     address writes nothing and keeps the stored one. An address cannot be cleared: `None`
-     keeps it, and an empty string is refused. An app address on an undeclared open is
+     address keeps the stored one. It skips the address write only on a settled folder: the
+     node's data exists and the folder holds no pending (`app-addr-pending`) or fence
+     (`app-addr-fence`) debt. On a new, wiped or owed folder (no data yet, or `app-addr-fence`
+     still there) it CASes the record's own bytes at the revision it read (an own-bytes fence,
+     below). An absent record is refused with `OpenError::Config` before the fence (the node
+     is not declared); the fence can be refused with `OpenError::Control` when the record
+     cannot be read, changed after that check, or the fence's outcome is unknown. While
+     `app-addr-pending` is there (an earlier write may still be in flight, below) it is
+     refused with `OpenError::Config`, before any host starts, with the step to open again
+     with the address the node should hold. An address cannot be cleared: `None` keeps it,
+     and an empty string is refused. An app address on an undeclared open is
      refused, and so is `rdb_node --app-addr` with `--form`, `--declare` or `--gen-certs`.
-   - **A changed record refuses the open.** Only the declaration, create-only, also writes the
-     record, so a record that changed between the read and the put means another process
-     claims the node: refused, nothing started, even when the other write holds exactly this
-     open's bytes.
+   - **A changed record refuses the open.** Three writers can change the record between the
+     read and the put: the declaration (create-only), another process that claims the node,
+     and an earlier open of this same node, whose delayed put lands late. The open cannot tell
+     which one wrote, so it refuses, nothing started, even when the other write holds exactly
+     this open's bytes.
    - **The fence (PR #159 review).** A put whose reply is lost may still apply later, at the
      revision it was sent at. Before every put, the open writes a marker file,
-     `app-addr-pending`, holding that revision, into the node process's folder, synced and
-     renamed into place; on Unix its folder is synced too (Windows cannot sync a folder; the
-     rename is still atomic). It removes the marker once the outcome is known: the put applied
+     `app-addr-pending`, holding that revision, into the node process's folder: it writes
+     `app-addr-pending.new`, syncs it and renames it into place; on Unix its folder is synced
+     too (Windows cannot sync a folder; the rename is still atomic). A crash before the rename
+     can leave `app-addr-pending.new` behind; the next put overwrites it. Leave both files
+     alone. It removes the marker once the outcome is known: the put applied
      (or a read back shows its bytes at a newer revision), or the record moved past that
      revision. A lost reply whose read back shows no change, a failed read back, an open
      dropped mid-put and a crash leave it. The next open that finds the marker writes even
      when the record already holds its address: the revision moves on, so no put sent at the
      old revision can apply after the open returned, and an address the open registered is
-     never replaced by a late one. Each refusal says whether the outcome is known and keeps
-     the store error. The marker is the only file this writes in the folder, besides what an
+     never replaced by a late one. The marker's presence is what counts: one whose text is
+     damaged fences the same, and one that is there but cannot be read refuses the open with
+     a step that keeps it. A node folder with no data yet (new, or emptied to rejoin) has lost
+     any marker an earlier folder held, so its open fences too (PR #159 review r3): before the
+     engine creates the node's data, the open writes `app-addr-fence` durably, the same way
+     as the marker (`app-addr-fence.new` written, synced and renamed into place; a crash
+     before the rename can leave `app-addr-fence.new` behind, and the next such open
+     overwrites it), and only a fence removes it, so an open that fails after the data exists still leaves the next open
+     fencing. Given an app address, the fence is that address's write, so the record then
+     holds the address supplied; given none, it is the record's own bytes written back at the
+     revision they were read at, which moves the revision on and changes nothing else, so only
+     then does the record keep the address it held. So a no-address rejoin on an emptied
+     folder needs no address from the operator, and no late put can apply after the fence.
+     An open given no app address while the marker is there cannot tell which address should
+     win, so the marker refuses it (above), and the operator opens again with the address the
+     node should hold. Each refusal says whether the outcome is known and keeps the store
+     error. `app-addr-pending`, `app-addr-pending.new`, `app-addr-fence` and
+     `app-addr-fence.new` are the only four files this writes in the folder, besides what an
      open already creates.
    - **Reads and checks.** `NodeRecord::decode` reads both node layouts as the declared fields
      alone, and `NodeRecord::decode_with_app` also returns the app address. The declared
      fields are what every check compares: the start check decodes them; declaring a formed
      database again reads `admin::read_nodes`, which decodes them, and compares those
      (`declare`'s `same`); and `declare_preflight` compares decoded fields too. `admin::adopt`
-     compares raw bytes, but only for a create whose reply was lost, during a declaration not
-     yet formed, before any node can register an address (a node registers only once the
-     formation record exists), so it only meets layout 1. `Db::route` returns the address as
-     `RouteInfo::app_address`, read again about once a second per owner.
+     compares raw bytes. It runs after a node-record create that did not apply: one answered
+     not applied, because the key already exists (as an interrupted declaration leaves it),
+     and one whose outcome is unknown (its reply was lost). Both happen only during a
+     declaration not yet formed, before any node can register an address (a node registers
+     only once the formation record exists), so it only meets layout 1. `Db::route` returns the address as
+     `RouteInfo::app_address`. A read that succeeds is kept for a second per owner. A failed
+     read does not fail the route (SBX answer, 2026-11-20): it answers the last address a
+     read of that owner returned, however old, or none if none succeeded, and refreshes
+     nothing, so the next call reads again.
    - **What this amends.** Decision 1's "nothing updates one in place" now means: nothing
      updates the declared address or machine; the node itself may update its app address.
    - **No rollback after node layout 2.** A build before node layout 2 (S1b) cannot decode a
      layout-2 record, so it refuses to start on such a store. S1b never shipped and no S1b
      store is in use (lead ruling, PR #159 review), so no rollback is supported once any node
      has registered an app address: to run an older build, declare a new database on a new
-     empty control store. Never hand-edit a record of a live store to get back to layout 1.
+     empty control store, and give every node a new, empty folder. Keeping the node folders
+     while changing only the control store is refused (`Mismatch`): the folders are bound to
+     the old database. Starting over does not carry the old data over. Keep the old folders
+     and the old store intact rather than deleting them. Never hand-edit a record of a live
+     store to get back to layout 1.
 
 ## Consequences
 
@@ -260,10 +297,27 @@ every rig open passes the address check it would meet in use.
   and the fence: `own83_b2_4_a_late_write_cannot_replace_a_successful_retry`,
   `own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next`,
   `own83_b2_6_an_unknown_registration_outcome_is_read_back`,
-  `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`;
+  `own83_b2_7_a_record_changed_mid_registration_refuses_the_open`,
+  `own83_b2_8_a_no_address_restart_is_refused_while_a_write_may_apply`,
+  `own83_b2_9_an_emptied_folder_fences_an_equal_address_rejoin`,
+  `own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses`,
+  `own83_b2_12_a_marker_that_cannot_be_staged_refuses_until_it_can`,
+  `own83_b2_13_a_lone_staged_marker_is_not_a_marker`,
+  `own83_b2_14_a_no_address_rejoin_on_an_emptied_folder_fences`,
+  `own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence`,
+  `own83_b2_16_a_no_address_fence_met_by_a_rival_refuses_until_it_fences`,
+  `own83_b2_17_a_no_address_fence_whose_outcome_is_unknown_refuses_until_it_fences`,
+  `own83_b2_18_a_no_address_fence_applied_and_unanswered_refuses_until_it_fences`,
+  `own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can`,
+  `own83_b2_20_a_rooted_owner_wiped_before_any_write_fences_through_a_conflict`,
+  `own83_b2_21_a_rooted_owner_wiped_before_any_write_fences_through_an_unknown_outcome`;
   `crates/rdb-api/src/db/partition_tests.rs`:
   `own83_25_a_changed_app_address_is_seen_within_the_gap` to
-  `own83_30_no_log_line_holds_an_app_address`; `rdb_node`'s
+  `own83_30_no_log_line_holds_an_app_address`,
+  `own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout`,
+  `own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters`,
+  `own83_33_a_failed_first_address_read_gives_no_address_and_recovers`,
+  `own83_34_a_reader_dropped_unfinished_ends_its_read`; `rdb_node`'s
   `own83_b2_app_addr_parses_and_form_refuses_it`; `rdb_dev`'s
   `route_line_names_the_owners_app_address_on_one_line`.
 

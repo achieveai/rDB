@@ -60,11 +60,11 @@ every member's boot", for the case below only.
   The cost is availability: the partition runs on fewer copies until the copy is back.
 - **The left-out return is memory only**, like a drop's. If the owner restarts again first, the
   copy returns only at its own node's next restart.
-- **Mixed settings.** Each step is the owner's own setting: leaving out, then re-adding. On this
-  build the returning copy marks a refused landing only with its own setting on. A copy with it
-  off can therefore leave a re-added partition read-only until that copy restarts; no write is
-  lost. With protocol 10 (#170) the owner's setting travels with the landing and this case goes
-  away. No startup refusal is added: the handshake does not carry the setting.
+- **Mixed settings.** Each step is the owner's own setting: leaving out, then re-adding. With
+  protocol 10 (#170, merged) the owner's setting travels with the landing, so the returning copy
+  follows the owner's, whatever its own. Before it, a copy with the setting off could leave a
+  re-added partition read-only until that copy restarted; no write was lost. No startup refusal
+  is added: the handshake does not carry the setting.
 - **Rollback to wait-for-every-copy needs no repair.** A generation this heal committed without a
   copy has the same shape a drop leaves: a pinned set without that copy. Builds before R5
   already handle that shape. Such a build heals with the members the record pins, which no longer

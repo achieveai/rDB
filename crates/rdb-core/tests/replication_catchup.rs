@@ -1277,7 +1277,7 @@ mod routed {
     use rdb_core::contracts::version::ENVELOPE_VERSION;
     use rdb_core::protection::HEALTH_EVAL_TIMER;
     use rdb_core::replication::catchup::CatchupCursor;
-    use rdb_core::replication::progress::{ProgressTracker, TrackerInit};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
     use rdb_core::replication::wire::encode_reply;
     use rdb_core::replication::Replication;
 
@@ -1357,6 +1357,11 @@ mod routed {
 
     /// Replication hosting A's primary side, head 12, and no cursor.
     pub(super) fn primary() -> Replication {
+        primary_with(ladder())
+    }
+
+    /// [`primary`] vouching for `history` instead of the fixture's 5..=12.
+    pub(super) fn primary_with(history: DigestLadder) -> Replication {
         let mut config = PartitionConfig::new(
             P,
             CONFIG,
@@ -1371,7 +1376,7 @@ mod routed {
             config,
             own: CopyId(0),
             lineage: lineage(),
-            history: ladder(),
+            history,
             local: ReplicaProgress {
                 received: ReceivedSeq(HEAD),
                 buffered_applied: AppliedSeq(HEAD),
@@ -1675,4 +1680,116 @@ fn m9_f3_b_an_unverifiable_repeat_does_not_reach_a_cursor_with_no_mark() {
     let effects = step(&mut module, 1, from_b(&b_ack(0, 0))).expect("routed");
     assert_eq!(effects, vec![replica(ReplicaIgnoreReason::Recorded)]);
     assert_eq!(module, before, "the stale ACK changes nothing");
+}
+
+// ---- issue #61: the ladder floor ----
+
+/// Issue #61 A3 (history-trim design §1b): a primary whose ladder still holds the genesis rung
+/// walks a copy that asks from the root from record 1. After `Replication::trim_history` to 5,
+/// History holds 5..=12 only, so the same `NeedPrefix{have 0, ROOT}` must ask for a snapshot:
+/// record 1 is gone from the engine. A need at the floor still walks (6 is sent), and one below
+/// it asks for a snapshot. A refused trim — no side on the node, above the head, a contradicting
+/// digest — changes nothing.
+/// Cut: `trim_below` keeps `(0, ROOT)` (`*held >= seq || *held == Seq::ZERO`), red (record 1 is
+/// sent after the trim).
+#[retcd_test]
+fn t61_need_prefix_zero_after_trim_asks_snapshot() {
+    use rdb_core::contracts::errors::RdbError;
+    use rdb_core::contracts::ids::{NodeId, PartitionId};
+    use routed::{from_b, primary_with, sends, step};
+    const A: NodeId = NodeId(1);
+    const P: PartitionId = PartitionId(4);
+
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    for seq in 1..=HEAD {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut untrimmed = primary_with(history.clone());
+    let effects = step(&mut untrimmed, 0, from_b(&need_prefix(0, Digest::ROOT))).expect("routed");
+    assert_eq!(
+        sends(&effects),
+        vec![1],
+        "control: the root walks from 1 {effects:?}"
+    );
+
+    let mut module = primary_with(history);
+    let invalid = |field| Err(RdbError::InvalidArgument { field });
+    for (name, node, seq, digest, field) in [
+        ("no side on the node", NodeId(9), Seq(5), d(5), "side"),
+        ("above the head", A, Seq(HEAD + 1), d(HEAD + 1), "seq"),
+        ("contradicts the rung held", A, Seq(5), d(6), "digest"),
+    ] {
+        let before = module.clone();
+        assert_eq!(
+            module.trim_history(node, P, seq, digest),
+            invalid(field),
+            "{name}"
+        );
+        assert_eq!(module, before, "{name}: nothing changes");
+    }
+    assert_eq!(module.trim_history(A, P, Seq(5), d(5)), Ok(()));
+    let ladder = module.primary(A, P).expect("installed").tracker().history();
+    assert_eq!(ladder.floor(), Some(Seq(5)));
+    assert_eq!(
+        ladder.lookup(Seq::ZERO, Digest::ROOT),
+        DigestLookup::NotRetained
+    );
+
+    let effects = step(&mut module, 1, from_b(&need_prefix(0, Digest::ROOT))).expect("routed");
+    assert_eq!(effects, vec![snapshot()], "the root is below the floor");
+    let effects = step(&mut module, 2, from_b(&need_prefix(4, d(4)))).expect("routed");
+    assert_eq!(effects, vec![snapshot()], "4 is below the floor");
+    let effects = step(&mut module, 3, from_b(&need_prefix(5, d(5)))).expect("routed");
+    assert_eq!(
+        sends(&effects),
+        vec![6],
+        "the floor itself walks {effects:?}"
+    );
+}
+
+/// Issue #61 (lead ruling 2026-11-22): an ACK the ladder no longer holds asks for a
+/// snapshot with no cursor behind it (`ProgressTracker::ack_ladder`, `NotRetained`). R1 now
+/// starts a catching-up cursor there, so the copy's ACK at the head after the install ends the
+/// catch-up with `CopyCaughtUp`, which is what releases the host's transfer. An ACK below the
+/// head instead walks the rest, and the ACK at the head then reports it once.
+/// Cut: `Primary::await_snapshot` starts no cursor, red at "the request has a cursor behind
+/// it".
+/// Unit (<10 ms).
+#[retcd_test]
+fn t61_an_ack_below_the_floor_starts_a_cursor_that_reports_caught_up() {
+    use routed::{b_ack, cursor, from_b, primary, sends, step};
+
+    // The ladder holds 5..=12: an ACK at 4 cannot be verified.
+    let mut module = primary();
+    assert!(cursor(&module).is_none(), "no catch-up runs");
+    let asked = step(&mut module, 0, from_b(&b_ack(4, 4))).expect("routed");
+    assert!(asked.contains(&snapshot()), "{asked:?}");
+    assert!(
+        cursor(&module).is_some(),
+        "the request has a cursor behind it"
+    );
+    let installed = step(&mut module, 1, from_b(&b_ack(HEAD, HEAD))).expect("routed");
+    assert_eq!(
+        caught_progress_durable(&installed).0,
+        1,
+        "the ACK at the head reports caught up {installed:?}"
+    );
+    assert!(
+        cursor(&module).is_none(),
+        "the cursor ends with the catch-up"
+    );
+
+    // Re-seeded at 9 with the head at 12: the cursor walks 10, 11 and 12, then reports.
+    let mut walked = primary();
+    let _ = step(&mut walked, 0, from_b(&b_ack(4, 4))).expect("routed");
+    let mut sent = Vec::new();
+    for (now, at) in [(1, 9), (2, 10), (3, 11)] {
+        let effects = step(&mut walked, now, from_b(&b_ack(at, at))).expect("routed");
+        assert_eq!(caught_progress_durable(&effects).0, 0, "{at}: {effects:?}");
+        sent.extend(sends(&effects));
+    }
+    assert_eq!(sent, vec![10, 11, 12], "the walk past S");
+    let last = step(&mut walked, 4, from_b(&b_ack(HEAD, HEAD))).expect("routed");
+    assert_eq!(caught_progress_durable(&last).0, 1, "{last:?}");
 }

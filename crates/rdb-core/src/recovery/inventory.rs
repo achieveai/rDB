@@ -44,6 +44,10 @@ pub(crate) enum Window {
     Probing {
         deadline: Tick,
         outstanding: BTreeSet<(CopyId, Seq)>,
+        /// Each pair probe `(b, a.head)`, with the shorter copies whose head is that seq: the
+        /// copies `b` was asked to vouch for (issue #61, history-trim design §3.5). A base probe
+        /// on the same tuple wins, so it is never here (m-a).
+        pair_probes: BTreeMap<(CopyId, Seq), BTreeSet<CopyId>>,
     },
 }
 
@@ -408,18 +412,48 @@ impl Collecting {
     }
 
     /// Selection needs these digests: the window becomes a probe wait ending at `deadline`.
+    ///
+    /// Each needed `(b, seq)` that is not `b`'s base probe (the anchor's `base_seq`, a rung `b`
+    /// lacks) is a pair probe: selection asks `b` to vouch for the head of every shorter copy
+    /// whose head is `seq` (issue #61). Those copies are remembered beside the probe, so a
+    /// `ProbeUnavailable` for it can drop them rather than `b`. A base probe on the same tuple
+    /// wins (m-a): `b` cannot show it descends from the root, so it is `b` that goes.
     pub(crate) fn start_probing(
         &mut self,
         needed: &[(CopyId, Seq)],
+        base_seq: Seq,
         deadline: Tick,
         emit: &mut Emit<'_>,
     ) {
         for &(copy, seq) in needed {
             emit.recovery(RecoveryEffect::ProbeDigestAt { copy, seq });
         }
+        let mut pair_probes = BTreeMap::new();
+        for &(probed, seq) in needed {
+            let Some(holder) = self.verified.get(&probed) else {
+                continue;
+            };
+            if seq == base_seq && holder.digest_at(seq).is_none() {
+                continue;
+            }
+            let shorter: BTreeSet<CopyId> = self
+                .verified
+                .values()
+                .filter(|other| {
+                    other.copy() != probed
+                        && other.head_seq() == seq
+                        && other.head_seq() < holder.head_seq()
+                })
+                .map(VerifiedInventory::copy)
+                .collect();
+            if !shorter.is_empty() {
+                pair_probes.insert((probed, seq), shorter);
+            }
+        }
         self.window = Window::Probing {
             deadline,
             outstanding: needed.iter().copied().collect(),
+            pair_probes,
         };
     }
 
@@ -449,15 +483,30 @@ impl Collecting {
         done
     }
 
-    /// A probe cannot be answered: that copy's prefix is lost to this recovery. `true` when no
-    /// probe is outstanding any more.
+    /// A probe was answered `ProbeUnavailable`: the holder is alive and `seq` is below its
+    /// History floor (issue #61, ADR-rdb-0009 as amended). `true` when no probe is outstanding
+    /// any more.
+    ///
+    /// For a pair probe below the probed copy's head, the probed copy could not vouch for the
+    /// shorter copies' heads: those shorter copies are recorded `Ineligible(StaleLineage)`
+    /// (`survivor_behind_retention`), their own outstanding probes are cleared (m-a), and the
+    /// probed copy is kept. Dropping them loses no record the probed copy lacks: their heads are
+    /// at or below its head, on the same root, and one generation's chain admits one record per
+    /// seq (design §3.5). A shadow probed is dropped as today (m-b), and so is the probed copy
+    /// for any other probe, a base probe included. A holder that is down, or faults, gives no
+    /// answer at all, and [`Self::probe_deadline`] drops it.
     pub(crate) fn probe_unavailable(
         &mut self,
         copy: CopyId,
         seq: Seq,
         emit: &mut Emit<'_>,
     ) -> bool {
-        let Window::Probing { outstanding, .. } = &self.window else {
+        let Window::Probing {
+            outstanding,
+            pair_probes,
+            ..
+        } = &mut self.window
+        else {
             emit.ignored(ReplicaIgnoreReason::OutOfPhase);
             return false;
         };
@@ -465,8 +514,58 @@ impl Collecting {
             emit.ignored(ReplicaIgnoreReason::NotASource);
             return false;
         }
-        self.drop_source(copy, emit);
+        let shorter = pair_probes.remove(&(copy, seq));
+        let probed_head = self.verified.get(&copy).map(VerifiedInventory::head_seq);
+        let keeps_probed = !self.shadows.contains(&copy) && probed_head.is_some_and(|h| seq < h);
+        match shorter {
+            Some(shorter) if keeps_probed => {
+                outstanding.remove(&(copy, seq));
+                for behind in shorter {
+                    self.drop_behind_retention(behind, copy, emit);
+                }
+            }
+            _ => self.drop_source(copy, emit),
+        }
         self.probes_done()
+    }
+
+    /// Record `behind` ineligible: its head is below the History floor of `by`, which could not
+    /// vouch for it (issue #61). Its own outstanding probes, and its place in any other pair
+    /// probe, go with it (m-a).
+    fn drop_behind_retention(&mut self, behind: CopyId, by: CopyId, emit: &mut Emit<'_>) {
+        let Some(dropped) = self.verified.remove(&behind) else {
+            return;
+        };
+        self.transfers.remove(&behind);
+        if let Window::Probing {
+            outstanding,
+            pair_probes,
+            ..
+        } = &mut self.window
+        {
+            outstanding.retain(|(owed, _)| *owed != behind);
+            for copies in pair_probes.values_mut() {
+                copies.remove(&behind);
+            }
+        }
+        tracing::info!(
+            partition = emit.event().partition.0,
+            copy = behind.0,
+            head = dropped.head_seq().0,
+            by = by.0,
+            by_head = self.verified.get(&by).map(|v| v.head_seq().0),
+            "survivor_behind_retention"
+        );
+        let reason = UnavailableReason::StaleLineage;
+        self.record_lost(
+            behind,
+            InventoryOutcome::Ineligible {
+                copy: behind,
+                reason,
+            },
+            reason,
+            emit,
+        );
     }
 
     /// The probe wait ran out: every copy still owing an answer is dropped.

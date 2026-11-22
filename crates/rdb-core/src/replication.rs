@@ -81,7 +81,7 @@ use crate::contracts::transport::{PeerLabel, TransportEvent};
 use append::{AppendReceiver, Head, ReceiverInit};
 use catchup::{retransmit_timer, RETRANSMIT_MS};
 use primary::{keepalive_timer, shadow_timer, Primary};
-use progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
+use progress::{trim_refusal, DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use source::Source;
 use wire::R1Frame;
 
@@ -216,6 +216,51 @@ impl Replication {
             .restore_history(rungs)
     }
 
+    /// Trim every R1 side installed at `(node, partition)`, primary and receiver alike, to the
+    /// History floor `(seq, digest)` (issue #61, design §0 and §3.4): the host calls this
+    /// before it trims its engine, so a ladder never vouches for a record the engine has
+    /// dropped. Every side is checked before any is trimmed, so a refusal changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `side` when neither side is installed there, or
+    /// what [`ProgressTracker::trim_history`] or [`AppendReceiver::trim_history`] refuses.
+    pub fn trim_history(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        seq: Seq,
+        digest: Digest,
+    ) -> Result<(), RdbError> {
+        let key = (node, partition);
+        let primary = self.primaries.get_mut(&key);
+        let receiver = self.receivers.get_mut(&key);
+        if primary.is_none() && receiver.is_none() {
+            return Err(RdbError::InvalidArgument { field: "side" });
+        }
+        let refusal = primary
+            .as_ref()
+            .and_then(|side| {
+                let tracker = side.tracker();
+                trim_refusal(tracker.history(), tracker.head(), seq, digest)
+            })
+            .or_else(|| {
+                receiver.as_ref().and_then(|side| {
+                    trim_refusal(side.history(), side.applied_head().seq, seq, digest)
+                })
+            });
+        if let Some(field) = refusal {
+            return Err(RdbError::InvalidArgument { field });
+        }
+        if let Some(side) = primary {
+            side.trim_history(seq, digest)?;
+        }
+        if let Some(side) = receiver {
+            side.trim_history(seq, digest)?;
+        }
+        Ok(())
+    }
+
     /// Install (or replace) the primary side for the tracker's own `(node, partition)`, with no
     /// catch-up cursor running.
     pub fn install_primary(&mut self, tracker: ProgressTracker) {
@@ -227,6 +272,21 @@ impl Replication {
     #[must_use]
     pub fn primary(&self, node: NodeId, partition: PartitionId) -> Option<&Primary> {
         self.primaries.get(&(node, partition))
+    }
+
+    /// **Test seam**, debug builds (issue #61): ask for `copy`'s snapshot as R1 does, with
+    /// its cursor catching up (`Primary::await_snapshot`), for a row that must ask while the
+    /// copy can say nothing. `None` when `(node, partition)` holds no primary side.
+    #[cfg(debug_assertions)]
+    pub fn ask_snapshot(
+        &mut self,
+        node: NodeId,
+        partition: PartitionId,
+        copy: CopyId,
+    ) -> Option<EffectKind> {
+        self.primaries
+            .get_mut(&(node, partition))
+            .map(|primary| primary.await_snapshot(copy))
     }
 
     /// The recovery catch-up `(node, partition)` is sending to copy `to`, if one is running.

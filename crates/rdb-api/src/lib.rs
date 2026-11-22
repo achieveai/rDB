@@ -12,6 +12,7 @@
 //! * [`control`] — [`control::ControlAdapter`], `ControlEffect` onto a `config_core::ConfigStore`.
 //! * [`admin`] — bootstrap of partition 1 through F1. It never injects `Recovered`.
 //! * [`db`] — [`Db`]: identities, deadlines, compiles and the §5.4 error mapping.
+//! * [`feed`] — the change feed's cursor, pages and resume rule (#87, ADR-rdb-0020).
 //! * [`ownership`] — [`OwnerToken`] and [`Ownership`]: the owner token an app fences its own
 //!   side effects with (#84).
 //!
@@ -39,6 +40,7 @@ pub mod admin;
 pub mod clock;
 pub mod control;
 pub mod db;
+pub mod feed;
 pub mod host;
 pub mod net;
 mod os_boot;
@@ -50,10 +52,13 @@ pub mod transport;
 mod test_store;
 
 pub use db::{
-    app_request_id, ApiError, Db, DbConfig, GetOk, NodeAddresses, NotReady, OpenError,
-    PartitionReady, PutError, PutOk, ReadOk, RestartReason, StorageOptions, Timeouts, TxnPut,
-    MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, TENANT,
+    app_request_id, ApiError, AsyncDb, Db, DbConfig, GetOk, Limit, NodeAddresses, NotReady,
+    ObjectEntry, ObjectPage, OpenError, PartitionReady, PrefixDeleteError, PutError, PutOk, ReadOk,
+    RestartReason, ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite, Source,
+    StorageOptions, Timeouts, TooLarge, TxnPut, TxnWrite, MAX_KEY, MAX_OBJECT_ID, MAX_OPS,
+    MAX_PAGE, MAX_SCOPED_ID, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE, TENANT,
 };
+pub use feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
 pub use host::{Change, ListEdit, Look, Seen};
 pub use ownership::{
     OwnerToken, Ownership, OwnershipEvent, OwnershipEvents, RouteInfo, DEACTIVATING_LEAD_MILLIS,
@@ -62,6 +67,8 @@ pub use planner::{write_outage_bound, Failover, OutageBound, OutageClass};
 /// The longest [`NodeAddresses::app`] a node registers, in bytes (#83 B2): 512.
 pub use rdb_core::authority::node::MAX_APP_ADDR_LEN;
 pub use rdb_core::partition_map::{affinity_hash, partition_of, MAX_PARTITIONS};
+pub use rdb_value::envelope::Kind as ObjectKind;
+pub use rdb_value::keys::{Listed, Scope, ScopeError};
 // The rdb-core types `Db`'s calls take and answer with, so an app depends on rdb-api alone
 // (A-R190): request ids, generations, the status answer and the error kinds.
 pub use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};

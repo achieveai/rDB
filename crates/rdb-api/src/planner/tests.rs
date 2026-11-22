@@ -58,6 +58,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         clock_bound_lost: false,
         committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         tail_refused: None,
+        needs_operator: None,
         members_revision: None,
     }
 }
@@ -1423,10 +1424,11 @@ fn x2_held(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> (Plann
 
 /// #81 X2, PR #171 review (stale snapshot in the clear): the sweep's snapshot names node 1 a
 /// candidate (frozen `grants/1` of a gone boot, owning nothing). Right after the clear reads
-/// `grants/1`, `partitions/7` comes to name node 1 owner. The clear reads `partitions/` after
-/// the grant, finds it, and deletes nothing: `grants/1` stays at its revision, and no delete is
-/// even sent (`planner_frozen_grant_kept`, `OwnsPartition`, is a debug line). Unit
-/// (in-memory store).
+/// `grants/1`, `partitions/7` comes to name node 1 owner, in `Fencing` (#172: a `Serving`
+/// record naming it no longer refuses, so the record written is a takeover's). The clear
+/// reads `partitions/` after the grant, finds it, and deletes nothing: `grants/1` stays at its
+/// revision, and no delete is even sent (`planner_frozen_grant_kept`, `OwnerInTransfer`, is a
+/// debug line). Unit (in-memory store).
 /// Cut: judge the grant against the sweep's snapshot, read before it (the old order);
 /// `grants/1` is deleted, red.
 #[config_log::retcd_test]
@@ -1437,6 +1439,7 @@ fn own81_x2_a_partition_naming_the_node_after_the_grant_read_keeps_the_freeze() 
     let owning = PartitionRecord {
         partition: PartitionId(7),
         owner: NodeId(1),
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Fencing,
         ..PartitionRecord::default()
     };
     let after = crate::test_store::PutAfterGet::new(

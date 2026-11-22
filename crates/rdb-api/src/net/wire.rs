@@ -35,6 +35,8 @@ use rdb_core::contracts::txn::{TxnRequest, TxnResult, TxnStatus};
 use rdb_value::blob::{Blob, Manifest, Upload};
 use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
 use rdb_value::delta::{Delta, Op};
+use rdb_value::envelope::Kind;
+use rdb_value::keys::Listed;
 use rdb_value::list::{Item, Items, List, Token};
 use rdb_value::path::Path;
 use rdb_value::value::{Int, Value};
@@ -42,6 +44,8 @@ use rdb_value::{cbor, Document, Expected};
 use serde::{Deserialize, Serialize};
 
 use crate::db::ApiError;
+use crate::feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
+use crate::host::snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 use crate::host::{
     Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg, NodeStatus,
     PeerAsk, PutOp, Seen,
@@ -176,6 +180,8 @@ pub enum WireMsg {
         correlation: CorrelationId,
         emitter: NodeId,
         not_before: Tick,
+        /// The committing owner's `live_readd` (#107 slice 2b, protocol 10).
+        owner_live_readd: bool,
     },
     Client {
         to: NodeId,
@@ -208,6 +214,18 @@ pub enum WireMsg {
         generation: Generation,
         through: Seq,
     },
+    /// Appended (PR-A's protocol bump, issue #61 S2): a snapshot offer, its pulls, its pages and
+    /// its refusal. Last, so no earlier kind's encoded index moves (`net::tests::kind`).
+    SnapshotOffer { to: NodeId, offer: SnapshotOffer },
+    /// Issue #61 S2: the target asks for a page.
+    SnapshotPull { to: NodeId, pull: SnapshotPull },
+    /// Issue #61 S2: one page.
+    SnapshotChunk { to: NodeId, chunk: SnapshotChunk },
+    /// Issue #61 S2: the target refused.
+    SnapshotOfferRefused {
+        to: NodeId,
+        refused: SnapshotOfferRefused,
+    },
 }
 
 impl WireMsg {
@@ -221,6 +239,10 @@ impl WireMsg {
             | Self::Restore { to, .. }
             | Self::Routed { to, .. }
             | Self::DurableProved { to, .. }
+            | Self::SnapshotOffer { to, .. }
+            | Self::SnapshotPull { to, .. }
+            | Self::SnapshotChunk { to, .. }
+            | Self::SnapshotOfferRefused { to, .. }
             | Self::Landed { to, .. }
             | Self::Client { to, .. }
             | Self::Inspect { to, .. }
@@ -238,6 +260,10 @@ impl WireMsg {
             Self::Restore { .. } => "restore",
             Self::Routed { .. } => "routed",
             Self::DurableProved { .. } => "durable_proved",
+            Self::SnapshotOffer { .. } => "snapshot_offer",
+            Self::SnapshotPull { .. } => "snapshot_pull",
+            Self::SnapshotChunk { .. } => "snapshot_chunk",
+            Self::SnapshotOfferRefused { .. } => "snapshot_offer_refused",
             Self::Landed { .. } => "landed",
             Self::Client { .. } => "client",
             Self::Inspect { .. } => "inspect",
@@ -360,6 +386,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             generation,
             through,
         },
+        Msg::SnapshotOffer(offer) => WireMsg::SnapshotOffer { to, offer: *offer },
+        Msg::SnapshotPull(pull) => WireMsg::SnapshotPull { to, pull },
+        Msg::SnapshotChunk(chunk) => WireMsg::SnapshotChunk { to, chunk: *chunk },
+        Msg::SnapshotOfferRefused(refused) => WireMsg::SnapshotOfferRefused { to, refused },
         Msg::Routed {
             partition,
             correlation,
@@ -388,6 +418,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => WireMsg::Landed {
             to,
             result,
@@ -395,6 +426,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         },
         Msg::Client(client) => {
             return match WireCall::try_from(&client.call) {
@@ -418,6 +450,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Fault { .. }
         | Msg::Activated { .. }
         | Msg::OwnerLearned { .. }
+        | Msg::FeedRead { .. }
         | Msg::FenceBound { .. }
         | Msg::ReplanNote { .. }
         | Msg::Inject { .. }
@@ -434,7 +467,15 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             return Err(Box::new((WireError::LocalOnly("Damage"), local)))
         }
         #[cfg(debug_assertions)]
+        local @ Msg::DropHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("DropHistory"), local)))
+        }
+        #[cfg(debug_assertions)]
         local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
+        #[cfg(debug_assertions)]
+        local @ Msg::TrimHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("TrimHistory"), local)))
+        }
     };
     Ok(Outbound::Plain(plain))
 }
@@ -445,6 +486,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
         Msg::OwnerLearned { .. } => "OwnerLearned",
+        Msg::FeedRead { .. } => "FeedRead",
         Msg::FenceBound { .. } => "FenceBound",
         Msg::ReplanNote { .. } => "ReplanNote",
         Msg::Inject { .. } => "Inject",
@@ -564,6 +606,16 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 through,
             },
         ),
+        WireMsg::SnapshotOffer { to, offer } => {
+            Inbound::Plain(to, Msg::SnapshotOffer(Box::new(offer)))
+        }
+        WireMsg::SnapshotPull { to, pull } => Inbound::Plain(to, Msg::SnapshotPull(pull)),
+        WireMsg::SnapshotChunk { to, chunk } => {
+            Inbound::Plain(to, Msg::SnapshotChunk(Box::new(chunk)))
+        }
+        WireMsg::SnapshotOfferRefused { to, refused } => {
+            Inbound::Plain(to, Msg::SnapshotOfferRefused(refused))
+        }
         WireMsg::Restore {
             to,
             partition,
@@ -610,6 +662,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => Inbound::Plain(
             to,
             Msg::Landed {
@@ -618,6 +671,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 correlation,
                 emitter,
                 not_before,
+                owner_live_readd,
             },
         ),
         WireMsg::Client {
@@ -706,6 +760,12 @@ pub enum WirePeerAsk {
         generation: Generation,
         barrier: u64,
     },
+    /// Issue #61 (PR-A's protocol bump): F1's digest probe of one copy, under the plan's anchor.
+    Probe {
+        copy: CopyId,
+        anchor: LineageAnchor,
+        seq: Seq,
+    },
 }
 
 impl From<PeerAsk> for WirePeerAsk {
@@ -744,6 +804,7 @@ impl From<PeerAsk> for WirePeerAsk {
                 generation,
                 barrier,
             },
+            PeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }
@@ -784,6 +845,7 @@ impl From<WirePeerAsk> for PeerAsk {
                 generation,
                 barrier,
             },
+            WirePeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }
@@ -876,7 +938,13 @@ pub enum WireCall {
         no_intact_copy: bool,
         give_up_live_copy: bool,
     },
-    // #80 S4 (A-R456 narrowed: refill): added last, under the existing version-13 bump.
+    // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
+    Changes {
+        identity: RequestIdentity,
+        from: WireFeedCursor,
+        max: u32,
+    },
+    // #80 S4 (A-R456 narrowed: refill): added after main's variants, under protocol 13.
     Refill {
         identity: RequestIdentity,
         to: NodeId,
@@ -897,6 +965,7 @@ impl WireCall {
             | Self::Move { identity, .. }
             | Self::Rebuild { identity, .. }
             | Self::ForgetTail { identity, .. }
+            | Self::Changes { identity, .. }
             | Self::Refill { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
@@ -917,6 +986,7 @@ impl WireCall {
             Self::Rebuild { .. } => "rebuild",
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
+            Self::Changes { .. } => "changes",
             Self::Refill { .. } => "refill",
         }
     }
@@ -1009,6 +1079,15 @@ impl TryFrom<&ClientCall> for WireCall {
                 through: *through,
                 remaining_millis: *remaining_millis,
             },
+            ClientCall::Changes {
+                identity,
+                from,
+                max,
+            } => Self::Changes {
+                identity: *identity,
+                from: WireFeedCursor::from(*from),
+                max: *max,
+            },
         })
     }
 }
@@ -1087,6 +1166,15 @@ impl TryFrom<WireCall> for ClientCall {
                 generation,
                 through,
                 remaining_millis,
+            },
+            WireCall::Changes {
+                identity,
+                from,
+                max,
+            } => Self::Changes {
+                identity,
+                from: from.into(),
+                max,
             },
         })
     }
@@ -1209,6 +1297,8 @@ pub enum WireChange {
         floor: u64,
     },
     Clear,
+    /// #147. Last, so every earlier variant keeps its number.
+    Delete,
 }
 
 fn elem_ops(ops: &[ElemOp]) -> Result<Vec<WireElemOp>, WireError> {
@@ -1303,6 +1393,7 @@ impl TryFrom<&Change> for WireChange {
             },
             Change::Gc { floor } => Self::Gc { floor: *floor },
             Change::Clear => Self::Clear,
+            Change::Delete => Self::Delete,
         })
     }
 }
@@ -1368,6 +1459,7 @@ impl TryFrom<WireChange> for Change {
             },
             WireChange::Gc { floor } => Self::Gc { floor },
             WireChange::Clear => Self::Clear,
+            WireChange::Delete => Self::Delete,
         })
     }
 }
@@ -1406,10 +1498,28 @@ impl From<WireToken> for Token {
 #[allow(missing_docs)]
 pub enum WireLook {
     Doc,
-    Members { after: Option<Vec<u8>>, limit: u64 },
-    Items { at: i64, limit: u64 },
-    ItemsAfter { token: WireToken, limit: u64 },
-    Range { offset: u64, len: u64 },
+    Members {
+        after: Option<Vec<u8>>,
+        limit: u64,
+    },
+    Items {
+        at: i64,
+        limit: u64,
+    },
+    ItemsAfter {
+        token: WireToken,
+        limit: u64,
+    },
+    Range {
+        offset: u64,
+        len: u64,
+    },
+    /// #147. Last, so every earlier variant keeps its number.
+    List {
+        after: Option<Bytes>,
+        limit: u64,
+        rootless: bool,
+    },
 }
 
 fn limit(limit: u64) -> Result<usize, WireError> {
@@ -1438,6 +1548,15 @@ impl TryFrom<&Look> for WireLook {
                 offset: *offset,
                 len: *len,
             },
+            Look::List {
+                after,
+                limit,
+                rootless,
+            } => Self::List {
+                after: after.clone(),
+                limit: *limit as u64,
+                rootless: *rootless,
+            },
         })
     }
 }
@@ -1461,6 +1580,15 @@ impl TryFrom<WireLook> for Look {
                 limit: limit(n)?,
             },
             WireLook::Range { offset, len } => Self::Range { offset, len },
+            WireLook::List {
+                after,
+                limit: n,
+                rootless,
+            } => Self::List {
+                after,
+                limit: limit(n)?,
+                rootless,
+            },
         })
     }
 }
@@ -1498,8 +1626,11 @@ impl From<WireApiError> for ApiError {
             kind: error.kind,
             retry: error.retry,
             no_mutation: error.no_mutation,
+            owner_fault: ApiError::fault_from_wire(error.retry, &error.detail),
             detail: error.detail,
             retry_after: error.retry_after_millis.map(Duration::from_millis),
+            // Set only on a refusal the `Db` raises before it sends (#148), so never on the wire.
+            too_large: None,
         }
     }
 }
@@ -1565,6 +1696,19 @@ pub enum WireSeen {
         manifest: WireManifest,
         bytes: Bytes,
     },
+    /// #147. Last, so every earlier variant keeps its number.
+    Objects {
+        objects: Vec<WireListed>,
+        full: bool,
+    },
+}
+
+/// [`Listed`] on the wire: the root's version and its envelope kind byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireListed {
+    pub id: Vec<u8>,
+    pub root: Option<(u64, u8)>,
 }
 
 impl TryFrom<&Seen> for WireSeen {
@@ -1625,6 +1769,16 @@ impl TryFrom<&Seen> for WireSeen {
                     chunk_sha256: blob.manifest.chunk_sha256.clone(),
                 },
                 bytes: bytes.clone(),
+            },
+            Seen::Objects { objects, full } => Self::Objects {
+                objects: objects
+                    .iter()
+                    .map(|listed| WireListed {
+                        id: listed.id.clone(),
+                        root: listed.root.map(|(version, kind)| (version, kind.byte())),
+                    })
+                    .collect(),
+                full: *full,
             },
         })
     }
@@ -1714,6 +1868,201 @@ impl TryFrom<WireSeen> for Seen {
                 },
                 bytes,
             },
+            WireSeen::Objects { objects, full } => Self::Objects {
+                objects: objects
+                    .into_iter()
+                    .map(|listed| {
+                        let root = listed
+                            .root
+                            .map(|(version, byte)| {
+                                Kind::from_byte(byte)
+                                    .map(|kind| (version, kind))
+                                    .ok_or_else(|| {
+                                        WireError::Value(format!("object kind byte {byte:#04x}"))
+                                    })
+                            })
+                            .transpose()?;
+                        Ok(Listed {
+                            id: listed.id,
+                            root,
+                        })
+                    })
+                    .collect::<Result<_, WireError>>()?,
+                full,
+            },
+        })
+    }
+}
+
+// ---- the change feed (#87) -------------------------------------------------------------------
+
+/// The shape of the records a [`WireFeedPage`] carries. `1` is the physical form (ruling Q5a):
+/// each `User` write's stored key and stored value bytes, with the object id parsed out. A page
+/// of any other format is refused `INCOMPATIBLE_VERSION`, never read as this one. A change to
+/// the record's meaning, with or without a change to its types, moves this.
+pub const FEED_RECORD_FORMAT: u32 = 1;
+
+/// [`FeedCursor`] on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedCursor {
+    pub generation: Generation,
+    pub seq: Seq,
+    pub digest: Digest,
+}
+
+impl From<FeedCursor> for WireFeedCursor {
+    fn from(cursor: FeedCursor) -> Self {
+        Self {
+            generation: cursor.generation,
+            seq: cursor.seq,
+            digest: cursor.digest,
+        }
+    }
+}
+
+impl From<WireFeedCursor> for FeedCursor {
+    fn from(cursor: WireFeedCursor) -> Self {
+        Self {
+            generation: cursor.generation,
+            seq: cursor.seq,
+            digest: cursor.digest,
+        }
+    }
+}
+
+/// [`FeedWrite`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedWrite {
+    pub group: AffinityId,
+    pub object: Bytes,
+    pub key: Bytes,
+    pub value: Option<Bytes>,
+}
+
+/// [`FeedRecord`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedRecord {
+    pub at: WireFeedCursor,
+    pub request: RequestIdentity,
+    pub writes: Vec<WireFeedWrite>,
+}
+
+/// [`FeedPage`] on the wire, without its format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub enum WireFeedBody {
+    Records {
+        records: Vec<WireFeedRecord>,
+        next: WireFeedCursor,
+        more: bool,
+    },
+    Behind {
+        head: Seq,
+    },
+    Trimmed {
+        floor: Seq,
+    },
+    Rewound {
+        to: WireFeedCursor,
+    },
+}
+
+/// A [`FeedPage`] on the wire: its records' [`FEED_RECORD_FORMAT`], then the page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFeedPage {
+    /// The records' format; this build reads [`FEED_RECORD_FORMAT`] only.
+    pub format: u32,
+    /// The page.
+    pub body: WireFeedBody,
+}
+
+impl From<&FeedPage> for WireFeedPage {
+    fn from(page: &FeedPage) -> Self {
+        let body = match page {
+            FeedPage::Records {
+                records,
+                next,
+                more,
+            } => WireFeedBody::Records {
+                records: records
+                    .iter()
+                    .map(|record| WireFeedRecord {
+                        at: record.at.into(),
+                        request: record.request,
+                        writes: record
+                            .writes
+                            .iter()
+                            .map(|write| WireFeedWrite {
+                                group: write.group,
+                                object: write.object.clone(),
+                                key: write.key.clone(),
+                                value: write.value.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                next: (*next).into(),
+                more: *more,
+            },
+            FeedPage::Behind { head } => WireFeedBody::Behind { head: *head },
+            FeedPage::Trimmed { floor } => WireFeedBody::Trimmed { floor: *floor },
+            FeedPage::Rewound { to } => WireFeedBody::Rewound { to: (*to).into() },
+        };
+        Self {
+            format: FEED_RECORD_FORMAT,
+            body,
+        }
+    }
+}
+
+impl TryFrom<WireFeedPage> for FeedPage {
+    type Error = ApiError;
+
+    /// # Errors
+    /// `INCOMPATIBLE_VERSION` for a page of a format other than [`FEED_RECORD_FORMAT`].
+    fn try_from(page: WireFeedPage) -> Result<Self, ApiError> {
+        if page.format != FEED_RECORD_FORMAT {
+            return Err(ApiError::new(
+                ErrorKind::IncompatibleVersion,
+                format!(
+                    "the node sent change feed records of format {}, and this build reads \
+                     format {FEED_RECORD_FORMAT} only; upgrade this client",
+                    page.format
+                ),
+            ));
+        }
+        Ok(match page.body {
+            WireFeedBody::Records {
+                records,
+                next,
+                more,
+            } => Self::Records {
+                records: records
+                    .into_iter()
+                    .map(|record| FeedRecord {
+                        at: record.at.into(),
+                        request: record.request,
+                        writes: record
+                            .writes
+                            .into_iter()
+                            .map(|write| FeedWrite {
+                                group: write.group,
+                                object: write.object,
+                                key: write.key,
+                                value: write.value,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                next: next.into(),
+                more,
+            },
+            WireFeedBody::Behind { head } => Self::Behind { head },
+            WireFeedBody::Trimmed { floor } => Self::Trimmed { floor },
+            WireFeedBody::Rewound { to } => Self::Rewound { to: to.into() },
         })
     }
 }
@@ -1753,6 +2102,8 @@ pub enum WireAnswer {
     TailForgotten {
         line: String,
     },
+    // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
+    Changes(WireFeedPage),
 }
 
 impl WireAnswer {
@@ -1794,6 +2145,7 @@ impl WireAnswer {
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
             Answer::Durable => Self::Durable,
+            Answer::Changes(page) => Self::Changes(WireFeedPage::from(page)),
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),
@@ -1833,6 +2185,13 @@ impl WireAnswer {
             Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::TailForgotten { line } => Answer::TailForgotten(line),
             Self::Durable => Answer::Durable,
+            Self::Changes(page) => match FeedPage::try_from(page) {
+                Ok(page) => Answer::Changes(page),
+                Err(error) => Answer::Error {
+                    error,
+                    request: None,
+                },
+            },
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
                 request,
@@ -1885,6 +2244,8 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
+    /// Added by #61's protocol version (rev 5 M1): the command an operator must run.
+    pub needs_operator: Option<String>,
     /// Added under protocol 13 (#80 S4): [`NodeStatus::members_revision`].
     pub members_revision: Option<u64>,
 }
@@ -1906,12 +2267,13 @@ pub struct WireTailRefused {
 
 /// A [`crate::host::TailAdoption`] as [`WireTailRefused::adoption`] and its reason.
 fn adoption_to_wire(adoption: crate::host::TailAdoption) -> (String, Option<String>) {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let (state, reason) = match adoption {
         Adoptable => ("adoptable", None),
         NotReady(reason) => ("not_ready", Some(reason)),
         Refused(reason) => ("refused", Some(reason)),
         Unchecked => ("unchecked", None),
+        Trimmed(reason) => ("trimmed", Some(reason)),
     };
     (state.to_owned(), reason.map(str::to_owned))
 }
@@ -1922,10 +2284,11 @@ fn adoption_from_wire(
     state: &str,
     reason: Option<&str>,
 ) -> Result<crate::host::TailAdoption, WireError> {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let known = |reason: &str| {
         crate::host::ADOPTION_REFUSALS
             .iter()
+            .chain(crate::host::ADOPTION_TRIMMED.iter())
             .copied()
             .find(|known| *known == reason)
             .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
@@ -1942,10 +2305,11 @@ fn adoption_from_wire(
         ("unchecked", None) => Unchecked,
         ("not_ready", Some(reason)) => NotReady(known(reason)?),
         ("refused", Some(reason)) => Refused(known(reason)?),
+        ("trimmed", Some(reason)) => Trimmed(known(reason)?),
         (state, reason) => return mismatch(state, reason),
     };
     match adoption {
-        NotReady(reason) | Refused(reason)
+        NotReady(reason) | Refused(reason) | Trimmed(reason)
             if crate::host::TailAdoption::of::<()>(&Err(reason)) != adoption =>
         {
             mismatch(state, Some(reason))
@@ -1999,6 +2363,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            needs_operator: status.needs_operator.clone(),
             members_revision: status.members_revision,
         }
     }
@@ -2062,6 +2427,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                     })
                 })
                 .transpose()?,
+            needs_operator: status.needs_operator,
             lengths: None,
             members_revision: status.members_revision,
         })

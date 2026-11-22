@@ -511,6 +511,8 @@ fn s80s4_an_open_on_a_removed_record_is_refused_and_route_keeps_its_app_address(
             dir.path(),
             NodeId(1),
             "https://gw-1.b.example:9443",
+            // The removed record is refused before `new_folder` is read.
+            false,
         ))
         .expect_err("an open of a removed node is refused");
     assert!(

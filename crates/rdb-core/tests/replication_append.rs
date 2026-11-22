@@ -1837,10 +1837,11 @@ fn ack_after_takeover(seq: u64) -> AppendAck {
 ///   nothing drops a rung (`DigestLadder`'s doc).
 ///
 /// Update (lead, after tester-kbr1): the round-2 residual is now pinned. A copy seeded above the
-/// cutoff holds no rung at or below it, and `on_recovered` answers
-/// `Ignored{Error(InvalidArgument)}` and changes nothing. The code calls that a handoff
-/// question, and no design row names an answer; the clause pins today's answer and that
-/// nothing is adopted, and changes if the design names another.
+/// cutoff holds no rung at or below it. Until issue #61 `on_recovered` answered
+/// `Ignored{Error(InvalidArgument)}` and changed nothing, pending a design answer. The #61
+/// history-trim design (§1b, row S1-R5, commit A3) names it: such a copy anchors at the root, as
+/// the refused-landing arm does, and asks the new primary from `(0, ROOT)`. The clause changed
+/// with it, as it said it would.
 #[retcd_test]
 fn m7b_139_recovered_looks_up_the_anchor_before_adopting_it_three_arms() {
     let new_lineage = Lineage {
@@ -1983,22 +1984,27 @@ fn m7b_139_recovered_looks_up_the_anchor_before_adopting_it_three_arms() {
         (new_root, new_lineage, None)
     );
 
-    // --- NotRetained, nothing to anchor on (tester-kb-append F2 residual, pinned by the lead):
-    // B seeded above the cutoff holds no rung at or below 100. It adopts nothing: the answer is
-    // `InvalidArgument` and the receiver is exactly what it was. The design names no answer
-    // here yet; if it names one, this clause changes with it.
+    // --- NotRetained, nothing to anchor on (tester-kb-append F2 residual; answered by issue
+    // #61 S1-R5): B seeded above the cutoff holds no rung at or below 100. It anchors at the
+    // root and asks the new primary from `(0, ROOT)`, adopting the new lineage.
     let mut module = Replication::new();
     module.install_receiver(receiver_at(P, 120, 120));
-    let before = rx(&module).clone();
-    assert_eq!(before.history().at_or_below(Seq(100)), None);
+    assert_eq!(rx(&module).history().at_or_below(Seq(100)), None);
     let effects = step(&mut module, &recovered(100, d(100), takeover_config()));
+    assert_eq!(effects.len(), 1, "{effects:?}");
     assert_eq!(
-        effects,
-        [ignored(KernelIgnoredReason::Error(
-            ErrorKind::InvalidArgument
-        ))]
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })
     );
-    assert_eq!(rx(&module), &before, "nothing adopted");
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.applied_head(), rx_.durable_seq()),
+        (root_head(), DurableSeq(0))
+    );
+    assert_eq!(rx_.lineage(), new_lineage);
 }
 
 /// Every other event kind a quarantined receiver can be offered, answered or declined, leaves
@@ -2668,8 +2674,10 @@ fn engine_rungs(through: u64) -> Vec<(Seq, Digest)> {
 /// root and its head, as after a rebuild that kept nothing older. B at 50 meets `NotRetained`,
 /// so C asks for a snapshot. The consumer reads C's engine and calls
 /// `Replication::restore_primary_history`; B's next `NeedPrefix` is answered with 51, with no
-/// snapshot. Refusals change nothing: rungs that stop short of the head or do not start at 0,
-/// a rung that contradicts the ladder, a node with no primary, and a retired primary.
+/// snapshot. Refusals change nothing: rungs that stop short of the head or leave a gap, a rung
+/// that contradicts the ladder, a node with no primary, and a retired primary. Issue #61 A3
+/// amended this row: rungs need not start at 0, only be dense from their first rung (the
+/// engine's trim floor), so `not from 0` became `a gap`, and a ladder from 50 is taken.
 #[retcd_test]
 fn a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for() {
     let mut history = DigestLadder::new();
@@ -2698,7 +2706,13 @@ fn a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for() {
     for (name, rungs) in [
         ("short of the head", engine_rungs(99)),
         ("contradicts the ladder", contradicts),
-        ("not from 0", engine_rungs(100)[1..].to_vec()),
+        (
+            "a gap",
+            engine_rungs(100)
+                .into_iter()
+                .filter(|(seq, _)| *seq != Seq(60))
+                .collect(),
+        ),
     ] {
         let before = module.primary(C, P).cloned();
         assert_eq!(
@@ -2716,6 +2730,15 @@ fn a_primary_restored_from_its_engine_walks_a_copy_it_asked_a_snapshot_for() {
         module.restore_primary_history(B, P, &engine_rungs(100)),
         invalid("primary")
     );
+
+    // Issue #61: an engine trimmed to 50 restores from its floor, and B at 50 walks from there.
+    let mut floored = module.clone();
+    assert_eq!(
+        floored.restore_primary_history(C, P, &engine_rungs(100)[50..]),
+        Ok(())
+    );
+    let mut primary = floored.primary(C, P).cloned().expect("installed");
+    assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
 
     assert_eq!(
         module.restore_primary_history(C, P, &engine_rungs(100)),
@@ -6078,6 +6101,11 @@ fn m10_d7_a_restore_history_takes_only_a_dense_agreeing_ladder() {
         Err(RdbError::InvalidArgument { field: "dormant" })
     );
 
+    // Issue #61: dense from its first rung, the engine's trim floor, is a whole ladder too.
+    let mut floored = rx_.clone();
+    assert_eq!(floored.restore_history(&dense[5..]), Ok(()));
+    assert_eq!(floored.history().digest_at(Seq(5)), Some(d(5)));
+
     assert_eq!(module.restore_history(B, P, &dense), Ok(()));
     assert_eq!(rx(&module).history().digest_at(Seq(5)), Some(d(5)));
 }
@@ -7442,4 +7470,113 @@ fn u2_m2_3_a_retransmit_above_a_superseding_plans_cutoff_is_stale_not_proof() {
         rejected(AppendReject::StaleGeneration { current: NEW_GEN })
     );
     assert_eq!(rx(&module).quarantine(), None);
+}
+
+// --- issue #61: the ladder floor -------------------------------------------------------------
+
+/// Issue #61 A3, S1-R5 (history-trim design §1b): B applied through 20 and its host trimmed
+/// History, and B's ladder, to 15. A `Recovered` whose cutoff is 10 finds no rung at or below
+/// the cutoff. Before #61 that was "unreachable" and answered `InvalidArgument`, leaving B
+/// unanchored; now B anchors at the root, as the refused-landing arm does, and asks the new
+/// primary from `(0, ROOT)`. That primary's trimmed ladder holds no root rung, so the walk asks
+/// for a snapshot. Untrimmed, the same `Recovered` anchors at the cutoff (control).
+/// Cut: the "unreachable" arm left in, red (`Ignored(Error(InvalidArgument))`, no reply).
+#[retcd_test]
+fn t61_recovered_cutoff_below_floor_anchors_at_root() {
+    let mut untrimmed = applied_to(20);
+    let effects = step(&mut untrimmed, &recovered(10, d(10), takeover_config()));
+    asks_new_primary(&effects, 10);
+
+    let mut module = applied_to(20);
+    assert_eq!(module.trim_history(B, P, Seq(15), d(15)), Ok(()));
+    assert_eq!(rx(&module).history().floor(), Some(Seq(15)));
+    let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })
+    );
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.applied_head(), rx_.received_seq(), rx_.durable_seq()),
+        (root_head(), ReceivedSeq(0), DurableSeq(0))
+    );
+    assert_eq!(rx_.history().floor(), Some(Seq::ZERO));
+    assert_eq!(rx_.history().highest(), Some(Seq::ZERO));
+    assert_eq!(rx_.lineage().generation, NEW_GEN);
+}
+
+/// Issue #61 round 3 (rdb-api `abort_begun`): a receiver rewound to the root after a snapshot
+/// install it began was aborted keeps the history root its `Recovered` set. As M7B-123, B is
+/// behind the root at `(100, d100)` of `GEN`; rewound, it holds `(0, ROOT)` and nothing else,
+/// with the same root, `authority_seq` and control revision. 51 of `GEN`, below the floor, is
+/// still judged as history: B answers `NeedPrefix` from 0, so the primary's cursor asks again,
+/// not `StaleGeneration`, which the primary ignores.
+/// Cut: `rewound` keeps no root (as `AppendReceiver::new` builds it), red (`StaleGeneration`).
+#[retcd_test]
+fn t61_r3_a_rewound_receiver_keeps_its_root_so_history_below_the_floor_draws_need_prefix() {
+    let (mut module, _) = behind_the_root();
+    let held = rx(&module).clone();
+    let rewound = held.rewound().expect("a rewound receiver");
+    assert_eq!(rewound.applied_head(), root_head());
+    assert_eq!(rewound.durable_seq(), DurableSeq(0));
+    assert_eq!(rewound.root(), held.root());
+    assert_eq!(rewound.authority_seq(), held.authority_seq());
+    assert_eq!(
+        rewound.last_partition_revision(),
+        held.last_partition_revision()
+    );
+    module.install_receiver(rewound);
+    let history = chain(ROOT_CUT);
+    let effects = sent_now(&mut module, C, &history[50]);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })
+    );
+}
+
+/// Issue #61 round 3 (rdb-api `Host::reseed`): a receiver that replaces another on the same copy
+/// and lineage takes what control installed (`carry_control_from`). As M7B-123, B holds the
+/// view and revision its `Recovered` installed. A new receiver at `(100, d100)`, as the re-seed
+/// builds one, carries both over, and the A1 view B already holds, routed again, is still a
+/// repeat (`NotRequired`), not recorded as new.
+/// Cut: `carry_control_from` does nothing, red (`authority_seq` 0, so the view is `Recorded`).
+#[retcd_test]
+fn t61_r3_a_replacement_receiver_carries_control_so_a_held_view_is_still_a_repeat() {
+    let (mut module, _) = behind_the_root();
+    let held = rx(&module).clone();
+    assert!(held.authority_seq() > 0, "{held:?}");
+    let mut fresh = AppendReceiver::new(ReceiverInit {
+        config: held.config().clone(),
+        own: held.copy(),
+        lineage: held.lineage(),
+        head: head(ROOT_CUT),
+        durable: DurableSeq(ROOT_CUT),
+    })
+    .expect("a re-seeded receiver");
+    fresh.carry_control_from(&held);
+    assert_eq!(fresh.authority_seq(), held.authority_seq());
+    assert_eq!(
+        fresh.last_partition_revision(),
+        held.last_partition_revision()
+    );
+    module.install_receiver(fresh);
+    let lineage = held.lineage();
+    let again = viewed(view_of(
+        held.authority_seq(),
+        lineage.generation,
+        lineage.owner_epoch,
+        held.config().config_version,
+    ));
+    assert_eq!(
+        step(&mut module, &again),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
 }

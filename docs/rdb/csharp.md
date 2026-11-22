@@ -27,8 +27,8 @@ the gateway. The gateway's output is `<run>/out/rdb-server.out`, its log `<run>/
 (never keys or values). Each call writes one `rdb_server_call` line: `method`, `kind` (`OK`, the
 error kind, or the gRPC code), `ms`, `request_id`, `no_mutation` (on errors), and `caller_gone`
 (true when the client had given up before the call ended: that is the line an operator settles an
-unknown write from). Each write that landed also writes `rdb_server_write`: `method`, `request_id`,
-`generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
+unknown write from). Each write that landed also writes `rdb_server_write` at debug (target `rdb_server::write`,
+#158): `method`, `request_id`, `generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
 (`no_mutation`, retried by the client). A stop (Ctrl-C, or `down`) ends within 45 s of being
 asked, however long a call has left: it waits that long in all for running calls to end and write
 their lines, then cuts every open connection (`rdb_server_stop_cut`) and logs the calls still
@@ -74,7 +74,7 @@ A refusal with `NoMutation = true` wrote nothing and needs no `StatusAsync`, whe
 carries a `RequestId`. A refusal carries one whenever the write was sent before it was refused,
 whatever its kind: `LEASE_EXPIRED`, and also `CONDITION_FAILED` or `INVALID_ARGUMENT` (for example
 a transaction with two puts to the same new key). A write refused before it was sent, such as one
-with a key over 1,024 bytes, carries none. `StatusAsync` is for an unknown outcome only.
+with a key over 1,024 bytes (`TOO_LARGE`, `Kind = TooLarge`), carries none. `StatusAsync` is for an unknown outcome only.
 
 Errors the client makes itself (`FromServer = false`) carry a retry class too: `BoundedJitter`
 for "not sent" and for a read with no answer (call again later), `Reconcile` for a write whose
@@ -117,10 +117,17 @@ answer was lost with no request id (read the object, then decide).
   `NoMutation = true`. The gateway would refuse it with no `RdbError`, which would read as an
   unknown outcome. Reads are not checked.
 - One write's whole record must fit 1 MiB (1,048,576 bytes), framing included. One put's
-  largest value is **1,048,240 bytes minus the key's length, minus 1 per 0x00 byte in the key**,
-  for a new key; 1 byte more for an existing key; the same with or without `ifVersion` (a 3-byte
-  key with no 0x00 byte: 1,048,237 new, 1,048,238 existing). A transaction's puts share the 1 MiB.
-  The server checks them (`INVALID_ARGUMENT`), exactly as the embedded API does.
+  largest value is **`MAX_VALUE`, 1,044,480 bytes** (1 MiB less 4 KiB), for any key the server
+  accepts, new or existing, with or without `ifVersion` (#148; it no longer moves with the key).
+  A transaction's puts share the 1 MiB.
+  The server checks them, exactly as the embedded API does: a key over 1,024 bytes, a value
+  over its limit, or a put's or transaction's whole write over the write limit is `TOO_LARGE`
+  (`Kind = TooLarge`, `NoMutation = true`, never retried), and the message names the limit, the
+  size and the most it allows. (The whole-write limit's `TOO_LARGE` covers byte puts and
+  transactions only. The embedded API's map, set, list and non-byte document writes, which this
+  client does not send, are `INVALID_ARGUMENT` over the record. Its object id limit answers
+  `TOO_LARGE` on any call, an object list's `after` cursor included. Its key limit applies only
+  to map and set writes and to a members page's `after` cursor.)
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an

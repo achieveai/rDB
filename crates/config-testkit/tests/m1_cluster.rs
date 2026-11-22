@@ -557,9 +557,12 @@ async fn m1_12_isolated_former_leader_rejects_write() {
     // Depose `leader` before healing. The ghost is already in its log, so while it is still
     // the only leader a heal lets it commit that entry legitimately — the outcome above was
     // "unknown", not "refused". A follower only campaigns after `leader_lease` plus its
-    // election timeout (2.25-3 s with the default timers), which outlasts the 2 s write
-    // timeout, so the put returning does not mean a successor exists. Observed 2026-09-27:
-    // no election, and the ghost committed when the read lost a race with replication.
+    // election timeout (2.25-3 s with the default timers). The put's write timeout is 2 s times
+    // `RETCD_TEST_DEADLINE_SCALE` (issue #160): at scale 1 it ends before any campaign, and at
+    // the gate's scale 3 (6 s) it can end before or after one, since the Raft timers are not
+    // scaled. Either way, the put returning does not mean a successor exists. Observed
+    // 2026-09-27: no election, and the ghost committed when the read lost a race with
+    // replication.
     let survivors: Vec<NodeId> = cluster
         .ids()
         .into_iter()

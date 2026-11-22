@@ -748,9 +748,25 @@ pub struct RouteInfo {
 impl RouteInfo {
     /// Where the owner's app takes forwarded requests: the address the owner's node wrote into
     /// its `nodes/{id}` record at open ([`crate::NodeAddresses::app`]), opaque to rDB (#83 B2).
-    /// `None` when the owner registered none, or the database was formed in one process
-    /// (`rdb_node --form`), which has no `nodes/` records. Read again at most once a second, so
-    /// an owner restarted with a new address is seen within about a second.
+    /// A read that succeeds is kept for a second, so successful reads come at most once a
+    /// second per owner, and an owner restarted with a new address is seen within about a
+    /// second.
+    ///
+    /// After a read that fails or does not answer in time, this is the last address a read of
+    /// that owner returned in this `Db`, whatever its age, so it may be stale; the call still
+    /// succeeds, and the next one reads again at once (SBX answer, 2026-11-20). `None` means
+    /// no address is stored (the owner registered none, or the database was formed by
+    /// `rdb_node --form`, which has no `nodes/` records), or no read of that owner has
+    /// succeeded yet. A stale address is safe because the sender checks the receiver's TLS
+    /// identity against [`Self::owner`] before it sends anything.
+    ///
+    /// **Only a dial hint** (SBX answer, 2026-11-20). rDB does not bind the address to the
+    /// node. rDB runs embedded in-process only, and its ports must not be reachable from
+    /// sandbox or app networks; gateways forward over their own mTLS on the private network.
+    /// The sender checks the receiver's TLS identity against [`Self::owner`] before sending any
+    /// data or credentials, so a wrong or stale address fails the handshake; the receiver
+    /// checks [`crate::Db::still_owner`] with [`Self::token`] before accepting forwarded data.
+    /// See `docs/rdb/embed.md`, "Which node owns a group".
     #[must_use]
     pub fn app_address(&self) -> Option<&str> {
         self.owner_address.as_deref()

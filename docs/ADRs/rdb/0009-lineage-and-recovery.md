@@ -149,9 +149,20 @@ Selected(max by head_seq)                    // safe only because every pair pas
 An earlier draft wrote "when the ladder lacks the needed seq, F1 emits `ProbeDigestAt` and waits",
 which smuggled an effect into a pure function that had no return path for it. Missing rungs are now
 a returned value, and the `Collecting` phase loops: emit the probes, fold the answers into the
-inventories, call again. A copy that cannot answer a probe is dropped from the candidate set and
-recorded in the `LossRecord` — losing an unreachable copy's prefix is a stated loss; promoting an
-unchecked one is not an option. The loop **collects every missing rung before returning**, so one
+inventories, call again. An unanswered probe (the holder is down, or its read faults) drops the
+probed copy from the candidate set at the probe deadline, recorded in the `LossRecord` — losing an
+unreachable copy's prefix is a stated loss; promoting an unchecked one is not an option.
+
+**Amended by issue #61 (History trim).** `ProbeUnavailable` now means the holder is alive and
+holds no record at that seq in the probed generation: either the seq is below its History floor,
+or it is above its head. A down holder, or one whose read faults, gives no answer. For a pair probe `(b, a.head)` below `b`'s head,
+`b` could not vouch for the shorter copies whose head is that seq, so **those shorter copies are
+dropped**, `Ineligible(StaleLineage)` (logged `survivor_behind_retention`), with their own
+outstanding probes; `b` is kept, and selection runs again on the rest. A shorter copy's head is at
+or below `b`'s, on the same root, and one generation admits one record per seq, so nothing `b`
+lacks is lost. A `ProbeUnavailable` for any other probe — a base probe, which wins when it is the
+same tuple as a pair probe, a probe of a shadow, or an answer above the probed copy's head —
+drops the probed copy, as before. The loop **collects every missing rung before returning**, so one
 round trip asks all the questions, and it **returns `Divergence` immediately** even with probes
 outstanding, because more evidence cannot un-prove a mismatch.
 
@@ -517,6 +528,41 @@ node whatever the setting, as check B does (slice 1, above).
   operator rule while the setting is off by default. Default-on prerequisite: a bump to 10, or a
   capability bit that gates the re-add, so a peer without both guards refuses or is never
   re-added live (issue #107). Any change that weakens check A takes a bump.
+  *Note 2026-11-20 (PR #178 review):* "a bump to 10" reads "a bump to the next free number at
+  that merge". Protocol numbers are assigned at merge: a branch takes main's version + 1 in a
+  one-line commit just before it merges, so no branch holds a number in advance (issue #148,
+  the `TooLarge` error kind, takes one that way; `crates/rdb-api/src/net/mod.rs`).
+
+**Amended 2026-11-19 (issue #107 slice 2b): protocol 10 and the owner's setting.** Two rules,
+shipped together. They supersede two parts of the slice 2a amendment above: the paragraph that
+says the receiving node reads its own setting, and the **Protocol 9** prerequisite. That text
+stays as written; this amendment replaces it.
+
+- **Protocol 10.** `PROTOCOL_VERSION` moves from 9 to 10, with no capability bit. Every build at
+  10 has check A, check B and the refusal mark. The handshake requires the same version in both
+  directions, so a build at 9 and a build at 10 never link, and each side logs
+  `net_handshake_refused` naming both versions. An owner never sees a link to a peer at 9 come
+  up, so its live re-add never probes that peer and never re-adds it at the boot it still runs.
+  So the operator rule of slice 2a ("only once every node runs a build with both") is now
+  enforced at the handshake. Upgrade: stop every node and every app process that links to
+  them (an app at 9 is refused by nodes at 10 too), upgrade them all, start the nodes, then
+  the apps (#170 review r1).
+  A capability bit was rejected: `wire::Hello` has no field for it, so it would change a wire
+  type and need the bump anyway.
+- **The owner's setting rides on the landing.** `Landed` carries `owner_live_readd`: the
+  `Timeouts::live_readd` of the owner whose F1 committed the generation. A copy refused a
+  landing marks a receiver it keeps only when that flag is on. Its own setting no longer plays
+  a part there; it governs only its own duty as an owner. A re-post of a committed root
+  (`copy_ahead`) relays the flag that root came with, never the relaying node's setting. No
+  stored record carries it: no restart or reopen path lands a generation, and marks live only in
+  memory. A later path that lands from `partitions/{id}` would have to carry it on the record.
+  So an owner with the setting on now protects a copy whose node has it off. A copy whose
+  owner has it off is no longer marked, since that owner never starts a same-boot return. Only
+  a cluster with mixed settings sees a difference. With the setting off everywhere, every
+  landing carries `false` and the logs are as before.
+
+Any change that weakens check A still takes a bump. The setting stays off by default until the
+512-partition acceptance run passes.
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
@@ -669,7 +715,7 @@ consumer does not handle.
 | No union exists | Structural: no merge function in the module; reviewed as an absence |
 | Unverified input cannot reach selection | Structural: `select_prefix` takes only `VerifiedInventory`, which has no public constructor. Reviewed, not compile-fail-tested — M7 adds no `trybuild` dependency, and a compile-fail row would assert the language, not this design |
 | A skipped compatibility loop is caught | Property test: generate inventory pairs agreeing at the root and disagreeing above it; `select_prefix` must return `Divergence`, never `Selected`. **This is the only guard on that half of the rule** |
-| A missing ladder rung is probed, not assumed | `select_prefix` returns `NeedProbes` with every missing rung in one batch; a copy that cannot answer is dropped and recorded in the `LossRecord` |
+| A missing ladder rung is probed, not assumed | `select_prefix` returns `NeedProbes` with every missing rung in one batch; an unanswered probe drops the probed copy, and a `ProbeUnavailable` for a pair probe below the probed copy's head drops the shorter copies instead (issue #61); either is recorded in the `LossRecord` |
 | Discovery window extends only while transferring, and not forever | Advertised-higher + progressing extends; stalled records unavailable and closes; a source dribbling one record per window is cut off after 3 extensions with `uncertain` set |
 | Every stalled source is recorded, not just one | Two concurrent transfers, both stalled: two `RecordSourceUnavailable` effects, one per copy |
 | Window survives a stale decision tick | A `FenceProven` whose `decision_tick` is 10 s old still gets a full 2,000 ms window from its arrival tick |

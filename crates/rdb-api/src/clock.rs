@@ -14,9 +14,11 @@
 //! `Tick` is one offset fixed at start, so two processes can disagree by any amount, and a
 //! frozen-clock pause leaves one behind for the rest of its life. [`ClockGuard`] compares this
 //! process's `Tick` with each peer's over the node links (`crate::net`): one [`ClockSample`] a
-//! second per link. A sample's true offset lies within `theta +- r/2`, whatever the asymmetry
-//! of the path, so [`verdict`] can tell **Agree** from **Breach** and calls everything between
-//! **Inconclusive**: delay and load widen the doubt and never make a Breach.
+//! second per link. A sample's true offset lies within `theta +- (r/2 + 1)`, whatever the
+//! asymmetry of the path: `r/2` for the path, and one more for the whole-millisecond readings
+//! ([`TICK_RESOLUTION_MILLIS`], issue #114). So [`verdict`] can tell **Agree** from **Breach**
+//! and calls everything between **Inconclusive**: delay and load widen the doubt and never make
+//! a Breach.
 //!
 //! [`HostClock::sample`] is where a [`ControlTime`] now comes from. With no `Net` attached
 //! it is always established, as it was before this guard. A node has a bound only while it,
@@ -45,12 +47,24 @@ pub const VERDICT_FRESH_MILLIS: u64 = 5_000;
 /// at most twice this, the 2-epsilon the promote proof needs.
 pub const LINK_EPSILON_MILLIS: u64 = Budgets::SPEC_DEFAULTS.clock_error_millis;
 
+/// A [`Tick`] is a whole millisecond, cut down from a finer clock, so one reading can sit up
+/// to just under 1 ms behind the clock it reads. Of a round's three stamps, the doubt that adds
+/// to `theta +- r/2` is under 1 ms either way: the true offset lies in
+/// `(theta - r/2 - 1, theta + r/2 + 1)`. Issue #114: two clocks started inside different
+/// milliseconds read 801 for a true offset under 801 with `r` 0, and a re-anchor by 801 put the
+/// node past its peers.
+pub const TICK_RESOLUTION_MILLIS: u64 = 1;
+
+/// [`TICK_RESOLUTION_MILLIS`] on both sides of a round, in the doubled units the arithmetic
+/// runs in.
+const DOUBLED_RESOLUTION: u64 = 2 * TICK_RESOLUTION_MILLIS;
+
 /// How one peer's clock compares with this process's, from one probe round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// The true offset is provably within epsilon: `abs(theta) + r/2 <= epsilon`.
+    /// The true offset is provably within epsilon: `abs(theta) + r/2 + 1 <= epsilon`.
     Agree,
-    /// The true offset is provably beyond epsilon: `abs(theta) - r/2 > epsilon`.
+    /// The true offset is provably beyond epsilon: `abs(theta) - r/2 - 1 > epsilon`.
     Breach,
     /// Neither proved: this round changes nothing.
     Inconclusive,
@@ -83,12 +97,13 @@ impl ClockSample {
     }
 }
 
-/// Judge one round. `doubled_offset` is twice `theta`; `round_trip` is `r`. `theta +- r/2`
-/// bounds the true offset, so Agree and Breach are proofs and the middle changes nothing.
+/// Judge one round. `doubled_offset` is twice `theta`; `round_trip` is `r`. `theta +- (r/2 +
+/// 1)` bounds the true offset ([`TICK_RESOLUTION_MILLIS`]), so Agree and Breach are proofs and
+/// the middle changes nothing.
 #[must_use]
 pub const fn verdict(doubled_offset: i128, round_trip: u64, epsilon: u64) -> Verdict {
     let abs = doubled_offset.unsigned_abs();
-    let r = round_trip as u128;
+    let r = round_trip as u128 + DOUBLED_RESOLUTION as u128;
     let two_epsilon = (epsilon as u128) * 2;
     if abs + r <= two_epsilon {
         Verdict::Agree
@@ -116,16 +131,21 @@ impl PeerVerdict {
         now.saturating_sub(self.formed_at) <= VERDICT_FRESH_MILLIS
     }
 
-    /// The peer is proved ahead of this clock by more than `epsilon`.
-    fn ahead(&self, epsilon: u64) -> bool {
-        self.doubled_offset - i128::from(self.round_trip) > 2 * i128::from(epsilon)
+    /// Twice the least the peer is proved ahead of this clock: `theta - r/2 - 1`, doubled.
+    fn doubled_lower_bound(&self) -> i128 {
+        self.doubled_offset - i128::from(self.round_trip) - i128::from(DOUBLED_RESOLUTION)
     }
 
-    /// The most this clock may be moved forward on this peer's word: `theta - r/2`, rounded
-    /// down. Only meaningful for a peer [`Self::ahead`].
+    /// The peer is proved ahead of this clock by more than `epsilon`.
+    fn ahead(&self, epsilon: u64) -> bool {
+        self.doubled_lower_bound() > 2 * i128::from(epsilon)
+    }
+
+    /// The most this clock may be moved forward on this peer's word: `theta - r/2 - 1`, rounded
+    /// down, which the true offset exceeds ([`TICK_RESOLUTION_MILLIS`]). Only meaningful for a
+    /// peer [`Self::ahead`].
     fn proven_ahead_millis(&self) -> u64 {
-        let doubled = self.doubled_offset - i128::from(self.round_trip);
-        u64::try_from(doubled / 2).unwrap_or(0)
+        u64::try_from(self.doubled_lower_bound() / 2).unwrap_or(0)
     }
 }
 
@@ -932,16 +952,17 @@ mod tests {
     /// red at the edge; drop the Agree latch from `established`, red below.
     #[test]
     fn row_13a_verdict_edges_and_the_bound_rule() {
-        // |theta| + r/2 == epsilon is the last Agree; one more is no longer proved.
-        assert_eq!(verdict(2 * 80, 40, EPS), Verdict::Agree);
-        assert_eq!(verdict(-2 * 80, 40, EPS), Verdict::Agree);
-        assert_eq!(verdict(2 * 81, 40, EPS), Verdict::Inconclusive);
-        // |theta| - r/2 == epsilon is not yet a Breach; one more is.
-        assert_eq!(verdict(2 * 120, 40, EPS), Verdict::Inconclusive);
-        assert_eq!(verdict(2 * 121, 40, EPS), Verdict::Breach);
-        assert_eq!(verdict(-2 * 121, 40, EPS), Verdict::Breach);
+        // |theta| + r/2 + 1 == epsilon is the last Agree; one more is no longer proved. The 1 is
+        // the readings' resolution (#114).
+        assert_eq!(verdict(2 * 79, 40, EPS), Verdict::Agree);
+        assert_eq!(verdict(-2 * 79, 40, EPS), Verdict::Agree);
+        assert_eq!(verdict(2 * 80, 40, EPS), Verdict::Inconclusive);
+        // |theta| - r/2 - 1 == epsilon is not yet a Breach; one more is.
+        assert_eq!(verdict(2 * 121, 40, EPS), Verdict::Inconclusive);
+        assert_eq!(verdict(2 * 122, 40, EPS), Verdict::Breach);
+        assert_eq!(verdict(-2 * 122, 40, EPS), Verdict::Breach);
         // An odd r: the doubled form loses nothing to the division.
-        assert_eq!(verdict(2 * 80, 41, EPS), Verdict::Inconclusive);
+        assert_eq!(verdict(2 * 79, 41, EPS), Verdict::Inconclusive);
         // Stamps: the offset is at minus the midpoint, and a backward round is no measurement.
         assert_eq!(round(100, 160, 120).doubled_offset(), 2 * 50);
         assert_eq!(round(120, 100, 100).round_trip_millis(), None);
@@ -1021,6 +1042,55 @@ mod tests {
         assert!(honest.established(K, later), "three honest ones are");
     }
 
+    /// Issue #114: the proof holds for clocks read in whole milliseconds. Two clocks run at
+    /// one rate, a true `offset` apart in microseconds, each started at some point inside a
+    /// millisecond; a round reads each stamp cut down to its millisecond. For every phase of
+    /// the two clocks and of the round's three instants, an Agree is within epsilon, a Breach
+    /// is beyond it, and a peer proved ahead is ahead by at least the amount a re-anchor
+    /// takes. The issue's round, true offset 800.3 ms read as 801 with `r` 0, is among them.
+    /// Cut: [`TICK_RESOLUTION_MILLIS`] to 0, red (a re-anchor of 801 for a true 800.3).
+    #[test]
+    fn issue_114_the_proof_holds_for_whole_millisecond_readings() {
+        let read = |micros: i64| u64::try_from(micros.div_euclid(1_000)).expect("positive");
+        let phases = (0..1_000).step_by(100).chain([1, 999]);
+        for offset in [
+            800_300, 800_000, 799_700, 100_000, -100_000, 101_000, 99_000, 0, 1_500,
+        ] {
+            for here in phases.clone() {
+                let there = here + offset;
+                for (out, back) in [(0, 0), (0, 400), (300, 300), (999, 1), (2_000, 3_000)] {
+                    for start in [10_000_000, 10_000_250, 10_000_999] {
+                        let echoed = start + out;
+                        let sample = round(
+                            read(start + here),
+                            read(echoed + there),
+                            read(echoed + back + here),
+                        );
+                        let r = sample.round_trip_millis().expect("forward");
+                        let doubled_offset = sample.doubled_offset();
+                        let what = format!("offset {offset} us, phase {here}, {sample:?}");
+                        let eps = i64::try_from(EPS).expect("small") * 1_000;
+                        match verdict(doubled_offset, r, EPS) {
+                            Verdict::Agree => assert!(offset.abs() <= eps, "Agree: {what}"),
+                            Verdict::Breach => assert!(offset.abs() > eps, "Breach: {what}"),
+                            Verdict::Inconclusive => {}
+                        }
+                        let seen = PeerVerdict {
+                            verdict: Verdict::Breach,
+                            doubled_offset,
+                            round_trip: r,
+                            formed_at: 0,
+                        };
+                        if seen.ahead(EPS) {
+                            let by = i64::try_from(seen.proven_ahead_millis()).expect("small");
+                            assert!(by * 1_000 <= offset, "a re-anchor by {by} ms: {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 13b: a round whose delay exceeds what it could prove is Inconclusive, at any offset the
     /// delay can explain, and changes neither the table nor the latch. Cut: drop `r` from the
     /// Breach test, red.
@@ -1046,7 +1116,7 @@ mod tests {
         // K=3: two peers ahead, by the smallest lower bound.
         let mut three = table(&[(2, offset_by(900, 20)), (3, offset_by(700, 40))], 0);
         let done = three.reanchor(3, EPS, 0).expect("two of three ahead");
-        assert_eq!(done.by_millis, 680, "theta - r/2 of the nearer peer");
+        assert_eq!(done.by_millis, 679, "theta - r/2 - 1 of the nearer peer");
         assert_eq!(done.peers, [NodeId(2), NodeId(3)]);
         assert!(three.peers.is_empty(), "those verdicts are cleared");
         assert!(!three.agreed, "the latch is reset");
