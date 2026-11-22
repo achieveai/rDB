@@ -72,6 +72,9 @@ pub struct AsyncDb {
 struct Registering {
     count: Mutex<usize>,
     done: Condvar,
+    /// Test-only (PR #178 review r6): fired each time a shutdown starts to wait for a bridge.
+    #[cfg(test)]
+    waiting: tokio::sync::Notify,
 }
 
 /// One bridge's share of [`Registering`]. It counts from before the bridge takes the `Db` to
@@ -419,6 +422,8 @@ fn unwrap_past_bridges(mut db: Arc<Db>, registering: &Registering) -> Result<Db,
             return Err(db);
         }
         if *bridges > 0 {
+            #[cfg(test)]
+            registering.waiting.notify_one();
             drop(registering.done.wait(bridges));
         } else {
             drop(bridges);
@@ -549,9 +554,10 @@ mod tests {
 
     /// PR #178 review r3 T32: a bridge still registering holds the `Db` (its count first,
     /// then the `Arc`, as `ownership_events`'s bridge does). `shutdown` stays pending while it
-    /// holds them and answers `Ok` once it lets go. Cut: `shutdown` answers `Err(self)` at once
-    /// on a failed `try_unwrap`: red, it is finished before the release. Integration: one
-    /// database open.
+    /// holds them and answers `Ok` once it lets go. The bridge lets go only once `shutdown`
+    /// signals that it waits for it (`Registering::waiting`, review r6), so no sleep decides
+    /// the order. Cut: `shutdown` answers `Err(self)` at once on a failed `try_unwrap`: red, it
+    /// is finished before it waits. Integration: one database open.
     #[config_log::retcd_test]
     fn shutdown_waits_for_a_registering_bridge() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -561,10 +567,16 @@ mod tests {
         let dir = config_testkit::fs::temp_dir();
         let db = opened(&rt, dir.path());
         rt.block_on(async move {
-            let registration = super::Registration::new(Arc::clone(&db.registering));
+            let registering = Arc::clone(&db.registering);
+            let registration = super::Registration::new(Arc::clone(&registering));
             let bridge = Arc::clone(&db.db);
-            let shut = tokio::spawn(db.shutdown());
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut shut = tokio::spawn(db.shutdown());
+            tokio::select! {
+                () = registering.waiting.notified() => {}
+                finished = &mut shut => {
+                    panic!("shutdown finished while a bridge registers: {:?}", finished.map(|r| r.is_ok()));
+                }
+            }
             assert!(
                 !shut.is_finished(),
                 "shutdown waits while a bridge registers"
