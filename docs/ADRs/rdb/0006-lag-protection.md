@@ -413,6 +413,9 @@ pause still bounds how long an applied record can go without being durable on tw
 
 **What replaces the signal.** The host logs `copy_durable_lagging` (Warn) when a copy stays below
 the quorum floor for `pause_age_millis`, and `copy_durable_lag_cleared` when it catches up.
+A copy still below the floor `peer_drop_after_millis` after that Warn is dropped on the
+`lagging` drop clock, linked or not (Q1, default (a)), so a copy that stays linked but stops
+syncing cannot leave the partition running at two copies with nothing but a log line.
 
 **Rejected:** leaving a stale copy out of the floor (option B, a contract change); a 2 s drop
 clock (option C, about 3 s of refusal and bad for rolling restarts).
@@ -434,7 +437,7 @@ clock (option C, about 3 s of refusal and bad for rolling restarts).
 | A block reads as a block | `BlockPartition` with no prior `Lost` (predicate already false, or before the first `Gained`): the module is `Paused`, `reason == DIVERGENCE_REQUIRES_OPERATOR`, and no later `HealthEval` or `Gained` resumes it |
 | A membership change does not unblock | `BlockPartition`, then a config change adding a regular copy that ACKs at head: `Gained` arrives, every predicate is durable through the barrier, and the module still stays `Paused` with admission unchanged |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |
-| A lost third copy does not pause (amendment 2026-11-22) | RF3, node 3 silent, writes for > `pause_age`: no `Paused`, no refusal, `copy_durable_lagging` names copy 3 (`i79_a_lost_secondary_refuses_no_write_and_warns`, `i79_a_third_copy_that_stops_syncing_never_pauses_l1`) |
+| A lost third copy does not pause (amendment 2026-11-22) | RF3, node 3 silent, writes for > `pause_age`: no `Paused`, no refusal, `copy_durable_lagging` names copy 3 (`i79_a_lost_secondary_refuses_no_write_and_warns`) |
 | The quorum still needs the primary (amendment 2026-11-22) | B and C durable, the primary's flush stalled: it pauses (the row above, unchanged; `i79_the_protection_floor_is_the_primary_and_the_best_secondary` clause 3) |
 | `next_interesting_tick` is sound | Property: for every state, no `HealthEval` strictly before the returned tick changes the state |
 | Idle never pauses | No transactions, advance virtual time by an hour: state stays `Healthy` |

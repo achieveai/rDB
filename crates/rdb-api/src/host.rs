@@ -1844,6 +1844,9 @@ enum DropClock {
     Unreachable,
     /// L1 refused writes on account of the copy for `peer_drop_after_millis` (A-R281).
     Paused,
+    /// Issue #79 (Q1): the copy stayed below the durable quorum floor past its
+    /// `copy_durable_lagging` Warn for `peer_drop_after_millis`, linked or not.
+    Lagging,
 }
 
 impl DropClock {
@@ -1851,6 +1854,7 @@ impl DropClock {
         match self {
             Self::Unreachable => "unreachable",
             Self::Paused => "paused",
+            Self::Lagging => "lagging",
         }
     }
 }
@@ -7584,9 +7588,15 @@ impl Host {
                     continue;
                 }
             }
-            let Some((copy, durable)) = self.holding_up(partition, now) else {
-                self.blamed.remove(&partition);
-                continue;
+            let (copy, durable, clock) = match self.holding_up(partition, now) {
+                Some((copy, durable)) => (copy, durable, DropClock::Paused),
+                None => match self.lagging_past_pause(partition) {
+                    Some((copy, durable)) => (copy, durable, DropClock::Lagging),
+                    None => {
+                        self.blamed.remove(&partition);
+                        continue;
+                    }
+                },
             };
             let unlinked = self
                 .committed
@@ -7598,7 +7608,7 @@ impl Host {
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
-                self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
+                self.drop_copy(partition, blame, blamed_ms, clock);
             }
         }
         self.live_readd_duty(now);
@@ -9553,6 +9563,32 @@ impl Host {
             })
             .map(|member| member.node)
             .collect()
+    }
+
+    /// Issue #79 (Q1, default (a)): under the quorum floor a linked copy that stays behind no
+    /// longer pauses L1, so [`Self::holding_up`]'s clock never starts for it, and without this
+    /// the partition would run at RF2 with nothing to say so but a Warn. This names, for the
+    /// same drop clock, the most-behind regular secondary that warned `copy_durable_lagging`
+    /// ([`Self::warn_lagging`]): the blame starts at the Warn, at `pause_age_millis`, where the
+    /// paused clock used to start. The gates are [`Self::holding_up`]'s.
+    fn lagging_past_pause(&self, partition: PartitionId) -> Option<(CopyId, DurableSeq)> {
+        if self.rejoins.contains_key(&partition) {
+            return None;
+        }
+        let committed = self.committed.get(&partition)?;
+        if committed.mode == PartitionMode::ReadOnly || !self.is_pinned_primary(partition) {
+            return None;
+        }
+        let tracker = self.replication.primary(self.node, partition)?.tracker();
+        self.lagging
+            .iter()
+            .filter(|((at, _), entry)| *at == partition && entry.warned)
+            .filter_map(|((_, copy), _)| {
+                tracker
+                    .peer(*copy)
+                    .map(|peer| (*copy, peer.progress.durable))
+            })
+            .min_by_key(|(copy, durable)| (durable.0, copy.0))
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
