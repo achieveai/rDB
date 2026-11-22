@@ -1619,9 +1619,11 @@ impl RocksEngine {
                     }
                     write.put_cf(cf, raw, framed);
                 }
-                // A plain delete would let a read fall through to the parent's key
-                // (ADR-rdb-0010 decision 4).
-                None if marks.link.is_some() => write.put_cf(cf, raw, tombstone(batch.seq.0)),
+                // A plain delete would let a read fall through to a lower level's value, so only
+                // a key some lower level holds gets a tombstone (ADR-rdb-0010 decision 4, S5a).
+                None if self.lower_holds(batch.partition, batch.generation, w.ns, &w.key)? => {
+                    write.put_cf(cf, raw, tombstone(batch.seq.0));
+                }
                 None => write.delete_cf(cf, raw),
             }
         }
@@ -2494,6 +2496,26 @@ impl RocksEngine {
             }
             level = link.parent;
         }
+    }
+
+    /// Whether a read of `key` in `ns` at lineage `(partition, generation)` that finds nothing on
+    /// the own level reaches a value on a lower level: [`Self::get`]'s walk from the first link.
+    /// One point read per level reached.
+    fn lower_holds(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+    ) -> Result<bool, StorageFault> {
+        let Some(link) = self.link(partition, generation) else {
+            return Ok(false);
+        };
+        let falls_through = match ns {
+            Namespace::History => decode_mark(key).is_some_and(|seq| seq <= link.base.0),
+            _ => !link.copied,
+        };
+        Ok(falls_through && self.get(partition, link.parent, ns, key)?.is_some())
     }
 
     /// The link of lineage `(partition, generation)`, `None` for a lineage with no parent.
