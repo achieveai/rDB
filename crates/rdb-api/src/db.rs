@@ -31,7 +31,7 @@ use rdb_core::contracts::ids::{
     RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
-use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
+use rdb_core::contracts::txn::{Condition, Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::partition_map::{affinity_hash, partition_of, RoutesRoot, MAX_PARTITIONS};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use rdb_storage::RocksEngine;
@@ -4343,8 +4343,10 @@ impl Db {
     }
 
     /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch under
-    /// `expect` when given. Whether any batch deleted something. Under [`Expected::Absent`], a
-    /// root found there ends the drain and the object survives (PR #178 review r4 N1).
+    /// `expect` when given. Whether any batch deleted something. [`Expected::Absent`] drains
+    /// records with no root by [`Self::rootless_batch`], never by the public write, which
+    /// refuses it: a root found there ends the drain and the object survives (PR #178 review r4
+    /// N1, r5 B1). Any other failed condition is the error.
     fn drain(
         &self,
         group: AffinityId,
@@ -4352,26 +4354,65 @@ impl Db {
         expect: Option<Expected>,
         deadline: Duration,
     ) -> Result<bool, PutError> {
+        let rootless = expect == Some(Expected::Absent);
         let mut emptied = false;
         loop {
             let put = PutOp {
                 group,
                 object: Bytes::copy_from_slice(id),
                 change: Change::Delete,
-                expect,
+                expect: expect.filter(|_| !rootless),
             };
-            match self.changes(vec![put], deadline) {
+            let sent = if rootless {
+                self.rootless_batch(put, deadline)
+            } else {
+                self.changes(vec![put], deadline)
+            };
+            match sent {
                 Ok(Some(_)) => emptied = true,
                 Ok(None) => return Ok(emptied),
-                Err(error)
-                    if expect == Some(Expected::Absent)
-                        && error.error.kind == ErrorKind::ConditionFailed =>
-                {
-                    return Ok(emptied);
+                // Reread the root: only a root committed since the compile ends it quietly.
+                Err(error) if rootless && error.error.kind == ErrorKind::ConditionFailed => {
+                    let reread = self.list_page(group, id, None, 1, false);
+                    let request = None;
+                    let (rooted, ..) = reread.map_err(|error| PutError { error, request })?;
+                    if rooted.first().is_some_and(|found| found.id == id) {
+                        return Ok(emptied);
+                    }
+                    return Err(error);
                 }
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// One batch of a rootless drain: `put`, a [`Change::Delete`] with no expect, compiled and
+    /// sent only while it carries the kernel's guard that the root is absent. `Ok(None)` when it
+    /// does not, a root being in the owner's view, or when nothing is left: nothing was sent.
+    fn rootless_batch(&self, put: PutOp, deadline: Duration) -> Result<Option<PutOk>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let root = rdb_value::keys::root_key(TENANT, put.group, &put.object).to_bytes();
+        let identity = self.write_identity()?;
+        let answer = match self.compile(identity, vec![put], deadline) {
+            Ok(Some(request))
+                if request.conditions.iter().any(
+                    |condition| matches!(condition, Condition::Absent { key } if *key == root),
+                ) =>
+            {
+                #[cfg(test)]
+                before_send(self, &root);
+                self.send_compiled(identity, request, send_wait(deadline))
+                    .map(Some)
+            }
+            Ok(_) => Ok(None),
+            Err(error) => Err(error),
+        };
+        self.finished(identity.request, answer)
     }
 
     /// Compile and send `puts` as one transaction under a fresh write id, with kernel deadline
@@ -7578,6 +7619,39 @@ fn after_page(db: &Db, prefix: &[u8]) {
         let mut steps = lock(&AFTER_PAGE);
         let at = steps.iter().position(|(armed, _)| armed == prefix);
         at.map(|at| steps.remove(at).1)
+    };
+    if let Some(step) = step {
+        step(db);
+    }
+}
+
+/// Test-only (PR #178 review r5): steps run in a rootless drain between a batch's compile and
+/// its send, each with the batches still to pass before it runs.
+#[cfg(test)]
+static BEFORE_SEND: Mutex<Vec<(Bytes, usize, PageStep)>> = Mutex::new(Vec::new());
+
+/// Test-only: a rootless drain of the object whose root key is `root` runs `step` after it
+/// has compiled `skip` batches and compiled one more, before that one is sent. Used once.
+#[cfg(test)]
+fn on_send(root: Bytes, skip: usize, step: PageStep) {
+    lock(&BEFORE_SEND).push((root, skip, step));
+}
+
+/// Count a compiled rootless batch at `root` toward the step [`on_send`] armed there, and run
+/// and disarm it when its turn has come.
+#[cfg(test)]
+fn before_send(db: &Db, root: &Bytes) {
+    let step = {
+        let mut steps = lock(&BEFORE_SEND);
+        let at = steps.iter().position(|(armed, ..)| armed == root);
+        match at {
+            Some(at) if steps[at].1 == 0 => Some(steps.remove(at).2),
+            Some(at) => {
+                steps[at].1 -= 1;
+                None
+            }
+            None => None,
+        }
     };
     if let Some(step) = step {
         step(db);
@@ -16233,5 +16307,88 @@ mod tests {
             other => panic!("a range read answered {other:?}"),
         }
         assert_eq!(emptied, 0, "the walk emptied nothing");
+    }
+
+    /// Write `count` chunks of `upload` at `id`, one byte each, with no root.
+    fn rootless_chunks(db: &Db, id: &[u8], upload: [u8; 16], count: u32) {
+        for index in 0..count {
+            let chunk = Change::Chunk {
+                upload,
+                index,
+                bytes: Bytes::from_static(b"c"),
+            };
+            db.write_in(GROUP, id, chunk, None).expect("a chunk");
+        }
+    }
+
+    /// PR #178 review r5 B1: a prefix delete drains an id with 255 chunks and no root; another
+    /// delete of that id runs between the drain's first compile and its send, so the batch's
+    /// chunk versions fail with no root there. The prefix delete answers that CONDITION_FAILED,
+    /// never success with a chunk left, and a rerun finishes. Cut: end a rootless drain quietly
+    /// on any failed condition (r4's code, no reread of the root); the walk answers `Ok` and a
+    /// chunk is left. Integration (~3 s): one open, the overlap from an `on_send` step.
+    #[test]
+    fn r5_b1_an_overlapping_delete_in_a_rootless_drain_is_the_error() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r5-b1/";
+        let id: &[u8] = b"r5-b1/chunks";
+        rootless_chunks(&db, id, [0x51; 16], 255);
+        let root = rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes();
+        on_send(
+            root,
+            0,
+            Box::new(|db: &Db| {
+                db.write_in(GROUP, b"r5-b1/chunks", Change::Delete, None)
+                    .expect("the overlapping delete")
+                    .expect("it deletes a batch");
+            }),
+        );
+        let refused = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .expect_err("a failed condition with no root is not success");
+        assert_eq!(
+            refused.error.error.kind,
+            ErrorKind::ConditionFailed,
+            "{}",
+            refused.error
+        );
+        let rerun = db.delete_prefix_in(GROUP, prefix, Duration::from_secs(5));
+        assert_eq!(
+            rerun.map_err(|e| e.error.error.kind),
+            Ok(1),
+            "a rerun empties the id"
+        );
+        let (left, ..) = db
+            .list_page(GROUP, prefix, None, 10, true)
+            .expect("list the prefix");
+        assert!(left.is_empty(), "nothing is left: {left:?}");
+    }
+
+    /// PR #178 review r5 Q: `write(.., Change::Delete, Some(Expected::Absent))` is not public
+    /// API: it is INVALID_ARGUMENT and deletes nothing. The rootless drain takes a private path.
+    /// Cut: compile that put as a delete with no expect again (274c1ab's host arm), and the
+    /// chunk is deleted. Integration (~2 s): one open.
+    #[test]
+    fn r5_q_a_public_delete_expecting_absent_is_invalid_argument() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let id: &[u8] = b"r5-q/chunk";
+        rootless_chunks(&db, id, [0x52; 16], 1);
+        let refused = db
+            .write_in(GROUP, id, Change::Delete, Some(Expected::Absent))
+            .expect_err("an absent expect on a delete is refused");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{}",
+            refused.error
+        );
+        let (left, ..) = db
+            .list_page(GROUP, id, None, 10, true)
+            .expect("list the id");
+        assert_eq!(left.len(), 1, "the chunk is still there: {left:?}");
     }
 }

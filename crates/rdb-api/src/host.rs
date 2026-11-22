@@ -1006,8 +1006,7 @@ pub enum Change {
     /// its count and links stay true; a blob's root goes first, leaving chunks with no root,
     /// which read as absent; any other object keeps its root to the last batch. `expect`
     /// `Version(v)` makes every batch a CAS on the root, and the chunks a deleted blob leaves go
-    /// on under it; `Absent` deletes only records with no root, and a root is
-    /// `CONDITION_FAILED`, never sent. A re-created object never inherits old records.
+    /// on under it; `Absent` is refused. A re-created object never inherits old records.
     Delete,
 }
 
@@ -14730,17 +14729,9 @@ impl Host {
                     .map_err(|e| compile_error(&root, &e)),
                 Change::Clear => self.clear(partition, identity, &root, view, published),
                 Change::Delete => match put.expect {
-                    // PR #178 review r4 N1: records with no root, which must stay rootless. Each
-                    // batch is guarded by the root's absence, so one committed later survives.
-                    Some(Expected::Absent) => {
-                        match view.version(Namespace::User, root.as_bytes()) {
-                            Some(found) => Err(ApiError::new(
-                                ErrorKind::ConditionFailed,
-                                format!("a delete expecting no root found one at version {found}"),
-                            )),
-                            None => self.delete(partition, &root, view, published, None),
-                        }
-                    }
+                    Some(Expected::Absent) => Err(ApiError::invalid(
+                        "a delete takes no absent expect: deleting nothing is not a write",
+                    )),
                     Some(Expected::Version(version)) => {
                         self.delete(partition, &root, view, published, Some(version))
                     }
