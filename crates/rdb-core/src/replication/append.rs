@@ -56,7 +56,7 @@ use crate::contracts::membership::{CopyId, Member, PartitionConfig};
 use crate::contracts::storage::{Batch, Namespace, StoreEffect, Write};
 use crate::contracts::transport::{Frame, PeerLabel, SendEffect};
 use crate::contracts::version::ENVELOPE_VERSION;
-use crate::replication::progress::{DigestLadder, DigestLookup};
+use crate::replication::progress::{dense_through, trim_refusal, DigestLadder, DigestLookup};
 use crate::replication::wire::{decode_recovery_append, encode_reply};
 use crate::replication::{ignored, quarantine_alert};
 
@@ -353,27 +353,23 @@ impl AppendReceiver {
         self.recovery_plan.as_ref()
     }
 
-    /// Give a dormant receiver the digests its engine verified, `(0, ROOT)` through its applied
-    /// head, so it can source a catch-up (critic-d7 F2): the cursor looks up the target's head
-    /// and every ACK in this ladder. Built when the first catch-up asks, not at open.
+    /// Give a dormant receiver the digests its engine verified, from the engine's floor
+    /// through its applied head, so it can source a catch-up (critic-d7 F2): the cursor looks up
+    /// the target's head and every ACK in this ladder. Built when the first catch-up asks, not
+    /// at open. The floor is `(0, ROOT)` on an engine never trimmed, and the trim floor
+    /// otherwise (issue #61).
     ///
     /// # Errors
     ///
     /// [`RdbError::InvalidArgument`] when this receiver is not dormant, when a rung is above
     /// the applied head or disagrees with a rung already held, or when the rungs leave a gap
-    /// between 0 and the head. Nothing is written then.
+    /// between their first rung and the head. Nothing is written then.
     pub fn restore_history(&mut self, rungs: &[(Seq, Digest)]) -> Result<(), RdbError> {
         let invalid = |field| Err(RdbError::InvalidArgument { field });
         if !self.dormant {
             return invalid("dormant");
         }
-        let head = self.applied_head.seq.0;
-        let dense = rungs.len() as u64 == head + 1
-            && rungs
-                .iter()
-                .enumerate()
-                .all(|(at, (seq, _))| seq.0 == at as u64);
-        if !dense {
+        if !dense_through(rungs, self.applied_head.seq) {
             return invalid("rungs");
         }
         let disagrees = rungs.iter().any(|&(seq, digest)| {
@@ -388,6 +384,67 @@ impl AppendReceiver {
             self.history.insert(seq, digest);
         }
         Ok(())
+    }
+
+    /// Trim the ladder to the floor `(seq, digest)` the host is about to trim History to (issue
+    /// #61): every rung below `seq` is dropped, `(0, ROOT)` with them once `seq` is above 0, and
+    /// the rung at `seq` is kept or written. Live, dormant, retired and quarantined receivers
+    /// alike: a ladder never vouches for a record its engine no longer holds.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `seq` when it is above the applied head, and
+    /// `digest` when it contradicts the rung held at `seq`, or is not the root at 0. Nothing
+    /// changes then.
+    pub fn trim_history(&mut self, seq: Seq, digest: Digest) -> Result<(), RdbError> {
+        if let Some(field) = trim_refusal(&self.history, self.applied_head.seq, seq, digest) {
+            return Err(RdbError::InvalidArgument { field });
+        }
+        self.history.trim_below(seq);
+        self.history.insert(seq, digest);
+        Ok(())
+    }
+
+    /// Issue #61 round 3: this receiver with nothing applied, for a copy whose engine no longer
+    /// holds any record of the lineage (a snapshot install aborted after its wipe). Head,
+    /// received, durable, ladder, staged record and quarantine go back to the root. The history
+    /// root that `Recovered` set is kept, so a record at or below its floor is still judged as
+    /// history. Everything control installed is kept too ([`Self::carry_control_from`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], which this receiver's own config and copy always pass.
+    pub fn rewound(&self) -> Result<Self, RdbError> {
+        let mut rewound = Self::new(ReceiverInit {
+            config: self.config.clone(),
+            own: self.own.copy,
+            lineage: self.lineage,
+            head: Head {
+                seq: Seq::ZERO,
+                digest: Digest::ROOT,
+            },
+            durable: DurableSeq(0),
+        })?;
+        rewound.root = self.root;
+        rewound.carry_control_from(self);
+        Ok(rewound)
+    }
+
+    /// Issue #61 round 3: take from `old`, the receiver this one replaces on the same copy and
+    /// lineage, what control and recovery installed and what no record carries: the control
+    /// revision (row 6R's floor), the A1 view's `authority_seq`, the retired, dormant and
+    /// sealed states, the kept recovery plan, the refused landings, and the batch counter, so
+    /// a late completion of an old batch never matches a new one. Without it a replacement
+    /// starts at revision 0 and `authority_seq` 0, so an older A1 view would pass as new.
+    pub fn carry_control_from(&mut self, old: &Self) {
+        self.last_partition_revision = old.last_partition_revision;
+        self.authority_seq = old.authority_seq;
+        self.retired = old.retired;
+        self.dormant = old.dormant;
+        self.recovery_plan.clone_from(&old.recovery_plan);
+        self.sealed_through = old.sealed_through;
+        self.refused_landings.clone_from(&old.refused_landings);
+        self.next_batch = old.next_batch;
     }
 
     /// Whether this is a dormant receiver (lead ruling A-R173): restored after a restart and

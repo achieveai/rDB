@@ -103,7 +103,9 @@ pub fn check_listen(addr: &str) -> Result<SocketAddr, String> {
 #[must_use]
 pub const fn code_for(kind: ErrorKind) -> Code {
     match kind {
-        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity => Code::InvalidArgument,
+        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity | ErrorKind::TooLarge => {
+            Code::InvalidArgument
+        }
         ErrorKind::Overloaded => Code::ResourceExhausted,
         ErrorKind::UnknownOutcome => Code::Unknown,
         ErrorKind::ConditionFailed
@@ -154,6 +156,7 @@ pub const fn wire_kind(kind: ErrorKind) -> pb::ErrorKind {
         ErrorKind::UploadChunkConflict => W::UploadChunkConflict,
         ErrorKind::CorruptBlob => W::CorruptBlob,
         ErrorKind::DurabilityUnconfirmed => W::DurabilityUnconfirmed,
+        ErrorKind::TooLarge => W::TooLarge,
     }
 }
 
@@ -316,6 +319,10 @@ pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> 
         ErrorKind::CorruptBlob => "write the blob again",
         ErrorKind::DurabilityUnconfirmed => {
             "the barrier wrote nothing and says nothing about the write: wait for it again"
+        }
+        ErrorKind::TooLarge => {
+            "make it smaller: the message names the limit, the size and the maximum; the same \
+             request fails the same way"
         }
     }
 }
@@ -625,11 +632,17 @@ where
     })
 }
 
+/// The target of `rdb_server_write`, one debug line per landed write (#158), so a filter can
+/// turn on that line alone: `RUST_LOG=info,rdb_server::write=debug`.
+pub const WRITE_LOG_TARGET: &str = "rdb_server::write";
+
 /// `ok` on the wire, logged as `rdb_server_write` on the blocking pool, where it is written
-/// even when the caller has gone (cs-tester D2).
+/// even when the caller has gone (cs-tester D2). One per write, so debug (#158); the call's
+/// `rdb_server_call` line at info carries its outcome and request id.
 fn logged_write(method: &'static str, ok: &PutOk) -> pb::WriteReply {
     let reply = write_reply(ok);
-    tracing::info!(
+    tracing::debug!(
+        target: WRITE_LOG_TARGET,
         method,
         request_id = reply.request_id,
         generation = reply.generation,

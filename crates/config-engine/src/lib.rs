@@ -33,6 +33,8 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+#[cfg(test)]
+mod applied_mirror_tests;
 pub mod config;
 pub mod direct;
 pub mod error;

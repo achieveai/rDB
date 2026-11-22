@@ -52,7 +52,7 @@ fn tuned(host: &mut Host) {
 }
 
 /// One round for the hosts at `nodes` only: the others hear nothing and run nothing.
-fn step_only(trio: &mut Trio, nodes: &[usize]) {
+pub(super) fn step_only(trio: &mut Trio, nodes: &[usize]) {
     for &at in nodes {
         let (host, _, rx) = &mut trio.nodes[at];
         host.run_due();
@@ -527,6 +527,72 @@ fn s5_28b_recovery_catches_up_a_sealed_copy_and_lands() {
             .filter(|held| held.generation == committed.new_generation && held.applied == 4)
             .map(|_| ())
     });
+}
+
+/// Issue #61 lead ruling 1, through a real promote on an untrimmed engine: node 3's links are
+/// held through three puts and through the promote, so F1 commits on nodes 1 and 2 with the
+/// cutoff past node 3's head, and node 2's new primary holds `fresh_primary`'s ladder
+/// `{(0, ROOT), cutoff}` (B-R58b). Once healed, node 3 is behind the cutoff and asks node 2; the
+/// ladder is not dense from the engine floor (0), so node 2 refills it
+/// (`snapshot_catchup_served{how = "ladder"}`) and opens no snapshot transfer, and node 3
+/// catches up in the new generation.
+/// Cut: density tested by the floor alone (A8a as committed), red (a transfer opened for a
+/// copy a few records behind).
+/// Integration (~5 s): s5_28b's world and a heal.
+#[config_log::retcd_test]
+fn t61_a_copy_behind_a_promote_on_an_untrimmed_engine_is_caught_up_from_a_refilled_ladder() {
+    const METHOD: &str =
+        "t61_a_copy_behind_a_promote_on_an_untrimmed_engine_is_caught_up_from_a_refilled_ladder";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, faults) = formed(dir.path());
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    for (request, object) in [(1, b"a"), (2, b"b"), (3, b"c")] {
+        let object: &'static [u8] = object;
+        assert!(matches!(
+            trio.ask(put(request, object, 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    renewal_landed_then_no_more(&mut trio);
+    faults.apply("cut-control");
+
+    let promote = spawn_promote(&trio, 2);
+    let committed = trio.until("node 2 committed the new generation", |trio| {
+        trio.nodes[1]
+            .0
+            .committed
+            .get(&PartitionId(1))
+            .filter(|result| result.new_generation > Generation(1))
+            .cloned()
+    });
+    trio.until("the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let cutoff = committed.selected.cutoff_seq;
+    trio.links.heal_all();
+    trio.until("node 3 caught up in the new generation", |trio| {
+        trio.status(2)
+            .holds
+            .filter(|held| held.generation == committed.new_generation && held.applied == cutoff.0)
+            .map(|_| ())
+    });
+    let served = logged!(METHOD, "snapshot_catchup_served");
+    assert!(
+        served
+            .iter()
+            .any(|line| line["node"] == 2 && line["how"] == "ladder"),
+        "node 2 refilled its ladder: {served:?}"
+    );
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert!(
+        opened.is_empty(),
+        "no transfer for a copy behind a promote: {opened:?}"
+    );
 }
 
 /// Row 30: the owner loses its grant and re-acquires it, then re-plans for a copy that

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
+use rdb_core::authority::node::NodeRecord;
 use rdb_core::authority::partition::{PartitionRecord, PartitionRoot, RecordMember, INSTANCE_LEN};
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
@@ -31,7 +32,7 @@ use rdb_core::contracts::ids::{
     RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
-use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
+use rdb_core::contracts::txn::{Condition, Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::partition_map::{affinity_hash, partition_of, RoutesRoot, MAX_PARTITIONS};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use rdb_storage::RocksEngine;
@@ -39,6 +40,8 @@ use rdb_storage::RocksEngine;
 pub use rdb_storage::StorageOptions;
 use rdb_value::collection::ElemOp;
 use rdb_value::delta::{Delta, Op};
+use rdb_value::envelope::Kind as ObjectKind;
+use rdb_value::keys::Listed;
 use rdb_value::value::Value;
 use rdb_value::{Document, Expected};
 use tokio::runtime::Handle;
@@ -94,7 +97,8 @@ pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest object id, in raw bytes, that any write or read through `Db` accepts (M9 S5). A
 /// raw `ClientCall` sent with `NodeHandle::send`, or a `TxnRequest` given to [`Db::resend`],
 /// is not checked (ADR-rdb-0013 decision 11). A longer one is
-/// `INVALID_ARGUMENT` before anything is compiled, sent or read, and its request id is used up.
+/// `TOO_LARGE` ([`Limit::ObjectId`]) before anything is compiled, sent or read, and its request
+/// id is used up.
 /// A read keeps this limit even if a later version lowers the write limit: data already written
 /// stays readable, so a lower write limit needs its own constant.
 pub const MAX_OBJECT_ID: usize = 1_024;
@@ -105,16 +109,48 @@ pub const MAX_OBJECT_ID: usize = 1_024;
 const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 
 /// The most ops one change carries, and the most puts one [`Db::txn`] takes (M9 S5): the
-/// kernel's own cap on writes in one request. A request over it is `INVALID_ARGUMENT` before
-/// anything is compiled or sent. A change's writes are capped separately, at compile: a map or
-/// set change also writes its root, so it takes at most 254 element changes.
+/// kernel's own cap on writes in one request. A request over it is `TOO_LARGE`
+/// ([`Limit::Ops`]) before anything is compiled or sent. A change's writes are capped
+/// separately, at compile: a map or set change also writes its root, so it takes at most 254
+/// element changes.
 pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
 
 /// The longest map key or set member, in bytes, that a write or a `Members` read's `after`
 /// accepts (M9 S5): a text key's UTF-8 length, or a byte key's length, so `é` counts 2. Other
-/// key types are short by their type. A longer one is `INVALID_ARGUMENT` before anything is
-/// compiled, sent or read.
+/// key types are short by their type. A longer one is `TOO_LARGE` ([`Limit::Key`]) before
+/// anything is compiled, sent or read.
 pub const MAX_KEY: usize = 1_024;
+
+/// The largest byte value one put carries (`put`, `put_in`, `put_as`, and each `TxnPut` of
+/// `txn` and `txn_as`), for any object id up to [`MAX_OBJECT_ID`] (#148). Fixed, so a caller
+/// can cut over on it: it does not move with the id. Equal to `rdb_value::blob::MAX_CHUNK`
+/// (1 MiB less 4 KiB). A larger value is `TOO_LARGE` ([`Limit::Value`]) before anything is
+/// compiled or sent, and its request id is used up. The same holds for a document that is one
+/// byte string (`Change::Doc` of one `Op::Replace(Value::Bytes(..))`, the shape a byte put
+/// writes): one byte over is `TOO_LARGE` too.
+pub const MAX_VALUE: usize = 1_044_480;
+
+/// The longest object id a [`ScopedDb`] takes (#147): [`MAX_OBJECT_ID`] less the longest scope
+/// header and the 8-byte workspace group, the same for every scope. A longer one is `TOO_LARGE`
+/// ([`Limit::ObjectId`]) with this maximum, whatever the scope's own length.
+pub const MAX_SCOPED_ID: usize = MAX_OBJECT_ID - rdb_value::keys::MAX_SCOPE_HEADER;
+
+/// The largest record one atomic write ships: `MAX_ENVELOPE_BYTES` (1 MiB). A byte write
+/// (`put` and `txn` forms) is checked against it before it is sent, with the upper-bound sum
+/// `265 + for each put: value_len + id_len + zero_bytes_in_id + 71` (embed.md, "How big a
+/// transaction can be"), never below the exact record. Over it is `TOO_LARGE`
+/// ([`Limit::Write`]), with that sum as the size (#148).
+pub const MAX_WRITE: usize = rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+
+// Any one put of MAX_VALUE bytes, under any id the Db admits (all 0x00 counts twice), fits
+// MAX_WRITE by the upper-bound sum, so the value limit is never a lie.
+const _: () = assert!(WRITE_COST + MAX_VALUE + 2 * MAX_OBJECT_ID + PUT_COST <= MAX_WRITE);
+const _: () = assert!(MAX_VALUE == rdb_value::blob::MAX_CHUNK);
+
+/// The upper-bound sum's cost of a byte write, however many puts it has (embed.md).
+const WRITE_COST: usize = 265;
+/// The upper-bound sum's cost of each put besides its value, id and the id's zero bytes.
+const PUT_COST: usize = 71;
 
 /// The largest page one read asks for: the most members, or list items, a `Members`, `Items`
 /// or `ItemsAfter` look takes (M9 S5). A larger `limit` is `INVALID_ARGUMENT` before anything is
@@ -123,13 +159,22 @@ pub const MAX_KEY: usize = 1_024;
 pub const MAX_PAGE: usize = 1_000;
 
 mod ack_floor;
+mod async_db;
+pub use async_db::{AsyncDb, TxnWrite};
 mod restart;
-
+mod scoped;
 pub use restart::RestartReason;
+pub use scoped::{ScopedDb, ScopedOk, ScopedPutError, ScopedSent, ScopedWrite};
+
+// `AsyncDb` hands an `Arc<Db>` to the blocking pool, so `Db` must be `Send + Sync` (#146).
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    shared::<Db>();
+};
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
-pub use error::ApiError;
+pub use error::{ApiError, Limit, TooLarge};
 
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
@@ -157,7 +202,7 @@ pub struct Timeouts {
     /// duty as an owner. A returning copy follows the setting of the owner that re-adds it,
     /// which rides on the landing, not its own (ADR-rdb-0009 section 7, #107 slice 2b).
     ///
-    /// Every build that speaks protocol 10 has check B and the refused-receiver mark, and an
+    /// Every build at protocol 10 or later has check B and the refused-receiver mark, and an
     /// older build is refused at the handshake, so it is never re-added. Set it on every node
     /// anyway, so whichever node owns a partition re-adds its copies the same way.
     pub live_readd: bool,
@@ -198,6 +243,14 @@ pub struct DbConfig {
     /// and 109/s at 10 min. A burst may use the whole cap at once; once it is full, a new write
     /// is `OVERLOADED` until trimming frees entries. Each retained entry costs about 1.8 KB of
     /// memory (measured on a debug build).
+    ///
+    /// Before and at the cap, the owner warns (issue #98): `dedup_cap_high` once when a
+    /// partition's index reaches 80% of the cap, and `dedup_cap_full` once when it reaches the
+    /// cap. Each names `node`, `partition`, `len`, `cap`, `retention_ms` and, when known,
+    /// `frees_in_ms` (the earliest an entry frees). Each is logged again only after the index has
+    /// fallen 5% of the cap (at least one entry) below its mark, so a fill hovering on a mark
+    /// does not log per write. [`Db::node_status`] reports the fill and the cap side by side, as
+    /// `lengths.dedup` and `lengths.dedup_cap`.
     pub dedup_cap: Option<usize>,
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
@@ -288,6 +341,18 @@ pub struct DbConfig {
 }
 
 /// What [`DbConfig::addresses`] holds.
+///
+/// **Migration (#83 B2):** this struct gained [`Self::app`]. It is built by struct literal, so
+/// an existing `NodeAddresses { listen, peers }` no longer compiles: add `app: None`. Only on a
+/// settled folder, where the node's data exists and the folder holds neither an
+/// `app-addr-pending` file (pending debt) nor an `app-addr-fence` file (fence debt), does that
+/// behave as before: no address write, and the stored address is kept. On a new, wiped or owed
+/// folder (no data yet, or `app-addr-fence` still there) an open with `None` writes the record:
+/// it CASes the record's own bytes back at the revision it read (an own-bytes fence). An absent
+/// record is refused with [`OpenError::Config`] before the fence (the node is not declared).
+/// The fence is refused with [`OpenError::Control`] when the record cannot be read, changed
+/// after that check, or the fence's outcome is unknown. While `app-addr-pending` is there, an
+/// open with `None` is refused with [`OpenError::Config`]. See [`Self::app`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAddresses {
     /// The address the node's listener is bound to, `host:port`: its record's, or the same
@@ -297,6 +362,23 @@ pub struct NodeAddresses {
     /// node's record's, and every declared node needs one. This node's own entry may be
     /// left out.
     pub peers: BTreeMap<NodeId, String>,
+    /// Where this node's app takes requests forwarded to it, opaque to rDB, 1 to
+    /// [`crate::MAX_APP_ADDR_LEN`] bytes (#83 B2). Each open given `Some` makes sure this
+    /// node's `nodes/{id}` record (layout 2) holds it before the node starts, so [`Db::route`]
+    /// names it for every partition the node owns. A record that already holds it is not
+    /// written, unless an earlier open's write of it may still be in flight: then the open
+    /// writes it again so the late one cannot apply (the folder's `app-addr-pending` file says
+    /// so). Only the app address is written; the declared address and machine never change.
+    ///
+    /// `None` keeps whatever the record holds: an earlier boot's address, or none. An address
+    /// cannot be cleared: `None` keeps it and an empty string is refused at open. Two cases
+    /// differ (PR #159 review r3). While the folder's `app-addr-pending` file says an earlier
+    /// write may still apply, an open given `None` is refused with [`OpenError::Config`], and
+    /// the next open must give the address the node should hold, which settles it. And an open
+    /// on a new or emptied folder (no data yet, or an earlier such open that did not finish)
+    /// fences the record with `None` too: it writes the record's own bytes back, so a late
+    /// write cannot replace the address it holds. See [`Db::open`]'s errors.
+    pub app: Option<String>,
 }
 
 /// The client a `Db` sends as unless [`DbConfig::client`] names another.
@@ -408,6 +490,80 @@ pub struct ReadOk {
     /// that copy's declared cutoff and may lack writes acknowledged just before the loss.
     /// `false` for every other read.
     pub recovery_mode: bool,
+}
+
+/// One object of an [`ObjectPage`] (#147).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectEntry {
+    /// The object id, whole.
+    pub id: Bytes,
+    /// The root's version.
+    pub version: u64,
+    /// The object's kind: a document, a map, a set, a list or a blob.
+    pub kind: ObjectKind,
+}
+
+/// A page of [`Db::list_in`] (#147): objects with a root, in id order, from one view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPage {
+    /// The objects.
+    pub entries: Vec<ObjectEntry>,
+    /// The page is full: ask again with this as `after`. `None` when the range ended.
+    pub next: Option<Bytes>,
+    /// The storage generation of the view.
+    pub generation: Generation,
+    /// The position of the view.
+    pub at: Seq,
+}
+
+/// A [`Db::delete_prefix_in`] that stopped (#147): how many objects it emptied first, and why it
+/// stopped. It is not atomic: run it again to finish, once the cause is gone. Its message says
+/// so only when a rerun can finish ([`Self::rerun_can_finish`]).
+#[derive(Debug, Clone)]
+pub struct PrefixDeleteError {
+    /// Objects emptied before the error, its own object included when the error came after
+    /// that object's last records were deleted. Only an object confirmed empty is counted.
+    pub deleted: u64,
+    /// Why it stopped.
+    pub error: PutError,
+}
+
+impl PrefixDeleteError {
+    /// Whether running the delete again can finish it (PR #178 review r2, T14). Not after a
+    /// refusal of the call itself, which a rerun meets the same way: `INVALID_ARGUMENT`,
+    /// `TOO_LARGE`, `CROSS_AFFINITY`, `INCOMPATIBLE_VERSION`, or `CORRUPT_HISTORY`, a damaged
+    /// object that needs repair first.
+    #[must_use]
+    pub fn rerun_can_finish(&self) -> bool {
+        !matches!(
+            self.error.error.kind,
+            ErrorKind::InvalidArgument
+                | ErrorKind::TooLarge
+                | ErrorKind::CrossAffinity
+                | ErrorKind::IncompatibleVersion
+                | ErrorKind::CorruptHistory
+        )
+    }
+}
+
+impl std::fmt::Display for PrefixDeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.rerun_can_finish() {
+            write!(
+                f,
+                "{} (after {} deleted; run the delete again to finish)",
+                self.error, self.deleted
+            )
+        } else {
+            write!(f, "{} (after {} deleted)", self.error, self.deleted)
+        }
+    }
+}
+
+impl std::error::Error for PrefixDeleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error.error)
+    }
 }
 
 /// A refused write, with the request so the caller can send it again (`retry`).
@@ -596,6 +752,10 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the heal's task still runs, sends included, and so may plan a recovery that
+    /// blocked on `CasContention` again ([`admin::heal_settling`]). [`Db::wait_ready`] does
+    /// not end on that block while it does.
+    heal_settling: Arc<AtomicBool>,
     /// Why the running heal is waiting, as its latest `heal_retry` said (R5): `wait_ready`'s
     /// time-out names it. `None` once the heal ends, or before it has waited.
     heal_waiting: Arc<Mutex<Option<String>>>,
@@ -692,6 +852,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_settling: Arc::new(AtomicBool::new(false)),
             heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
             stuck: Mutex::new(None),
@@ -731,7 +892,109 @@ struct Route {
     /// #83: what [`Db::route`] last read of each partition's record, and the stamp of the
     /// `partitions/` watches it was read under. Served while the stamp is current.
     answers: Mutex<BTreeMap<u32, (RouteInfo, RouteStamp)>>,
+    /// #83 B2: per owner node, its last good app-address read and the read in flight. The
+    /// lock is held only to look and to swap, never across a read.
+    addrs: Mutex<BTreeMap<NodeId, AddrSlot>>,
 }
+
+/// One owner's app address in [`Route`] (#83 B2, PR #159 review r2).
+#[derive(Default)]
+struct AddrSlot {
+    /// The last read that succeeded: what `nodes/{id}` held, and when that read began. Served
+    /// for [`APP_ADDR_REREAD_GAP`] from then. A failed read leaves it as it was, stamp
+    /// included, and [`Db::route`] answers it past its gap in place of the failed read (SBX
+    /// answer, 2026-11-20).
+    good: Option<(Option<String>, Instant)>,
+    /// The read in flight, which callers that find `good` expired wait for.
+    reading: Option<Arc<AddrRead>>,
+}
+
+/// One read of an owner's app address that other callers wait for (PR #159 review r2): its
+/// answer, success or failure, once the reader has one.
+#[derive(Default)]
+struct AddrRead {
+    answer: Mutex<Option<Result<Option<String>, ApiError>>>,
+    done: std::sync::Condvar,
+}
+
+impl AddrRead {
+    /// Hand `answer` to every caller waiting for this read.
+    fn finish(&self, answer: Result<Option<String>, ApiError>) {
+        *lock(&self.answer) = Some(answer);
+        self.done.notify_all();
+    }
+
+    /// This read's answer, or `None` once `deadline` passes first.
+    fn wait_until(&self, deadline: Instant) -> Option<Result<Option<String>, ApiError>> {
+        let mut answer = lock(&self.answer);
+        loop {
+            if let Some(answer) = answer.as_ref() {
+                return Some(answer.clone());
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            answer = self
+                .done
+                .wait_timeout(answer, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// The caller reading an owner's app address for everyone waiting (PR #159 review r2). Dropped
+/// without [`Self::finish`], as a panic drops it, it still ends the read, failed, so no later
+/// caller waits on a read nobody is making.
+struct AddrReader<'a> {
+    route: &'a Route,
+    node: NodeId,
+    read: Arc<AddrRead>,
+    finished: bool,
+}
+
+impl AddrReader<'_> {
+    /// Keep `answer` if it succeeded, stamped `read_at`, end the read and hand `answer` to its
+    /// waiters.
+    fn finish(mut self, answer: &Result<Option<String>, ApiError>, read_at: Instant) {
+        self.end(answer.clone(), Some(read_at));
+    }
+
+    fn end(&mut self, answer: Result<Option<String>, ApiError>, read_at: Option<Instant>) {
+        self.finished = true;
+        {
+            let mut addrs = lock(&self.route.addrs);
+            let slot = addrs.entry(self.node).or_default();
+            if let (Ok(app), Some(read_at)) = (&answer, read_at) {
+                slot.good = Some((app.clone(), read_at));
+            }
+            slot.reading = None;
+        }
+        self.read.finish(answer);
+    }
+}
+
+impl Drop for AddrReader<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.end(
+                Err(ApiError::new(
+                    ErrorKind::Unavailable,
+                    format!(
+                        "route: the read of nodes/{} ended without an answer",
+                        self.node.0
+                    ),
+                )),
+                None,
+            );
+        }
+    }
+}
+
+/// How long [`Db::route`] serves an owner's app address before it reads `nodes/{id}` again
+/// (#83 B2). A node writes its address only at an open, so a restart that changes it is seen
+/// within this. A read that succeeds is served for this long, so successful reads come at most
+/// once per owner node per gap; a failed read keeps nothing, so the next caller reads again at
+/// once.
+pub(crate) const APP_ADDR_REREAD_GAP: Duration = Duration::from_secs(1);
 
 impl Default for Route {
     fn default() -> Self {
@@ -740,6 +1003,7 @@ impl Default for Route {
             refresh: None,
             last_read: Mutex::new(BTreeMap::new()),
             answers: Mutex::new(BTreeMap::new()),
+            addrs: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -772,6 +1036,10 @@ pub struct PartitionReady {
     pub ready: bool,
     /// Why not; `None` when ready.
     pub reason: Option<NotReady>,
+    /// Issue #61 (design rev 5 M1): the owner's `NodeStatus::needs_operator`, the command an
+    /// operator must run for a copy that holds a tail past the history floor. Independent of
+    /// `ready`: a partition whose other copies admit writes is ready and still degraded.
+    pub degraded: Option<String>,
 }
 
 /// Why a partition is not ready.
@@ -891,20 +1159,347 @@ async fn read_owner(
     Ok((record.owner, root.instance))
 }
 
-/// #83: `partition`'s owner and token as its `partitions/{p}` record names them.
-async fn read_route(store: &dyn ConfigStore, partition: PartitionId) -> Result<RouteInfo, String> {
-    let key = ControlKey::Partition(partition).encode();
-    let read = store
+/// The file in a node process's folder that says an app-address write of this folder's node may
+/// still apply (#83 B2, PR #159 review): it holds the revision of `nodes/{id}` that write was
+/// sent at. Written durably before the write is sent, removed once the write's outcome is
+/// known. It is staged first as `app-addr-pending.new`, then renamed over: a crash before the
+/// rename can leave that staged file behind, and the next write overwrites it. Leave both
+/// files alone; [`register_app_addr`] settles them. These are the only files it writes in the
+/// folder.
+pub(crate) const APP_ADDR_PENDING_FILE: &str = "app-addr-pending";
+
+/// Whether the folder says an app-address write of its node may still apply (PR #159 review
+/// r2). Presence is what counts: a marker whose text is damaged still says so, so it fences
+/// like any other. A marker that is there and cannot be read refuses the open, naming a step
+/// that keeps the marker, since this open cannot tell what it says.
+fn pending_app_addr(dir: &Path) -> Result<bool, OpenError> {
+    let file = dir.join(APP_ADDR_PENDING_FILE);
+    match std::fs::read(&file) {
+        Ok(text) => {
+            if std::str::from_utf8(&text)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .is_none()
+            {
+                tracing::warn!(
+                    file = %file.display(),
+                    "db_app_addr_pending_unparsed"
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OpenError::Config(format!(
+            "{} is there but could not be read ({error}): it may say that an earlier open's \
+             app-address write may still apply, and this open cannot tell. Leave it and \
+             {APP_ADDR_PENDING_FILE}.new in place, make it readable by this process, then open \
+             this node again with the app address it should hold. Nothing was started",
+            file.display()
+        ))),
+    }
+}
+
+/// Refuse an open given no app address while the folder says an app-address write may still
+/// apply (PR #159 review r2). Such an open writes nothing, so it cannot fence: the earlier
+/// write could still replace the stored address after this open returned. An open given the
+/// address the node should hold settles it, and later opens can then leave it out.
+fn app_addr_settled(dir: &Path) -> Result<(), OpenError> {
+    if !pending_app_addr(dir)? {
+        return Ok(());
+    }
+    Err(OpenError::Config(format!(
+        "{} says an earlier open's write of this node's app address may still apply, and this \
+         open was given no app address, so it cannot settle that write: it could replace the \
+         stored address after this open returned. Open this node again with the app address it \
+         should hold (NodeAddresses::app, or rdb_node --app-addr); that open settles it, and \
+         later opens may leave the address out. Leave {APP_ADDR_PENDING_FILE} and \
+         {APP_ADDR_PENDING_FILE}.new in place. Nothing was started",
+        dir.join(APP_ADDR_PENDING_FILE).display()
+    )))
+}
+
+/// Record durably that an app-address write sent at `revision` may still apply: the file is
+/// written beside, synced, renamed over, and its folder synced, all before the write is sent.
+fn mark_app_addr_pending(dir: &Path, revision: u64) -> Result<(), OpenError> {
+    write_marker(dir, APP_ADDR_PENDING_FILE, &revision.to_string())
+}
+
+/// The file in a node process's folder that says this node's next open must fence its
+/// `nodes/{id}` record (#83 B2, PR #159 review r3): written durably when an open finds the
+/// node's copy new or emptied, before its engine creates any data, and removed only once an
+/// open has fenced. An emptied folder has lost any [`APP_ADDR_PENDING_FILE`] an earlier folder
+/// held, so a write that folder sent may still apply; and an open that fails after the engine
+/// has created data must not leave the next open thinking the folder settled. It is written as
+/// `app-addr-fence.new` first, synced, then renamed ([`write_marker`]), so a crash before the
+/// rename can leave `app-addr-fence.new` behind, and the next such open overwrites it. Leave
+/// both alone.
+pub(crate) const APP_ADDR_FENCE_FILE: &str = "app-addr-fence";
+
+/// Whether [`APP_ADDR_FENCE_FILE`] is there. One that is there and cannot be looked at refuses
+/// the open, since it may say a fence is owed.
+fn app_addr_fence_owed(dir: &Path) -> Result<bool, OpenError> {
+    let file = dir.join(APP_ADDR_FENCE_FILE);
+    match std::fs::symlink_metadata(&file) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OpenError::Config(format!(
+            "{} could not be looked at ({error}): it may say this node's record must be fenced, \
+             and this open cannot tell. Leave it in place, make it readable by this process, \
+             then open this node again. Nothing was started",
+            file.display()
+        ))),
+    }
+}
+
+/// The fence [`APP_ADDR_FENCE_FILE`] asked for is done: no write an earlier folder sent can
+/// still apply.
+fn clear_app_addr_fence(dir: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(dir.join(APP_ADDR_FENCE_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpenError::Io(error)),
+    }
+}
+
+/// Write `name` in `dir` holding `text`, durably: staged as `name.new`, synced, renamed over,
+/// and the folder synced.
+fn write_marker(dir: &Path, name: &str, text: &str) -> Result<(), OpenError> {
+    use std::io::Write as _;
+    let staged = dir.join(format!("{name}.new"));
+    {
+        let mut out = std::fs::File::create(&staged)?;
+        writeln!(out, "{text}")?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&staged, dir.join(name))?;
+    // The rename is a change of the folder: sync it too, or a crash can lose the marker after
+    // the write went out. Windows cannot open a folder as a file; there NTFS journals the
+    // rename itself.
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The pending app-address write's outcome is known: no write this folder sent can still apply.
+fn clear_app_addr_pending(dir: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(dir.join(APP_ADDR_PENDING_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(OpenError::Io(error)),
+    }
+}
+
+/// Write `app` into `node`'s `nodes/{id}` record, layout 2, at the revision it was read at
+/// (#83 B2): the declared fields as they are, only the app address new. `dir` is the node
+/// process's folder.
+///
+/// A record that already holds `app` is not written, so a restart with the same address
+/// changes nothing, unless an earlier open's write may still apply at the revision it read, and
+/// replace this open's address after this open returned. Two things say it may: `dir` holds
+/// [`APP_ADDR_PENDING_FILE`] (present at all, whatever its text), or `new_folder`, this node's
+/// folder had no data before this open (new or emptied) or still holds the
+/// [`APP_ADDR_FENCE_FILE`] such an open wrote, so a marker an earlier folder held is gone.
+/// Then this open writes anyway, a fence: the revision moves on, and no write sent at an
+/// older one can apply (PR #159 review, r2). The marker is written durably before every write
+/// and removed only once its outcome is known: applied, or the record moved on. A write whose
+/// outcome stays unknown, an open dropped mid-write, and a crash leave it, so the next open
+/// fences.
+///
+/// The record has three writers: the declaration, create-only; another process that claims
+/// this node; and an earlier open of this node, whose delayed write can land between this
+/// open's read and its write. A record changed in between is refused, even when it holds the
+/// same bytes, since this open cannot tell which of them wrote it. Every refusal is before any
+/// host starts. Logged `db_app_addr_registered{node, app_len, written, fenced}`; the address
+/// itself is never logged, since an opaque address may carry a credential.
+async fn register_app_addr(
+    store: &dyn ConfigStore,
+    dir: &Path,
+    node: NodeId,
+    app: &str,
+    new_folder: bool,
+) -> Result<(), OpenError> {
+    let key = ControlKey::Node(node).encode();
+    let refused = |why: String| OpenError::Control(format!("{key}: {why}; nothing was started"));
+    let read = || {
+        store.get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+    };
+    let found = read()
+        .await
+        .map_err(|error| refused(format!("read before the app address is written: {error}")))?
+        .record
+        .ok_or_else(|| refused("absent, so node's app address has no record".to_owned()))?;
+    let (record, held) = NodeRecord::decode_with_app(&found.value)
+        .filter(|(record, _)| record.node == node)
+        .ok_or_else(|| refused("not a node record this build reads".to_owned()))?;
+    let fenced = pending_app_addr(dir)? || new_folder;
+    if held.as_deref() == Some(app) && !fenced {
+        tracing::info!(
+            node = node.0,
+            app_len = app.len(),
+            written = false,
+            fenced,
+            "db_app_addr_registered"
+        );
+        return Ok(());
+    }
+    let at = found.mod_revision;
+    mark_app_addr_pending(dir, at)?;
+    let value = record.encode_with_app(app);
+    let written = store
+        .put(config_core::PutRequest {
+            key: Bytes::from(key.clone()),
+            value: value.clone(),
+            expected_mod_revision: Some(at),
+            dedup: None,
+        })
+        .await;
+    match written {
+        Ok(response) if response.outcome == config_core::MutationOutcome::Applied => {}
+        Ok(response) => {
+            // Refused at `at`: the record moved on, so no write sent at `at` can apply.
+            clear_app_addr_pending(dir)?;
+            return Err(refused(format!(
+                "changed after this open read it at revision {at} (the write answered {:?}): \
+                 another process may claim this node",
+                response.outcome
+            )));
+        }
+        Err(error) => {
+            // The write may still apply (`DeadlineExceededUnknownOutcome`), or another error
+            // says nothing certain: read back, and keep the marker unless the record moved.
+            let outcome = match read().await {
+                Err(read_error) => format!(
+                    "the write's outcome is unknown ({error}) and the read back failed \
+                     ({read_error}); the next open writes it again over any late one"
+                ),
+                Ok(now) => match now.record {
+                    Some(now) if now.mod_revision != at && now.value == value => {
+                        clear_app_addr_pending(dir)?;
+                        tracing::info!(
+                            node = node.0,
+                            app_len = app.len(),
+                            written = true,
+                            fenced,
+                            "db_app_addr_registered"
+                        );
+                        return Ok(());
+                    }
+                    Some(now) if now.mod_revision == at => format!(
+                        "the write's outcome is unknown ({error}) and it has not applied yet; \
+                         the next open writes it again over any late one"
+                    ),
+                    Some(now) => {
+                        clear_app_addr_pending(dir)?;
+                        format!(
+                            "the write's outcome was unknown ({error}), and the record now \
+                             holds other bytes at revision {}: another process may claim this \
+                             node",
+                            now.mod_revision
+                        )
+                    }
+                    None => {
+                        clear_app_addr_pending(dir)?;
+                        format!("the write's outcome was unknown ({error}), and the record is gone")
+                    }
+                },
+            };
+            return Err(refused(outcome));
+        }
+    }
+    clear_app_addr_pending(dir)?;
+    tracing::info!(
+        node = node.0,
+        app_len = app.len(),
+        written = true,
+        fenced,
+        "db_app_addr_registered"
+    );
+    Ok(())
+}
+
+/// Fence `node`'s `nodes/{id}` record for an open given no app address whose folder owes a
+/// fence ([`APP_ADDR_FENCE_FILE`]; PR #159 review r3): write the record's own bytes back at the
+/// revision they were read at. Nothing in the record changes, but the revision moves on, so no
+/// app-address write an earlier folder of this node sent at an older revision can apply and
+/// replace the address the record holds. Then the fence file is removed.
+///
+/// Every refusal is before any host starts, and keeps the fence file, so the next open fences
+/// again: a record that changed after this open read it (another writer, or such a late write
+/// landing first), or a write whose outcome is unknown. A late arrival of this write is
+/// harmless: it holds the bytes the record held at its revision. Logged
+/// `db_app_addr_fenced{node, revision}`.
+async fn fence_app_addr(
+    store: &dyn ConfigStore,
+    dir: &Path,
+    node: NodeId,
+) -> Result<(), OpenError> {
+    let key = ControlKey::Node(node).encode();
+    let refused = |why: String| {
+        OpenError::Control(format!(
+            "{key}: {why}; this node's folder is new or emptied, so an earlier folder's \
+             app-address write may still apply, and the open fences it first. Open this node \
+             again; nothing was started"
+        ))
+    };
+    let found = store
         .get(config_core::GetRequest {
             key: Bytes::from(key.clone()),
         })
         .await
-        .map_err(|error| format!("route: get {key}: {error}"))?;
-    let found = read
+        .map_err(|error| refused(format!("read before the fence: {error}")))?
         .record
-        .ok_or_else(|| format!("route: {key} is absent: the database is not formed yet"))?;
-    let record = PartitionRecord::decode(&found.value)
-        .ok_or_else(|| format!("route: {key} is not a partition record this build reads"))?;
+        .ok_or_else(|| refused("absent, so it cannot be fenced".to_owned()))?;
+    let at = found.mod_revision;
+    let written = store
+        .put(config_core::PutRequest {
+            key: Bytes::from(key.clone()),
+            value: found.value,
+            expected_mod_revision: Some(at),
+            dedup: None,
+        })
+        .await
+        .map_err(|error| refused(format!("the fence's outcome is unknown ({error})")))?;
+    if written.outcome != config_core::MutationOutcome::Applied {
+        return Err(refused(format!(
+            "changed after this open read it at revision {at} (the fence answered {:?})",
+            written.outcome
+        )));
+    }
+    clear_app_addr_fence(dir)?;
+    tracing::info!(
+        node = node.0,
+        revision = written.revision,
+        "db_app_addr_fenced"
+    );
+    Ok(())
+}
+
+/// Why [`read_route`] has no answer: `UNAVAILABLE`, which a later call can fix, or a record this
+/// build cannot decode, which none can (#135).
+#[derive(Debug)]
+enum RouteReadError {
+    Unavailable(String),
+    Undecodable(String),
+}
+
+/// `partitions/{p}`'s owner and token. The answer holds no address.
+async fn read_route(
+    store: &dyn ConfigStore,
+    partition: PartitionId,
+) -> Result<RouteInfo, RouteReadError> {
+    let key = ControlKey::Partition(partition).encode();
+    let found = control_get(store, &key).await?.ok_or_else(|| {
+        RouteReadError::Unavailable(format!(
+            "route: {key} is absent: the database is not formed yet"
+        ))
+    })?;
+    let record = PartitionRecord::decode(&found).ok_or_else(|| {
+        RouteReadError::Undecodable(format!(
+            "route: {key} is not a partition record this build reads"
+        ))
+    })?;
     Ok(RouteInfo {
         partition,
         owner: record.owner,
@@ -912,7 +1507,40 @@ async fn read_route(store: &dyn ConfigStore, partition: PartitionId) -> Result<R
             generation: record.generation,
             owner_epoch: record.owner_epoch,
         },
+        owner_address: None,
     })
+}
+
+/// The app address `nodes/{node}` holds (#83 B2): `None` when the record is absent (a database
+/// formed in one process has none) or holds none (layout 1, or a node opened with no app
+/// address).
+async fn read_app_addr(
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Option<String>, RouteReadError> {
+    let key = ControlKey::Node(node).encode();
+    let Some(found) = control_get(store, &key).await? else {
+        return Ok(None);
+    };
+    NodeRecord::decode_with_app(&found)
+        .filter(|(record, _)| record.node == node)
+        .map(|(_, app)| app)
+        .ok_or_else(|| {
+            RouteReadError::Undecodable(format!(
+                "route: {key} is not a node record this build reads"
+            ))
+        })
+}
+
+/// One control-store `get` of `key`'s value, as a route reads it.
+async fn control_get(store: &dyn ConfigStore, key: &str) -> Result<Option<Bytes>, RouteReadError> {
+    store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.to_owned()),
+        })
+        .await
+        .map(|read| read.record.map(|record| record.value))
+        .map_err(|error| RouteReadError::Unavailable(format!("route: get {key}: {error}")))
 }
 
 /// The refusal of a partition count no database can have (issue #79, ruling Q3): 0, or above
@@ -1292,13 +1920,16 @@ pub(crate) async fn heal_in_turn(
     ctxs: Vec<admin::HealCtx>,
     state: Arc<Mutex<HealState>>,
     waiting: Arc<Mutex<Option<String>>>,
-) {
+) -> Vec<(admin::HealCtx, admin::HealProof)> {
     let mut first = None;
     let mut ended = Ok(());
+    let mut handed = Vec::new();
     for ctx in ctxs {
+        let watch = ctx.again();
         match admin::heal_retrying(ctx).await {
-            Ok(healed) => {
+            Ok((healed, proved)) => {
                 first.get_or_insert(healed);
+                handed.push((watch, proved));
             }
             Err(error) => {
                 tracing::error!(%error, "heal_failed");
@@ -1307,12 +1938,41 @@ pub(crate) async fn heal_in_turn(
             }
         }
     }
+    let healed = ended.is_ok();
     *lock(&state) = match (ended, first) {
         (Ok(()), Some(healed)) => HealState::Handed(healed),
         (Err(error), _) => HealState::Failed(error),
         (Ok(()), None) => HealState::NotNeeded,
     };
     *lock(&waiting) = None;
+    if healed {
+        handed
+    } else {
+        Vec::new()
+    }
+}
+
+/// #172 (PR #218 review): after [`heal_in_turn`] handed every owner its plans, watch each
+/// owner's recoveries ([`admin::heal_settling`]): a recovery whose commit lost to an undone
+/// `Fencing` is planned again in this open, and `wait_ready` waits while this runs. A re-plan
+/// that failed is the heal's error from then on, so `wait_ready` names its cause (round 2); the
+/// caller clears the settling flag only after this returns.
+async fn settle_in_turn(
+    handed: Vec<(admin::HealCtx, admin::HealProof)>,
+    state: &Arc<Mutex<HealState>>,
+) {
+    if handed.is_empty() {
+        return;
+    }
+    let watched = futures::future::join_all(
+        handed
+            .into_iter()
+            .map(|(watch, proved)| admin::heal_settling(watch, proved)),
+    )
+    .await;
+    if let Some(error) = watched.into_iter().find_map(Result::err) {
+        *lock(state) = HealState::Failed(error);
+    }
 }
 
 /// Why [`Db::wait_ready`] returned without the owner admitting writes.
@@ -1343,9 +2003,12 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
-    /// The owner's recovery ended `Blocked` before it took writes. It does not try again in this
-    /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
-    /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
+    /// The owner's recovery ended `Blocked` before it took writes, and nothing in this open will
+    /// try it again (ruling F-a), so no wait helps (A-R196). For `CasContention` that holds
+    /// only once the reopen's heal has stopped watching: until then [`admin::heal_settling`]
+    /// plans it again, and a re-plan that failed is answered as [`Self::Heal`] with its cause,
+    /// not as this (#172, PR #218 review). A new open usually gets past it; one that is blocked
+    /// again is not a slow host, so the text says to stop then (review-s1 F-007).
     #[error(
         "the open's recovery stopped before node {node} took writes ({reason}), and it does \
          not try again in this open. If the last open of this folder stopped the same way, stop \
@@ -1595,6 +2258,21 @@ impl Db {
     /// but whose reply was lost can be run again against the same store;
     /// [`admin::BootstrapError::AlreadyExists`] is left for a record that changes between that
     /// check and the bootstrap.
+    ///
+    /// The app address ([`NodeAddresses::app`], #83 B2), each before any host starts:
+    ///
+    /// - [`OpenError::Config`] for an address that is empty or over [`crate::MAX_APP_ADDR_LEN`]
+    ///   bytes, or given on a database no declaration made; for an open given no address while
+    ///   the folder's `app-addr-pending` file says an earlier write may still apply (open again
+    ///   with the address the node should hold); for an `app-addr-pending` file whose
+    ///   contents cannot be read; and for `app-addr-fence` metadata that cannot be looked at
+    ///   for any reason other than `NotFound`. The fence file's contents are never read: it
+    ///   counts by being there.
+    /// - [`OpenError::Control`] when the node's `nodes/{id}` record cannot be read or written,
+    ///   is absent or does not decode, changed after this open read it, or the write's outcome
+    ///   stays unknown; the same for the fence a new or emptied folder writes. Opening again
+    ///   settles it: the folder's files make the next open write again.
+    /// - [`OpenError::Io`] when one of those files cannot be written.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
@@ -1831,6 +2509,21 @@ impl Db {
         } else {
             None
         };
+        let app = config.addresses.as_ref().and_then(|a| a.app.as_deref());
+        if let Some(app) = app {
+            if let Some(why) = rdb_core::authority::node::app_addr_refusal(app) {
+                return Err(OpenError::Config(format!(
+                    "{why}; nothing but its folder was created"
+                )));
+            }
+            if formation.is_none() {
+                return Err(OpenError::Config(
+                    "an app address is written to this node's nodes/{id} record, which only a \
+                     declared database has; nothing but its folder was created"
+                        .to_owned(),
+                ));
+            }
+        }
         if let Some(formation) = &formation {
             declared_open_refusal(&config.local, config.addresses.as_ref(), formation, &*store)
                 .await?;
@@ -1853,6 +2546,21 @@ impl Db {
                 formed_member(&store, &missing, false).await?;
             }
         }
+        // #83 B2, PR #159 review r2: a node folder with no data yet holds no marker, whatever
+        // an earlier folder of this node left in flight, so its open fences. r3: that is made
+        // durable before the engine creates `CURRENT`, so an open that fails after it does not
+        // leave the next one thinking the folder settled; only a fence removes it.
+        let new_folder = match config.local.as_slice() {
+            [node] if formation.is_some() => {
+                if nodes_dir.join(node.0.to_string()).join("CURRENT").exists() {
+                    app_addr_fence_owed(&config.dir)?
+                } else {
+                    write_marker(&config.dir, APP_ADDR_FENCE_FILE, "")?;
+                    true
+                }
+            }
+            _ => false,
+        };
         let created = match std::fs::create_dir(&nodes_dir) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -1921,6 +2629,21 @@ impl Db {
             )
             .await?;
         }
+        // #83 B2: after the engines' `LOCK`s, so of two opens of one folder only one writes,
+        // and before any host starts, so no boot leads a partition before its address is in.
+        // An open given no address is refused while a write may be pending.
+        // A new or emptied folder fences either way (r3): with an address, here, by writing it;
+        // with none, below, by writing the record's own bytes back.
+        match (app, config.local.as_slice()) {
+            (Some(app), [node]) => {
+                register_app_addr(&*store, &config.dir, *node, app, new_folder).await?;
+                if new_folder {
+                    clear_app_addr_fence(&config.dir)?;
+                }
+            }
+            (None, _) => app_addr_settled(&config.dir)?,
+            (Some(_), _) => {}
+        }
         let refused = |error| counter_refused(&found.instance, error);
         let n = match &found.roll {
             // Only a fresh open, which names a new instance here, creates the counter. A declared
@@ -1950,12 +2673,17 @@ impl Db {
                     },
                     other => refused(other),
                 })?;
-                Self::link_roll(&mut claim.engines, &config.dir, PARTITION, roll)?;
+                let rolled = Self::link_roll(&mut claim.engines, &config.dir, PARTITION, roll)?;
+                if rolled.is_empty() {
+                    return Err(
+                        Self::unrolled(&claim.engines, &store, &found.instance, roll).await,
+                    );
+                }
                 tracing::info!(
                     generation = roll.to.0,
                     from = roll.from.0,
                     base = roll.base.0,
-                    copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                    copies = ?rolled.iter().map(|node| node.0).collect::<Vec<_>>(),
                     n,
                     "db_open_rolled_forward"
                 );
@@ -1979,15 +2707,23 @@ impl Db {
                 },
                 other => refused(other),
             })?;
-            Self::link_roll(&mut claim.engines, &config.dir, *partition, roll)?;
+            let rolled = Self::link_roll(&mut claim.engines, &config.dir, *partition, roll)?;
+            if rolled.is_empty() {
+                return Err(Self::unrolled(&claim.engines, &store, &found.instance, roll).await);
+            }
             tracing::info!(
                 partition = partition.0,
                 generation = roll.to.0,
                 from = roll.from.0,
                 base = roll.base.0,
-                copies = ?roll.copies.iter().map(|node| node.0).collect::<Vec<_>>(),
+                copies = ?rolled.iter().map(|node| node.0).collect::<Vec<_>>(),
                 "db_open_rolled_forward"
             );
+        }
+        // PR #159 review r3: the no-address fence of a new or emptied folder, the last check
+        // before any host starts, so an open refused by an earlier one writes nothing.
+        if let (None, [node], true) = (app, config.local.as_slice(), new_folder) {
+            fence_app_addr(&*store, &config.dir, *node).await?;
         }
         let engines = std::mem::take(&mut claim.engines);
         let unwind = claim.created.take();
@@ -2122,6 +2858,7 @@ impl Db {
                     boot,
                     heals,
                     &config.local,
+                    config.failover.is_some(),
                     config.timeouts.live_readd,
                 )?;
             }
@@ -2650,7 +3387,8 @@ impl Db {
                         to: record.generation,
                         base: root.predecessor_cutoff,
                         copies,
-                        owner: record.owner,
+                        record: *record,
+                        root: *root,
                         possible_loss: rolled_possible_loss(store, partition, record, root).await?,
                     }),
                 }),
@@ -2678,13 +3416,22 @@ impl Db {
         })
     }
 
-    /// Link `roll` on each of its copies, once the decision is claimed.
+    /// Link `roll` on each of its copies, once the decision is claimed, and answer the copies
+    /// linked.
+    ///
+    /// Issue #61 (design section 1a): a copy whose copied inherit meets its own trim floor
+    /// (`HistoryMissing{below_floor:..}`: its History cannot rebuild the parent as of the base)
+    /// is skipped, logged `roll_forward_below_floor` (warn), and left to rejoin behind and be
+    /// rebuilt by snapshot. Nothing was written to it. A roll that skips every copy links none,
+    /// and the caller refuses the open ([`Self::unrolled`]): no open proceeds holding no copy
+    /// of the generation (t4, #137).
     fn link_roll(
         engines: &mut BTreeMap<NodeId, RocksEngine>,
         #[cfg_attr(not(test), allow(unused_variables))] dir: &Path,
         partition: PartitionId,
         roll: &Roll,
-    ) -> Result<(), OpenError> {
+    ) -> Result<Vec<NodeId>, OpenError> {
+        let mut rolled = Vec::new();
         for node in &roll.copies {
             // #62: a crash part way through the roll-forward, in one process.
             #[cfg(test)]
@@ -2698,38 +3445,99 @@ impl Db {
             // lands there with the switch, as the landing would have written it.
             let mark = roll
                 .possible_loss
-                .filter(|_| *node == roll.owner)
+                .filter(|_| *node == roll.record.owner)
                 .map(|reason| rdb_storage::PossibleLossMark {
                     generation: roll.to,
                     applied: roll.base.0,
                     cause: reason.cause(),
                 });
-            engines
+            let inherited = engines
                 .get_mut(node)
                 .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
-                .inherit_marked(partition, roll.from, roll.to, roll.base, mark)
-                .map_err(|error| {
-                    OpenError::Node(format!("node {}: roll forward: {error}", node.0))
-                })?;
-            if let Some(mark) = mark {
-                tracing::info!(
-                    target: host::FAILOVER_TARGET,
-                    partition = partition.0,
-                    copy = node.0,
-                    generation = mark.generation.0,
-                    applied = mark.applied,
-                    reason = host::PossibleLossReason::from_cause(mark.cause).as_str(),
-                    "failover_possible_loss_recorded"
-                );
+                .inherit_marked(partition, roll.from, roll.to, roll.base, mark);
+            match inherited {
+                Ok(_) => {
+                    rolled.push(*node);
+                    if let Some(mark) = mark {
+                        tracing::info!(
+                            target: host::FAILOVER_TARGET,
+                            partition = partition.0,
+                            copy = node.0,
+                            generation = mark.generation.0,
+                            applied = mark.applied,
+                            reason = host::PossibleLossReason::from_cause(mark.cause).as_str(),
+                            "failover_possible_loss_recorded"
+                        );
+                    }
+                }
+                Err(rdb_storage::InheritError::HistoryMissing { at })
+                    if at.starts_with("below_floor") =>
+                {
+                    tracing::warn!(
+                        node = node.0,
+                        partition = partition.0,
+                        from = roll.from.0,
+                        to = roll.to.0,
+                        base = roll.base.0,
+                        at,
+                        "roll_forward_below_floor"
+                    );
+                }
+                Err(error) => {
+                    return Err(OpenError::Node(format!(
+                        "node {}: roll forward: {error}",
+                        node.0
+                    )))
+                }
             }
         }
-        Ok(())
+        Ok(rolled)
+    }
+
+    /// Issue #61 (t4, #137): why an open whose roll-forward linked no copy is refused. The
+    /// owner's copy here and empty is #137's case and is refused as [`empty_owner`] refuses it;
+    /// any other open, an empty owner that [`empty_owner`] would let roll forward included, is
+    /// `Stale`, naming the generation no copy could take.
+    async fn unrolled(
+        engines: &BTreeMap<NodeId, RocksEngine>,
+        store: &Arc<dyn ConfigStore>,
+        instance: &[u8; INSTANCE_LEN],
+        roll: &Roll,
+    ) -> OpenError {
+        let partition = roll.record.partition;
+        let empty_owner = engines
+            .get(&roll.record.owner)
+            .is_some_and(|engine| !engine.lineages().iter().any(|(held, _)| *held == partition));
+        tracing::warn!(
+            partition = partition.0,
+            generation = roll.to.0,
+            from = roll.from.0,
+            base = roll.base.0,
+            empty_owner,
+            "roll_forward_linked_none"
+        );
+        if empty_owner {
+            if let Err(refused) = self::empty_owner(store, instance, &roll.record, &roll.root).await
+            {
+                return refused;
+            }
+        }
+        OpenError::Stale {
+            generation: roll.to.0,
+            detail: format!(
+                "not rolled forward: no copy of partition {} holds generation {}'s history \
+                 through seq {} any more (each was trimmed below it), so none can take \
+                 generation {}",
+                partition.0, roll.from.0, roll.base.0, roll.to.0
+            ),
+        }
     }
 
     /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
-    /// logs how many had started.
+    /// logs how many had started. `failover` is whether this open runs a planner (#172: the
+    /// heal then waits on a frozen grant the planner may clear).
     #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
@@ -2739,6 +3547,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        failover: bool,
         live_readd: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
@@ -2787,6 +3596,7 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                failover,
                 os_boot: self
                     .opened
                     .os_boot
@@ -2801,10 +3611,16 @@ impl Db {
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         let waiting = Arc::clone(&self.opened.heal_waiting);
+        let settling = Arc::clone(&self.opened.heal_settling);
+        settling.store(true, Ordering::Release);
         // In the opener's span, as the planner's task is: the heal's lines (`heal_retry` among
         // them) land in the opener's test file (issue #200, PR #171 review; R5).
         self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
-            heal_in_turn(ctxs, state, waiting),
+            async move {
+                let handed = heal_in_turn(ctxs, Arc::clone(&state), waiting).await;
+                settle_in_turn(handed, &state).await;
+                settling.store(false, Ordering::Release);
+            },
             tracing::Span::current(),
         )));
         Ok(())
@@ -2825,9 +3641,13 @@ impl Db {
     /// or its restart failed, answers at once: the owner stays out until the folder is opened
     /// again. So does a
     /// recovery that ended `Blocked` on an owner this `Db` runs: only a fresh fence leaves that
-    /// phase, and an open sends one fence only (ruling F-a, A-R196), except while that owner
-    /// re-plans at a restarted copy's new boot (#67 Wait 2): that is waited on to `within`, then
-    /// answered `Blocked` (A-R196 narrowed, #202). An owner in another process
+    /// phase, and an open sends one fence only (ruling F-a, A-R196). Two exceptions wait
+    /// instead. A local owner that re-plans at a restarted copy's new boot (#67 Wait 2) is
+    /// waited on to `within`, then answered `Blocked` (A-R196 narrowed, #202). And
+    /// `Blocked(CasContention)` while the reopen's heal still runs: [`admin::heal_settling`]
+    /// plans that recovery again with a fresh fence (#172, PR #218 review), so this waits on,
+    /// and answers `Blocked` only once the heal has stopped watching; a re-plan that failed
+    /// answers [`ReadyError::Heal`] with its cause instead. An owner in another process
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
@@ -2934,7 +3754,15 @@ impl Db {
                     Some(ReadyError::Blocked {
                         owner: node,
                         reason,
-                    }) if self.runs(node) => {
+                    }) if self.runs(node)
+                        && !(reason == "CasContention"
+                            && self.opened.heal_settling.load(Ordering::Acquire)) =>
+                    {
+                        // A re-plan that failed just before the flag cleared: its cause, not
+                        // the block it left (PR #218 review, round 2).
+                        if let HealState::Failed(error) = &*lock(&self.opened.heal) {
+                            return Err(ReadyError::Heal(error.clone()));
+                        }
                         if !self.boot_replan_pending(partition, node) {
                             tracing::warn!(owner = node.0, reason, "ready_blocked");
                             return Err(ReadyError::Blocked {
@@ -2948,8 +3776,10 @@ impl Db {
                         replanning = Some((node, reason));
                     }
                     Some(ReadyError::Blocked { reason, .. }) => {
-                        // Another process's owner is not ended by one blocked recovery: it
-                        // re-plans a rejoin that does not end writable (A-R282, A-R314 item 2).
+                        // Not ended by this block: an owner in another process re-plans a rejoin
+                        // that does not end writable (A-R282, A-R314 item 2), and an owner this
+                        // `Db` runs blocked `CasContention` is planned again while the heal's
+                        // watch runs ([`admin::heal_settling`]).
                         if remote_blocked.as_ref() != Some(&reason) {
                             tracing::info!(owner = owner.node.0, reason, "ready_owner_blocked");
                             remote_blocked = Some(reason);
@@ -3103,24 +3933,29 @@ impl Db {
         asked
             .into_iter()
             .map(|(partition, owner, sent)| {
-                let reason = match sent {
-                    Err(_) => Some(NotReady::NoLink),
+                let (reason, degraded) = match sent {
+                    Err(_) => (Some(NotReady::NoLink), None),
                     Ok(answer) => answer
                         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .map_or(Some(NotReady::NoAnswer), |status| not_ready(&status)),
+                        .map_or((Some(NotReady::NoAnswer), None), |status| {
+                            (not_ready(&status), status.needs_operator)
+                        }),
                 };
                 PartitionReady {
                     partition,
                     owner,
                     ready: reason.is_none(),
                     reason,
+                    degraded,
                 }
             })
             .collect()
     }
 
     /// The node this `Db` sends `partition`'s calls to, or `None` for a partition it does not
-    /// have.
+    /// have. Read from this `Db`'s own cache, not from rEtcd: during a move it can still name
+    /// the old owner after the control record names the new one, which [`Self::leader_of`]
+    /// reads.
     #[must_use]
     pub fn owner_of(&self, partition: PartitionId) -> Option<NodeId> {
         (1..=self.route.partitions())
@@ -3362,7 +4197,7 @@ impl Db {
             let local = lock(&self.nodes).iter().any(|handle| handle.node == owner);
             return Some(Answer::Error {
                 error: if local {
-                    ApiError::host("the owner's node thread has stopped")
+                    ApiError::owner_fault("the owner's node thread has stopped")
                 } else {
                     ApiError::owner_unreachable(owner)
                 },
@@ -3840,6 +4675,12 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
+        if let Some(error) = byte_write_refusal(&[(object, value)], identity) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
         let put = PutOp {
             group,
             object: Bytes::copy_from_slice(object),
@@ -3921,6 +4762,7 @@ impl Db {
                 error: limit_refused(
                     identity,
                     "puts",
+                    Limit::Ops,
                     puts.len(),
                     MAX_OPS,
                     format!(
@@ -3929,6 +4771,13 @@ impl Db {
                         identity.request.0
                     ),
                 ),
+                request: None,
+            });
+        }
+        let bytes: Vec<_> = puts.iter().map(|put| (put.object, put.value)).collect();
+        if let Some(error) = byte_write_refusal(&bytes, identity) {
+            return Err(PutError {
+                error,
                 request: None,
             });
         }
@@ -4109,6 +4958,20 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        match self.compile(identity, puts, deadline)? {
+            Some(request) => self.send_compiled(identity, request, wait).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The compile half of [`Self::compile_and_send`]: `puts` compiled at the owner under
+    /// `identity`, and nothing sent. `Ok(None)` when they change nothing.
+    fn compile(
+        &self,
+        identity: RequestIdentity,
+        puts: Vec<PutOp>,
+        deadline: Duration,
+    ) -> Result<Option<TxnRequest>, PutError> {
         // A request over a limit is refused here, before it reaches the owner's thread: nothing
         // is compiled or sent, and its request id is used up (M9 S5).
         if let Some(error) = write_refusal(&puts, identity) {
@@ -4142,17 +5005,7 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(partition, call, self.timeouts.put) {
-            Some(Answer::Compiled(mut request)) => {
-                // The ack floor rides the first send and every resend of it unchanged; it is
-                // not part of the request's digest (A-R252). Only this `Db`'s own write ids
-                // in flight carry one.
-                let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
-                if let Some(carried) = carried {
-                    request.acked_below = Some(carried.acked_below);
-                    request.pinned = carried.pinned;
-                }
-                self.send(ClientCall::Resend { request }, wait).map(Some)
-            }
+            Some(Answer::Compiled(request)) => Ok(Some(request)),
             Some(Answer::Unchanged) => Ok(None),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
@@ -4166,6 +5019,23 @@ impl Db {
                 ),
             )),
         }
+    }
+
+    /// The send half of [`Self::compile_and_send`]: `request`, compiled under `identity`.
+    fn send_compiled(
+        &self,
+        identity: RequestIdentity,
+        mut request: TxnRequest,
+        wait: Duration,
+    ) -> Result<PutOk, PutError> {
+        // The ack floor rides the first send and every resend of it unchanged; it is not part
+        // of the request's digest (A-R252). Only this `Db`'s own write ids in flight carry one.
+        let carried = lock(&self.ack_floor).carried(identity.request.0, Instant::now());
+        if let Some(carried) = carried {
+            request.acked_below = Some(carried.acked_below);
+            request.pinned = carried.pinned;
+        }
+        self.send(ClientCall::Resend { request }, wait)
     }
 
     /// Send `request` again, unchanged: same identity, same payload.
@@ -4459,6 +5329,375 @@ impl Db {
         self.status_at(self.partition_for(group), request, generation)
     }
 
+    /// Up to `limit` objects in group `group` whose id starts with `prefix`, in id order, after
+    /// object `after` when given (#147). Objects with no root, such as an unpublished upload's
+    /// chunks, are not listed. Each object costs the owner one seek, however many entries it
+    /// holds. Each page is read from its own view at the publication barrier; pages are not one
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_in`]. `INVALID_ARGUMENT` for a `limit` over [`MAX_PAGE`]; `TOO_LARGE`
+    /// for a `prefix` or `after` over [`MAX_OBJECT_ID`]; `CORRUPT_HISTORY` for a damaged key or
+    /// root in the range.
+    pub fn list_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ObjectPage, ApiError> {
+        let (objects, full, generation, at) = self.list_page(group, prefix, after, limit, false)?;
+        let entries: Vec<_> = objects
+            .into_iter()
+            .filter_map(|listed| {
+                listed.root.map(|(version, kind)| ObjectEntry {
+                    id: Bytes::from(listed.id),
+                    version,
+                    kind,
+                })
+            })
+            .collect();
+        let next = if full {
+            entries.last().map(|entry| entry.id.clone())
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            entries,
+            next,
+            generation,
+            at,
+        })
+    }
+
+    fn list_page(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        rootless: bool,
+    ) -> Result<(Vec<Listed>, bool, Generation, Seq), ApiError> {
+        let read = self.read_call(ClientCall::Get {
+            identity: self.identity(),
+            group,
+            object: Bytes::copy_from_slice(prefix),
+            look: Look::List {
+                after: after.map(Bytes::copy_from_slice),
+                limit,
+                rootless,
+            },
+        })?;
+        match read.seen {
+            Seen::Objects { objects, full } => Ok((objects, full, read.generation, read.at)),
+            other => Err(ApiError::host(&format!(
+                "a list was answered with {other:?}"
+            ))),
+        }
+    }
+
+    /// Delete every object in group `group` whose id starts with `prefix`, of every kind, and
+    /// every object with no root there, such as an unpublished upload's chunks (#147). Answers
+    /// how many objects it emptied.
+    ///
+    /// It walks the prefix a page at a time. Documents go up to [`MAX_OPS`] to a transaction,
+    /// each at the version listed; when one moved, the page is listed again, up to 3 times.
+    /// Every other object is deleted with [`Change::Delete`] until it answers `Ok(None)`.
+    /// `deadline` is each send's kernel deadline.
+    ///
+    /// **It is not atomic.** An error says how far it got, and running it again finishes the
+    /// job. An object created under the prefix after its page was read survives, as does a root
+    /// committed after its page was read at an id listed with no root.
+    ///
+    /// # Errors
+    ///
+    /// [`PrefixDeleteError`]: the objects emptied so far, and the first refusal, a list's
+    /// included, as [`Self::list_in`] and [`Self::write_in`] give them.
+    pub fn delete_prefix_in(
+        &self,
+        group: AffinityId,
+        prefix: &[u8],
+        deadline: Duration,
+    ) -> Result<u64, PrefixDeleteError> {
+        let mut deleted = 0;
+        let stop = |deleted, error| PrefixDeleteError { deleted, error };
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let mut moved = 0;
+            let (objects, full) = loop {
+                let (objects, full, ..) = self
+                    .list_page(group, prefix, after.as_deref(), MAX_PAGE, true)
+                    .map_err(|error| {
+                        stop(
+                            deleted,
+                            PutError {
+                                error,
+                                request: None,
+                            },
+                        )
+                    })?;
+                let docs: Vec<_> = objects
+                    .iter()
+                    .filter_map(|listed| match listed.root {
+                        Some((version, ObjectKind::Document)) => Some((&listed.id, version)),
+                        _ => None,
+                    })
+                    .collect();
+                match self.delete_docs(group, &docs, deadline, &mut deleted) {
+                    Ok(()) => break (objects, full),
+                    Err(error) if error.error.kind == ErrorKind::ConditionFailed && moved < 3 => {
+                        moved += 1;
+                    }
+                    Err(error) => return Err(stop(deleted, error)),
+                }
+            };
+            #[cfg(test)]
+            after_page(self, prefix);
+            for listed in &objects {
+                // PR #178 review r4 N1: an id listed with no root is drained only while it has
+                // none, so a root committed there after the page was read survives.
+                let expect = match listed.root {
+                    Some((_, ObjectKind::Document)) => continue,
+                    Some(_) => None,
+                    None => Some(Expected::Absent),
+                };
+                match self.drain(group, &listed.id, expect, deadline) {
+                    Ok(emptied) => deleted += u64::from(emptied),
+                    Err((emptied, error)) => return Err(stop(deleted + u64::from(emptied), error)),
+                }
+            }
+            match objects.last() {
+                Some(last) if full => after = Some(last.id.clone()),
+                _ => return Ok(deleted),
+            }
+        }
+    }
+
+    /// Delete documents `docs`, each at its listed version, counting each into `deleted` once
+    /// its root is gone (PR #178 review r1, T1 and T2). A pack of up to [`MAX_OPS`] documents is
+    /// compiled first and sent only when it fits one request and deletes every root in it;
+    /// otherwise it is halved. A document that does not fit alone (more records under it than
+    /// one request carries, such as a 255-chunk upload) is drained a batch at a time.
+    fn delete_docs(
+        &self,
+        group: AffinityId,
+        docs: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+        deleted: &mut u64,
+    ) -> Result<(), PutError> {
+        let mut rest = docs;
+        let mut take = MAX_OPS;
+        while !rest.is_empty() {
+            take = take.min(rest.len());
+            let pack = &rest[..take];
+            match self.delete_pack(group, pack, deadline)? {
+                Some(answer) => {
+                    if answer.is_some() {
+                        *deleted += pack.len() as u64;
+                    }
+                    rest = &rest[take..];
+                    take = MAX_OPS;
+                }
+                None if take > 1 => take /= 2,
+                None => {
+                    let (id, version) = pack[0];
+                    let drained = self.drain(group, id, Some(Expected::Version(version)), deadline);
+                    match drained {
+                        Ok(emptied) => *deleted += u64::from(emptied),
+                        Err((emptied, error)) => {
+                            *deleted += u64::from(emptied);
+                            return Err(error);
+                        }
+                    }
+                    rest = &rest[1..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile the deletes of documents `pack`, each at its listed version, under one fresh
+    /// write id, and send them only when they fit one request ([`MAX_OPS`] mutations) and delete
+    /// every root in it. `Ok(None)`: they do not, and nothing was sent.
+    fn delete_pack(
+        &self,
+        group: AffinityId,
+        pack: &[(&Vec<u8>, u64)],
+        deadline: Duration,
+    ) -> Result<Option<Option<PutOk>>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let puts = pack
+            .iter()
+            .map(|(id, version)| PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: Some(Expected::Version(*version)),
+            })
+            .collect();
+        let answer = match self.compile(identity, puts, deadline) {
+            Ok(Some(request)) => {
+                let deletes_root = |id: &[u8]| {
+                    let root = rdb_value::keys::root_key(TENANT, group, id).to_bytes();
+                    request.mutations.iter().any(
+                        |mutation| matches!(mutation, rdb_core::contracts::txn::Mutation::Delete { key, .. } if *key == root),
+                    )
+                };
+                if request.mutations.len() <= MAX_OPS && pack.iter().all(|(id, _)| deletes_root(id))
+                {
+                    self.send_compiled(identity, request, send_wait(deadline))
+                        .map(|ok| Some(Some(ok)))
+                } else {
+                    Ok(None)
+                }
+            }
+            Ok(None) => Ok(Some(None)),
+            Err(error) => Err(error),
+        };
+        self.finished(identity.request, answer)
+    }
+
+    /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch under
+    /// `expect` when given. Whether the drain emptied it: one of its batches committed and the
+    /// object was then confirmed empty, by a compile that found nothing stored or, after an
+    /// error, by a reread (PR #178 review r6 B1). An object it stopped at with records left is
+    /// not emptied. [`Expected::Absent`] drains records with no root by
+    /// [`Self::rootless_batch`], never by the public write, which refuses it: a root found there
+    /// ends the drain and the object survives (PR #178 review r4 N1, r5 B1). Any other failed
+    /// condition is the error.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, with whether the object was emptied before it: its last records
+    /// deleted, then the next compile failed.
+    fn drain(
+        &self,
+        group: AffinityId,
+        id: &[u8],
+        expect: Option<Expected>,
+        deadline: Duration,
+    ) -> Result<bool, (bool, PutError)> {
+        let rootless = expect == Some(Expected::Absent);
+        let mut committed = false;
+        loop {
+            let put = PutOp {
+                group,
+                object: Bytes::copy_from_slice(id),
+                change: Change::Delete,
+                expect: expect.filter(|_| !rootless),
+            };
+            let sent = if rootless {
+                self.rootless_batch(put, deadline)
+            } else {
+                self.put_changes(vec![put], deadline)
+                    .map(|sent| match sent {
+                        Some(_) => Batch::Sent,
+                        None => Batch::Empty,
+                    })
+            };
+            let error = match sent {
+                Ok(Batch::Sent) => {
+                    committed = true;
+                    continue;
+                }
+                Ok(Batch::Empty) => return Ok(committed),
+                Ok(Batch::Rooted) => return Ok(false),
+                Err(error) => error,
+            };
+            let stored = (committed || rootless).then(|| self.stored(group, id));
+            let emptied = committed && matches!(stored, Some(Ok(None)));
+            // A rootless batch's failed condition: only a root committed since the compile ends
+            // the drain quietly, and the object survives.
+            if rootless && error.error.kind == ErrorKind::ConditionFailed {
+                match stored {
+                    Some(Ok(Some(Some(_)))) => return Ok(false),
+                    Some(Err(error)) => {
+                        let request = None;
+                        return Err((false, PutError { error, request }));
+                    }
+                    _ => {}
+                }
+            }
+            return Err((emptied, error));
+        }
+    }
+
+    /// What object `id` stores now, from a one-object list: `None` nothing, `Some(root)`
+    /// records, with the root's version and kind when it has one.
+    fn stored(
+        &self,
+        group: AffinityId,
+        id: &[u8],
+    ) -> Result<Option<Option<(u64, ObjectKind)>>, ApiError> {
+        let (listed, ..) = self.list_page(group, id, None, 1, true)?;
+        Ok(listed
+            .into_iter()
+            .next()
+            .filter(|found| found.id == id)
+            .map(|found| found.root))
+    }
+
+    /// One batch of a rootless drain: `put`, a [`Change::Delete`] with no expect, compiled and
+    /// sent only while it carries the kernel's guard that the root is absent. Nothing is sent
+    /// when nothing is left ([`Batch::Empty`]) or when it does not, a root being in the owner's
+    /// view ([`Batch::Rooted`]).
+    fn rootless_batch(&self, put: PutOp, deadline: Duration) -> Result<Batch, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let root = rdb_value::keys::root_key(TENANT, put.group, &put.object).to_bytes();
+        #[cfg(test)]
+        if let Some(error) = compile_fault(&root) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let answer = match self.compile(identity, vec![put], deadline) {
+            Ok(Some(request))
+                if request.conditions.iter().any(
+                    |condition| matches!(condition, Condition::Absent { key } if *key == root),
+                ) =>
+            {
+                #[cfg(test)]
+                before_send(self, &root);
+                self.send_compiled(identity, request, send_wait(deadline))
+                    .map(|_| Batch::Sent)
+            }
+            Ok(Some(_)) => Ok(Batch::Rooted),
+            Ok(None) => Ok(Batch::Empty),
+            Err(error) => Err(error),
+        };
+        self.finished(identity.request, answer)
+    }
+
+    /// Compile and send `puts` as one transaction under a fresh write id, with kernel deadline
+    /// `deadline`.
+    fn put_changes(&self, puts: Vec<PutOp>, deadline: Duration) -> Result<Option<PutOk>, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        let identity = self.write_identity()?;
+        let answer = self.compile_and_send(identity, puts, deadline, send_wait(deadline));
+        // PR #178 review r1 T3: every id `write_identity` begins is finished, or the ack floor
+        // stays below it and its dedup slot is never released.
+        self.finished(identity.request, answer)
+    }
+
     fn status_at(
         &self,
         partition: PartitionId,
@@ -4550,26 +5789,144 @@ impl Db {
             .any(|handle| handle.owner_views.still_owner(partition, token))
     }
 
-    /// Where `group`'s calls go (#83): its partition, and the owner and token its
-    /// `partitions/{p}` record names. A hint for forwarding a request, never authority: the
-    /// owner can lose the partition the moment after, so act only through
+    /// Where `group`'s calls go (#83): its partition, the owner and token its `partitions/{p}`
+    /// record names, and the app address that owner's `nodes/{id}` record names
+    /// ([`RouteInfo::app_address`], slice B2). A hint for forwarding a request, never
+    /// authority: the owner can lose the partition the moment after, so act only through
     /// [`Self::still_owner`] on the owner and the destination's own token check.
     ///
-    /// Cached. A node this process runs watches `partitions/` for its own authority already, and
-    /// each change that watch delivers for a partition makes that partition's answer stale; the
-    /// end of any such watch makes every answer stale. Nothing new is watched. While no such
-    /// watch is open (an app-only `Db`, or every node here cut from rEtcd) nothing is cached and
-    /// each call reads the record. A stale answer is read again, within the read timeout.
-    /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each read.
+    /// Two reads, each cached on its own:
+    ///
+    /// - The partition record. A node this process runs watches `partitions/` for its own
+    ///   authority already, and each change that watch delivers for a partition makes that
+    ///   partition's answer stale; the end of any such watch makes every answer stale. Nothing
+    ///   new is watched. While no such watch is open (an app-only `Db`, or every node here cut
+    ///   from rEtcd) nothing is cached and each call reads the record.
+    /// - The owner's app address, kept one second per owner node after a read that succeeds,
+    ///   then read again, since nothing watches `nodes/`. A cached partition answer still needs
+    ///   this read once its second is up, and that read can be slow or fail. Calls that need
+    ///   one owner's address while it is being read wait for that read and take its answer,
+    ///   success or failure; other owners do not wait on it.
+    ///
+    /// **A failed address read does not fail the call** (SBX answer, 2026-11-20). When the
+    /// owner's `nodes/{id}` read fails or does not answer in time, the answer names the owner
+    /// and token with the last address a read of that owner returned in this `Db`, whatever
+    /// its age, so it may be stale; or `None` if no read of that owner has succeeded yet. That
+    /// is safe because the address is only a dial hint: the sender checks the receiver's TLS
+    /// identity against the owner before it sends anything ([`RouteInfo::app_address`]). The
+    /// failure refreshes nothing, so the next call reads again at once.
+    ///
+    /// A call takes at most two read timeouts ([`Timeouts::read`]) in all, however many calls
+    /// run at once: one for the partition record, and one for the owner's address, waiting
+    /// for another call's read of it included.
+    ///
+    /// Logged `db_route_read{partition, owner, generation, owner_epoch, cached}` on each
+    /// partition-record read and `db_route_app_addr_read{node, app_len}` (DEBUG, target
+    /// `rdb_api::route_addr`) on each address read
+    /// that succeeds; `db_route_read_failed{what, detail}` (warn) when a read fails or does not
+    /// answer in time, then `db_route_app_addr_unreadable{node, reason, served}` (warn) when
+    /// that read was the address's (`served` is `last_good` or `none`); and
+    /// `db_route_read_undecodable{what, detail}` (warn) for a record this build cannot decode.
+    /// The address itself is never logged, since it may carry a credential.
     ///
     /// # Errors
     ///
-    /// `UNAVAILABLE` when the record cannot be read in the read timeout, does not decode, or is
-    /// absent, and from a `Db` a crate test built by hand, which has no control store.
+    /// - `UNAVAILABLE` (retry `BoundedJitter`) in three cases: the partition record cannot be
+    ///   read, or is not read in time; it is absent; or the `Db` is one a crate test built
+    ///   without a control store. A later call can succeed. The owner's address read is never
+    ///   `UNAVAILABLE`: one that fails answers the last good address (above), and an absent
+    ///   `nodes/{id}` record answers `None`.
+    /// - `INCOMPATIBLE_VERSION` (retry `Quarantine`, #135) when the partition record or the
+    ///   owner's node record does not decode: a newer build may have written it, or it is
+    ///   damaged; no retry succeeds. Logged `db_route_read_undecodable`.
     pub fn route(&self, group: AffinityId) -> Result<RouteInfo, ApiError> {
-        let partition = self.partition_for(group);
+        self.route_partition(self.partition_for(group))
+    }
+
+    /// [`Self::route`] of a partition rather than a group (#83, SBX's `leader_of`): the owner,
+    /// token and owner address that `partition`'s records name, cached the same way.
+    ///
+    /// Not [`Self::owner_of`]: this reads the control records, what rEtcd says the owner is,
+    /// from any process. Like `route`, it can answer from the cache a node's control watch
+    /// keeps current, so a change of the record is seen once its watch event arrives.
+    /// `owner_of` reads nothing; it names the node this `Db` sends the partition's calls to,
+    /// from its own cache, and during a move the two can differ until this `Db` learns of the
+    /// move.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for a partition this database does not have (0, or above
+    /// [`Self::partition_count`]); otherwise as [`Self::route`].
+    pub fn leader_of(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
+        let partitions = self.route.partitions();
+        if !(1..=partitions).contains(&partition.0) {
+            return Err(ApiError::invalid(format!(
+                "leader_of: partition {} is not one of this database's partitions 1 to \
+                 {partitions}",
+                partition.0
+            )));
+        }
+        self.route_partition(partition)
+    }
+
+    /// The partition `group` lives in (#83, SBX's `partition_of`): the key map over the
+    /// partition count fixed when the database was formed (at most [`MAX_PARTITIONS`], 512).
+    /// Every group of one partition moves with it. Reads nothing. Valid while the database has
+    /// its original partitions: a partition that later splits can leave it naming the parent
+    /// of a group.
+    #[must_use]
+    pub fn partition_of(&self, group: AffinityId) -> PartitionId {
+        self.partition_for(group)
+    }
+
+    fn route_partition(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
+        let mut info = self.route_record(partition)?;
+        info.owner_address = self.owner_address(info.owner)?;
+        Ok(info)
+    }
+
+    /// `node`'s app address for a route answer (#83 B2, SBX answer, 2026-11-20): a read that
+    /// fails or does not answer in time is not an error. The answer then names the last
+    /// address a read of `node` returned in this `Db`, whatever its age, or none if no read of
+    /// it has succeeded yet. That may be stale, which is safe because the sender checks the
+    /// receiver's TLS identity before it sends anything. The failure refreshes nothing, so the
+    /// next call reads again. Logged `db_route_app_addr_unreadable{node, reason, served}`
+    /// (warn): `reason` the error kind or `timeout`, `served` `last_good` or `none`, never the
+    /// address. A record this build cannot decode stays `INCOMPATIBLE_VERSION` (#135): no
+    /// later read can fix it.
+    fn owner_address(&self, node: NodeId) -> Result<Option<String>, ApiError> {
+        let started = Instant::now();
+        match self.app_address_of(node) {
+            Ok(app) => Ok(app),
+            Err(refused) if refused.kind == ErrorKind::IncompatibleVersion => Err(refused),
+            Err(refused) => {
+                // The whole budget spent is a timeout, waiting for another call's read
+                // included; anything sooner is the store's answer.
+                let reason = if started.elapsed() >= self.timeouts.read {
+                    "timeout".to_owned()
+                } else {
+                    format!("{:?}", refused.kind)
+                };
+                let last_good = lock(&self.route.addrs)
+                    .get(&node)
+                    .and_then(|slot| slot.good.as_ref())
+                    .map(|(app, _)| app.clone());
+                let served = if last_good.is_some() {
+                    "last_good"
+                } else {
+                    "none"
+                };
+                tracing::warn!(node = node.0, %reason, served, "db_route_app_addr_unreadable");
+                Ok(last_good.flatten())
+            }
+        }
+    }
+
+    /// `partition`'s owner and token, from the cache while its stamp is current, else read
+    /// from `partitions/{p}`. The answer holds no address.
+    fn route_record(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
         let marks = self.control.route_marks();
-        if let Some((info, stamp)) = lock(&self.route.answers).get(&partition.0).copied() {
+        if let Some((info, stamp)) = lock(&self.route.answers).get(&partition.0).cloned() {
             if marks.current(partition, stamp) {
                 return Ok(info);
             }
@@ -4577,32 +5934,11 @@ impl Db {
         // The stamp is taken before the read, so a change delivered during it leaves the
         // answer stale rather than cached past the change.
         let stamp = marks.stamp(partition);
-        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
-            return Err(ApiError::new(
-                ErrorKind::Unavailable,
-                "route: this Db has no control store to read partitions/ from".to_owned(),
-            ));
-        };
-        let (done, read) = mpsc::channel();
-        rt.spawn(async move {
-            // The caller may have given up; then nobody needs the answer.
-            let _ = done.send(read_route(&*store, partition).await);
-        });
-        let info = match read.recv_timeout(self.timeouts.read) {
-            Ok(Ok(info)) => info,
-            Ok(Err(detail)) => {
-                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
-                return Err(ApiError::new(ErrorKind::Unavailable, detail));
-            }
-            Err(_) => {
-                let detail = format!(
-                    "route: partitions/{} did not read within {:?}",
-                    partition.0, self.timeouts.read
-                );
-                tracing::warn!(partition = partition.0, %detail, "db_route_read_failed");
-                return Err(ApiError::new(ErrorKind::Unavailable, detail));
-            }
-        };
+        let what = format!("partitions/{}", partition.0);
+        let deadline = Instant::now() + self.timeouts.read;
+        let info = self.control_read(&what, deadline, move |store| async move {
+            read_route(&*store, partition).await
+        })?;
         tracing::info!(
             partition = partition.0,
             owner = info.owner.0,
@@ -4612,9 +5948,123 @@ impl Db {
             "db_route_read"
         );
         if let Some(stamp) = stamp {
-            lock(&self.route.answers).insert(partition.0, (info, stamp));
+            lock(&self.route.answers).insert(partition.0, (info.clone(), stamp));
         }
         Ok(info)
+    }
+
+    /// The app address `node`'s `nodes/{id}` record holds (#83 B2), kept for
+    /// [`APP_ADDR_REREAD_GAP`]: a node writes it only at an open, so a restart that changes it
+    /// is seen within the gap, and nothing watches `nodes/`.
+    ///
+    /// One budget, one read timeout from entry, covers the whole call, waiting for another
+    /// caller included (PR #159 review r2). Refreshes of one node are coalesced: the first
+    /// caller to find the answer expired reads, and callers that come while it reads wait for
+    /// that read's answer, success or failure, within their own budget, and take it. So a slow
+    /// read that succeeds is shared with every caller already waiting, even if its pre-read
+    /// stamp has expired by then; a later caller reads again. Concurrent callers never queue
+    /// read after read. A failed read keeps nothing, so the next caller reads again. Other
+    /// nodes never wait on this one's read. Logged `db_route_app_addr_read{node, app_len}` at
+    /// DEBUG, target `rdb_api::route_addr`;
+    /// the address itself is never logged, since it may carry a credential.
+    ///
+    /// A failed read is `UNAVAILABLE` here; [`Self::owner_address`] answers the last good
+    /// read (`good`) in its place, past its gap, without refreshing its stamp.
+    fn app_address_of(&self, node: NodeId) -> Result<Option<String>, ApiError> {
+        let deadline = Instant::now() + self.timeouts.read;
+        let key = ControlKey::Node(node).encode();
+        let read = {
+            let mut addrs = lock(&self.route.addrs);
+            let slot = addrs.entry(node).or_default();
+            if let Some((app, read_at)) = &slot.good {
+                if read_at.elapsed() < APP_ADDR_REREAD_GAP {
+                    return Ok(app.clone());
+                }
+            }
+            if let Some(reading) = slot.reading.clone() {
+                drop(addrs);
+                return reading.wait_until(deadline).unwrap_or_else(|| {
+                    let detail = format!(
+                        "route: {key} did not read within {:?}: another call's read of it is \
+                         still running",
+                        self.timeouts.read
+                    );
+                    tracing::warn!(what = %key, %detail, "db_route_read_failed");
+                    Err(ApiError::new(ErrorKind::Unavailable, detail))
+                });
+            }
+            let read = Arc::new(AddrRead::default());
+            slot.reading = Some(Arc::clone(&read));
+            read
+        };
+        let reader = AddrReader {
+            route: &self.route,
+            node,
+            read,
+            finished: false,
+        };
+        let read_at = Instant::now();
+        let app = self.control_read(&key, deadline, move |store| async move {
+            read_app_addr(&*store, node).await
+        });
+        if let Ok(app) = &app {
+            // PR #159 review r3 (T49): a routine read, neither lifecycle nor mutation, so
+            // DEBUG, under its own target, which test logging enables.
+            tracing::debug!(
+                target: "rdb_api::route_addr",
+                node = node.0,
+                app_len = app.as_ref().map_or(0, String::len),
+                "db_route_app_addr_read"
+            );
+        }
+        reader.finish(&app, read_at);
+        app
+    }
+
+    /// Run `read` against the control store on its runtime, until `deadline`: a store that
+    /// answers late or fails is `UNAVAILABLE`, a record this build cannot decode
+    /// `INCOMPATIBLE_VERSION` (#135), since no retry decodes it.
+    fn control_read<T, F>(
+        &self,
+        what: &str,
+        deadline: Instant,
+        read: impl FnOnce(Arc<dyn ConfigStore>) -> F,
+    ) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, RouteReadError>> + Send + 'static,
+    {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("route: this Db has no control store to read {what} from"),
+            ));
+        };
+        let (done, answer) = mpsc::channel();
+        let reading = read(store);
+        rt.spawn(async move {
+            // The caller may have given up; then nobody needs the answer.
+            let _ = done.send(reading.await);
+        });
+        match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(RouteReadError::Unavailable(detail))) => {
+                tracing::warn!(what, %detail, "db_route_read_failed");
+                Err(ApiError::new(ErrorKind::Unavailable, detail))
+            }
+            Ok(Err(RouteReadError::Undecodable(detail))) => {
+                tracing::warn!(what, %detail, "db_route_read_undecodable");
+                Err(ApiError::new(
+                    ErrorKind::IncompatibleVersion,
+                    format!("{detail}; {}", error::ROUTE_NEWER_RECORD_STEP),
+                ))
+            }
+            Err(_) => {
+                let detail = format!("route: {what} did not read within {:?}", self.timeouts.read);
+                tracing::warn!(what, %detail, "db_route_read_failed");
+                Err(ApiError::new(ErrorKind::Unavailable, detail))
+            }
+        }
     }
 
     /// The ownership changes of every node this process runs (#83): `Activated`,
@@ -4898,6 +6348,70 @@ impl Db {
         match answer.recv_timeout(self.timeouts.read) {
             Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
             Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
+        }
+    }
+
+    /// **Dev tool only**, debug builds (issue #61; `rdb_dev admin trim-history --through N`):
+    /// trim `node`'s copy of partition 1 to `through` ([`Msg::TrimHistory`]): every History
+    /// record below it is deleted, the record at it kept. Answers the new floor, which
+    /// [`NodeStatus::lengths`]' `history_floor` reports from then on.
+    ///
+    /// # Errors
+    ///
+    /// The host's refusal as text (nothing was changed): `inventory_pinned`, `root_unknown`,
+    /// `below_floor`, `engine:<reason>` and the like; `node` not run by this process, stopped,
+    /// or not answering within the read timeout.
+    #[cfg(debug_assertions)]
+    pub fn trim_history(&self, node: NodeId, through: u64) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("trim_history", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
+        self.trim_history_for_tests(node, PARTITION, through)
+    }
+
+    /// **Tests only**, debug builds, hidden (issue #61, lead ruling for the S2-R1 and S2-R4
+    /// parity rows): [`Self::trim_history`] on any `partition`, through the same
+    /// [`Msg::TrimHistory`] path, so a row in another crate trims the copy it runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::trim_history`].
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn trim_history_for_tests(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        through: u64,
+    ) -> Result<u64, String> {
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::TrimHistory {
+            partition,
+            through: Seq(through),
+            reply,
+        };
+        let sent = lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => {
+                return Err(format!(
+                    "node {} is not run by this process: trim its copy from its own process",
+                    node.0
+                ))
+            }
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done
+                .map(|floor| floor.0)
+                .map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(_) => Err(format!(
+                "node {} did not answer within {:?}",
+                node.0, self.timeouts.read
+            )),
         }
     }
 
@@ -5475,9 +6989,11 @@ impl Db {
     /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
     /// until its last grant expiry plus the safety margin is proven past. The other partitions
     /// the node owned remain not ready until each has its own promote (`Faulted` while the
-    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
+    /// faulted host answers, or `NoLink` when sending to it fails). The node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
-    /// for a partition it no longer owns.
+    /// for a partition it no longer owns; with [`DbConfig::failover`] set and every partition
+    /// it owns `Serving`, it waits instead for a planner to clear the frozen grant of its old
+    /// boot, then heals them as owner (#172).
     ///
     /// # Errors
     ///
@@ -5672,6 +7188,8 @@ impl Db {
                     node.0
                 ),
                 retry_after: None,
+                too_large: None,
+                owner_fault: false,
             });
         }
         // #170 review r6: marked `restarting` under the node lock, then stopped and started
@@ -6349,7 +7867,7 @@ impl Db {
             reply: host::RebuildReply(reply),
         };
         if self.send_to(owner, asked).is_err() {
-            return Err(ApiError::host(&format!(
+            return Err(ApiError::owner_fault(&format!(
                 "node {} (the owner) stopped before it was asked to rebuild node {}",
                 owner.0, node.0
             )));
@@ -6560,7 +8078,11 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         }) => Some((version, Bytes::from(bytes))),
         // `get` looks with `Look::Doc`, so `Members` and `Items` are not expected here; either
         // way it is no byte string.
-        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) | Seen::Range { .. } => {
+        Seen::Doc(_)
+        | Seen::Members(_)
+        | Seen::Items(_)
+        | Seen::Range { .. }
+        | Seen::Objects { .. } => {
             return Err(ApiError::invalid(
                 "the object is not a byte string; read it with Db::read",
             ))
@@ -6595,6 +8117,17 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
         error.detail, sent.identity.request.0
     );
     error
+}
+
+/// One batch of a [`Db::delete_prefix_in`] drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// Sent and committed.
+    Sent,
+    /// Nothing is stored under the object: nothing was sent.
+    Empty,
+    /// A rootless batch with a root in the owner's view: nothing was sent.
+    Rooted,
 }
 
 /// What a call carries to the owner, so what an answer lost under it may hide.
@@ -6633,7 +8166,7 @@ fn carries(call: &ClientCall) -> Carries {
 /// compile, a read, a status look) applied nothing (A-R394 E1).
 fn unanswered(local: bool, owner: NodeId, carried: Carries) -> ApiError {
     if local {
-        return ApiError::host("the owner dropped the call unanswered");
+        return ApiError::owner_fault("the owner dropped the call unanswered");
     }
     match carried {
         Carries::Write => ApiError::owner_lost(owner),
@@ -6694,6 +8227,8 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
                 no_mutation: true,
                 detail: "the read was refused".to_owned(),
                 retry_after: None,
+                too_large: None,
+                owner_fault: false,
             }
         }
         ErrorKind::GenerationChanged => RdbError::GenerationChanged {
@@ -6718,6 +8253,8 @@ pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
         no_mutation: kernel.proves_no_mutation(),
         detail: "the read was refused".to_owned(),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -6794,8 +8331,10 @@ struct Roll {
     to: Generation,
     base: Seq,
     copies: Vec<NodeId>,
-    /// The record's owner: the copy a promote lands on.
-    owner: NodeId,
+    /// The record and root the decision read: an open whose roll links no copy (issue #61,
+    /// every copy below its trim floor) is refused from them, as an empty owner is (#137).
+    record: PartitionRecord,
+    root: PartitionRoot,
     /// #177: the possible-loss reason the promote that committed `to` stored with its plan,
     /// when it was one ([`rolled_possible_loss`]).
     possible_loss: Option<host::PossibleLossReason>,
@@ -7473,6 +9012,8 @@ fn rebuild_error(retry: RetryRule, no_mutation: bool, detail: String) -> ApiErro
         no_mutation,
         detail: format!("{detail}; {}", error::REBUILD_STEP),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -7769,7 +9310,7 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
     })
 }
 
-/// The first limit `puts` breaks, as `INVALID_ARGUMENT` naming the put as `op <index>`, or
+/// The first limit `puts` breaks, as `TOO_LARGE` naming the put as `op <index>`, or
 /// `None` when every put is within every limit. `identity` is the one the refused request used up.
 fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> {
     let request = identity.request;
@@ -7778,6 +9319,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "object_id",
+                Limit::ObjectId,
                 put.object.len(),
                 MAX_OBJECT_ID,
                 format!(
@@ -7793,6 +9335,7 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             return Some(limit_refused(
                 identity,
                 "ops",
+                Limit::Ops,
                 ops,
                 MAX_OPS,
                 format!(
@@ -7801,6 +9344,45 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
                 ),
             ));
         }
+        if let Change::Chunk { bytes, .. } = &put.change {
+            if bytes.len() > rdb_value::blob::MAX_CHUNK {
+                return Some(limit_refused(
+                    identity,
+                    "chunk",
+                    Limit::Chunk,
+                    bytes.len(),
+                    rdb_value::blob::MAX_CHUNK,
+                    format!(
+                        "op {index}: chunk {} bytes, over the {}-byte limit; request {} not sent",
+                        bytes.len(),
+                        rdb_value::blob::MAX_CHUNK,
+                        request.0
+                    ),
+                ));
+            }
+        }
+        // Q5 (PR #178 review r1, lead ruling): a document that is one byte string, the shape a
+        // byte put writes, keeps the byte put's value limit. Every other document shape keeps
+        // the owner's compile refusal.
+        if let Change::Doc(Delta(ops)) = &put.change {
+            if let [Op::Replace(Value::Bytes(bytes))] = ops.as_slice() {
+                if bytes.len() > MAX_VALUE {
+                    return Some(limit_refused(
+                        identity,
+                        "value",
+                        Limit::Value,
+                        bytes.len(),
+                        MAX_VALUE,
+                        format!(
+                            "op {index}: value {} bytes, over the {MAX_VALUE}-byte limit; \
+                             request {} not sent",
+                            bytes.len(),
+                            request.0
+                        ),
+                    ));
+                }
+            }
+        }
         let elems = match &put.change {
             Change::Map(elems) | Change::Set(elems) => elems.as_slice(),
             Change::Doc(_)
@@ -7808,7 +9390,8 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
             | Change::Chunk { .. }
             | Change::Publish { .. }
             | Change::Gc { .. }
-            | Change::Clear => &[],
+            | Change::Clear
+            | Change::Delete => &[],
         };
         elems
             .iter()
@@ -7816,7 +9399,53 @@ fn write_refusal(puts: &[PutOp], identity: RequestIdentity) -> Option<ApiError> 
     })
 }
 
-/// `INVALID_ARGUMENT` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
+/// The first size limit a byte write breaks, or `None` (#148). `puts` are its (object id,
+/// value) pairs in order. An id over [`MAX_OBJECT_ID`] is left to [`write_refusal`], which
+/// names it first, as it always has. Then each value against [`MAX_VALUE`], naming the put as
+/// `op <index>`, then the upper-bound sum against [`MAX_WRITE`].
+fn byte_write_refusal(puts: &[(&[u8], &[u8])], identity: RequestIdentity) -> Option<ApiError> {
+    if puts.iter().any(|(object, _)| object.len() > MAX_OBJECT_ID) {
+        return None;
+    }
+    let request = identity.request.0;
+    if let Some((index, value)) = puts
+        .iter()
+        .map(|(_, value)| value.len())
+        .enumerate()
+        .find(|(_, value)| *value > MAX_VALUE)
+    {
+        return Some(limit_refused(
+            identity,
+            "value",
+            Limit::Value,
+            value,
+            MAX_VALUE,
+            format!(
+                "op {index}: value {value} bytes, over the {MAX_VALUE}-byte limit; request \
+                 {request} not sent"
+            ),
+        ));
+    }
+    let bound = puts.iter().fold(WRITE_COST, |sum, (object, value)| {
+        let zeros = object.iter().filter(|byte| **byte == 0).count();
+        sum + value.len() + object.len() + zeros + PUT_COST
+    });
+    (bound > MAX_WRITE).then(|| {
+        limit_refused(
+            identity,
+            "write",
+            Limit::Write,
+            bound,
+            MAX_WRITE,
+            format!(
+                "write {bound} bytes by the upper-bound sum, over the {MAX_WRITE}-byte limit for \
+                 the whole write; request {request} not sent"
+            ),
+        )
+    })
+}
+
+/// `TOO_LARGE` for a map key or set member over [`MAX_KEY`], or `None`. `index` names
 /// the put, when there is one; `done` ends the detail: `request R not <done>`.
 fn key_refusal(
     key: &Value,
@@ -7830,6 +9459,7 @@ fn key_refusal(
         limit_refused(
             identity,
             "key",
+            Limit::Key,
             found,
             MAX_KEY,
             format!(
@@ -7875,13 +9505,17 @@ fn op_count(change: &Change) -> usize {
         Change::Doc(delta) => delta.0.len(),
         Change::Map(ops) | Change::Set(ops) => ops.len(),
         Change::List(edits) => edits.len(),
-        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } | Change::Clear => 0,
+        Change::Chunk { .. }
+        | Change::Publish { .. }
+        | Change::Gc { .. }
+        | Change::Clear
+        | Change::Delete => 0,
     }
 }
 
-/// The first limit a read `call` breaks, as `INVALID_ARGUMENT`, or `None` when it is within
-/// every limit. A call that is not a read is never refused here: [`Db::read_call`] sends reads
-/// only.
+/// The first limit a read `call` breaks, as `TOO_LARGE` (`INVALID_ARGUMENT` for a page), or
+/// `None` when it is within every limit. A call that is not a read is never refused here:
+/// [`Db::read_call`] sends reads only.
 fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     let (identity, object, look) = match call {
         ClientCall::Get {
@@ -7907,6 +9541,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         return Some(limit_refused(
             *identity,
             "object_id",
+            Limit::ObjectId,
             object.len(),
             MAX_OBJECT_ID,
             format!(
@@ -7920,26 +9555,39 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         Some(
             Look::Members { limit, .. }
             | Look::Items { limit, .. }
-            | Look::ItemsAfter { limit, .. },
+            | Look::ItemsAfter { limit, .. }
+            | Look::List { limit, .. },
         ) => *limit,
         Some(Look::Doc | Look::Range { .. }) | None => 0,
     };
     if page > MAX_PAGE {
-        return Some(limit_refused(
-            *identity,
-            "page",
-            page,
-            MAX_PAGE,
-            format!(
-                "page limit {page}, over {MAX_PAGE}; request {} not read",
-                request.0
-            ),
-        ));
+        // A count the read asks for, not a size it carries: `INVALID_ARGUMENT`, not `TOO_LARGE`.
+        log_limit_refused(*identity, "page", page, MAX_PAGE);
+        return Some(ApiError::invalid(format!(
+            "page limit {page}, over {MAX_PAGE}; request {} not read",
+            request.0
+        )));
     }
     match look {
         Some(Look::Members {
             after: Some(after), ..
         }) => key_refusal(after, *identity, None, "read"),
+        Some(Look::List {
+            after: Some(after), ..
+        }) if after.len() > MAX_OBJECT_ID => Some(limit_refused(
+            *identity,
+            "object_id",
+            Limit::ObjectId,
+            after.len(),
+            MAX_OBJECT_ID,
+            format!(
+                "list after an id of {} bytes, over the {MAX_OBJECT_ID}-byte limit; request {} \
+                 not read",
+                after.len(),
+                request.0
+            ),
+        )),
+        Some(Look::List { .. }) => None,
         Some(
             Look::Members { after: None, .. }
             | Look::Doc
@@ -7951,16 +9599,31 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
     }
 }
 
-/// A request over a limit: one `limit_refused` line, which never carries the caller's bytes,
-/// and `INVALID_ARGUMENT` with `detail`.
+/// A request over a size limit: one `limit_refused` line, which never carries the caller's
+/// bytes, and `TOO_LARGE` with `detail`, naming `typed` with `found` and `max` (#148). `limit`
+/// is the line's name for it.
 fn limit_refused(
     identity: RequestIdentity,
     limit: &'static str,
+    typed: Limit,
     found: usize,
     max: usize,
     detail: String,
 ) -> ApiError {
-    // `client` with `request` is the key a log query joins on: `request` alone is not unique.
+    log_limit_refused(identity, limit, found, max);
+    ApiError::too_large_refusal(
+        TooLarge {
+            limit: typed,
+            size: found,
+            max,
+        },
+        detail,
+    )
+}
+
+/// The `limit_refused` line. `client` with `request` is the key a log query joins on:
+/// `request` alone is not unique.
+fn log_limit_refused(identity: RequestIdentity, limit: &'static str, found: usize, max: usize) {
     tracing::info!(
         client = identity.client.0,
         request = identity.request.0,
@@ -7969,7 +9632,6 @@ fn limit_refused(
         max,
         "limit_refused"
     );
-    ApiError::invalid(detail)
 }
 
 /// The time a transaction's send waits: its deadline plus twice the host's waiter margin, so
@@ -7982,6 +9644,96 @@ fn send_wait(deadline: Duration) -> Duration {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A [`Db::delete_prefix_in`] step, run once by the next walk of that prefix.
+#[cfg(test)]
+type PageStep = Box<dyn FnOnce(&Db) + Send>;
+
+/// Test-only (PR #178 review r4 N1): steps run between a prefix page's read and its drains.
+#[cfg(test)]
+static AFTER_PAGE: Mutex<Vec<(Vec<u8>, PageStep)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next [`Db::delete_prefix_in`] of `prefix` runs `step` after its first page
+/// is read and its documents are deleted, before any other object on it is drained.
+#[cfg(test)]
+fn on_page(prefix: &[u8], step: PageStep) {
+    lock(&AFTER_PAGE).push((prefix.to_vec(), step));
+}
+
+/// Run and disarm the step [`on_page`] armed for `prefix`, if any.
+#[cfg(test)]
+fn after_page(db: &Db, prefix: &[u8]) {
+    let step = {
+        let mut steps = lock(&AFTER_PAGE);
+        let at = steps.iter().position(|(armed, _)| armed == prefix);
+        at.map(|at| steps.remove(at).1)
+    };
+    if let Some(step) = step {
+        step(db);
+    }
+}
+
+/// Test-only (PR #178 review r5): steps run in a rootless drain between a batch's compile and
+/// its send, each with the batches still to pass before it runs.
+#[cfg(test)]
+static BEFORE_SEND: Mutex<Vec<(Bytes, usize, PageStep)>> = Mutex::new(Vec::new());
+
+/// Test-only: a rootless drain of the object whose root key is `root` runs `step` after it
+/// has compiled `skip` batches and compiled one more, before that one is sent. Used once.
+#[cfg(test)]
+fn on_send(root: Bytes, skip: usize, step: PageStep) {
+    lock(&BEFORE_SEND).push((root, skip, step));
+}
+
+/// Count a compiled rootless batch at `root` toward the step [`on_send`] armed there, and run
+/// and disarm it when its turn has come.
+#[cfg(test)]
+fn before_send(db: &Db, root: &Bytes) {
+    let step = {
+        let mut steps = lock(&BEFORE_SEND);
+        let at = steps.iter().position(|(armed, ..)| armed == root);
+        match at {
+            Some(at) if steps[at].1 == 0 => Some(steps.remove(at).2),
+            Some(at) => {
+                steps[at].1 -= 1;
+                None
+            }
+            None => None,
+        }
+    };
+    if let Some(step) = step {
+        step(db);
+    }
+}
+
+/// Test-only (PR #178 review r6 B1): rootless drains whose batch compile is refused, each with
+/// the batches still to compile before it.
+#[cfg(test)]
+static COMPILE_FAULT: Mutex<Vec<(Bytes, usize)>> = Mutex::new(Vec::new());
+
+/// Test-only: a rootless drain of the object whose root key is `root` compiles `skip` batches,
+/// then answers the next one UNAVAILABLE without compiling it. Used once.
+#[cfg(test)]
+fn on_compile_fault(root: Bytes, skip: usize) {
+    lock(&COMPILE_FAULT).push((root, skip));
+}
+
+/// Count a rootless batch compile at `root` toward the fault [`on_compile_fault`] armed there,
+/// and answer and disarm it when its turn has come.
+#[cfg(test)]
+fn compile_fault(root: &Bytes) -> Option<ApiError> {
+    let mut faults = lock(&COMPILE_FAULT);
+    let at = faults.iter().position(|(armed, _)| armed == root)?;
+    if faults[at].1 > 0 {
+        faults[at].1 -= 1;
+        return None;
+    }
+    faults.remove(at);
+    Some(ApiError::new(
+        ErrorKind::Unavailable,
+        "test: the compile is refused",
+    ))
 }
 
 /// Test-only (#62): open directories whose next roll-forward stops before it links the named
@@ -8050,6 +9802,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod dedup_cap_tests;
 
 #[cfg(test)]
 mod feed_tests;
@@ -8953,8 +10708,8 @@ mod tests {
     /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
     /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
     /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, as does `Overloaded` (P1's
-    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host fault, never a
-    /// guess. The owner's mailbox is answered by hand.
+    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host error, never a
+    /// guess: `NotWired`, and not an owner fault, as no takeover fixes it (#134). The owner's mailbox is answered by hand.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn a_refused_get_takes_its_retry_rule_from_the_kernel() {
@@ -9014,7 +10769,8 @@ mod tests {
             assert_eq!(refused.retry, retry, "{kind:?}: {refused:?}");
             if retry == RetryRule::NotWired {
                 assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
-                assert!(refused.detail.starts_with("host fault: "), "{refused:?}");
+                assert!(refused.detail.starts_with("host error: "), "{refused:?}");
+                assert!(!refused.owner_fault, "{refused:?}");
             } else {
                 assert_eq!(refused.kind, kind, "{refused:?}");
             }
@@ -10497,11 +12253,7 @@ mod tests {
         let oversized = db
             .put_as(app, b"a", &vec![b'z'; 1_048_536], None)
             .expect_err("past the envelope");
-        assert_eq!(
-            oversized.error.kind,
-            ErrorKind::InvalidArgument,
-            "{oversized:?}"
-        );
+        assert_eq!(oversized.error.kind, ErrorKind::TooLarge, "{oversized:?}");
         assert!(!oversized.error.no_mutation, "{oversized:?}");
 
         // `status 2`, then `retry 2`: still seq 3, never a second apply.
@@ -11197,11 +12949,26 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 S5: a request over a limit is `INVALID_ARGUMENT`, `Definitive`, `no_mutation`, with no
-    /// request, its detail ending `request R not sent` or `not read`, and nothing reaches the
-    /// owner. `R` is the id it used up.
+    /// M9 S5: a request over a size limit is `TOO_LARGE` (#148; `INVALID_ARGUMENT` before it),
+    /// `Definitive`, `no_mutation`, typed in `too_large`, with no request, its detail ending
+    /// `request R not sent` or `not read`, and nothing reaches the owner. `R` is the id it used
+    /// up.
     #[track_caller]
     fn refused_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert!(error.too_large.is_some(), "typed: {error:?}");
+        unsent_as(ErrorKind::TooLarge, error, detail, mailbox);
+    }
+
+    /// [`refused_unsent`] for a refusal that is no size: a page count or a deadline, which stay
+    /// `INVALID_ARGUMENT` and carry no `too_large`.
+    #[track_caller]
+    fn invalid_unsent(error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
+        assert_eq!(error.too_large, None, "{error:?}");
+        unsent_as(ErrorKind::InvalidArgument, error, detail, mailbox);
+    }
+
+    #[track_caller]
+    fn unsent_as(kind: ErrorKind, error: &ApiError, detail: &str, mailbox: &mpsc::Receiver<Msg>) {
         assert_eq!(
             (
                 error.kind,
@@ -11209,12 +12976,7 @@ mod tests {
                 error.no_mutation,
                 error.detail.as_str()
             ),
-            (
-                ErrorKind::InvalidArgument,
-                RetryRule::Definitive,
-                true,
-                detail
-            ),
+            (kind, RetryRule::Definitive, true, detail),
         );
         assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
     }
@@ -11339,7 +13101,7 @@ mod tests {
                 refused.request.is_none()
             ),
             (
-                ErrorKind::InvalidArgument,
+                ErrorKind::TooLarge,
                 RetryRule::Definitive,
                 false,
                 format!(
@@ -11473,6 +13235,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -11563,6 +13326,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -11675,6 +13439,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
             possible_loss: None,
         };
         let (db, mailbox, rt) = unanswered(Duration::from_millis(20));
@@ -11825,6 +13590,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -11927,6 +13693,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -11968,6 +13735,8 @@ mod tests {
             no_mutation: true,
             detail: "lease expired for partition 1".to_owned(),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         });
         assert!(
             refused.detail.ends_with(error::QUARANTINED_STEP)
@@ -12043,6 +13812,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -12714,7 +14484,8 @@ mod tests {
 
     /// A-R261: a `Db` with no control store (only one a crate test builds by hand, now that
     /// every open keeps one) refuses a promote with the real cause and the call that fixes it,
-    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent.
+    /// not "fix the argument": `UNAVAILABLE`, nothing changed, nothing sent. #134 audit: the
+    /// text names its step, so no "retrying will not help: report this" follows it.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn m10_s2_a_promote_on_a_db_with_no_control_store_names_the_cause_and_the_open_to_use() {
@@ -12728,8 +14499,7 @@ mod tests {
         assert_eq!(
             refused.to_string(),
             "UNAVAILABLE (this Db was opened without a control store, so it cannot run admin \
-             commands such as promote: open it with Db::open, which connects it to one; next: \
-             retrying will not help: keep this Db's log and report this message)"
+             commands such as promote: open it with Db::open, which connects it to one)"
         );
         assert_eq!(mailbox.try_iter().count(), 0, "nothing was sent");
     }
@@ -12926,6 +14696,7 @@ mod tests {
                 committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
                 tail_refused: None,
                 possible_loss: None,
+                needs_operator: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -13132,7 +14903,7 @@ mod tests {
         // The deadline comes before the count, and uses up no request id.
         let late = MAX_TXN_DEADLINE + Duration::from_millis(1);
         let txn = db.txn(&puts, late).expect_err("past the deadline");
-        refused_unsent(
+        invalid_unsent(
             &txn.error,
             &format!(
                 "deadline: {} ms is past the maximum of {} ms; nothing was sent",
@@ -13338,7 +15109,7 @@ mod tests {
         };
         for (request, look) in (1_u64..).zip(looks(MAX_PAGE + 1)) {
             let refused = db.read(b"l", look).expect_err("over the limit");
-            refused_unsent(
+            invalid_unsent(
                 &refused,
                 &format!("page limit 1001, over 1000; request {request} not read"),
                 &mailbox,
@@ -13984,6 +15755,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             possible_loss: None,
+            needs_operator: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
@@ -16422,11 +18194,7 @@ mod tests {
         let refused = db
             .put(&[0; MAX_OBJECT_ID + 1], b"1", None)
             .expect_err("over the limit");
-        assert_eq!(
-            refused.error.kind,
-            ErrorKind::InvalidArgument,
-            "{refused:?}"
-        );
+        assert_eq!(refused.error.kind, ErrorKind::TooLarge, "{refused:?}");
         let clients: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
             .filter(|line| line["@m"] == "limit_refused")
@@ -16889,6 +18657,243 @@ mod tests {
         db.shutdown();
     }
 
+    /// #158 option B: an owner refusing writes for several windows logs, at info, one
+    /// `refusal_first` for the key and one `refusal_summary` per window, not one line per
+    /// refusal. Debug keeps every refusal's `reply` line, and the summaries' counts add up to
+    /// them. The window is 100 ms here, so three windows close in well under a second.
+    /// Cut: no `refusal_summary` line is written: the counts never reach the refusals, red.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn r158_refusals_log_one_first_and_one_summary_per_window_at_info() {
+        const METHOD: &str = "r158_refusals_log_one_first_and_one_summary_per_window_at_info";
+        const WINDOW: Duration = Duration::from_millis(100);
+        let dir = config_testkit::fs::temp_dir();
+        crate::host::set_refusal_window(dir.path(), 100);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+
+        // Overload: refused puts, back to back, until three windows have passed.
+        let started = Instant::now();
+        let mut refused = 0_u64;
+        let mut hashes = Vec::new();
+        while started.elapsed() < 3 * WINDOW || refused < 20 {
+            let paused = db
+                .put(b"c", &refused.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+            let identity = paused.request.as_ref().expect("the request sent").identity;
+            hashes.push(crate::host::refusals::hash_hex(
+                crate::host::refusals::request_id_hash(identity),
+            ));
+            refused += 1;
+        }
+        let elapsed = started.elapsed();
+        db.links().heal_all();
+
+        // The last window closes one window after its last refusal: wait for its summary.
+        let paused_in = |line: &serde_json::Value| -> u64 {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                    .expect("top is JSON");
+            top.as_array()
+                .expect("top is an array")
+                .iter()
+                .filter(|key| key["reason"] == "ProtectionPaused")
+                .map(|key| key["count"].as_u64().expect("a count"))
+                .sum()
+        };
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        let lines = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let summarised: u64 = lines
+                .iter()
+                .filter(|line| line["@m"] == "refusal_summary")
+                .map(paused_in)
+                .sum();
+            if summarised >= refused {
+                break lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "summaries count {summarised} of {refused} refusals"
+            );
+            std::thread::yield_now();
+        };
+        db.shutdown();
+
+        let with = |message: &'static str| {
+            lines
+                .iter()
+                .filter(move |line| line["@m"] == message)
+                .collect::<Vec<_>>()
+        };
+        // Debug: every refusal, one `reply` line each.
+        let paused_replies: Vec<u64> = with("reply")
+            .into_iter()
+            .filter(|line| {
+                line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .inspect(|line| assert_eq!(line["@l"], "Debug", "{line}"))
+            .map(|line| line["request"].as_u64().expect("a request id"))
+            .collect();
+        assert_eq!(
+            paused_replies.len() as u64,
+            refused,
+            "a debug reply per refusal"
+        );
+        // Info: one first, and at most one summary per window the overload spanned (plus the
+        // window it ended in).
+        let firsts: Vec<_> = with("refusal_first")
+            .into_iter()
+            .filter(|line| line["reason"] == "ProtectionPaused")
+            .collect();
+        assert_eq!(firsts.len(), 1, "one first for the key: {firsts:?}");
+        // Review r1 (PR #182): an identity is logged as its hash, never as the raw id.
+        let first_hash = firsts[0]["request_id_hash"].as_str().expect("a hash");
+        assert!(
+            hashes.iter().any(|hash| hash == first_hash),
+            "{}",
+            firsts[0]
+        );
+        assert!(
+            firsts[0].get("request").is_none() && firsts[0].get("detail").is_none(),
+            "{}",
+            firsts[0]
+        );
+        let summaries: Vec<_> = with("refusal_summary")
+            .into_iter()
+            .filter(|line| paused_in(line) > 0)
+            .collect();
+        let windows = elapsed.as_millis().div_ceil(WINDOW.as_millis()) + 1;
+        assert!(
+            (summaries.len() as u128) <= windows,
+            "{} summaries for {elapsed:?} of refusals: {summaries:?}",
+            summaries.len()
+        );
+        assert!(summaries.len() >= 3, "a summary per window: {summaries:?}");
+        for line in firsts.iter().chain(&summaries) {
+            assert_eq!(line["@l"], "Information", "{line}");
+        }
+        // The summaries' counts are the debug lines, and name requests among them, by hash.
+        let summarised: u64 = summaries.iter().map(|line| paused_in(line)).sum();
+        assert_eq!(summarised, refused, "summaries count every refusal once");
+        for line in &summaries {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top")).expect("json");
+            for key in top.as_array().expect("array") {
+                for end in ["first", "last"] {
+                    let hash = key[end].as_str().expect("a hash");
+                    assert!(
+                        hashes.iter().any(|refused| refused == hash),
+                        "{end} {hash} is a refused request"
+                    );
+                }
+            }
+        }
+        // No refusal is an info `reply` line any more.
+        assert!(
+            with("reply").iter().all(|line| line["@l"] == "Debug"),
+            "replies stay at debug"
+        );
+    }
+
+    /// #158 option B: a stop summarises the open window. With the production 10 s window, refused
+    /// puts and then a shutdown: the summaries count every refusal the debug lines hold, though
+    /// no window reached its end.
+    /// Cut: the host's stop does not close the open window: no summary, red.
+    /// Integration (~2 s): three node threads, a real pause, then a shutdown.
+    #[config_log::retcd_test]
+    fn r158_a_stop_summarises_the_refusals_of_the_open_window() {
+        const METHOD: &str = "r158_a_stop_summarises_the_refusals_of_the_open_window";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let refused = 30_u64;
+        for n in 0..refused {
+            let paused = db
+                .put(b"c", &n.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+        }
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let debug = lines
+            .iter()
+            .filter(|line| {
+                line["@m"] == "reply"
+                    && line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .count() as u64;
+        assert_eq!(debug, refused, "a debug reply per refusal");
+        let summarised: u64 = lines
+            .iter()
+            .filter(|line| line["@m"] == "refusal_summary")
+            .flat_map(|line| {
+                let top: serde_json::Value =
+                    serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                        .expect("top is JSON");
+                top.as_array().expect("top is an array").clone()
+            })
+            .filter(|key| key["reason"] == "ProtectionPaused")
+            .map(|key| key["count"].as_u64().expect("a count"))
+            .sum();
+        assert_eq!(
+            summarised, refused,
+            "the stop's summary counts every refusal"
+        );
+    }
+
     /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's
     /// last put is still answered after the reopen has written past it: its status is its
     /// outcome, never `Expired`, and never `Unknown` for want of its row.
@@ -16991,6 +18996,241 @@ mod tests {
         }
         assert!(with(2, false).is_ok(), "the floor off takes cap 2");
         assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
+    }
+
+    /// PR #178 review r4 N1: a delete prefix lists an unpublished upload's chunk, an id with no
+    /// root; the upload is published there before the drain runs. The drain expects the root to
+    /// stay absent, so it stops at the blob: the walk empties nothing and the blob reads back
+    /// whole. Cut: drain a rootless id with no `expect` again (`None` for `listed.root` `None`
+    /// in `delete_prefix_in`), and the walk deletes the blob and its chunk. Integration (~3 s):
+    /// one open; the publish runs from the walk's own page step (`on_page`), so the race is
+    /// deterministic.
+    #[test]
+    fn r4_n1_a_root_committed_after_the_page_at_a_rootless_id_survives_the_drain() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r4-n1/";
+        let id: &[u8] = b"r4-n1/blob";
+        let bytes = Bytes::from_static(b"rootless until published");
+        let size = bytes.len() as u64;
+        let sha256: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        let upload = [0x41; 16];
+        let chunk = Change::Chunk {
+            upload,
+            index: 0,
+            bytes: bytes.clone(),
+        };
+        db.write_in(GROUP, id, chunk, None).expect("the chunk");
+        on_page(
+            prefix,
+            Box::new(move |db: &Db| {
+                let publish = Change::Publish {
+                    upload,
+                    size,
+                    chunk_size: size,
+                    sha256,
+                };
+                db.write_in(GROUP, b"r4-n1/blob", publish, None)
+                    .expect("the publish after the page")
+                    .expect("the publish writes the root");
+            }),
+        );
+        let emptied = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("delete prefix: {} after {}", e.error, e.deleted));
+        let read = db
+            .read_in(
+                GROUP,
+                id,
+                Look::Range {
+                    offset: 0,
+                    len: size,
+                },
+            )
+            .unwrap_or_else(|e| panic!("the blob reads back: {e}"));
+        match read.seen {
+            Seen::Range { bytes: seen, .. } => assert_eq!(seen, bytes, "the blob's bytes"),
+            other => panic!("a range read answered {other:?}"),
+        }
+        assert_eq!(emptied, 0, "the walk emptied nothing");
+    }
+
+    /// Write `count` chunks of `upload` at `id`, one byte each, with no root.
+    fn rootless_chunks(db: &Db, id: &[u8], upload: [u8; 16], count: u32) {
+        for index in 0..count {
+            let chunk = Change::Chunk {
+                upload,
+                index,
+                bytes: Bytes::from_static(b"c"),
+            };
+            db.write_in(GROUP, id, chunk, None).expect("a chunk");
+        }
+    }
+
+    /// PR #178 review r5 B1: a prefix delete drains an id with 255 chunks and no root; another
+    /// delete of that id runs between the drain's first compile and its send, so the batch's
+    /// chunk versions fail with no root there. The prefix delete answers that CONDITION_FAILED,
+    /// never success with a chunk left, and a rerun finishes. Cut: end a rootless drain quietly
+    /// on any failed condition (r4's code, no reread of the root); the walk answers `Ok` and a
+    /// chunk is left. Integration (~3 s): one open, the overlap from an `on_send` step.
+    #[test]
+    fn r5_b1_an_overlapping_delete_in_a_rootless_drain_is_the_error() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r5-b1/";
+        let id: &[u8] = b"r5-b1/chunks";
+        rootless_chunks(&db, id, [0x51; 16], 255);
+        let root = rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes();
+        on_send(
+            root,
+            0,
+            Box::new(|db: &Db| {
+                db.write_in(GROUP, b"r5-b1/chunks", Change::Delete, None)
+                    .expect("the overlapping delete")
+                    .expect("it deletes a batch");
+            }),
+        );
+        let refused = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .expect_err("a failed condition with no root is not success");
+        assert_eq!(
+            refused.error.error.kind,
+            ErrorKind::ConditionFailed,
+            "{}",
+            refused.error
+        );
+        let rerun = db.delete_prefix_in(GROUP, prefix, Duration::from_secs(5));
+        assert_eq!(
+            rerun.map_err(|e| e.error.error.kind),
+            Ok(1),
+            "a rerun empties the id"
+        );
+        let (left, ..) = db
+            .list_page(GROUP, prefix, None, 10, true)
+            .expect("list the prefix");
+        assert!(left.is_empty(), "nothing is left: {left:?}");
+    }
+
+    /// PR #178 review r5 Q: `write(.., Change::Delete, Some(Expected::Absent))` is not public
+    /// API: it is INVALID_ARGUMENT and deletes nothing. The rootless drain takes a private path.
+    /// Cut: compile that put as a delete with no expect again (274c1ab's host arm), and the
+    /// chunk is deleted. Integration (~2 s): one open.
+    #[test]
+    fn r5_q_a_public_delete_expecting_absent_is_invalid_argument() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let id: &[u8] = b"r5-q/chunk";
+        rootless_chunks(&db, id, [0x52; 16], 1);
+        let refused = db
+            .write_in(GROUP, id, Change::Delete, Some(Expected::Absent))
+            .expect_err("an absent expect on a delete is refused");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{}",
+            refused.error
+        );
+        let (left, ..) = db
+            .list_page(GROUP, id, None, 10, true)
+            .expect("list the id");
+        assert_eq!(left.len(), 1, "the chunk is still there: {left:?}");
+    }
+
+    /// PR #178 review r5 B3: a prefix delete drains an id with 255 chunks and no root, more
+    /// than one batch carries (254 records). After batch 1, between batch 2's compile and its
+    /// send, a new upload's chunk is written there and published. Batch 2's guard that the root
+    /// is absent fails, the drain rereads the root, finds it and stops: the walk succeeds, and
+    /// the new blob reads back whole, root and chunk. The walk counts 0: the blob was never
+    /// empty (r6 B1). Cuts: in `drain`, answer a rootless batch's failed condition without
+    /// rereading the root, and the walk answers CONDITION_FAILED; or count a drain that deleted
+    /// a batch when a root ends it, and the walk counts 1. Integration (~3 s): one open, the
+    /// publish from an `on_send` step.
+    #[test]
+    fn r5_b3_a_root_committed_between_batches_of_a_rootless_drain_survives() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r5-b3/";
+        let id: &[u8] = b"r5-b3/blob";
+        rootless_chunks(&db, id, [0x53; 16], 255);
+        let bytes = Bytes::from_static(b"published between batches");
+        let size = bytes.len() as u64;
+        let sha256: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        let upload = [0x54; 16];
+        let written = bytes.clone();
+        on_send(
+            rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes(),
+            1,
+            Box::new(move |db: &Db| {
+                let chunk = Change::Chunk {
+                    upload,
+                    index: 0,
+                    bytes: written,
+                };
+                db.write_in(GROUP, b"r5-b3/blob", chunk, None)
+                    .expect("the new chunk");
+                let publish = Change::Publish {
+                    upload,
+                    size,
+                    chunk_size: size,
+                    sha256,
+                };
+                db.write_in(GROUP, b"r5-b3/blob", publish, None)
+                    .expect("the publish between batches")
+                    .expect("the publish writes the root");
+            }),
+        );
+        let emptied = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("delete prefix: {} after {}", e.error, e.deleted));
+        let read = db
+            .read_in(
+                GROUP,
+                id,
+                Look::Range {
+                    offset: 0,
+                    len: size,
+                },
+            )
+            .unwrap_or_else(|e| panic!("the blob reads back: {e}"));
+        match read.seen {
+            Seen::Range { bytes: seen, .. } => assert_eq!(seen, bytes, "the new blob's bytes"),
+            other => panic!("a range read answered {other:?}"),
+        }
+        assert_eq!(emptied, 0, "the walk emptied nothing: the blob survives");
+    }
+
+    /// PR #178 review r6 B1: a prefix delete drains an id with one chunk and no root. Its one
+    /// batch deletes the chunk, and the next compile, which would confirm nothing is left, is
+    /// refused UNAVAILABLE. The error counts the id: a reread finds it empty. Cut: answer a
+    /// drain's error as not emptied (`false` for `emptied` in `drain`), and `deleted` is 0.
+    /// Integration (~2 s): one open, the refusal from `on_compile_fault`.
+    #[test]
+    fn r6_b1_an_object_emptied_before_a_failed_compile_is_counted() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r6-b1/";
+        let id: &[u8] = b"r6-b1/chunk";
+        rootless_chunks(&db, id, [0x61; 16], 1);
+        on_compile_fault(rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes(), 1);
+        let refused = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .expect_err("the refused compile is the error");
+        assert_eq!(
+            refused.error.error.kind,
+            ErrorKind::Unavailable,
+            "{}",
+            refused.error
+        );
+        assert_eq!(refused.deleted, 1, "the emptied id counts: {refused}");
+        let (left, ..) = db
+            .list_page(GROUP, prefix, None, 10, true)
+            .expect("list the prefix");
+        assert!(left.is_empty(), "nothing is left: {left:?}");
     }
 
     /// A `Db` built by hand whose heal stands at `heal`, with one OS boot id queued for a node

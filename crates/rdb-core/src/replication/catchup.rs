@@ -302,6 +302,16 @@ impl CatchupCursor {
         Repeat::judge(mark, Some(digest), self.staged_bound(mark), ack, history)
     }
 
+    /// Issue #61 (lead ruling 2026-11-22): R1 asked for this copy's snapshot from outside
+    /// the cursor (`Primary::await_snapshot`).
+    /// The cursor then waits as a `NotRetained` need leaves it: catching up, nothing in flight. The
+    /// re-seed's ACK at the head reports `CopyCaughtUp`, and one below the head walks the rest.
+    pub fn await_snapshot(&mut self) {
+        self.outstanding = None;
+        self.unacked = None;
+        self.catching_up = true;
+    }
+
     /// Start a catch-up the copy has not asked for (a recovery source, lead ruling B-R59): send
     /// the record at `head`. The copy answers `NeedPrefix` from its own head, and step 1 walks it
     /// from there; or it holds the record and answers `AlreadyHave` with its ACK.

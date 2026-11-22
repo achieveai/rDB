@@ -793,6 +793,8 @@ fn inherit(
         Err(e) => {
             let (verdict, code) = match e {
                 InheritError::LineageConflict { .. } => ("REFUSED", exit::LINEAGE_CONFLICT),
+                // A parent mid snapshot install is a lineage-state refusal, as `ParentStaging` is.
+                InheritError::ParentInstalling { .. } => ("REFUSED", exit::LINEAGE_CONFLICT),
                 InheritError::BehindCutoff { .. } => ("REFUSED", exit::BEHIND_CUTOFF),
                 InheritError::HistoryMissing { .. } => ("REFUSED", exit::HISTORY_MISSING),
                 InheritError::Storage(_) => ("FAILED", exit::STORAGE_FAULT),

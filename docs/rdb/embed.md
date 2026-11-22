@@ -210,7 +210,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 ```
 
 - `Db::open` is async; run it on your runtime. `wait_ready`, `put` and `get` are plain blocking
-  calls; do not call them from inside an async task.
+  calls. Do not call them inline from an async task: wrap the `Db` in `AsyncDb`
+  ([Async calls](#async-calls)), whose calls never block a tokio worker.
 - The runtime whose handle you pass must keep running until `db.shutdown()` returns. Control
   calls to rEtcd, watches and the reopen's repair run as tasks on it, also while your thread
   sits in `wait_ready`, `put` or `get`. A multi-thread runtime, as above, does that. A
@@ -312,6 +313,59 @@ fn profile(db: &Db) -> Result<Vec<(Value, Value)>, Box<dyn Error>> {
 - This code is compiled and run by the rows in `crates/rdb-api/src/db/reopen_tests.rs`
   (`guide_sample`), so it matches this release.
 
+### Async calls
+
+Every `Db` call but `open` blocks its thread until the node answers (#146). Called inline from
+a task, it parks a tokio worker for the whole call. On a current-thread runtime it can also wait
+for a task that cannot run: `db.route(..)` on a cold cache waits for a control read on the
+`Db`'s own runtime, and answers `UNAVAILABLE "did not read within"`.
+
+`rdb_api::AsyncDb` wraps an `Arc<Db>` and runs each call, unchanged, on tokio's blocking pool
+(`spawn_blocking`), so no worker waits:
+
+```rust,ignore
+let db = AsyncDb::new(Arc::new(Db::open(config, store, handle).await?));
+db.wait_ready(Duration::from_secs(30)).await?;
+let put = db.put(group, Bytes::from_static(b"k"), Bytes::from_static(b"v"), None).await?;
+let got = db.get(group, Bytes::from_static(b"k")).await?;
+db.shutdown().await.ok();
+```
+
+- The calls are `wait_ready`, `put`, `get`, `read`, `write`, `txn`, `txn_as`, `resend_within`,
+  `status`, `route` and `ownership_events`. `scoped(scope)` gives a tenant's handle (see
+  [Scopes, groups, list and delete](#scopes-groups-list-and-delete)). Each names its group; each answers exactly what the
+  sync `_in` call answers, with the same timeouts, errors and retry rules.
+- `txn` and `txn_as` take `Vec<TxnWrite>`, the owned form of `TxnPut`.
+- `status(group, request, generation)` is `status_in`. Ask with the write's generation: with
+  the ack floor on, asked with `None`, an acknowledged write answers `Unknown`.
+- `ownership_events()` returns a `tokio::sync::mpsc::Receiver`. One blocking-pool thread carries
+  the events for as long as the receiver lives; it lets go within 100 ms of the receiver being
+  dropped. So size the pool (`max_blocking_threads`) to at least the receivers you keep plus
+  one, or every other call, `shutdown` included, queues behind them.
+- `db.db()` gives the `Db` for the calls that never block: `ownership` and `still_owner`. Admin and dev calls have no async form; wrap them in `spawn_blocking` yourself.
+- Await the calls inside any tokio runtime: its blocking pool runs them. That pool is bounded
+  (512 threads by default). Past that, calls queue on the pool; no worker blocks.
+- A panic inside a call reaches the task that awaited it, as the sync call's panic would.
+- **Dropping a write's future does not cancel the write.** It stops the wait only: a `put`,
+  `txn` or `write` already on the pool runs on and may apply, and its request id is lost with
+  the future. That is intended. When exactly-once matters, write under a request id you saved
+  before the call (`app_request_id(n)`): `txn_as` here (a one-put transaction for a single put),
+  or `Db::put_as` and `Db::txn_as` on the sync `Db`. Then ask `status` with that id first.
+  `resend_within` takes the request as sent (`PutOk::sent`, or `PutError::request` when one
+  was sent), which a dropped future never handed back.
+- A call the pool never ran (the runtime shut down first) sent nothing. `put`, `write` and
+  `txn` answer `no_mutation` true; `txn_as` and `resend_within` answer false for a reused id,
+  because an earlier send may have applied. `wait_ready` and `shutdown` panic then instead,
+  having no error to return.
+- Dropping the last `AsyncDb` (and the last `Arc<Db>`) inside a task drops the `Db`, whose
+  `Drop` stops and joins its node threads, on that task's thread. End with
+  `db.shutdown().await`, which does that on the blocking pool. It answers `Err(db)`, doing
+  nothing, while another clone is alive.
+- A runtime that is dropped waits for the blocking-pool calls still running.
+- To restart an embedded `Db` that runs its own links: `db.shutdown().await`, then shut the
+  `Net` down (`Net::shutdown`, which #81 adds), then drop the `Db`, the `Net` and the `Links`,
+  then open again. A `Db` shutdown does not stop its `Net`.
+
 ### How big a transaction can be
 
 A transaction must fit one record of at most 1,048,576 bytes
@@ -333,25 +387,59 @@ record = 265 + for each put: value_len + id_len + zero_bytes_in_id + 65 + head +
 To size a cap, use the upper bound for every put: `value_len + id_len + zero_bytes_in_id + 71`.
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
-  ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
-- The largest single value, for a create, is 1,048,240 bytes less the id's length and less
-  one more for each zero byte in the id. For a one-byte id that is a zero byte, it is 1,048,238
-  bytes.
+  ids count at most 955 bytes each, with each zero byte counted twice: 955 bytes with no zero
+  byte, or fewer with some (an id of 955 zero bytes counts 1,910). That bound comes to
+  1,048,327 bytes.
+- The largest single value a put takes is `MAX_VALUE`, 1,044,480 bytes, for any id. A byte
+  write over the bound is refused by the `Db` with `TOO_LARGE` before it is sent (see
+  [Size limits](#size-limits)). So is a byte document one byte over: a `Change::Doc` that is
+  one `Op::Replace(Value::Bytes(..))`, the shape a byte put writes.
 
-A transaction one byte over is refused with `INVALID_ARGUMENT`, and nothing is written:
+A `write` of a map, a set, a list, or a `Change::Doc` that is not a byte document, one byte over
+the record, is refused by the compile, with the kernel's `record_len`, as `INVALID_ARGUMENT`
+(`over the 1 MiB limit for the whole write`), and nothing is written. A byte document over
+`MAX_VALUE` is `TOO_LARGE` instead (above). A `txn` whose puts fit one by one but not together
+is refused first by the `Db`'s upper-bound sum, as `TOO_LARGE` (`Limit::Write`), before the
+kernel's admission check (`envelope_bytes`) could see it.
 
-| Over the limit | Refused by | Detail |
-|---|---|---|
-| One put, alone | the compile, with the kernel's `record_len` | `over the 1 MiB limit for the whole write` |
-| Only all the puts together | the kernel's admission check | `envelope_bytes` |
-
-- A single value of 1 MiB or more can get a different detail, naming the 1,048,536-byte limit for
-  one value (`rdb_value::envelope::MAX_PAYLOAD`). Sent to an owner in another process, it reads
-  `a value cannot be carried`. Both are `INVALID_ARGUMENT`. The record limit above is always the
-  lower one.
 - The ack floor uses only the room a transaction leaves, so it is not part of the sum.
 - `write` (`Change::Doc`, maps, sets, lists and blob chunks) has the same limit, but its overhead
   differs, so this sum does not apply to it.
+
+### Size limits
+
+Every limit below is checked by the `Db` before anything is compiled or sent (#148). Over one,
+the call is refused with `TOO_LARGE` and `retry: Definitive`, and nothing is written. A read, or a
+write under a fresh request id (`put`, `put_in`, `txn`, `write`, `write_in`), also answers
+`no_mutation: true`. A write under the caller's request id (`put_as`, `txn_as`, `write_as`,
+`write_as_in`) answers `no_mutation: false`: this send wrote nothing, but an earlier send under
+that id may have applied, so ask `status` with it. A `resend` carries a request already compiled
+and is checked against no limit here; it answers `no_mutation: false` on every refusal. The same
+call fails the same way, so make it smaller. `ApiError::too_large()` returns a
+`TooLarge { limit, size, max }`: which limit, the size the call carried, and the maximum.
+
+| Limit (`rdb_api::Limit`) | Constant | Maximum | Applies to |
+|---|---|---|---|
+| `ObjectId` | `MAX_OBJECT_ID` | 1,024 bytes | Every write and read |
+| `Key` | `MAX_KEY` | 1,024 bytes | A map key or set member, and `Look::Members { after }` |
+| `Value` | `MAX_VALUE` | 1,044,480 bytes | Each value of `put`, `put_in`, `put_as`, `txn` and `txn_as`, and a byte document (`Change::Doc`) |
+| `Write` | `MAX_WRITE` | 1,048,576 bytes | A whole `put` or `txn`, by the upper-bound sum above |
+| `Ops` | `MAX_OPS` | 255 | The ops of one change, and the puts of one `txn` |
+| `Chunk` | `rdb_value::blob::MAX_CHUNK` | 1,044,480 bytes | One `Change::Chunk` |
+
+- `MAX_VALUE` is fixed: it does not move with the id. A value of up to `MAX_VALUE` bytes fits one
+  put under any id the `Db` accepts. Values above it, up to the old id-dependent ceiling, were
+  accepted before #148 and are refused now. Values already stored stay readable.
+- A "1 MiB" value (1,048,576 bytes) does not fit, and never did. Store larger data as a blob:
+  `Change::Chunk` with chunks of at most `MAX_CHUNK` bytes, then `Change::Publish`.
+- For `Write`, `size` is the upper-bound sum, never below the exact record. So a write at the
+  limit always passes, and no refusal from the compile or the kernel lands first.
+- An over-long object id answers first. In a byte write, a value over `MAX_VALUE` answers
+  before the whole write.
+- A page `limit` over `MAX_PAGE` and a deadline over `MAX_TXN_DEADLINE` are not sizes. They stay
+  `INVALID_ARGUMENT`.
+- Only the `Db` raises `TOO_LARGE`, so `too_large` is never set on an answer that came over a
+  link. The gateway sends wire kind `TOO_LARGE` with gRPC code `INVALID_ARGUMENT`.
 
 ### More than one partition
 
@@ -429,15 +517,64 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
-  partition it still owns stops for good until that partition is moved too. Move each one. If
-  the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
-  those partitions can still be moved while it runs.
-- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
-  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
-  a restart (a new boot) that owns nothing, a failover planner, where one runs
-  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
-  promoted again like any regular copy. With no planner running the frozen grant stays, and the
-  node only holds copies.
+  partition it still owns stops until that partition is moved too, or the node restarts with
+  a failover planner running (below). Move each one, or restart it. A partition the planner
+  cannot move (`lone_survivor`: fewer than two other copies answer) stays on the node, still
+  `Serving`.
+- **A restarted node takes back what it still owns, when a planner runs** (#172). With
+  `DbConfig::failover` set, the restarted node's open waits for the planner instead of failing:
+  once the planner sees the new boot, and every partition the node still owns is `Serving`, it
+  deletes the old boot's frozen grant, and the open heals those partitions with the node as
+  owner at a new generation. No `admin promote` is needed. The open logs
+  `heal_grant_frozen_waiting` once while it waits; the planner logs
+  `planner_frozen_grant_cleared`. This is what brings back a host that was killed or hung and
+  then restarted while one of its partitions had no second copy to move to. The planner clears
+  each frozen node on its own; several at once (a rack after a power cycle) is not tested. The
+  wait ends at the heal's deadline (the grant, its margins and 10 s).
+- **Without a planner, or with a move under way at the first look, the open still fails.**
+  With failover off, or any partition the node owns in `Fencing` or `FencingDrained` when the
+  heal first reads the frozen grant (a promote is under way), its open fails with
+  `HealError::Frozen` at once; those partitions can still be moved while it runs. Above one
+  partition the error names the partitions it still owns; with one partition it names only the
+  node. Once the open has started waiting for the planner, a promote's `Fencing` seen later
+  does not end the wait: it keeps polling to its deadline (`heal_grant_frozen_fence_seen`), so
+  a clear the planner already queued can land and the promote resolve.
+- **If the planner never clears it, the open says so.** At the deadline, with every owned
+  partition still `Serving`, the open fails `HealError::Frozen` saying the planner did not
+  clear the frozen grant before the deadline: check that a failover planner runs and sees the
+  node's new boot, then open again. It does not advise `admin promote`, which is refused while
+  the node answers. If the grant was last seen held, not frozen (another open, such as a live
+  copy of the folder at another path, acquired it), the open fails `HealError::NotCleared`
+  with that advice instead.
+- **A promote that races the clear never makes a second owner.** If a promote of a partition
+  the restarted node owns runs while the planner clears its grant, one of these happens:
+  - A planner promote, or an operator promote over more than one partition, that wrote
+    `Fencing` before the clear's delete and froze after it: refused as
+    `PromoteError::OwnerAlive` ("it came back during the promote"), and its `Fencing` write is
+    undone. Nothing moves.
+  - A single-partition operator promote in the same place: it recreates the grant frozen and
+    takes the partition over.
+  - A promote whose freeze came before the clear's delete, and whose target binds the proof
+    after the delete: it cannot commit. The target refuses the proof (`routed_fence_refused`),
+    the node's heal commits, and the promote ends `PromoteError::Superseded` naming the node.
+  - The same, with the target binding the proof before the delete: the target's commit and
+    the node's heal commit race on one compare of the partition record, and only one lands.
+    If the target lands first it owns the partition, and the node's heal stops
+    (`OvertakenByPeer`). If the heal lands first, the promote ends `PromoteError::Superseded`
+    naming the node.
+
+  If the node's heal planned against a `Fencing` write that the promote then undid, the heal's
+  first commit is refused (`CasContention`). The same open plans it again against the record
+  as it now is and heals the partition (`heal_replan_after_conflict`); no second open is
+  needed, also when the node's other partitions have already taken writes. If that second
+  plan fails, `wait_ready` returns `ReadyError::Heal` with the reason. Until that commit, no
+  process admits writes on the partition, though its record still names the node.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
+  but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
+  boot) whose partitions are all `Serving` (none at all included), a failover planner, where
+  one runs (`DbConfig::failover`), deletes the frozen grant (#81 X2, #172), and the new boot
+  can be chosen and promoted again like any regular copy. With no planner running the frozen
+  grant stays, and the node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
@@ -448,8 +585,8 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
-  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  copies from then on and cannot lead again at that boot (after a restart, a running failover
+  planner clears the freeze, #81 X2 and #172), and the moved partition stays paused
   until its other copy is back, because that copy was on the stopped node.
 - **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
   ADR-rdb-0028): after a process restart, an owner with `Timeouts::live_readd` on heals with
@@ -552,8 +689,7 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
 - `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
   embedder asks the same.
 - Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
-  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
-  place, as below.
+  restarts on it. An embedder that runs `Db` itself restarts in place, as below.
 
 **Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
 supervisor, restarts the node in place:
@@ -563,7 +699,7 @@ supervisor, restarts the node in place:
    `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
    cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
    a partition, so a frozen node beside an owning one waits until the owner's partitions move.
-   Run one `Db` per node, as the gateway does, so each restarts on its own.
+   Run one `Db` per node, so each restarts on its own.
 2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
    links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
    than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
@@ -573,8 +709,10 @@ supervisor, restarts the node in place:
 4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
    at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
    held.
-5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
-   restart policy, say) restart it. The gateway does this.
+5. If the reopen fails, either exit the process non-zero and let your own supervisor (a
+   container restart policy, say) restart it, or open again yourself. rDB does not restart a
+   failed reopen for you, and SBX's gateway integration, which would need one of these, is
+   not built yet.
 
 Drop before you reopen, so a node never has two `Db`s at once.
 
@@ -600,6 +738,12 @@ snapshot. rDB fences its own writes. To fence yours, use the owner token.
   partition's primary and the work it guards (for SBX, its sandbox) live together. If the node
   stops, that work stops with it and is moved elsewhere with the partition. An effect made by
   another process or machine is not covered by `still_owner`, only by the destination's fence.
+- From **any** process, `db.route(group).token` (or `db.leader_of(partition).token`) is the
+  token the partition's record names: the one its owner stamps (#84). In a node's process it
+  can be a cached answer, kept while the control watch is open: a change of the record is
+  seen once its watch event arrives (see `route`, below). Use it to see that a
+  new owner took over (its token is higher), or to check what a destination holds. It is a hint
+  read from rEtcd, never ownership: only `still_owner`, in the owner's process, says you may act.
 - Compare tokens as a whole (`OwnerToken` is `Ord`). Never compare the epoch alone.
 
 **What `still_owner` promises.** It mirrors admission check 6 (the grant's horizon and the
@@ -660,9 +804,11 @@ the old owner's token still equals the record, and its effects are accepted. Tha
 because the new owner restores and acts **after** its register.
 
 - A key prefix or a label alone refuses nothing: a late writer just writes under its old prefix.
-- rDB does not sign tokens. `OwnerToken`'s fields are public, so any code can build one. A
-  destination must take tokens only from your own processes, each stamping the token its
-  `ownership` returned. A made-up high token would lock the real owner out.
+- **An owner token is not a credential.** rDB does not sign tokens. `OwnerToken`'s fields are
+  public, so any code in the process can build one. A token guards against a stale owner, not
+  a hostile caller. So a destination must take tokens only from your own processes, each
+  stamping the token its `ownership` returned. A made-up high token would lock the real owner
+  out.
 - An effect whose destination cannot compare a token is not covered. `still_owner` narrows its
   window but cannot close it.
 
@@ -916,21 +1062,272 @@ For SBX, subscribe once at start-up, then:
 
 ### Which node owns a group: `route`
 
-`db.route(group)` returns `RouteInfo { partition, owner, token }`: the group's partition, the
-node that owns it, and the owner's token, read from the partition's control record. Use it to
-send a request to the right node.
+`db.route(group)` returns a `RouteInfo`: `partition`, `owner` and `token`, read from the
+partition's control record, and the owner's app address, read from the owner's `nodes/{id}`
+record. Use it to send a request to the right node.
+
+- `route.app_address()` is where the owner's app takes forwarded requests. Each node registers
+  its own at open: `NodeAddresses::app` (in `rdb_node`, `--app-addr A`), 1 to
+  `rdb_api::MAX_APP_ADDR_LEN` (512) bytes, opaque to rDB, so a URL, `host:port` or anything
+  your gateway dials works. rDB returns it byte for byte and never logs it, since it may
+  carry a credential: its logs give only its length (`app_len`).
+- Each open given an app address makes sure the node's record holds it before the node
+  starts, so a node never leads a partition before its address is there. A record that
+  already holds it is not written again, unless an earlier open's write may still be in
+  flight (below). An open with no app address keeps the one stored before, unless such a
+  write may still be in flight: then it is refused with `OpenError::Config`, and the next
+  open must give the address the node should hold (below). **An address
+  cannot be cleared:** no app address keeps it, and an empty one is refused. Only the app
+  address is written; the node's declared address and machine never change.
+- **A write whose answer was lost.** Before it writes, the open puts a small file,
+  `app-addr-pending`, in its folder. It writes `app-addr-pending.new` first, then renames it;
+  a crash before the rename can leave `app-addr-pending.new` behind, and the next write
+  overwrites it. The file stays while the write's outcome is unknown: its answer was lost
+  and the read back failed or showed no change, the open was dropped, or the process
+  crashed. Such an open is refused, saying so, and nothing is started. The next open that
+  finds the file writes its address even if the record already holds it, so the old write
+  can no longer apply and never replaces the address of an open that succeeded.
+  - The file counts by being there: one whose text is damaged works the same. One that is
+    there but cannot be read refuses the open; make it readable and open again.
+  - While the file is there, an open with no app address is refused.
+    Open the node again with the address it should hold; that settles it, and later opens
+    can leave the address out.
+  - **A new or emptied folder fences.** A node folder with no data yet, new or emptied to
+    rejoin, has lost any such file, so an earlier folder's write may still apply. Its open
+    first writes another file, `app-addr-fence`, before the node's data is created, the same
+    way: `app-addr-fence.new` first, then renamed (a crash before the rename can leave
+    `app-addr-fence.new` behind, and the next such open overwrites it). The open then fences
+    the record: given an app address, it writes that address even if the record already
+    holds it, so the record then holds the address supplied; given none, it writes the
+    record's own bytes back, which changes nothing in it but moves its revision on, so only
+    then does the record keep the address it held. Either way no earlier write can apply
+    after it. The file is removed only once the fence is
+    written, so an open that fails after the node's data was created leaves it, and the next
+    open on that folder fences too. You need not supply the address for this: an open with
+    none fences on its own. Supply it only when an open refuses for `app-addr-pending`
+    (above).
+  - **Leave these files alone.** `app-addr-pending`, `app-addr-pending.new`,
+    `app-addr-fence` and `app-addr-fence.new` are the only four files this writes in the
+    folder, besides what an open already creates.
+- An open is also refused, with nothing started, when the record changed after it read it,
+  even to the same bytes. The declaration, another process that claims the node, or a
+  delayed write of an earlier open of this node can change it, and the open cannot tell
+  which.
+- It is `None` when the owner registered none, or on a database made by `rdb_node --form`,
+  which has no `nodes/` records, or when no read of that owner's record has succeeded yet in
+  this `Db` (below). An app address on such a database is refused at open, and
+  `rdb_node --form --app-addr` is refused while parsing.
+- `route` keeps an owner's address for a second after a read that succeeds, then reads it
+  again, so a node restarted with a new address is seen within about a second. Calls that
+  need the same owner's address while it is being read wait for that read and take its
+  answer, success or failure.
+- A node's `Db` keeps the partition answer while its control watch is open, until the watch
+  delivers a change to that partition or ends. It opens no new watch. An app-only `Db` (no
+  local node) reads rEtcd on every call.
+- **A failed address read does not fail `route` or `leader_of`** (SBX answer, 2026-11-20).
+  When the owner's `nodes/{id}` read fails or does not answer in time, the answer still names
+  the owner and token, with the last address a read of that owner returned in this `Db`,
+  however old, or `None` if no read of it has succeeded yet. So the address can be stale.
+  That is safe because the sender checks the receiver's TLS identity before it sends
+  anything (below). The failure refreshes nothing, so the next call reads again at once. It
+  is logged `db_route_app_addr_unreadable{node, reason, served}` (warn), where `served` is
+  `last_good` or `none`.
+- **How long a call can take.** At most two read timeouts (`Timeouts::read`) in all, however
+  many calls run at once: one for the partition's record and one for the owner's address,
+  waiting for another call's read of it included. A cached owner still needs its address
+  read once its second is up, and that read can be slow or fail too: the call then answers
+  as above, with the last good address.
+- `db.partition_of(group)` names the group's partition without reading anything. The count is
+  fixed when the database is formed (at most 512), by its declaration or by `rdb_node --form`, so a group stays in its partition, and
+  every group of a partition moves with it, while the database has its original partitions:
+  a partition that later splits can move a group to another partition (see the key map,
+  above).
+- `db.leader_of(partition)` is `route` by partition: what rEtcd's records say, from any
+  process, cached the same way, so in a node's process a change is seen once its watch event
+  arrives. A partition the database does not have is `INVALID_ARGUMENT`. It is not
+  `db.owner_of(partition)`, which reads nothing and names the node this `Db` sends the
+  partition's calls to; during a move the two can differ until this `Db` learns of it.
+- A record this build cannot decode is `INCOMPATIBLE_VERSION` (retry `Quarantine`): a newer
+  build may have written it, or it is damaged, and a retry cannot help. Run the build the
+  nodes run, or a newer one. If the nodes' own build cannot read it either, it is damaged:
+  stop sending that partition's calls, keep the store as it is, never edit the record by
+  hand, and report it with the message. A partition record that cannot be read right now
+  is `UNAVAILABLE`, and a later call can succeed; an owner's record that cannot be read right
+  now is not an error (above).
 
 - It is a **hint**. Ownership can move right after you read it. The token, checked by the
   destination, is what makes a late request harmless.
-- A node's `Db` keeps the answer while its control watch is open, until the watch delivers a
-  change to that partition or ends. It opens no new watch. An app-only `Db` (no local node)
-  reads rEtcd on every call.
-- It does not yet return the owner's network address.
+
+**The app address is only a dial hint** (SBX answer, 2026-11-20). The SBX gateway consumes
+`route.app_address()` to forward a request to the owner's gateway. rDB does not bind the
+address to the node, so the address alone proves nothing:
+
+- rDB runs embedded in the app's process only. Its ports must not be reachable from sandbox
+  or app networks.
+- A gateway forwards to another gateway over its own mutual TLS, on the private network.
+- **The sender** checks the receiver's TLS certificate identity against the route's owner
+  node id (`route.owner`) before it sends any data or credentials. A wrong or stale address
+  then fails the handshake, and nothing is sent.
+- **The receiver** checks `db.still_owner(partition, token)` (#84) before it accepts
+  forwarded data, so a request that reaches a former owner is refused. That check says only
+  that the token is the present local authority for the partition, in the receiver's own
+  process, at the moment of the check. It does not check the sender's TLS identity, and it
+  says nothing about an effect that happens later: a pause after the check (a GC pause, a VM
+  suspend) still needs the destination's token fence. See "`still_owner` alone is not
+  enough" and "The destination's fence" under
+  [Fencing your own side effects](#fencing-your-own-side-effects).
+
+**Upgrading from an earlier build.** `NodeAddresses` gained `app`: add `app: None` to an
+existing `NodeAddresses { listen, peers }`. That behaves as before, with no address write, only
+on a settled folder: the node's data exists and the folder holds neither `app-addr-pending`
+(pending debt) nor `app-addr-fence` (fence debt). On a new, wiped or owed folder (no data yet,
+or `app-addr-fence` still there), an open with `app: None` writes the node's record: it CASes
+the record's own bytes back at the revision it read (an own-bytes fence, above), so it keeps the
+stored address but moves the revision on. An absent record is refused with `OpenError::Config`
+before the fence (the node is not declared). The fence can be refused with
+`OpenError::Control` (the record cannot be read, it changed after that check, or the fence's
+outcome is unknown; open again). While `app-addr-pending` is there, it is refused with
+`OpenError::Config` (above). `RouteInfo` is no longer
+`Copy` (it owns the address): add `.clone()` where an answer is used after it moved, and
+match it with `..`. It can no longer be built with a struct literal outside rDB, since the
+address field is private: take it from `route` or `leader_of`. Its equality now includes the
+address.
+
+**No rollback after an app address is registered.** The first open with an app address
+rewrites the node's record in a newer layout (2), which an earlier build cannot read: it
+refuses to start on that store. No store of such a build is in use, so no rollback is
+supported. To run an earlier build, start over:
+
+- Declare a new database on a new, empty control store.
+- Give every node a new, empty folder. Keeping the node folders while changing only the
+  control store is refused (`Mismatch`): the folders belong to the old database.
+- The old data is not carried over.
+- Keep the old folders and the old store intact; do not delete them.
+
+Never hand-edit a record in a live store.
 
 **Try it.** `rdb_node` prints each event as
 `rdb_node ownership-event node=N partition=P state=activated token=G.E` (with
 `deadline_in_ms=D` for `deactivating`), and logs it as `ownership_event`. In rdb_dev,
-`admin route G` prints `route group G partition P owner node N token G.E`.
+`admin route G` prints `route group G partition P owner node N token G.E addr ADDRESS`
+(`addr none` when the owner's record holds no address, or when no read of that owner's
+address has succeeded yet in this `Db`, so `addr none` does not prove that none is recorded). The address is shown with each control character
+and backslash escaped (`\r`, `\n`, `\u{1b}`, `\\`), and each Unicode line separator and bidi
+control as a visible escape (`\u{2028}`, `\u{202e}`), so it stays on one line in its stored
+order;
+`RouteInfo::app_address` still returns the stored bytes.
+
+### Scopes, groups, list and delete
+
+Give request code a `ScopedDb`, never the `Db` (#147). A `ScopedDb` is one tenant's view: it
+reaches that tenant's data and nothing else, whatever partition the data shares.
+
+```rust,ignore
+let scope = Scope::new(b"acme", Some(b"tenant-42"))?;    // app, optional sub-tenant
+let tenant = async_db.scoped(scope);                     // hand this to request code
+tenant.put(workspace, Bytes::from_static(b"doc"), value, None).await?;
+let page = tenant.list(workspace, Bytes::new(), None, 100).await?;
+tenant.delete_prefix(workspace, Bytes::new(), deadline).await?;
+```
+
+- **A scope** is an app (1–64 bytes) and an optional sub-tenant (1–64 bytes). Any byte is
+  allowed. An empty part, or one over 64 bytes, is a `ScopeError`. A scope is a leaf: an
+  app-level handle sees none of its sub-tenants' data. Open one handle per (app, sub).
+- **A workspace** is a `u64` group inside a scope. Every call names one, and an object id inside
+  it. No call takes a key, an `AffinityId` or a raw `RequestId`.
+- The calls are `put`, `get`, `read`, `write`, `write_as`, `txn`, `txn_as`, `status`,
+  `status_of`, `resend_within`, `list` and `delete_prefix`. Each answers what its `Db` call
+  answers.
+
+**How it is stored.** These bytes are permanent (SBX ADR 0039): renaming an app means moving its
+data.
+
+```text
+S         = len(app) u8 | app | 0x00                          no sub-tenant
+S         = len(app) u8 | app | 0x01 | len(sub) u8 | sub      with a sub-tenant
+stored id = S || workspace u64 BE || id
+affinity  = first 8 bytes BE of SHA-256("RDBSCOPE1" || S || workspace BE)
+request   = APP_REQUEST_BIT | top-bit-cleared first 8 bytes BE of
+            SHA-256("RDBREQ1" || S || workspace BE || n BE)
+```
+
+- No `S || workspace` is a prefix of another, so no key of one (scope, workspace) is a key of
+  another. That is what isolates tenants. The affinity only places data: two workspaces that
+  land on one partition, or on one affinity, still share no key.
+- The affinity hashes the workspace, so one scope's workspaces spread over every partition.
+  Never place by tenant alone: one tenant would become one hot partition.
+- `write_as`, `txn_as` and `status` take the app's own request number `n`, per scope and
+  workspace. Two scopes using the same `n` never meet. A request id from two scopes collides
+  only on a 63-bit hash collision, about M²/2^64 for M live ids, and its effect is a status
+  answer, never a value.
+- `resend_within` and `status_of` take only a `ScopedSent`, which only a scope's own answers
+  carry. Another scope's token is `INVALID_ARGUMENT`, and nothing is sent. A scoped answer's
+  `PutOk.sent` holds no keys or values.
+
+**Id budget.** Every scoped id is at most `MAX_SCOPED_ID` = 885 bytes, in every scope: 1,024
+less the longest `S` (131 bytes) and the workspace (8). A longer id is `TOO_LARGE` with
+`TooLarge { limit: ObjectId, size, max: MAX_SCOPED_ID }`. The budget does not move with the
+scope's length.
+
+**List.** `list(workspace, prefix, after, limit)` returns up to `limit` (at most `MAX_PAGE`)
+objects whose id starts with `prefix`, after `after`: each `ObjectEntry { id, version, kind }`,
+with `id` inside the scope. `next` is the last id when the page is full; pass it as `after`.
+
+- An empty prefix lists the whole workspace. A workspace is the widest list: rDB keeps no list of
+  a scope's workspaces. Keep your own index of workspaces to offboard a whole tenant.
+- One object costs one seek, however many entries it holds. Records with no root, such as the
+  chunks of an upload never published, are not listed.
+- Each page is one read. Pages are not one snapshot.
+
+**Delete.** `write(workspace, id, Change::Delete, expect)` deletes any kind of object.
+
+- An object that fits one record is one call. Anything larger, including a document with
+  upload chunks under it, is deleted in batches of up to 254 records: call again until
+  `Ok(None)`. Between batches the object reads as valid or absent,
+  never as damage: a map, set or list reads with fewer entries, and a blob reads as absent
+  (its root goes first; the chunks left go in the next calls). A new object at that id never
+  inherits old entries.
+- `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
+  With no root left it is `ObjectAbsent`, even when only chunks remain, since they may be a
+  later upload's: finish a blob's leftover chunks with `expect: None`.
+  `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
+- `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload
+  chunks with no root included, and returns how many. **It is not atomic.** On an error,
+  `PrefixDeleteError { deleted, error }` says how far it got; run it again to finish. An object
+  created under the prefix while it runs may survive. So does a root committed, after its page
+  was read, at an id that page listed with no root: that id's records are deleted only while
+  it has no root. Any other conflict there is the error.
+- Offboarding a tenant is one `delete_prefix(workspace, "")` per workspace in your index.
+
+**What a scope does not stop.**
+
+- A holder of the `Db` or the `AsyncDb` reaches every scope. In process, the boundary is the type
+  you hand to request code.
+- An app connected over a network link is not scoped by the node. **rDB's client and peer ports
+  must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
+  your gateway. A node-side check of the certificate's app against the id is owed (#154).
+  Until it lands, a node refuses a delete (`Change::Delete`, alone or in a `txn`) and a list
+  from an app link not on its admin apps (`rdb_node --admin-apps`) with `INVALID_ARGUMENT`,
+  and nothing is deleted or listed; admin apps and nodes still send both. #154 replaces that
+  refusal with the scope check.
+  rDB ships development and multihost-test config only: `docker/` (the `rdb-bf-node` image,
+  whose Dockerfile `EXPOSE`s 7001-7004: the rEtcd voter's peer, client and gossip ports and its
+  health port, which the voter binds to loopback only) and `scripts/docker-multihost.sh`, which
+  runs voters and data nodes (peer port 7101) on one private Docker network and publishes no
+  port to the host. Neither is a production deployment, so until #154 that boundary is the
+  embedder's network policy.
+  For SBX (checked 2026-11-22): no network control covers an rDB node listener yet. SBX's
+  nftables rules block only sandboxes, whose outbound traffic is dropped except to the egress
+  proxy. Those rules and SBX's ADR 0027 are SBX's internal documents, not public, so this page
+  cannot link them. Nothing stops another holder of an app certificate on the network. The
+  real control is #154 (open), the node-side check; until it lands, the refusal above of
+  Delete and List from a non-admin app.
+- `route`, `ownership` and ownership events return partition and node facts only, never a
+  record.
+
+**Try it.** `cargo run -p rdb-api --example scoped_db` writes `doc` in four scopes whose names
+run into each other (`a`, `ab`, `a`+`b`, `a`+`c`) and prints each scope's value and list, then
+deletes one scope's workspace and lists again. Only that scope's list changes.
 
 ## 5. Reopening your folder
 
@@ -1123,6 +1520,14 @@ So a partition sustains about `cap / retention` writes per second:
 | 10 min | 109 |
 
 - **Bursts are free.** A burst may use the whole cap at once.
+- **You are warned before the cap is full.** The owner logs `dedup_cap_high` (warn) once when a
+  partition's kept answers reach 80% of the cap, and `dedup_cap_full` (warn) once when they
+  reach the cap. Each line has `node`, `partition`, `len`, `cap`, `retention_ms` and, when
+  known, `frees_in_ms` (the earliest an answer frees). Each is logged again only after the count
+  falls 5% of the cap (at least one answer) below its mark, so a count sitting on a mark does
+  not log on every write.
+- **`Db::node_status` shows how full it is:** `lengths.dedup` (kept answers) beside
+  `lengths.dedup_cap` (the cap), on the owner. A node holding no answers reports 0 for both.
 - **A full cap answers `OVERLOADED`.** Its `retry_after` (on `ApiError`, also in the message)
   is the earliest time an entry frees. Wait at least that long before you send again. It is
   left out when no time is known.
@@ -1181,6 +1586,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `PROTECTION_PAUSED` | The owner holds new writes until a copy confirms the older ones. | After a short wait. `db.node_status()` shows what writes wait on. |
 | `LEASE_EXPIRED` | The owner's permission to write ran out. An owner cut off from rEtcd keeps writing on the grant it holds until that grant runs out, about 5.9 s after its last renewal with the default 6 s grant. From then it answers this until it reaches rEtcd again and holds a new grant. | After `db.wait_ready(..)`. |
 | `NOT_PRIMARY` | This node no longer owns the partition: a promote moved it. The refusal names the new owner (`hint`). `no_mutation` is true: nothing was written. | At once. The `Db` tries to re-read the owner on this answer (see the barrier notes below for when it does not); the retry goes to the new one once a re-read succeeds. |
+| `TOO_LARGE` | The call is over a fixed size limit: an object id, a key, a value, a whole write, a change's ops or a blob chunk. Nothing was sent. `refused.error.too_large()` names the limit, the size and the maximum ([Size limits](#size-limits)). | Never as it is. Make it smaller, and send it as a new write. |
 | `DURABILITY_UNCONFIRMED` | `db.wait_durable(..)` ended without confirming the position. When the owner answers it, either a regular copy has not proved it, and the message names the copies still owed; or every copy proved it but the owner's grant stopped admitting before it could answer `Ok`, and the message says so, names no copy, and says to read back, since a newer owner may have replaced it. When the owner does not answer at all, the `Db` gives up a second after `timeout` with "no barrier answer from the owner", and cannot name the copies. It says nothing about the write. | Call `db.wait_durable(..)` again, or fold it into the next barrier. Nothing to resend. |
 | `GENERATION_CHANGED` | A node restarted and the generation moved on. This send wrote nothing. | At once. If it was sent before, ask `db.status(..)` first whether an earlier send applied it. |
 | `UNKNOWN_OUTCOME` | No outcome yet. Two ways: **after 2 s**, the owner applied the write but no second copy confirmed it (`POST_APPLY_DEADLINE_MILLIS`), and later writes pause (`PROTECTION_PAUSED`) until it resolves; or, **at the call's deadline**, no answer came at all (a put: `Timeouts::put`, 5 s; a txn: its own deadline, up to 30 s). | Ask `db.status(..)`, or resend the same request. |
@@ -1188,6 +1594,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -1271,14 +1678,15 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (10 at this commit;
-  set at merge), whether or not this setting is on. An older build speaks 9, even one that has
-  this setting, and the two refuse each other when they connect, each logging
-  `net_handshake_refused` with both versions. So an older node is never added back live, and it cannot link at all. The
-  same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
-  10. To upgrade to 10: stop every node and every app process that links to them, upgrade
-  them all, start the nodes, then the apps. A rolling upgrade, with some processes at 9 and
-  some at 10, does not link.
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (12 at this commit:
+  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list), whether or not this setting is on. A
+  build before these guards speaks 9, even one that has this setting, and a build at 10 or 11 lacks
+  the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
+  connect, each logging `net_handshake_refused` with both versions. So an older node is never
+  added back live, and it cannot link at all. The same holds for an app process with no copy
+  (`--nodes`): an app at an older version is refused by nodes at 12. To upgrade: stop every
+  node and every app process that links to them, upgrade them all, start the nodes, then the
+  apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
   whose node has the setting off is still protected when an owner with it on adds it back. A
   copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
@@ -1371,6 +1779,19 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
 ### Known limits in this release
 
+- **Writes pause while a copy is rebuilt after the owner dies.** This happens when history was
+  trimmed, a copy was down for longer than the trimmed history covers, and then the owner died.
+  The one copy left owns the partition read-only until the other copy has a snapshot and has
+  caught up. Until then writes are refused `RECOVERY_READ_ONLY`, naming the copy being rebuilt
+  ("When writes pause"). How long that takes grows with the partition's size. `retry_after` is
+  a fixed 5 s poll hint, not an estimate: rDB cannot yet count a partition's bytes cheaply
+  enough to give one.
+- **The same pause follows `admin promote --drop`** when the copy left behind is behind the
+  trimmed history. Reads keep working through the rebuild. Once the copy has caught up, the
+  owner re-plans with it to take writes again. That re-plan fences the partition first, so a
+  read may get `LEASE_EXPIRED` (retry after recovery) for about 2 s. During the re-plan (about
+  a second), writes are refused with retryable, no-mutation errors (`UNAVAILABLE`,
+  `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED`); retry them.
 - **A move whose new copy makes no progress for 90 s is given up.** A move's new copy catches
   up one record per round trip. Copying a long history is progress, however long it takes.
   The clock counts only time in which the copy gets no closer to the head. That happens when
@@ -1408,7 +1829,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (`[0:0:0:0:0:0:0:1]` gives `::1`, `DB-A.example.` gives `db-a.example`). Two nodes on one
     machine are refused: the same label, or the same host whatever the labels say (two
     spellings of one IP, such as `[::1]` and `[0:0:0:0:0:0:0:1]`, are one host).
-  - An address must be one a peer can dial, since a record is never rewritten. The port is 1
+  - An address must be one a peer can dial, since a node's declared address and machine are
+    never rewritten (only the node's own app address can change, at its open: see `route`
+    below). The port is 1
     to 65535. The host is one of:
     - a four-octet IPv4 address, or an IPv6 address in brackets, that is not unspecified,
       broadcast or multicast;
@@ -1508,6 +1931,27 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
+  - `Trimmed` (issue #61): the history needed to adopt the tail is trimmed, so it cannot come
+    back. Giving it up still needs `--give-up-live-copy`, and forget-tail's refusal names the
+    whole command.
+- **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
+  `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
+  set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,
+  command}` on that copy's node. The partition still takes writes on its other copies. The named
+  copy cannot be rebuilt, because it holds records no other copy has, and history needed to
+  bring them back has been trimmed. It happens only on a partition whose record an older build
+  wrote and that has committed no writable generation since.
+  - To let it rejoin, run on the owner:
+    `admin forget-tail --partition P --through H --give-up-live-copy`, with the H the warn
+    names. The copy is then rebuilt from a snapshot and returns by itself.
+  - **THIS CAN LOSE ACKNOWLEDGED WRITES.** Seqs above the partition's cutoff, up to H, on that
+    copy are deleted for good. Some of them may be writes your app was told succeeded (`Ok`
+    without `wait_durable`). Before running it, read what that copy holds, if you need it
+    (`rdb_storage::dump` on a stopped node, or a backup). Do not wipe or rebuild the node first:
+    that loses the same records without the check.
+  - If `degraded` still names the copy after the command was accepted, run the same command
+    again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
+    copies.
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
   the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
   `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
@@ -1556,8 +2000,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (10 at this commit; set
-  at merge; issues #107 and #87), and the handshake
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (12 at this commit: 10 for
+  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148), and the handshake
   refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
@@ -1632,6 +2076,11 @@ A refused call (`put`, `get`, `read`, `write`, `status`) returns `ApiError`. Its
 alone, and `ApiError::explain()` gives the detail with it. For example, a refusal while the
 database is not serving says `UNAVAILABLE (...; next: the database is not serving right now:
 wait a few seconds and try again; ...)`.
+
+`ApiError`'s fields stay public to read, but it has a private one too (#134), so code outside
+`rdb_api` cannot build one with a struct literal. Build one with its constructors:
+`ApiError::new(kind, detail)`, `ApiError::invalid(detail)` or `ApiError::from_kernel(&error)`,
+then `with_retry_after` when needed. SBX had no such literal (checked 2026-11-20).
 
 **Refused for good.** No open of this folder, against this rEtcd, will ever succeed. Retrying
 does not help; the "what to do" column does.

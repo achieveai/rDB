@@ -128,6 +128,9 @@ pub(crate) struct NodeInner {
     /// see arrive (test plan M4-28, M4-29).
     receipts: Mutex<Vec<(u64, u64)>>,
     retention_task: Mutex<Option<JoinHandle<()>>>,
+    /// Seams for in-crate rows only (#192 review); compiled out of every real build.
+    #[cfg(test)]
+    test_hooks: TestHooks,
     /// Observed leadership transitions, and the leader they were observed against
     /// (`retcd_raft_leader_changes_total`, ADR-0026).
     ///
@@ -311,6 +314,8 @@ impl ConfigNode {
             watch,
             receipts: Mutex::new(Vec::new()),
             retention_task: Mutex::new(None),
+            #[cfg(test)]
+            test_hooks: TestHooks::default(),
             leader_changes: AtomicU64::new(0),
             last_seen_leader: Mutex::new(None),
             gossip_endpoint_mismatch: AtomicU64::new(0),
@@ -334,12 +339,18 @@ impl ConfigNode {
             .watch
             .attach(&inner.reader, Arc::clone(&inner.authorizer), span.clone());
 
-        let retention_handle =
-            tokio::spawn(retention_loop(Arc::downgrade(&inner)).instrument(span.clone()));
-        *inner
-            .retention_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(retention_handle);
+        #[cfg(not(test))]
+        let periodic_retention = true;
+        #[cfg(test)]
+        let periodic_retention = inner.cfg.periodic_retention;
+        if periodic_retention {
+            let retention_handle =
+                tokio::spawn(retention_loop(Arc::downgrade(&inner)).instrument(span.clone()));
+            *inner
+                .retention_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(retention_handle);
+        }
 
         let handle = tokio::spawn(
             background_loop(
@@ -1010,6 +1021,19 @@ impl ConfigNode {
         self.inner.reader.compact_revision().unwrap_or(0)
     }
 
+    /// One pass of the leader's retention tick, for the #194 row that holds an apply inside
+    /// its write and shows the tick does not wait for it.
+    #[cfg(test)]
+    pub(crate) async fn evaluate_retention_once(&self) {
+        self.inner.evaluate_retention().await;
+    }
+
+    /// The in-crate seams on this node (#192 review).
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> &TestHooks {
+        &self.inner.test_hooks
+    }
+
     /// A digest over retained journal events above `from_exclusive` (test plan TA-31).
     ///
     /// Separate from [`ConfigNode::state_hash`], which keeps its M1/M2 definition: a
@@ -1264,16 +1288,35 @@ impl NodeInner {
     /// hold on every node a retired node might dial, including one that was partitioned while
     /// the removal happened, so the fence travels through the log like any other fact.
     fn retired_nodes(&self) -> BTreeSet<NodeId> {
-        let mut out = BTreeSet::new();
-        self.reader
-            .with_state(&mut |s| out = s.retired_nodes().clone());
-        out
+        self.reader.retired_nodes()
     }
 
     fn is_retired(&self, node_id: NodeId) -> bool {
+        self.reader.is_retired(node_id)
+    }
+
+    /// The readmission fence for `add_learner` and `promote_voter`, read under the
+    /// state-machine lock, never from the applied mirror.
+    ///
+    /// "A node id is never reused" is a safety rule, so it must not depend on the mirror. The
+    /// mirror moves only after a `RetireNode` batch is written, so while that write is in
+    /// flight it still says "not retired", and a same-id `add_learner` issued in that window
+    /// would pass and be proposed (#192 review). Under the lock, the check waits for the apply
+    /// and sees the retirement, as it did before #186. This is a rare admin path, so a wait of
+    /// one fsync here is fine; the per-RPC peer-plane check keeps `is_retired`.
+    fn is_retired_for_readmission(&self, node_id: NodeId) -> bool {
+        #[cfg(test)]
+        self.test_hooks
+            .readmission_checks
+            .fetch_add(1, Ordering::SeqCst);
         let mut retired = false;
-        self.reader
-            .with_state(&mut |s| retired = s.is_retired(node_id));
+        self.reader.with_state(&mut |s| {
+            retired = s.is_retired(node_id);
+            #[cfg(test)]
+            self.test_hooks
+                .readmission_reads_under_sm
+                .fetch_add(1, Ordering::SeqCst);
+        });
         retired
     }
 
@@ -1447,8 +1490,9 @@ impl NodeInner {
             });
         }
         // Before anything is proposed: a retired id must never re-enter membership, not even
-        // as a learner (M5-62).
-        if self.is_retired(node_id) {
+        // as a learner (M5-62). Under the state-machine lock, not the mirror: see
+        // `is_retired_for_readmission`.
+        if self.is_retired_for_readmission(node_id) {
             return Err(AdminError::Retired { node_id });
         }
         if self
@@ -1479,7 +1523,7 @@ impl NodeInner {
 
     async fn promote_voter_inner(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
         self.require_leader()?;
-        if self.is_retired(node_id) {
+        if self.is_retired_for_readmission(node_id) {
             return Err(AdminError::Retired { node_id });
         }
         let report = self.membership_report();
@@ -2329,7 +2373,17 @@ impl NodeInner {
                 .map_or(0, |(rev, _)| rev.saturating_add(1))
         };
 
-        let Ok(stats) = self.reader.journal_stats() else {
+        // One read of the store's last durable batch, not the state-machine lock, so this tick
+        // on a Tokio worker never waits out an apply's fsync (#194). Its floor can lag a
+        // compaction still writing; `StateReader::retention_inputs` says why that is safe.
+        let inputs = self.reader.retention_inputs();
+        #[cfg(test)]
+        let inputs = if self.test_hooks.fail_retention_inputs.load(Ordering::SeqCst) {
+            Err(config_storage::StorageReadError::Poisoned)
+        } else {
+            inputs
+        };
+        let Ok((stats, compact_revision)) = inputs else {
             return;
         };
         let view = JournalView {
@@ -2338,7 +2392,6 @@ impl NodeInner {
             count: stats.count,
             bytes: stats.bytes,
         };
-        let compact_revision = self.reader.compact_revision().unwrap_or(0);
         let Some((up_to, reason)) = retention_target(
             view,
             &self.retention,
@@ -2425,10 +2478,7 @@ impl NodeInner {
     /// untrue. Read from the state machine rather than cached, because a snapshot install can
     /// raise it without this process applying anything.
     fn max_applied_command_schema(&self) -> u16 {
-        let mut out: u16 = config_core::COMMAND_SCHEMA_V1;
-        self.reader
-            .with_state(&mut |s| out = s.max_applied_command_schema());
-        out
+        self.reader.max_applied_command_schema()
     }
 
     /// Whether a committed voter has *answered* naming a schema below `command_schema`.
@@ -2699,6 +2749,21 @@ fn write_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
         },
         Fatal::Stopped | Fatal::Panicked => ConfigError::DeadlineExceededUnknownOutcome,
     }
+}
+
+/// Seams the in-crate rows use to fence or fail one step (#192 review). Test builds only.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    /// Readmission checks started. Bumped before the check takes the state-machine lock, so
+    /// a row can wait until an `add_learner` or `promote_voter` is inside it.
+    pub(crate) readmission_checks: AtomicU64,
+    /// Readmission reads that ran inside `with_state`, i.e. under the state-machine lock.
+    /// Bumped inside the read itself, so a check that reads the applied mirror instead never
+    /// bumps it, however late its read lands.
+    pub(crate) readmission_reads_under_sm: AtomicU64,
+    /// While set, the retention tick sees `retention_inputs` fail.
+    pub(crate) fail_retention_inputs: AtomicBool,
 }
 
 /// The leader-only retention task (ADR-0019).

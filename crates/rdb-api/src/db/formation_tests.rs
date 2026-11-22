@@ -55,6 +55,9 @@ struct Rig {
     addrs: BTreeMap<NodeId, String>,
     /// The listeners bound when the rig was made, each until its node's first open takes it.
     reserved: std::sync::Mutex<BTreeMap<NodeId, tokio::net::TcpListener>>,
+    /// The app address each node registers when [`Rig::open_all`] or [`Rig::restart`] opens it
+    /// (#83 B2); a node not named registers none.
+    apps: BTreeMap<NodeId, String>,
 }
 
 impl Drop for Rig {
@@ -134,10 +137,12 @@ fn open_node(
         listener,
         addrs,
         Timeouts::default(),
+        None,
     )
 }
 
-/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop).
+/// [`open_node`] with `timeouts` (#80 S1b: a shorter unreachable drop) and the app address the
+/// node registers (#83 B2).
 #[allow(clippy::too_many_arguments)]
 fn open_node_with(
     rt: &tokio::runtime::Runtime,
@@ -148,6 +153,7 @@ fn open_node_with(
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
+    app: Option<&str>,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     open_node_faulted(
         rt,
@@ -158,6 +164,7 @@ fn open_node_with(
         listener,
         addrs,
         timeouts,
+        app,
         Faults::new(),
     )
 }
@@ -174,9 +181,34 @@ fn open_node_faulted(
     listener: tokio::net::TcpListener,
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
+    app: Option<&str>,
     faults: Arc<Faults>,
 ) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
+    let (config, net) = node_config(cert_dir, node, dir, listener, addrs, timeouts, app, faults);
+    let db = rt.block_on(Db::open_with(
+        config,
+        Arc::clone(store),
+        rt.handle().clone(),
+        fast(),
+    ))?;
+    Ok((db, net))
+}
+
+/// What [`open_node_with`] opens `node` with, and its started net, inside a runtime context:
+/// for a row that drives the open's future itself (#83 B2: an open dropped mid-write). Its net
+/// applies `faults` (PR #181 review round 4).
+#[allow(clippy::too_many_arguments)]
+fn node_config(
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
+    app: Option<&str>,
+    faults: Arc<Faults>,
+) -> (DbConfig, Arc<Net>) {
     let boot = next_boot(dir).expect("a boot");
     let label = Label::Node(node);
     let links = Links::new();
@@ -195,23 +227,19 @@ fn open_node_faulted(
         Some(listener),
     )
     .expect("the node's net starts");
-    let db = rt.block_on(Db::open_with(
-        DbConfig {
-            local: vec![node],
-            links: Some(links),
-            boot: Some(boot),
-            timeouts,
-            addresses: Some(NodeAddresses {
-                listen: addrs[&node].clone(),
-                peers: addrs.clone(),
-            }),
-            ..config(dir)
-        },
-        Arc::clone(store),
-        rt.handle().clone(),
-        fast(),
-    ))?;
-    Ok((db, net))
+    let config = DbConfig {
+        local: vec![node],
+        links: Some(links),
+        boot: Some(boot),
+        timeouts,
+        addresses: Some(NodeAddresses {
+            listen: addrs[&node].clone(),
+            peers: addrs.clone(),
+            app: app.map(str::to_owned),
+        }),
+        ..config(dir)
+    };
+    (config, net)
 }
 
 /// Listeners for nodes 1 to `k`, node N on 127.0.0.N at a port from the test range, and the
@@ -259,6 +287,7 @@ fn bare_rig_of(store: Arc<dyn ConfigStore>, k: u32) -> Rig {
         own_runtimes: false,
         addrs,
         reserved: std::sync::Mutex::new(reserved),
+        apps: BTreeMap::new(),
     }
 }
 
@@ -410,6 +439,7 @@ impl Rig {
                 listener,
                 &addrs,
                 self.timeouts,
+                self.apps.get(node).map(String::as_str),
                 Arc::clone(&faults),
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
@@ -2727,6 +2757,7 @@ impl Rig {
             listener,
             &self.addrs,
             timeouts,
+            self.apps.get(&node).map(String::as_str),
             Arc::clone(&faults),
         )
         .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
@@ -3814,10 +3845,10 @@ fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
 }
 
 /// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
-/// written, since a node record is never rewritten: port 0, a bracketed host that is not an IPv6
-/// address (`[::gg]`), and (PR #144 review r2) an unspecified, broadcast or multicast host
-/// (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`, `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same
-/// store then takes the corrected addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
+/// written: port 0, a bracketed host that is not an IPv6 address (`[::gg]`), and (PR #144 review
+/// r2) an unspecified, broadcast or multicast host (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`,
+/// `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same store then takes the corrected
+/// addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
 /// parses no bracketed host; both declare, red at the first. Cut: `dialable` refuses nothing; red
 /// at `255.255.255.255`. Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0`.
 #[config_log::retcd_test]
@@ -4253,6 +4284,7 @@ fn declared_addresses() -> NodeAddresses {
         peers: (1..=3)
             .map(|n| (NodeId(n), format!("127.0.0.{n}:7100")))
             .collect(),
+        app: None,
     }
 }
 
@@ -4504,6 +4536,1804 @@ fn s1b_a_store_declared_by_an_s1a_build_is_refused_with_how_to_redeclare() {
         "{again:?}"
     );
     assert_eq!(snapshot(&rt, &*store), s1a, "nothing was written");
+}
+
+/// The info-level bytes a write costs, summed over every node's lines (#158 ruling 3): `rdb_node`
+/// logs at info in production, and at ~4.8 KB a write a node at 500 writes/s filled ~210 GB a day.
+const INFO_BYTES_PER_WRITE: usize = 300;
+
+/// The writes the burst makes, after the warm-up, one at a time: each is its own batch, the
+/// worst case for per-batch lines.
+const BURST: usize = 200;
+
+/// A log line's size as the production file holds it: the per-test layer adds `testModule`,
+/// `testMethod` and `testRun`, which `rdb_node`'s file never carries.
+fn production_line_bytes(line: &serde_json::Value) -> usize {
+    let mut line = line.clone();
+    if let Some(fields) = line.as_object_mut() {
+        for test_field in ["testModule", "testMethod", "testRun"] {
+            fields.remove(test_field);
+        }
+    }
+    serde_json::to_string(&line).expect("a JSON line").len() + 1
+}
+
+/// Whether a line is at Information or above. Read from `@l`, not from what the test filter let
+/// through: the per-test layer records rdb's debug lines too.
+fn at_info_or_above(line: &serde_json::Value) -> bool {
+    matches!(
+        line["@l"].as_str(),
+        Some("Information" | "Warning" | "Error" | "Fatal")
+    )
+}
+
+/// The writes of one burst through `db` into `group`, after a warm-up: the info-level bytes per
+/// write, all nodes' lines counted, and every line the burst logged at any level.
+fn burst_info_bytes(method: &str, db: &Db, group: AffinityId) -> (usize, Vec<serde_json::Value>) {
+    // Warm-up: the first writes land while the partition finishes recovering, which logs state
+    // changes that are not the per-write cost.
+    for i in 0..5 {
+        put_lands(db, group, format!("warm{i}").as_bytes(), b"v");
+    }
+
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    for i in 0..BURST {
+        put_lands(db, group, format!("k{i}").as_bytes(), b"v");
+    }
+    let mut lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let burst = lines.split_off(before);
+
+    let mut by_event: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut total = 0;
+    for line in burst.iter().filter(|line| at_info_or_above(line)) {
+        let bytes = production_line_bytes(line);
+        total += bytes;
+        let event = line["@m"].as_str().unwrap_or("?").to_owned();
+        let entry = by_event.entry(event).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+    let per_write = total / BURST;
+    let mut top: Vec<(String, (usize, usize))> = by_event.into_iter().collect();
+    top.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    top.truncate(12);
+    // Printed whether or not it passes, so a run records the measured cost.
+    eprintln!(
+        "{method}: {per_write} info bytes per write over {BURST} writes ({total} in all); {top:?}"
+    );
+    assert!(
+        per_write < INFO_BYTES_PER_WRITE,
+        "{per_write} info bytes per write over {BURST} writes ({total} in all, 3 nodes); \
+         bound {INFO_BYTES_PER_WRITE}. Top events (lines, bytes): {top:?}"
+    );
+    (per_write, burst)
+}
+
+/// #158: a steady stream of writes to a 3-node database costs under [`INFO_BYTES_PER_WRITE`]
+/// bytes of info-level log per write, all three nodes' lines counted. Per-write and per-batch
+/// lines are debug; info carries state changes and faults. Integration (~5 s): a formation, then
+/// [`BURST`] writes to one owner's partition.
+/// Cut: any per-write event moved back to info (for example `publication_fact`, `reply` or
+/// `batch_commit`) puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let db = rig.of(owner);
+    let group = group_of(db, partition);
+    burst_info_bytes(METHOD, db, group);
+}
+
+/// Review r1 (PR #182): the bound row above writes through the owner's own handle, so the wire
+/// path is not measured. Here every write goes through another node's handle to the owner over
+/// the network; the bound holds the same. Control: the burst logged a debug
+/// `net_client_request` for each write, so the writes really crossed the wire.
+/// Integration (~5 s): a formation, then [`BURST`] writes through a node that does not own the
+/// partition.
+/// Cut: `net_client_request` back at info puts the row over the bound.
+#[config_log::retcd_test]
+fn r158_info_log_bytes_per_remote_write_stay_under_the_bound() {
+    const METHOD: &str = "r158_info_log_bytes_per_remote_write_stay_under_the_bound";
+    let rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let via = NodeId(owner.0 % 3 + 1);
+    let db = rig.of(via);
+    let group = group_of(db, partition);
+    let (_, burst) = burst_info_bytes(METHOD, db, group);
+    let requests: Vec<_> = burst
+        .iter()
+        .filter(|line| line["@m"] == "net_client_request")
+        .collect();
+    assert!(
+        requests.len() >= BURST,
+        "{} net_client_request lines for {BURST} writes from node {} to owner {}",
+        requests.len(),
+        via.0,
+        owner.0
+    );
+    for line in &requests {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
+}
+
+/// `refused` stale-version puts through the owner of a fresh rig, then its shutdown, which
+/// summarises the open refusal window. The info-level bytes they cost, all nodes counted, and
+/// the lines among them (`refusal_first`, `refusal_summary`, and what else the refused writes
+/// logged at info). Left out: the shutdown's own lifecycle lines, and the control link's
+/// `control_*` lines, which the rEtcd watch logs on its own schedule whether or not anything is
+/// written (6 `control_watch_backoff` lines, ~1.8 KB, in each phase on 2026-11-21).
+fn refused_info_bytes(method: &str, refused: usize) -> (usize, Vec<(String, usize)>) {
+    let mut rig = declared_rig();
+    rig.wait_ready();
+    let partition = 1;
+    let owner = admin::initial_owner(PartitionId(partition));
+    let group = group_of(rig.of(owner), partition);
+    put_lands(rig.of(owner), group, b"stale", b"v");
+    let before = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    for _ in 0..refused {
+        let error = rig
+            .of(owner)
+            .put_in(group, b"stale", b"w", Some(1_000_000))
+            .expect_err("a stale version is refused");
+        assert!(error.error.no_mutation, "{error:?}");
+    }
+    let during = config_testkit::logs::lines_for_current_test(module_path!(), method).len();
+    rig.shutdown_all();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let counted: Vec<(String, usize)> = lines[before..]
+        .iter()
+        .enumerate()
+        .filter(|(i, line)| {
+            at_info_or_above(line)
+                && !line["@m"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("control_"))
+                && (before + i < during || line["@m"] == "refusal_summary")
+        })
+        .map(|(_, line)| {
+            (
+                line["@m"].as_str().unwrap_or("?").to_owned(),
+                production_line_bytes(line),
+            )
+        })
+        .collect();
+    (counted.iter().map(|(_, bytes)| bytes).sum(), counted)
+}
+
+/// Review r2 (PR #182), the question whether the 300 B budget covers refusals. It is a budget
+/// per steady-state write, and refusals in steady state are well inside it: 200 refused writes
+/// in one window cost one `refusal_first` and one `refusal_summary`, a few bytes each. An
+/// isolated refusal costs those same two lines, about 700 B, by design (#158 option B): the
+/// first says what is refused, and the summary's count is what makes the debug lines add up.
+/// Measured and printed both ways. Integration (~6 s): two rigs, one refused write, then 200.
+/// Cut: a refusal logged at info one line each (the `client_compile` or `reply` at info) puts
+/// the repeated case over the bound.
+#[config_log::retcd_test]
+fn r158_refused_writes_cost_one_first_and_one_summary_at_info() {
+    const METHOD: &str = "r158_refused_writes_cost_one_first_and_one_summary_at_info";
+    let (isolated, isolated_lines) = refused_info_bytes(METHOD, 1);
+    let (repeated, repeated_lines) = refused_info_bytes(METHOD, BURST);
+    eprintln!(
+        "{METHOD}: isolated {isolated} B {isolated_lines:?}; {BURST} repeated {repeated} B, \
+         {} B each {repeated_lines:?}",
+        repeated / BURST
+    );
+    for lines in [&isolated_lines, &repeated_lines] {
+        let names: Vec<&str> = lines.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["refusal_first", "refusal_summary"],
+            "a refusal at info is its first and its window's summary: {lines:?}"
+        );
+    }
+    assert!(
+        repeated / BURST < INFO_BYTES_PER_WRITE,
+        "{repeated} B for {BURST} refused writes"
+    );
+    assert!(isolated < 1_000, "{isolated} B for one refused write");
+}
+
+/// Two groups that both map to `partition`: two workspaces that move together.
+fn two_groups_of(db: &Db, partition: u32) -> (AffinityId, AffinityId) {
+    let mut groups = (1..1_000_000)
+        .map(AffinityId)
+        .filter(|group| db.partition_of(*group) == PartitionId(partition));
+    let first = groups.next().expect("a group");
+    (first, groups.next().expect("a second group"))
+}
+
+/// `route(group)` on `db` until it names `owner`, bounded: the gateway's node reads the new
+/// record once its `partitions/` watch delivers the change.
+fn route_names(db: &Db, group: AffinityId, owner: NodeId) -> crate::RouteInfo {
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let route = db.route(group).expect("a route");
+        if route.owner == owner {
+            return route;
+        }
+        assert!(Instant::now() < until, "route still names {route:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The app address node N registers in the B2 rows: SBX's gateway port beside it.
+fn app_of(node: NodeId) -> String {
+    format!("https://gw-{}.example:8443", node.0)
+}
+
+/// [`declared_rig_of`] with every node registering [`app_of`] at open (#83 B2).
+fn declared_rig_with_apps(k: u32, partitions: u32) -> Rig {
+    let mut rig = bare_rig_of(Arc::new(config_testkit::MemStore::new()), k);
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration of {k} nodes is written: {other:?}"),
+    }
+    rig.apps = (1..=k).map(|n| (NodeId(n), app_of(NodeId(n)))).collect();
+    rig.open_all(fresh_dirs_of(k));
+    rig
+}
+
+/// own83_b2_1 (#83 B2 acceptance; SBX's scenarios "forwarding to the owner" and "a partition's
+/// workspaces move together"; #84's epoch): five declared node processes, each on its own host,
+/// each registering its app address at open. The gateway in node 2's process routes two
+/// workspaces of partition 4, which the ring places on node 4: both name node 4, node 4's app
+/// address and one token, and `leader_of(4)` says the same. In node 4's process,
+/// `ownership(4)` holds that token, the epoch SBX stamps on its side effects. Node 4 stops and
+/// partition 4 is promoted to node 5 from node 2's process: both workspaces now route to node 5
+/// at node 5's app address, under a higher token, which node 5's `ownership` holds; node 5 does
+/// not own the old token; a put through the gateway lands in partition 4 and the write made
+/// before the move reads back. Cuts: the open's `register_app_addr` call removed, red at the
+/// first route (no address); the address read for a fixed node (node 1), red at the first
+/// route (node 1's address). Integration (~10 s): five processes' formation and a promote that
+/// waits out node 4's grant.
+#[config_log::retcd_test]
+fn own83_b2_1_route_forwards_to_the_owners_app_address_across_a_promote() {
+    const P: u32 = 4;
+    let mut rig = declared_rig_with_apps(S1B_K, S1B_P);
+    rig.wait_ready();
+    let owner = NodeId(ring(S1B_K, P).primary);
+    assert_eq!(owner, NodeId(4), "the ring places partition 4 on node 4");
+    let gateway = rig.of(NodeId(2));
+    let (a, b) = two_groups_of(gateway, P);
+    let before = gateway.route(a).expect("a route");
+    assert_eq!(
+        (before.partition, before.owner, before.app_address()),
+        (PartitionId(P), owner, Some(app_of(owner).as_str())),
+        "{before:?}"
+    );
+    assert_eq!(
+        gateway.route(b).expect("a route"),
+        before,
+        "workspaces move together"
+    );
+    assert_eq!(
+        gateway.leader_of(PartitionId(P)).expect("leader_of"),
+        before
+    );
+    let held = rig
+        .of(owner)
+        .ownership(PartitionId(P))
+        .expect("node 4 leads partition 4");
+    assert_eq!(
+        held.token, before.token,
+        "the epoch the owner stamps is route's"
+    );
+    put_lands(gateway, a, b"before", b"1");
+
+    rig.stop(owner);
+    let to = NodeId(5);
+    rig.of(NodeId(2))
+        .promote_partition(PartitionId(P), to, None)
+        .unwrap_or_else(|e| panic!("node 4 is stopped: {e}"));
+    let gateway = rig.of(NodeId(2));
+    let after = route_names(gateway, a, to);
+    assert_eq!(
+        (after.partition, after.app_address()),
+        (PartitionId(P), Some(app_of(to).as_str())),
+        "{after:?}"
+    );
+    assert!(after.token > before.token, "{after:?} after {before:?}");
+    assert_eq!(
+        route_names(gateway, b, to),
+        after,
+        "workspaces move together"
+    );
+    let until = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    let now_held = loop {
+        if let Some(held) = rig.of(to).ownership(PartitionId(P)) {
+            break held;
+        }
+        assert!(Instant::now() < until, "node 5 never led partition 4");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        now_held.token, after.token,
+        "the new owner stamps route's token"
+    );
+    assert!(!rig.of(to).still_owner(PartitionId(P), before.token));
+    let put = put_lands(gateway, b, b"after", b"2");
+    assert_eq!(put.partition, PartitionId(P), "{put:?}");
+    let got = gateway.get_in(a, b"before").expect("a get");
+    assert_eq!(
+        got.value.as_ref().map(|(_, value)| &value[..]),
+        Some(&b"1"[..]),
+        "the write made before the move reads back: {got:?}"
+    );
+}
+
+/// The `nodes/{id}` record's body and its mod revision.
+fn node_record(rig: &Rig, node: NodeId) -> (Bytes, u64) {
+    let read = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Node(node).encode()),
+        }))
+        .expect("a read");
+    let record = read.record.expect("the record");
+    (record.value, record.mod_revision)
+}
+
+/// own83_b2_2 (#83 B2, owner ruling 2026-11-19): a declared open writes its app address into
+/// its own `nodes/{id}` record (layout 2), changing no declared field: `read_nodes` reads the
+/// records the declaration wrote, and declaring the same again is `Already`. A restart with the
+/// same address writes nothing (the mod revision stays); a restart with another replaces it;
+/// a restart with none keeps the stored one. Cut: the "already holds it" check removed, red at
+/// "same address". Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_2_a_declared_open_registers_its_app_address_once_per_change() {
+    let mut rig = declared_rig_with_apps(3, PARTITIONS);
+    rig.wait_ready();
+    let node = NodeId(2);
+    let (body, first) = node_record(&rig, node);
+    assert_eq!(
+        NodeRecord::decode_with_app(&body).and_then(|(_, app)| app),
+        Some(app_of(node)),
+        "layout 2 holds the app address"
+    );
+    let declared = rig.declaration();
+    let read = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("records");
+    for decl in &declared.nodes {
+        assert_eq!(
+            read[&decl.node].addr, decl.addr,
+            "the declared fields are unchanged"
+        );
+    }
+    assert!(
+        matches!(
+            rig.rt.block_on(admin::declare(&rig.store, &declared)),
+            Ok(admin::Declared::Already(_))
+        ),
+        "the same declaration is adopted"
+    );
+
+    rig.restart(node, Timeouts::default());
+    assert_eq!(
+        node_record(&rig, node).1,
+        first,
+        "same address: nothing written"
+    );
+
+    rig.apps.insert(node, "gw-2.other:9000".to_owned());
+    rig.restart(node, Timeouts::default());
+    let (body, moved) = node_record(&rig, node);
+    assert!(moved > first, "another address is written");
+    assert_eq!(
+        NodeRecord::decode_with_app(&body)
+            .and_then(|(_, app)| app)
+            .as_deref(),
+        Some("gw-2.other:9000")
+    );
+
+    rig.apps.remove(&node);
+    rig.restart(node, Timeouts::default());
+    let (body, kept) = node_record(&rig, node);
+    assert_eq!(kept, moved, "no address: nothing written");
+    assert_eq!(
+        NodeRecord::decode_with_app(&body)
+            .and_then(|(_, app)| app)
+            .as_deref(),
+        Some("gw-2.other:9000"),
+        "kept"
+    );
+}
+
+/// own83_b2_3 (#83 B2): an app address is refused where no record can hold it, or out of
+/// bounds, before anything is written: an empty one and one of 513 bytes on a declared open,
+/// and any on an undeclared one. Each leaves the store as it was. Cut: the undeclared refusal
+/// removed, red: the open goes on and is refused for another reason (no `partitions/1`).
+/// Unit (<1 s, an in-memory store, no net).
+#[config_log::retcd_test]
+fn own83_b2_3_an_app_address_is_refused_where_no_record_can_hold_it() {
+    let rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
+    let empty = snapshot(&rig.rt, &*rig.store);
+    let dir = folder();
+    let undeclared = rig.rt.block_on(Db::open_with(
+        DbConfig {
+            local: vec![NodeId(1)],
+            addresses: Some(NodeAddresses {
+                app: Some("gw-1:8443".to_owned()),
+                ..declared_addresses()
+            }),
+            ..config(&dir.0)
+        },
+        Arc::clone(&rig.store),
+        rig.rt.handle().clone(),
+        fast(),
+    ));
+    let refused = undeclared.expect_err("undeclared");
+    assert!(
+        refused.to_string().contains("only a declared database"),
+        "{refused}"
+    );
+    assert_eq!(snapshot(&rig.rt, &*rig.store), empty, "nothing was written");
+
+    rig.declare_created();
+    let declared = snapshot(&rig.rt, &*rig.store);
+    for app in [
+        String::new(),
+        "a".repeat(rdb_core::authority::node::MAX_APP_ADDR_LEN + 1),
+    ] {
+        let dir = folder();
+        let opened = rig.rt.block_on(Db::open_with(
+            DbConfig {
+                local: vec![NodeId(1)],
+                addresses: Some(NodeAddresses {
+                    app: Some(app.clone()),
+                    ..declared_addresses()
+                }),
+                ..config(&dir.0)
+            },
+            Arc::clone(&rig.store),
+            rig.rt.handle().clone(),
+            fast(),
+        ));
+        let refused = opened.expect_err("out of bounds");
+        assert!(
+            refused.to_string().contains("app address"),
+            "{} bytes: {refused}",
+            app.len()
+        );
+        assert_eq!(
+            snapshot(&rig.rt, &*rig.store),
+            declared,
+            "nothing was written"
+        );
+    }
+}
+
+// ---- #83 B2, PR #159 review: the app-address write's fence, and its unknown outcomes ----
+
+/// What an [`AddrPuts`] store does to the next `nodes/` put.
+#[derive(Debug, Clone)]
+enum NodePut {
+    /// Through to the store.
+    Pass,
+    /// Kept to apply later ([`AddrPuts::deliver`]), answered `DeadlineExceededUnknownOutcome`
+    /// at once: a write sent whose reply was lost and which has not applied yet.
+    Late,
+    /// [`NodePut::Late`], and the next `nodes/` read fails: the read back fails.
+    LateUnread,
+    /// Kept to apply later, never answered: the caller's future is dropped there, as a
+    /// process stopped mid-write, after its marker and before the write applied.
+    Park,
+    /// Applied, answered `DeadlineExceededUnknownOutcome`.
+    AppliedLost,
+    /// [`NodePut::AppliedLost`], and the next `nodes/` read fails: applied, and the read back
+    /// fails.
+    AppliedUnread,
+    /// These bytes written over the record first, then the put sent: it meets a record that
+    /// moved after the open read it.
+    Rival(Bytes),
+    /// These bytes written over the record first, the put not applied, answered
+    /// `DeadlineExceededUnknownOutcome`.
+    RivalLost(Bytes),
+}
+
+impl NodePut {
+    /// The step's name, all `test_addr_put` logs of it (PR #159 review r6): [`NodePut::Rival`]
+    /// and [`NodePut::RivalLost`] carry raw record bytes, which may hold an app address with a
+    /// credential, and docs/logging.md forbids raw value bytes in any log line.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Late => "late",
+            Self::LateUnread => "late_unread",
+            Self::Park => "park",
+            Self::AppliedLost => "applied_lost",
+            Self::AppliedUnread => "applied_unread",
+            Self::Rival(_) => "rival",
+            Self::RivalLost(_) => "rival_lost",
+        }
+    }
+}
+
+/// A memory store whose `nodes/` puts follow a script (#83 B2): each scripted put records
+/// whether the folder's pending marker was on disk when it arrived.
+struct AddrPuts {
+    inner: config_testkit::MemStore,
+    script: std::sync::Mutex<std::collections::VecDeque<NodePut>>,
+    kept: std::sync::Mutex<Vec<config_core::PutRequest>>,
+    failing_reads: std::sync::atomic::AtomicU32,
+    /// The marker a scripted put looks for, and what each one found.
+    marker: std::sync::Mutex<Option<PathBuf>>,
+    marked: std::sync::Mutex<Vec<bool>>,
+    /// The revision each rival write made.
+    rivals: std::sync::Mutex<Vec<u64>>,
+    parked: tokio::sync::Notify,
+}
+
+impl AddrPuts {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: config_testkit::MemStore::new(),
+            script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            kept: std::sync::Mutex::new(Vec::new()),
+            failing_reads: std::sync::atomic::AtomicU32::new(0),
+            marker: std::sync::Mutex::new(None),
+            marked: std::sync::Mutex::new(Vec::new()),
+            rivals: std::sync::Mutex::new(Vec::new()),
+            parked: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn next(&self, step: NodePut) {
+        self.script.lock().expect("script").push_back(step);
+    }
+
+    /// Apply every kept put now, as its late arrival: each one's outcome.
+    fn deliver(&self, rt: &tokio::runtime::Runtime) -> Vec<config_core::MutationOutcome> {
+        let kept: Vec<_> = self.kept.lock().expect("kept").drain(..).collect();
+        kept.into_iter()
+            .map(|put| {
+                rt.block_on(self.inner.put(put))
+                    .expect("applied or refused")
+                    .outcome
+            })
+            .collect()
+    }
+
+    fn keep(&self, request: config_core::PutRequest) {
+        self.kept.lock().expect("kept").push(request);
+    }
+
+    async fn overwrite(&self, key: &Bytes, value: Bytes) -> Result<(), config_core::ConfigError> {
+        self.inner
+            .put(config_core::PutRequest {
+                key: key.clone(),
+                value,
+                expected_mod_revision: None,
+                dedup: None,
+            })
+            .await
+            .map(|written| self.rivals.lock().expect("rivals").push(written.revision))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for AddrPuts {
+    async fn get(
+        &self,
+        request: config_core::GetRequest,
+    ) -> Result<config_core::GetResponse, config_core::ConfigError> {
+        if request.key.starts_with(b"nodes/")
+            && self
+                .failing_reads
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(config_core::ConfigError::Unavailable {
+                reason: "AddrPuts: this read back is scripted to fail".to_owned(),
+            });
+        }
+        self.inner.get(request).await
+    }
+
+    async fn list(
+        &self,
+        request: config_core::ListRequest,
+    ) -> Result<config_core::ListResponse, config_core::ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, config_core::ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(
+        &self,
+        request: config_core::PutRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        use config_core::ConfigError::DeadlineExceededUnknownOutcome as Unknown;
+        if !request.key.starts_with(b"nodes/") {
+            return self.inner.put(request).await;
+        }
+        let step = self
+            .script
+            .lock()
+            .expect("script")
+            .pop_front()
+            .unwrap_or(NodePut::Pass);
+        if let Some(marker) = self.marker.lock().expect("marker").as_ref() {
+            self.marked.lock().expect("marked").push(marker.exists());
+        }
+        tracing::info!(step = step.label(), "test_addr_put");
+        match step {
+            NodePut::Pass => self.inner.put(request).await,
+            NodePut::Late => {
+                self.keep(request);
+                Err(Unknown)
+            }
+            NodePut::LateUnread => {
+                self.keep(request);
+                self.failing_reads.store(1, Ordering::SeqCst);
+                Err(Unknown)
+            }
+            NodePut::Park => {
+                self.keep(request);
+                self.parked.notify_one();
+                std::future::pending().await
+            }
+            NodePut::AppliedLost => {
+                self.inner.put(request).await?;
+                Err(Unknown)
+            }
+            NodePut::AppliedUnread => {
+                self.inner.put(request).await?;
+                self.failing_reads.store(1, Ordering::SeqCst);
+                Err(Unknown)
+            }
+            NodePut::Rival(value) => {
+                self.overwrite(&request.key, value).await?;
+                self.inner.put(request).await
+            }
+            NodePut::RivalLost(value) => {
+                self.overwrite(&request.key, value).await?;
+                Err(Unknown)
+            }
+        }
+    }
+
+    async fn delete(
+        &self,
+        request: config_core::DeleteRequest,
+    ) -> Result<config_core::MutationResponse, config_core::ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, config_core::ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// A declared three-node store behind an [`AddrPuts`], and node 1's folder, where node 1 has
+/// opened once with `first` and stopped: its record holds `first`. Only node 1 ever runs.
+///
+/// Each open counts the calls to its `open_spawning` spawn, one per host started (PR #159
+/// review r2): a refused open must have made none, and an open that succeeds at least one, the
+/// control that the count sees a start at all. [`Fence::open_on`] asserts both, so every
+/// refusal a row meets is checked to be before any host starts.
+struct Fence {
+    rig: Rig,
+    store: Arc<AddrPuts>,
+    dir: Folder,
+}
+
+impl Fence {
+    fn new(first: &str) -> Self {
+        let store = AddrPuts::new();
+        let rig = bare_rig_of(Arc::clone(&store) as Arc<dyn ConfigStore>, 3);
+        rig.declare_created();
+        let dir = folder();
+        *store.marker.lock().expect("marker") = Some(dir.0.join(APP_ADDR_PENDING_FILE));
+        let fence = Self { rig, store, dir };
+        fence.open(first).expect("the first open registers");
+        fence
+    }
+
+    /// Open node 1 on its folder with `app`; stopped again at once when it opens.
+    fn open(&self, app: &str) -> Result<(), OpenError> {
+        self.open_on(&self.rig.rt, Some(app))
+    }
+
+    /// [`Fence::open`] on `rt` with `app`, or with no app address: a fresh runtime is a new
+    /// process. Opened through `open_spawning`, whose spawn is counted: refused, no host
+    /// started; opened, at least one did.
+    fn open_on(&self, rt: &tokio::runtime::Runtime, app: Option<&str>) -> Result<(), OpenError> {
+        let listener = self.rig.listen(rt, NodeId(1));
+        let _entered = rt.enter();
+        let (config, net) = node_config(
+            &self.rig.cert_dir,
+            NodeId(1),
+            &self.dir.0,
+            listener,
+            &self.rig.addrs,
+            Timeouts::default(),
+            app,
+            Faults::new(),
+        );
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&starts);
+        let spawn = move |node, engine, links, control, clock, boot, partitions, nodes| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            host::spawn_on(
+                node,
+                engine,
+                links,
+                control,
+                clock,
+                fast(),
+                Limits::default(),
+                host::UNREACHABLE_DROP_AFTER_MILLIS,
+                false,
+                boot,
+                partitions,
+                nodes,
+            )
+        };
+        let opened = rt.block_on(Db::open_spawning(
+            config,
+            Arc::clone(&self.rig.store),
+            rt.handle().clone(),
+            fast(),
+            spawn,
+        ));
+        let starts = starts.load(Ordering::SeqCst);
+        match opened {
+            Ok(mut db) => {
+                assert!(
+                    starts > 0,
+                    "the control: an open that succeeds starts its host"
+                );
+                db.shutdown();
+                drop((db, net));
+                Ok(())
+            }
+            Err(refused) => {
+                assert_eq!(starts, 0, "refused before any host starts: {refused}");
+                Err(refused)
+            }
+        }
+    }
+
+    /// Node 1's record: its app address and mod revision.
+    fn record(&self) -> (Option<String>, u64) {
+        let (body, revision) = node_record(&self.rig, NodeId(1));
+        let (_, app) = NodeRecord::decode_with_app(&body).expect("node 1's record decodes");
+        (app, revision)
+    }
+
+    /// The record's bytes as node 1 writes them with `app`.
+    fn bytes_with(&self, app: &str) -> Bytes {
+        let (body, _) = node_record(&self.rig, NodeId(1));
+        NodeRecord::decode(&body)
+            .expect("node 1's record decodes")
+            .encode_with_app(app)
+    }
+
+    fn marked(&self) -> bool {
+        self.dir.0.join(APP_ADDR_PENDING_FILE).exists()
+    }
+
+    /// How many `nodes/` puts reached the store so far.
+    fn node_puts(&self) -> usize {
+        self.store.marked.lock().expect("marked").len()
+    }
+
+    /// Whether every scripted put found the marker on disk when it arrived.
+    fn marker_before_every_put(&self) -> bool {
+        let marked = self.store.marked.lock().expect("marked");
+        !marked.is_empty() && marked.iter().all(|found| *found)
+    }
+}
+
+/// own83_b2_4 (#83 B2, PR #159 review, the fence): node 1's record holds A. An open with B sends
+/// its write at revision r, and the reply is lost before the write applies: refused, no host
+/// started (its spawn counted zero, [`Fence`]), the marker left. The retry with A finds the record already holding A, but the
+/// marker says a write may still apply at r, so it writes A again (the fence): the revision
+/// moves past r. The late write of B then arrives and is refused, and the record holds A. A
+/// further open with A, no marker now, writes nothing. Every scripted put found the marker on
+/// disk. The address carries a synthetic credential: no log line of the changed, fenced or
+/// unchanged registration holds it. Cut: the fence skipped (`held == app` returns before the
+/// marker is read), red at "B never replaces A" (the late write applies). Cut:
+/// `db_app_addr_registered` logs `app = %app`, red at the log check. Integration (~2 s): one
+/// node, opened four times.
+#[config_log::retcd_test]
+fn own83_b2_4_a_late_write_cannot_replace_a_successful_retry() {
+    const A: &str = "https://svc:pw-SYNTHETIC-51ce@gw-1.example:8443/sbx";
+    let fence = Fence::new(A);
+    let (held, r) = fence.record();
+    assert_eq!(held.as_deref(), Some(A));
+
+    fence.store.next(NodePut::Late);
+    let refused = fence
+        .open("gw-1.b:9443")
+        .expect_err("the outcome is unknown");
+    assert!(
+        refused.to_string().contains("has not applied yet")
+            && refused.to_string().contains("nothing was started"),
+        "{refused}"
+    );
+    assert!(fence.marked(), "the marker stays while the write may apply");
+    assert_eq!(fence.record(), (Some(A.to_owned()), r), "B has not applied");
+
+    fence.open(A).expect("the retry with A opens");
+    let (_, fenced) = fence.record();
+    let late = fence.store.deliver(&fence.rig.rt);
+    assert_eq!(fence.record().0.as_deref(), Some(A), "B never replaces A");
+    assert!(!fence.marked(), "the fence resolved the marker");
+    assert_eq!(
+        late,
+        [config_core::MutationOutcome::Conflict],
+        "the late write at r is refused"
+    );
+    assert!(fenced > r, "the retry wrote A again, past r");
+    assert_eq!(fence.record(), (Some(A.to_owned()), fenced));
+
+    fence.open(A).expect("an unchanged open");
+    assert_eq!(fence.record().1, fenced, "no marker: nothing written");
+    assert!(fence.marker_before_every_put());
+
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_b2_4_a_late_write_cannot_replace_a_successful_retry",
+    );
+    let registered: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_app_addr_registered")
+        .collect();
+    assert_eq!(
+        registered.len(),
+        3,
+        "first, fenced, unchanged: {registered:?}"
+    );
+    assert!(registered.iter().all(|line| line["app_len"] == A.len()));
+    for line in &lines {
+        assert!(!line.to_string().contains("pw-SYNTHETIC-51ce"), "{line}");
+    }
+}
+
+/// own83_b2_5 (#83 B2, PR #159 review, lead's crash row): the open with B is dropped after its
+/// marker is durable and before its write applies, as a crash there leaves it. The process
+/// starts again (a new runtime) and opens with A, which the record already holds: the marker
+/// makes it write A again. Then both the parked write at the old revision and a stale retry
+/// of B at that revision are refused, and the record holds A. Cut: the fence skipped, red at
+/// "B never replaces A". Cut: the marker written after the put is sent, red at "the marker
+/// was on disk". Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_5_an_open_dropped_mid_write_is_fenced_by_the_next() {
+    const A: &str = "gw-1.a:8443";
+    let fence = Fence::new(A);
+    let (_, r) = fence.record();
+    fence.store.next(NodePut::Park);
+    let rt = &fence.rig.rt;
+    let listener = fence.rig.listen(rt, NodeId(1));
+    {
+        let _entered = rt.enter();
+        let (config, net) = node_config(
+            &fence.rig.cert_dir,
+            NodeId(1),
+            &fence.dir.0,
+            listener,
+            &fence.rig.addrs,
+            Timeouts::default(),
+            Some("gw-1.b:9443"),
+            Faults::new(),
+        );
+        let store = Arc::clone(&fence.rig.store);
+        let dropped = rt.block_on(async {
+            tokio::select! {
+                opened = Db::open_with(config, store, rt.handle().clone(), fast()) => {
+                    Err(format!("the open finished: {:?}", opened.map(|_| ())))
+                }
+                () = fence.store.parked.notified() => Ok(()),
+            }
+        });
+        dropped.expect("the open is dropped at its write");
+        drop(net);
+    }
+    assert!(fence.marked(), "the marker outlives the dropped open");
+    assert!(
+        fence.marker_before_every_put(),
+        "the marker was on disk before the write went out"
+    );
+    assert_eq!(fence.record(), (Some(A.to_owned()), r));
+
+    let restarted = runtime();
+    fence
+        .open_on(&restarted, Some(A))
+        .expect("the restarted open");
+    let (_, fenced) = fence.record();
+
+    let stale = config_core::PutRequest {
+        key: Bytes::from(ControlKey::Node(NodeId(1)).encode()),
+        value: fence.bytes_with("gw-1.b:9443"),
+        expected_mod_revision: Some(r),
+        dedup: None,
+    };
+    fence.store.keep(stale);
+    let late = fence.store.deliver(rt);
+    assert_eq!(fence.record().0.as_deref(), Some(A), "B never replaces A");
+    assert_eq!(
+        late,
+        [
+            config_core::MutationOutcome::Conflict,
+            config_core::MutationOutcome::Conflict
+        ],
+        "the parked write and a stale retry, both at r"
+    );
+    assert!(fenced > r, "written again past r");
+    assert!(!fence.marked(), "the fence resolved the marker");
+    assert_eq!(fence.record(), (Some(A.to_owned()), fenced));
+}
+
+/// own83_b2_6 (#83 B2, PR #159 review, the unknown-outcome table): a registration write
+/// answered `DeadlineExceededUnknownOutcome` is read back. Applied, and the read back matches:
+/// the open goes on, the marker removed. Not applied, and a rival's bytes are there instead:
+/// refused, naming the rival's revision, the rival's record kept, the marker removed (no
+/// write at the old revision can apply). The read back fails, twice, on two opens: each is
+/// refused naming both the lost reply and the failed read, the marker kept, the record as it
+/// was. Every refusal starts no host (its spawn counted zero, [`Fence`]). Then the store is healthy: the next open writes (the fence) and goes on. Cut: the read
+/// back's error dropped (`.ok()`, as before the review), red at "read back failed". Cut: the
+/// marker removed on a failed read back, red at "kept". Integration (~3 s): one node, six
+/// opens.
+#[config_log::retcd_test]
+fn own83_b2_6_an_unknown_registration_outcome_is_read_back() {
+    let fence = Fence::new("gw-1.a:8443");
+
+    fence.store.next(NodePut::AppliedLost);
+    let (_, r) = fence.record();
+    fence
+        .open("gw-1.b:9443")
+        .expect("applied: the open goes on");
+    let (held, applied) = fence.record();
+    assert_eq!(held.as_deref(), Some("gw-1.b:9443"));
+    assert!(applied > r);
+    assert!(!fence.marked(), "applied: resolved");
+
+    let rival = fence.bytes_with("gw-1.rival:1");
+    fence.store.next(NodePut::RivalLost(rival));
+    let refused = fence.open("gw-1.c:9443").expect_err("a rival wrote");
+    let (held, rivals) = fence.record();
+    assert!(
+        refused.to_string().contains("other bytes")
+            && refused.to_string().contains(&format!("revision {rivals}")),
+        "{refused}"
+    );
+    assert_eq!(held.as_deref(), Some("gw-1.rival:1"), "the rival's record");
+    assert!(!fence.marked(), "the record moved: resolved");
+
+    for attempt in 1..=2 {
+        fence.store.next(NodePut::LateUnread);
+        let refused = fence.open("gw-1.d:9443").expect_err("unknown");
+        let text = refused.to_string();
+        assert!(
+            text.contains("outcome is unknown")
+                && text.contains("read back failed")
+                && text.contains("scripted to fail"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: kept");
+        assert_eq!(
+            fence.record(),
+            (Some("gw-1.rival:1".to_owned()), rivals),
+            "{attempt}: as it was"
+        );
+    }
+    fence.open("gw-1.d:9443").expect("a healthy store");
+    let (held, recovered) = fence.record();
+    assert_eq!(held.as_deref(), Some("gw-1.d:9443"));
+    assert!(recovered > rivals);
+    assert!(!fence.marked());
+    // The two late writes were sent at the rival's revision, which has moved on.
+    assert_eq!(
+        fence.store.deliver(&fence.rig.rt),
+        [
+            config_core::MutationOutcome::Conflict,
+            config_core::MutationOutcome::Conflict
+        ]
+    );
+    assert_eq!(fence.record().0.as_deref(), Some("gw-1.d:9443"));
+}
+
+/// own83_b2_11 (#83 B2, PR #159 review r2, T5): a registration write that applied, whose reply
+/// was lost and whose read back failed. Twice: the open with B is refused naming both, no host
+/// started, the marker kept, and the record holds B at a new revision (the second attempt finds
+/// B already there, and the marker makes it write again). Then the store is healthy and the
+/// open with B, an equal-address retry, writes once more (the fence): the open goes on, the
+/// marker is resolved and the revision moves on. A further open writes nothing. Cut: the
+/// marker removed on a failed read back, red at "kept". Integration (~3 s): one node, five
+/// opens.
+#[config_log::retcd_test]
+fn own83_b2_11_an_applied_write_whose_read_back_fails_is_settled_by_a_retry() {
+    const B: &str = "gw-1.b:9443";
+    let fence = Fence::new("gw-1.a:8443");
+    let (_, mut last) = fence.record();
+    for attempt in 1..=2 {
+        fence.store.next(NodePut::AppliedUnread);
+        let refused = fence.open(B).expect_err("the outcome is unknown");
+        let text = refused.to_string();
+        assert!(
+            text.contains("outcome is unknown")
+                && text.contains("read back failed")
+                && text.contains("scripted to fail"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: kept");
+        let (held, revision) = fence.record();
+        assert_eq!(held.as_deref(), Some(B), "{attempt}: the write applied");
+        assert!(revision > last, "{attempt}: at a new revision");
+        last = revision;
+    }
+    fence.open(B).expect("a healthy store: the retry opens");
+    let (held, settled) = fence.record();
+    assert_eq!(held.as_deref(), Some(B));
+    assert!(settled > last, "the retry fenced: the revision moved on");
+    assert!(!fence.marked(), "and the marker is resolved");
+    fence.open(B).expect("an unchanged open");
+    assert_eq!(fence.record().1, settled, "no marker: nothing written");
+}
+
+/// own83_b2_7 (#83 B2, PR #159 review, the revision race): the record changes after the open
+/// reads it and before its write. A rival address, and a rival write of exactly the bytes this
+/// open wants at a newer revision: each refuses the open, no host started (its spawn counted
+/// zero, [`Fence`]), the rival's bytes and revision kept, the marker removed. Cut: the put sent without `expected_mod_revision`,
+/// red at "the rival's record" (the open overwrites it). Cut: a conflict whose stored bytes
+/// equal this open's taken as success, red at the identical rival. Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_7_a_record_changed_mid_registration_refuses_the_open() {
+    let fence = Fence::new("gw-1.a:8443");
+    for (what, rival) in [
+        ("a rival address", fence.bytes_with("gw-1.rival:1")),
+        ("identical bytes", fence.bytes_with("gw-1.b:9443")),
+    ] {
+        fence.store.next(NodePut::Rival(rival.clone()));
+        let refused = fence.open("gw-1.b:9443").expect_err(what);
+        let text = refused.to_string();
+        assert!(
+            text.contains("changed after this open read it")
+                && text.contains("nothing was started"),
+            "{what}: {text}"
+        );
+        let (body, revision) = node_record(&fence.rig, NodeId(1));
+        assert_eq!(body, rival, "{what}: the rival's record");
+        let rival_at = fence.store.rivals.lock().expect("rivals").pop();
+        assert_eq!(Some(revision), rival_at, "{what}: the rival's revision");
+        assert!(!fence.marked(), "{what}: resolved");
+    }
+}
+
+/// The synthetic credential the raw-log rows put in a rival's record (PR #159 review r6).
+const RIVAL_CRED: &str = "rdb-test-cred-5f3a9c";
+
+/// A rival's record for node 1 whose app address carries [`RIVAL_CRED`].
+fn rival_with_cred(fence: &Fence) -> Bytes {
+    fence.bytes_with(&format!("https://svc:{RIVAL_CRED}@gw-1.rival:8443/sbx"))
+}
+
+/// This test's log lines name the `test_addr_put` step only by `label`, and no line holds the
+/// rival record's raw bytes, as their debug text, or [`RIVAL_CRED`].
+fn rival_step_logged_by_label_only(method: &str, label: &str, rival: &Bytes) {
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let steps: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "test_addr_put")
+        .collect();
+    assert!(!steps.is_empty(), "the control: the step is logged");
+    // The payload as a `step` of `?step` would hold it, escaped as a JSON line holds it.
+    let debug = serde_json::to_string(&format!("{rival:?}")).expect("a string");
+    let debug = debug.trim_matches('"');
+    for line in &lines {
+        let text = line.to_string();
+        assert!(
+            !text.contains(RIVAL_CRED),
+            "the credential is logged: {text}"
+        );
+        assert!(
+            !text.contains(debug),
+            "the record's bytes are logged: {text}"
+        );
+    }
+    assert!(
+        steps.iter().any(|line| line["step"] == label),
+        "the {label} step is logged by its label: {steps:?}"
+    );
+}
+
+/// own83_b2_22 (#83 B2, PR #159 review r6, raw-log row): a [`NodePut::Rival`] step writes a
+/// rival record whose app address carries a synthetic credential, and the open is refused.
+/// The store's `test_addr_put` line names the step `rival`, and no line of this test holds the
+/// record's bytes or the credential. Cut: `test_addr_put` logs `?step`, red at "the
+/// credential is logged". Integration (~2 s): one node, two opens.
+#[config_log::retcd_test]
+fn own83_b2_22_a_rival_step_logs_its_label_not_the_record() {
+    let fence = Fence::new("gw-1.a:8443");
+    let rival = rival_with_cred(&fence);
+    fence.store.next(NodePut::Rival(rival.clone()));
+    let refused = fence.open("gw-1.b:9443").expect_err("a rival wrote");
+    assert!(
+        refused
+            .to_string()
+            .contains("changed after this open read it"),
+        "{refused}"
+    );
+    assert_eq!(
+        node_record(&fence.rig, NodeId(1)).0,
+        rival,
+        "the rival's record"
+    );
+    rival_step_logged_by_label_only(
+        "own83_b2_22_a_rival_step_logs_its_label_not_the_record",
+        "rival",
+        &rival,
+    );
+}
+
+/// own83_b2_23 (#83 B2, PR #159 review r6, raw-log row): a [`NodePut::RivalLost`] step writes
+/// a rival record whose app address carries a synthetic credential, and answers the open's
+/// write unknown: refused, naming other bytes. The store's `test_addr_put` line names the step
+/// `rival_lost`, and no line of this test holds the record's bytes or the credential. Cut:
+/// `test_addr_put` logs `?step`, red at "the credential is logged". Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_23_a_rival_lost_step_logs_its_label_not_the_record() {
+    let fence = Fence::new("gw-1.a:8443");
+    let rival = rival_with_cred(&fence);
+    fence.store.next(NodePut::RivalLost(rival.clone()));
+    let refused = fence.open("gw-1.b:9443").expect_err("a rival wrote");
+    assert!(refused.to_string().contains("other bytes"), "{refused}");
+    assert_eq!(
+        node_record(&fence.rig, NodeId(1)).0,
+        rival,
+        "the rival's record"
+    );
+    rival_step_logged_by_label_only(
+        "own83_b2_23_a_rival_lost_step_logs_its_label_not_the_record",
+        "rival_lost",
+        &rival,
+    );
+}
+
+/// Node 1's record holds A, and an open with B sent its write at revision r, whose reply was
+/// lost before it applied: refused, the marker left, the write of B still to arrive (#83 B2,
+/// PR #159 review r2). Returns the fence and r.
+fn fence_with_late_b(a: &str) -> (Fence, u64) {
+    let fence = Fence::new(a);
+    let (_, r) = fence.record();
+    fence.store.next(NodePut::Late);
+    let refused = fence
+        .open("gw-1.b:9443")
+        .expect_err("the outcome is unknown");
+    assert!(
+        refused.to_string().contains("has not applied yet"),
+        "{refused}"
+    );
+    assert!(fence.marked(), "the marker stays while B may apply");
+    assert_eq!(fence.record(), (Some(a.to_owned()), r), "B has not applied");
+    (fence, r)
+}
+
+/// The late write of B arrives: refused at r, and the record still holds A.
+fn late_b_is_refused(fence: &Fence, a: &str, r: u64) {
+    let (_, fenced) = fence.record();
+    assert!(fenced > r, "the recovery wrote A again, past r");
+    assert_eq!(
+        fence.store.deliver(&fence.rig.rt),
+        [config_core::MutationOutcome::Conflict],
+        "the late write at r is refused"
+    );
+    assert_eq!(
+        fence.record(),
+        (Some(a.to_owned()), fenced),
+        "B never replaces A"
+    );
+    assert!(!fence.marked(), "the fence resolved the marker");
+}
+
+/// own83_b2_8 (#83 B2, PR #159 review r2, T1): a restart given no app address, while B's write
+/// may still apply, is refused before any host starts, naming the step: open again with the
+/// address the node should hold. It writes nothing and keeps the marker, since an open without
+/// an address cannot fence. The open with A then settles it: it writes A again, and the late B
+/// is refused. A later open with no address opens and writes nothing. Cut: `app_addr_settled`
+/// skipped (the `None` arm does nothing), red at "a no-address open while B may apply" (it
+/// opens). Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_8_a_no_address_restart_is_refused_while_a_write_may_apply() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let rt = &fence.rig.rt;
+    for attempt in 1..=2 {
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("a no-address open while B may apply");
+        let text = refused.to_string();
+        assert!(
+            text.contains("was given no app address")
+                && text.contains("Open this node again with the app address it should hold")
+                && text.contains("Leave app-addr-pending and app-addr-pending.new in place")
+                && text.contains("Nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert!(fence.marked(), "{attempt}: the marker is kept");
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    fence.open(A).expect("the explicit-address open settles it");
+    late_b_is_refused(&fence, A, r);
+    let (_, settled) = fence.record();
+    fence
+        .open_on(rt, None)
+        .expect("settled: a no-address open opens");
+    assert_eq!(
+        fence.record(),
+        (Some(A.to_owned()), settled),
+        "and writes nothing"
+    );
+}
+
+/// own83_b2_9 (#83 B2, PR #159 review r2, T28): B's write may still apply, and node 1's folder
+/// is then emptied, its marker with it, as an operator empties a node's folder for it to
+/// rejoin. The open with A on the empty folder finds the record holding A and no marker, but
+/// the folder had no data, so it writes A again (the fence), and the late B is refused. A
+/// restart on that folder, now holding data, writes nothing. Cut: `new_folder` ignored
+/// (`fenced` from the marker only), red at "the recovery wrote A again" (no write, and the late
+/// B then applies). Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_9_an_emptied_folder_fences_an_equal_address_rejoin() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    assert!(!fence.marked());
+    fence.open(A).expect("the rejoin with A opens");
+    late_b_is_refused(&fence, A, r);
+    let (_, rejoined) = fence.record();
+    fence.open(A).expect("a restart on the rejoined folder");
+    assert_eq!(
+        fence.record().1,
+        rejoined,
+        "data and no marker: nothing written"
+    );
+}
+
+/// own83_b2_10 (#83 B2, PR #159 review r2, T32): the marker's presence is what fences. With B's
+/// write pending, the marker's text is damaged: the open with A still writes A again, and the
+/// late B is refused. A marker that is there but cannot be read (a folder in its place, so the
+/// read fails for an I/O reason) refuses opens with an address and without one, before any
+/// host starts, naming a step that keeps the marker; the marker stays. Made readable again,
+/// the open with A goes on and resolves it. Cut: a damaged marker refused as before r2 (`Ok`
+/// only for a parsed revision), red at "a damaged marker fences". Cut: the I/O arm answers
+/// `Ok(false)`, red at "an unreadable marker" (the open goes on). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_10_a_damaged_marker_fences_and_an_unreadable_one_refuses() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let marker = fence.dir.0.join(APP_ADDR_PENDING_FILE);
+    std::fs::write(&marker, b"\xff not a revision\n").expect("the marker is damaged");
+    fence.open(A).expect("a damaged marker fences");
+    late_b_is_refused(&fence, A, r);
+
+    let (_, before) = fence.record();
+    std::fs::create_dir(&marker).expect("a folder where the marker is");
+    for app in [Some(A), None] {
+        let refused = fence
+            .open_on(&fence.rig.rt, app)
+            .expect_err("an unreadable marker");
+        let text = refused.to_string();
+        assert!(
+            text.contains("is there but could not be read")
+                && text.contains("Leave it and app-addr-pending.new in place")
+                && text.contains("Nothing was started"),
+            "{app:?}: {text}"
+        );
+        assert!(marker.is_dir(), "{app:?}: the marker is kept");
+        assert_eq!(fence.record().1, before, "{app:?}: nothing written");
+    }
+    std::fs::remove_dir(&marker).expect("the folder is removed");
+    std::fs::write(&marker, format!("{before}\n")).expect("a readable marker");
+    fence.open(A).expect("readable: the open goes on");
+    assert!(fence.record().1 > before, "it fenced");
+    assert!(!fence.marked(), "and resolved the marker");
+}
+
+/// own83_b2_12 (#83 B2, PR #159 review r3, T47): the marker cannot be staged while an earlier
+/// marker already says B may apply. With B pending, `app-addr-pending.new` is a folder, so
+/// staging the next marker fails: the open with A is refused twice, before any host starts,
+/// with no `nodes/` put sent, the marker and the record as they were. The folder removed, the
+/// open with A fences, and the late B is refused. Cut: a staging failure ignored (the put sent
+/// without a fresh marker), red at "refused". Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_12_a_marker_that_cannot_be_staged_refuses_until_it_can() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    let marker = fence.dir.0.join(APP_ADDR_PENDING_FILE);
+    let staged = fence.dir.0.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    let held = std::fs::read(&marker).expect("the marker B left");
+    std::fs::create_dir(&staged).expect("a folder where the staged file goes");
+    let puts = fence.node_puts();
+    for attempt in 1..=2 {
+        let refused = fence
+            .open(A)
+            .expect_err("refused: the marker cannot be staged");
+        assert!(
+            matches!(refused, OpenError::Io(_)),
+            "{attempt}: {refused:?}"
+        );
+        assert_eq!(fence.node_puts(), puts, "{attempt}: no put sent");
+        assert_eq!(
+            std::fs::read(&marker).expect("the marker is kept"),
+            held,
+            "{attempt}: the marker as it was"
+        );
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: the record as it was"
+        );
+    }
+    std::fs::remove_dir(&staged).expect("the folder is removed");
+    fence
+        .open(A)
+        .expect("stageable again: the open with A fences");
+    late_b_is_refused(&fence, A, r);
+}
+
+/// own83_b2_13 (#83 B2, PR #159 review r3, T48): a lone `app-addr-pending.new`, as a crash
+/// between staging and the rename leaves it, says nothing: the rename never happened, so no
+/// write was sent after it. On a settled folder whose record holds A, with only the staged file
+/// there, an open with A succeeds and writes nothing: the record and its revision as they were,
+/// no `nodes/` put, no final marker, and the staged file left in place. Cut: the staged file
+/// read as a marker (`pending_app_addr` true when it is there), red at "nothing written".
+/// Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_13_a_lone_staged_marker_is_not_a_marker() {
+    const A: &str = "gw-1.a:8443";
+    let fence = Fence::new(A);
+    fence.open(A).expect("settled: a restart with A");
+    let settled = fence.record();
+    let staged = fence.dir.0.join(format!("{APP_ADDR_PENDING_FILE}.new"));
+    std::fs::write(&staged, format!("{}\n", settled.1)).expect("a staged file, no rename");
+    let puts = fence.node_puts();
+    fence
+        .open(A)
+        .expect("an open with A beside a lone staged file");
+    assert_eq!(fence.record(), settled, "nothing written");
+    assert_eq!(fence.node_puts(), puts, "no put");
+    assert!(!fence.marked(), "no final marker");
+    assert!(staged.exists(), "the staged file is left in place");
+}
+
+/// own83_b2_14 (#83 B2, PR #159 review r3, T42): B's write may still apply, and node 1's
+/// folder is emptied, its marker with it. A rejoin given no app address on the emptied folder
+/// cannot write an address, so it fences by writing the record's own bytes back: it opens, the
+/// record still holds A at a later revision, and the late B is refused. The fence file is gone
+/// once it has fenced. A restart with no address and one with A, on the rejoined folder, write
+/// nothing. Cut: `fence_app_addr` skipped before the hosts start, red at "the recovery wrote A
+/// again, past r" (no write, and the late B then applies). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_14_a_no_address_rejoin_on_an_emptied_folder_fences() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    fence
+        .open_on(&fence.rig.rt, None)
+        .expect("the no-address rejoin opens");
+    late_b_is_refused(&fence, A, r);
+    assert!(
+        !fence.dir.0.join(APP_ADDR_FENCE_FILE).exists(),
+        "fenced: the fence file is removed"
+    );
+    let (_, rejoined) = fence.record();
+    fence
+        .open_on(&fence.rig.rt, None)
+        .expect("a no-address restart");
+    fence.open(A).expect("a restart with A");
+    assert_eq!(
+        fence.record(),
+        (Some(A.to_owned()), rejoined),
+        "settled: nothing written"
+    );
+}
+
+/// own83_b2_15 (#83 B2, PR #159 review r3, T43): the new-folder fence survives a first open that
+/// fails after the engine has created data. B's write may still apply; node 1's folder is
+/// emptied but keeps an empty `nodes/`, so a failed open does not remove what its engine
+/// created. Two opens with A on it fail at the read before the address is written, before any
+/// host starts, each leaving `CURRENT` behind. The next open with A still fences (the fence file
+/// says so, not `CURRENT`), and the late B is refused. A restart then writes nothing. Cut: the
+/// fence file not consulted once `CURRENT` exists, red at "the recovery wrote A again, past r".
+/// The fence file's name is pinned: it is on disk, so renaming it would miss a fence an older
+/// build left owed. Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_15_a_failed_first_open_keeps_the_new_folder_fence() {
+    const A: &str = "gw-1.a:8443";
+    // The name is persisted: a folder an older build left owes its fence under it (T53).
+    assert_eq!(APP_ADDR_FENCE_FILE, "app-addr-fence");
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir_all(fence.dir.0.join("nodes")).expect("an empty nodes/");
+    let current = fence.dir.0.join("nodes").join("1").join("CURRENT");
+    for attempt in 1..=2 {
+        fence.store.failing_reads.store(1, Ordering::SeqCst);
+        let refused = fence.open(A).expect_err("the read before the write fails");
+        assert!(
+            refused
+                .to_string()
+                .contains("read before the app address is written"),
+            "{attempt}: {refused}"
+        );
+        assert!(current.exists(), "{attempt}: the engine left CURRENT");
+        assert!(
+            fence.dir.0.join(APP_ADDR_FENCE_FILE).exists(),
+            "{attempt}: the fence is still owed"
+        );
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    fence.open(A).expect("the healthy retry opens");
+    late_b_is_refused(&fence, A, r);
+    let (_, settled) = fence.record();
+    fence.open(A).expect("a restart");
+    assert_eq!(fence.record().1, settled, "settled: nothing written");
+}
+
+/// What meets the no-address fence's write in [`none_fence_refuses_until_it_fences`].
+enum FenceMeets {
+    /// Another write lands first: the fence meets a record that moved.
+    Rival,
+    /// Its reply is lost and it has not applied: it may still apply later.
+    Late,
+    /// It applies and its reply is lost.
+    AppliedLost,
+}
+
+/// The no-address fence's refusals (PR #159 review r4, T28): B's write may still apply and node
+/// 1's folder is emptied, its marker with it, so an open given no app address owes the fence.
+/// Twice that fence's write meets `meets`: each open is refused `OpenError::Control`, before any
+/// host starts ([`Fence::open_on`] counts them), its write having reached the store, and the
+/// fence file is kept, so the next open fences again. Then a no-address open whose fence
+/// applies opens: the fence file is gone, and every write still delayed (B, and any fence write
+/// kept back) is refused when it arrives. A restart with no address writes nothing.
+fn none_fence_refuses_until_it_fences(meets: FenceMeets) {
+    const A: &str = "gw-1.a:8443";
+    const C: &str = "gw-1.c:7443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    let owed = fence.dir.0.join(APP_ADDR_FENCE_FILE);
+    let rt = &fence.rig.rt;
+    let mut held = (Some(A.to_owned()), r);
+    for attempt in 1..=2 {
+        let (step, why) = match meets {
+            FenceMeets::Rival => (
+                NodePut::Rival(fence.bytes_with(C)),
+                "changed after this open read it",
+            ),
+            FenceMeets::Late => (NodePut::Late, "the fence's outcome is unknown"),
+            FenceMeets::AppliedLost => (NodePut::AppliedLost, "the fence's outcome is unknown"),
+        };
+        fence.store.next(step);
+        let puts = fence.node_puts();
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("the fence did not settle");
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, OpenError::Control(_))
+                && text.contains(why)
+                && text.contains("nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert_eq!(fence.node_puts(), puts + 1, "{attempt}: the fence was sent");
+        assert!(owed.exists(), "{attempt}: the fence is still owed");
+        let now = fence.record();
+        match meets {
+            FenceMeets::Late => assert_eq!(now, held, "{attempt}: not applied"),
+            FenceMeets::Rival => {
+                assert_eq!(now.0.as_deref(), Some(C), "{attempt}: the rival's bytes");
+                assert!(now.1 > held.1, "{attempt}: the rival moved it");
+            }
+            FenceMeets::AppliedLost => {
+                assert_eq!(
+                    now.0.as_deref(),
+                    Some(A),
+                    "{attempt}: the record's own bytes"
+                );
+                assert!(now.1 > held.1, "{attempt}: the fence applied");
+            }
+        }
+        held = now;
+    }
+    fence
+        .open_on(rt, None)
+        .expect("a no-address open whose fence applies");
+    assert!(!owed.exists(), "fenced: the debt is cleared");
+    let (app, fenced) = fence.record();
+    assert_eq!(app, held.0, "the fence wrote the record's own bytes");
+    assert!(fenced > held.1, "the fence moved the revision on");
+    let delayed = match meets {
+        FenceMeets::Late => 3,
+        FenceMeets::Rival | FenceMeets::AppliedLost => 1,
+    };
+    assert_eq!(
+        fence.store.deliver(rt),
+        vec![config_core::MutationOutcome::Conflict; delayed],
+        "every delayed write is refused"
+    );
+    assert_eq!(
+        fence.record(),
+        (app.clone(), fenced),
+        "nothing delayed applied"
+    );
+    fence.open_on(rt, None).expect("a no-address restart");
+    assert_eq!(fence.record(), (app, fenced), "settled: nothing written");
+}
+
+/// own83_b2_16 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence meeting a rival write that moved the record. Cut: the fence's `Conflict` accepted
+/// (the outcome check skipped), red at "the fence did not settle". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_16_a_no_address_fence_met_by_a_rival_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::Rival);
+}
+
+/// own83_b2_17 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence's reply lost before it applied. Accepting that unknown outcome would let an older
+/// write land after startup. Cut: an unknown outcome accepted as fenced, red at "the fence did
+/// not settle". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_17_a_no_address_fence_whose_outcome_is_unknown_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::Late);
+}
+
+/// own83_b2_18 (#83 B2, PR #159 review r4, T28): [`none_fence_refuses_until_it_fences`], the
+/// fence applied and its reply lost. Cut: the fence file removed before the write is sent, red
+/// at "the fence is still owed". Integration (~4 s).
+#[config_log::retcd_test]
+fn own83_b2_18_a_no_address_fence_applied_and_unanswered_refuses_until_it_fences() {
+    none_fence_refuses_until_it_fences(FenceMeets::AppliedLost);
+}
+
+/// own83_b2_19 (#83 B2, PR #159 review r4, T28): the new-folder fence file cannot be put in
+/// place. B's write may still apply and node 1's folder is emptied; a non-empty folder stands
+/// where `app-addr-fence` goes, so its rename fails. Two opens given no app address are each
+/// refused `OpenError::Io` before any host starts, with no `nodes/` put and no `CURRENT`
+/// created. With the path repaired, a no-address open fences and opens, and the late B is
+/// refused. Cut: the fence file's write failure ignored (`let _ =`), red at "no nodes/ put"
+/// (the open goes on and sends the fence before it fails). Integration (~3 s).
+#[config_log::retcd_test]
+fn own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can() {
+    const A: &str = "gw-1.a:8443";
+    let (fence, r) = fence_with_late_b(A);
+    std::fs::remove_dir_all(&fence.dir.0).expect("the folder is emptied");
+    std::fs::create_dir(&fence.dir.0).expect("the empty folder");
+    let blocker = fence.dir.0.join(APP_ADDR_FENCE_FILE);
+    std::fs::create_dir(&blocker).expect("a folder where the fence file goes");
+    std::fs::write(blocker.join("keep"), b"x").expect("it is not empty");
+    let current = fence.dir.0.join("nodes").join("1").join("CURRENT");
+    let rt = &fence.rig.rt;
+    for attempt in 1..=2 {
+        let puts = fence.node_puts();
+        let refused = fence
+            .open_on(rt, None)
+            .expect_err("the fence file cannot be put in place");
+        assert!(matches!(refused, OpenError::Io(_)), "{attempt}: {refused}");
+        assert_eq!(fence.node_puts(), puts, "{attempt}: no nodes/ put");
+        assert!(!current.exists(), "{attempt}: no CURRENT");
+        assert_eq!(
+            fence.record(),
+            (Some(A.to_owned()), r),
+            "{attempt}: nothing written"
+        );
+    }
+    std::fs::remove_dir_all(&blocker).expect("the path is repaired");
+    fence
+        .open_on(rt, None)
+        .expect("the repaired no-address open fences");
+    late_b_is_refused(&fence, A, r);
+    assert!(!blocker.exists(), "fenced: the fence file is removed");
+}
+
+/// Open `node`'s process alone on `dir` with `app`, through `open_spawning` with its spawn
+/// counted, as [`Fence::open_on`] does: refused, no host started; opened, at least one did, and
+/// it is shut down again at once.
+fn open_counted(rig: &Rig, node: NodeId, dir: &Path, app: Option<&str>) -> Result<(), OpenError> {
+    let rt = &rig.rt;
+    let listener = rig.listen(rt, node);
+    let _entered = rt.enter();
+    let (config, net) = node_config(
+        &rig.cert_dir,
+        node,
+        dir,
+        listener,
+        &rig.addrs,
+        Timeouts::default(),
+        app,
+        Faults::new(),
+    );
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&starts);
+    let spawn = move |node, engine, links, control, clock, boot, partitions, nodes| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        host::spawn_on(
+            node,
+            engine,
+            links,
+            control,
+            clock,
+            fast(),
+            Limits::default(),
+            host::UNREACHABLE_DROP_AFTER_MILLIS,
+            false,
+            boot,
+            partitions,
+            nodes,
+        )
+    };
+    let opened = rt.block_on(Db::open_spawning(
+        config,
+        Arc::clone(&rig.store),
+        rt.handle().clone(),
+        fast(),
+        spawn,
+    ));
+    let starts = starts.load(Ordering::SeqCst);
+    match opened {
+        Ok(mut db) => {
+            assert!(
+                starts > 0,
+                "the control: an open that succeeds starts its host"
+            );
+            db.shutdown();
+            drop((db, net));
+            Ok(())
+        }
+        Err(refused) => {
+            assert_eq!(starts, 0, "refused before any host starts: {refused}");
+            Err(refused)
+        }
+    }
+}
+
+/// The no-address fence on #137's state (PR #159 review r5, T28): node 1 owns partition 1,
+/// whose root committed and was never activated, and node 1's whole folder is then lost; the
+/// emptied folder keeps an empty `nodes/`. An app-address write an earlier folder sent at the
+/// record's revision `r` may still apply (kept back, delivered last). Twice node 1's open with
+/// no app address meets `meets` at its fence write: refused `OpenError::Control` before any host
+/// starts, with `app-addr-fence` kept. The first leaves `CURRENT` (and whatever the roll forward
+/// wrote) behind, so the second meets an existing `CURRENT` and still fences. Then a
+/// no-address open fences and opens despite `CURRENT`: the fence file is gone and every delayed
+/// write is refused. All three processes then restart and are ready, and nothing more is
+/// written to node 1's record.
+fn rooted_owner_fence_refuses_until_it_fences(meets: FenceMeets) {
+    const B: &str = "gw-1.b:9443";
+    const C: &str = "gw-1.c:7443";
+    let store = AddrPuts::new();
+    let (mut rig, rooted) =
+        wiped_before_any_write(Arc::clone(&store) as Arc<dyn ConfigStore>, 1, NodeId(1));
+    assert!(
+        matches!(rooted.as_slice(), [(PARTITION, NodeId(1), _)]),
+        "partition 1 is rooted, owned by node 1: {rooted:?}"
+    );
+    let dir = rig.procs[0].dir.clone();
+    std::fs::create_dir(dir.join("nodes")).expect("an empty nodes/");
+    let owed = dir.join(APP_ADDR_FENCE_FILE);
+    let current = dir.join("nodes").join("1").join("CURRENT");
+    let bytes_with = |app: &str| {
+        let (body, _) = node_record(&rig, NodeId(1));
+        NodeRecord::decode(&body)
+            .expect("node 1's record decodes")
+            .encode_with_app(app)
+    };
+    let (body, r) = node_record(&rig, NodeId(1));
+    store.keep(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Node(NodeId(1)).encode()),
+        value: bytes_with(B),
+        expected_mod_revision: Some(r),
+        dedup: None,
+    });
+    let mut held = (body, r);
+    for attempt in 1..=2 {
+        let (step, why) = match meets {
+            FenceMeets::Rival => (
+                NodePut::Rival(bytes_with(C)),
+                "changed after this open read it",
+            ),
+            FenceMeets::Late => (NodePut::Late, "the fence's outcome is unknown"),
+            FenceMeets::AppliedLost => (NodePut::AppliedLost, "the fence's outcome is unknown"),
+        };
+        store.next(step);
+        let refused =
+            open_counted(&rig, NodeId(1), &dir, None).expect_err("the fence did not settle");
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, OpenError::Control(_))
+                && text.contains(why)
+                && text.contains("nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert!(owed.exists(), "{attempt}: the fence is still owed");
+        assert!(current.exists(), "{attempt}: CURRENT is left behind");
+        let now = node_record(&rig, NodeId(1));
+        match meets {
+            FenceMeets::Late => assert_eq!(now, held, "{attempt}: not applied"),
+            FenceMeets::Rival | FenceMeets::AppliedLost => {
+                assert!(now.1 > held.1, "{attempt}: the record moved")
+            }
+        }
+        held = now;
+    }
+    open_counted(&rig, NodeId(1), &dir, None).expect("a no-address open fences despite CURRENT");
+    assert!(!owed.exists(), "fenced: the debt is cleared");
+    let (body, fenced) = node_record(&rig, NodeId(1));
+    assert_eq!(body, held.0, "the fence wrote the record's own bytes");
+    assert!(fenced > held.1, "the fence moved the revision on");
+    let delayed = match meets {
+        FenceMeets::Late => 3,
+        FenceMeets::Rival | FenceMeets::AppliedLost => 1,
+    };
+    assert_eq!(
+        store.deliver(&rig.rt),
+        vec![config_core::MutationOutcome::Conflict; delayed],
+        "every delayed write is refused"
+    );
+    rig.restart_all();
+    rig.wait_ready();
+    assert_eq!(
+        node_record(&rig, NodeId(1)),
+        (body, fenced),
+        "nothing delayed applied, and the restart wrote nothing"
+    );
+}
+
+/// own83_b2_20 (#83 B2, PR #159 review r5, T28): [`rooted_owner_fence_refuses_until_it_fences`],
+/// the fence meeting a rival write (`Conflict`). Cuts: the fence's `Conflict` accepted, red at
+/// "the fence did not settle"; the fence file not consulted once `CURRENT` exists, red at "the
+/// fence did not settle" on the second open (it goes on unfenced). Integration (~6 s).
+#[config_log::retcd_test]
+fn own83_b2_20_a_rooted_owner_wiped_before_any_write_fences_through_a_conflict() {
+    rooted_owner_fence_refuses_until_it_fences(FenceMeets::Rival);
+}
+
+/// own83_b2_21 (#83 B2, PR #159 review r5, T28): [`rooted_owner_fence_refuses_until_it_fences`],
+/// the fence's reply lost before it applied (an unknown outcome). Cut: an unknown outcome
+/// accepted as fenced, red at "the fence did not settle". Integration (~6 s).
+#[config_log::retcd_test]
+fn own83_b2_21_a_rooted_owner_wiped_before_any_write_fences_through_an_unknown_outcome() {
+    rooted_owner_fence_refuses_until_it_fences(FenceMeets::Late);
 }
 
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
@@ -4808,6 +6638,7 @@ fn s2_open_of_a_declared_database_refuses_plaintext_control() {
             .zip(hosts)
             .map(|(n, host)| (NodeId(n), format!("{host}:7100")))
             .collect(),
+        app: None,
     };
     let dir = config_testkit::fs::temp_dir();
     let before = snapshot(&rt, &*plain);

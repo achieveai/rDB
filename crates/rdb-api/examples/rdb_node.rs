@@ -13,7 +13,15 @@
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
 //!          [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
+//! every form: [--log-max-mb M] [--log-files N]
 //! ```
+//!
+//! * `--log-dir` is where the JSONL log goes (default `.`), as `rdb_node-N.jsonl`. It rotates
+//!   by size (#158): before a write would take it past `--log-max-mb` (default 256), it becomes
+//!   `rdb_node-N.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at
+//!   least 2) files are kept, the live one included. `--log-max-mb 0` never rotates. A second
+//!   process writing the same log is refused at start (exit 2). At info a node logs state
+//!   changes and faults, not each write; `RUST_LOG` sets the filter.
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
@@ -70,6 +78,15 @@
 //!   `--live-readd` lets this node, as an owner, add back a copy its own drop clock left out
 //!   once that copy's link is back, with no restart of the copy (`Timeouts::live_readd`, #107).
 //!   Off unless given.
+//!   `--app-addr A` writes A, the address this node's app takes forwarded requests on, into the
+//!   node's `nodes/{id}` record before the node starts, so `Db::route` names it (#83 B2). Only
+//!   a declared database has the record: a node of a database made by `--form` is refused it at
+//!   open. `--form`, `--declare` and `--gen-certs` each refuse the flag, since none of them starts
+//!   a node that would write it. Unset, the record keeps what an earlier start wrote; an address
+//!   cannot be cleared. Unset is refused while the folder's `app-addr-pending` file says an
+//!   earlier start's write may still apply: start again with `--app-addr` and the address the
+//!   node should hold, which settles it. On a new or emptied `--dir`, an unset start fences the
+//!   record (it writes the record's own bytes back), so no late write replaces its address.
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -131,6 +148,9 @@ struct Args {
     node: Option<u32>,
     dir: Option<PathBuf>,
     listen: Option<String>,
+    /// #83 B2: `--app-addr`, the address this node's app takes forwarded requests on. Unset is
+    /// refused while an earlier start's write may still apply (`app-addr-pending`).
+    app_addr: Option<String>,
     peers: BTreeMap<NodeId, String>,
     control: Vec<String>,
     cert_dir: Option<PathBuf>,
@@ -138,6 +158,10 @@ struct Args {
     faults: Option<PathBuf>,
     stop_file: Option<PathBuf>,
     log_dir: Option<PathBuf>,
+    /// `--log-max-mb`; `None` is `SizeRotation::DEFAULT`'s, 0 never rotates (#158).
+    log_max_mb: Option<u64>,
+    /// `--log-files`; `None` is `SizeRotation::DEFAULT`'s.
+    log_files: Option<usize>,
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
@@ -185,7 +209,8 @@ const USAGE: &str = "usage:
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
            [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
-           [--live-readd]
+           [--live-readd] [--app-addr A]
+  every form: [--log-max-mb M] [--log-files N] (default 256 MiB x 8 files; M = 0 never rotates)
   --faults F: a file of lines, each one of
            hold N | hold all | drop-request N | drop-reply N | cut-control | mute
 ";
@@ -233,6 +258,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--dir" => args.dir = Some(value("--dir")?.into()),
             "--listen" => args.listen = Some(value("--listen")?),
+            "--app-addr" => args.app_addr = Some(value("--app-addr")?),
             "--peers" => {
                 for pair in value("--peers")?.split(',') {
                     let (n, addr) = pair
@@ -289,6 +315,20 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--faults" => args.faults = Some(value("--faults")?.into()),
             "--stop-file" => args.stop_file = Some(value("--stop-file")?.into()),
             "--log-dir" => args.log_dir = Some(value("--log-dir")?.into()),
+            "--log-max-mb" => {
+                args.log_max_mb = Some(
+                    value("--log-max-mb")?
+                        .parse()
+                        .map_err(|_| "--log-max-mb takes whole megabytes".to_owned())?,
+                );
+            }
+            "--log-files" => {
+                args.log_files = Some(
+                    value("--log-files")?
+                        .parse()
+                        .map_err(|_| "--log-files takes a file count".to_owned())?,
+                );
+            }
             "--nodes" => {
                 let k: u32 = value("--nodes")?
                     .parse()
@@ -364,6 +404,23 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     failover_refusal(&args)?;
     declare_refusal(&args)?;
+    // #83 B2, PR #159 review: only a node process writes `--app-addr`. Forming opens with no
+    // addresses, declaring writes control records only, and making certificates opens nothing,
+    // so each would drop the flag without a word.
+    if args.app_addr.is_some() {
+        for (given, mode) in [
+            (args.form, "--form"),
+            (args.declare, "--declare"),
+            (args.gen_certs, "--gen-certs"),
+        ] {
+            if given {
+                return Err(format!(
+                    "--app-addr is written by a node process of a declared database, not with \
+                     {mode}"
+                ));
+            }
+        }
+    }
     control_certs_refusal(&args)?;
     Ok(args)
 }
@@ -554,6 +611,13 @@ fn run(
     let mut config = config_log::LogConfig::for_application("rdb_node");
     config.dir.clone_from(&log_dir);
     config.file_name = format!("{name}.jsonl");
+    config.rotate = match config_log::SizeRotation::from_flags(args.log_max_mb, args.log_files) {
+        Ok(rotate) => rotate,
+        Err(e) => {
+            eprintln!("rdb_node: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let guard = match start_logging(config) {
         Ok(guard) => guard,
         Err(e) => {
@@ -1090,6 +1154,7 @@ fn serve_on_ready(
         addresses: Some(rdb_api::NodeAddresses {
             listen: listen.clone(),
             peers: args.peers.clone(),
+            app: args.app_addr.clone(),
         }),
     };
     let mut db = rt
@@ -1547,7 +1612,10 @@ mod tests {
     /// partition: each `partitions/{p}` gains its root, and every node reaches ready (its
     /// `ready` line, through `serve_on_ready`). Only then is the stop file written, so no node
     /// is still in a readiness wait when its peers go. Stopped through `--stop-file`, each ends
-    /// cleanly and its folder holds only its own `nodes/N`. Cluster row (~0.5 s measured,
+    /// cleanly and its folder holds only its own `nodes/N`. #83 B2 (PR #159 review): nodes 1
+    /// to 3 start with `--app-addr`, node 4 without; each of the first three records holds its
+    /// flag's bytes unchanged, node 4's none. Cut: `serve_on_ready` passes `app: None`, red at
+    /// node 1's record. Cluster row (~0.5 s measured,
     /// bounded at 30 s): four nodes link over TLS, form four partitions and admit writes. The
     /// node threads log outside this row's span, so their lines land in the run's
     /// `_untagged-<pid>.jsonl`.
@@ -1612,14 +1680,20 @@ mod tests {
         let dirs: Vec<std::path::PathBuf> = (1..=K)
             .map(|n| root.path().join(format!("node-{n}")))
             .collect();
+        let (certs_path, stop_path) = (path(&certs), path(&stop));
+        let apps: Vec<String> = (1..K)
+            .map(|n| format!("https://u:p@gw-{n}.example:8443/sbx"))
+            .collect();
         let ended = std::thread::scope(|scope| {
             let running: Vec<_> = (1..=K)
                 .map(|n| {
-                    let args = parsed(&[
+                    let node = n.to_string();
+                    let dir = path(&dirs[n as usize - 1]);
+                    let mut argv = vec![
                         "--node",
-                        &n.to_string(),
+                        &node,
                         "--dir",
-                        &path(&dirs[n as usize - 1]),
+                        &dir,
                         "--listen",
                         &addrs[n as usize - 1],
                         "--peers",
@@ -1627,13 +1701,17 @@ mod tests {
                         "--control",
                         "http://127.0.0.1:1",
                         "--cert-dir",
-                        &path(&certs),
+                        &certs_path,
                         "--stop-file",
-                        &path(&stop),
+                        &stop_path,
                         "--ready-secs",
                         "30",
-                    ])
-                    .expect("parses");
+                    ];
+                    // #83 B2: nodes 1 to 3 register an app address, node 4 none.
+                    if n < K {
+                        argv.extend(["--app-addr", &apps[n as usize - 1]]);
+                    }
+                    let args = parsed(&argv).expect("parses");
                     let store = Arc::clone(&store);
                     let (rt, on_ready) = (&rt, &on_ready);
                     let bound = handed[n as usize - 1].take();
@@ -1691,6 +1769,22 @@ mod tests {
                 })
                 .collect();
             assert_eq!(held, [n.to_string()], "node {n} holds only its own copy");
+            let key = rdb_core::contracts::control::ControlKey::Node(rdb_api::NodeId(n)).encode();
+            let body = rt
+                .block_on(store.get(config_core::GetRequest {
+                    key: bytes::Bytes::from(key),
+                }))
+                .expect("a read")
+                .record
+                .expect("the node's record")
+                .value;
+            let app = rdb_core::authority::node::NodeRecord::decode_with_app(&body)
+                .and_then(|(_, app)| app);
+            assert_eq!(
+                app.as_deref(),
+                apps.get(n as usize - 1).map(String::as_str),
+                "node {n}'s --app-addr reached its record unchanged"
+            );
         }
     }
 
@@ -1704,6 +1798,40 @@ mod tests {
             Err("--failover runs only in a node process, not with --form".to_owned())
         );
         assert!(parsed(&["--form"]).is_ok_and(|args| args.form && !args.failover));
+    }
+
+    /// #83 B2, PR #159 review: `--app-addr` reaches a node process's args byte for byte, a
+    /// URL with a credential and a space included; a node process without it has none.
+    /// `--form` with `--app-addr` is a parse error, since forming would drop it; plain
+    /// `--form` still parses. `--declare` and `--gen-certs` refuse it too, for the same reason;
+    /// plain `--gen-certs` still parses. Cut: `--declare` dropped from the refusal's list, red
+    /// at `--declare`. Unit.
+    #[test]
+    fn own83_b2_app_addr_parses_and_form_refuses_it() {
+        let app = "https://user:s3cret@gw-1.example:8443/sbx path";
+        let args = parsed(&["--node", "1", "--app-addr", app]).expect("parses");
+        assert_eq!(args.app_addr.as_deref(), Some(app));
+        let args = parsed(&["--node", "1"]).expect("parses");
+        assert_eq!(args.app_addr, None);
+        for mode in ["--form", "--declare", "--gen-certs"] {
+            let mut argv = vec![mode, "--app-addr", "gw:1"];
+            if mode == "--declare" {
+                argv.extend([
+                    "--peers",
+                    "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100",
+                ]);
+            }
+            assert_eq!(
+                parsed(&argv).map(|_| ()),
+                Err(format!(
+                    "--app-addr is written by a node process of a declared database, not with \
+                     {mode}"
+                )),
+                "{mode}"
+            );
+        }
+        assert!(parsed(&["--form"]).is_ok_and(|args| args.form && args.app_addr.is_none()));
+        assert!(parsed(&["--gen-certs"]).is_ok_and(|args| args.gen_certs));
     }
 
     /// PR #119 review: `--failover` with `--gen-certs` is a parse error; plain `--gen-certs`

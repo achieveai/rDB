@@ -67,7 +67,7 @@ public class LiveTests
         var over = new byte[1025];
         Array.Fill(over, (byte)'k');
         var e = await Assert.ThrowsAsync<RdbException>(() => client.PutAsync(over, Encoding.UTF8.GetBytes("v")));
-        Assert.Equal(RdbErrorKind.InvalidArgument, e.Kind);
+        Assert.Equal(RdbErrorKind.TooLarge, e.Kind);
         Assert.True(e.NoMutation);
         Assert.True(e.FromServer);
         Assert.DoesNotContain("Db::", e.Message);

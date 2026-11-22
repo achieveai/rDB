@@ -55,6 +55,38 @@ pub(crate) fn proved_durable(
         .max()
 }
 
+/// Whether `rungs` are one dense run, each sequence one above the last, ending at `head`
+/// (issue #61): `restore_history` on both sides takes the ladder from its first rung, which is
+/// the engine's trim floor, or 0 with `(0, ROOT)` on a copy never trimmed.
+pub(crate) fn dense_through(rungs: &[(Seq, Digest)], head: Seq) -> bool {
+    let Some(&(first, _)) = rungs.first() else {
+        return false;
+    };
+    rungs.last().is_some_and(|&(last, _)| last == head)
+        && rungs
+            .iter()
+            .zip(first.0..)
+            .all(|(&(seq, _), expected)| seq.0 == expected)
+}
+
+/// Why `history` will not take the trim floor `(seq, digest)` on a side whose applied head is
+/// `head`, or `None` when it will (issue #61): `seq` above the head names a record never
+/// applied (`seq`); a digest that contradicts the rung held at `seq`, or anything but the root
+/// at 0, is not this history's floor (`digest`). One gate for both sides, so a primary and a
+/// receiver on one node cannot disagree on a floor.
+pub(crate) fn trim_refusal(
+    history: &DigestLadder,
+    head: Seq,
+    seq: Seq,
+    digest: Digest,
+) -> Option<&'static str> {
+    if seq > head {
+        return Some("seq");
+    }
+    let contradicts = history.digest_at(seq).is_some_and(|held| held != digest);
+    (contradicts || (seq == Seq::ZERO && digest != Digest::ROOT)).then_some("digest")
+}
+
 /// What a copy holds of A1's view: the key the install rule compares a new view against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HeldView {
@@ -123,9 +155,11 @@ pub enum DigestLookup {
 /// Sequence to digest, for every position this copy can still vouch for.
 ///
 /// Dense where the record is retained, and able to hold sparse rungs where records have been
-/// dropped — what is retained is storage's policy, not R1's, and the ladder mirrors it. In this
-/// build nothing drops a rung, so the ladder is dense from its floor; [`Self::truncate_above`]
-/// is the only removal, made by the `Recovered` transition.
+/// dropped — what is retained is storage's policy, not R1's, and the ladder mirrors it. Two
+/// removals exist: [`Self::truncate_above`], made by the `Recovered` transition, and
+/// [`Self::trim_below`], made when the host trims History to a floor (issue #61). Below the
+/// floor nothing is retained, so every lookup there is [`DigestLookup::NotRetained`] and the
+/// answer is a state snapshot.
 ///
 /// A [`BTreeMap`], never a hash map: ordered iteration is a charter rule, because two runs of
 /// one event log must produce one trace.
@@ -185,6 +219,22 @@ impl DigestLadder {
     /// stop being ladder-visible, though storage keeps the suffix for forensics.
     pub fn truncate_above(&mut self, seq: Seq) {
         self.entries.retain(|held, _| *held <= seq);
+    }
+
+    /// Drop every rung strictly below `seq`, keeping the rung at `seq` (issue #61, the ladder
+    /// invariant of the history-trim design §0): History holds `seq..=applied` with `seq`
+    /// included, and the ladder mirrors it. So once `seq` is above 0 the genesis rung
+    /// `(0, ROOT)` goes too, and a copy that asks from the root meets `NotRetained`, which asks
+    /// for a snapshot, instead of a walk from record 1 that the engine can no longer serve.
+    pub fn trim_below(&mut self, seq: Seq) {
+        self.entries.retain(|held, _| *held >= seq);
+    }
+
+    /// The lowest sequence the ladder holds, or `None` when it holds nothing. After
+    /// [`Self::trim_below`] it is the trim floor, when the ladder held that rung.
+    #[must_use]
+    pub fn floor(&self) -> Option<Seq> {
+        self.entries.keys().next().copied()
     }
 
     /// How many positions the ladder vouches for.

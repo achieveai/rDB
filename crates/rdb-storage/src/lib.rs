@@ -21,18 +21,20 @@
 
 mod engine;
 mod inherit;
+mod install;
 pub mod keys;
 mod lineage;
 mod snapshot;
 
 pub use engine::{
     dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RecordDamage, RocksEngine,
-    StorageOptions, WalSync, DEFAULT_BLOCK_CACHE_BYTES, DEFAULT_MEMTABLE_BUDGET_BYTES,
+    StorageOptions, TrimRefused, WalSync, DEFAULT_BLOCK_CACHE_BYTES, DEFAULT_MEMTABLE_BUDGET_BYTES,
     DEFAULT_SYNC_STUCK_MILLIS, DEFAULT_WRITE_BUFFER_BYTES, WAL_BUDGETS,
 };
 #[cfg(debug_assertions)]
 pub use inherit::flatten_at_depth;
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
-pub use keys::{Link, PossibleLossCause, PossibleLossMark, PublishMark, INSTANCE_LEN};
+pub use install::InstallError;
+pub use keys::{Link, PossibleLossCause, PossibleLossMark, PublishMark, TrimFloor, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
-pub use snapshot::{RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};
+pub use snapshot::{snapshot_entry_bytes, RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};

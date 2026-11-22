@@ -150,3 +150,383 @@ fn a_wide_log_relation_needs_the_map_inference_threshold_option() {
         "test_logs_relation must carry the option; the two arms above are why"
     );
 }
+
+/// Issue #132: [`config_testkit::logs::lines_for_current_test`] must never hand back a line that
+/// is still being written. A test commonly polls its own log while threads it started keep
+/// logging into the same file (the `rdb-api` trio rows poll `logged!` inside `until`), so a read
+/// races the append of a line logged after its flush. That line is the writer's to finish, not
+/// the reader's to see half of.
+///
+/// On ext4 one `write` becomes visible a page at a time, so a reader that stops at the end of
+/// the file can stop inside a line. XFS takes the inode lock for a buffered read as well as for
+/// a write, so there a read never sees part of one `write`, and on XFS this row cannot go red.
+/// The gate's log root is under the target directory, which is on XFS on the build host. So the
+/// body runs in a child process ([`child_reads_its_log_while_long_lines_are_written`]) whose log
+/// root is a fresh directory in the system temp dir (`/tmp`, ext4, on the build host). Where the
+/// temp dir is also on a filesystem like XFS, this row passes without having raced anything.
+///
+/// Cut: `lines_for_current_test` reads the file to its current end, red (`malformed JSONL line`)
+/// with the child's log root on ext4.
+#[test]
+fn lines_for_current_test_never_reads_a_line_still_being_written() {
+    const CHILD: &str = "child_reads_its_log_while_long_lines_are_written";
+    let run = run_bounded_child(CHILD, child_bound(READ_PATIENCE * scale()));
+    assert!(
+        run.success && run.stdout.contains("1 passed"),
+        "{CHILD} failed or ran no test: {run}"
+    );
+}
+
+/// Each reader's patience for the long lines, before [`scale`]. One round takes milliseconds on
+/// an idle host; a reader that is still waiting after this is waiting for a line that is not
+/// coming.
+const READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The patience of [`child_misses_the_long_line`]: short, because no line it waits for is ever
+/// written, so the row spends all of it.
+const MISSING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn scale() -> u32 {
+    config_testkit::poll::deadline_scale()
+}
+
+/// How long the parent lets a child run whose readers give up after `patience`: that, plus
+/// [`READ_PATIENCE`] times [`scale`] for the process start and the writer.
+fn child_bound(patience: std::time::Duration) -> std::time::Duration {
+    patience + READ_PATIENCE * scale()
+}
+
+/// The reader loop must end when the long line never comes, and say which line it waited for.
+/// Before it had a deadline, a reader whose `LONG` never arrived read its markers forever and
+/// the child never exited.
+///
+/// The child ([`child_misses_the_long_line`]) runs the same body as
+/// [`child_reads_its_log_while_long_lines_are_written`], but its writer logs a line with a
+/// different message, so no reader ever sees `LONG`.
+///
+/// Cut: drop the reader's deadline check, and the child outlives [`child_bound`] and is killed.
+#[test]
+fn a_reader_whose_long_line_never_comes_fails_within_its_patience() {
+    const CHILD: &str = "child_misses_the_long_line";
+    let bound = child_bound(MISSING_PATIENCE);
+    let run = run_bounded_child(CHILD, bound);
+    assert!(
+        !run.killed,
+        "{CHILD} was still running after {bound:?} and was killed: {run}"
+    );
+    assert!(!run.success, "{CHILD} passed with no long line: {run}");
+    let diagnostic = format!("no `{LONG}` line within {MISSING_PATIENCE:?}");
+    assert!(
+        run.stdout.contains(&diagnostic) || run.stderr.contains(&diagnostic),
+        "{CHILD} failed without naming the missing line ({diagnostic}): {run}"
+    );
+}
+
+/// [`run_bounded_child`]'s kill: a child that never exits is killed at its bound, reaped, and
+/// reported as a failure, and what it wrote before the kill is kept.
+///
+/// The bound here is short ([`MISSING_PATIENCE`] times [`scale`]) because the whole of it is
+/// spent; the rows above derive theirs the same way, from a patience, with [`child_bound`].
+///
+/// Cut: remove the kill in [`run_bounded_child`]. The row then fails in bounded time, once the
+/// child is still alive [`REAP_PATIENCE`] times [`scale`] after the bound, and the child is
+/// killed and reaped in cleanup.
+#[test]
+fn a_child_that_never_exits_is_killed_at_its_bound() {
+    const CHILD: &str = "child_never_exits";
+    let bound = MISSING_PATIENCE * scale();
+    let run = run_bounded_child(CHILD, bound);
+    assert!(run.killed, "{CHILD} was not killed: {run}");
+    assert!(!run.success, "a killed child is a failure: {run}");
+    assert!(
+        run.elapsed >= bound,
+        "{CHILD} was killed before its bound {bound:?}: {run}"
+    );
+    assert!(
+        run.stderr.contains(STUCK_MARKER),
+        "the output {CHILD} wrote before the kill was lost: {run}"
+    );
+}
+
+/// What [`child_never_exits`] writes before it blocks.
+const STUCK_MARKER: &str = "stuck child is up";
+
+/// The body of [`a_child_that_never_exits_is_killed_at_its_bound`]: write a line, then block
+/// for ever.
+#[test]
+#[ignore = "run in a child process by a_child_that_never_exits_is_killed_at_its_bound"]
+fn child_never_exits() {
+    use std::io::Write;
+    // Straight to the process's stderr, past libtest's capture, which a kill would discard.
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "{STUCK_MARKER}").expect("write the marker");
+    stderr.flush().expect("flush the marker");
+    loop {
+        std::thread::park();
+    }
+}
+
+/// What a bounded child run ended with.
+struct ChildRun {
+    success: bool,
+    /// The child outlived its bound and was killed, then reaped.
+    killed: bool,
+    elapsed: std::time::Duration,
+    /// Removed when the run is dropped, after the row's asserts have printed it.
+    root: tempfile::TempDir,
+    stdout: String,
+    stderr: String,
+}
+
+impl std::fmt::Display for ChildRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "success={} killed={} after {:?}, log root {}\nstdout:\n{}\nstderr:\n{}",
+            self.success,
+            self.killed,
+            self.elapsed,
+            self.root.path().display(),
+            self.stdout,
+            self.stderr
+        )
+    }
+}
+
+/// Run the ignored test `child` alone in a child process of this binary, with its log root a
+/// fresh directory in the system temp dir. If it is still running after `bound`, kill it.
+///
+/// Every wait is bounded, the one after the kill too: a child still alive [`REAP_PATIENCE`]
+/// times [`scale`] after its kill fails the row, which then kills and reaps it on the way out
+/// ([`Reaped`]). So no row hangs on a child and none leaves one behind.
+fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
+    let root = tempfile::Builder::new()
+        .prefix("retcd-132-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp log root");
+    // Files, not pipes: nobody reads a pipe while the parent polls, and a full one would stall
+    // the child. The log glob only reaches `<root>/<run>/*/*.jsonl`, so these are not in it.
+    let stdout_path = root.path().join("child.stdout");
+    let stderr_path = root.path().join("child.stderr");
+    let read = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read the child's output {}: {e}", path.display()))
+    };
+    let started = std::time::Instant::now();
+    let mut process = Reaped(
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([child, "--exact", "--ignored", "--test-threads=1"])
+            .env("RETCD_TEST_LOG_DIR", root.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).expect("child stdout file"))
+            .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
+            .spawn()
+            .expect("spawn the child"),
+    );
+    let (status, killed) = match poll_exit(&mut process.0, started + bound) {
+        Some(status) => (status, false),
+        None => {
+            process.0.kill().expect("kill the child");
+            let reap = REAP_PATIENCE * scale();
+            let status = poll_exit(&mut process.0, std::time::Instant::now() + reap)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{child} was still alive {reap:?} after its kill at {bound:?}\n\
+                         stdout:\n{}\nstderr:\n{}",
+                        read(&stdout_path),
+                        read(&stderr_path)
+                    )
+                });
+            (status, true)
+        }
+    };
+    ChildRun {
+        success: status.success(),
+        killed,
+        elapsed: started.elapsed(),
+        stdout: read(&stdout_path),
+        stderr: read(&stderr_path),
+        root,
+    }
+}
+
+/// How long [`run_bounded_child`] waits, before [`scale`], for a killed child to exit.
+const REAP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The child's exit status, or `None` if it is still running at `until`.
+///
+/// The loop has a bound of its own besides the `until` check: a count of polls worth twice
+/// the time to `until`, plus [`POLL_SLACK`]. The `until` check always ends it first; the
+/// count exists so that losing that check fails the row in bounded time instead of hanging
+/// it (#155 review, iteration 5).
+fn poll_exit(
+    process: &mut std::process::Child,
+    until: std::time::Instant,
+) -> Option<std::process::ExitStatus> {
+    let window = until.saturating_duration_since(std::time::Instant::now());
+    let max_polls = 2 * (window.as_millis() / POLL_EVERY.as_millis()) + POLL_SLACK;
+    for _ in 0..max_polls {
+        if let Some(status) = process.try_wait().expect("try_wait on the child") {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        // A bounded poll on a child process, not synchronization: the loop ends on the
+        // child's exit, on `until`, or on its poll count, never on the sleep itself.
+        std::thread::sleep(POLL_EVERY); // testkit:allow-sleep
+    }
+    panic!(
+        "poll_exit made {max_polls} polls for a {window:?} window and never reached its deadline"
+    )
+}
+
+/// How often [`poll_exit`] asks whether the child has exited.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Polls [`poll_exit`] allows beyond twice its window, so a short window still gets several.
+const POLL_SLACK: u128 = 50;
+
+/// A child process that is killed and reaped when dropped, if it is still running: the
+/// cleanup for a row that failed while its child was alive.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// The message of the long line each round writes, and the one each reader waits for.
+const LONG: &str = "concurrent long line";
+
+/// The body of [`lines_for_current_test_never_reads_a_line_still_being_written`], run in a child
+/// process with its own log root.
+#[config_log::retcd_test]
+#[ignore = "run in a child process by lines_for_current_test_never_reads_a_line_still_being_written"]
+fn child_reads_its_log_while_long_lines_are_written() {
+    read_while_long_lines_are_written(
+        "child_reads_its_log_while_long_lines_are_written",
+        LONG,
+        READ_PATIENCE * scale(),
+    );
+}
+
+/// The body of [`a_reader_whose_long_line_never_comes_fails_within_its_patience`]: the writer
+/// logs its long lines under another message, so every reader runs out its patience.
+#[config_log::retcd_test]
+#[ignore = "run in a child process by a_reader_whose_long_line_never_comes_fails_within_its_patience"]
+fn child_misses_the_long_line() {
+    read_while_long_lines_are_written(
+        "child_misses_the_long_line",
+        "not the long line",
+        MISSING_PATIENCE,
+    );
+}
+
+/// A line queued before a read's flush cannot be seen cut, because the flush waits for it; only
+/// one written while a read that has already flushed is still reaching the end of the file can.
+/// So each round gives one line of `PAD` bytes, logged with message `writes`, to its own file,
+/// through a twin span with its own `testMethod`, while `READERS` threads keep reading that file,
+/// still small and cheap to read, until each has read a [`LONG`] line whole.
+///
+/// Each reader gives up `patience` after it starts, checked before every read, and fails naming
+/// the line it waited for. Without that, a reader whose line never comes reads forever.
+///
+/// Also checks the flush still holds: the marker each reader logs just before a read is in it.
+fn read_while_long_lines_are_written(
+    method: &str,
+    writes: &'static str,
+    patience: std::time::Duration,
+) {
+    use std::sync::{Condvar, Mutex};
+
+    const ROUNDS: usize = 12;
+    const READERS: usize = 6;
+    const PAD: usize = 4 << 20;
+    let twin = |round: usize| format!("{method}_r{round}");
+
+    // Readers started so far, over all rounds. The writer logs round `r`'s long line once
+    // every reader has started round `r`.
+    let started = (Mutex::new(0usize), Condvar::new());
+    let start = |n: usize| {
+        *started.0.lock().unwrap_or_else(|e| e.into_inner()) += n;
+        started.1.notify_all();
+    };
+    let span = tracing::Span::current();
+    let failure = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _entered = span.enter();
+            let pad = "x".repeat(PAD);
+            for round in 0..ROUNDS {
+                let count = started.0.lock().unwrap_or_else(|e| e.into_inner());
+                drop(
+                    started
+                        .1
+                        .wait_while(count, |n| *n < (round + 1) * READERS)
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+                let method = twin(round);
+                tracing::info_span!("twin", testMethod = method.as_str()).in_scope(|| {
+                    tracing::info!(round, pad = pad.as_str(), "{writes}");
+                });
+            }
+        });
+        let readers: Vec<_> = (0..READERS)
+            .map(|reader| {
+                let (span, start, twin) = (span.clone(), &start, &twin);
+                scope.spawn(move || {
+                    let _entered = span.enter();
+                    let deadline = std::time::Instant::now() + patience;
+                    let rounds = std::panic::catch_unwind(|| {
+                        let mut reads = 0u64;
+                        for round in 0..ROUNDS {
+                            let method = twin(round);
+                            let in_twin = tracing::info_span!("twin", testMethod = method.as_str());
+                            start(1);
+                            loop {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "reader {reader} of {method}: no `{LONG}` line within \
+                                     {patience:?}, after {reads} reads"
+                                );
+                                in_twin.in_scope(|| tracing::info!(reader, reads, "read marker"));
+                                let lines = config_testkit::logs::lines_for_current_test(
+                                    module_path!(),
+                                    &method,
+                                );
+                                assert!(
+                                    lines.iter().any(|l| l["@m"] == "read marker"
+                                        && l["reader"] == reader
+                                        && l["reads"] == reads),
+                                    "read {reads} by reader {reader} of {method} is missing \
+                                     the marker logged just before it"
+                                );
+                                reads += 1;
+                                if lines.iter().any(|l| l["@m"] == LONG) {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    // A failed reader stops early; count its rounds started so the writer
+                    // and the other readers can finish.
+                    if rounds.is_err() {
+                        start(ROUNDS * READERS);
+                    }
+                    rounds
+                })
+            })
+            .collect();
+        readers
+            .into_iter()
+            .map(|r| r.join().expect("reader thread"))
+            .find_map(Result::err)
+    });
+    if let Some(panic) = failure {
+        std::panic::resume_unwind(panic);
+    }
+}
