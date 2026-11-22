@@ -547,6 +547,19 @@ pub enum Msg {
         /// The note read, at or past `generation`.
         note: CommittedWithout,
     },
+    /// R5: the reopen's heal planned `partition` without these regular copies, each at
+    /// `UNLINKED_BOOT` (`admin::heal`): no record proves the boot a copy runs now, since a
+    /// frozen or expired grant can name an older process of a node that already runs again.
+    /// The heal sends it only with `live_readd` on (`admin::may_leave_out`), and each copy is
+    /// recorded for #107's live re-add as an unreachable drop, so its first link back, whatever
+    /// boot it reports, is a live return. Sent before the heal's `Plan`. Not routed; local to
+    /// this process, so no wire change.
+    HealLeftOut {
+        /// The partition.
+        partition: PartitionId,
+        /// The copies left out.
+        left: Vec<Member>,
+    },
     /// An event from the admin (bootstrap's `Plan` and `FenceProven`). Not routed.
     Inject {
         /// The partition.
@@ -1823,8 +1836,9 @@ struct LiveReadd {
     /// [`LIVE_READD_HOLD_MILLIS`]; crate tests set it directly.
     hold_millis: u64,
     /// Per partition and node, a copy this owner's own drop clock left out, and why
-    /// ([`LiveReturn`]). Set only by [`Host::note_left_out`] from the committed plan's
-    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none.
+    /// ([`LiveReturn`]). Set by [`Host::note_left_out`] from the committed plan's
+    /// [`Replan::cause`], so an operator's drop, a move, a promote or a give-up has none, and
+    /// by R5's `Msg::HealLeftOut` for each copy the reopen's heal left out.
     /// Spent by the one live re-add it allows (slice 2a: one attempt per drop), and removed by
     /// a commit that pins the node regular, or that leaves it out with no cause.
     clocked: BTreeMap<(PartitionId, NodeId), LiveReturn>,
@@ -3810,6 +3824,44 @@ impl Host {
                     if let Some(generation) = generation {
                         self.end_barriers_below(partition, generation);
                     }
+                }
+                Ok(())
+            }
+            Msg::HealLeftOut { partition, left } => {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    left_out = ?left.iter().map(|m| (m.node.0, m.boot.0)).collect::<Vec<_>>(),
+                    "heal_left_out_noted"
+                );
+                // R5: a left-out copy returns by #107 once its link is back, whether it never
+                // stopped or started again (PR #181 ruling A). Memory only, like a drop's: a
+                // restart of this owner forgets it, and the copy then waits for its own restart.
+                if self.live_readd.on {
+                    for member in left
+                        .iter()
+                        .filter(|member| member.boot == crate::admin::UNLINKED_BOOT)
+                    {
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            left_out = member.node.0,
+                            "heal_left_out_clocked"
+                        );
+                        self.live_readd.clocked.insert(
+                            (partition, member.node),
+                            LiveReturn {
+                                clock: DropClock::Unreachable,
+                                durable: None,
+                                link_lost: true,
+                            },
+                        );
+                    }
+                }
+                let entry = self.left_out.entry(partition).or_default();
+                for member in left {
+                    entry.retain(|known| known.node != member.node);
+                    entry.push(member);
                 }
                 Ok(())
             }
@@ -7987,18 +8039,32 @@ impl Host {
     /// carried on the `Landed`, not by its own. Any change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
-        // later revives none.
+        // later revives none. R5 (PR #181): a partition with no commit here yet is the reopen's
+        // heal still committing, after its `HealLeftOut` and before its `Plan` lands; its
+        // entries wait for that commit instead of being forgotten in the gap.
+        let pending: BTreeSet<PartitionId> = self
+            .live_readd
+            .clocked
+            .keys()
+            .map(|(partition, _)| *partition)
+            .filter(|partition| !self.committed.contains_key(partition))
+            .collect();
         let owned: BTreeSet<PartitionId> = self
             .live_readd
             .clocked
             .keys()
             .map(|(partition, _)| *partition)
-            .filter(|partition| self.is_pinned_primary(*partition))
+            .filter(|partition| pending.contains(partition) || self.is_pinned_primary(*partition))
             .collect();
         let live = &mut self.live_readd;
         live.clocked
             .retain(|(partition, _), _| owned.contains(partition));
-        let keys: Vec<(PartitionId, NodeId)> = live.clocked.keys().copied().collect();
+        let keys: Vec<(PartitionId, NodeId)> = live
+            .clocked
+            .keys()
+            .copied()
+            .filter(|(partition, _)| !pending.contains(partition))
+            .collect();
         live.links.retain(|key, _| keys.contains(key));
         live.refusals_logged
             .retain(|(partition, node, _)| keys.contains(&(*partition, *node)));
@@ -17285,6 +17351,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::FeedRead { .. } => "feed_read",
         Msg::FenceBound { .. } => "fence_bound",
         Msg::ReplanNote { .. } => "replan_note",
+        Msg::HealLeftOut { .. } => "heal_left_out",
         Msg::Inject { .. } => "inject",
         Msg::Frame { .. } => "frame",
         Msg::PeerAsk { .. } => "peer_ask",
