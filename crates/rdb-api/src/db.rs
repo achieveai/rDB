@@ -476,7 +476,8 @@ pub struct ObjectPage {
 /// so only when a rerun can finish ([`Self::rerun_can_finish`]).
 #[derive(Debug, Clone)]
 pub struct PrefixDeleteError {
-    /// Objects emptied before the error.
+    /// Objects emptied before the error, its own object included when the error came after
+    /// that object's last records were deleted. Only an object confirmed empty is counted.
     pub deleted: u64,
     /// Why it stopped.
     pub error: PutError,
@@ -4242,10 +4243,10 @@ impl Db {
                     Some(_) => None,
                     None => Some(Expected::Absent),
                 };
-                let emptied = self
-                    .drain(group, &listed.id, expect, deadline)
-                    .map_err(|error| stop(deleted, error))?;
-                deleted += u64::from(emptied);
+                match self.drain(group, &listed.id, expect, deadline) {
+                    Ok(emptied) => deleted += u64::from(emptied),
+                    Err((emptied, error)) => return Err(stop(deleted + u64::from(emptied), error)),
+                }
             }
             match objects.last() {
                 Some(last) if full => after = Some(last.id.clone()),
@@ -4282,12 +4283,14 @@ impl Db {
                 None if take > 1 => take /= 2,
                 None => {
                     let (id, version) = pack[0];
-                    *deleted += u64::from(self.drain(
-                        group,
-                        id,
-                        Some(Expected::Version(version)),
-                        deadline,
-                    )?);
+                    let drained = self.drain(group, id, Some(Expected::Version(version)), deadline);
+                    match drained {
+                        Ok(emptied) => *deleted += u64::from(emptied),
+                        Err((emptied, error)) => {
+                            *deleted += u64::from(emptied);
+                            return Err(error);
+                        }
+                    }
                     rest = &rest[1..];
                 }
             }
@@ -4343,19 +4346,27 @@ impl Db {
     }
 
     /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch under
-    /// `expect` when given. Whether any batch deleted something. [`Expected::Absent`] drains
-    /// records with no root by [`Self::rootless_batch`], never by the public write, which
-    /// refuses it: a root found there ends the drain and the object survives (PR #178 review r4
-    /// N1, r5 B1). Any other failed condition is the error.
+    /// `expect` when given. Whether the drain emptied it: one of its batches committed and the
+    /// object was then confirmed empty, by a compile that found nothing stored or, after an
+    /// error, by a reread (PR #178 review r6 B1). An object it stopped at with records left is
+    /// not emptied. [`Expected::Absent`] drains records with no root by
+    /// [`Self::rootless_batch`], never by the public write, which refuses it: a root found there
+    /// ends the drain and the object survives (PR #178 review r4 N1, r5 B1). Any other failed
+    /// condition is the error.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, with whether the object was emptied before it: its last records
+    /// deleted, then the next compile failed.
     fn drain(
         &self,
         group: AffinityId,
         id: &[u8],
         expect: Option<Expected>,
         deadline: Duration,
-    ) -> Result<bool, PutError> {
+    ) -> Result<bool, (bool, PutError)> {
         let rootless = expect == Some(Expected::Absent);
-        let mut emptied = false;
+        let mut committed = false;
         loop {
             let put = PutOp {
                 group,
@@ -4366,30 +4377,58 @@ impl Db {
             let sent = if rootless {
                 self.rootless_batch(put, deadline)
             } else {
-                self.changes(vec![put], deadline)
+                self.changes(vec![put], deadline).map(|sent| match sent {
+                    Some(_) => Batch::Sent,
+                    None => Batch::Empty,
+                })
             };
-            match sent {
-                Ok(Some(_)) => emptied = true,
-                Ok(None) => return Ok(emptied),
-                // Reread the root: only a root committed since the compile ends it quietly.
-                Err(error) if rootless && error.error.kind == ErrorKind::ConditionFailed => {
-                    let reread = self.list_page(group, id, None, 1, false);
-                    let request = None;
-                    let (rooted, ..) = reread.map_err(|error| PutError { error, request })?;
-                    if rooted.first().is_some_and(|found| found.id == id) {
-                        return Ok(emptied);
-                    }
-                    return Err(error);
+            let error = match sent {
+                Ok(Batch::Sent) => {
+                    committed = true;
+                    continue;
                 }
-                Err(error) => return Err(error),
+                Ok(Batch::Empty) => return Ok(committed),
+                Ok(Batch::Rooted) => return Ok(false),
+                Err(error) => error,
+            };
+            let stored = (committed || rootless).then(|| self.stored(group, id));
+            let emptied = committed && matches!(stored, Some(Ok(None)));
+            // A rootless batch's failed condition: only a root committed since the compile ends
+            // the drain quietly, and the object survives.
+            if rootless && error.error.kind == ErrorKind::ConditionFailed {
+                match stored {
+                    Some(Ok(Some(Some(_)))) => return Ok(false),
+                    Some(Err(error)) => {
+                        let request = None;
+                        return Err((false, PutError { error, request }));
+                    }
+                    _ => {}
+                }
             }
+            return Err((emptied, error));
         }
     }
 
+    /// What object `id` stores now, from a one-object list: `None` nothing, `Some(root)`
+    /// records, with the root's version and kind when it has one.
+    fn stored(
+        &self,
+        group: AffinityId,
+        id: &[u8],
+    ) -> Result<Option<Option<(u64, ObjectKind)>>, ApiError> {
+        let (listed, ..) = self.list_page(group, id, None, 1, true)?;
+        Ok(listed
+            .into_iter()
+            .next()
+            .filter(|found| found.id == id)
+            .map(|found| found.root))
+    }
+
     /// One batch of a rootless drain: `put`, a [`Change::Delete`] with no expect, compiled and
-    /// sent only while it carries the kernel's guard that the root is absent. `Ok(None)` when it
-    /// does not, a root being in the owner's view, or when nothing is left: nothing was sent.
-    fn rootless_batch(&self, put: PutOp, deadline: Duration) -> Result<Option<PutOk>, PutError> {
+    /// sent only while it carries the kernel's guard that the root is absent. Nothing is sent
+    /// when nothing is left ([`Batch::Empty`]) or when it does not, a root being in the owner's
+    /// view ([`Batch::Rooted`]).
+    fn rootless_batch(&self, put: PutOp, deadline: Duration) -> Result<Batch, PutError> {
         if let Some(error) = deadline_refusal(deadline) {
             return Err(PutError {
                 error,
@@ -4397,6 +4436,13 @@ impl Db {
             });
         }
         let root = rdb_value::keys::root_key(TENANT, put.group, &put.object).to_bytes();
+        #[cfg(test)]
+        if let Some(error) = compile_fault(&root) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
         let identity = self.write_identity()?;
         let answer = match self.compile(identity, vec![put], deadline) {
             Ok(Some(request))
@@ -4407,9 +4453,10 @@ impl Db {
                 #[cfg(test)]
                 before_send(self, &root);
                 self.send_compiled(identity, request, send_wait(deadline))
-                    .map(Some)
+                    .map(|_| Batch::Sent)
             }
-            Ok(_) => Ok(None),
+            Ok(Some(_)) => Ok(Batch::Rooted),
+            Ok(None) => Ok(Batch::Empty),
             Err(error) => Err(error),
         };
         self.finished(identity.request, answer)
@@ -6304,6 +6351,17 @@ fn reconcile_step(mut error: ApiError, sent: Option<&TxnRequest>) -> ApiError {
     error
 }
 
+/// One batch of a [`Db::delete_prefix_in`] drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// Sent and committed.
+    Sent,
+    /// Nothing is stored under the object: nothing was sent.
+    Empty,
+    /// A rootless batch with a root in the owner's view: nothing was sent.
+    Rooted,
+}
+
 /// What a call carries to the owner, so what an answer lost under it may hide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Carries {
@@ -7656,6 +7714,35 @@ fn before_send(db: &Db, root: &Bytes) {
     if let Some(step) = step {
         step(db);
     }
+}
+
+/// Test-only (PR #178 review r6 B1): rootless drains whose batch compile is refused, each with
+/// the batches still to compile before it.
+#[cfg(test)]
+static COMPILE_FAULT: Mutex<Vec<(Bytes, usize)>> = Mutex::new(Vec::new());
+
+/// Test-only: a rootless drain of the object whose root key is `root` compiles `skip` batches,
+/// then answers the next one UNAVAILABLE without compiling it. Used once.
+#[cfg(test)]
+fn on_compile_fault(root: Bytes, skip: usize) {
+    lock(&COMPILE_FAULT).push((root, skip));
+}
+
+/// Count a rootless batch compile at `root` toward the fault [`on_compile_fault`] armed there,
+/// and answer and disarm it when its turn has come.
+#[cfg(test)]
+fn compile_fault(root: &Bytes) -> Option<ApiError> {
+    let mut faults = lock(&COMPILE_FAULT);
+    let at = faults.iter().position(|(armed, _)| armed == root)?;
+    if faults[at].1 > 0 {
+        faults[at].1 -= 1;
+        return None;
+    }
+    faults.remove(at);
+    Some(ApiError::new(
+        ErrorKind::Unavailable,
+        "test: the compile is refused",
+    ))
 }
 
 /// Test-only (#62): open directories whose next roll-forward stops before it links the named
@@ -16396,9 +16483,11 @@ mod tests {
     /// than one batch carries (254 records). After batch 1, between batch 2's compile and its
     /// send, a new upload's chunk is written there and published. Batch 2's guard that the root
     /// is absent fails, the drain rereads the root, finds it and stops: the walk succeeds, and
-    /// the new blob reads back whole, root and chunk. Cut: in `drain`, answer a rootless batch's
-    /// failed condition without rereading the root; the walk answers CONDITION_FAILED.
-    /// Integration (~3 s): one open, the publish from an `on_send` step.
+    /// the new blob reads back whole, root and chunk. The walk counts 0: the blob was never
+    /// empty (r6 B1). Cuts: in `drain`, answer a rootless batch's failed condition without
+    /// rereading the root, and the walk answers CONDITION_FAILED; or count a drain that deleted
+    /// a batch when a root ends it, and the walk counts 1. Integration (~3 s): one open, the
+    /// publish from an `on_send` step.
     #[test]
     fn r5_b3_a_root_committed_between_batches_of_a_rootless_drain_survives() {
         let dir = config_testkit::fs::temp_dir();
@@ -16434,7 +16523,8 @@ mod tests {
                     .expect("the publish writes the root");
             }),
         );
-        db.delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+        let emptied = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("delete prefix: {} after {}", e.error, e.deleted));
         let read = db
             .read_in(
@@ -16450,5 +16540,36 @@ mod tests {
             Seen::Range { bytes: seen, .. } => assert_eq!(seen, bytes, "the new blob's bytes"),
             other => panic!("a range read answered {other:?}"),
         }
+        assert_eq!(emptied, 0, "the walk emptied nothing: the blob survives");
+    }
+
+    /// PR #178 review r6 B1: a prefix delete drains an id with one chunk and no root. Its one
+    /// batch deletes the chunk, and the next compile, which would confirm nothing is left, is
+    /// refused UNAVAILABLE. The error counts the id: a reread finds it empty. Cut: answer a
+    /// drain's error as not emptied (`false` for `emptied` in `drain`), and `deleted` is 0.
+    /// Integration (~2 s): one open, the refusal from `on_compile_fault`.
+    #[test]
+    fn r6_b1_an_object_emptied_before_a_failed_compile_is_counted() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r6-b1/";
+        let id: &[u8] = b"r6-b1/chunk";
+        rootless_chunks(&db, id, [0x61; 16], 1);
+        on_compile_fault(rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes(), 1);
+        let refused = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .expect_err("the refused compile is the error");
+        assert_eq!(
+            refused.error.error.kind,
+            ErrorKind::Unavailable,
+            "{}",
+            refused.error
+        );
+        assert_eq!(refused.deleted, 1, "the emptied id counts: {refused}");
+        let (left, ..) = db
+            .list_page(GROUP, prefix, None, 10, true)
+            .expect("list the prefix");
+        assert!(left.is_empty(), "nothing is left: {left:?}");
     }
 }
