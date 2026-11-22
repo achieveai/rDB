@@ -2605,10 +2605,14 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let boot = BootId(22);
     let (first_tx, _first_out) = tokio::sync::mpsc::unbounded_channel();
-    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx);
+    let first = super::new_conn(&shared, Label::Node(NodeId(2)), first_tx)
+        .expect("recorded: no shutdown ran");
     super::install(&shared, NodeId(2), &first, boot);
     let (waiter, answer) = mpsc::channel();
     super::lock(&first.pending).insert(1, super::Waiter::Status(waiter));
@@ -2616,7 +2620,8 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
     // The second handshake, still live beside the first. On its own thread, so a lock that is
     // never let go fails the row at `PATIENCE` instead of hanging it.
     let (second_tx, _second_out) = tokio::sync::mpsc::unbounded_channel();
-    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx);
+    let second = super::new_conn(&shared, Label::Node(NodeId(2)), second_tx)
+        .expect("recorded: no shutdown ran");
     let (done, installed) = mpsc::channel();
     {
         let shared = Arc::clone(&shared);
@@ -2679,6 +2684,9 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let net = Arc::new(Net {
         shared: Arc::clone(&shared),
@@ -2686,7 +2694,8 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
         addr: None,
     });
     let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
-    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    let conn =
+        super::new_conn(&shared, Label::Node(NodeId(2)), tx).expect("recorded: no shutdown ran");
     super::install(&shared, NodeId(2), &conn, BootId(22));
 
     let (reply, answer) = mpsc::channel();
@@ -2906,9 +2915,13 @@ fn a_future_or_duplicate_clock_echo_is_not_a_round() {
         rt: rt.handle().clone(),
         span: tracing::Span::current(),
         on_boot: std::sync::Mutex::new(None),
+        link_tasks: std::sync::Mutex::new(Some(Vec::new())),
+        stop: tokio::sync::watch::channel(false).0,
+        between_conn_and_route: std::sync::Mutex::new(None),
     });
     let (tx, _out) = tokio::sync::mpsc::unbounded_channel();
-    let conn = super::new_conn(&shared, Label::Node(NodeId(2)), tx);
+    let conn =
+        super::new_conn(&shared, Label::Node(NodeId(2)), tx).expect("recorded: no shutdown ran");
     let long_ago = std::time::Instant::now()
         .checked_sub(Duration::from_secs(3))
         .expect("an instant 3 s back");
@@ -3099,4 +3112,230 @@ async fn an_accepted_socket_has_nodelay_set() {
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
     );
+}
+
+/// `Net::shutdown` rows (#81, PR #171 review): node 1's `Net` with no sockets and a route to
+/// node 2, on a current-thread runtime.
+fn shutdown_rig() -> (tokio::runtime::Runtime, Arc<Net>) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let net = Net::unsocketed(NodeId(1), BootId(11), &[NodeId(2)], rt.handle().clone());
+    (rt, net)
+}
+
+/// Node 2's link on `net` is gone: no route up, no connection left, and the link's stream
+/// `out` has ended.
+fn no_link_to_2(net: &Net, out: &mut tokio::sync::mpsc::UnboundedReceiver<super::Envelope>) {
+    assert!(
+        !matches!(net.states()[&NodeId(2)], LinkState::Up(_)),
+        "node 2's route is not up: {:?}",
+        net.states()
+    );
+    assert_eq!(net.connection(NodeId(2)), None);
+    assert_eq!(net.conn_count(), 0, "no connection is left");
+    assert!(
+        matches!(
+            out.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the link's stream has ended"
+    );
+}
+
+/// PR #171 review (registration racing `Net::shutdown`): a link to node 2 registers on its own
+/// thread and is held after its connection is recorded and before its route is published;
+/// `Net::shutdown` runs; then the registration goes on. It is refused: node 2's route is not
+/// `Up`, no connection is left, and the link's stream has ended, so no call waits on it.
+/// Unit (no sockets).
+/// Cut: no stop-flag check in `new_conn` or `install`; the route is `Up` after the shutdown,
+/// red.
+#[config_log::retcd_test]
+fn a_registration_racing_shutdown_leaves_no_link_up() {
+    let (_rt, net) = shutdown_rig();
+    let (arrived_tx, arrived) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel::<()>();
+    net.hold_next_registration(move || {
+        let _ = arrived_tx.send(());
+        release
+            .recv_timeout(PATIENCE)
+            .expect("the row releases the registration");
+    });
+    let registering = {
+        let net = Arc::clone(&net);
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _entered = span.enter();
+            net.link_up_unsocketed(NodeId(2), BootId(22))
+        })
+    };
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the registration is held");
+    assert_eq!(net.conn_count(), 1, "its connection is recorded");
+    net.shutdown();
+    release_tx.send(()).expect("the registration waits");
+    let (id, mut out) = registering.join().expect("the registration thread");
+    assert_eq!(id, 0, "the registration is refused");
+    no_link_to_2(&net, &mut out);
+}
+
+/// PR #171 review: a link task that panics after its link came up never reaches its own
+/// `close`. `Net::shutdown` still ends the link: it closes every recorded connection, whatever
+/// became of the task that recorded it. The task is a plain spawned task that registers as the
+/// link task does ([`Net::link_up_unsocketed`]) and then panics. Unit (no sockets).
+/// Cut: `shutdown` closes no connection (it only aborts tasks); node 2's route stays `Up`, red.
+#[config_log::retcd_test]
+fn a_link_whose_task_panicked_is_still_closed_by_shutdown() {
+    let (rt, net) = shutdown_rig();
+    let (handed, out) = mpsc::channel();
+    let task = {
+        let net = Arc::clone(&net);
+        rt.spawn(async move {
+            let (_, out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+            handed.send(out).expect("the row holds the stream");
+            panic!("the link task panics after its link came up");
+        })
+    };
+    let joined = rt.block_on(task);
+    assert!(
+        joined.as_ref().is_err_and(|error| error.is_panic()),
+        "{joined:?}"
+    );
+    let mut out = out.recv_timeout(PATIENCE).expect("the link's stream");
+    assert!(
+        matches!(net.states()[&NodeId(2)], LinkState::Up(BootId(22))),
+        "the panicked task's link is still up before the shutdown"
+    );
+    net.shutdown();
+    no_link_to_2(&net, &mut out);
+}
+
+/// How many `net_shutdown` lines the current row logged.
+fn shutdowns_logged(test: &str) -> usize {
+    config_testkit::logs::lines_for_current_test(module_path!(), test)
+        .iter()
+        .filter(|line| line["@m"].as_str() == Some("net_shutdown"))
+        .count()
+}
+
+/// PR #171 review (lifecycle): `Net::shutdown` twice. The second does nothing: one
+/// `net_shutdown` line, and the link stays down. Unit (no sockets).
+/// Cut: no once-only guard in `shutdown`; two lines, red.
+#[config_log::retcd_test]
+fn net_shutdown_twice_is_one_shutdown() {
+    const TEST: &str = "net_shutdown_twice_is_one_shutdown";
+    let (_rt, net) = shutdown_rig();
+    let (_, mut out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+    net.shutdown();
+    net.shutdown();
+    assert_eq!(shutdowns_logged(TEST), 1);
+    no_link_to_2(&net, &mut out);
+}
+
+/// PR #171 review (lifecycle): `Net::shutdown`, then the last `Arc<Net>` dropped. `Drop` runs
+/// the shutdown again and it does nothing: one `net_shutdown` line, no panic. Unit.
+/// Cut: no once-only guard in `shutdown`; two lines, red.
+#[config_log::retcd_test]
+fn net_shutdown_then_drop_is_one_shutdown() {
+    const TEST: &str = "net_shutdown_then_drop_is_one_shutdown";
+    let (_rt, net) = shutdown_rig();
+    let (_, mut out) = net.link_up_unsocketed(NodeId(2), BootId(22));
+    net.shutdown();
+    let weak = Arc::downgrade(&net);
+    drop(net);
+    assert!(weak.upgrade().is_none(), "the row held the last Arc<Net>");
+    assert_eq!(shutdowns_logged(TEST), 1);
+    assert!(matches!(
+        out.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+/// PR #171 review (lifecycle): a `Net` started with no listener (it only dials, as `rdb_node
+/// --form` does) shuts down: its own tasks, the dial to node 1 and the release loop, both end,
+/// one `net_shutdown` line names no link ended, and nothing panics. The dial never stops by
+/// itself (nothing listens at its address, so it backs off and dials again), so only the
+/// shutdown's abort ends it. Integration (~10 ms: no handshake is made).
+/// Cut: `shutdown` neither drains nor aborts its tasks; red at "every task of the `Net` ends".
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn net_shutdown_with_no_server() {
+    const TEST: &str = "net_shutdown_with_no_server";
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let side = side(
+        Spec::node(2, dir.path(), &[1]).dialling(1, "127.0.0.1:9".parse().expect("an address")),
+        false,
+    )
+    .await;
+    let tasks = side.net.own_tasks();
+    assert_eq!(tasks.len(), 2, "the dial and the release loop, no serve");
+    side.net.shutdown();
+    let deadline = std::time::Instant::now() + crate::host::test_patience(PATIENCE);
+    while !tasks.iter().all(tokio::task::AbortHandle::is_finished) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every task of the `Net` ends: {} of {} still running",
+            tasks.iter().filter(|task| !task.is_finished()).count(),
+            tasks.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let lines: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), TEST)
+            .into_iter()
+            .filter(|line| line["@m"].as_str() == Some("net_shutdown"))
+            .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["ended"], 0, "{lines:?}");
+    assert!(
+        !matches!(side.net.states()[&NodeId(1)], LinkState::Up(_)),
+        "no link to node 1"
+    );
+}
+
+/// PR #171 review (lifecycle): a `Net` serving on a runtime, with a link up to a peer, dropped
+/// on a thread outside any runtime. `Drop` runs the shutdown there without panicking: it only
+/// signals and aborts, which needs no runtime context. One `net_shutdown` line, and the peer
+/// loses its route. Integration (~150 ms: real TLS on loopback).
+/// Cut: `Drop` awaits the serve task's end with `Handle::current().block_on`; it panics with no
+/// runtime, red at "dropped without a panic".
+#[config_log::retcd_test]
+fn net_drop_outside_a_runtime() {
+    const TEST: &str = "net_drop_outside_a_runtime";
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+    let one = rt.block_on(side(Spec::node(1, dir.path(), &[2]), true));
+    let addr = one.net.addr().expect("node 1 listens");
+    let two = rt.block_on(side(
+        Spec::node(2, dir.path(), &[1]).dialling(1, addr),
+        false,
+    ));
+    rt.block_on(two.net.wait_up(&[NodeId(1)], PATIENCE))
+        .expect("node 2 reaches node 1");
+    let span = tracing::Span::current();
+    let dropped = std::thread::spawn(move || {
+        let _entered = span.enter();
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this thread is outside any runtime"
+        );
+        drop(one);
+    })
+    .join();
+    assert!(dropped.is_ok(), "dropped without a panic");
+    assert_eq!(shutdowns_logged(TEST), 1);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while two.net.connection(NodeId(1)).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 2 still holds a link to node 1"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

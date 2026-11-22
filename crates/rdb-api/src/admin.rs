@@ -3436,6 +3436,21 @@ async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>
         .collect()
 }
 
+/// Delete `grants/{node}` only while it is still at `revision` (#81 X2: the planner's clear
+/// of a stale frozen grant, judged by `clear_frozen_verdict`). `Cleared` at the delete's
+/// revision, or `Conflict` when the record moved or went first.
+///
+/// # Errors
+///
+/// The store's failure, as [`clear_grant`]'s delete reports it.
+pub(crate) async fn delete_grant_at(
+    store: &dyn ConfigStore,
+    node: NodeId,
+    revision: u64,
+) -> Result<Clearance, ApiError> {
+    delete(store, &ControlKey::Grant(node).encode(), revision).await
+}
+
 /// Delete `key` only while it is still at `revision`.
 async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Clearance, ApiError> {
     let answer = store

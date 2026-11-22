@@ -51,8 +51,8 @@ mod test_store;
 
 pub use db::{
     app_request_id, ApiError, Db, DbConfig, GetOk, NodeAddresses, NotReady, OpenError,
-    PartitionReady, PutError, PutOk, ReadOk, StorageOptions, Timeouts, TxnPut, MAX_KEY,
-    MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, TENANT,
+    PartitionReady, PutError, PutOk, ReadOk, RestartReason, StorageOptions, Timeouts, TxnPut,
+    MAX_KEY, MAX_OBJECT_ID, MAX_OPS, MAX_PAGE, MAX_TXN_DEADLINE, TENANT,
 };
 pub use host::{Change, ListEdit, Look, Seen};
 pub use ownership::{
