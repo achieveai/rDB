@@ -354,11 +354,18 @@ fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
 const REAP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The child's exit status, or `None` if it is still running at `until`.
+///
+/// The loop has a bound of its own besides the `until` check: a count of polls worth twice
+/// the time to `until`, plus [`POLL_SLACK`]. The `until` check always ends it first; the
+/// count exists so that losing that check fails the row in bounded time instead of hanging
+/// it (#155 review, iteration 5).
 fn poll_exit(
     process: &mut std::process::Child,
     until: std::time::Instant,
 ) -> Option<std::process::ExitStatus> {
-    loop {
+    let window = until.saturating_duration_since(std::time::Instant::now());
+    let max_polls = 2 * (window.as_millis() / POLL_EVERY.as_millis()) + POLL_SLACK;
+    for _ in 0..max_polls {
         if let Some(status) = process.try_wait().expect("try_wait on the child") {
             return Some(status);
         }
@@ -366,10 +373,19 @@ fn poll_exit(
             return None;
         }
         // A bounded poll on a child process, not synchronization: the loop ends on the
-        // child's exit or on `until`, never on the sleep itself.
-        std::thread::sleep(std::time::Duration::from_millis(20)); // testkit:allow-sleep
+        // child's exit, on `until`, or on its poll count, never on the sleep itself.
+        std::thread::sleep(POLL_EVERY); // testkit:allow-sleep
     }
+    panic!(
+        "poll_exit made {max_polls} polls for a {window:?} window and never reached its deadline"
+    )
 }
+
+/// How often [`poll_exit`] asks whether the child has exited.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Polls [`poll_exit`] allows beyond twice its window, so a short window still gets several.
+const POLL_SLACK: u128 = 50;
 
 /// A child process that is killed and reaped when dropped, if it is still running: the
 /// cleanup for a row that failed while its child was alive.
