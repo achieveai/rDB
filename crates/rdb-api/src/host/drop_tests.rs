@@ -9134,6 +9134,70 @@ fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
     assert!(applied > Some(installed), "node 3 is past S {installed}: {applied:?}");
 }
 
+/// Issue #61 PR #204 review, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
+/// rebuilt from a snapshot, its ACK stalled at the root below the cutoff. Node 1 holds the pull
+/// for page 1 and is given a move onto node 3 (catch-up deadline 1 s). A duty at `t` starts the
+/// move clock; one more page served, a duty at `t + 2 s` finds the transfer served more and
+/// starts the clock again, and the move stands. With no page after that, a duty at `t + 4 s`
+/// gives the move up (`move_catch_up_given_up`): the stall is still judged.
+/// Cut: `shadow_duty` passes `pulled = 0` (the transfer not read), red (the move is given up at
+/// `t + 2 s`).
+/// Integration (~4 s): S2-R1's setup; the duties are direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
+    const METHOD: &str = "t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock";
+    use super::snapshot::SnapshotPull;
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+            host.move_catch_up_millis = 1_000;
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    assert_eq!(role_of_three(&trio), Some(ReplicaRole::Shadow), "node 3 is the shadow");
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let pull = SnapshotPull {
+        partition: p,
+        generation: install.offer.lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    let t = trio.clock.now();
+    let owner = &mut trio.nodes[0].0;
+    owner.moves.insert(
+        p,
+        CopyMove {
+            from: NodeId(2),
+            to: NodeId(3),
+            abandoned: None,
+            filled: false,
+            lagged: false,
+        },
+    );
+    owner.shadow_duty(p, t);
+    let first = owner.move_catching_up.get(&p).copied().expect("the clock started");
+    assert_eq!((first.since, first.acked), (t, 0), "{first:?}");
+    owner.snapshot_pages_held_from = Some(2);
+    owner.snapshot_pull(pull);
+    owner.shadow_duty(p, t.plus_millis(2_000));
+    let reset = owner.move_catching_up.get(&p).copied().expect("the clock runs");
+    assert_eq!(reset.since, t.plus_millis(2_000), "{reset:?}");
+    assert!(reset.pulled > first.pulled, "{first:?} then {reset:?}");
+    assert!(owner.moves[&p].abandoned.is_none(), "the move stands");
+    assert!(logged!(METHOD, "move_catch_up_given_up").is_empty());
+    owner.shadow_duty(p, t.plus_millis(4_000));
+    assert!(owner.moves[&p].abandoned.is_some(), "no page: the move is given up");
+    assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
+}
+
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
 #[cfg(debug_assertions)]
 fn promoted_and_durable(trio: &mut Trio, request: u64) {
