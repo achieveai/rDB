@@ -301,7 +301,9 @@ every rig open passes the address check it would meet in use.
   `own83_b2_16_a_no_address_fence_met_by_a_rival_refuses_until_it_fences`,
   `own83_b2_17_a_no_address_fence_whose_outcome_is_unknown_refuses_until_it_fences`,
   `own83_b2_18_a_no_address_fence_applied_and_unanswered_refuses_until_it_fences`,
-  `own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can`;
+  `own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can`,
+  `own83_b2_20_a_rooted_owner_wiped_before_any_write_fences_through_a_conflict`,
+  `own83_b2_21_a_rooted_owner_wiped_before_any_write_fences_through_an_unknown_outcome`;
   `crates/rdb-api/src/db/partition_tests.rs`:
   `own83_25_a_changed_app_address_is_seen_within_the_gap` to
   `own83_30_no_log_line_holds_an_app_address`,

@@ -5122,6 +5122,174 @@ fn own83_b2_19_a_new_folder_fence_that_cannot_be_written_refuses_until_it_can() 
     assert!(!blocker.exists(), "fenced: the fence file is removed");
 }
 
+/// Open `node`'s process alone on `dir` with `app`, through `open_spawning` with its spawn
+/// counted, as [`Fence::open_on`] does: refused, no host started; opened, at least one did, and
+/// it is shut down again at once.
+fn open_counted(rig: &Rig, node: NodeId, dir: &Path, app: Option<&str>) -> Result<(), OpenError> {
+    let rt = &rig.rt;
+    let listener = rig.listen(rt, node);
+    let _entered = rt.enter();
+    let (config, net) = node_config(
+        &rig.cert_dir,
+        node,
+        dir,
+        listener,
+        &rig.addrs,
+        Timeouts::default(),
+        app,
+    );
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&starts);
+    let spawn = move |node, engine, links, control, clock, boot, partitions, nodes| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        host::spawn_on(
+            node,
+            engine,
+            links,
+            control,
+            clock,
+            fast(),
+            Limits::default(),
+            host::UNREACHABLE_DROP_AFTER_MILLIS,
+            false,
+            boot,
+            partitions,
+            nodes,
+        )
+    };
+    let opened = rt.block_on(Db::open_spawning(
+        config,
+        Arc::clone(&rig.store),
+        rt.handle().clone(),
+        fast(),
+        spawn,
+    ));
+    let starts = starts.load(Ordering::SeqCst);
+    match opened {
+        Ok(mut db) => {
+            assert!(
+                starts > 0,
+                "the control: an open that succeeds starts its host"
+            );
+            db.shutdown();
+            drop((db, net));
+            Ok(())
+        }
+        Err(refused) => {
+            assert_eq!(starts, 0, "refused before any host starts: {refused}");
+            Err(refused)
+        }
+    }
+}
+
+/// The no-address fence on #137's state (PR #159 review r5, T28): node 1 owns partition 1,
+/// whose root committed and was never activated, and node 1's whole folder is then lost; the
+/// emptied folder keeps an empty `nodes/`. An app-address write an earlier folder sent at the
+/// record's revision `r` may still apply (kept back, delivered last). Twice node 1's open with
+/// no app address meets `meets` at its fence write: refused `OpenError::Control` before any host
+/// starts, with `app-addr-fence` kept. The first leaves `CURRENT` (and whatever the roll forward
+/// wrote) behind, so the second meets an existing `CURRENT` and still fences. Then a
+/// no-address open fences and opens despite `CURRENT`: the fence file is gone and every delayed
+/// write is refused. All three processes then restart and are ready, and nothing more is
+/// written to node 1's record.
+fn rooted_owner_fence_refuses_until_it_fences(meets: FenceMeets) {
+    const B: &str = "gw-1.b:9443";
+    const C: &str = "gw-1.c:7443";
+    let store = AddrPuts::new();
+    let (mut rig, rooted) =
+        wiped_before_any_write(Arc::clone(&store) as Arc<dyn ConfigStore>, 1, NodeId(1));
+    assert!(
+        matches!(rooted.as_slice(), [(PARTITION, NodeId(1), _)]),
+        "partition 1 is rooted, owned by node 1: {rooted:?}"
+    );
+    let dir = rig.procs[0].dir.clone();
+    std::fs::create_dir(dir.join("nodes")).expect("an empty nodes/");
+    let owed = dir.join(APP_ADDR_FENCE_FILE);
+    let current = dir.join("nodes").join("1").join("CURRENT");
+    let bytes_with = |app: &str| {
+        let (body, _) = node_record(&rig, NodeId(1));
+        NodeRecord::decode(&body)
+            .expect("node 1's record decodes")
+            .encode_with_app(app)
+    };
+    let (body, r) = node_record(&rig, NodeId(1));
+    store.keep(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Node(NodeId(1)).encode()),
+        value: bytes_with(B),
+        expected_mod_revision: Some(r),
+        dedup: None,
+    });
+    let mut held = (body, r);
+    for attempt in 1..=2 {
+        let (step, why) = match meets {
+            FenceMeets::Rival => (
+                NodePut::Rival(bytes_with(C)),
+                "changed after this open read it",
+            ),
+            FenceMeets::Late => (NodePut::Late, "the fence's outcome is unknown"),
+            FenceMeets::AppliedLost => (NodePut::AppliedLost, "the fence's outcome is unknown"),
+        };
+        store.next(step);
+        let refused =
+            open_counted(&rig, NodeId(1), &dir, None).expect_err("the fence did not settle");
+        let text = refused.to_string();
+        assert!(
+            matches!(refused, OpenError::Control(_))
+                && text.contains(why)
+                && text.contains("nothing was started"),
+            "{attempt}: {text}"
+        );
+        assert!(owed.exists(), "{attempt}: the fence is still owed");
+        assert!(current.exists(), "{attempt}: CURRENT is left behind");
+        let now = node_record(&rig, NodeId(1));
+        match meets {
+            FenceMeets::Late => assert_eq!(now, held, "{attempt}: not applied"),
+            FenceMeets::Rival | FenceMeets::AppliedLost => {
+                assert!(now.1 > held.1, "{attempt}: the record moved")
+            }
+        }
+        held = now;
+    }
+    open_counted(&rig, NodeId(1), &dir, None).expect("a no-address open fences despite CURRENT");
+    assert!(!owed.exists(), "fenced: the debt is cleared");
+    let (body, fenced) = node_record(&rig, NodeId(1));
+    assert_eq!(body, held.0, "the fence wrote the record's own bytes");
+    assert!(fenced > held.1, "the fence moved the revision on");
+    let delayed = match meets {
+        FenceMeets::Late => 3,
+        FenceMeets::Rival | FenceMeets::AppliedLost => 1,
+    };
+    assert_eq!(
+        store.deliver(&rig.rt),
+        vec![config_core::MutationOutcome::Conflict; delayed],
+        "every delayed write is refused"
+    );
+    rig.restart_all();
+    rig.wait_ready();
+    assert_eq!(
+        node_record(&rig, NodeId(1)),
+        (body, fenced),
+        "nothing delayed applied, and the restart wrote nothing"
+    );
+}
+
+/// own83_b2_20 (#83 B2, PR #159 review r5, T28): [`rooted_owner_fence_refuses_until_it_fences`],
+/// the fence meeting a rival write (`Conflict`). Cuts: the fence's `Conflict` accepted, red at
+/// "the fence did not settle"; the fence file not consulted once `CURRENT` exists, red at "the
+/// fence did not settle" on the second open (it goes on unfenced). Integration (~6 s).
+#[config_log::retcd_test]
+fn own83_b2_20_a_rooted_owner_wiped_before_any_write_fences_through_a_conflict() {
+    rooted_owner_fence_refuses_until_it_fences(FenceMeets::Rival);
+}
+
+/// own83_b2_21 (#83 B2, PR #159 review r5, T28): [`rooted_owner_fence_refuses_until_it_fences`],
+/// the fence's reply lost before it applied (an unknown outcome). Cut: an unknown outcome
+/// accepted as fenced, red at "the fence did not settle". Integration (~6 s).
+#[config_log::retcd_test]
+fn own83_b2_21_a_rooted_owner_wiped_before_any_write_fences_through_an_unknown_outcome() {
+    rooted_owner_fence_refuses_until_it_fences(FenceMeets::Late);
+}
+
 /// The rEtcd cluster the #80 S2 control-TLS rows run against.
 const S2_CLUSTER: config_core::ClusterId = config_core::ClusterId::from_bytes([0x80; 16]);
 
