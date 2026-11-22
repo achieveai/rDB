@@ -12,6 +12,7 @@
 #   scripts/docker-multihost.sh kill N | restart N | restart-voter V | pause N   [--name rdbmh]
 #   scripts/docker-multihost.sh d1       [--name rdbd1] [--subnet 10.180.81.0/24] [--image ..]
 #                                        [--no-build] [--restart-on-exit] [--live-readd] [--basis SHA]
+#   scripts/docker-multihost.sh add | rebalance | remove N | check-members   [--name rdbmh]
 #
 # `up` builds the image (unless --no-build), checks that nothing it would create exists yet
 # (the network <name>-net, the volumes <name>-init, <name>-vN and <name>-dN, any container
@@ -106,6 +107,28 @@
 # to 40 hex digits) names the source of an image built elsewhere. d1 refuses, before it creates
 # anything, an image with neither, and a --basis that disagrees with the label.
 #
+# #80 S4 (ADR-rdb-0025). The rig's node ids live in /init/nodes.txt, one `N STATE` line per id
+# ever given (live, removed, foreign, unserved); every session's --nodes and a new node's
+# --peers name the live ones. `up` writes it, then ends with one `rebalance` (Q6 a).
+#   add          add-node the next id at the next IP (.10+N, machine label the IP), sign its
+#                certificate (--issue-node), start <name>-dN like up's nodes, ready in 120 s.
+#                Later sessions name it in --nodes (S-6). Records A3's baseline.
+#   rebalance    one `admin rebalance`; prints its lines; fails unless the session exits 0.
+#   remove N     a running node: `admin drain N`, then `admin remove-node N`, then N must exit 0
+#                after `rdb_node removed node=N`. A node whose container is not running:
+#                `admin remove-node N --unreachable-ok N`, again every 5 s for up to 90 s while
+#                it is still pinned. Other live nodes not running are named --unreachable-ok.
+#   check-members  D2's A1-A11, once per rig (A8-A10 change it): A1 the added node ready; A2
+#                its record at its own IP and machine; A3 no older node restarted since the add;
+#                A4 copy_skew <= 1; A5 3 copies on 3 machines everywhere; A6 a put and its get
+#                in every partition; A7 the removed node pinned nowhere, holding no copy, exited
+#                0 with `removed`; A8 started again it exits 2, "ids are never reused"; A11 d3,
+#                whose --peers names it, restarts and logs start_peer_removed_skipped; A10 kill
+#                the owner most often sharing a partition with the new node; where the new node
+#                is chosen owner, a fresh session writes and reads back; A9 a node from the
+#                other CA is never linked, an add at d3's IP is refused, ids run out at 8.
+#   check, failover and pause count nodes 1..N, so they refuse a rig after add or remove.
+#
 # Runs outside the gate (#80 owner ruling 3): it needs Docker and a release image build.
 # --subnet must be a /24 that overlaps no Docker network and no host route; `up` checks.
 set -euo pipefail
@@ -118,7 +141,7 @@ WITH_VOTER_LEADER=0 REJOIN_S=120 NO_DOCKER=0 TARGET="" RESTART_ON_EXIT=0 LIVE_RE
 [ "$CMD" = selftest ] && NAME=rdbst
 [ "$CMD" = d1 ] && NAME=rdbd1 SUBNET=10.180.81.0/24
 case "$CMD" in
-    failover|kill|restart|restart-voter|pause)
+    failover|kill|restart|restart-voter|pause|remove)
         case "${1:-}" in
             ''|*[!0-9]*|0*) echo "docker-multihost: $CMD takes a node number from 1, not '${1:-}'" >&2; exit 2 ;;
         esac
@@ -170,6 +193,11 @@ HELPER="$NAME-x"
 IP_CMD="${MULTIHOST_IP_CMD:-ip}"
 # The command d1 runs its up and its steps with: this script, or a stub in the selftest.
 D1_SELF="${MULTIHOST_D1_SELF:-$0}"
+# The rig's node ids as /init/nodes.txt keeps them (#80 S4): one `N STATE` line per id ever
+# given, STATE one of live, removed, foreign (a record whose node presents another CA's
+# certificate) or unserved (a record no container serves). Only live ids go in --peers and
+# --nodes. Empty until load or up fills it, and then 1..NODES are live.
+NODES_TXT=""
 
 say() { echo "multihost: $*"; }
 die() { echo "multihost: FAILED at $*" >&2; exit 1; }
@@ -180,12 +208,38 @@ load() {
     docker network inspect "$NET" >/dev/null 2>&1 || die "load: no network $NET; run up first"
     NODES="$(setting nodes)"; VOTERS="$(setting voters)"; PARTITIONS="$(setting partitions)"
     SUBNET="$(setting subnet)"; IMAGE="$(setting image)"; CLUSTER="$(setting cluster)"
+    NODES_TXT="$(init_read nodes.txt)" \
+        || die "load: $NAME-init has no nodes.txt; up wrote it from #80 S4 on, so this rig is older: make a new one"
+}
+# /init's files, read and written through a throwaway container on the init volume.
+init_read() { docker run --rm --label "$LABEL" -v "$NAME-init:/i:ro" --entrypoint cat "$IMAGE" "/i/$1" 2>/dev/null; }
+init_write() { # path under /init; the content on stdin
+    # shellcheck disable=SC2016 # the container's own $1
+    docker run --rm -i --label "$LABEL" -v "$NAME-init:/i" --entrypoint sh "$IMAGE" \
+        -c 'mkdir -p "$(dirname "/i/$1")" && cat > "/i/$1"' sh "$1" || die "init: could not write /init/$1"
+}
+live_ids() { if [ -n "$NODES_TXT" ]; then awk '$2 == "live" { print $1 }' <<< "$NODES_TXT"; else seq 1 "$NODES"; fi; }
+node_state() { awk -v n="$1" '$1 == n { print $2 }' <<< "$NODES_TXT"; }
+ever_max() { { live_ids; awk '{ print $1 }' <<< "$NODES_TXT"; } | sort -n | tail -n 1; }
+set_state() { # node, state: in NODES_TXT and in /init/nodes.txt
+    NODES_TXT="$( { awk -v n="$1" 'NF && $1 != n' <<< "$NODES_TXT"; echo "$1 $2"; } | sort -n)"
+    init_write nodes.txt <<< "$NODES_TXT"
+}
+# check, failover and pause count nodes 1..NODES, so they run only while those are the live set.
+formed_only() {
+    [ "$(live_ids | tr '\n' ' ')" = "$(seq 1 "$NODES" | tr '\n' ' ')" ] \
+        || die "$CMD: the live nodes are now $(live_ids | tr '\n' ' ')after add or remove, and $CMD counts nodes 1..$NODES; check-members judges a changed rig"
 }
 prefix() { echo "${SUBNET%.*/24}"; }
 voter_ip() { echo "$(prefix).$((1 + $1))"; }
 node_ip() { echo "$(prefix).$((10 + $1))"; }
 control() { local n s=""; for n in $(seq 1 "$VOTERS"); do s="$s${s:+,}$(voter_ip "$n"):7002"; done; echo "$s"; }
-peers() { local n s=""; for n in $(seq 1 "$NODES"); do s="$s${s:+,}$n=$(node_ip "$n"):7101"; done; echo "$s"; }
+peers() { peers_with ""; }
+peers_with() { # an id to name besides the live ones, or nothing
+    local n s=""
+    for n in $( { live_ids; [ -z "$1" ] || echo "$1"; } | sort -nu); do s="$s${s:+,}$n=$(node_ip "$n"):7101"; done
+    echo "$s"
+}
 voters_arg() { local n s=""; for n in $(seq 1 "$VOTERS"); do s="$s${s:+,}$n=$(voter_ip "$n")"; done; echo "$s"; }
 run_rm() { docker run --rm --label "$LABEL" --network "$NET" -v "$NAME-init:/init:ro" "$IMAGE" "$@"; }
 
@@ -361,19 +415,31 @@ up() {
         --partitions "$PARTITIONS" --nodes "$NODES" --peers "$(peers)" --log-dir /tmp/logs \
         || die "declare"
 
-    for n in $(seq 1 "$NODES"); do
-        own_volume "$NAME-d$n"
-        docker run -d --name "$NAME-d$n" --label "$LABEL" --network "$NET" --ip "$(node_ip "$n")" \
-            "${restart[@]}" -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
-            --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers)" --control "$(control)" \
-            --control-tls /init/certs/control --cert-dir /init/certs --admin-apps admin \
-            --failover "${readd[@]}" --log-dir /data/logs >/dev/null || die "node $n start"
-        say "node $n at $(node_ip "$n")"
-    done
+    NODE_RESTART=("${restart[@]}") NODE_READD=("${readd[@]}")
+    for n in $(seq 1 "$NODES"); do run_data_node "$n"; done
     for n in $(seq 1 "$NODES"); do
         wait_for "node $n ready" 120 sh -c "docker logs $NAME-d$n 2>&1 | grep -q 'rdb_node ready node=$n'"
     done
+    NODES_TXT="$(for n in $(seq 1 "$NODES"); do echo "$n live"; done)"
+    init_write nodes.txt <<< "$NODES_TXT"
     say "up: $VOTERS voters, $NODES nodes, $PARTITIONS partitions, node restart policy $policy, live readd $readd_label"
+    # Q6 (a): the formed ring is kept, and one rebalance evens it out.
+    rebalance_run || die "up: the closing rebalance (Q6 a)"
+}
+
+# Data node N's container, as up starts it: its own volume, --peers naming the live nodes and
+# N, --failover, and up's restart policy and --live-readd (NODE_RESTART, NODE_READD). The
+# certificate folder is /init/certs unless named (A9 starts one from another CA).
+NODE_RESTART=() NODE_READD=()
+run_data_node() { # node [cert dir]
+    local n="$1" certs="${2:-/init/certs}"
+    own_volume "$NAME-d$n"
+    docker run -d --name "$NAME-d$n" --label "$LABEL" --network "$NET" --ip "$(node_ip "$n")" \
+        "${NODE_RESTART[@]}" -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
+        --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers_with "$n")" --control "$(control)" \
+        --control-tls /init/certs/control --cert-dir "$certs" --admin-apps admin \
+        --failover "${NODE_READD[@]}" --log-dir /data/logs >/dev/null || die "node $n start"
+    say "node $n at $(node_ip "$n")"
 }
 
 # The throwaway voter <name>-x. start_helper creates it only when no container has that name
@@ -443,11 +509,11 @@ verdict() { # name, then 0 or not
 }
 
 # One rdb_dev app session over the nodes' links: lines on stdin, as app admin.
-dev() { # extra rdb_dev flags...; DEV_WITHIN=S ends the session after S seconds (exit 124)
+dev() { # extra rdb_dev flags...; DEV_WITHIN=S ends the session after S seconds (exit 124); DEV_NODES=L names other --nodes
     local limit=()
     [ -z "${DEV_WITHIN:-}" ] || limit=(timeout -k 5 "$DEV_WITHIN")
     "${limit[@]}" docker run --rm -i --label "$LABEL" --network "$NET" -v "$NAME-init:/init:ro" "$IMAGE" dev \
-        --dir /tmp/dev --log-dir /tmp/dev-logs --control "$(control)" --nodes "$(peers)" \
+        --dir /tmp/dev --log-dir /tmp/dev-logs --control "$(control)" --nodes "${DEV_NODES:-$(peers)}" \
         --cert-dir /init/certs --app admin --control-tls /init/certs/control "$@"
 }
 
@@ -469,6 +535,7 @@ check_scratch() {
 
 check() {
     load
+    formed_only
     # Every claim is read from its own exit code; one failing claim must not end the check.
     set +e
     local n out rc tmp
@@ -841,6 +908,62 @@ def j3(partitions, pre_path, run_path, reads_path, after_path):
             if after.get(p, {}).get("ok", 0) == 0]
     verdict(not bad, "J3 the K5 values still read back, and a 5 s probe writes every partition", bad)
 
+PLACE_NODE = re.compile(r"placement node=(\d+) machine=(\S+) state=(\S+) copies=(\d+) primaries=(\d+)$")
+PLACE_SKEW = re.compile(r"placement: copy_skew=(\d+) primary_skew=(\d+)$")
+
+def placement(path):
+    """({node: (machine, copies)}, (copy_skew, primary_skew)) from `admin placement`."""
+    nodes, skew = {}, None
+    for line in lines(path):
+        if line.startswith("placement node="):
+            m = PLACE_NODE.match(line)
+            if not m:
+                die(f"cannot read a placement line: {line}")
+            nodes[int(m.group(1))] = (m.group(2), int(m.group(4)))
+        elif line.startswith("placement: copy_skew="):
+            m = PLACE_SKEW.match(line)
+            if not m:
+                die(f"cannot read a placement line: {line}")
+            skew = (int(m.group(1)), int(m.group(2)))
+    if skew is None:
+        die(f"no 'placement: copy_skew=' line in {path}")
+    return nodes, skew
+
+def ids(text):
+    return [] if text == "-" else [int(x) for x in text.split(",") if x]
+
+def members(status_path, placement_path, partitions, removed, added):
+    """A2 (machine), A4, A5 and A7 (no pin, no copy) over one status and one placement."""
+    nodes, (copy_skew, primary_skew) = placement(placement_path)
+    parts = status(status_path)
+    for spec in added:
+        n, _, ip = spec.partition("=")
+        got = nodes.get(int(n), ("<no line>", 0))[0]
+        verdict(got == ip, f"A2 nodes/{n} is on its own machine {ip} in the placement",
+                [f"placement says machine={got}"])
+    verdict(copy_skew <= 1, f"A4 copy_skew={copy_skew} <= 1 (primary_skew={primary_skew})")
+    bad = []
+    for p in range(1, partitions + 1):
+        if p not in parts:
+            bad.append(f"partition {p}: no status line")
+            continue
+        copies = [node for node, role in parts[p][2] if role in ("owner", "regular")]
+        on = {nodes.get(node, (f"<node {node} not placed>", 0))[0] for node in copies}
+        if len(copies) != 3 or len(on) != 3:
+            bad.append(f"partition {p}: copies {copies} on {sorted(on)}")
+    verdict(not bad, f"A5 each of {partitions} partitions has 3 copies on 3 machines", bad)
+    for n in removed:
+        pinned = [p for p, (owner, _, listed) in sorted(parts.items())
+                  if owner == n or any(node == n for node, _ in listed)]
+        verdict(not pinned, f"A7 no partition's status names removed node {n}", [f"named by {pinned}"])
+        held = nodes.get(n, (None, 0))[1]
+        verdict(held == 0, f"A7 the placement gives removed node {n} no copy (copies={held})")
+
+def owners_of(n, path):
+    return sorted(p for p, (owner, _, _) in status(path).items() if owner == n)
+
+if len(sys.argv) < 2:
+    die("no mode")
 mode, args = sys.argv[1], sys.argv[2:]
 if mode == "failover":
     n, partitions, t0, put_ms = (int(a) for a in args[:4])
@@ -933,6 +1056,38 @@ elif mode == "leader":
         print(f"analyze: the voters name {sorted(named) or 'no'} leader", file=sys.stderr)
         sys.exit(1)
     print(named.pop())
+elif mode == "added":
+    want = f"added node={args[1]} addr={args[2]}:7101 machine={args[2]}"
+    got = [line for line in lines(args[0]) if line.startswith(("added ", "err "))]
+    print(got[-1] if got else "<no added line>")
+    sys.exit(0 if got == [want] else 1)
+elif mode == "rebalanced":
+    text = lines(args[0])
+    errs = [line for line in text if line.startswith("err ") or "usage:" in line]
+    summary = [line for line in text if line.startswith("rebalance: moves=")]
+    for line in errs[:3] or summary[-1:] or ["<no 'rebalance: moves=' line>"]:
+        print(line)
+    sys.exit(0 if summary and not errs else 1)
+elif mode == "members":
+    members(args[0], args[1], int(args[2]), ids(args[3]),
+            [a for a in args[4].split(",") if a and a != "-"])
+elif mode == "a10pick":
+    # The owner, other than the new node, of the most partitions that hold the new node as a
+    # regular copy: `O P,P,..`; exit 1 when the new node is a regular copy nowhere.
+    new, held = int(args[0]), {}
+    for p, (owner, _, listed) in sorted(status(args[1]).items()):
+        if owner != new and (new, "regular") in listed:
+            held.setdefault(owner, []).append(p)
+    if not held:
+        print(f"node {new} is a regular copy of no partition")
+        sys.exit(1)
+    owner = max(sorted(held), key=lambda o: len(held[o]))
+    print(owner, ",".join(str(p) for p in held[owner]))
+elif mode == "a10won":
+    # Of the partitions P,.. the killed owner held with the new node a copy, those it now owns.
+    won = [p for p in owners_of(int(args[0]), args[2]) if p in ids(args[1])]
+    print(",".join(str(p) for p in won) or "-")
+    sys.exit(0 if won else 1)
 else:
     die(f"unknown mode {mode}")
 PY
@@ -1076,6 +1231,7 @@ claims() { local line; while IFS= read -r line; do echo "$line"; case "$line" in
 
 failover() {
     load
+    formed_only
     target_in "data nodes" "$NODES"
     local n="$TARGET" tmp leader="" bound
     set +e
@@ -1215,6 +1371,7 @@ owned_now() { # node, out
 
 pause_node() {
     load
+    formed_only
     target_in "data nodes" "$NODES"
     local n="$TARGET" c="$NAME-d$TARGET" tmp policy
     policy="$(setting restart)" || die "pause: the restart setting could not be read"
@@ -1392,6 +1549,336 @@ d1() {
     [ "$failed" = 0 ]
 }
 
+# --- #80 S4: add, rebalance, remove, check-members ---------------------------------------------
+
+# One rebalance session; its lines printed, then its summary. Fails, naming why, unless the
+# session exited 0 and printed `rebalance: moves=..`.
+rebalance_run() {
+    local out rc=0 line
+    out="$(mktemp)"
+    session_run "$out" "admin rebalance" || rc=$?
+    grep -E '^(moved |refilled |residual: |rebalance: |err )' "$out" | sed 's/^/  /'
+    if line="$(analyze rebalanced "$out")" && [ "$rc" = 0 ]; then
+        say "rebalance: $line"; rm -f "$out"; return 0
+    fi
+    tail -n 5 "$out" | sed 's/^/  session: /' >&2
+    echo "multihost: the rebalance session exited $rc: $line" >&2
+    rm -f "$out"
+    return 1
+}
+
+# `--unreachable-ok M` for every live node, other than SKIP, whose container is not running:
+# a membership change asks every other live member for a fresh status (S-3).
+unreachable_args() { # skip
+    local n
+    for n in $(live_ids); do
+        [ "$n" = "$1" ] && continue
+        [ "$(docker inspect -f '{{.State.Running}}' "$NAME-d$n" 2>/dev/null)" = true ] \
+            || printf -- '--unreachable-ok %s ' "$n"
+    done
+}
+
+# Wait until container C has stopped for good (Docker's restart policy done with it): prints
+# `exited CODE RESTARTS`, or fails after SECS.
+stopped_for_good() { # container, seconds
+    local i st again
+    for i in $(seq 1 "$2"); do
+        st="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$1" 2>/dev/null || true)"
+        if [ "${st%% *}" = exited ]; then
+            # Exited, and still exited with the same restart count 2 s later: Docker is done.
+            sleep 2
+            again="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}' "$1" 2>/dev/null || true)"
+            [ "$again" = "$st" ] && { echo "$st"; return 0; }
+        fi
+        sleep 1
+    done
+    echo "${st:-<not inspected>}"
+    return 1
+}
+
+# A node with the next id at the next IP: add-node (the record), then its certificate, then
+# its container; ready within 120 s. The record comes first because the id is the store's to
+# give; the script predicts it (the highest id ever given, plus one) to pick the IP, and stops,
+# saying so, if the store gives another.
+add_node() {
+    load
+    run_scratch
+    local tmp="$CHECK_TMP" n ip ok rc=0 line m policy
+    n=$(( $(ever_max) + 1 )); ip="$(node_ip "$n")"
+    absent container "$NAME-d$n" || die "add: a container named $NAME-d$n exists; not touched"
+    absent volume "$NAME-d$n" || die "add: a volume named $NAME-d$n exists; not touched"
+    # A3's baseline: when each live node's container started.
+    for m in $(live_ids); do
+        echo "$m $(docker inspect -f '{{.State.StartedAt}}' "$NAME-d$m")" || die "add: inspect $NAME-d$m"
+    done > "$tmp/started"
+    ok="$(unreachable_args 0)"
+    [ -z "$ok" ] || say "add: naming the nodes not running: $ok"
+    session_run "$tmp/add.out" "admin add-node --addr $ip:7101 --machine $ip $ok" || rc=$?
+    line="$(analyze added "$tmp/add.out" "$n" "$ip")" \
+        || die "add: the session exited $rc; wanted 'added node=$n addr=$ip:7101 machine=$ip', got: $line"
+    say "add: $line"
+    set_state "$n" live
+    init_write "state/add-$n.out" < "$tmp/add.out"
+    init_write state/started-before-add.txt < "$tmp/started"
+    docker run --rm --label "$LABEL" -v "$NAME-init:/data" "$IMAGE" data --gen-certs \
+        --cert-dir /data/certs --issue-node "$n" \
+        || die "add: --issue-node $n (nodes/$n exists; no container serves it)"
+    policy="$(setting restart)" || die "add: the restart setting could not be read"
+    [ "$policy" = none ] || NODE_RESTART=(--restart "$policy")
+    [ "$(setting live_readd)" != 1 ] || NODE_READD=(--live-readd)
+    run_data_node "$n"
+    wait_for "node $n ready" 120 sh -c "docker logs $NAME-d$n 2>&1 | grep -q 'rdb_node ready node=$n'"
+    say "add: node $n ready at $ip. Sessions from now on name it in --nodes (S-6): run rebalance next"
+}
+
+rebalance_cmd() {
+    load
+    rebalance_run || die "rebalance"
+}
+
+# remove N: a running node is drained, then removed, and must exit 0 saying `removed`; a node
+# whose container is not running is removed with --unreachable-ok N, again every 5 s for up to
+# 90 s while its copies are still pinned (about Timeouts::unreachable_drop_after).
+remove_node() {
+    load
+    local n="$TARGET" state ok rc line
+    state="$(node_state "$n")"
+    [ "$state" = live ] \
+        || { echo "docker-multihost: remove $n: node $n is ${state:-not one this rig gave}, not live" >&2; exit 2; }
+    run_scratch
+    local tmp="$CHECK_TMP"
+    ok="$(unreachable_args "$n")"
+    [ -z "$ok" ] || say "remove $n: naming the other nodes not running: $ok"
+    if [ "$(docker inspect -f '{{.State.Running}}' "$NAME-d$n" 2>/dev/null)" = true ]; then
+        rc=0; session_run "$tmp/drain.out" "admin drain $n" || rc=$?
+        grep -E '^(drain: |moved |refilled |residual: |rebalance: |drained |err )' "$tmp/drain.out" | sed 's/^/  /'
+        if [ "$rc" != 0 ] || ! grep -q "^drained node=$n " "$tmp/drain.out"; then
+            die "remove $n: the drain session exited $rc without 'drained node=$n'"
+        fi
+        rc=0; session_run "$tmp/remove.out" "admin remove-node $n $ok" || rc=$?
+        line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
+        if [ "$rc" != 0 ] || [ "${line%% addr=*}" != "removed node=$n" ]; then
+            die "remove $n: the session exited $rc: ${line:-<no removed line>}"
+        fi
+        set_state "$n" removed
+        say "remove $n: $line"
+        line="$(stopped_for_good "$NAME-d$n" 60)" || die "remove $n: $NAME-d$n still runs 60 s after the remove ($line)"
+        case "$line" in "exited 0 "*) ;; *) die "remove $n: $NAME-d$n stopped as '$line', not exit 0" ;; esac
+        docker logs "$NAME-d$n" 2>&1 | grep -q "^rdb_node removed node=$n\$" \
+            || die "remove $n: $NAME-d$n exited 0 without printing 'rdb_node removed node=$n'"
+        say "remove $n: $NAME-d$n exited 0 after 'rdb_node removed node=$n'"
+    else
+        local deadline=$((SECONDS + 90))
+        while :; do
+            rc=0; session_run "$tmp/remove.out" "admin remove-node $n --unreachable-ok $n $ok" || rc=$?
+            line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
+            [ "$rc" = 0 ] && [ "${line%% addr=*}" = "removed node=$n" ] && break
+            case "$line" in *"is still pinned by partitions"*) ;; *) die "remove $n: the session exited $rc: ${line:-<no removed line>}" ;; esac
+            [ "$SECONDS" -lt "$deadline" ] || die "remove $n: still pinned after 90 s: $line"
+            say "remove $n: still pinned; asking again in 5 s"
+            sleep 5
+        done
+        set_state "$n" removed
+        say "remove $n: $line. Its copies come back with rebalance"
+    fi
+}
+
+# check-members: D2's A1 to A11 (arch-80-s34 D2). A1-A7 read the rig; A8, A11, A10 and A9, in
+# that order, change it, so a rig is judged once.
+check_members() {
+    load
+    set +e
+    run_scratch
+    local tmp="$CHECK_TMP" n m rc line added removed spec="" v r
+    init_read state/check-members.started > /dev/null \
+        && die "check-members: it has run on $NAME already, and A8-A10 changed the rig; make a new one"
+    date -u +%FT%TZ | init_write state/check-members.started
+    added="$(awk -v k="$NODES" '$2 == "live" && $1 > k { print $1 }' <<< "$NODES_TXT")"
+    removed="$(awk '$2 == "removed" { print $1 }' <<< "$NODES_TXT")"
+    [ -n "$added" ]; verdict "A1 the rig has a node added after up (${added:-none})" $?
+    [ -n "$removed" ]; verdict "A7 the rig has a removed node (${removed:-none})" $?
+
+    # A1, A2: the new node is ready, and its record is at its own IP and machine.
+    for n in $added; do
+        docker logs "$NAME-d$n" 2>&1 | grep -q "^rdb_node ready node=$n\$"; verdict "A1 node $n ready" $?
+        init_read "state/add-$n.out" > "$tmp/add-$n.out"
+        line="$(analyze added "$tmp/add-$n.out" "$n" "$(node_ip "$n")")"
+        verdict "A2 add-node said $line" $?
+        spec="$spec${spec:+,}$n=$(node_ip "$n")"
+    done
+    # A3: no node that was live before the add was restarted.
+    init_read state/started-before-add.txt > "$tmp/started"; rc=$?
+    while read -r m line; do
+        grep -qx "$m" <<< "$removed" && continue
+        [ "$(docker inspect -f '{{.State.StartedAt}}' "$NAME-d$m")" = "$line" ] || { echo "  node $m restarted"; rc=1; }
+    done < "$tmp/started"
+    verdict "A3 every node live before the add has the StartedAt it had then" "$rc"
+
+    # A4, A5, A7: placement and status.
+    session_run "$tmp/placement.out" "admin placement"; rc=$?
+    grep '^placement' "$tmp/placement.out" | sed 's/^/  /'
+    session_run "$tmp/status.out" "admin status"; rc=$((rc | $?))
+    [ "$rc" = 0 ]; verdict "A2/A4/A5/A7 the placement and status sessions exited 0" $?
+    analyze members "$tmp/status.out" "$tmp/placement.out" "$PARTITIONS" \
+        "$(echo "$removed" | paste -sd, -)" "${spec:--}" > "$tmp/members.txt"; rc=$?
+    claims < "$tmp/members.txt"
+    [ "$rc" = 0 ]; verdict "A2/A4/A5/A7 the placement and status lines could be read (analyze exit $rc)" $?
+    for r in $removed; do
+        line="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$NAME-d$r")"
+        [ "$line" = "exited 0" ] && docker logs "$NAME-d$r" 2>&1 | grep -q "^rdb_node removed node=$r\$"
+        verdict "A7 $NAME-d$r exited 0 after 'rdb_node removed node=$r' ($line)" $?
+    done
+
+    # A6: a put and its get in every partition, through the live nodes.
+    { for g in $(seq 1 400); do echo "admin where $g"; done; echo quit; } | dev > "$tmp/where.out" 2>&1
+    python3 -I - "$tmp/where.out" "$PARTITIONS" > "$tmp/groups" <<'PY'
+import re, sys
+seen = {}
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    m = re.match(r"group (\d+) hash \S+ partition (\d+) ", line)
+    if m:
+        seen.setdefault(int(m.group(2)), int(m.group(1)))
+for p in range(1, int(sys.argv[2]) + 1):
+    if p in seen:
+        print(p, seen[p])
+PY
+    local nonce ok
+    nonce="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    {
+        echo "wait ready 60"
+        while read -r p g; do
+            echo "put --group $g mh-$p mh-$nonce-p$p-g$g"
+            echo "get --group $g mh-$p"
+        done < "$tmp/groups"
+        echo quit
+    } | dev > "$tmp/puts.out" 2>&1; rc=$?
+    local read_rc
+    ok="$(read_check "$tmp/puts.out" "$tmp/groups" "$nonce")"; read_rc=$?
+    [ "$rc" = 0 ] && [ "$read_rc" = 0 ] && [ "$(wc -l < "$tmp/groups")" = "$PARTITIONS" ]
+    verdict "A6 put, then the exact value read back, in each of $PARTITIONS partitions ($ok, session exit $rc)" $?
+
+    # A8: a removed node started again is refused: exit 2 with the reused-id text.
+    r="$(echo "$removed" | head -n 1)"
+    if [ -n "$r" ]; then
+        local since; since="$(date +%s)"
+        docker start "$NAME-d$r" > /dev/null
+        line="$(stopped_for_good "$NAME-d$r" 90)"
+        [ "${line#exited 2 }" != "$line" ] \
+            && docker logs --since "$since" "$NAME-d$r" 2>&1 | grep -q "node $r was removed; ids are never reused"
+        verdict "A8 $NAME-d$r started again stops with exit 2, 'node $r was removed; ids are never reused' ($line)" $?
+    fi
+
+    # A11 (S-4): d3, whose --peers still names the removed node, restarts and skips it.
+    v=3; [ "$(node_state 3)" = live ] || v="$(live_ids | awk -v k="$NODES" '$1 <= k' | head -n 1)"
+    if [ -n "$r" ] && [ -n "$v" ] && [ "$r" -le "$NODES" ]; then
+        local since; since="$(date +%s)"
+        docker restart "$NAME-d$v" > /dev/null
+        node_ready_since "$v" "$since" 60; rc=$?
+        docker exec "$NAME-d$v" sh -c 'grep -rh start_peer_removed_skipped /data/logs' 2>/dev/null \
+            | grep -q "\"peer\":${r}[,}]" || rc=1
+        verdict "A11 node $v, its --peers naming removed node $r, restarted ready and logged start_peer_removed_skipped peer=$r" $?
+    else
+        verdict "A11 a node up started, and a removed node it names in --peers (v=${v:-none}, r=${r:-none})" 1
+    fi
+
+    # A10 (S-6): kill the owner that holds the new node a regular copy most often; where the
+    # new node is chosen owner, a fresh app session writes and reads back.
+    n="$(echo "$added" | head -n 1)"
+    if [ -n "$n" ]; then a10 "$n" "$tmp"; else verdict "A10 a node was added" 1; fi
+
+    # A9: another CA's node, a second node on one machine, and the 9th id are all refused.
+    a9 "$tmp"
+
+    if [ "$FAILS" = 0 ]; then say "check-members: all passed"; else say "check-members: $FAILS failed"; fi
+    [ "$FAILS" = 0 ]
+}
+
+a10() { # new node, scratch
+    local n="$1" tmp="$2" pick o parts left=x won since deadline
+    session_run "$tmp/a10-pre.out" "admin status"
+    pick="$(analyze a10pick "$n" "$tmp/a10-pre.out")" || { verdict "A10 $pick" 1; return; }
+    o="${pick%% *}"; parts="${pick#* }"
+    docker kill "$NAME-d$o" > /dev/null || { verdict "A10 docker kill $NAME-d$o" 1; return; }
+    KILLED="$KILLED $NAME-d$o"
+    say "A10: killed $NAME-d$o, owner of partitions $parts where node $n is a regular copy"
+    deadline=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        left="$(owned_now "$o" "$tmp/a10-post.out")" && [ "$left" = 0 ] && break
+        sleep 2
+    done
+    if [ "$left" != 0 ]; then
+        verdict "A10 within 60 s node $o owns nothing (still ${left:-unread})" 1
+    elif ! won="$(analyze a10won "$n" "$parts" "$tmp/a10-post.out")"; then
+        verdict "A10 node $n was chosen owner of one of $parts (it was not; nothing to write there)" 1
+    else
+        awk -v won=",$won," 'index(won, "," $1 ",")' "$tmp/groups" > "$tmp/a10.groups"
+        local nonce; nonce="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        {
+            echo "wait ready 60"
+            while read -r p g; do
+                echo "put --group $g mh-$p mh-$nonce-p$p-g$g"
+                echo "get --group $g mh-$p"
+            done < "$tmp/a10.groups"
+            echo quit
+        } | dev > "$tmp/a10.out" 2>&1
+        local ok; ok="$(read_check "$tmp/a10.out" "$tmp/a10.groups" "$nonce")"
+        verdict "A10 a new app session wrote and read back partitions $won, now owned by node $n ($ok)" $?
+    fi
+    since="$(date +%s)"
+    docker start "$NAME-d$o" > /dev/null && KILLED="${KILLED/ $NAME-d$o/}"
+    node_ready_since "$o" "$since" 60; verdict "A10 node $o ready again within 60 s" $?
+}
+
+a9() { # scratch
+    local tmp="$1" k ip line started=0
+    k=$(( $(ever_max) + 1 )); ip="$(node_ip "$k")"
+    # (a) node k with a certificate from the other CA: its record is added, its links refused.
+    if ! absent container "$NAME-d$k" || ! absent volume "$NAME-d$k"; then
+        verdict "A9 no container or volume is named $NAME-d$k yet" 1
+    elif session_run "$tmp/a9a.out" "admin add-node --addr $ip:7101 --machine $ip"
+         line="$(analyze added "$tmp/a9a.out" "$k" "$ip")"; then
+        set_state "$k" foreign
+        docker run --rm --label "$LABEL" -v "$NAME-init:/data" "$IMAGE" data --gen-certs \
+            --cert-dir /data/certs-other --issue-node "$k" > /dev/null \
+            && ( run_data_node "$k" /init/certs-other ) > /dev/null && started=1
+        local i up=0 seen=""
+        for i in 1 2 3 4 5; do
+            printf 'admin status\nquit\n' | DEV_NODES="$(peers_with "$k")" DEV_WITHIN=20 dev > "$tmp/a9-links.out" 2>&1
+            seen="$(grep "^link node=$k " "$tmp/a9-links.out" | tail -n 1)"
+            case "$seen" in "link node=$k up "*) up=1 ;; esac
+            sleep 3
+        done
+        echo "  $seen"
+        docker logs "$NAME-d$k" 2>&1 | tail -n 3 | sed 's/^/  d'"$k"': /'
+        [ "$started" = 1 ] && [ "$up" = 0 ] && [ -n "$seen" ] && [ "$seen" != "link node=$k down: not reached yet" ]
+        verdict "A9 node $k, certified by another CA, is never linked (container started=$started; $seen)" $?
+    else
+        verdict "A9 nodes/$k for the other CA's node was added ($line)" 1
+    fi
+    # (b) a node at d3's IP is refused: one data node per machine.
+    ip="$(node_ip 3)"
+    session_run "$tmp/a9b.out" "admin add-node --addr $ip:7101 --machine $ip --unreachable-ok $k"
+    line="$(grep -E '^(added |err )' "$tmp/a9b.out" | tail -n 1)"
+    grep -q '^err admin add-node: .*one data node per machine' <<< "$line"
+    verdict "A9 add-node at d3's IP is refused: $line" $?
+    # (c) ids up to 8 are given, and a 9th is refused.
+    local unreach="--unreachable-ok $k" last
+    last="$(ever_max)"
+    while [ "$last" -lt 8 ]; do
+        last=$((last + 1)); ip="$(node_ip "$last")"
+        session_run "$tmp/a9c.out" "admin add-node --addr $ip:7101 --machine $ip $unreach"
+        line="$(analyze added "$tmp/a9c.out" "$last" "$ip")" || { verdict "A9 id $last is given ($line)" 1; return; }
+        set_state "$last" unserved
+        unreach="$unreach --unreachable-ok $last"
+        echo "  $line"
+    done
+    ip="$(node_ip 9)"
+    session_run "$tmp/a9d.out" "admin add-node --addr $ip:7101 --machine $ip $unreach"
+    line="$(grep -E '^(added |err )' "$tmp/a9d.out" | tail -n 1)"
+    grep -q '^err admin add-node: .*all 8 node ids are used' <<< "$line"
+    verdict "A9 a 9th id is refused: $line" $?
+}
+
 # --- selftest -------------------------------------------------------------------------------
 ST_FAILS=0
 st() { # name, then 0 or not
@@ -1481,6 +1968,8 @@ case "$1 $2" in
         exit 0 ;;
     "container inspect") echo "Error response from daemon: No such container: $3" >&2; exit 1 ;;
 esac
+# #80 S4: load reads /init/nodes.txt.
+case "$*" in *"--entrypoint cat"*nodes.txt) printf '1 live\n2 live\n'; exit 0 ;; esac
 # While check runs, record what its scratch area holds.
 [ "$1" = logs ] && ls "$TMPDIR" >> "$SEEN"
 exit 1
@@ -1770,7 +2259,9 @@ selftest_args() {
                 "pause" "pause x" "check --restart-on-exit" "failover 2 --restart-on-exit" \
                 "check --live-readd" "failover 2 --live-readd" "pause 2 --live-readd" \
                 "d1 --basis 12345" "d1 --basis 5524c9G" "d1 --basis" "failover 2 --basis 5524c9d" \
-                "d1 --basis 5524c9d5524c9d5524c9d5524c9d5524c9d5524c9d1"; do
+                "d1 --basis 5524c9d5524c9d5524c9d5524c9d5524c9d5524c9d1" \
+                "remove" "remove x" "remove 0" "add --with-voter-leader" "check-members --live-readd" \
+                "rebalance --rejoin-s 5" "remove 2 --basis 5524c9d"; do
         : > "$t/calls"
         # shellcheck disable=SC2086 # the case's words
         PATH="$t/bin:$PATH" "$0" $args > /dev/null 2>&1; rc=$?
@@ -1923,6 +2414,10 @@ case "$1 $2" in
     "logs "*) for n in 1 2 3 4 5; do echo "rdb_node ready node=$n"; done; exit 0 ;;
 esac
 case "$*" in
+    *"--entrypoint sh"*) cat >> "$CALLS"; exit 0 ;;
+    *" dev --dir /tmp/dev "*)
+        cat >> "$CALLS"
+        echo "rebalance: moves=0 refills=0 residuals=0 copy_skew=1 primary_skew=1"; exit 0 ;;
     *" data --help")
         echo "usage:" >&2
         [ "$KNOWS" = 1 ] && echo "           [--live-readd] [--app-addr A]" >&2
@@ -1952,6 +2447,9 @@ SH
                 && ! grep -qE -- '--live-readd|data --help' "$t/calls" \
                 && grep -q 'org.rdb.multihost.live_readd=0 ' "$t/calls"
             st "up without the flags gives no container a restart policy or --live-readd, and asks no --help (exit $rc)" $?
+            # Q6 (a): nodes.txt names 1..5 live, and then one rebalance session runs.
+            [ "$(grep -nE '^(5 live|admin rebalance)$' "$t/calls" | cut -d: -f2 | tr '\n' ' ')" = "5 live admin rebalance " ]
+            st "up writes nodes.txt with nodes 1..5 live, then ends with admin rebalance" $?
         fi
     done
     : > "$t/calls"
@@ -1973,6 +2471,7 @@ SH
 #!/bin/sh
 echo "$*" >> "$CALLS"
 case "$*" in
+    *"--entrypoint cat"*nodes.txt) printf '1 live\n2 live\n3 live\n4 live\n5 live\n'; exit 0 ;;
     *org.rdb.multihost.restart*) echo none; exit 0 ;;
     "network inspect -f"*) echo 5; exit 0 ;;
     "network inspect "*) exit 0 ;;
@@ -1982,7 +2481,7 @@ SH
     : > "$t/calls"
     PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" pause 2 --name rdbst-u > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -q "FAILED at pause: up ran without --restart-on-exit" "$t/out" \
-        && ! grep -qE '^(pause|unpause|run|exec) ' "$t/calls"
+        && ! grep -vF -- '--entrypoint cat' "$t/calls" | grep -qE '^(pause|unpause|run|exec) '
     st "pause on a rig without the restart policy is refused and pauses nothing (exit $rc)" $?
     rm -rf "$t"
 }
@@ -2048,6 +2547,123 @@ SH
     rm -rf "$t"
 }
 
+# #80 S4: the add, rebalance, remove and check-members readings over hand-made outputs, the
+# nodes.txt helpers, and the refusals, with a docker stub (no containers).
+selftest_s4() {
+    fails() { ! "$@"; }
+    local t; t="$(mktemp -d)"
+    local rc out
+    # added: only the exact line for this id, address and machine.
+    printf 'reached ready\nadded node=6 addr=10.9.9.16:7101 machine=10.9.9.16\n' > "$t/add.ok"
+    printf 'added node=6 addr=10.9.9.17:7101 machine=10.9.9.17\n' > "$t/add.ip"
+    printf 'err admin add-node: all 8 node ids are used\n' > "$t/add.err"
+    analyze added "$t/add.ok" 6 10.9.9.16 > /dev/null; st "added reads its exact line" $?
+    fails analyze added "$t/add.ip" 6 10.9.9.16 > /dev/null; st "added refuses another IP" $?
+    out="$(analyze added "$t/add.err" 6 10.9.9.16)"; rc=$?
+    [ "$rc" = 1 ] && [ "$out" = "err admin add-node: all 8 node ids are used" ]
+    st "added refuses an err line and prints it (exit $rc)" $?
+    # rebalanced: the summary, and no err or usage line.
+    printf 'moved partition=3 from=1 to=6 # skew\nresidual: none\nrebalance: moves=1 refills=0 residuals=0 copy_skew=1 primary_skew=1\n' > "$t/rb.ok"
+    printf 'err admin rebalance: inventory: the inventory has no nodes\n' > "$t/rb.err"
+    printf 'usage: admin rebalance [--max-moves <k>]\nrebalance: moves=0 refills=0 residuals=0 copy_skew=0 primary_skew=0\n' > "$t/rb.usage"
+    out="$(analyze rebalanced "$t/rb.ok")"; rc=$?
+    [ "$rc" = 0 ] && [ "$out" = "rebalance: moves=1 refills=0 residuals=0 copy_skew=1 primary_skew=1" ]
+    st "rebalanced prints the summary (exit $rc)" $?
+    fails analyze rebalanced "$t/rb.err" > /dev/null; st "rebalanced fails on an err line" $?
+    fails analyze rebalanced "$t/rb.usage" > /dev/null; st "rebalanced fails on a usage line, summary or not" $?
+    : > "$t/rb.none"; fails analyze rebalanced "$t/rb.none" > /dev/null; st "rebalanced fails with no summary" $?
+    # members: A2, A4, A5, A7 over placement and status.
+    local ip="10.9.9"
+    s4_placement() { # skew, node 2 copies
+        echo "placement: nodes=5 partitions=2"
+        for n in 1 3 4 5; do echo "placement node=$n machine=$ip.1$n state=ok copies=2 primaries=1"; done
+        echo "placement node=6 machine=$ip.16 state=ok copies=2 primaries=0"
+        [ "$2" = 0 ] || echo "placement node=2 machine=$ip.12 state=ok copies=$2 primaries=0"
+        echo "placement: copy_skew=$1 primary_skew=1"
+    }
+    s4_status() { # members of partition 2
+        echo "partitions/1 rev=5 PartitionRecord { owner: NodeId(1), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=[1:owner,3:regular,6:regular]"
+        echo "partitions/2 rev=6 PartitionRecord { owner: NodeId(4), generation: Generation(1), owner_epoch: OwnerEpoch(2) } members=$1"
+    }
+    s4_placement 1 0 > "$t/pl.ok"; s4_status "[4:owner,5:regular,6:regular]" > "$t/stat.ok"
+    out="$(analyze members "$t/stat.ok" "$t/pl.ok" 2 2 "6=$ip.16")"; rc=$?
+    [ "$rc" = 0 ] && [ "$(grep -c '^PASS ' <<< "$out")" = 5 ] && ! grep -q '^FAIL' <<< "$out"
+    st "members passes A2 A4 A5 and both A7 claims on a good rig (exit $rc)" $?
+    out="$(analyze members "$t/stat.ok" "$t/pl.ok" 2 2 "6=$ip.17")"
+    grep -q '^FAIL A2 nodes/6' <<< "$out"; st "members fails A2 on another machine" $?
+    s4_placement 2 0 > "$t/pl.skew"
+    grep -q '^FAIL A4 copy_skew=2' <<< "$(analyze members "$t/stat.ok" "$t/pl.skew" 2 2 -)"
+    st "members fails A4 at copy_skew 2" $?
+    s4_status "[4:owner,5:regular]" > "$t/stat.two"
+    grep -q '^FAIL A5' <<< "$(analyze members "$t/stat.two" "$t/pl.ok" 2 2 -)"; st "members fails A5 on 2 copies" $?
+    printf 'placement: nodes=2 partitions=2\nplacement node=1 machine=m1 state=ok copies=2 primaries=1\nplacement node=3 machine=m1 state=ok copies=2 primaries=1\nplacement node=6 machine=m6 state=ok copies=2 primaries=0\nplacement: copy_skew=0 primary_skew=1\n' > "$t/pl.machine"
+    s4_status "[1:owner,3:regular,6:regular]" > "$t/stat.machine"
+    grep -q '^FAIL A5' <<< "$(analyze members "$t/stat.machine" "$t/pl.machine" 2 - -)"
+    st "members fails A5 on 3 copies over 2 machines" $?
+    s4_status "[4:owner,2:shadow,5:regular,6:regular]" > "$t/stat.pin"
+    grep -q '^FAIL A7 no partition' <<< "$(analyze members "$t/stat.pin" "$t/pl.ok" 2 2 -)"
+    st "members fails A7 when a status still names the removed node" $?
+    s4_placement 1 1 > "$t/pl.held"
+    grep -q '^FAIL A7 the placement gives removed node 2 no copy (copies=1)' <<< "$(analyze members "$t/stat.ok" "$t/pl.held" 2 2 -)"
+    st "members fails A7 when the placement gives the removed node a copy" $?
+    printf 'placement node=x\n' > "$t/pl.bad"
+    analyze members "$t/stat.ok" "$t/pl.bad" 2 2 - > /dev/null 2>&1; rc=$?
+    [ "$rc" = 2 ]; st "members stops on a placement line it cannot read (exit $rc)" $?
+    # a10pick and a10won.
+    { s4_status "[4:owner,5:regular,6:regular]"
+      echo "partitions/3 rev=7 PartitionRecord { owner: NodeId(4), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=[4:owner,1:regular,6:regular]"; } > "$t/a10.pre"
+    [ "$(analyze a10pick 6 "$t/a10.pre")" = "4 2,3" ]; st "a10pick names the owner most often beside the new node" $?
+    fails analyze a10pick 7 "$t/stat.two" > /dev/null; st "a10pick fails where the new node is a copy nowhere" $?
+    s4_status "[6:owner,5:regular,1:regular]" | sed 's/NodeId(4)/NodeId(6)/' > "$t/a10.post"
+    [ "$(analyze a10won 6 2,3 "$t/a10.post")" = 2 ]; st "a10won lists what the new node now owns" $?
+    fails analyze a10won 5 2,3 "$t/a10.post" > /dev/null; st "a10won fails when the new node owns none" $?
+    # nodes.txt helpers.
+    out="$( NODES=5 NODES_TXT=""; live_ids | tr '\n' ' ')"
+    [ "$out" = "1 2 3 4 5 " ]; st "live_ids is 1..NODES before nodes.txt" $?
+    out="$( NODES=5 NODES_TXT=$'1 live\n2 removed\n3 live\n4 live\n5 live\n6 live\n7 foreign\n8 unserved'
+            SUBNET=10.9.9.0/24; echo "$(live_ids | tr '\n' ' ')|$(ever_max)|$(peers)|$(peers_with 7)")"
+    [ "$out" = "1 3 4 5 6 |8|1=10.9.9.11:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101|1=10.9.9.11:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101,7=10.9.9.17:7101" ]
+    st "live_ids, ever_max, peers and peers_with read nodes.txt ($out)" $?
+    # Commands against a stub rig whose nodes.txt says 2 was removed and 6 added.
+    mkdir -p "$t/bin"
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$*" in
+    "network inspect -f"*multihost.nodes*) echo 5; exit 0 ;;
+    "network inspect -f"*multihost.subnet*) echo 10.9.9.0/24; exit 0 ;;
+    "network inspect -f"*) echo 3; exit 0 ;;
+    "network inspect "*) exit 0 ;;
+    *"--entrypoint cat"*nodes.txt) printf '1 live\n2 removed\n3 live\n4 live\n5 live\n6 live\n'; exit 0 ;;
+esac
+exit 1
+SH
+    chmod +x "$t/bin/docker"
+    local cmd
+    for cmd in check failover\ 3 pause\ 3; do
+        : > "$t/calls"
+        # shellcheck disable=SC2086 # the command's words
+        PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" $cmd --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+        [ "$rc" = 1 ] && grep -q "FAILED at ${cmd%% *}: the live nodes are now 1 3 4 5 6 after add or remove" "$t/out" \
+            && ! grep -qE '^(kill|pause|exec|start|run -d)' "$t/calls"
+        st "${cmd%% *} refuses a rig after add or remove (exit $rc)" $?
+    done
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" remove 2 --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 2 ] && grep -q "remove 2: node 2 is removed, not live" "$t/out" && ! grep -q -- '-i ' "$t/calls"
+    st "remove of a removed node is refused before any session (exit $rc)" $?
+    : > "$t/calls"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" remove 9 --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 2 ] && grep -q "remove 9: node 9 is not one this rig gave, not live" "$t/out"
+    st "remove of an id the rig never gave is refused (exit $rc)" $?
+    # A rig from before S4 (no nodes.txt) is refused by every command that loads it.
+    sed -i 's/nodes.txt) printf.*/nodes.txt) exit 1 ;;/' "$t/bin/docker"
+    PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" rebalance --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "FAILED at load: rdbst-s4-init has no nodes.txt" "$t/out"
+    st "a rig without nodes.txt is refused (exit $rc)" $?
+    rm -rf "$t"
+}
+
 selftest() {
     # Each case reads its own exit code; one failing case must not end the selftest.
     set +e
@@ -2063,6 +2679,7 @@ selftest() {
     selftest_d1_teardown
     selftest_up_restart
     selftest_restart_claims
+    selftest_s4
     if [ "$NO_DOCKER" = 1 ]; then echo "SKIP selftest docker part (--no-docker)"; else selftest_docker; fi
     if [ "$ST_FAILS" = 0 ]; then say "selftest: all passed"; else say "selftest: $ST_FAILS failed"; fi
     [ "$ST_FAILS" = 0 ]
@@ -2080,5 +2697,9 @@ case "$CMD" in
     restart-voter) restart_voter ;;
     pause) pause_node ;;
     d1) d1 ;;
+    add) add_node ;;
+    rebalance) rebalance_cmd ;;
+    remove) remove_node ;;
+    check-members) check_members ;;
     *) sed -n '2,15p' "$0"; exit 2 ;;
 esac
