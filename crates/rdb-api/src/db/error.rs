@@ -61,6 +61,13 @@ const ADMIN_LOST_STEP: &str = "so run `admin status`";
 /// contradict (bb walk paper cut).
 pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this says";
 
+/// The tail of a `RECOVERY_READ_ONLY` refusal while the owner rebuilds a copy from a snapshot
+/// (issue #61, design N3): the window ends by itself, and `retry_after` is a "not before" poll
+/// hint, not an estimate.
+pub(crate) const REBUILDING_STEP: &str = "reads still work and nothing was discarded; this \
+    send wrote nothing: send the write again as a new write after `retry_after`, which is a poll \
+    hint, not an estimate";
+
 /// The tail every `admin move` refusal ends with (M11): its detail names the step.
 pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 
@@ -401,6 +408,7 @@ impl ApiError {
         if reopen
             || self.detail.ends_with(RUN_AGAIN)
             || self.detail.ends_with(REBUILD_STEP)
+            || self.detail.ends_with(REBUILDING_STEP)
             || self.detail.ends_with(BARRIER_STEP)
             || self.detail.ends_with(MOVE_STEP)
             || self.detail.ends_with(FORGET_TAIL_STEP)

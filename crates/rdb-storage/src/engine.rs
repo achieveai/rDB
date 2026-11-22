@@ -46,9 +46,10 @@ use crate::keys::{
     self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
     decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
     ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
-    Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
-    FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY,
-    PRIVATE_NS, SEALED_KEY,
+    Link, PublishMark, TrimFloor, APPLIED_KEY, CF_HISTORY, CF_METADATA, COLUMN_FAMILIES,
+    COPYING_KEY, DURABLE_KEY, FORMAT_KEY, FORMAT_VERSION, INSTALLING_KEY, INSTANCE_KEY,
+    INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY, TRIM_FLOOR_KEY,
+    TRIM_FLOOR_LEN,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -297,6 +298,63 @@ pub enum BindError {
     },
 }
 
+/// Why [`RocksEngine::stage_trim_history`] refused (issue #61). Nothing was written in any
+/// case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TrimRefused {
+    /// The engine holds no such lineage.
+    #[error("no such lineage")]
+    UnknownLineage,
+    /// A full copy is staged into the lineage and was never switched: its keys are partial.
+    #[error("a full copy is staged in this lineage")]
+    Staging,
+    /// A child inherited the lineage. Its History is trimmed through the child's walk, which
+    /// keeps the part the child does not read.
+    #[error("sealed by child generation {}", child.0)]
+    Sealed {
+        /// The child generation.
+        child: Generation,
+    },
+    /// The floor is above the lineage's applied watermark: the record at it does not exist.
+    #[error("floor {} is above applied {}", floor.0, applied.0)]
+    AboveApplied {
+        /// The floor asked for.
+        floor: Seq,
+        /// The lineage's applied watermark.
+        applied: AppliedSeq,
+    },
+    /// The floor is below the one the lineage already reads under: a floor never moves down.
+    #[error("floor {} is below the current floor {}", floor.0, current.0)]
+    BelowFloor {
+        /// The floor asked for.
+        floor: Seq,
+        /// [`RocksEngine::floor_seq`] now.
+        current: Seq,
+    },
+    /// The lineage is mid snapshot install: its History is not written yet.
+    #[error("a snapshot install is in progress in this lineage")]
+    Installing,
+    /// RocksDB refused the write.
+    #[error("the trim write failed")]
+    WriteFailed,
+}
+
+impl TrimRefused {
+    /// The `reason` field `history_trim_refused` carries.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownLineage => "unknown_lineage",
+            Self::Staging => "staging",
+            Self::Sealed { .. } => "sealed",
+            Self::AboveApplied { .. } => "above_applied",
+            Self::BelowFloor { .. } => "below_floor",
+            Self::Installing => "installing",
+            Self::WriteFailed => "write_failed",
+        }
+    }
+}
+
 /// One lineage's engine-private records as the engine holds them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marks {
@@ -308,6 +366,13 @@ pub(crate) struct Marks {
     pub(crate) sealed_by: Option<Generation>,
     /// Set on a child mid full copy: the `(parent, base)` of its `copying` record.
     pub(crate) staging: Option<(Generation, Seq)>,
+    /// Set on a trimmed level: its own `trim_floor` record (issue #61), written by a trim of it
+    /// or of a child that cut it (design rev 5c). [`RocksEngine::floor`] takes the highest mark
+    /// that cuts what a lineage reads.
+    pub(crate) floor: Option<TrimFloor>,
+    /// Set on a lineage mid snapshot install: its `installing` record, `(generation, at)`
+    /// (issue #61). A read-write open clears such a lineage.
+    pub(crate) installing: Option<(Generation, Seq)>,
 }
 
 /// One core set's data engine on RocksDB.
@@ -353,6 +418,10 @@ pub struct RocksEngine {
     /// How many times a [`WalSync::flush`] synced the WAL files through its own handles
     /// (A-R365): RocksDB's `rocksdb.wal.synced` does not see those, so [`Self::wal_syncs`] adds them.
     wal_flushes: Arc<AtomicU64>,
+    /// Debug builds: how many [`WalSync::flush`] calls also fsynced the database directory,
+    /// the unix-only step (issue #71); see [`Self::wal_dir_syncs`].
+    #[cfg(debug_assertions)]
+    wal_dir_syncs: Arc<AtomicU64>,
     /// Debug builds: the options a writable open used, kept for their WAL-sync counter
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
@@ -382,6 +451,11 @@ pub enum InjectedFault {
     /// [`RocksEngine::put_publish_marks`], [`RocksEngine::persist_epoch_revocation`]): nothing is
     /// written and nothing counts as synced (review-s1 F-008). Not reached by a bind of the id the copy already holds.
     SyncedPut,
+    /// The next [`RocksEngine::install_begin`]'s batch: nothing is wiped and nothing is marked
+    /// installing (issue #61, design rev 5b).
+    InstallBegin,
+    /// The next [`RocksEngine::install_chunk`]'s batch: nothing of the chunk lands.
+    InstallChunk,
 }
 
 impl InjectedFault {
@@ -396,6 +470,8 @@ impl InjectedFault {
             Self::Switch => "switch",
             Self::CopyBatch => "copy-batch",
             Self::SyncedPut => "synced-put",
+            Self::InstallBegin => "install-begin",
+            Self::InstallChunk => "install-chunk",
         }
     }
 }
@@ -415,6 +491,9 @@ pub struct WalSync {
     dir: PathBuf,
     /// The engine's count of WAL syncs made here ([`RocksEngine::wal_syncs`]).
     flushes: Arc<AtomicU64>,
+    /// Debug builds: the engine's count of directory fsyncs ([`RocksEngine::wal_dir_syncs`]).
+    #[cfg(debug_assertions)]
+    dir_syncs: Arc<AtomicU64>,
     /// RocksDB's latest sequence number when the sync began (A-R214).
     latest: u64,
     /// Set when an armed [`InjectedFault::WalFlush`] fired at the start: the fsync fails with
@@ -466,11 +545,15 @@ impl WalSync {
         // file's entry survives a power cut. On Linux that is a real step; RocksDB's Windows
         // env makes it a no-op (`WinDirectory::Fsync` returns OK), and Windows cannot open a
         // directory as a `File`. So sync it wherever the OS can (A-R373).
-        // Never executed on this host; the first Linux gate owes a row (achieveai/rDB#71).
+        // On Linux the row `m10_f4_unix_wal_rollover_under_syncs_keeps_credited_prefixes_after_a_crash`
+        // (`tests/m10_wal_sync.rs`, issue #71) runs it across WAL rollovers and deletions and
+        // counts it through [`RocksEngine::wal_dir_syncs`]. Windows never takes it.
         if cfg!(unix) {
             std::fs::File::open(&self.dir)
                 .and_then(|dir| dir.sync_all())
                 .map_err(|e| format!("sync the WAL directory {}: {e}", self.dir.display()))?;
+            #[cfg(debug_assertions)]
+            self.dir_syncs.fetch_add(1, Ordering::Relaxed);
         }
         self.flushes.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -560,6 +643,15 @@ impl RocksEngine {
             options.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced)
                 + self.wal_flushes.load(Ordering::Relaxed)
         })
+    }
+
+    /// Debug builds only: how many [`WalSync::flush`] calls since this engine opened also
+    /// fsynced the database directory after syncing the WAL files (A-R373, issue #71). Unix
+    /// only: on Windows it stays zero, as that step does not run there.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn wal_dir_syncs(&self) -> u64 {
+        self.wal_dir_syncs.load(Ordering::Relaxed)
     }
 
     /// The one synced write of a metadata key (review-s1 F-008): a put with `sync` set, and
@@ -712,7 +804,7 @@ impl RocksEngine {
         steps.done("ensure_format");
         let instance = read_instance(&db, &path)?;
         steps.done("read_instance");
-        let lineages = restore_lineages(&db, &path)?;
+        let mut lineages = restore_lineages(&db, &path)?;
         steps.done("restore_lineages");
         for (&(partition, generation), marks) in &lineages {
             tracing::info!(
@@ -724,11 +816,15 @@ impl RocksEngine {
                 link = ?marks.link,
                 sealed_by = ?marks.sealed_by.map(|child| child.0),
                 staging = ?marks.staging,
+                floor = marks.floor.map(|floor| floor.seq.0),
+                installing = ?marks.installing.map(|(_, at)| at.0),
                 "lineage_restored"
             );
         }
         check_marks(&lineages)?;
         steps.done("check_marks");
+        clear_installs(&db, &path, &mut lineages)?;
+        steps.done("clear_installs");
         steps.finish();
         tracing::info!(
             target: LOG_TARGET,
@@ -758,6 +854,8 @@ impl RocksEngine {
             storage,
             sync_in_flight: false,
             wal_flushes: Arc::default(),
+            #[cfg(debug_assertions)]
+            wal_dir_syncs: Arc::default(),
             #[cfg(debug_assertions)]
             options: Some(options),
         })
@@ -803,6 +901,8 @@ impl RocksEngine {
             storage: StorageOptions::default(),
             sync_in_flight: false,
             wal_flushes: Arc::default(),
+            #[cfg(debug_assertions)]
+            wal_dir_syncs: Arc::default(),
             #[cfg(debug_assertions)]
             options: None,
         })
@@ -992,6 +1092,21 @@ impl RocksEngine {
         }
         self.instance = Some(id);
         tracing::info!(target: LOG_TARGET, instance_hex = hex(&id), "instance_bound");
+        Ok(())
+    }
+
+    /// Write `write` with `sync` set, as [`Self::put_metadata_synced_all`] does: logged when a
+    /// sync is in flight, and counted by [`Self::wal_synced_through_latest`] once it returns.
+    pub(crate) fn write_batch_synced(
+        &mut self,
+        write: WriteBatch,
+        what: &'static str,
+    ) -> Result<(), String> {
+        self.note_synced_write(what);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db.write_opt(write, &opts).map_err(|e| e.to_string())?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
         Ok(())
     }
 
@@ -1465,6 +1580,19 @@ impl RocksEngine {
             );
             return Err(StorageFault::WriteFailed);
         }
+        // An install in progress owns the lineage's key range until it finishes (issue #61): a
+        // commit would land among chunks and under a barrier it does not chain to.
+        if let Some((_, at)) = marks.installing {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition,
+                generation,
+                seq,
+                at = at.0,
+                "installing_generation_write_refused"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
         let applied = AppliedSeq(marks.applied.0.max(batch.seq.0));
         let mut write = WriteBatch::default();
         for w in &batch.writes {
@@ -1604,6 +1732,8 @@ impl RocksEngine {
             _claim: self.claim.clone(),
             dir: self.path.clone(),
             flushes: Arc::clone(&self.wal_flushes),
+            #[cfg(debug_assertions)]
+            dir_syncs: Arc::clone(&self.wal_dir_syncs),
             latest,
             failed,
             captured,
@@ -1928,6 +2058,193 @@ impl RocksEngine {
         Ok(deleted)
     }
 
+    /// The trim mark lineage `(partition, generation)` reads under (issue #61, design rev 5c),
+    /// with the generation whose level holds it: the **highest** mark that cuts what the
+    /// lineage reads. The walk follows every link, `copied` ones included, since History falls
+    /// through all of them. A level's mark counts only while it is at most one past the last seq
+    /// the lineage reads there: `applied + 1` on its own level (a cut level whose History is
+    /// all gone is marked `head + 1`, "empty"), `base + 1` through a link, the smallest along
+    /// the path. On one engine every cut level is on the trimmed lineage's own chain (`inherit`
+    /// refuses a second child of a sealed parent), so a sealed level reads under its own mark.
+    /// A caller that needs the lineage's own mark (its root is that lineage's root) checks the
+    /// generation. `None` when no level holds one: History is whole from seq 1.
+    #[must_use]
+    pub fn floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, TrimFloor)> {
+        let mut best: Option<(Generation, TrimFloor)> = None;
+        let mut level = generation;
+        let mut top = self
+            .buffered_applied(partition, generation)
+            .0
+            .saturating_add(1);
+        loop {
+            let Some(marks) = self.lineages.get(&(partition, level)) else {
+                return best;
+            };
+            // No row reaches the filter: a parent mark above `base + 1` needs a child inherited
+            // below the parent's floor, which A2's `below_floor` refuses. Defence only.
+            if let Some(floor) = marks.floor.filter(|floor| floor.seq.0 <= top) {
+                // No row reaches "highest" over "first": in one chain a level's own mark is
+                // always at least its parent's, so the two agree. Defence only.
+                if best.is_none_or(|(_, held)| floor.seq > held.seq) {
+                    best = Some((level, floor));
+                }
+            }
+            let Some(link) = marks.link else {
+                return best;
+            };
+            top = top.min(link.base.0.saturating_add(1));
+            level = link.parent;
+        }
+    }
+
+    /// The lowest seq whose History record lineage `(partition, generation)` keeps:
+    /// [`Self::floor`]'s seq, or [`Seq::ZERO`] when the lineage was never trimmed. The record
+    /// **at** the floor is kept, so a floored lineage still reads its floor record.
+    #[must_use]
+    pub fn floor_seq(&self, partition: PartitionId, generation: Generation) -> Seq {
+        self.floor(partition, generation)
+            .map_or(Seq::ZERO, |(_, floor)| floor.seq)
+    }
+
+    /// Delete lineage `(partition, generation)`'s History below `floor.seq` and write `floor`
+    /// as its trim mark, in one atomic `WriteBatch`, staged unsynced (issue #61, A-R317): the
+    /// trim is durable only after the next WAL sync that begins after this returns, so a node's
+    /// thread never waits on an fsync for it. A crash before that sync reopens with the older
+    /// floor and its rows back, which is the safe direction: the caller rebuilds its ladders
+    /// from [`Self::floor_seq`] at open.
+    ///
+    /// The walk follows History's own chain, every link included (`copied` ones too, since
+    /// History falls through them): the lineage's own level loses `[0, floor)`, and a level
+    /// reached through links whose bases are `b1, b2, ..` loses `[0, min(floor, b1+1, b2+1, ..))`,
+    /// exactly the part of it this lineage reads. A parent's records above the base (a tail
+    /// issue #105 keeps) are never touched. The record at `floor.seq` always stays.
+    ///
+    /// Each level cut is marked at its own cut, `min(floor, b1+1, ..)`, in the same batch, with
+    /// `floor`'s root, unless it already holds a higher mark: a mark never goes down (design
+    /// rev 5c). A parent with no records above its base is so marked `head + 1`, empty: its
+    /// head record is gone too, which no reader of it needs once the child is past its base.
+    ///
+    /// Returns how many levels the walk visited. Local cleanup, not a replicated write: no
+    /// `applied` mark moves. Logs `history_trimmed{levels, from, to}`, or
+    /// `history_trim_refused{reason}`.
+    ///
+    /// # Errors
+    ///
+    /// A [`TrimRefused`] naming why; nothing is written in any case.
+    pub fn stage_trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) -> Result<usize, TrimRefused> {
+        let current = self.floor_seq(partition, generation);
+        let result = self.trim_history(partition, generation, floor, current);
+        let (p, g, to) = (partition.0, generation.0, floor.seq.0);
+        match &result {
+            Ok(levels) => tracing::info!(
+                target: LOG_TARGET, partition = p, generation = g, levels, from = current.0, to,
+                "history_trimmed"
+            ),
+            Err(refused) => tracing::warn!(
+                target: LOG_TARGET, partition = p, generation = g, from = current.0, to,
+                reason = refused.reason(), detail = %refused, "history_trim_refused"
+            ),
+        }
+        result
+    }
+
+    fn trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+        current: Seq,
+    ) -> Result<usize, TrimRefused> {
+        let Some(marks) = self.lineages.get(&(partition, generation)).copied() else {
+            return Err(TrimRefused::UnknownLineage);
+        };
+        if marks.staging.is_some() {
+            return Err(TrimRefused::Staging);
+        }
+        if marks.installing.is_some() {
+            return Err(TrimRefused::Installing);
+        }
+        if let Some(child) = marks.sealed_by {
+            return Err(TrimRefused::Sealed { child });
+        }
+        if floor.seq.0 > marks.applied.0 {
+            return Err(TrimRefused::AboveApplied {
+                floor: floor.seq,
+                applied: marks.applied,
+            });
+        }
+        if floor.seq < current {
+            return Err(TrimRefused::BelowFloor {
+                floor: floor.seq,
+                current,
+            });
+        }
+        let cf = self.cf(CF_HISTORY);
+        let mut write = WriteBatch::default();
+        // Every level cut gets its own mark at its cut, in this batch (design rev 5c), so a
+        // reader of that level alone (a sealed intermediate, an older generation) knows its History
+        // starts there. A mark never goes down, and its root is the child's.
+        let mut marked: Vec<(Generation, TrimFloor)> = Vec::new();
+        let (mut level, mut end, mut levels) = (generation, floor.seq.0, 0_usize);
+        loop {
+            levels += 1;
+            write.delete_range_cf(
+                cf,
+                encode_key(partition, level, Namespace::History, &[]),
+                encode_key(partition, level, Namespace::History, &end.to_be_bytes()),
+            );
+            let held = self
+                .lineages
+                .get(&(partition, level))
+                .and_then(|marks| marks.floor);
+            // No row reaches a held mark above `end`: it needs a parent marked above the child's
+            // `base + 1`, which A2's `below_floor` refuses. Defence only: a mark never goes down.
+            if held.is_none_or(|held| held.seq.0 < end) {
+                let mark = TrimFloor {
+                    seq: Seq(end),
+                    ..floor
+                };
+                write.put_cf(
+                    self.cf(CF_METADATA),
+                    private_key(partition, level, TRIM_FLOOR_KEY),
+                    mark.encode(),
+                );
+                marked.push((level, mark));
+            }
+            let Some(link) = self.link(partition, level) else {
+                break;
+            };
+            end = end.min(link.base.0.saturating_add(1));
+            level = link.parent;
+        }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(false);
+        if let Err(e) = self.db.write_opt(write, &opts) {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = generation.0,
+                error = %e,
+                "history_trim_write_failed"
+            );
+            return Err(TrimRefused::WriteFailed);
+        }
+        for (level, mark) in marked {
+            self.lineages.entry((partition, level)).or_default().floor = Some(mark);
+        }
+        Ok(levels)
+    }
+
     /// The highest sequence applied to state, not necessarily synced.
     #[must_use]
     pub fn buffered_applied(&self, partition: PartitionId, generation: Generation) -> AppliedSeq {
@@ -2000,8 +2317,9 @@ impl RocksEngine {
     /// The lowest `History` seq lineage `(partition, generation)` serves through its chain
     /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one
     /// within that level's reach ([`Self::history_reach`]), or the lineage's applied head plus
-    /// one when none does (1 for an empty copy). It assumes no hole above that record: a history
-    /// trim (#61) must revisit it.
+    /// one when none does (1 for an empty copy). It assumes no hole above that record. #61's
+    /// trim deletes only below its floor, so it leaves none; only the debug tool
+    /// `drop_history` can.
     ///
     /// # Errors
     ///
@@ -2234,9 +2552,22 @@ impl std::fmt::Display for RawRecord {
                         link.parent.0, link.base.0, link.copied
                     )
                 })
+            } else if key == TRIM_FLOOR_KEY {
+                TrimFloor::decode(&self.value).map_or_else(undecodable, |floor| {
+                    format!(
+                        "seq:{} root_base:{} root_digest:{}",
+                        floor.seq.0,
+                        floor.root_base.0,
+                        hex(&floor.root_digest.0)
+                    )
+                })
             } else if key == COPYING_KEY {
                 decode_copying(&self.value).map_or_else(undecodable, |(parent, base)| {
                     format!("parent:{} base:{}", parent.0, base.0)
+                })
+            } else if key == INSTALLING_KEY {
+                decode_copying(&self.value).map_or_else(undecodable, |(generation, at)| {
+                    format!("generation:{} at:{}", generation.0, at.0)
                 })
             } else {
                 decode_mark(&self.value).map_or_else(undecodable, |v| v.to_string())
@@ -2477,6 +2808,41 @@ fn read_instance(db: &DB, path: &Path) -> Result<Option<[u8; INSTANCE_LEN]>, Ope
 }
 
 /// Refuse a lineage with `durable > applied`.
+/// Remove every lineage a crash left mid snapshot install (issue #61), in one synced batch: its
+/// keys in every namespace and its engine records, exactly as `install_begin` wiped the
+/// lineages before it. The copy rejoins with the partition empty and asks again. Logs
+/// `snapshot_install_cleared_at_open` per lineage. A read-only open keeps them, and verify
+/// reports them `CopyIncomplete`.
+fn clear_installs(db: &DB, path: &Path, lineages: &mut Lineages) -> Result<(), OpenError> {
+    let cleared: Vec<((PartitionId, Generation), Seq)> = lineages
+        .iter()
+        .filter_map(|(&key, marks)| marks.installing.map(|(_, at)| (key, at)))
+        .collect();
+    if cleared.is_empty() {
+        return Ok(());
+    }
+    let mut write = WriteBatch::default();
+    for &((partition, generation), _) in &cleared {
+        for (cf, start, end) in keys::lineage_ranges(partition, generation) {
+            write.delete_range_cf(handle(db, path, cf)?, start, end);
+        }
+    }
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    db.write_opt(write, &opts).map_err(|e| backend(path, &e))?;
+    for ((partition, generation), at) in cleared {
+        lineages.remove(&(partition, generation));
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            "snapshot_install_cleared_at_open"
+        );
+    }
+    Ok(())
+}
+
 fn check_marks(lineages: &Lineages) -> Result<(), OpenError> {
     match lineages
         .iter()
@@ -2654,6 +3020,13 @@ fn restore_lineages(
                 }
                 marks.link = Some(link);
             }
+            INSTALLING_KEY => {
+                sized("installing", 16)?;
+                marks.installing = Some(
+                    decode_copying(&value)
+                        .ok_or_else(|| corrupt("installing record did not decode"))?,
+                );
+            }
             COPYING_KEY => {
                 sized("copying", 16)?;
                 let staging = decode_copying(&value)
@@ -2679,11 +3052,40 @@ fn restore_lineages(
                 }
                 marks.sealed_by = Some(child);
             }
+            TRIM_FLOOR_KEY => {
+                sized("trim_floor", TRIM_FLOOR_LEN)?;
+                marks.floor = Some(
+                    TrimFloor::decode(&value)
+                        .ok_or_else(|| corrupt("trim_floor record did not decode"))?,
+                );
+            }
             _ => return Err(corrupt("an engine record name format 1 does not define")),
         }
     }
     // The switch batch writes `applied = base` with the link, and applied only rises after.
+    // A trim refuses a floor above applied, and applied only rises after (issue #61). The one
+    // exception is a parent level a child's trim emptied: it is marked `applied + 1` (design
+    // rev 5c), and only a level some lineage links to can be.
+    let parents: BTreeSet<(PartitionId, Generation)> = lineages
+        .iter()
+        .filter_map(|(&(partition, _), marks)| marks.link.map(|link| (partition, link.parent)))
+        .collect();
     for (&(partition, generation), marks) in &lineages {
+        let limit = if parents.contains(&(partition, generation)) {
+            marks.applied.0.saturating_add(1)
+        } else {
+            marks.applied.0
+        };
+        if let Some(floor) = marks.floor.filter(|floor| floor.seq.0 > limit) {
+            return Err(OpenError::CorruptRecord {
+                path: path.to_path_buf(),
+                key_hex: hex(&private_key(partition, generation, TRIM_FLOOR_KEY)),
+                problem: format!(
+                    "inconsistent lineage records: trim floor {} above applied {}",
+                    floor.seq.0, marks.applied.0
+                ),
+            });
+        }
         if let Some(link) = marks.link.filter(|link| marks.applied.0 < link.base.0) {
             return Err(OpenError::CorruptRecord {
                 path: path.to_path_buf(),

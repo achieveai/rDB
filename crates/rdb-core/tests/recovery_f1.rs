@@ -1116,9 +1116,16 @@ fn a_mismatching_probe_answer_quarantines() {
     assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
 }
 
-/// An unanswerable probe, or the probe deadline, drops that source before selecting.
+/// Issue #61 A4 (history-trim design §3.5, rev 4 N1): `ProbeUnavailable` means the holder is
+/// alive and the seq is below its History floor. For the pair probe `(A, 15)` — A asked to vouch
+/// for B's and C's heads — that drops the **shorter** copies, `Ineligible(StaleLineage)`, and
+/// keeps A, the longer, which is then selected. This was the first half of
+/// `an_unanswered_probe_drops_the_source`, which expected A dropped and 15 selected; rewritten
+/// red before green.
+/// Cut: `probe_unavailable` drops the probed copy for every probe (pre-#61), red (`lost(A,
+/// Stalled)`, `selected(15, B)`).
 #[retcd_test]
-fn an_unanswered_probe_drops_the_source() {
+fn probe_unavailable_below_the_probed_head_drops_the_shorter() {
     let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
     assert_eq!(
         f1.rec(
@@ -1129,14 +1136,19 @@ fn an_unanswered_probe_drops_the_source() {
             }
         ),
         vec![
-            lost(A, UnavailableReason::Stalled),
-            selected(15, B),
-            sync(B, 15),
-            sync(C, 15),
+            lost(B, UnavailableReason::StaleLineage),
+            lost(C, UnavailableReason::StaleLineage),
+            selected(20, A),
+            sync(A, 20),
             arm(3, 2_100 + WINDOW),
         ]
     );
+}
 
+/// The probe deadline drops a source that never answered before selecting: a holder that is
+/// down, or faults, gives no answer (issue #61 keeps this half word for word).
+#[retcd_test]
+fn an_unanswered_probe_drops_the_source() {
     let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
     assert_eq!(
         f1.step(2 * WINDOW - 1, fired(2)),
@@ -8399,4 +8411,171 @@ fn issue105_the_first_commit_after_the_upgrade_is_writable_and_sets_l() {
         PartitionMode::Active,
         "a normal recovery is not held"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #61 A4: a probe below a floor drops the shorter survivor, never the longer
+// ---------------------------------------------------------------------------------------------
+
+/// Issue #61 A4: a `ProbeUnavailable` for a **base** probe still drops the probed copy. A lacks
+/// the base rung, so it is asked at the base; unavailable there it cannot show it descends from
+/// the root, and A goes, `Stalled`, as before #61. B and C are kept and 20 is selected from B.
+/// Cut: every `ProbeUnavailable` keeps the probed copy, red (A is selected).
+#[retcd_test]
+fn t61_probe_unavailable_for_root_still_drops_the_probed() {
+    let mut f1 = baseless_closed();
+    assert_eq!(
+        f1.rec(
+            2_100,
+            RecoveryEvent::ProbeUnavailable {
+                copy: A,
+                seq: Seq(BASE)
+            }
+        ),
+        vec![
+            lost(A, UnavailableReason::Stalled),
+            selected(20, B),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 2_100 + WINDOW),
+        ]
+    );
+}
+
+/// Issue #61 A4, m-a: when `(A, base)` is both A's base probe and the pair probe for B, whose
+/// head is the base, the base probe wins: A is dropped `Stalled`, and B is kept. C holds the base
+/// and 20, so 20 is selected from C.
+/// Cut: the base-probe check in `start_probing` removed, red (B dropped `StaleLineage`, A kept).
+#[retcd_test]
+fn t61_a_same_tuple_base_probe_drops_the_probed() {
+    let baseless = SurvivorInventory {
+        ladder: vec![(Seq(16), dg(0, 16))],
+        ..inv(A, 20)
+    };
+    let (mut f1, close) = closed(&[], vec![baseless, inv(B, BASE), inv(C, 20)], &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: A,
+                seq: Seq(BASE)
+            }),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    let effects = f1.rec(
+        2_100,
+        RecoveryEvent::ProbeUnavailable {
+            copy: A,
+            seq: Seq(BASE),
+        },
+    );
+    assert_eq!(
+        effects[..2],
+        [lost(A, UnavailableReason::Stalled), selected(20, C)],
+        "{effects:?}"
+    );
+    assert!(
+        !effects.contains(&lost(B, UnavailableReason::StaleLineage)),
+        "{effects:?}"
+    );
+}
+
+/// Issue #61 A4, m-a: a shorter copy dropped behind retention owes no probe. B (head 15, sparse)
+/// owes `(B, 12)` for C; A owes `(A, 12)` and `(A, 15)`. A answers `(A, 15)` unavailable, so B is
+/// dropped and its `(B, 12)` goes with it. A's answer at 12 is then the last one, and selection
+/// runs at once.
+/// Cut: `drop_behind_retention` leaves B's probes outstanding, red (the run waits for the
+/// deadline: `Recorded`, no selection).
+#[retcd_test]
+fn t61_dropped_shorter_copies_owe_no_probe() {
+    let (mut f1, close) = closed(&[], vec![sparse(A, 20), sparse(B, 15), inv(C, 12)], &[]);
+    let probes: Vec<_> = close
+        .iter()
+        .filter_map(|e| match e {
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt {
+                copy,
+                seq,
+            })) => Some((*copy, seq.0)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(probes, vec![(A, 12), (A, 15), (B, 12)], "{close:?}");
+    assert_eq!(
+        f1.rec(
+            2_100,
+            RecoveryEvent::ProbeUnavailable {
+                copy: A,
+                seq: Seq(15)
+            }
+        ),
+        vec![lost(B, UnavailableReason::StaleLineage)]
+    );
+    let effects = f1.rec(
+        2_101,
+        RecoveryEvent::ProbeAnswered {
+            copy: A,
+            seq: Seq(12),
+            digest: dg(0, 12),
+        },
+    );
+    assert_eq!(effects.first(), Some(&selected(20, A)), "{effects:?}");
+}
+
+/// Issue #61 A4, m-b: when the probed copy is a shadow, today's rule applies and the shadow is
+/// dropped, never the regulars it could not vouch for. D, a shadow, holds 20 sparsely; A, B and C
+/// hold 15. D's pair probe at 15 is unavailable: D goes `Stalled`, and 15 is selected from A.
+/// Cut: the shadow check in `probe_unavailable` removed, red (A, B, C dropped, D selected).
+#[retcd_test]
+fn t61_a_floored_shadow_is_dropped_not_the_regulars() {
+    let (mut f1, _) = closed(
+        &[member(D, ReplicaRole::Shadow)],
+        vec![inv(A, 15), inv(B, 15), inv(C, 15), sparse(D, 20)],
+        &[],
+    );
+    let effects = f1.rec(
+        2_100,
+        RecoveryEvent::ProbeUnavailable {
+            copy: D,
+            seq: Seq(15),
+        },
+    );
+    assert_eq!(
+        effects[..2],
+        [lost(D, UnavailableReason::Stalled), selected(15, A)],
+        "{effects:?}"
+    );
+}
+
+/// Issue #61 A4: after a shorter copy is dropped behind retention, the commit is writable on the
+/// two longer copies. A (sparse) and B hold 20, C holds 15; A cannot vouch for 15, so C is dropped
+/// `Ineligible(StaleLineage)`. 20 is selected from A, both A and B prove it durable, and the
+/// commit is `DegradedRf2`.
+/// Cut: the probed copy dropped instead (pre-#61), red (`selected(20, B)`, A lost).
+#[retcd_test]
+fn t61_after_drop_selection_commits_writable_on_two() {
+    let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 20), inv(C, 15)], &[]);
+    let effects = f1.rec(
+        2_100,
+        RecoveryEvent::ProbeUnavailable {
+            copy: A,
+            seq: Seq(15),
+        },
+    );
+    assert_eq!(
+        effects[..2],
+        [lost(C, UnavailableReason::StaleLineage), selected(20, A)],
+        "{effects:?}"
+    );
+    assert_eq!(
+        f1.rec(3_000, durable(A, 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(
+        f1.rec(3_001, durable(B, 20, dg(0, 20))),
+        vec![cas(CONTROL_REV, A), arm(4, 3_001 + WINDOW)]
+    );
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::DegradedRf2);
 }

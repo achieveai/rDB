@@ -140,6 +140,17 @@ One transaction WriteBatch contains its deterministic mutation list/history enve
 
 A logical history record is retained in RocksDB as data; native engine WAL sequence numbers are not the cross-node replication identity. Core engines may mix many partitions in the physical WAL; each partition still has its own logical ordered history.
 
+**Amended 2026-11-20 (issue #61): History is kept from a floor F.** A lineage's History need not start at seq 1. ADR-rdb-0027 has the decision.
+
+- **The floor.** A trim writes one engine-private `TrimFloor { seq, root_base, root_digest }` record on the lineage. Its `seq` is the floor F. History then holds `F..=applied`. The record **at** F is kept; nothing below it is.
+- **Reading it.** `RocksEngine::floor` walks the lineage's chain through every link, `copied` ones included, and answers the highest mark that cuts what the lineage reads. `RocksEngine::floor_seq` is its seq, or 0 on a lineage never trimmed.
+- **The trim.** `RocksEngine::stage_trim_history` is one unsynced `WriteBatch`. It deletes `[0, F)` on the lineage's own level, and on each level reached through a link at base `b` it deletes `[0, min(F, b+1))`. It marks every level it cuts, and a mark never goes down. A parent's records above a link's base (an issue #105 tail) are never touched.
+- **What refuses a trim.** The engine refuses a lineage that is staging, installing or sealed, a floor above `applied`, and a floor below the current one. The host also refuses while an inventory pin is held (`inventory_pinned`), and past the lowest `S` of a snapshot transfer it serves (`transfer_pinned`).
+- **The ladders follow.** The host trims R1's ladders first, then the engine, then the ladders it keeps, in one step, so no ladder holds a rung below F (ADR-rdb-0005).
+- **A trim is local.** It is one copy's cleanup, not a replicated write. No `applied` mark moves.
+- **The other writer.** A snapshot install writes a floor at its barrier `S` (§10.1).
+- **Who trims in this release.** Only the debug-build dev tool `rdb_dev admin trim-history --through N` (`Db::trim_history`). The automatic trim, with its keep window and byte cap, is a later change.
+
 ### 4.2 Initial bounded budgets
 
 | Resource | Initial rule | Failure behavior |
@@ -760,6 +771,13 @@ Returning replicas with stale suffixes are quarantined read-only for diagnostics
 
 Quarantined suffix retention defaults to seven days and capacity permits; deletion requires operational policy approval. It is not merged automatically into current data. A suffix adopted under §8.5 was never quarantined. Proven corruption may require manual restore and is outside automatic majority-loss recovery.
 
+**Amended 2026-11-20 (issue #61): how a copy behind the floor is rebuilt.** A copy whose head is below its primary's History floor (§4.1) cannot catch up record by record. It is rebuilt from a state snapshot (§10.1).
+
+- **The install is the staging and switch above, for this case.** `install_begin` deletes every lineage the partition holds on that copy and writes an `installing` record on the new lineage, in one batch. `install_chunk` writes each page. `install_finish` writes the barrier's History record, `applied = S` and a `TrimFloor` at `S`, and deletes `installing`, in one synced batch.
+- **A crash mid-install.** A lineage still `installing` at open is cleared (`snapshot_install_cleared_at_open`), and the copy rejoins empty.
+- **The old lineages are deleted at install start, not kept seven days.** That happens only after the target checked the offer's authority (§10.1). A copy whose tail scan finds a current issue #105 tail refuses the offer instead (§10.1). A superseded tail (§8.5) is deleted with the rest.
+- **The read-only window.** When the one copy left must rebuild the other before writes return, writes are refused `RECOVERY_READ_ONLY` until it has (§10.1).
+
 ### 8.5 A live copy's tail: the guard and the way back
 
 Added 2026-11-11 (issue #105, units 1 and 2). It states what the code does. The owner's decisions of 2026-11-09 are marked where they apply.
@@ -825,6 +843,13 @@ A holder adopts the tail inside its inventory answer. It then reports as an ordi
 4. **P2.** Every record from the base to the head reads, verifies and chains.
 5. **The write's preconditions** for the chosen way, below. These mirror what the storage engine's `inherit` would refuse, so `Adoptable` means the write will succeed.
 
+**Amended 2026-11-20 (issue #61): below a floor, adoption refuses.** P1 and P2 read History that a trim (§4.1) may have deleted. Then `Host::adoption` adopts nothing and answers `TailAdoption::Trimmed` (§8.5.6):
+
+- `tail_below_floor`, before P1, when the tail's lineage is trimmed above the anchor's base;
+- `base_below_floor`, from `Host::chain`, when the base is below the floor of the lineage P2 walks.
+
+Such a tail cannot come back by adoption. The copy is rebuilt by snapshot once it is given up (§8.5.9, §10.1).
+
 `Host::adopt` then writes it one of three ways:
 
 - **Link.** The copy holds no lineage at the anchor's generation. `inherit` links it onto the tail's lineage at the tail's head. At the chain depth ceiling (32 levels) the link is a full copy instead. That copy runs on the host thread, at most once per 32 levels.
@@ -841,7 +866,7 @@ After any of them, a receiver held on that copy is dropped. A catch-up it then s
 
 > A commit is writable only if a verified copy, of any role, on a node in L's regulars, holds lineage L intact.
 
-Intact means not staging, and holding a record at seq 1 when L applied any. A copy reports it as `SurvivorInventory.holds_last_writable`. A wiped or rebuilt copy fails it. A flattened copy passes.
+Intact means not staging, and holding a record at its floor when L applied any: seq 1 on a lineage never trimmed, else its trim floor F (amended 2026-11-20, issue #61; `Host::has_floor`, the read check B also uses). A copy reports it as `SurvivorInventory.holds_last_writable`. A wiped or rebuilt copy fails it. A flattened copy passes.
 
 The rule is waived while L is unknown, over a first generation, and for a run given `--no-intact-copy`. While it applies and no L-regular has verified intact, the discovery window waits once more for a silent one (`recovery_window_extended_for_intact`).
 
@@ -857,6 +882,7 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `NotReady(reason)` | The proofs hold so far, but a precondition is not met yet | Holds | Needs `--give-up-live-copy` |
 | `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
 | `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
+| `Trimmed(reason)` | The proofs could not run: the history they read is trimmed (issue #61; wire word `trimmed`). The tail cannot come back | Holds | Needs `--give-up-live-copy` |
 
 `ADOPTION_REFUSALS` is the wire vocabulary: the 11 reasons a peer can decode. The first three are `NotReady`. Two more refusals sit outside it: check B's floor refusals `tail_has_no_floor` and `tail_history_read_failed` (#121). A reason outside the list is reported as `Unchecked`, so it never crosses the wire as `Refused`.
 
@@ -874,7 +900,9 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `anchor_lineage_differs` | `Refused` | Replay: the anchor's lineage does not chain into the tail |
 | `tail_too_long` | `Refused` | Replay: more than `ADOPT_REPLAY_MAX` records |
 
-`TailAdoption::could_return` is true for every state but `Refused`.
+`ADOPTION_TRIMMED` holds the two `Trimmed` reasons: `tail_below_floor` (the tail's lineage is trimmed above the anchor's base) and `base_below_floor` (the chain from the base is trimmed). A bare `forget-tail --through` over a `Trimmed` tail is refused with "they cannot come back: the history needed to adopt them is trimmed", naming the whole command `admin forget-tail --partition P --through H --give-up-live-copy`.
+
+`TailAdoption::needs_give_up_flag` is true for every state but `Refused`.
 
 The owner's membership repair re-plans only when every held tail is `Adoptable`. A stalled rebuild copy whose tail is `Adoptable` does not hold that repair back, since the re-plan is what adopts it.
 
@@ -921,7 +949,7 @@ It is refused, giving up nothing, when:
 
 - H is at or below the committed cutoff;
 - no copy holds a tail above the cutoff;
-- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given. A holder the committed ledger marks that no repair probe has reported on yet counts as `Unchecked`; a probe's report, `Refused` included, stands over the mark. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
+- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), or a `Trimmed` one (issue #61, below), unless `--give-up-live-copy` is given. A holder the committed ledger marks that no repair probe has reported on yet counts as `Unchecked`; a probe's report, `Refused` included, stands over the mark. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
 - `--no-intact-copy` is given and the intact rule did not cap the owner's last commit;
 - another re-plan is running.
 
@@ -929,9 +957,16 @@ The owner re-plans with `RecoveryPlan.release`. F1 copies `through` onto that ru
 
 What is given up is gone for good. Being accepted does not mean writable: the re-plan can still commit `ReadOnly`, for example with too few copies. The next run then holds the tail again.
 
+**Amended 2026-11-20 (issue #61): trimmed tails, and a copy outside the membership.**
+
+- **A `Trimmed` tail needs `--give-up-live-copy`.** It cannot come back, but nothing proved it superseded, so it may hold the only copy of an acknowledged write. Without the flag the refusal says the seqs "cannot come back: the history needed to adopt them is trimmed", and names the whole command: `admin forget-tail --partition P --through H --give-up-live-copy`.
+- **A copy that refused this owner's snapshot offer is counted.** Such a copy may be outside the membership, so no repair probe and no ledger entry names it. The owner keeps each `tail_held` refusal it hears as an offer hold (`offer_holds`, logged `offer_hold_recorded`), and forget-tail counts it as `Unchecked`, so it needs `--give-up-live-copy`. Without this, the ask would be refused "nothing for --through to give up".
+- **What an accepted ask does with a hold.** Every hold at or below H is dropped (`offer_hold_released`). The answer names each one: `copy N on node M: seqs C+1..=H given up for good`. No offer is sent then. The re-plan's writable commit supersedes the tail, and the next ordinary catch-up offer rebuilds the copy (§10.1).
+- **Holds live in memory.** An owner restart loses them. The copy then refuses the next offer again, and the owner records the hold again.
+
 #### 8.5.10 Upgrade, release and limits
 
-**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 10 (9 when this was decided; issue #107 slice 2b moved it to 10, and that upgrade is also stop every node and every app process linked to them, upgrade them all, start the nodes, then the apps; an app process at another version is refused at the handshake as a node is). An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
+**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 11 (9 when this was decided; issue #107 slice 2b and issue #87 moved it to 10, and issue #61's snapshot wire to 11, and each of those upgrades is also stop every node and every app process linked to them, upgrade them all, start the nodes, then the apps; an app process at another version is refused at the handshake as a node is). An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
 
 **Owner decision (2026-11-09): units 1 and 2 release together.** Unit 1 alone can only give a live copy's tail up.
 
@@ -1007,20 +1042,58 @@ No dedicated shadow pool is mandatory. In v1, a shadow-eligible node is configur
 
 ```mermaid
 sequenceDiagram
-  participant S as Authoritative source
-  participant DB as Logical history retention
-  participant T as Invisible target staging
-  S->>S: Capture partition barrier + snapshot
-  S->>T: Manifest + hashed chunks
-  S->>DB: Retain history after barrier
-  T->>T: Verify chunks and import staging prefix
-  DB->>T: Replay contiguous transactions
-  T->>T: Fsync exact seq + digest
-  T-->>S: Ready(barrier, seq, digest)
+  participant S as Primary (source)
+  participant T as Copy behind the floor (target)
+  S->>S: Open a transfer at S = applied, pin the trim at S
+  S->>T: SnapshotOffer once S is durable
+  T->>T: Authority check, or SnapshotOfferRefused
+  loop Until the last page
+    T->>S: SnapshotPull(after, chain so far)
+    S->>T: SnapshotChunk(entries, chain)
+    T->>T: Check the chain, then write the page
+  end
+  T->>T: install_finish: barrier record, applied = S, TrimFloor at S (synced)
+  T-->>S: ACK at S
+  S->>T: Records S+1 ..= head, then CopyCaughtUp releases the pin
 ```
 
-**Takeaway:** snapshot bytes are insufficient alone; the target stays invisible until verified catch-up reaches an exact durable lineage barrier.
+**Takeaway:** the target pulls a chained, paged view of the primary's state, checks each page before it writes it, and is caught up from `S` by ordinary records. The snapshot proves transport and lineage, not content.
 
+**Amended 2026-11-20 (issue #61, as built).** The diagram above is the build. The three paragraphs after this list are the original intent; where they differ, this list holds. ADR-rdb-0027 has the decision.
+
+- **When.** For a copy behind its primary's History floor (§4.1), R1's ladder holds no rung to check, and R1 emits `SnapshotCatchupRequired`. `Host::snapshot_catchup` serves it.
+  - If the primary's own ladder is not dense from the engine's floor to its head, it is refilled from the engine, and the copy is walked record by record (`snapshot_catchup_served{how="ladder"}`). A refill is never deduplicated.
+  - Only a dense ladder opens a transfer: the engine cannot serve the record either.
+- **Source.** A transfer is a paged `RocksSnapshot` view at `S`, the lineage's applied seq, plus a pin: a trim past `S` is refused (`transfer_pinned`) until the copy's `CopyCaughtUp`.
+  - One transfer per copy. While one of this generation is open, every ask is dropped, a newer barrier too (`snapshot_catchup_in_flight`).
+  - `snapshots_served` is keyed by `(generation, S)`. A repeat ask for the same barrier in the same generation is dropped. A later commit's ask at the same `S` is served again.
+  - A transfer ends on the copy's `CopyCaughtUp`, on the target's refusal, on the target node's `PeerBooted`, after 60 s with no pull (`SNAPSHOT_IDLE_MILLIS`), or on a page read fault.
+- **Target-started pull, chained chunks, no up-front manifest.** The source sends `SnapshotOffer` once its engine's `durable` reaches `S`. The target then pulls one page at a time (`SnapshotPull`). Each `SnapshotChunk` holds at most `COPY_BATCH_KEYS` entries.
+  - The pull carries the target's chain so far, so the source keeps no chain state.
+  - A chunk's chain is `Digest::of(Domain::Record, [SNAPSHOT_CHUNK_LABEL, prev, then each entry's namespace, key, value, version, generation])`. Chunk 0's `prev` is the barrier record's `record_digest`.
+  - The target checks each chunk before it writes it. A mismatch is refused `snapshot_install_refused{reason="chain"}`, and nothing is switched.
+- **The authority check comes first.** `Host::snapshot_offer` accepts an offer only when all of these hold. Otherwise it changes nothing, logs `snapshot_offer_refused{reason}`, and sends `SnapshotOfferRefused`, and the source drops its transfer and pin at once.
+  - Its live receiver adopted the offer's lineage (partition, generation, owner epoch) and copy (`not_adopted`).
+  - The offerer is that config's primary node and boot (`not_primary`).
+  - `S` is above its applied head (`not_ahead`).
+  - The barrier record decodes, names `S` and recomputes its digest (`bad_barrier`).
+  - Its tail scan finds no held issue #105 tail (`tail_held`, below).
+- **Delete at install, after that check.** The first chunk runs `install_begin`, which deletes every lineage the partition holds on that copy. `install_begin` and `install_chunk` are unsynced; `install_finish` is synced. A crash before the finish leaves either the old lineages, when the begin never reached disk, or an `installing` lineage, which the open clears (§8.4).
+- **Re-seed.** After `install_finish` the target re-seeds its receiver at `(S, barrier digest)` with `durable = S`, and sends the primary an unsolicited ACK at `S`. R1 takes it as any ACK: at the head it reports `CopyCaughtUp`; below it, it walks `S+1..=head`.
+- **Content is not proven.** The chain proves the pages arrived as the source sent them, in order, from that barrier. It does not prove the source's state is what its History would build (owner ruling Q5).
+- **Keep window plus cap.** The paragraph below names a 30-minute, 20-GB budget. In this build no automatic trim runs: History is trimmed only by the debug-build `rdb_dev admin trim-history`, and only the transfer pin and the inventory pin hold a trim back. A keep window (kept at least) and a byte cap (a hard cap that overrides a lagging copy and a transfer pin) are a later change.
+- **A held #105 tail refuses the offer.** `Host::offer_tail` runs the tail scan with L from the target's landed commit.
+  - A writable commit supersedes every older tail, so a copy left out of one never hits. A hit needs L unknown: a partition whose record an older build wrote, with no writable commit since.
+  - On a hit the target refuses `tail_held` with the tail's head H. It warns `copy_needs_forget_tail` once per partition and copy, and its `NodeStatus::needs_operator` names the copy, H and the command.
+  - The owner records the refusal as an offer hold (`offer_holds`). Its `needs_operator`, which `Db::readiness` shows as `PartitionReady::degraded`, names the same. `admin forget-tail` counts the hold (§8.5.9).
+- **A move's catch-up clock.** A move's shadow below the floor is rebuilt the same way. While the owner's transfer to that shadow serves more entries, the move's no-progress clock starts again (`Host::transfer_pulled`, `Host::move_lag_duty`).
+- **The read-only window.** History was trimmed, a copy was down past the floor, and then the owner died. The one copy left commits `ReadOnly` (§8.3 needs two copies for writes) and rebuilds the other by snapshot.
+  - During the window a write is refused `RECOVERY_READ_ONLY`, `retry = RetryAfterRecovery`, `no_mutation` true, with `retry_after` = `REBUILD_RETRY_HINT` (5 s) (`Host::named_read_only`, `Host::rebuilding_read_only`).
+  - The detail names the copy, its node, the entries and MiB sent and the seconds since the transfer opened, and ends with `REBUILDING_STEP`.
+  - The 5 s is a poll hint, not an estimate: the source knows what it has sent, not what is left.
+  - After the rebuild, the owner commits writable: `DegradedRf2` on the two copies while the third is down (lead ruling R21).
+
+Original intent:
 
 Take a partition-consistent snapshot at `(generation, seq, digest)`. Export only that partition prefix with a manifest of chunk hashes, sizes, format version and root digest; no assumption that a whole core-engine checkpoint is a per-partition transfer.
 

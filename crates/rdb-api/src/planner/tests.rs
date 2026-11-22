@@ -58,6 +58,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         clock_bound_lost: false,
         committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         tail_refused: None,
+        needs_operator: None,
     }
 }
 

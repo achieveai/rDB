@@ -149,9 +149,20 @@ Selected(max by head_seq)                    // safe only because every pair pas
 An earlier draft wrote "when the ladder lacks the needed seq, F1 emits `ProbeDigestAt` and waits",
 which smuggled an effect into a pure function that had no return path for it. Missing rungs are now
 a returned value, and the `Collecting` phase loops: emit the probes, fold the answers into the
-inventories, call again. A copy that cannot answer a probe is dropped from the candidate set and
-recorded in the `LossRecord` — losing an unreachable copy's prefix is a stated loss; promoting an
-unchecked one is not an option. The loop **collects every missing rung before returning**, so one
+inventories, call again. An unanswered probe (the holder is down, or its read faults) drops the
+probed copy from the candidate set at the probe deadline, recorded in the `LossRecord` — losing an
+unreachable copy's prefix is a stated loss; promoting an unchecked one is not an option.
+
+**Amended by issue #61 (History trim).** `ProbeUnavailable` now means the holder is alive and
+holds no record at that seq in the probed generation: either the seq is below its History floor,
+or it is above its head. A down holder, or one whose read faults, gives no answer. For a pair probe `(b, a.head)` below `b`'s head,
+`b` could not vouch for the shorter copies whose head is that seq, so **those shorter copies are
+dropped**, `Ineligible(StaleLineage)` (logged `survivor_behind_retention`), with their own
+outstanding probes; `b` is kept, and selection runs again on the rest. A shorter copy's head is at
+or below `b`'s, on the same root, and one generation admits one record per seq, so nothing `b`
+lacks is lost. A `ProbeUnavailable` for any other probe — a base probe, which wins when it is the
+same tuple as a pair probe, a probe of a shadow, or an answer above the probed copy's head —
+drops the probed copy, as before. The loop **collects every missing rung before returning**, so one
 round trip asks all the questions, and it **returns `Divergence` immediately** even with probes
 outstanding, because more evidence cannot un-prove a mismatch.
 
@@ -700,7 +711,7 @@ consumer does not handle.
 | No union exists | Structural: no merge function in the module; reviewed as an absence |
 | Unverified input cannot reach selection | Structural: `select_prefix` takes only `VerifiedInventory`, which has no public constructor. Reviewed, not compile-fail-tested — M7 adds no `trybuild` dependency, and a compile-fail row would assert the language, not this design |
 | A skipped compatibility loop is caught | Property test: generate inventory pairs agreeing at the root and disagreeing above it; `select_prefix` must return `Divergence`, never `Selected`. **This is the only guard on that half of the rule** |
-| A missing ladder rung is probed, not assumed | `select_prefix` returns `NeedProbes` with every missing rung in one batch; a copy that cannot answer is dropped and recorded in the `LossRecord` |
+| A missing ladder rung is probed, not assumed | `select_prefix` returns `NeedProbes` with every missing rung in one batch; an unanswered probe drops the probed copy, and a `ProbeUnavailable` for a pair probe below the probed copy's head drops the shorter copies instead (issue #61); either is recorded in the `LossRecord` |
 | Discovery window extends only while transferring, and not forever | Advertised-higher + progressing extends; stalled records unavailable and closes; a source dribbling one record per window is cut off after 3 extensions with `uncertain` set |
 | Every stalled source is recorded, not just one | Two concurrent transfers, both stalled: two `RecordSourceUnavailable` effects, one per copy |
 | Window survives a stale decision tick | A `FenceProven` whose `decision_tick` is 10 s old still gets a full 2,000 ms window from its arrival tick |

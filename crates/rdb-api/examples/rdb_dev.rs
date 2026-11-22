@@ -443,6 +443,11 @@
 //!                                         whose adoption was refused needs no flag), or
 //!                                         the intact rule not holding the partition.
 //!                                         Under `--nodes`, only an admin app may run it
+//! admin trim-history --through N [--node n]
+//!                                         debug builds only (issue #61): delete partition 1's
+//!                                         History below seq N on node n, or on every node this
+//!                                         process runs, keeping the record at N; answers
+//!                                         `trimmed: node n history_floor N` per node
 //! admin fork-copy <n>                     debug builds only (#65 mode C walk): rewrite node
 //!                                         n's head record as a validly chained different
 //!                                         one; `node restart n` then rejoins it and the
@@ -2234,6 +2239,9 @@ fn repl<'scope, 'env>(
                 bad |= !answer(&fork_copy_line(db, node));
             }),
             ["admin", "fork-copy", ..] => Err(FORK_COPY_USAGE.to_owned()),
+            ["admin", "trim-history", rest @ ..] => {
+                trim_history_lines(db, rest).map(|lines| bad |= !answer_all(&lines))
+            }
             ["admin", "clear", object] => {
                 let answer = db.write(object.as_bytes(), Change::Clear, None);
                 bad |= !kind_write_line(
@@ -2468,19 +2476,32 @@ fn take_partition<'a>(rest: &[&'a str]) -> Result<(Option<PartitionId>, Vec<&'a 
 
 /// `admin readiness`: one line per partition, then how many are ready.
 fn readiness_lines(db: &Db) -> Vec<String> {
-    let seen = db.readiness();
+    readiness_text(&db.readiness())
+}
+
+/// [`readiness_lines`]' words for what `Db::readiness` saw. A partition that needs an operator
+/// (issue #61, `PartitionReady::degraded`) gets a second line, `degraded: <command>`, whether or
+/// not it is ready, so the operator sees it without reading logs.
+fn readiness_text(seen: &[rdb_api::PartitionReady]) -> Vec<String> {
     let ready = seen.iter().filter(|partition| partition.ready).count();
     let total = seen.len();
     seen.iter()
-        .map(|partition| match &partition.reason {
-            None => format!(
-                "partition {} owner {} ready",
-                partition.partition.0, partition.owner.0
-            ),
-            Some(reason) => format!(
-                "partition {} owner {} not ready: {reason:?}",
-                partition.partition.0, partition.owner.0
-            ),
+        .flat_map(|partition| {
+            let state = match &partition.reason {
+                None => format!(
+                    "partition {} owner {} ready",
+                    partition.partition.0, partition.owner.0
+                ),
+                Some(reason) => format!(
+                    "partition {} owner {} not ready: {reason:?}",
+                    partition.partition.0, partition.owner.0
+                ),
+            };
+            let degraded = partition
+                .degraded
+                .as_ref()
+                .map(|needs| format!("partition {} degraded: {needs}", partition.partition.0));
+            std::iter::once(state).chain(degraded)
         })
         .chain(std::iter::once(format!(
             "readiness: {ready} of {total} partitions ready"
@@ -2990,7 +3011,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "get", "read", "status", "nodes", "node", "admin", "control", "links", "link", "wait",
         "sleep", "quit", "exit", "blob", "client", "put-loop", "barrier", "changes",
     ];
-    const SUBVERBS: [&str; 28] = [
+    const SUBVERBS: [&str; 29] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -3019,6 +3040,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "client drop-reply",
         "admin repair-element",
         "admin fork-copy",
+        "admin trim-history",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -4176,6 +4198,51 @@ fn root_rewrite(
 /// Why `admin damage <set> --element K` takes only `--as digest` (A-R211).
 const SET_MEMBER_AS: &str = "a set member holds no envelope, so any bytes in it are damage; \
      damage a set member with --as digest, or a newer build's set with the root and --as newer";
+
+/// `admin trim-history`'s usage (issue #61).
+const TRIM_HISTORY_USAGE: &str =
+    "admin trim-history --through N [--node n]: N a seq, n is 1, 2 or 3; debug builds only";
+
+/// `admin trim-history --through N [--node n]` (issue #61): a debug-build hook that trims
+/// partition 1's History on node n, or on every node this process runs, to N
+/// ([`Db::trim_history`]). One line per node: `trimmed: node n history_floor N`, or `err ...`
+/// for a node that refused. Release builds answer `err` and change nothing.
+fn trim_history_lines(db: &Db, rest: &[&str]) -> Result<Vec<String>, String> {
+    let (through, node) = match rest {
+        ["--through", n] => (n, None),
+        ["--through", n, "--node", node] | ["--node", node, "--through", n] => {
+            (n, Some(parse_node(node)?))
+        }
+        _ => return Err(TRIM_HISTORY_USAGE.to_owned()),
+    };
+    let through: u64 = through.parse().map_err(|_| TRIM_HISTORY_USAGE.to_owned())?;
+    #[cfg(debug_assertions)]
+    {
+        let nodes: Vec<NodeId> = match node {
+            Some(node) => vec![node],
+            None => db
+                .node_status()
+                .into_iter()
+                .map(|status| status.node)
+                .collect(),
+        };
+        Ok(nodes
+            .into_iter()
+            .map(|node| match db.trim_history(node, through) {
+                Ok(floor) => format!("trimmed: node {} history_floor {floor}", node.0),
+                Err(error) => format!("err admin trim-history node {}: {error}", node.0),
+            })
+            .collect())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (db, through, node);
+        Ok(vec![
+            "err admin trim-history: a debug-build hook; this release build changes nothing"
+                .to_owned(),
+        ])
+    }
+}
 
 /// `admin fork-copy`'s usage (#65 mode C walk).
 const FORK_COPY_USAGE: &str = "admin fork-copy <n>: n is 1, 2 or 3; debug builds only";
@@ -6000,6 +6067,41 @@ mod tests {
         assert!(why.contains("no --group form"), "{why}");
     }
 
+    /// Issue #61 A8c (lead ask): `admin readiness` prints a partition's `degraded` command on a
+    /// line of its own, ready or not, so an operator sees it without reading logs. Unit.
+    /// Cut: `degraded` not printed, red.
+    #[test]
+    fn t61_readiness_prints_a_degraded_partitions_command() {
+        use rdb_api::{NotReady, PartitionReady};
+        let needs = "copy 3 on node 3 holds a tail through seq 40 past the history floor; run: \
+                     admin forget-tail --group 1 --copy 3 --through 40";
+        let seen = [
+            PartitionReady {
+                partition: PartitionId(1),
+                owner: NodeId(2),
+                ready: true,
+                reason: None,
+                degraded: Some(needs.to_owned()),
+            },
+            PartitionReady {
+                partition: PartitionId(2),
+                owner: NodeId(1),
+                ready: false,
+                reason: Some(NotReady::NoLink),
+                degraded: None,
+            },
+        ];
+        assert_eq!(
+            super::readiness_text(&seen),
+            vec![
+                "partition 1 owner 2 ready".to_owned(),
+                format!("partition 1 degraded: {needs}"),
+                "partition 2 owner 1 not ready: NoLink".to_owned(),
+                "readiness: 1 of 2 partitions ready".to_owned(),
+            ]
+        );
+    }
+
     use super::*;
 
     /// The longest a stopped control leader can leave the voters without one, in ms. A follower
@@ -6061,6 +6163,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            needs_operator: None,
         }
     }
 

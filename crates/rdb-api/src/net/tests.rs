@@ -30,12 +30,16 @@ use super::faults::Faults;
 use super::wire::{self, Frame, Inbound, Label, Outbound, WireAnswer, WireMsg, WireReply};
 use super::{certs, LinkState, Net, NetConfig, PROTOCOL_VERSION};
 use crate::db::ApiError;
+use crate::host::snapshot::{
+    SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull, SnapshotRefusal,
+};
 use crate::host::{
     Answer, Change, Client, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg,
     NodeStatus, PeerAsk, PutOp, Seen,
 };
 use crate::transport::Links;
 use rdb_core::contracts::errors::{ErrorKind, RetryRule};
+use rdb_core::contracts::storage::Namespace;
 
 /// A value of `T` decoded from zeros: every integer 0, every list empty, every enum its first
 /// variant. For contract types a link carries as they are (serde-derived in rdb-core), where
@@ -73,9 +77,13 @@ const fn kind(msg: &WireMsg) -> usize {
         WireMsg::Inspect { .. } => 7,
         WireMsg::Answered { .. } => 8,
         WireMsg::DurableProved { .. } => 9,
+        WireMsg::SnapshotOffer { .. } => 10,
+        WireMsg::SnapshotPull { .. } => 11,
+        WireMsg::SnapshotChunk { .. } => 12,
+        WireMsg::SnapshotOfferRefused { .. } => 13,
     }
 }
-const KINDS: usize = 10;
+const KINDS: usize = 14;
 
 /// `msg` as the far side of a link posts it, and the kind it travelled as.
 fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
@@ -111,6 +119,76 @@ fn across(to: NodeId, msg: Msg) -> (Inbound, usize) {
     };
     let kind = kind(&wire);
     (wire::inbound(wire).expect("lands"), kind)
+}
+
+/// Issue #61 S2: one of each snapshot message, every field away from its default, the refusal
+/// carrying `reason`.
+fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
+    let lineage = rdb_core::contracts::authority::Lineage {
+        partition: PartitionId(1),
+        generation: Generation(4),
+        owner_epoch: rdb_core::contracts::ids::OwnerEpoch(3),
+    };
+    let digest = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let after = Some((Namespace::Dedup, Bytes::from_static(b"key-9")));
+    vec![
+        Msg::SnapshotOffer(Box::new(SnapshotOffer {
+            lineage,
+            config_version: rdb_core::contracts::ids::ConfigVersion(6),
+            from: NodeId(1),
+            boot: BootId(5),
+            copy: CopyId(3),
+            at: Seq(800),
+            root: (Seq(120), digest),
+            barrier: Bytes::from_static(b"barrier record"),
+            transfer: 17,
+        })),
+        Msg::SnapshotPull(SnapshotPull {
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            node: NodeId(3),
+            after: after.clone(),
+            prev: digest,
+        }),
+        Msg::SnapshotChunk(Box::new(SnapshotChunk {
+            from: NodeId(1),
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            after,
+            entries: vec![
+                (
+                    Namespace::User,
+                    Bytes::from_static(b"user-1"),
+                    Bytes::from_static(b"value"),
+                    17,
+                    Generation(2),
+                ),
+                (
+                    Namespace::Progress,
+                    Bytes::from_static(b"p"),
+                    Bytes::new(),
+                    u64::MAX,
+                    Generation(4),
+                ),
+            ],
+            chain: digest,
+            done: true,
+        })),
+        Msg::SnapshotOfferRefused(SnapshotOfferRefused {
+            partition: PartitionId(1),
+            generation: Generation(4),
+            at: Seq(800),
+            copy: CopyId(3),
+            node: NodeId(3),
+            reason,
+            through: Some(Seq(812)),
+            transfer: 17,
+        }),
+    ]
 }
 
 /// A valid partition 1 configuration: the two contract types that validate on decode
@@ -558,6 +636,12 @@ fn status() -> NodeStatus {
             reason: "held_past_base",
             adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
         }),
+        needs_operator: Some(crate::host::snapshot::needs_forget_tail(
+            PartitionId(1),
+            CopyId(2),
+            NodeId(3),
+            rdb_core::contracts::ids::Seq(9),
+        )),
     }
 }
 
@@ -615,6 +699,17 @@ fn every_message_kind_crosses_the_wire_unchanged() {
                 barrier: 7,
             },
         },
+        // Issue #61 (PR-A's protocol bump): F1's digest probe.
+        Msg::PeerAsk {
+            asker: NodeId(3),
+            partition: PartitionId(1),
+            correlation: zero(),
+            ask: PeerAsk::Probe {
+                copy: CopyId(2),
+                anchor: zero(),
+                seq: rdb_core::contracts::ids::Seq(800),
+            },
+        },
         Msg::DurableProved {
             partition: PartitionId(1),
             barrier: 7,
@@ -656,6 +751,9 @@ fn every_message_kind_crosses_the_wire_unchanged() {
             owner_live_readd: true,
         },
     ];
+    let plain = plain
+        .into_iter()
+        .chain(snapshot_msgs(SnapshotRefusal::TailHeld));
     for msg in plain {
         let before = format!("{msg:?}");
         match across(to, msg) {
@@ -1201,17 +1299,20 @@ fn status_through_the_wire(
     NodeStatus::try_from(*back)
 }
 
-/// PR #110 review: a status naming a tail crosses the wire unchanged in each of the four
-/// adoption states, `Adoptable`, `NotReady`, `Refused` and `Unchecked`. Unit.
+/// PR #110 review: a status naming a tail crosses the wire unchanged in each adoption state,
+/// `Adoptable`, `NotReady`, `Refused`, `Unchecked`, and (issue #61, its protocol version) `Trimmed` with
+/// each of its reasons. Unit.
 /// Cut: `adoption_to_wire` sends `unchecked` for every state, red.
 #[test]
 fn pr110_a_tail_status_round_trips_in_every_adoption_state() {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     for adoption in [
         Adoptable,
         NotReady("replay_not_ready"),
         Refused("base_digest_differs"),
         Unchecked,
+        Trimmed("tail_below_floor"),
+        Trimmed("base_below_floor"),
     ] {
         let back = status_through_the_wire(adoption).expect("lands");
         assert_eq!(
@@ -1260,6 +1361,16 @@ fn pr110_wire_refuses_adoptable_with_a_reason() {
 #[test]
 fn pr110_wire_refuses_unchecked_with_a_reason() {
     odd_adoption_is_refused("unchecked", Some("base_digest_differs"));
+}
+
+/// Issue #61 (lead ruling R16), wire decoder: `refused` naming a trimmed history is refused,
+/// and so is `trimmed` naming a failed proof or no reason. Unit.
+/// Cut: the state check after `known` skips `Trimmed`, red.
+#[test]
+fn t61_wire_refuses_trimmed_on_the_wrong_state() {
+    odd_adoption_is_refused("refused", Some("tail_below_floor"));
+    odd_adoption_is_refused("trimmed", Some("base_digest_differs"));
+    odd_adoption_is_refused("trimmed", None);
 }
 
 /// PR #110 review, wire decoder: `not_ready` with no reason is refused. Unit.
@@ -1755,6 +1866,54 @@ fn a_sender_is_held_to_its_certificate_label() {
     }
 }
 
+/// Issue #61 (#214 folded in): each snapshot message is held to the sender's certificate. The
+/// offer and its pages name the source (node 1 here), a pull and a refusal the target (node 3).
+/// From node 1 the offer and the page pass and the pull and the refusal are refused; from
+/// node 3 the reverse; from node 2, a certified member naming neither, all four are refused,
+/// each naming the node it claimed. An app may send none of them.
+/// Cut: the snapshot arms removed from `sender_refused`, red (node 2's forgeries pass).
+/// Unit.
+#[test]
+fn a_snapshot_message_is_held_to_its_certificate_label() {
+    let on_wire = |msg: Msg| match wire::outbound(NodeId(4), msg) {
+        Ok(Outbound::Plain(wire)) => wire,
+        other => panic!("a plain message: {other:?}"),
+    };
+    let msgs: Vec<WireMsg> = snapshot_msgs(SnapshotRefusal::NotAhead)
+        .into_iter()
+        .map(on_wire)
+        .collect();
+    let names: Vec<&str> = msgs.iter().map(WireMsg::name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "snapshot_offer",
+            "snapshot_pull",
+            "snapshot_chunk",
+            "snapshot_offer_refused"
+        ]
+    );
+    let passes = |peer: u32| -> Vec<bool> {
+        msgs.iter()
+            .map(|msg| {
+                super::sender_refused(&Label::Node(NodeId(peer)), msg, &admin_apps()).is_none()
+            })
+            .collect()
+    };
+    assert_eq!(passes(1), vec![true, false, true, false], "from the source");
+    assert_eq!(passes(3), vec![false, true, false, true], "from the target");
+    assert_eq!(passes(2), vec![false; 4], "from neither");
+    for (msg, claimed) in msgs.iter().zip([1, 3, 1, 3]) {
+        let reason =
+            super::sender_refused(&Label::Node(NodeId(2)), msg, &admin_apps()).expect("forged");
+        assert!(reason.contains(&format!("node {claimed}")), "{reason}");
+        assert!(
+            super::sender_refused(&Label::App("pilot".to_owned()), msg, &admin_apps()).is_some(),
+            "an app sends {msg:?}"
+        );
+    }
+}
+
 /// A-R479, the arm itself: a copy move and a rebuild pass only from an app on the admin list
 /// (or from a node); an empty list, a library caller's default, refuses every app's. Other
 /// calls from any app are untouched. Cut: no admin arm, red.
@@ -1990,6 +2149,34 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     assert_eq!(
         reason,
         format!("node-2 speaks protocol_version 3, node-1 speaks {PROTOCOL_VERSION}")
+    );
+}
+
+/// Issue #61 A8b (lead ruling R16 item 1): an app one protocol version behind is refused at the
+/// handshake as a peer is, so no build before #61's version ever reads the adoption state `trimmed` or
+/// `WireNodeStatus::needs_operator`: the guarantee is the refusal, and there is no down-level
+/// encoding to keep. The number is derived from `PROTOCOL_VERSION`.
+/// Cut: the listener accepts an older hello (`refusal` skips the version) → the link comes up.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn t61_an_app_one_protocol_version_behind_never_reads_trimmed() {
+    let dir = config_testkit::fs::temp_dir();
+    let label = Label::App("pilot".to_owned());
+    certs::generate(dir.path(), &[Label::Node(NodeId(1)), label.clone()]).expect("certs");
+    let one = side(Spec::node(1, dir.path(), &[]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let previous = PROTOCOL_VERSION - 1;
+    let older = Spec {
+        claim: Some(label.clone()),
+        cert_of: Some(label),
+        version: previous,
+        ..Spec::node(9, dir.path(), &[1]).dialling(1, addr)
+    };
+    let older = side(older, false).await;
+    let reason = refusal(&older, 1).await;
+    assert_eq!(
+        reason,
+        format!("app-pilot speaks protocol_version {previous}, node-1 speaks {PROTOCOL_VERSION}")
     );
 }
 
@@ -3430,6 +3617,44 @@ async fn an_accepted_socket_has_nodelay_set() {
     assert!(
         socket.nodelay().expect("read the option"),
         "Nagle is still on"
+    );
+}
+
+/// Issue #61 S2 (PR-A A8a): every snapshot message crosses the wire field for field, in its own
+/// kind, and the refusal carries each reason, `tail_held` included though A8a never sends it, so
+/// A8b changes no wire shape. Cut: a kind not appended last moves an index, red in `across`.
+/// Unit.
+#[test]
+fn t61_snapshot_wire_round_trip() {
+    let to = NodeId(2);
+    let reasons = [
+        SnapshotRefusal::NotAdopted,
+        SnapshotRefusal::NotPrimary,
+        SnapshotRefusal::NotAhead,
+        SnapshotRefusal::BadBarrier,
+        SnapshotRefusal::TailHeld,
+        SnapshotRefusal::Chain,
+        SnapshotRefusal::Install,
+        SnapshotRefusal::InstallRetryable,
+    ];
+    let mut kinds = BTreeSet::new();
+    for reason in reasons {
+        for msg in snapshot_msgs(reason) {
+            let before = format!("{msg:?}");
+            match across(to, msg) {
+                (Inbound::Plain(at, after), kind) => {
+                    assert_eq!(at, to);
+                    assert_eq!(format!("{after:?}"), before);
+                    kinds.insert(kind);
+                }
+                (other, _) => panic!("{before} landed as {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        kinds,
+        (10..14).collect(),
+        "the four snapshot kinds, appended last"
     );
 }
 
