@@ -11,7 +11,8 @@
 //!
 //! What the handle does not stop: a holder of the `Db` itself, or an app over a network link,
 //! reaches every scope. rDB's client and peer ports must never be reachable from sandbox or app
-//! networks (#154 owes a node-side check).
+//! networks (#154 owes a node-side check). Until it lands, a node refuses a delete and a list
+//! from an app link that is not one of its admin apps; the other verbs still reach every scope.
 
 use std::sync::Arc;
 use std::time::Duration;
