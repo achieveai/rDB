@@ -6871,7 +6871,7 @@ mod routed_fence {
         assert_eq!(
             bind_routed_fence(PartitionId(1), &proof, Ok(facts), NOW, &test_budgets())
                 .map_err(|(reason, _)| reason),
-            Ok(stored_plan())
+            Ok((stored_plan(), None))
         );
         let (proof, mut facts) = true_fence();
         facts.plan = None;
@@ -6955,8 +6955,43 @@ mod routed_fence {
         };
         plan.release.through = Some(Seq(11));
         let bytes = crate::admin::encode_promote_plan(&plan);
-        assert_eq!(bytes[0], 4);
+        assert_eq!(bytes[0], crate::admin::PROMOTE_PLAN_VERSION);
         assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
+    }
+
+    /// #177: a promote's possible-loss reason is stored after the plan, at the current version
+    /// (5), and reads back with it; none reads back as none. A plan stored at version 4, before
+    /// the reason, reads with none and still binds a routed fence, by the rule older versions
+    /// follow. Cuts: version 4 read as version 5, red (the decode fails); the reason not
+    /// written, red (it reads back none). Unit (<1 ms).
+    #[test]
+    fn i177_a_stored_plan_carries_its_possible_loss_and_a_version_4_one_has_none() {
+        use crate::host::PossibleLossReason;
+        let plan = stored_plan();
+        for reason in [
+            None,
+            Some(PossibleLossReason::OsBootChanged),
+            Some(PossibleLossReason::OsBootUnknown),
+        ] {
+            let bytes = crate::admin::encode_promote_plan_with(&plan, reason);
+            assert_eq!(bytes[0], crate::admin::PROMOTE_PLAN_VERSION);
+            assert_eq!(
+                crate::admin::decode_promote_plan_with(&bytes),
+                Ok((plan.clone(), reason)),
+                "{reason:?}"
+            );
+        }
+        // Version 4's layout: the byte, then the plan alone.
+        let mut v4 = vec![4];
+        v4.extend(postcard::to_stdvec(&plan).expect("a plan serialises"));
+        assert_eq!(
+            crate::admin::decode_promote_plan_with(&v4),
+            Ok((plan, None)),
+            "a version 4 plan has no reason"
+        );
+        let (proof, mut facts) = true_fence();
+        facts.plan = Some(bytes::Bytes::from(v4));
+        assert_eq!(bind(&proof, facts), Ok(()));
     }
 
     /// `stored_plan()` with `must_hold` {3} and a prior naming three members and no note, as #80

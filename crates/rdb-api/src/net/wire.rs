@@ -897,6 +897,11 @@ pub enum WireCall {
         from: WireFeedCursor,
         max: u32,
     },
+    // #177: added last, with #177's protocol version, so the variants above keep their index.
+    AckPossibleLoss {
+        identity: RequestIdentity,
+        generation: Generation,
+    },
 }
 
 impl WireCall {
@@ -913,7 +918,8 @@ impl WireCall {
             | Self::Move { identity, .. }
             | Self::Rebuild { identity, .. }
             | Self::ForgetTail { identity, .. }
-            | Self::Changes { identity, .. } => Some(*identity),
+            | Self::Changes { identity, .. }
+            | Self::AckPossibleLoss { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -934,6 +940,7 @@ impl WireCall {
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
             Self::Changes { .. } => "changes",
+            Self::AckPossibleLoss { .. } => "ack_possible_loss",
         }
     }
 }
@@ -1030,6 +1037,13 @@ impl TryFrom<&ClientCall> for WireCall {
                 from: WireFeedCursor::from(*from),
                 max: *max,
             },
+            ClientCall::AckPossibleLoss {
+                identity,
+                generation,
+            } => Self::AckPossibleLoss {
+                identity: *identity,
+                generation: *generation,
+            },
         })
     }
 }
@@ -1116,6 +1130,13 @@ impl TryFrom<WireCall> for ClientCall {
                 identity,
                 from: from.into(),
                 max,
+            },
+            WireCall::AckPossibleLoss {
+                identity,
+                generation,
+            } => Self::AckPossibleLoss {
+                identity,
+                generation,
             },
         })
     }
@@ -1957,6 +1978,10 @@ pub enum WireAnswer {
     },
     // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
     Changes(WireFeedPage),
+    // #177: added last, with #177's protocol version, so the variants above keep their index.
+    PossibleLossAcked {
+        line: String,
+    },
 }
 
 impl WireAnswer {
@@ -1997,6 +2022,7 @@ impl WireAnswer {
             },
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
+            Answer::PossibleLossAcked(line) => Self::PossibleLossAcked { line: line.clone() },
             Answer::Durable => Self::Durable,
             Answer::Changes(page) => Self::Changes(WireFeedPage::from(page)),
             Answer::Error { error, request } => Self::Error {
@@ -2037,6 +2063,7 @@ impl WireAnswer {
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
             Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::TailForgotten { line } => Answer::TailForgotten(line),
+            Self::PossibleLossAcked { line } => Answer::PossibleLossAcked(line),
             Self::Durable => Answer::Durable,
             Self::Changes(page) => match FeedPage::try_from(page) {
                 Ok(page) => Answer::Changes(page),
@@ -2064,6 +2091,19 @@ pub struct WireHolding {
     pub owner_epoch: Option<OwnerEpoch>,
     pub applied: u64,
     pub durable: u64,
+    /// Added with #177's protocol version: why a restored holding's host may have lost
+    /// acknowledged writes.
+    pub restored: Option<crate::host::PossibleLossReason>,
+}
+
+/// [`crate::host::PossibleLoss`] on the wire. Added with #177's protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WirePossibleLoss {
+    pub copy: NodeId,
+    pub generation: Generation,
+    pub applied: u64,
+    pub reason: crate::host::PossibleLossReason,
 }
 
 /// [`NodeStatus`] on the wire.
@@ -2100,6 +2140,8 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
+    /// Added with #177's protocol version: the partition's possible-loss record on this node.
+    pub possible_loss: Option<WirePossibleLoss>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2181,6 +2223,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                 owner_epoch: held.owner_epoch,
                 applied: held.applied,
                 durable: held.durable,
+                restored: held.restored,
             }),
             authority: status.authority.clone(),
             fence: status.fence,
@@ -2212,6 +2255,12 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            possible_loss: status.possible_loss.map(|loss| WirePossibleLoss {
+                copy: loss.copy,
+                generation: loss.generation,
+                applied: loss.applied,
+                reason: loss.reason,
+            }),
         }
     }
 }
@@ -2233,6 +2282,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 owner_epoch: held.owner_epoch,
                 applied: held.applied,
                 durable: held.durable,
+                restored: held.restored,
             }),
             authority: status.authority,
             fence: status.fence,
@@ -2275,6 +2325,12 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 })
                 .transpose()?,
             lengths: None,
+            possible_loss: status.possible_loss.map(|loss| crate::host::PossibleLoss {
+                copy: loss.copy,
+                generation: loss.generation,
+                applied: loss.applied,
+                reason: loss.reason,
+            }),
         })
     }
 }

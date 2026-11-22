@@ -48,7 +48,7 @@ use rdb_core::contracts::time::Tick;
 
 use crate::admin::{self, PromoteCtx, PromoteError, Promoted};
 use crate::clock::HostClock;
-use crate::host::{Msg, NodeStatus, NodeStopped};
+use crate::host::{Msg, NodeStatus, NodeStopped, PossibleLossReason, FAILOVER_TARGET};
 use crate::transport::Links;
 
 /// How the planner runs (#81 C1). Set [`crate::DbConfig::failover`] to turn it on; `None`, the
@@ -199,6 +199,18 @@ fn cause(error: &ConfigError) -> &'static str {
 
 /// One `partitions/` record and the members it pins, if it pins them (layout 4).
 type Entry = (PartitionRecord, Option<Vec<RecordMember>>);
+
+/// #177: why a failover chosen over `looks` may lose acknowledged writes: some member that
+/// answered reports a holding restored from a store whose host may have rebooted. Every member
+/// that answered counts, whether or not the choice counted it, a faulted or frozen one too:
+/// its store may have held the only copy of a write. Of mixed reasons, unknown wins
+/// ([`PossibleLossReason::worst`]); otherwise changed. `None` when no member reports one.
+fn possible_loss(looks: &[(NodeId, Option<NodeStatus>)]) -> Option<PossibleLossReason> {
+    looks
+        .iter()
+        .filter_map(|(_, status)| status.as_ref()?.holds?.restored)
+        .reduce(PossibleLossReason::worst)
+}
 
 /// The copy to promote for `partition`, whose owner `dead` is dead. Pure.
 ///
@@ -947,6 +959,33 @@ impl Planner {
             .find(|(node, _)| *node == to)
             .and_then(|(_, status)| status.clone());
         let holds = looked.as_ref().and_then(|status| status.holds);
+        let possible_loss = possible_loss(&looks);
+        if let Some(reason) = possible_loss {
+            // Once per choice; a partition whose promote keeps failing repeats it at debug.
+            let generation = current.next().0;
+            let applied = holds.map(|h| h.applied);
+            if quiet {
+                tracing::debug!(
+                    target: FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = to.0,
+                    generation,
+                    applied,
+                    reason = reason.as_str(),
+                    "failover_possible_loss"
+                );
+            } else {
+                tracing::warn!(
+                    target: FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = to.0,
+                    generation,
+                    applied,
+                    reason = reason.as_str(),
+                    "failover_possible_loss"
+                );
+            }
+        }
         let answering: Vec<u32> = looks
             .iter()
             .filter(|(_, status)| status.is_some())
@@ -998,6 +1037,7 @@ impl Planner {
             members_version: version,
             member_boot: Arc::new(member_boot),
             send: Arc::new(send),
+            possible_loss,
         };
         if self.still_held(held).is_none() {
             tracing::info!(

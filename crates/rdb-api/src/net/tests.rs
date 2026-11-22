@@ -293,6 +293,11 @@ fn calls() -> Vec<ClientCall> {
         },
         give_up_live_copy: true,
     });
+    // #177: `admin ack-possible-loss`, its generation carried.
+    calls.push(ClientCall::AckPossibleLoss {
+        identity: identity(4, 37),
+        generation: Generation(6),
+    });
     // Issue #87: a feed call, its cursor's three parts and its cap carried.
     calls.push(ClientCall::Changes {
         identity: identity(4, 36),
@@ -489,6 +494,9 @@ fn answers() -> Vec<Answer> {
         Answer::Status(zero()),
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::TailForgotten("forget-tail: partition 1 re-plans from generation 4".to_owned()),
+        Answer::PossibleLossAcked(
+            "ack-possible-loss: partition 1 generation 6 cleared on node 2".to_owned(),
+        ),
         Answer::Durable,
     ]);
     answers.extend(feed_pages().into_iter().map(Answer::Changes));
@@ -519,6 +527,7 @@ fn status() -> NodeStatus {
             owner_epoch: Some(zero()),
             applied: 5,
             durable: 4,
+            restored: Some(crate::host::PossibleLossReason::OsBootUnknown),
         }),
         authority: "Serving".to_owned(),
         fence: None,
@@ -557,6 +566,12 @@ fn status() -> NodeStatus {
             base: rdb_core::contracts::ids::Seq(2),
             reason: "held_past_base",
             adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
+        }),
+        possible_loss: Some(crate::host::PossibleLoss {
+            copy: NodeId(2),
+            generation: Generation(9),
+            applied: 5,
+            reason: crate::host::PossibleLossReason::OsBootChanged,
         }),
     }
 }
@@ -748,6 +763,9 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         head: Seq(1),
     }));
     assert_eq!(index(&page), 10);
+    // #177: the ack's call and answer went last, after the feed's.
+    let acked = WireAnswer::carry(&Answer::PossibleLossAcked(String::new()));
+    assert_eq!(index(&acked), 11);
     let call = wire::WireCall::try_from(&ClientCall::Changes {
         identity: identity(1, 1),
         from: crate::feed::FeedCursor::START,
@@ -763,6 +781,11 @@ fn every_message_kind_crosses_the_wire_unchanged() {
     let call_index = |call: &wire::WireCall| postcard::to_stdvec(call).expect("encodes")[0];
     assert_eq!(call_index(&forget), 9);
     assert_eq!(call_index(&call), 10);
+    let ack = wire::WireCall::AckPossibleLoss {
+        identity: identity(1, 3),
+        generation: Generation(1),
+    };
+    assert_eq!(call_index(&ack), 11);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
@@ -1591,6 +1614,30 @@ async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_do
         &answer,
         "pilot",
         "rebuild",
+    );
+}
+
+/// #177: as the rows above, for `ack-possible-loss`: clearing the record is an operator's
+/// act, so an app off the admin list is refused as a forget-tail is, and no record is
+/// touched. Cut: drop `AckPossibleLoss` from `sender_refused`'s admin arm, red: node 1's first
+/// message is the ack.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::AckPossibleLoss {
+            identity: identity(9, 1),
+            generation: Generation(4),
+        },
+    )
+    .await;
+    assert_not_admin(
+        "i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused",
+        &got,
+        &answer,
+        "pilot",
+        "ack-possible-loss",
     );
 }
 

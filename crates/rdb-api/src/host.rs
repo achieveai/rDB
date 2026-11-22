@@ -83,7 +83,8 @@ use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{
-    Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions, MAX_CHAIN_DEPTH,
+    Inherited, PossibleLossMark, PublishMark, RocksEngine, RocksSnapshot, StorageOptions,
+    MAX_CHAIN_DEPTH,
 };
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
@@ -987,6 +988,17 @@ pub enum ClientCall {
         /// `--give-up-live-copy`: give up a tail a live copy reports too.
         give_up_live_copy: bool,
     },
+    /// #177: `admin ack-possible-loss` ([`Answer::PossibleLossAcked`]). Any node takes it, for
+    /// the record its own store holds: one that names another generation is refused
+    /// `INVALID_ARGUMENT` and kept, so a stale ack cannot clear a newer record; with none
+    /// standing it answers at once. Over a link only an admin app may send it
+    /// (`NetConfig::admin_apps`), as for a forget-tail.
+    AckPossibleLoss {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The generation of the record to clear.
+        generation: Generation,
+    },
     /// #90: answer [`Answer::Durable`] once every regular copy pinned now has proved its WAL
     /// synced through `through` in `generation`. Carries no identity, so it never queues behind
     /// a call and never blocks a write.
@@ -1236,6 +1248,8 @@ pub enum Answer {
     Rebuilt(String),
     /// A [`ClientCall::ForgetTail`] was taken: the operator's line, naming what is given up.
     TailForgotten(String),
+    /// A [`ClientCall::AckPossibleLoss`] was taken: the operator's line.
+    PossibleLossAcked(String),
     /// A [`ClientCall::WaitDurable`] was proved on every regular copy.
     Durable,
     /// A [`ClientCall::Changes`] page.
@@ -1515,6 +1529,91 @@ pub struct NodeStatus {
     /// inventory, or from a staged child on the newest lineage, so a restart cannot hide one.
     /// Crosses the wire.
     pub tail_refused: Option<TailRefused>,
+    /// #177: the possible-loss record this node's store holds for the partition, until
+    /// `Db::ack_possible_loss` clears it; `None` while none stands. Read from the store each
+    /// time the status is built, so a restart cannot hide one. Crosses the wire.
+    pub possible_loss: Option<PossibleLoss>,
+}
+
+/// #177: the `tracing` target of every possible-loss line (`failover_possible_loss` and the
+/// lines beside it). Named, not the module path, so a code move never renames it.
+pub(crate) const FAILOVER_TARGET: &str = "rdb_api::failover";
+
+/// #177: why a promote may have lost writes that were acknowledged: the OS of a copy's host
+/// may have rebooted since that copy last ran, and a reboot drops what its page cache held
+/// that was not yet on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PossibleLossReason {
+    /// The copy's open found another OS boot than the one on file: the host rebooted.
+    OsBootChanged,
+    /// The copy's open could not tell: no boot on file (its last open never became ready), an
+    /// unreadable boot id, or a platform with none to compare.
+    OsBootUnknown,
+}
+
+impl PossibleLossReason {
+    /// The `reason` field of `failover_possible_loss`: `os_boot_changed` or `os_boot_unknown`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OsBootChanged => "os_boot_changed",
+            Self::OsBootUnknown => "os_boot_unknown",
+        }
+    }
+
+    /// Of two reasons, the one a record keeps: unknown wins, since "cannot tell" may hide a
+    /// reboot and "rebooted" says no more than that.
+    #[must_use]
+    pub const fn worst(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::OsBootChanged, Self::OsBootChanged) => Self::OsBootChanged,
+            _ => Self::OsBootUnknown,
+        }
+    }
+
+    pub(crate) const fn from_cause(cause: rdb_storage::PossibleLossCause) -> Self {
+        match cause {
+            rdb_storage::PossibleLossCause::OsBootChanged => Self::OsBootChanged,
+            rdb_storage::PossibleLossCause::OsBootUnknown => Self::OsBootUnknown,
+        }
+    }
+
+    pub(crate) const fn cause(self) -> rdb_storage::PossibleLossCause {
+        match self {
+            Self::OsBootChanged => rdb_storage::PossibleLossCause::OsBootChanged,
+            Self::OsBootUnknown => rdb_storage::PossibleLossCause::OsBootUnknown,
+        }
+    }
+
+    /// The reason an open's OS-boot verdict gives, `None` for the same boot. A platform with
+    /// no boot id to compare counts as unknown.
+    pub(crate) const fn from_os_boot(verdict: crate::os_boot::OsBoot) -> Option<Self> {
+        match verdict {
+            crate::os_boot::OsBoot::Same => None,
+            crate::os_boot::OsBoot::Changed => Some(Self::OsBootChanged),
+            crate::os_boot::OsBoot::Unknown | crate::os_boot::OsBoot::Unsupported => {
+                Some(Self::OsBootUnknown)
+            }
+        }
+    }
+}
+
+/// #177: a partition's possible-loss record, as [`NodeStatus::possible_loss`] reports it. A
+/// failover chose its target while a copy restored from a store whose host may have rebooted
+/// was a member, so writes acknowledged before the failover may be gone from every copy. rDB
+/// keeps serving; the record is for an operator to re-check the group and clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PossibleLoss {
+    /// The node the promote landed on, which holds the record.
+    pub copy: NodeId,
+    /// The generation that promote committed. `Db::ack_possible_loss` must name it.
+    pub generation: Generation,
+    /// Where that generation starts: the promoted copy's applied seq when the promote landed
+    /// on it. A write acknowledged at or below it may be lost; one above it was written under
+    /// the new generation and is not in question.
+    pub applied: u64,
+    /// Why.
+    pub reason: PossibleLossReason,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -1549,6 +1648,11 @@ pub struct Holding {
     pub applied: u64,
     /// Highest contiguous sequence proved durable.
     pub durable: u64,
+    /// #177: for a holding reported from a restored store (`owner_epoch` `None`), why its host
+    /// may have lost acknowledged writes: this process's open found the OS boot changed or could
+    /// not tell. `None` for every other holding, and for a restored one whose open found the
+    /// same boot. A failover that sees it on any member logs `failover_possible_loss`.
+    pub restored: Option<PossibleLossReason>,
 }
 
 /// A node's thread has stopped: nothing sent to it is read.
@@ -1736,6 +1840,7 @@ pub(crate) fn spawn_on(
     host.partition_count = partitions;
     host.nodes = nodes;
     host.transaction = Transaction::with_limits(limits);
+    host.warn_possible_losses();
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
     // reads its own nodes' lines from its own file rather than the shared untagged one.
     #[cfg(test)]
@@ -3150,6 +3255,9 @@ struct Host {
     /// join a generation because of a tail past its base (#79 S4d). In memory only: a restart
     /// loses it, and the next landing or inventory records it again. Cleared by a successful land.
     tail_refused: BTreeMap<PartitionId, TailRefused>,
+    /// #177: per partition, the generation a bound promote fence leads to and the possible-loss
+    /// reason its stored plan carries, until that generation lands here ([`Self::recovered`]).
+    possible_loss_planned: BTreeMap<PartitionId, (Generation, PossibleLossReason)>,
     /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
@@ -3380,6 +3488,7 @@ impl Host {
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
             tail_refused: BTreeMap::new(),
+            possible_loss_planned: BTreeMap::new(),
             tail_holds: BTreeMap::new(),
             rebuild_hold: BTreeMap::new(),
             stall_step: BTreeMap::new(),
@@ -4026,14 +4135,27 @@ impl Host {
                     ))
                 };
                 match bound {
-                    Ok(plan) => {
+                    Ok((plan, possible_loss)) => {
                         tracing::info!(
                             node = self.node.0,
                             partition = partition.0,
                             control_revision = proof.control_revision.0,
                             rechecked,
+                            possible_loss = possible_loss.map(PossibleLossReason::as_str),
                             "routed_fence_bound"
                         );
+                        // #177: kept for the landing of the generation this fence leads to,
+                        // which writes the record with its switch. A newer fence replaces it.
+                        let generation = proof.prior_generation.next();
+                        match possible_loss {
+                            Some(reason) => {
+                                self.possible_loss_planned
+                                    .insert(partition, (generation, reason));
+                            }
+                            None => {
+                                self.possible_loss_planned.remove(&partition);
+                            }
+                        }
                         let site = Site {
                             partition,
                             correlation,
@@ -7103,7 +7225,28 @@ impl Host {
             "recovered"
         );
         self.end_barriers_below(partition, result.new_generation);
-        self.inherit(partition, result)?;
+        // #177: a promote planned with a possible loss lands its record with its switch.
+        let mark = self
+            .possible_loss_planned
+            .remove(&partition)
+            .filter(|(generation, _)| *generation == result.new_generation)
+            .map(|(generation, reason)| PossibleLossMark {
+                generation,
+                applied: result.selected.cutoff_seq.0,
+                cause: reason.cause(),
+            });
+        self.inherit(partition, result, mark)?;
+        if let Some(mark) = mark {
+            tracing::info!(
+                target: FAILOVER_TARGET,
+                partition = partition.0,
+                copy = self.node.0,
+                generation = mark.generation.0,
+                applied = mark.applied,
+                reason = PossibleLossReason::from_cause(mark.cause).as_str(),
+                "failover_possible_loss_recorded"
+            );
+        }
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
         self.committed_correlation
@@ -11463,7 +11606,7 @@ impl Host {
         // #90: outside the `first` guard: a landing repeats, and a barrier may start between.
         self.end_barriers_below(partition, landed_generation);
         if first && barrier {
-            self.inherit(partition, &result)?;
+            self.inherit(partition, &result, None)?;
             self.tail_refused.remove(&partition);
         }
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
@@ -11838,14 +11981,21 @@ impl Host {
         );
     }
 
-    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), Fault> {
+    /// Link `result`'s generation; `mark`, when given, is written in the same batch (#177).
+    fn inherit(
+        &mut self,
+        partition: PartitionId,
+        result: &RecoveryResult,
+        mark: Option<PossibleLossMark>,
+    ) -> Result<(), Fault> {
         self.views.remove(&partition);
         self.engine
-            .inherit(
+            .inherit_marked(
                 partition,
                 result.retained_status_map.predecessor_generation,
                 result.new_generation,
                 result.selected.cutoff_seq,
+                mark,
             )
             .map(drop)
             .map_err(|e| {
@@ -14864,6 +15014,7 @@ impl Host {
             | ClientCall::Move { .. }
             | ClientCall::Rebuild { .. }
             | ClientCall::ForgetTail { .. }
+            | ClientCall::AckPossibleLoss { .. }
             | ClientCall::WaitDurable { .. }
             | ClientCall::Changes { .. } => None,
             ClientCall::Put { identity, .. }
@@ -15014,6 +15165,18 @@ impl Host {
             ClientCall::Rebuild { node, .. } => {
                 let answer = match self.rebuild_from_app(partition, node) {
                     Ok(line) => Answer::Rebuilt(line),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                let _ = reply.send(answer);
+                return Ok(());
+            }
+            // #177: answered in this step, from this node's own store.
+            ClientCall::AckPossibleLoss { generation, .. } => {
+                let answer = match self.ack_possible_loss(partition, generation) {
+                    Ok(line) => Answer::PossibleLossAcked(line),
                     Err(error) => Answer::Error {
                         error,
                         request: None,
@@ -16362,7 +16525,111 @@ impl Host {
             owner_epoch: None,
             applied: self.engine.buffered_applied(partition, generation).0,
             durable: self.engine.durable(partition, generation).0,
+            restored: self.links.os_boot_of(self.node),
         })
+    }
+
+    /// #177: clear this node's possible-loss record for `partition` when it names
+    /// `generation`. No record: `Ok`, nothing written. Another generation: `INVALID_ARGUMENT`,
+    /// the record kept. The clear is one synced write; logged `failover_possible_loss_acked`.
+    fn ack_possible_loss(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<String, ApiError> {
+        let standing = self.engine.possible_loss(partition).map_err(|fault| {
+            ApiError::host(&format!(
+                "node {}: read the possible-loss record of partition {}: {fault:?}",
+                self.node.0, partition.0
+            ))
+        })?;
+        let Some(mark) = standing else {
+            return Ok(format!(
+                "ack-possible-loss: partition {} has no possible-loss record on node {}; nothing \
+                 to clear",
+                partition.0, self.node.0
+            ));
+        };
+        if mark.generation != generation {
+            tracing::warn!(
+                target: FAILOVER_TARGET,
+                node = self.node.0,
+                partition = partition.0,
+                asked = generation.0,
+                generation = mark.generation.0,
+                "failover_possible_loss_ack_refused"
+            );
+            return Err(ApiError::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "partition {}'s possible-loss record on node {} is for generation {}, not \
+                     {}: nothing was cleared; check that generation, then ack it by its number",
+                    partition.0, self.node.0, mark.generation.0, generation.0
+                ),
+            ));
+        }
+        self.engine
+            .clear_possible_loss(partition)
+            .map_err(|fault| {
+                ApiError::host(&format!(
+                    "node {}: clear the possible-loss record of partition {}: {fault:?}; it still \
+                 stands",
+                    self.node.0, partition.0
+                ))
+            })?;
+        tracing::info!(
+            target: FAILOVER_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            node = self.node.0,
+            "failover_possible_loss_acked"
+        );
+        Ok(format!(
+            "ack-possible-loss: partition {} generation {} cleared on node {}",
+            partition.0, generation.0, self.node.0
+        ))
+    }
+
+    /// #177: at each start of this node on its store, `failover_possible_loss` once more for
+    /// every possible-loss record it holds, so a reader of a restarted process's log still
+    /// sees one that stands.
+    fn warn_possible_losses(&self) {
+        for partition in (1..=self.partition_count).map(PartitionId) {
+            if let Some(loss) = self.possible_loss(partition) {
+                tracing::warn!(
+                    target: FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = loss.copy.0,
+                    generation = loss.generation.0,
+                    applied = loss.applied,
+                    reason = loss.reason.as_str(),
+                    "failover_possible_loss"
+                );
+            }
+        }
+    }
+
+    /// #177: the possible-loss record this node's store holds for `partition`. A read that
+    /// fails is logged `possible_loss_unreadable` at error and reported as none: the open
+    /// refused a marker it could not decode, so only the read itself can fail here.
+    fn possible_loss(&self, partition: PartitionId) -> Option<PossibleLoss> {
+        match self.engine.possible_loss(partition) {
+            Ok(mark) => mark.map(|mark| PossibleLoss {
+                copy: self.node,
+                generation: mark.generation,
+                applied: mark.applied,
+                reason: PossibleLossReason::from_cause(mark.cause),
+            }),
+            Err(fault) => {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    ?fault,
+                    "possible_loss_unreadable"
+                );
+                None
+            }
+        }
     }
 
     fn status(&self, partition: PartitionId) -> NodeStatus {
@@ -16400,6 +16667,7 @@ impl Host {
                     owner_epoch: Some(lineage.owner_epoch),
                     applied: receiver.buffered_applied_seq().0,
                     durable: receiver.durable_seq().0,
+                    restored: None,
                 })
             }
             None if adopted.generation.0 == 0 && receiver.is_none() => {
@@ -16413,6 +16681,7 @@ impl Host {
                     .buffered_applied(partition, adopted.generation)
                     .0,
                 durable: self.engine.durable(partition, adopted.generation).0,
+                restored: None,
             }),
         };
         let l1 = self.l1.get(&partition).map(|l1| &l1.protection);
@@ -16474,6 +16743,7 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             tail_refused: self.tail_refused_of(partition),
+            possible_loss: self.possible_loss(partition),
             reload_pending: None,
             lengths: Some(IndexLengths {
                 dedup: self
@@ -17224,7 +17494,7 @@ pub(crate) fn bind_routed_fence(
     facts: Result<FenceFacts, String>,
     now: Tick,
     budgets: &Budgets,
-) -> Result<RecoveryPlan, (&'static str, String)> {
+) -> Result<(RecoveryPlan, Option<PossibleLossReason>), (&'static str, String)> {
     if routed != proof.partition {
         return Err((
             "partition",
@@ -17309,7 +17579,7 @@ pub(crate) fn bind_routed_fence(
             ),
         ));
     };
-    crate::admin::decode_promote_plan(&stored).map_err(|error| ("plan_unreadable", error))
+    crate::admin::decode_promote_plan_with(&stored).map_err(|error| ("plan_unreadable", error))
 }
 
 /// A-R446b (critic-63 M2): how long to wait before reading and checking a routed fence once

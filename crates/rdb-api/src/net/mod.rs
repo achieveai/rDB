@@ -1223,7 +1223,8 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 call:
                     call @ (wire::WireCall::Move { .. }
                     | wire::WireCall::Rebuild { .. }
-                    | wire::WireCall::ForgetTail { .. }),
+                    | wire::WireCall::ForgetTail { .. }
+                    | wire::WireCall::AckPossibleLoss { .. }),
                 to,
                 ..
             },
@@ -1233,6 +1234,10 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 wire::WireCall::ForgetTail { .. } => {
                     ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
                 }
+                wire::WireCall::AckPossibleLoss { .. } => (
+                    "ack-possible-loss",
+                    crate::db::error::ACK_POSSIBLE_LOSS_STEP,
+                ),
                 _ => ("rebuild", crate::db::error::REBUILD_STEP),
             };
             // App `admin` refused here is on a node whose list leaves it out: telling it to
@@ -1244,7 +1249,8 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             };
             return Some(format!(
                 "app {app} is not an admin app on node {}: only an admin app may move or \
-                 rebuild a copy or forget a tail, and the node's operator names them; add {app} \
+                 rebuild a copy, forget a tail or ack a possible loss, and the node's operator \
+                 names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",
                 to.0

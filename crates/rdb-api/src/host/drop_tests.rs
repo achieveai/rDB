@@ -2613,6 +2613,7 @@ fn promote_in(
     )?;
     let links = Arc::clone(&trio.links);
     let ctx = crate::admin::PromoteCtx {
+        possible_loss: None,
         partition: crate::admin::PARTITION,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),
@@ -6845,6 +6846,7 @@ fn i177_a_restored_copy_reports_its_newest_whole_lineage_never_a_staged_one() {
         owner_epoch: None,
         applied: host.engine.buffered_applied(p, generation).0,
         durable: host.engine.durable(p, generation).0,
+        restored: None,
     };
     let status = host.status(p);
     assert_eq!(status.role, "none");

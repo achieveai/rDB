@@ -3174,6 +3174,7 @@ fn bb_64_a_promote_stopped_after_fencing_keeps_the_members_for_the_re_run() {
     written_and_closed(&rt, dir.path(), &store);
     let before = partition_revision(&rt, &store);
     let ctx = admin::PromoteCtx {
+        possible_loss: None,
         partition: PARTITION,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),
@@ -4052,6 +4053,7 @@ fn promote_redelivering(
         Ok(())
     };
     let ctx = admin::PromoteCtx {
+        possible_loss: None,
         partition: PARTITION,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),
@@ -4720,6 +4722,7 @@ fn m10_s2_r447_a_rerun_with_another_drop_fences_at_its_own_revision_and_commits_
 
     let boot_links = Arc::clone(nodes.links());
     let stopped = admin::PromoteCtx {
+        possible_loss: None,
         partition: PARTITION,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),

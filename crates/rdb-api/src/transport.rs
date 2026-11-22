@@ -52,6 +52,9 @@ struct Inner {
     boots: BTreeMap<NodeId, BootId>,
     /// The links to other processes, once attached.
     net: Option<Arc<Net>>,
+    /// #177: for each node this process runs whose open found the OS boot not the same, why
+    /// ([`Links::note_os_boot`]). A node's restored holding carries it to the planner.
+    os_boot: BTreeMap<NodeId, crate::host::PossibleLossReason>,
     /// Held pairs, smaller node first. A hold covers both directions.
     held: BTreeSet<(NodeId, NodeId)>,
     /// Per direction, what a hold kept back, oldest first.
@@ -132,6 +135,27 @@ impl Links {
     #[must_use]
     pub fn net(&self) -> Option<Arc<Net>> {
         self.lock().net.clone()
+    }
+
+    /// #177: record what this process's open found of `node`'s OS boot, `None` for the same
+    /// boot. Set once per open, before the node starts, and kept across the node's in-process
+    /// restarts: they run under the same open.
+    pub(crate) fn note_os_boot(
+        &self,
+        node: NodeId,
+        reason: Option<crate::host::PossibleLossReason>,
+    ) {
+        let mut inner = self.lock();
+        match reason {
+            Some(reason) => inner.os_boot.insert(node, reason),
+            None => inner.os_boot.remove(&node),
+        };
+    }
+
+    /// #177: what [`Self::note_os_boot`] recorded for `node`; `None` for the same boot, or a
+    /// node this process's open did not see.
+    pub(crate) fn os_boot_of(&self, node: NodeId) -> Option<crate::host::PossibleLossReason> {
+        self.lock().os_boot.get(&node).copied()
     }
 
     /// The boot `node` runs at: the one it registered with when this process runs it (A-R232),

@@ -68,6 +68,9 @@ pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 /// and nothing was given up.
 pub(crate) const FORGET_TAIL_STEP: &str = "nothing was given up";
 
+/// The tail of a refused `admin ack-possible-loss` (#177): the record still stands.
+pub(crate) const ACK_POSSIBLE_LOSS_STEP: &str = "nothing was cleared";
+
 /// The tail of a move's answer when the move ended by filling a free slot (A-R457 (a)): its
 /// detail says what the move did and the step to move the source's copy.
 pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
@@ -394,6 +397,7 @@ impl ApiError {
             || self.detail.ends_with(BARRIER_STEP)
             || self.detail.ends_with(MOVE_STEP)
             || self.detail.ends_with(FORGET_TAIL_STEP)
+            || self.detail.ends_with(ACK_POSSIBLE_LOSS_STEP)
             || self.detail.ends_with(MOVE_ENDED)
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)

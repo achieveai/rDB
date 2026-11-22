@@ -36,6 +36,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
             owner_epoch: Some(OwnerEpoch(0)),
             applied,
             durable: applied,
+            restored: None,
         }),
         authority: "none".to_owned(),
         fence: None,
@@ -58,6 +59,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         clock_bound_lost: false,
         committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
         tail_refused: None,
+        possible_loss: None,
     }
 }
 
@@ -105,6 +107,7 @@ fn restored(
         owner_epoch: None,
         applied,
         durable: applied,
+        restored: None,
     });
     looks
 }
@@ -133,6 +136,115 @@ fn i177_a_restored_copy_one_generation_behind_is_not_counted() {
     );
     let live_behind = looks(&[(2, Some((2, 50))), (3, Some((3, 5)))]);
     assert_eq!(choose(1, &rf3(), &live_behind), Ok(NodeId(3)));
+}
+
+/// [`restored`], with the restored holding's OS-boot verdict `reason` (#177).
+fn restored_with(
+    looks: Vec<(NodeId, Option<NodeStatus>)>,
+    node: u32,
+    (generation, applied): (u64, u64),
+    reason: Option<PossibleLossReason>,
+) -> Vec<(NodeId, Option<NodeStatus>)> {
+    let mut looks = restored(looks, node, generation, applied);
+    for (n, status) in &mut looks {
+        if *n == NodeId(node) {
+            if let Some(holds) = status.as_mut().and_then(|status| status.holds.as_mut()) {
+                holds.restored = reason;
+            }
+        }
+    }
+    looks
+}
+
+/// #177: which promotes carry a possible-loss reason. A restored member whose host's boot
+/// changed marks the promote whichever copy is chosen: the other copy (B promoted, A
+/// restored), the restored copy itself (A promoted), or none counted at all (a restored copy
+/// one generation behind, which `choose_target` does not count, still held writes). A
+/// restored copy on the same boot marks nothing, nor do live copies. Of mixed reasons,
+/// unknown wins.
+/// Cuts: `possible_loss` reads only the chosen copy's holding, the B-promoted case goes `None`,
+/// red; it skips members `choose_target` does not count, the behind case goes `None`, red;
+/// `worst` keeps the first reason, the mixed case is `OsBootChanged`, red.
+#[test]
+fn i177_a_restored_member_on_a_changed_boot_marks_the_promote_whichever_copy_wins() {
+    use PossibleLossReason::{OsBootChanged, OsBootUnknown};
+    let changed = Some(OsBootChanged);
+    // B promoted, A (node 2) restored on a changed boot.
+    let b = restored_with(
+        looks(&[(2, Some((3, 0))), (3, Some((3, 11)))]),
+        2,
+        (3, 10),
+        changed,
+    );
+    assert_eq!(choose(1, &rf3(), &b), Ok(NodeId(3)));
+    assert_eq!(possible_loss(&b), changed, "B promoted");
+    // A itself promoted.
+    let a = restored_with(
+        looks(&[(2, Some((3, 0))), (3, Some((3, 9)))]),
+        2,
+        (3, 10),
+        changed,
+    );
+    assert_eq!(choose(1, &rf3(), &a), Ok(NodeId(2)));
+    assert_eq!(possible_loss(&a), changed, "A promoted");
+    // A restored member the choice does not count.
+    let behind = restored_with(
+        looks(&[(2, Some((3, 0))), (3, Some((3, 5))), (4, Some((3, 5)))]),
+        2,
+        (2, 50),
+        changed,
+    );
+    assert_eq!(
+        possible_loss(&behind),
+        changed,
+        "an uncounted restored member"
+    );
+    // The same boot, and live copies only: nothing.
+    let same = restored_with(
+        looks(&[(2, Some((3, 0))), (3, Some((3, 11)))]),
+        2,
+        (3, 10),
+        None,
+    );
+    assert_eq!(possible_loss(&same), None, "the same boot");
+    assert_eq!(
+        possible_loss(&looks(&[(2, Some((3, 10))), (3, Some((3, 11)))])),
+        None,
+        "live copies"
+    );
+    // Mixed reasons, in either order: unknown.
+    let mixed = restored_with(
+        restored_with(
+            looks(&[(2, Some((3, 0))), (3, Some((3, 0)))]),
+            2,
+            (3, 10),
+            changed,
+        ),
+        3,
+        (3, 10),
+        Some(OsBootUnknown),
+    );
+    assert_eq!(
+        possible_loss(&mixed),
+        Some(OsBootUnknown),
+        "changed then unknown"
+    );
+    let mixed = restored_with(
+        restored_with(
+            looks(&[(2, Some((3, 0))), (3, Some((3, 0)))]),
+            2,
+            (3, 10),
+            Some(OsBootUnknown),
+        ),
+        3,
+        (3, 10),
+        changed,
+    );
+    assert_eq!(
+        possible_loss(&mixed),
+        Some(OsBootUnknown),
+        "unknown then changed"
+    );
 }
 
 /// V1: unequal prefixes in one generation. The copy holding the acknowledged write wins

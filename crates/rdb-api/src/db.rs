@@ -2002,6 +2002,10 @@ impl Db {
             "db_open_found"
         );
         let links = config.links.clone().unwrap_or_default();
+        // #177: before any node starts, so a restored holding never reports without it.
+        for (node, verdict) in &os_boot {
+            links.note_os_boot(*node, host::PossibleLossReason::from_os_boot(*verdict));
+        }
         let clock = links.clock();
         let control = ControlAdapter::new(Arc::clone(&store), rt.clone(), Arc::clone(&links));
         for (a, b) in &config.hold {
@@ -2646,6 +2650,8 @@ impl Db {
                         to: record.generation,
                         base: root.predecessor_cutoff,
                         copies,
+                        owner: record.owner,
+                        possible_loss: rolled_possible_loss(store, partition, record, root).await?,
                     }),
                 }),
                 Err(why) => Err(OpenError::Stale {
@@ -2688,13 +2694,34 @@ impl Db {
                     node.0
                 )));
             }
+            // #177: the owner's copy is where the promote would have landed, so its record
+            // lands there with the switch, as the landing would have written it.
+            let mark = roll
+                .possible_loss
+                .filter(|_| *node == roll.owner)
+                .map(|reason| rdb_storage::PossibleLossMark {
+                    generation: roll.to,
+                    applied: roll.base.0,
+                    cause: reason.cause(),
+                });
             engines
                 .get_mut(node)
                 .ok_or_else(|| OpenError::Node(format!("node {}: no engine", node.0)))?
-                .inherit(partition, roll.from, roll.to, roll.base)
+                .inherit_marked(partition, roll.from, roll.to, roll.base, mark)
                 .map_err(|error| {
                     OpenError::Node(format!("node {}: roll forward: {error}", node.0))
                 })?;
+            if let Some(mark) = mark {
+                tracing::info!(
+                    target: host::FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = node.0,
+                    generation = mark.generation.0,
+                    applied = mark.applied,
+                    reason = host::PossibleLossReason::from_cause(mark.cause).as_str(),
+                    "failover_possible_loss_recorded"
+                );
+            }
         }
         Ok(())
     }
@@ -5463,6 +5490,19 @@ impl Db {
         to: NodeId,
         drop: Option<NodeId>,
     ) -> Result<admin::Promoted, admin::PromoteError> {
+        self.promote_with(partition, to, drop, None)
+    }
+
+    /// [`Self::promote_partition`], storing `possible_loss` with the plan
+    /// ([`admin::PromoteCtx::possible_loss`]). An operator's promote stores none; crate tests
+    /// store one to drive a possible-loss record without the planner (#177).
+    fn promote_with(
+        &self,
+        partition: PartitionId,
+        to: NodeId,
+        drop: Option<NodeId>,
+        possible_loss: Option<host::PossibleLossReason>,
+    ) -> Result<admin::Promoted, admin::PromoteError> {
         if self.owner_of(partition).is_none() {
             return Err(admin::PromoteError::NoSuchPartition {
                 partition: partition.0,
@@ -5518,6 +5558,7 @@ impl Db {
         };
         let within = heal_within(&budgets);
         let ctx = admin::PromoteCtx {
+            possible_loss,
             store,
             budgets,
             clock: self.clock,
@@ -6095,6 +6136,67 @@ impl Db {
         }
     }
 
+    /// #177: `admin ack-possible-loss`. Clear partition 1's possible-loss record
+    /// ([`NodeStatus::possible_loss`]) for the promote that committed `generation`, once the
+    /// group has been re-checked. The call goes to the node of this process whose status reports
+    /// that record, else to the owner, and that node checks the generation again against its
+    /// own store. The clear is one synced write. Writes are never blocked by the record, so
+    /// nothing waits on this.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing cleared, when the record that stands names another
+    /// generation, so a stale ack cannot clear a newer record; `INVALID_ARGUMENT`, nothing
+    /// changed, when this `Db` runs over links as an app the node does not list as an admin app;
+    /// `UNAVAILABLE` when no answer came in the read timeout. No record standing is `Ok`.
+    pub fn ack_possible_loss(&self, generation: Generation) -> Result<(), ApiError> {
+        if let Some(error) =
+            self.refuse_groupless("ack_possible_loss", "it runs on one partition only")
+        {
+            return Err(error);
+        }
+        let call = ClientCall::AckPossibleLoss {
+            identity: self.identity(),
+            generation,
+        };
+        let holder = self
+            .statuses_of(PARTITION)
+            .into_iter()
+            .find(|status| {
+                status
+                    .possible_loss
+                    .is_some_and(|loss| loss.generation == generation)
+            })
+            .map(|status| status.node);
+        let answer = match holder {
+            Some(node) => match self.send_call(node, PARTITION, call) {
+                Ok(answer) => answer.recv_timeout(self.timeouts.read).ok(),
+                Err(NodeStopped(node)) => Some(Answer::Error {
+                    error: ApiError::host(&format!("node {} has stopped", node.0)),
+                    request: None,
+                }),
+            },
+            None => self.call(PARTITION, call, self.timeouts.read),
+        };
+        match answer {
+            Some(Answer::PossibleLossAcked(line)) => {
+                tracing::info!(generation = generation.0, line, "db_possible_loss_acked");
+                Ok(())
+            }
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "an ack-possible-loss was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!(
+                    "no answer to the ack-possible-loss in {:?}",
+                    self.timeouts.read
+                ),
+            )),
+        }
+    }
+
     /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
     /// status look.
     ///
@@ -6511,9 +6613,10 @@ enum Carries {
 fn carries(call: &ClientCall) -> Carries {
     match call {
         ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
-        ClientCall::Move { .. } | ClientCall::Rebuild { .. } | ClientCall::ForgetTail { .. } => {
-            Carries::Admin
-        }
+        ClientCall::Move { .. }
+        | ClientCall::Rebuild { .. }
+        | ClientCall::ForgetTail { .. }
+        | ClientCall::AckPossibleLoss { .. } => Carries::Admin,
         ClientCall::Compile { .. }
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
@@ -6691,6 +6794,51 @@ struct Roll {
     to: Generation,
     base: Seq,
     copies: Vec<NodeId>,
+    /// The record's owner: the copy a promote lands on.
+    owner: NodeId,
+    /// #177: the possible-loss reason the promote that committed `to` stored with its plan,
+    /// when it was one ([`rolled_possible_loss`]).
+    possible_loss: Option<host::PossibleLossReason>,
+}
+
+/// #177: the possible-loss reason a promote stored with its plan, for a roll-forward of
+/// `record`'s generation: the plan at `operations/` for the fence `root.run` names, when it is
+/// a promote's plan for the generation before `record`'s. `None` when none is stored there, as
+/// for a heal, which stores no plan.
+///
+/// # Errors
+///
+/// The read failed, or the stored bytes are not a plan this build reads: the open is refused
+/// rather than landing the generation without a record it may need.
+async fn rolled_possible_loss(
+    store: &Arc<dyn ConfigStore>,
+    partition: PartitionId,
+    record: &PartitionRecord,
+    root: &PartitionRoot,
+) -> Result<Option<host::PossibleLossReason>, OpenError> {
+    let key = admin::promote_operation(root.run)
+        .map_err(OpenError::Control)?
+        .encode();
+    let found = store
+        .get(config_core::GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| OpenError::Control(format!("get {key}: {error}")))?;
+    let Some(found) = found.record else {
+        return Ok(None);
+    };
+    let (plan, reason) = admin::decode_promote_plan_with(&found.value).map_err(|error| {
+        undecodable(
+            &key,
+            &format!("not a promote plan this build reads: {error}"),
+        )
+    })?;
+    let planned = plan.anchor.lineage;
+    if planned.partition != partition || planned.generation.next() != record.generation {
+        return Ok(None);
+    }
+    Ok(reason)
 }
 
 /// Whether `engine` holds `generation` of partition 1 as a generation it can serve. A full copy
@@ -7750,6 +7898,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Move { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
+        | ClientCall::AckPossibleLoss { .. }
         | ClientCall::WaitDurable { .. }
         | ClientCall::Changes { .. } => return None,
     };
@@ -11323,6 +11472,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -11412,6 +11562,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -11524,6 +11675,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         let (db, mailbox, rt) = unanswered(Duration::from_millis(20));
         let looks = Arc::new(AtomicU64::new(0));
@@ -11672,6 +11824,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -11773,6 +11926,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -11888,6 +12042,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -12770,6 +12925,7 @@ mod tests {
                 clock_bound_lost: false,
                 committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
                 tail_refused: None,
+                possible_loss: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -13827,6 +13983,7 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {
@@ -15471,6 +15628,190 @@ mod tests {
             "{rolled:?}"
         );
         ready_and_reads_back(&db, "after the roll-forward");
+        db.shutdown();
+    }
+
+    /// #177: the `@m == message` lines this row logged.
+    fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .collect()
+    }
+
+    /// The possible-loss record node `node` reports.
+    fn possible_loss_on(db: &Db, node: u32) -> Option<host::PossibleLoss> {
+        db.node_status()
+            .into_iter()
+            .find(|status| status.node == NodeId(node))
+            .unwrap_or_else(|| panic!("node {node} answers a status look"))
+            .possible_loss
+    }
+
+    /// #177, the record's life on one folder: a promote onto node 2 stored with
+    /// `OsBootChanged` (as the planner stores it when a restored member's boot changed) lands a
+    /// record on node 2's store, reported in `NodeStatus::possible_loss` with the promote's
+    /// generation; writes go on. An ack of another generation is `INVALID_ARGUMENT` and clears
+    /// nothing. A reopen keeps it and logs WARN `failover_possible_loss` for it once. An ack of
+    /// its generation clears it (INFO `failover_possible_loss_acked`), and a second ack, with no
+    /// record standing, is `Ok`.
+    /// Cuts: `Host::recovered` inherits with no mark, the first `possible_loss_on` is `None`,
+    /// red; `Host::ack_possible_loss` skips its generation check, the stale ack clears it, red;
+    /// `spawn_on` skips `warn_possible_losses`, no WARN at the reopen, red;
+    /// `RocksEngine::clear_possible_loss` deletes nothing, the record stands after the ack, red.
+    /// Integration (~8 s): a fresh open, a promote, a reopen.
+    #[config_log::retcd_test]
+    fn i177_a_possible_loss_record_stands_through_a_reopen_until_its_own_generation_is_acked() {
+        const METHOD: &str =
+            "i177_a_possible_loss_record_stands_through_a_reopen_until_its_own_generation_is_acked";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        assert_eq!(
+            possible_loss_on(&db, 2),
+            None,
+            "no record before the promote"
+        );
+        let promoted = db
+            .promote_with(
+                PARTITION,
+                NodeId(2),
+                None,
+                Some(host::PossibleLossReason::OsBootChanged),
+            )
+            .expect("the promote");
+        let generation = promoted.generation;
+        let loss = possible_loss_on(&db, 2).expect("the promote landed a record on node 2");
+        assert_eq!(
+            (loss.copy, loss.generation, loss.reason),
+            (
+                NodeId(2),
+                generation,
+                host::PossibleLossReason::OsBootChanged
+            ),
+            "{loss:?}"
+        );
+        assert!(loss.applied >= 1, "a=1 was applied: {loss:?}");
+        assert_eq!(logged(METHOD, "failover_possible_loss_recorded").len(), 1);
+        assert!(logged(METHOD, "failover_possible_loss").is_empty());
+        db.put(b"c", b"3", None).expect("writes are not blocked");
+
+        let stale = db
+            .ack_possible_loss(generation.next())
+            .expect_err("an ack of another generation");
+        assert_eq!(stale.kind, ErrorKind::InvalidArgument, "{stale:?}");
+        assert_eq!(
+            possible_loss_on(&db, 2),
+            Some(loss),
+            "a stale ack clears nothing"
+        );
+        db.shutdown();
+        drop(db);
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the reopen");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the reopen is ready");
+        assert_eq!(
+            possible_loss_on(&db, 2),
+            Some(loss),
+            "the record survives a reopen"
+        );
+        let warned = logged(METHOD, "failover_possible_loss");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0]["@l"], "Warning", "{warned:?}");
+        assert_eq!(
+            (
+                &warned[0]["partition"],
+                &warned[0]["copy"],
+                &warned[0]["generation"],
+                &warned[0]["applied"],
+                &warned[0]["reason"]
+            ),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(2),
+                &serde_json::json!(generation.0),
+                &serde_json::json!(loss.applied),
+                &serde_json::json!("os_boot_changed")
+            ),
+            "{warned:?}"
+        );
+
+        db.ack_possible_loss(generation)
+            .expect("the ack of its generation");
+        assert_eq!(possible_loss_on(&db, 2), None, "the ack cleared it");
+        let acked = logged(METHOD, "failover_possible_loss_acked");
+        assert_eq!(acked.len(), 1, "{acked:?}");
+        assert_eq!(
+            (&acked[0]["partition"], &acked[0]["generation"]),
+            (&serde_json::json!(1), &serde_json::json!(generation.0)),
+            "{acked:?}"
+        );
+        db.ack_possible_loss(generation)
+            .expect("an ack with no record standing is Ok");
+        assert_eq!(logged(METHOD, "failover_possible_loss_acked").len(), 1);
+        ready_and_reads_back(&db, "after the ack");
+        db.shutdown();
+    }
+
+    /// #177, a crash between the promote's commit and its landing: node 2's commit of the
+    /// promoted generation lands in the control store, and node 2 faults before anything after
+    /// it runs (the after-commit hook), so no store holds the generation or its record. The
+    /// next open rolls the generation forward onto node 2 from the plan the promote stored,
+    /// and lands the record with it: `NodeStatus::possible_loss` names the generation.
+    /// Cut: `rolled_possible_loss` answers `Ok(None)`; the roll-forward lands no record, red.
+    /// Integration (~12 s): a fresh open, a promote cut short at its commit, a rolled-forward
+    /// open until ready.
+    #[config_log::retcd_test]
+    fn i177_a_promote_cut_short_after_its_commit_lands_its_possible_loss_record_on_the_reopen() {
+        const METHOD: &str =
+            "i177_a_promote_cut_short_after_its_commit_lands_its_possible_loss_record_on_the_reopen";
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        let before = stored_generation(&rt, &store).expect("partitions/1");
+        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        let answer = db.promote_with(
+            PARTITION,
+            NodeId(2),
+            None,
+            Some(host::PossibleLossReason::OsBootChanged),
+        );
+        tracing::info!(?answer, "i177_promote_cut_short_answer");
+        until_stored(&rt, &store, before + 1);
+        db.shutdown();
+        drop(db);
+        crate::host::set_after_commit(dir.path(), None);
+        assert!(
+            logged(METHOD, "failover_possible_loss_recorded").is_empty(),
+            "the faulted node landed nothing"
+        );
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        let rolled = rolled_forward(METHOD);
+        assert_eq!(rolled.len(), 1, "{rolled:?}");
+        assert_eq!(rolled[0]["generation"], before + 1, "{rolled:?}");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the rolled-forward open is ready");
+        let loss = possible_loss_on(&db, 2).expect("the roll-forward landed the record");
+        assert_eq!(
+            (loss.copy, loss.generation, loss.reason),
+            (
+                NodeId(2),
+                Generation(before + 1),
+                host::PossibleLossReason::OsBootChanged
+            ),
+            "{loss:?}"
+        );
+        assert_eq!(logged(METHOD, "failover_possible_loss_recorded").len(), 1);
         db.shutdown();
     }
 

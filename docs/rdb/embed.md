@@ -402,6 +402,30 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   grant has run out it moves every partition of that owner, logging `planner_node_silent` with
   reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
   owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
+- **A failover past a rebooted host may have lost writes** (#177). After a failover onto a
+  copy whose host may have rebooted, rDB logs WARN `failover_possible_loss` (logger
+  `rdb_api::failover`) and sets `NodeStatus::possible_loss`. Alert and re-check the group, then
+  clear it with `Db::ack_possible_loss(generation)` (`admin ack-possible-loss`). Writes are not
+  blocked by it.
+  - When: the planner promoted while some member reported a copy restored after its owner
+    died, and that copy's host had a different OS boot from the one its folder recorded
+    (`os_boot_changed`), or one rDB could not compare (`os_boot_unknown`). A rebooted host may
+    have lost writes its store had not yet flushed, so a write acknowledged before the
+    failover may be on no copy.
+  - The fields, on the WARN line and on `PossibleLoss`: `partition`; `copy`, the node promoted,
+    whose store holds the record; `generation`, the generation the promote made, which the
+    ack names; `applied`, the last seq that copy held when it took over (writes above it,
+    acknowledged before the failover, are the ones to re-check); `reason`, `os_boot_changed`
+    or `os_boot_unknown` (`PossibleLossReason`).
+  - The record is kept on the promoted copy's store and survives restarts and later
+    failovers. The WARN is logged once when the promote is chosen and again at each open
+    while the record stands. `admin promote` by hand stores none.
+  - The ack clears it only for its own generation: another number is `INVALID_ARGUMENT` and
+    clears nothing, so a stale ack cannot clear a newer record. No record standing is `Ok`.
+    Only an admin app may ack, as for `forget_tail`. It logs INFO
+    `failover_possible_loss_acked`. One partition only in this release: the ack is refused
+    above one partition.
+  - A wiped or rebuilt copy loses its record.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
