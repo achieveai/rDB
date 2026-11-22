@@ -2378,7 +2378,7 @@ fn u2_b1_a_target_restore_installs_a_receiver_holding_the_plan_and_its_cutoff() 
     assert_eq!(plan.cutoff, cutoff, "the plan carries the cutoff");
 }
 
-/// Issue #61, PR #204 review: a held copy's offer hold (rev 5b) survives a refused combined
+/// Issue #61: a held copy's offer hold (rev 5b) survives a refused combined
 /// forget-tail. `--through H --no-intact-copy --give-up-live-copy`, while the intact rule is
 /// not what holds the partition, is refused, and the owner's `needs_operator` still names the
 /// held copy: no hold was released, since no re-plan follows a refusal.
@@ -2421,7 +2421,7 @@ fn t61_pr204_a_refused_combined_forget_tail_keeps_the_held_copy_warning() {
     assert!(!owner.rejoins.contains_key(&p), "no re-plan");
 }
 
-/// Issue #61, PR #204 review: a `tail_held` refusal that arrives after its transfer ended (the
+/// Issue #61: a `tail_held` refusal that arrives after its transfer ended (the
 /// writable re-plan cleared the transfer and the hold) records no hold: the owner's
 /// `needs_operator` stays `None` and `offer_hold_recorded` is not logged.
 /// Cut: the hold inserted whether or not the refusal matches the open transfer (as at

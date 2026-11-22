@@ -2902,7 +2902,7 @@ struct Host {
     ///
     /// [`COPY_BATCH_KEYS`]: rdb_storage::COPY_BATCH_KEYS
     snapshot_page_keys: usize,
-    /// PR #204 review: the most bytes one snapshot page carries, in
+    /// The most bytes one snapshot page carries, in
     /// [`rdb_storage::snapshot_entry_bytes`]: [`SNAPSHOT_PAGE_BYTES`]. Rows set it lower to
     /// reach a page cut by size with few keys.
     ///
@@ -2916,7 +2916,7 @@ struct Host {
     /// can land writes past `S` first. Rows only.
     #[cfg(debug_assertions)]
     snapshot_offer_held: bool,
-    /// Issue #61 PR #204 review: while set, this source's next export fails once at its view
+    /// Issue #61: while set, this source's next export fails once at its view
     /// read (`snapshot_catchup_unserved{reason = view_failed}`), as a storage fault there would.
     /// Rows only.
     #[cfg(debug_assertions)]
@@ -10730,7 +10730,7 @@ impl Host {
                 through.0
             ));
         }
-        // PR #204 review: every check runs before any hold is released, so a refused
+        // Every check runs before any hold is released, so a refused
         // combination leaves the held-copy warning standing.
         if release.no_intact_copy {
             let capped = self
@@ -11159,7 +11159,7 @@ impl Host {
             );
             return;
         }
-        // PR #204 review (item 13): a required copy this node is sending a snapshot to, with a
+        // A required copy this node is sending a snapshot to, with a
         // page pulled within `SNAPSHOT_IDLE_MILLIS`, is being rebuilt, not stalled: the check
         // waits another pin wait instead of naming a stall. A transfer left idle that long is
         // abandoned (`transfer_duty`), so a dead one still reaches the line.
@@ -11723,7 +11723,7 @@ impl Host {
     /// and marks its receiver refused for the generation ([`Replication::refuse_landing`]), so
     /// its `Recovered` anchors at the root and the copy is rebuilt by snapshot.
     ///
-    /// PR #204 review (item 12): only when its receiver does not hold the cutoff with the
+    /// Only when its receiver does not hold the cutoff with the
     /// cutoff's digest. A refused receiver that does still anchors at the cutoff (a proven
     /// prefix, `AppendReceiver::on_recovered`), and would then take the suffix into a
     /// generation this copy never linked, which holds none of the keys before the cutoff. That
@@ -12321,7 +12321,7 @@ impl Host {
     }
 
     /// The newest generation of `partition` this engine holds: a bounded lookup, never a copy
-    /// of every lineage key (PR #204 review; explicit status requests call it).
+    /// of every lineage key (explicit status requests call it).
     fn newest_held(&self, partition: PartitionId) -> Option<Generation> {
         self.engine.newest_generation(partition)
     }
@@ -13884,7 +13884,7 @@ impl Host {
                     );
                     RecoveryEvent::InventoryFailed { copy }
                 }
-                // PR #204 review: a copy installing a snapshot of this partition has wiped its
+                // A copy installing a snapshot of this partition has wiped its
                 // old lineages and links the new one only when the install finishes, so its own
                 // unlinked anchor is the install's normal state, not a fault: the re-plan that
                 // follows the install asks again.

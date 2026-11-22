@@ -116,8 +116,11 @@ floor F (ADR-rdb-0027, spec §4.1). Three things here change. Decision 4 is unch
   `HistoryMissing{below_floor:<F-1>}` instead of reading it as absent. A `base` below F is refused
   `below_floor:<base>`. On a landing, `Host::inherit` turns that refusal into a refused landing:
   the copy links nothing, logs `land_inherit_refused{reason="inherit_below_floor"}`, marks its
-  receiver refused for the generation, anchors at the root, and is rebuilt by snapshot. Any other
-  `inherit` refusal still faults the node.
+  receiver refused for the generation, anchors at the root, and is rebuilt by snapshot. That
+  holds only when the copy's receiver does not hold the cutoff with the cutoff's digest. A
+  receiver that does would still anchor at the cutoff and take the suffix into a generation that
+  holds none of the keys before it, so that landing faults the node instead, with nothing linked
+  or anchored (`Host::inherit`). Any other `inherit` refusal still faults the node.
 - **The `installing` record.** A snapshot install writes a new engine-private record,
   `installing` (generation and barrier seq), on the new lineage in `install_begin`'s batch, and
   `install_finish` deletes it in its synced batch. `inherit` refuses a parent that is installing

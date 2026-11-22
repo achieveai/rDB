@@ -56,8 +56,8 @@ const NAMESPACES: [Namespace; 4] = [
 /// One record of a view: namespace, key, value, version, and the generation that holds it.
 pub type SnapshotEntry = (Namespace, Bytes, Bytes, Version, Generation);
 
-/// What one entry adds to a snapshot page on the wire, at most (PR #204 review): its key and
-/// value, plus [`SNAPSHOT_ENTRY_OVERHEAD`] for the namespace, the two length prefixes, the
+/// What one entry adds to a snapshot page on the wire, at most: its key and
+/// value, plus `SNAPSHOT_ENTRY_OVERHEAD` (64) for the namespace, the two length prefixes, the
 /// version and the generation, which postcard writes in far fewer bytes.
 #[must_use]
 pub const fn snapshot_entry_bytes(key: &[u8], value: &[u8]) -> usize {
@@ -243,7 +243,7 @@ impl RocksSnapshot {
             .map(|(page, _)| page)
     }
 
-    /// PR #204 review: a page of [`Self::entries_after`] capped by size as well as count. At
+    /// A page of [`Self::entries_after`] capped by size as well as count. At
     /// most `limit` entries, stopping before the entry that would take the page's
     /// [`snapshot_entry_bytes`] past `max_bytes`; the first entry always goes, so a page is
     /// never empty while the view has more. Answers the page and whether the view holds an

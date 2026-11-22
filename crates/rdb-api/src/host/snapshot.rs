@@ -62,7 +62,7 @@ pub const SNAPSHOT_CHUNK_LABEL: &[u8] = b"rdb snapshot chunk v1";
 /// A source drops a transfer no pull has touched for this long (design section 2, step 6).
 pub(crate) const SNAPSHOT_IDLE_MILLIS: u64 = 60_000;
 
-/// PR #204 review: the most bytes one snapshot page carries by default, a quarter of the
+/// The most bytes one snapshot page carries by default, a quarter of the
 /// 64 MiB frame ([`crate::net::MAX_FRAME`]), so a page of large values always fits it with the
 /// frame's own fields to spare. A page holds at least one entry, so a single entry larger than
 /// the frame still cannot be sent.
@@ -434,7 +434,7 @@ impl Host {
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
         // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
-        // Written only beside the transfer, after every fallible step below (PR #204 review):
+        // Written only beside the transfer, after every fallible step below:
         // a step that fails leaves no marker, so R1's next ask at this barrier is served.
         if self.snapshots_served.get(&(partition, copy)) == Some(&(generation, barrier)) {
             return;
@@ -716,7 +716,7 @@ impl Host {
             );
             return;
         }
-        // PR #204 review: capped by size too, so a page of large values fits the frame, and
+        // Capped by size too, so a page of large values fits the frame, and
         // ended from the cursor: a page cut short by size is not the last.
         let page = transfer.view.page_after(
             pull.after.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
@@ -831,7 +831,7 @@ impl Host {
             );
         }
         // Rev 5b: a held tail is recorded, so `admin forget-tail` counts it and the owner's
-        // status names the command. Only for the transfer open now (PR #204 review): a late
+        // status names the command. Only for the transfer open now: a late
         // refusal of an ended one, after the writable re-plan cleared its hold, records none.
         if let (true, SnapshotRefusal::TailHeld, Some(through)) =
             (ours, refused.reason, refused.through)
@@ -934,6 +934,7 @@ impl Host {
                 partition = partition.0,
                 replaced_at = held.offer.at.0,
                 at = offer.at.0,
+                deferred = held.deferred,
                 "snapshot_install_replaced"
             );
         }
@@ -1111,7 +1112,7 @@ impl Host {
         self.send_peer(install.offer.from, Msg::SnapshotPull(pull), "snapshot_pull");
     }
 
-    /// PR #204 review: whether `frame`, delivered for `partition`, is an ordinary append of the
+    /// Whether `frame`, delivered for `partition`, is an ordinary append of the
     /// lineage an install here owns, contiguous with the receiver's accept head, and so is not
     /// handed to the receiver. Only such a record would be staged; any other append (a head
     /// probe or a keepalive past a gap, or a repeat) reaches the receiver's validation, which
@@ -1190,6 +1191,7 @@ impl Host {
                 node = self.node.0,
                 partition = partition.0,
                 at = install.offer.at.0,
+                deferred = install.deferred,
                 "snapshot_install_dropped"
             );
             return Ok(());
@@ -1269,6 +1271,7 @@ impl Host {
             at = install.offer.at.0,
             begun = install.begun,
             chunks = install.chunks,
+            deferred = install.deferred,
             reason = reason.reason(),
             detail,
             "snapshot_install_refused"

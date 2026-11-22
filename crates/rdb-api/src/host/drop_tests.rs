@@ -8990,7 +8990,7 @@ fn rebuilt(trio: &mut Trio, method: &str, floor: u64) -> u64 {
     at
 }
 
-/// Issue #61 PR #204 review, the dedup marker: as S2-R1, but node 1's first export fails at its
+/// Issue #61, the dedup marker: as S2-R1, but node 1's first export fails at its
 /// view read (`snapshot_export_fault`, once), after the barrier check. No write lands, so R1
 /// asks again at the same barrier, and that ask is served: one
 /// `snapshot_catchup_unserved{reason = view_failed}`, then a transfer opened at that same
@@ -9132,7 +9132,7 @@ fn t61_pr204_a_head_probe_past_the_gap_reaches_the_receiver_during_an_install() 
     assert_eq!(done[0]["deferred"], 0, "{done:?}");
 }
 
-/// Issue #61 PR #204 review, an append during an install: as S2-R1, node 1 holds the pull for
+/// Issue #61, an append during an install: as S2-R1, node 1 holds the pull for
 /// page 1, so node 3's install has begun and owns the partition. An ordinary append of the
 /// install's lineage then reaches node 3, contiguous with its receiver's head (seq 1 on the
 /// root, built as `trio::write_chain_in` builds a record, since the trimmed history holds no
@@ -9255,7 +9255,7 @@ fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
     );
 }
 
-/// Issue #61 PR #204 review, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
+/// Issue #61, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
 /// rebuilt from a snapshot, its ACK stalled at the root below the cutoff. Node 1 holds the pull
 /// for page 1 and is given a move onto node 3 (catch-up deadline 1 s). A duty at `t` starts the
 /// move clock; one more page served, a duty at `t + 2 s` finds the transfer served more and
@@ -9334,7 +9334,7 @@ fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
     assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
 }
 
-/// Issue #61 PR #204 review, a replayed page: as S2-R1, node 1 holds the pull for page 2, so
+/// Issue #61, a replayed page: as S2-R1, node 1 holds the pull for page 2, so
 /// node 3 has written pages 0 and 1 and its cursor is past page 1. Page 0 then reaches node 3
 /// again, as node 1 built it (from the barrier, after no key). It is dropped
 /// (`snapshot_chunk_dropped{why = mismatch}`): the install's cursor, chain, entries and pages are
@@ -9563,7 +9563,7 @@ fn t61_pr204_a_non_primary_cannot_forge_an_offer_a_page_or_a_pull() {
     }
 }
 
-/// Issue #61 PR #204 review, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
+/// Issue #61, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
 /// node 3's next pull is never answered. A transfer duty past `SNAPSHOT_IDLE_MILLIS` abandons
 /// the transfer (`snapshot_transfer_abandoned{why = idle}`) and forgets the barrier it served,
 /// so R1's ask at that same barrier opens a fresh transfer; node 3 replaces its install with
@@ -9619,7 +9619,7 @@ fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afres
     rebuilt(&mut trio, METHOD, floor);
 }
 
-/// Issue #61 PR #204 review, item 13: a rebuild watch whose required copy is still being sent a
+/// Issue #61, item 13: a rebuild watch whose required copy is still being sent a
 /// snapshot does not name a stall. As S2-R1, with node 1 holding page 1 so node 3's transfer
 /// runs longer than the watch, node 1 holds a `ReadOnly` watch that requires node 3's copy,
 /// and its check runs while the transfer is live: no `recovery_rebuild_stalled`, nothing in
@@ -9706,7 +9706,7 @@ fn t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live
     assert!(owner.stalled.contains_key(&p));
 }
 
-/// Issue #61 PR #204 review, item 14: a copy asked for its inventory while it installs a
+/// Issue #61, item 14: a copy asked for its inventory while it installs a
 /// snapshot of the partition answers `InventoryFailed` with `anchor_generation_unlinked`, its
 /// normal state until the install links the lineage, and logs it at info with `installing`,
 /// not at error. As S2-R1, with node 1 holding page 1 so node 3's install stays open.
@@ -9752,7 +9752,7 @@ fn t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error() {
     assert_eq!(failed[0]["installing"], true, "{failed:?}");
 }
 
-/// Issue #61 PR #204 review, item 12: a barrier member whose landing needs a copied inherit
+/// Issue #61, item 12: a barrier member whose landing needs a copied inherit
 /// that its trim floor refuses must not anchor at the cutoff. As S2-R1 before the wipe: every
 /// copy holds puts 1..=30, trimmed to 26. Node 3 lands the next generation at cutoff 28, so
 /// the inherit copies as of 28, and puts 29 and 30 created keys whose absence at 28 the
@@ -9846,7 +9846,7 @@ fn t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults()
     }
 }
 
-/// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
+/// Issue #61, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
 /// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
 /// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
 /// is at most the cap (`snapshot_transfer_installed{largest_page_bytes}`), it takes several
