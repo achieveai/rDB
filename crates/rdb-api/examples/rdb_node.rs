@@ -1197,7 +1197,35 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<Served, String> {
         let _entered = rt.enter();
         control(args)?
     };
+    #[cfg(unix)]
+    listen_for_term(rt, &TERMINATED).map_err(|e| format!("cannot listen for SIGTERM: {e}"))?;
     serve_on(args, rt, store)
+}
+
+/// Set by SIGTERM or SIGINT: the serve loop stops as it does for `--stop-file`, so a
+/// supervisor's stop (`docker stop`, systemd) shuts the node down cleanly. Only [`serve`]
+/// installs it, so a row's serve in the test binary is never stopped by another's signal.
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+/// Set `flag` when this process gets SIGTERM or SIGINT, logging `rdb_node_sigterm`.
+#[cfg(unix)]
+fn listen_for_term(rt: &tokio::runtime::Runtime, flag: &'static AtomicBool) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let _entered = rt.enter();
+    for (kind, name) in [
+        (SignalKind::terminate(), "TERM"),
+        (SignalKind::interrupt(), "INT"),
+    ] {
+        let mut signals = signal(kind)?;
+        let span = tracing::Span::current();
+        rt.spawn(async move {
+            if signals.recv().await.is_some() {
+                span.in_scope(|| tracing::warn!(signal = name, "rdb_node_sigterm"));
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    Ok(())
 }
 
 /// [`serve`] on `store`, so a row can run the node process's start on its own store.
@@ -1329,7 +1357,10 @@ fn serve_on_ready(
         on_ready(node);
     }
     let mut retrying = report_ready(node, first);
-    let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
+    let stopped = || {
+        TERMINATED.load(Ordering::SeqCst)
+            || args.stop_file.as_ref().is_some_and(|stop| stop.exists())
+    };
     let done = AtomicBool::new(false);
     // Each watcher logs in the span this serve runs in, as the node's own lines do, so a row's
     // node logs land in that row's file, not untagged.
@@ -3189,5 +3220,37 @@ mod tests {
             "over TLS the boot is written before the bind"
         );
         drop(held);
+    }
+
+    /// #80 S4: SIGTERM stops a node run as rdb_node. Once `listen_for_term` is installed, the
+    /// process sends itself SIGTERM and the flag the serve loop reads turns true within 5 s.
+    /// Unit (no node process). Cut: the listener is not installed; SIGTERM's default action
+    /// kills the test binary.
+    #[cfg(unix)]
+    #[config_log::retcd_test]
+    fn s80s4_sigterm_sets_the_serve_loops_stop_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        // The row's own flag, so a serve elsewhere in this binary never sees it.
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        super::listen_for_term(&rt, &FLAG).expect("the listener installs");
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "kill -TERM: {sent}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !FLAG.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            FLAG.load(Ordering::SeqCst),
+            "SIGTERM sets the flag within 5 s"
+        );
     }
 }
