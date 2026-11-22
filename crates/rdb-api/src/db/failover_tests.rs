@@ -74,6 +74,17 @@ fn failover() -> Failover {
 
 /// A database of `partitions` partitions, formed by one all-nodes open, written once, closed.
 fn formed(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>, partitions: u32) {
+    formed_seeded(rt, dir, store, partitions, &|_| {});
+}
+
+/// [`formed`], running `seed` on the forming open once it is ready, before it closes.
+fn formed_seeded(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+    partitions: u32,
+    seed: &dyn Fn(&Db),
+) {
     let mut db = rt
         .block_on(Db::open_with(
             DbConfig {
@@ -87,6 +98,7 @@ fn formed(rt: &tokio::runtime::Runtime, dir: &Path, store: &Arc<dyn ConfigStore>
         .expect("the forming open");
     db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
         .expect("the forming open is ready");
+    seed(&db);
     db.shutdown();
 }
 
@@ -115,6 +127,27 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
 /// Ordinary callers pass `None` and start without faults.
 fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<NodeId>) -> Rig {
     let mut grant_cuts = BTreeMap::new();
+    let mut rig = opened_parts(partitions, failovers, &|_| {}, &mut |node, control| {
+        if cut != Some(node) {
+            return control;
+        }
+        let grant_cut =
+            PrefixCut::new(control, &ControlKey::Grant(node).encode(), CutCalls::Writes);
+        grant_cuts.insert(node, Arc::clone(&grant_cut));
+        grant_cut
+    });
+    rig.grant_cuts = grant_cuts;
+    rig
+}
+
+/// [`opened`], formed by [`formed_seeded`] with `seed`, and with each node's control store
+/// passed through `wrap` before its process opens (#172: a row's gate on one node's calls).
+fn opened_parts(
+    partitions: u32,
+    failovers: [Option<Failover>; 3],
+    seed: &dyn Fn(&Db),
+    wrap: &mut dyn FnMut(NodeId, Arc<dyn ConfigStore>) -> Arc<dyn ConfigStore>,
+) -> Rig {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let dir = config_testkit::fs::temp_dir();
@@ -125,7 +158,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         .chain([Label::App(APP.to_owned())])
         .collect();
     certs::generate(cert_dir.path(), &labels).expect("certs");
-    formed(&rt, dir.path(), &store, partitions);
+    formed_seeded(&rt, dir.path(), &store, partitions, seed);
     let listeners: Vec<tokio::net::TcpListener> = ALL_NODES
         .iter()
         .map(|_| rt.block_on(config_testkit::ports::ephemeral_listener()).0)
@@ -143,7 +176,6 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
             .zip(failovers)
             .map(|((node, listener), failover)| {
                 let node = *node;
-                let grant_cuts = &mut grant_cuts;
                 start_proc(
                     &rt,
                     dir.path(),
@@ -153,18 +185,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
                     node,
                     listener,
                     failover,
-                    |control| {
-                        if cut != Some(node) {
-                            return control;
-                        }
-                        let grant_cut = PrefixCut::new(
-                            control,
-                            &ControlKey::Grant(node).encode(),
-                            CutCalls::Writes,
-                        );
-                        grant_cuts.insert(node, Arc::clone(&grant_cut));
-                        grant_cut
-                    },
+                    |control| wrap(node, control),
                 )
             })
             .collect()
@@ -178,7 +199,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         addrs,
         procs,
         partitions,
-        grant_cuts,
+        grant_cuts: BTreeMap::new(),
     };
     rig
 }
@@ -245,6 +266,15 @@ impl Rig {
     /// Stop process `i` for good, as a crash and a supervisor's start would, and start node
     /// `i + 1` again on its folder and address at a new boot, running `failover`.
     fn restart(&mut self, i: usize, failover: Option<Failover>) {
+        self.restart_unready(i, failover);
+        self.procs[i]
+            .db
+            .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the restarted process is ready");
+    }
+
+    /// [`Self::restart`], not waiting for the new process to be ready: its heal may fail.
+    fn restart_unready(&mut self, i: usize, failover: Option<Failover>) {
         let node = ALL_NODES[i];
         // `Db::shutdown` leaves the links up; `Net::shutdown` ends them, as the process's exit
         // would, so the peers meet the new boot when it dials or is dialled.
@@ -276,10 +306,6 @@ impl Rig {
             |control| control,
         );
         self.procs.insert(i, proc);
-        self.procs[i]
-            .db
-            .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
-            .expect("the restarted process is ready");
     }
 
     /// The members `partitions/{partition}` pins.
@@ -2291,4 +2317,350 @@ fn pr156_a_spawned_planner_logs_its_panic() {
         1,
         "the planner stopped at its panic"
     );
+}
+
+/// The forming open's seed for the #172 rows: fault node 2's host and promote the partition it
+/// owns to node 1, dropping node 2, so that partition pins two copies, nodes 1 and 3. Node 2
+/// then owns nothing, and its frozen grant of the forming boot is the planner's to clear (#81
+/// X2) once node 2's process runs at a new boot. Node 2 is never restarted after that, so no
+/// owner re-adds it (`readd_candidate` wants a boot newer than the one it recorded).
+fn seed_two_copy_partition(db: &Db) {
+    let p = (1..=db.partition_count())
+        .find(|p| db.owner_of(PartitionId(*p)) == Some(NodeId(2)))
+        .expect("node 2 owns a partition");
+    let boot = db.boot_of(NodeId(2)).expect("this open runs node 2");
+    db.send_to(
+        NodeId(2),
+        Msg::Fault {
+            boot,
+            kind: "i172_seed",
+            detail: "injected".to_owned(),
+        },
+    )
+    .expect("node 2 takes the fault");
+    until("node 2 faults", Duration::from_secs(10), || {
+        db.node_status()
+            .iter()
+            .any(|status| status.node == NodeId(2) && status.fault.is_some())
+    });
+    let promoted = db
+        .promote_partition(PartitionId(p), NodeId(1), Some(NodeId(2)))
+        .expect("the seed promote");
+    tracing::info!(
+        partition = p,
+        generation = promoted.generation.0,
+        "i172_seeded"
+    );
+}
+
+/// #172 (option C): a node killed while one of its partitions cannot move takes it back when it
+/// restarts, with no `admin promote`. Three partitions; the seed leaves node 1 owning `q` on
+/// nodes 1, 2 and 3 and `p` on nodes 1 and 3 only ([`seed_two_copy_partition`]). Node 1 is
+/// killed (`stop`): the planner promotes `q`, which freezes `grants/1` for all of node 1, and
+/// refuses `p` as `lone_survivor` (one other copy answers), so `p` stays on node 1, `Serving`.
+/// Node 1 restarts at a new boot with a planner configured. Its heal finds the frozen grant
+/// and waits (`heal_grant_frozen_waiting`) instead of failing; the planner sees the new boot and
+/// clears the freeze (`planner_frozen_grant_cleared`, guard 3 now passing a `Serving` owner);
+/// the heal acquires and heals `p` with node 1 as owner at a new generation; a put lands in
+/// `p`. No promote of `p` is ever made.
+/// Integration (~18 s alone): two grant lapses, a restart.
+/// Cuts, each run on 2026-11-21, seen red, reverted and checked byte-identical with `cmp`:
+/// - guard 3 as #81 X2 had it (`.find(|partition| partition.owner == node)` in
+///   `clear_frozen_verdict`): red in 33 s, "the restarted process is ready: Heal(Frozen { node:
+///   1, step: \"the failover planner did not clear it in time; a takeover from node 1 is
+///   unfinished and it still owns partition 2; ...\" })". The heal waited out its deadline.
+/// - the heal not waiting (`if false && ctx.failover && moving.is_none()` in `clear_until`): red
+///   in 21 s, "the restarted process is ready: Heal(Frozen { node: 1, step: \"a takeover from
+///   node 1 is unfinished and it still owns partition 2; ...\" })", the at-once refusal.
+#[config_log::retcd_test]
+fn i172_a_killed_owner_restarted_takes_back_its_lone_partition() {
+    const METHOD: &str = "i172_a_killed_owner_restarted_takes_back_its_lone_partition";
+    let mut rig = opened_parts(
+        3,
+        [Some(failover()); 3],
+        &seed_two_copy_partition,
+        &mut |_, control| control,
+    );
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let owned = rig.owned_by(NodeId(1));
+    let (lone, movable): (Vec<u32>, Vec<u32>) = owned
+        .iter()
+        .partition(|p| rig.members(**p).iter().all(|m| m.node != NodeId(2)));
+    let ([p], [q]) = (lone.as_slice(), movable.as_slice()) else {
+        panic!("node 1 owns one two-copy and one three-copy partition: {lone:?} {movable:?}");
+    };
+    let (p, q) = (*p, *q);
+    until(
+        "node 2's frozen grant of the forming boot is cleared",
+        lifetimes(10),
+        || {
+            rig.grants()
+                .get(&NodeId(2))
+                .is_none_or(|grant| !grant.frozen)
+        },
+    );
+    until("a planner holds its grant", lifetimes(7), || {
+        rig.planner_grant().is_some()
+    });
+
+    rig.stop(0);
+    until("q moves and serves", lifetimes(20), || {
+        let record = rig.record(q);
+        record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
+    });
+    let refused = logged_at_least_within(METHOD, "planner_no_eligible_copy", 1, lifetimes(5));
+    assert!(
+        refused
+            .iter()
+            .any(|line| line["partition"] == p && line["reason"] == "lone_survivor"),
+        "{refused:?}"
+    );
+    assert!(
+        rig.grants()[&NodeId(1)].frozen,
+        "q's promote froze grants/1"
+    );
+    let before = rig.record(p);
+    assert_eq!(
+        (before.owner, before.lifecycle),
+        (NodeId(1), PartitionLifecycle::Serving),
+        "{before:?}"
+    );
+    let old_boot = rig.procs[0].boot;
+
+    rig.restart(0, Some(failover()));
+    let boot = rig.procs[0].boot;
+    assert!(boot > old_boot, "a new boot: {old_boot:?} -> {boot:?}");
+    until("node 1 holds a grant of its new boot", lifetimes(5), || {
+        rig.grants()
+            .get(&NodeId(1))
+            .is_some_and(|grant| grant.boot == boot && !grant.frozen)
+    });
+    let after = rig.record(p);
+    assert_eq!(
+        (after.owner, after.lifecycle),
+        (NodeId(1), PartitionLifecycle::Serving),
+        "{after:?}"
+    );
+    assert!(
+        after.generation > before.generation,
+        "healed at a new generation: {before:?} -> {after:?}"
+    );
+    let waiting = logged(METHOD, "heal_grant_frozen_waiting");
+    assert!(
+        waiting
+            .iter()
+            .any(|line| line["node"] == 1 && line["boot"] == boot.0),
+        "{waiting:?}"
+    );
+    let cleared = logged(METHOD, "planner_frozen_grant_cleared");
+    assert!(
+        cleared
+            .iter()
+            .any(|line| line["node"] == 1 && line["record_boot"] == old_boot.0),
+        "{cleared:?}"
+    );
+    let planned_p: Vec<_> = promotes(METHOD)
+        .into_iter()
+        .filter(|line| line["partition"] == p)
+        .collect();
+    assert!(
+        planned_p.is_empty(),
+        "no planner promote of p: {planned_p:?}"
+    );
+    // The seed's promote is the only hand promote of p.
+    let by_hand: Vec<_> = logged(METHOD, "db_promoted")
+        .into_iter()
+        .filter(|line| line["partition"] == p)
+        .collect();
+    assert_eq!(
+        by_hand.len(),
+        1,
+        "only the seed's promote of p: {by_hand:?}"
+    );
+
+    let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
+    let put = put_lands(&app, group_of(&app, p), lifetimes(5));
+    assert_eq!(put.partition, PartitionId(p), "{put:?}");
+    println!("i172 p={p} q={q} before={before:?} after={after:?}");
+}
+
+/// #172 design section 3, the race: a promote of `p` writes `Fencing` between the planner's
+/// clear reading `partitions/` and deleting the frozen `grants/1`, while node 1 has restarted at
+/// a new boot. Six partitions, no running planner; node 1 owns `q` and `p`. Node 1 stops, `q` is
+/// promoted by hand (which freezes `grants/1`), node 1 restarts at a new boot with no planner of
+/// its own, so its heal fails `Frozen` at once and it never acquires. Node 2's planner, driven
+/// by the row over a [`CallGate`], sweeps: its clear reads `grants/1` and `partitions/` (`p`
+/// `Serving`, so guard 3 passes) and parks before its delete. Node 3 then promotes `p` to
+/// itself; its `owner_dead` reads the frozen record and its `Fencing` CAS lands, and it parks
+/// on that reply. The clear's delete then goes, at the unchanged revision, and lands; then the
+/// promote goes on to its freeze.
+///
+/// Observed, from the code and pinned here: the freeze finds `grants/1` gone where
+/// `owner_dead` judged a frozen record, so it refuses `OwnerAlive` ("it came back during the
+/// promote"), and CASes `partitions/p` back from `Fencing` (`promote_fencing_undone`). Nothing
+/// commits: `p` is node 1's at its old generation, `Serving`. The design's section 3 says this
+/// interleaving creates the key frozen and completes as a normal takeover; that is the
+/// single-partition path (`owner_must_be_dead` false). Above one partition, which is every
+/// planner promote, it is refused instead. Either way no two owners hold one generation, and
+/// that invariant is asserted for every outcome before the outcome itself is. Also seen in the
+/// log: after its clear, the same sweep judges node 1 dead and tries `p` itself; node 1
+/// answers the look and `planner_promote_failed` writes nothing.
+/// Integration (~12 s alone): a grant lapse, a hand promote, a restart.
+/// Cut, run on 2026-11-21, seen red, reverted and checked byte-identical with `cmp`: `freeze`
+/// ignores `dead_at` for an absent record (`if false && dead_at.is_some_and(..)`, so it creates
+/// the record frozen, as the design describes). The promote then completes: `Ok(Promoted {
+/// owner: NodeId(3), generation: Generation(3), .. })`, the record at generation 3 owned by node
+/// 3. The invariant held (node 1's heal had already failed, so it served nothing), and the pinned
+/// `OwnerAlive` assertion went red with that `Ok(..)` as its message. So this cut proves the row
+/// pins the `dead_at` check; it does not show that check is what keeps one owner here.
+#[config_log::retcd_test]
+fn i172_a_promote_fencing_between_the_clears_read_and_delete_makes_no_second_owner() {
+    const METHOD: &str =
+        "i172_a_promote_fencing_between_the_clears_read_and_delete_makes_no_second_owner";
+    let mut gate3 = None;
+    let mut rig = opened_parts(6, [None; 3], &|_| {}, &mut |node, control| {
+        if node != NodeId(3) {
+            return control;
+        }
+        let gate = crate::test_store::CallGate::new(control);
+        gate3 = Some(Arc::clone(&gate));
+        gate
+    });
+    let gate3 = gate3.expect("node 3's store is gated");
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let moving = rig.owned_by(NodeId(1));
+    assert!(moving.len() >= 2, "{moving:?}");
+    let (q, p) = (moving[0], moving[1]);
+    rig.stop(0);
+    rig.procs[1]
+        .db
+        .promote_partition(PartitionId(q), NodeId(2), None)
+        .unwrap_or_else(|error| panic!("node 1 is stopped: {error}"));
+    assert!(
+        rig.grants()[&NodeId(1)].frozen,
+        "q's promote froze grants/1"
+    );
+    let old_boot = rig.procs[0].boot;
+
+    rig.restart_unready(0, None);
+    let boot = rig.procs[0].boot;
+    let healed = rig.procs[0]
+        .db
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)));
+    assert!(
+        healed
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("frozen")),
+        "with no planner the heal fails at once: {healed:?}"
+    );
+    until("nodes 2 and 3 know node 1's new boot", lifetimes(5), || {
+        [1, 2]
+            .iter()
+            .all(|i| rig.procs[*i].db.links().boot_of(NodeId(1)) == Some(boot))
+    });
+    let before = rig.record(p);
+    assert_eq!(
+        (before.owner, before.lifecycle),
+        (NodeId(1), PartitionLifecycle::Serving),
+        "{before:?}"
+    );
+
+    let clear_gate = crate::test_store::CallGate::new(Arc::clone(&rig.store));
+    let planner = crate::planner::Planner {
+        store: Arc::clone(&clear_gate) as Arc<dyn ConfigStore>,
+        ..rig.procs[1]
+            .db
+            .planner(failover())
+            .expect("a node process's planner")
+    };
+    let mut memory = crate::planner::Memory::default();
+    assert!(
+        rig.rt.block_on(planner.hold(&mut memory)),
+        "node 2's planner holds"
+    );
+    clear_gate.arm_delete(&ControlKey::Grant(NodeId(1)).encode());
+    // A scoped thread starts outside the test's span, so its lines would land in the run's
+    // untagged file; each thread enters the test span so `logged` can read them.
+    let span = tracing::Span::current();
+    let (answer, fenced) = std::thread::scope(|scope| {
+        let sweep = scope.spawn(|| {
+            let _test = span.enter();
+            rig.rt.block_on(planner.sweep(&mut memory))
+        });
+        until(
+            "the clear has read and parks its delete",
+            lifetimes(5),
+            || clear_gate.parked() == 1,
+        );
+        gate3.arm_put_reply(&ControlKey::Partition(PartitionId(p)).encode());
+        let promote = scope.spawn(|| {
+            let _test = span.enter();
+            rig.procs[2]
+                .db
+                .promote_partition(PartitionId(p), NodeId(3), Some(NodeId(1)))
+        });
+        until(
+            "the promote's Fencing write lands and parks",
+            lifetimes(5),
+            || gate3.parked() == 1,
+        );
+        let fenced = rig.record(p);
+        clear_gate.release();
+        until("the clear deletes grants/1", lifetimes(5), || {
+            !rig.grants().contains_key(&NodeId(1))
+        });
+        gate3.release();
+        let answer = promote.join().expect("the promote thread");
+        sweep.join().expect("the sweep thread");
+        (answer, fenced)
+    });
+    assert_eq!(fenced.lifecycle, PartitionLifecycle::Fencing, "{fenced:?}");
+    let cleared = logged(METHOD, "planner_frozen_grant_cleared");
+    assert!(
+        cleared
+            .iter()
+            .any(|line| line["node"] == 1 && line["record_boot"] == old_boot.0),
+        "{cleared:?}"
+    );
+    let after = rig.record(p);
+    println!("i172 race p={p} before={before:?} after={after:?} answer={answer:?}");
+    // The invariant, whatever the outcome: one owner, and a new generation only with a new
+    // owner who committed it.
+    assert_eq!(after.lifecycle, PartitionLifecycle::Serving, "{after:?}");
+    match &answer {
+        Ok(promoted) => assert_eq!(
+            (after.owner, after.generation.0, promoted.generation),
+            (NodeId(3), before.generation.0 + 1, after.generation),
+            "a normal takeover"
+        ),
+        Err(admin::PromoteError::Superseded { .. }) => {
+            assert_eq!(after.owner, NodeId(1), "node 1 healed first: {after:?}")
+        }
+        Err(_) => assert_eq!(
+            (after.owner, after.generation),
+            (NodeId(1), before.generation),
+            "nothing committed: {after:?}"
+        ),
+    }
+    let owners: Vec<NodeId> = rig
+        .procs
+        .iter()
+        .filter_map(|proc| proc.db.ownership(PartitionId(p)))
+        .map(|ownership| ownership.node)
+        .collect();
+    assert!(owners.len() <= 1, "at most one owner of p: {owners:?}");
+    // The outcome this interleaving has above one partition (see the doc).
+    assert!(
+        matches!(
+            &answer,
+            Err(admin::PromoteError::OwnerAlive { node: 1, evidence, .. })
+                if evidence.contains("came back during the promote")
+        ),
+        "{answer:?}"
+    );
+    // `promote_fencing_undone` is logged on node 3's runtime worker, outside the test span, so
+    // `logged` cannot see it; the record coming back unchanged is the undo, observed directly.
+    assert_eq!(after, before, "the Fencing write was undone");
 }

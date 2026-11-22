@@ -955,3 +955,120 @@ impl ConfigStore for SwapPartitionOneInstance {
         self.inner.watch_leader(request).await
     }
 }
+
+/// Any control store that, once armed, parks **one** call on a key under a prefix until the row
+/// lets it go (#172, the race row): [`CallGate::arm_put_reply`] applies the next such put and
+/// holds its reply (a promote's `Fencing` write that has landed, its promote not yet gone on),
+/// [`CallGate::arm_delete`] holds the next such delete before it reaches the store (the
+/// planner's clear, its reads done, its delete not yet sent). Each parked call adds one to
+/// [`CallGate::parked`] and waits for one [`CallGate::release`]. Every other call passes.
+pub(crate) struct CallGate {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    put_reply: Mutex<Option<Vec<u8>>>,
+    delete: Mutex<Option<Vec<u8>>>,
+    parked: std::sync::atomic::AtomicU32,
+    gate: Semaphore,
+}
+
+impl CallGate {
+    pub(crate) fn new(inner: std::sync::Arc<dyn ConfigStore>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            put_reply: Mutex::new(None),
+            delete: Mutex::new(None),
+            parked: std::sync::atomic::AtomicU32::new(0),
+            gate: Semaphore::new(0),
+        })
+    }
+
+    /// Apply the next put under `prefix`, then hold its reply.
+    pub(crate) fn arm_put_reply(&self, prefix: &str) {
+        *self.put_reply.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Hold the next delete under `prefix` before it reaches the store.
+    pub(crate) fn arm_delete(&self, prefix: &str) {
+        *self.delete.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// How many calls have parked so far.
+    pub(crate) fn parked(&self) -> u32 {
+        self.parked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let one parked call go on.
+    pub(crate) fn release(&self) {
+        self.gate.add_permits(1);
+    }
+
+    /// Whether `key` takes the armed hold in `slot`, disarming it if so.
+    fn take(slot: &Mutex<Option<Vec<u8>>>, key: &[u8]) -> bool {
+        let mut armed = slot.lock().expect("gate");
+        if armed.as_ref().is_some_and(|prefix| key.starts_with(prefix)) {
+            *armed = None;
+            return true;
+        }
+        false
+    }
+
+    async fn park(&self, call: &'static str, key: &[u8]) {
+        tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_parked");
+        self.parked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.gate
+            .acquire()
+            .await
+            .expect("the gate is never closed")
+            .forget();
+        tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_released");
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for CallGate {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        if !Self::take(&self.put_reply, &request.key) {
+            return self.inner.put(request).await;
+        }
+        let key = request.key.clone();
+        let applied = self.inner.put(request).await;
+        tracing::info!(?applied, "test_call_gate_put_applied");
+        self.park("put_reply", &key).await;
+        applied
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        if Self::take(&self.delete, &request.key) {
+            let key = request.key.clone();
+            self.park("delete", &key).await;
+        }
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}

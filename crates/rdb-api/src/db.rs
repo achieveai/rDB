@@ -2008,7 +2008,15 @@ impl Db {
                 // The owner's process heals (arch-s2 B1): this one only runs its copy.
                 tracing::info!(owner = found.owner.0, "db_open_not_owner");
             } else {
-                db.start_heal(&store, &rt, budgets, boot, heals, &config.local)?;
+                db.start_heal(
+                    &store,
+                    &rt,
+                    budgets,
+                    boot,
+                    heals,
+                    &config.local,
+                    config.failover.is_some(),
+                )?;
             }
         }
         db.unwind = None;
@@ -2591,7 +2599,9 @@ impl Db {
     /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
-    /// logs how many had started.
+    /// logs how many had started. `failover` is whether this open runs a planner (#172: the
+    /// heal then waits on a frozen grant the planner may clear).
+    #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -2600,6 +2610,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        failover: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
             let nodes = lock(&self.nodes);
@@ -2647,6 +2658,7 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                failover,
             });
         }
         let state = Arc::clone(&self.opened.heal);
@@ -4795,9 +4807,11 @@ impl Db {
     /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
     /// until its last grant expiry plus the safety margin is proven past. The other partitions
     /// the node owned remain not ready until each has its own promote (`Faulted` while the
-    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
+    /// faulted host answers, or `NoLink` when sending to it fails). The node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
-    /// for a partition it no longer owns.
+    /// for a partition it no longer owns; with [`DbConfig::failover`] set and every partition
+    /// it owns `Serving`, it waits instead for a planner to clear the frozen grant of its old
+    /// boot, then heals them as owner (#172).
     ///
     /// # Errors
     ///

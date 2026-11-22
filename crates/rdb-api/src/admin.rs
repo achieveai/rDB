@@ -1691,13 +1691,13 @@ pub async fn count_open_at(
                 .await;
             match written {
                 Ok(response) if response.outcome == MutationOutcome::Applied => {
-                    return counted(response.revision)
+                    return counted(response.revision);
                 }
                 Ok(_) | Err(ConfigError::Conflict { .. }) => {
                     return Err(CounterError::Moved {
                         key,
                         read: revision,
-                    })
+                    });
                 }
                 Err(error)
                     if matches!(error, ConfigError::DeadlineExceededUnknownOutcome)
@@ -1719,13 +1719,13 @@ pub async fn count_open_at(
             Ok(read) => match read.record {
                 Some(found) if found.mod_revision == revision => send = true,
                 Some(found) if decode_count(&found.value) == Some(next) => {
-                    return counted(found.mod_revision)
+                    return counted(found.mod_revision);
                 }
                 _ => {
                     return Err(CounterError::Moved {
                         key,
                         read: revision,
-                    })
+                    });
                 }
             },
             Err(error) if crate::control::transient(&error) => {
@@ -1804,7 +1804,7 @@ pub async fn activate(
                     .await;
                 match written {
                     Ok(response) if response.outcome == MutationOutcome::Applied => {
-                        return activated(next, response.revision)
+                        return activated(next, response.revision);
                     }
                     Ok(_) => format!("CAS at {} was not applied", found.mod_revision),
                     Err(error) => error.to_string(),
@@ -2119,6 +2119,10 @@ pub(crate) struct HealCtx {
     /// last handshake reported for another ([`crate::transport::Links::boot_of`]); `None`
     /// until that node's link has come up (arch-s2 B1).
     pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+    /// Whether this open runs a failover planner ([`crate::DbConfig::failover`]). Then a
+    /// planner can clear the owner's frozen grant of a gone boot (#172), so [`clear_until`]
+    /// waits for that instead of failing at once.
+    pub(crate) failover: bool,
 }
 
 /// The correlation a heal's two events carry.
@@ -2649,19 +2653,39 @@ enum Gone {
 
 /// Run [`judge`] for `node` until it answers `Cleared` or `Absent`, or `deadline` passes. A
 /// guard that still holds is waited out until about when it says it will stop holding.
+///
+/// A frozen grant is never cleared by this heal, only by the promote that froze it, or (#172,
+/// option C) by the failover planner once it sees this new boot ([`crate::planner`]'s X2
+/// clear). So with [`HealCtx::failover`] set and every partition the node owns `Serving`, a
+/// frozen record is polled to `deadline` (logged `heal_grant_frozen_waiting` once); once the
+/// planner deletes it, the next look reads it `Absent` and the heal goes on to acquire
+/// create-only. With failover off, or a partition of the node in `Fencing` or
+/// `FencingDrained` (a takeover under way), it fails at once with the `admin promote` advice,
+/// as before.
 async fn clear_until(
     ctx: &HealCtx,
     node: NodeId,
     deadline: tokio::time::Instant,
 ) -> Result<Gone, HealError> {
     let mut last = format!("the control store did not answer; {STORE_STEP}");
+    let mut waiting_frozen = false;
     while tokio::time::Instant::now() < deadline {
         match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
             Ok((Clearance::Cleared(revision), Some(record), _)) => {
                 return Ok(Gone::Deleted(revision, record));
             }
-            Ok((Clearance::Absent, None, read)) => return Ok(Gone::Absent(read)),
-            // Waiting never clears a frozen grant: only the promote that froze it, run again.
+            Ok((Clearance::Absent, None, read)) => {
+                if waiting_frozen {
+                    tracing::info!(
+                        node = node.0,
+                        read_revision = read.0,
+                        "heal_grant_frozen_cleared"
+                    );
+                }
+                return Ok(Gone::Absent(read));
+            }
+            // Waiting never clears a frozen grant by itself: only the promote that froze it,
+            // run again, or the failover planner's clear of a gone boot (#172).
             Ok((
                 clearance @ Clearance::Refused {
                     refusal: ClearRefusal::Frozen,
@@ -2669,15 +2693,52 @@ async fn clear_until(
                 },
                 ..,
             )) => {
-                tracing::warn!(node = node.0, "heal_grant_frozen");
-                return Err(HealError::Frozen {
-                    node: node.0,
-                    step: if ctx.partition_count > 1 {
-                        frozen_step(node, &ctx.partitions)
-                    } else {
-                        kept_in_words(clearance, node, ctx.clock.now())
-                    },
-                });
+                let moving = if ctx.failover {
+                    match frozen_owner_in_transfer(&*ctx.store, node).await {
+                        Ok(moving) => moving,
+                        Err(error)
+                            if error.retry == RetryRule::BoundedJitter
+                                || error.kind == ErrorKind::UnknownOutcome =>
+                        {
+                            last = format!(
+                                "the control store answered: {}; {STORE_STEP}",
+                                error.detail
+                            );
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        Err(error) => return Err(HealError::Control(error.detail)),
+                    }
+                } else {
+                    None
+                };
+                if ctx.failover && moving.is_none() {
+                    if !waiting_frozen {
+                        waiting_frozen = true;
+                        tracing::info!(
+                            node = node.0,
+                            boot = ctx.boot.0,
+                            partitions = ?ctx.partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
+                            within_ms = ctx.within.as_millis(),
+                            "heal_grant_frozen_waiting"
+                        );
+                    }
+                    last = format!(
+                        "the failover planner did not clear it in time; {}",
+                        frozen_advice(ctx, clearance, node)
+                    );
+                } else {
+                    tracing::warn!(
+                        node = node.0,
+                        failover = ctx.failover,
+                        in_transfer = moving.map(|partition| partition.0),
+                        "heal_grant_frozen"
+                    );
+                    return Err(HealError::Frozen {
+                        node: node.0,
+                        step: frozen_advice(ctx, clearance, node),
+                    });
+                }
             }
             Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
             // A lost delete reply is read again next time round, as `clear_grant` advises.
@@ -2691,11 +2752,45 @@ async fn clear_until(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    if waiting_frozen {
+        tracing::warn!(
+            node = node.0,
+            within_ms = ctx.within.as_millis(),
+            "heal_grant_frozen"
+        );
+        return Err(HealError::Frozen {
+            node: node.0,
+            step: last,
+        });
+    }
     Err(HealError::NotCleared {
         node: node.0,
         within_ms: ctx.within.as_millis(),
         last,
     })
+}
+
+/// What [`HealError::Frozen`] advises for `node`'s frozen grant: above one partition, a
+/// promote of each partition the node still owns; else `clearance` in words.
+fn frozen_advice(ctx: &HealCtx, clearance: Clearance, node: NodeId) -> String {
+    if ctx.partition_count > 1 {
+        frozen_step(node, &ctx.partitions)
+    } else {
+        kept_in_words(clearance, node, ctx.clock.now())
+    }
+}
+
+/// A partition naming `node` as owner that is not `Serving` (a takeover under way), read fresh
+/// from the whole `partitions/` family, or `None` when every one is `Serving` (#172).
+async fn frozen_owner_in_transfer(
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Option<PartitionId>, ApiError> {
+    Ok(list_partitions(store)
+        .await?
+        .into_iter()
+        .find(|record| record.owner == node && record.lifecycle != PartitionLifecycle::Serving)
+        .map(|record| record.partition))
 }
 
 /// The next step for a frozen grant above one partition (issue #79 S3): each partition the
@@ -4169,7 +4264,7 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
         _ => {
             return Err(format!(
                 "plan version {version}, this build reads 1, 2, 3 and {PROMOTE_PLAN_VERSION}"
-            ))
+            ));
         }
     };
     if !rest.is_empty() {
@@ -4213,12 +4308,12 @@ async fn store_plan(
                  promote finishes. A promote needs rEtcd write access to operations/ as well as \
                  partitions/ and grants/: grant it, then promote again",
                 partition.0
-            )))
+            )));
         }
         Err(error) => {
             return Err(PromoteError::Control(format!(
                 "could not store the plan at {key}: {error}; promote again"
-            )))
+            )));
         }
     }
     let read = store
@@ -5116,6 +5211,7 @@ mod tests {
             owner,
             within,
             member_boot: Arc::new(|_| Some(OPEN_2)),
+            failover: false,
             owner_node: OWNER,
             partitions,
             bootstrap,
@@ -5900,6 +5996,7 @@ mod tests {
                 owner,
                 within: Duration::from_millis(100),
                 member_boot,
+                failover: false,
                 owner_node: OWNER,
                 partitions: Vec::new(),
                 bootstrap: vec![(two, Revision(4))],
@@ -7314,6 +7411,7 @@ mod tests {
             owner,
             within: Duration::from_millis(100),
             member_boot: Arc::new(|node: NodeId| (node == OWNER).then_some(OPEN_2)),
+            failover: false,
             owner_node: OWNER,
             partitions: vec![PARTITION],
             bootstrap: Vec::new(),
@@ -7753,6 +7851,7 @@ mod tests {
             owner,
             within: Duration::from_millis(500),
             member_boot: Arc::new(|_| Some(OPEN_2)),
+            failover: false,
             owner_node: NodeId(2),
             partitions: vec![PARTITION],
             bootstrap: Vec::new(),
@@ -8650,6 +8749,7 @@ mod tests {
             owner,
             within,
             member_boot: Arc::new(|node| (node != NodeId(4)).then_some(OPEN_2)),
+            failover: false,
             owner_node: OWNER,
             partitions: vec![PARTITION],
             bootstrap: Vec::new(),

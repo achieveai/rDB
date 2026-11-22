@@ -37,7 +37,7 @@ use config_core::{ConfigError, ConfigStore, GetRequest, ListRequest, MutationOut
 use futures::StreamExt;
 use rdb_core::authority::clock::{e_new, expiry_proven, utc_ok, ClockView};
 use rdb_core::authority::grant::{clear_frozen_verdict, GrantRecord};
-use rdb_core::authority::partition::{PartitionRecord, RecordMember};
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord, RecordMember};
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
@@ -638,9 +638,16 @@ impl Planner {
             .filter(|(_, record)| record.frozen)
             .map(|(node, _)| *node)
             .collect();
-        // #81 X2: a frozen grant of a node that owns nothing in this snapshot is a candidate
-        // for the clear. Only a candidate: `clear_frozen` reads both families again, in order.
-        for node in frozen.iter().filter(|node| !owned.contains_key(node)) {
+        // #81 X2, widened by #172: a frozen grant of a node whose every partition in this
+        // snapshot is `Serving` (none at all included) is a candidate for the clear. Only a
+        // candidate: `clear_frozen` reads both families again, in order.
+        for node in frozen.iter().filter(|node| {
+            owned.get(node).is_none_or(|entries| {
+                entries
+                    .iter()
+                    .all(|entry| entry.0.lifecycle == PartitionLifecycle::Serving)
+            })
+        }) {
             self.clear_frozen(*node, memory.held).await;
         }
         let mut todo = Vec::new();
@@ -1012,16 +1019,20 @@ impl Planner {
         Ok((to, Some(answer)))
     }
 
-    /// #81 X2 (owner answer (a) on #81, 2026-11-19): delete `grants/{node}` when it is a frozen
-    /// record of a boot that is gone and the node owns nothing ([`clear_frozen_verdict`]), so
-    /// the node's new boot can be chosen and promoted again. Run by [`Self::sweep`] only, so
+    /// #81 X2 (owner answer (a) on #81, 2026-11-19), widened by #172 (option C): delete
+    /// `grants/{node}` when it is a frozen record of a boot that is gone and every partition
+    /// the node owns is `Serving` ([`clear_frozen_verdict`]), so the node's new boot can be
+    /// chosen and promoted again, and can heal a partition a partial failover left on it
+    /// (`lone_survivor`) as owner at a new generation. Run by [`Self::sweep`] only, so
     /// only while this planner holds `planner/grant`; `held` is the grant the sweep started
     /// under.
     ///
     /// The sweep's snapshot only names the candidate. Here `grants/{node}` is read first, and
-    /// `partitions/` again after it, so no partition can come to name the node between the
-    /// ownership read and the grant it judges (PR #171 review): a read that fails refuses the
-    /// clear. The planner's grant is checked again ([`Self::still_held`]) right before the
+    /// `partitions/` again after it, so no partition can come to name the node, or leave
+    /// `Serving`, between the ownership read and the grant it judges (PR #171 review): a read
+    /// that fails refuses the clear. A promote whose `Fencing` write lands after that read and
+    /// before the delete is settled by the freeze's and F1's single-key CASes, not here (#172
+    /// design section 3). The planner's grant is checked again ([`Self::still_held`]) right before the
     /// delete, which goes at the grant read's `mod_revision`: a renewal or a fresh freeze in
     /// between makes it a conflict, and nothing is cleared. Every refusal is logged, and the
     /// next sweep tries again.
