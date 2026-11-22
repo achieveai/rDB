@@ -799,8 +799,11 @@ impl Host {
             );
         }
         // Rev 5b: a held tail is recorded, so `admin forget-tail` counts it and the owner's
-        // status names the command.
-        if let (SnapshotRefusal::TailHeld, Some(through)) = (refused.reason, refused.through) {
+        // status names the command. Only for the transfer open now (PR #204 review): a late
+        // refusal of an ended one, after the writable re-plan cleared its hold, records none.
+        if let (true, SnapshotRefusal::TailHeld, Some(through)) =
+            (ours, refused.reason, refused.through)
+        {
             self.offer_holds
                 .entry(refused.partition)
                 .or_default()

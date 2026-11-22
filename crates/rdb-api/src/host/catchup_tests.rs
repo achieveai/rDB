@@ -2421,6 +2421,42 @@ fn t61_pr204_a_refused_combined_forget_tail_keeps_the_held_copy_warning() {
     assert!(!owner.rejoins.contains_key(&p), "no re-plan");
 }
 
+/// Issue #61, PR #204 review: a `tail_held` refusal that arrives after its transfer ended (the
+/// writable re-plan cleared the transfer and the hold) records no hold: the owner's
+/// `needs_operator` stays `None` and `offer_hold_recorded` is not logged.
+/// Cut: the hold inserted whether or not the refusal matches the open transfer (as at
+/// 67d028c), red (a hold comes back).
+#[config_log::retcd_test]
+fn t61_pr204_a_late_tail_held_refusal_brings_no_hold_back() {
+    const METHOD: &str = "t61_pr204_a_late_tail_held_refusal_brings_no_hold_back";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let owner = &mut trio.nodes[0].0;
+    let committed = &owner.committed[&p];
+    let (generation, cutoff) = (committed.new_generation, committed.selected.cutoff_seq);
+    assert!(owner.transfers.is_empty(), "no transfer is open");
+    assert_eq!(owner.needs_operator(p), None);
+    owner.snapshot_refused_heard(&super::snapshot::SnapshotOfferRefused {
+        partition: p,
+        generation,
+        at: cutoff,
+        copy: CopyId(2),
+        node: NodeId(3),
+        reason: super::snapshot::SnapshotRefusal::TailHeld,
+        through: Some(Seq(cutoff.0 + 3)),
+    });
+    assert_eq!(owner.needs_operator(p), None, "no hold came back");
+    assert!(
+        owner.offer_holds.get(&p).is_none_or(BTreeMap::is_empty),
+        "{:?}",
+        owner.offer_holds
+    );
+    assert!(logged!(METHOD, "offer_hold_recorded").is_empty());
+}
+
 /// Issue #105 (design section 8.1): `admin forget-tail` on the owner. Each refusal is
 /// `no_mutation`, names why, and ends "nothing was given up": no flag; a node that is not the
 /// owner; `--through` at or below the cutoff; `--through` with no tail anywhere to give up; a
