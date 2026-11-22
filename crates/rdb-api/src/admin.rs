@@ -10086,9 +10086,15 @@ mod tests {
         r5_one_full_plan("edge", &sent);
         let unknown = r5_lines(METHOD, "heal_peers_unknown");
         assert_eq!(unknown.len(), 1, "{unknown:?}");
-        assert_eq!(unknown[0]["reason"], "copy_not_proven_down", "a late wait keeps its reason");
+        assert_eq!(
+            unknown[0]["reason"], "copy_not_proven_down",
+            "a late wait keeps its reason"
+        );
         assert_eq!(r5_lines(METHOD, "heal_retry").len(), 1, "one retry");
-        assert!(r5_lines(METHOD, "heal_leave_out_expired").is_empty(), "no late decision");
+        assert!(
+            r5_lines(METHOD, "heal_leave_out_expired").is_empty(),
+            "no late decision"
+        );
     }
 
     /// PR #181 review round 2, blocker 1: two attempts in a row each get a grant read that ends
