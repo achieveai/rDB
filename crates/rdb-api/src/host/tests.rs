@@ -7483,3 +7483,69 @@ fn each_sync_the_syncer_runs_warns_once_while_slow() {
     }
     assert!(host.fault.is_none(), "{:?}", host.fault);
 }
+
+/// #87 review r1: a feed read's storage fault is typed only when it is stored damage.
+/// `Corrupt` is `CORRUPT_HISTORY`, ending with the feed's step on a feed reply
+/// ([`Fault::feed_error`], review r2) and without it as the node's fault; any other storage
+/// fault stays the
+/// generic host fault ([`ApiError::host`]: `UNAVAILABLE`, `NotWired`). The real damage paths
+/// (a broken frame, an envelope that does not decode) are
+/// `f87_2_damaged_history_answers_every_feed_caller_corrupt_history`.
+/// Review r4: the damage's own fault takes the owner-fault step, and an untyped fault's feed
+/// reply ends with the other-copy step.
+/// Cuts: `feed_storage_fault` typing every fault, red (`WriteFailed` typed); `next_step` back to
+/// `NotWired`-only host faults, red (`write over`); `feed_error` without the other-copy step,
+/// red.
+/// Unit (~1 ms).
+#[test]
+fn f87_2_a_feed_storage_fault_is_typed_only_when_it_is_damage() {
+    let damage = feed_storage_fault("feed: history floor".to_owned(), StorageFault::Corrupt);
+    let error = damage.feed_error();
+    assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_HISTORY_STEP),
+        "{error:?}"
+    );
+    // Review r2 (4647111500): the step is for a feed reply; the node's fault itself, which
+    // a put or a get hears, does not carry it.
+    let error = damage.error();
+    assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+    assert!(
+        !error.detail.contains(crate::db::error::FEED_HISTORY_STEP),
+        "{error:?}"
+    );
+    // Review r4 (4647111500, 4654680328): that fault's step is the owner-fault step, not
+    // `CORRUPT_HISTORY`'s "write over its key": the damage is the node's, not the caller's
+    // entry. Admitted (may have applied): ask the status with the same id. Refused: a new write.
+    assert!(error.is_host_fault(), "{error:?}");
+    let step = error.next_step().expect("a step");
+    assert!(step.contains("`Db::status` with its request id"), "{step}");
+    assert!(!step.contains("write over"), "{step}");
+    let step = damage.refusal().next_step().expect("a step");
+    assert!(step.contains("this send wrote nothing"), "{step}");
+    assert!(!step.contains("write over"), "{step}");
+    for fault in [
+        StorageFault::WriteFailed,
+        StorageFault::FlushFailed,
+        StorageFault::ProcessCrash,
+        StorageFault::HostCrash,
+    ] {
+        let error = feed_storage_fault("feed: history floor".to_owned(), fault).feed_error();
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Unavailable, RetryRule::NotWired),
+            "{fault:?}: {error:?}"
+        );
+        assert!(
+            !error.detail.contains(crate::db::error::FEED_HISTORY_STEP),
+            "{fault:?}: {error:?}"
+        );
+        // Review r4: a feed read off a faulted node with no damage goes to another copy.
+        assert!(
+            error
+                .detail
+                .ends_with(crate::db::error::FEED_OTHER_COPY_STEP),
+            "{fault:?}: {error:?}"
+        );
+    }
+}

@@ -1399,6 +1399,10 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     let (owner, mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1504,6 +1508,10 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
     let (owner, _mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -3701,6 +3709,134 @@ fn m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart
         2,
         "nodes 2 and 3 opened as copies: {logged:?}"
     );
+}
+
+/// R5 side fixes: node 1's process opens alone, so its heal waits for nodes 2 and 3 and logs
+/// `heal_retry`. (1) That line lands in this row's own log file: the heal task runs in the span
+/// of the open that started it, not untagged. (2) `wait_ready`'s time-out names what the heal
+/// waits for, the `heal_retry` error, not only "none". Cuts: the heal task spawned without
+/// `instrument`: no `heal_retry` in this row's file, red at the wait for it; `wait_ready`'s
+/// `timed_out` leaves `heal_waiting` out: the text names no heal reason, red.
+/// Integration (~16 s): the first attempt must run out the heal's window (`heal_within`).
+#[config_log::retcd_test]
+fn r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why() {
+    const METHOD: &str = "r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut one = rt
+        .block_on(Db::open_with(
+            node_config(dir.path(), &[1]),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 1's process opens");
+    let window = heal_within(&fast());
+    let deadline =
+        std::time::Instant::now() + crate::host::test_patience(window + Duration::from_secs(10));
+    let retry = loop {
+        let found = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .find(|line| line["@m"] == "heal_retry");
+        if let Some(line) = found {
+            break line;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no heal_retry in this row's own log within {window:?} and patience"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let reason = retry["error"].as_str().expect("heal_retry names its error");
+    assert!(reason.contains("no link to node"), "{retry}");
+    let timed_out = one
+        .wait_ready(Duration::from_millis(300))
+        .expect_err("node 1 cannot heal alone");
+    assert!(
+        matches!(timed_out, ReadyError::TimedOut { .. }),
+        "{timed_out:?}"
+    );
+    let text = timed_out.to_string();
+    assert!(
+        text.contains(&format!("the reopen's heal is waiting: {reason}")),
+        "{text}"
+    );
+    one.shutdown();
+}
+
+/// PR #181 review questions 1 and 2: node processes share one folder, each with its own
+/// copy, so the OS boot marker is per copy (`nodes/<n>/os_boot`). After a reboot (copies on
+/// `boot-a`, the OS on `boot-b`), owner node 1's process opens and dies before it is ready;
+/// then node 3's process, which leads neither partition, is ready at once and records its own
+/// copy's boot. Node 1's marker stays absent, so its next open is `Unknown` and waits for every
+/// copy, never `Same`. Integration (~2 s): a fresh open, three node-process opens.
+/// Cut: one marker for the whole folder, at `config.dir`: node 3's ready stamps it and node
+/// 1's reopen reads `Same`, red.
+#[config_log::retcd_test]
+fn r5_o_a_node_that_leads_nothing_never_stamps_an_owners_os_boot() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(2),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    db.shutdown();
+    drop(db);
+    assert_eq!(admin::initial_owner(PartitionId(1)), NodeId(1));
+    assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
+    let copy = |node: u32| dir.path().join("nodes").join(node.to_string());
+    let marker = |node: u32| copy(node).join(crate::os_boot::OS_BOOT_FILE);
+    for node in 1..=3 {
+        crate::os_boot::record(&copy(node), "boot-a").expect("the marker is written");
+        crate::os_boot::inject(&copy(node), Ok("boot-b"));
+    }
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Changed)
+    );
+    owner.shutdown();
+    drop(owner);
+    assert!(!marker(1).exists(), "a reboot removes node 1's marker");
+
+    let mut third = open_node(&rt, dir.path(), &store, &[3]).expect("node 3's process opens");
+    third
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("node 3 leads nothing, so it is ready at once");
+    third.shutdown();
+    drop(third);
+    assert_eq!(
+        std::fs::read_to_string(marker(3))
+            .expect("node 3's marker")
+            .trim(),
+        "boot-b"
+    );
+    assert!(!marker(1).exists(), "node 3 never writes node 1's marker");
+    assert!(
+        !dir.path().join(crate::os_boot::OS_BOOT_FILE).exists(),
+        "no folder-wide marker"
+    );
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Unknown),
+        "node 1 waits for every copy"
+    );
+    owner.shutdown();
 }
 
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
@@ -6110,5 +6246,36 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
     assert!(
         local.contains("host fault: the owner dropped the call unanswered"),
         "{local}"
+    );
+}
+
+/// #200 / PR #171 review: the reopen heal's task runs in the opener's span, so its lines land
+/// in the opener's own test file. Reopens a written folder; its owner heals, and that heal logs
+/// `heal_members` from the runtime task. Cut: `Db::start_heal` instruments the task with
+/// `Span::none()` in place of the opener's span; red at "a heal line in this test's file".
+/// Integration (~1 s): one fresh open, one reopen until ready.
+#[config_log::retcd_test]
+fn own200_the_reopen_heal_logs_into_the_openers_test_file() {
+    const METHOD: &str = "own200_the_reopen_heal_logs_into_the_openers_test_file";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    db.shutdown();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let names: std::collections::BTreeSet<_> = lines
+        .iter()
+        .filter_map(|line| line["@m"].as_str())
+        .collect();
+    assert!(
+        names.contains("db_heal_started"),
+        "the reopen heals: {names:?}"
+    );
+    assert!(
+        names.contains("heal_members"),
+        "a heal line in this test's file: {names:?}"
     );
 }
