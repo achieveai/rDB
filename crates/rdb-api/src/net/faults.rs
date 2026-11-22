@@ -13,6 +13,15 @@
 //! * `drop-reply N`: the `N`-th client call is served, and its answer is lost.
 //! * `cut-control`: every rEtcd call of this node fails `Unavailable`, and its watches end
 //!   ([`CutStore`]).
+//! * `refuse-links`: no new link comes up, either way. This node dials none (each dial fails
+//!   before its `Hello`), and it answers no peer's `Hello` (the accepted stream ends with no
+//!   `Welcome`), so no peer learns its boot. A link already up is left alone: pair it with
+//!   `mute`, whose silence closes that link at the peer's probe timeout, as the formation
+//!   rig's `Rig::mute` does. Since #170, `mute` alone also dials nobody and answers no
+//!   handshake; `refuse-links` refuses links without silencing one already up.
+//!   Logged: each refused accept as `net_handshake_refused_by_fault{peer}` (info), once per
+//!   dial; a refused dial through the dial loop's `net_dial_failed{reason}` with reason
+//!   `fault refuse-links: ...`, once until its reason changes.
 //!
 //! Every client call is logged `net_client_request{n, client, request}`, so a discovery run
 //! maps `N` to a request before a fault run names it. Blank lines and `#` comments are
@@ -53,6 +62,8 @@ pub struct FaultSet {
     pub drop_reply: BTreeSet<u64>,
     /// `cut-control`.
     pub cut_control: bool,
+    /// `refuse-links`: no handshake either way, dialled or accepted.
+    pub refuse_links: bool,
     /// `mute`: every link reads nothing, answers no probe and writes nothing, as a stopped
     /// process looks from outside (#81: the planner's silence test). It dials nobody and
     /// answers no handshake, so a link it closed stays down until the line goes. Pair it with
@@ -93,6 +104,10 @@ pub fn parse(text: &str) -> (FaultSet, Vec<String>) {
             }
             ["mute"] => {
                 set.mute = true;
+                true
+            }
+            ["refuse-links"] => {
+                set.refuse_links = true;
                 true
             }
             _ => false,
@@ -143,7 +158,7 @@ impl Faults {
         for line in &refused {
             tracing::error!(
                 %line,
-                "net_fault_line_refused: want hold <n>|hold all|drop-request N|drop-reply N|cut-control|mute"
+                "net_fault_line_refused: want hold <n>|hold all|drop-request N|drop-reply N|cut-control|mute|refuse-links"
             );
         }
         tracing::info!(
@@ -153,6 +168,7 @@ impl Faults {
             drop_reply = ?set.drop_reply,
             cut_control = set.cut_control,
             mute = set.mute,
+            refuse_links = set.refuse_links,
             "net_faults"
         );
         self.cut.store(set.cut_control, Ordering::SeqCst);
@@ -170,6 +186,12 @@ impl Faults {
     #[must_use]
     pub fn muted(&self) -> bool {
         self.lock().mute
+    }
+
+    /// Whether this node brings up no new link, dialled or accepted (`refuse-links`).
+    #[must_use]
+    pub fn refuses_links(&self) -> bool {
+        self.lock().refuse_links
     }
 
     /// Count one client call received; its number, from 1.
