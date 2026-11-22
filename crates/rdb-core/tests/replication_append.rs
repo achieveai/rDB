@@ -7508,3 +7508,75 @@ fn t61_recovered_cutoff_below_floor_anchors_at_root() {
     assert_eq!(rx_.history().highest(), Some(Seq::ZERO));
     assert_eq!(rx_.lineage().generation, NEW_GEN);
 }
+
+/// Issue #61 round 3 (rdb-api `abort_begun`): a receiver rewound to the root after a snapshot
+/// install it began was aborted keeps the history root its `Recovered` set. As M7B-123, B is
+/// behind the root at `(100, d100)` of `GEN`; rewound, it holds `(0, ROOT)` and nothing else,
+/// with the same root, `authority_seq` and control revision. 51 of `GEN`, below the floor, is
+/// still judged as history: B answers `NeedPrefix` from 0, so the primary's cursor asks again,
+/// not `StaleGeneration`, which the primary ignores.
+/// Cut: `rewound` keeps no root (as `AppendReceiver::new` builds it), red (`StaleGeneration`).
+#[retcd_test]
+fn t61_r3_a_rewound_receiver_keeps_its_root_so_history_below_the_floor_draws_need_prefix() {
+    let (mut module, _) = behind_the_root();
+    let held = rx(&module).clone();
+    let rewound = held.rewound().expect("a rewound receiver");
+    assert_eq!(rewound.applied_head(), root_head());
+    assert_eq!(rewound.durable_seq(), DurableSeq(0));
+    assert_eq!(rewound.root(), held.root());
+    assert_eq!(rewound.authority_seq(), held.authority_seq());
+    assert_eq!(
+        rewound.last_partition_revision(),
+        held.last_partition_revision()
+    );
+    module.install_receiver(rewound);
+    let history = chain(ROOT_CUT);
+    let effects = sent_now(&mut module, C, &history[50]);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq::ZERO,
+            head_digest: Digest::ROOT,
+        })
+    );
+}
+
+/// Issue #61 round 3 (rdb-api `Host::reseed`): a receiver that replaces another on the same copy
+/// and lineage takes what control installed (`carry_control_from`). As M7B-123, B holds the
+/// view and revision its `Recovered` installed. A new receiver at `(100, d100)`, as the re-seed
+/// builds one, carries both over, and the A1 view B already holds, routed again, is still a
+/// repeat (`NotRequired`), not recorded as new.
+/// Cut: `carry_control_from` does nothing, red (`authority_seq` 0, so the view is `Recorded`).
+#[retcd_test]
+fn t61_r3_a_replacement_receiver_carries_control_so_a_held_view_is_still_a_repeat() {
+    let (mut module, _) = behind_the_root();
+    let held = rx(&module).clone();
+    assert!(held.authority_seq() > 0, "{held:?}");
+    let mut fresh = AppendReceiver::new(ReceiverInit {
+        config: held.config().clone(),
+        own: held.copy(),
+        lineage: held.lineage(),
+        head: head(ROOT_CUT),
+        durable: DurableSeq(ROOT_CUT),
+    })
+    .expect("a re-seeded receiver");
+    fresh.carry_control_from(&held);
+    assert_eq!(fresh.authority_seq(), held.authority_seq());
+    assert_eq!(
+        fresh.last_partition_revision(),
+        held.last_partition_revision()
+    );
+    module.install_receiver(fresh);
+    let lineage = held.lineage();
+    let again = viewed(view_of(
+        held.authority_seq(),
+        lineage.generation,
+        lineage.owner_epoch,
+        held.config().config_version,
+    ));
+    assert_eq!(
+        step(&mut module, &again),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+}

@@ -405,6 +405,48 @@ impl AppendReceiver {
         Ok(())
     }
 
+    /// Issue #61 round 3: this receiver with nothing applied, for a copy whose engine no longer
+    /// holds any record of the lineage (a snapshot install aborted after its wipe). Head,
+    /// received, durable, ladder, staged record and quarantine go back to the root. The history
+    /// root that `Recovered` set is kept, so a record at or below its floor is still judged as
+    /// history. Everything control installed is kept too ([`Self::carry_control_from`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], which this receiver's own config and copy always pass.
+    pub fn rewound(&self) -> Result<Self, RdbError> {
+        let mut rewound = Self::new(ReceiverInit {
+            config: self.config.clone(),
+            own: self.own.copy,
+            lineage: self.lineage,
+            head: Head {
+                seq: Seq::ZERO,
+                digest: Digest::ROOT,
+            },
+            durable: DurableSeq(0),
+        })?;
+        rewound.root = self.root;
+        rewound.carry_control_from(self);
+        Ok(rewound)
+    }
+
+    /// Issue #61 round 3: take from `old`, the receiver this one replaces on the same copy and
+    /// lineage, what control and recovery installed and what no record carries: the control
+    /// revision (row 6R's floor), the A1 view's `authority_seq`, the retired, dormant and
+    /// sealed states, the kept recovery plan, the refused landings, and the batch counter, so
+    /// a late completion of an old batch never matches a new one. Without it a replacement
+    /// starts at revision 0 and `authority_seq` 0, so an older A1 view would pass as new.
+    pub fn carry_control_from(&mut self, old: &Self) {
+        self.last_partition_revision = old.last_partition_revision;
+        self.authority_seq = old.authority_seq;
+        self.retired = old.retired;
+        self.dormant = old.dormant;
+        self.recovery_plan.clone_from(&old.recovery_plan);
+        self.sealed_through = old.sealed_through;
+        self.refused_landings.clone_from(&old.refused_landings);
+        self.next_batch = old.next_batch;
+    }
+
     /// Whether this is a dormant receiver (lead ruling A-R173): restored after a restart and
     /// not yet replaced by `Recovered`.
     #[must_use]

@@ -9769,7 +9769,12 @@ fn t61_r3_the_fourth_refusal_keeps_the_barrier_and_the_retry_duty_reopens_it() {
     );
     let reopened = logged!(METHOD, "snapshot_retry_reopened");
     assert_eq!(reopened.len(), 1, "{reopened:?}");
-    assert!(reopened[0]["probe"].is_u64(), "{reopened:?}");
+    assert!(
+        reopened[0]["probe"]
+            .as_str()
+            .is_some_and(|probe| probe.starts_with("Some(")),
+        "a head was probed: {reopened:?}"
+    );
     let whys = copy3_field(&trio, METHOD, "snapshot_transfer_released", "why");
     assert_eq!(
         whys,
@@ -9834,11 +9839,14 @@ fn t61_r3_an_install_that_expires_before_its_first_page_aborts_nothing() {
 }
 
 /// Issue #61 round 3, inventory after an expiry: as item 14's row, node 1 holds page 1, so
-/// node 3's install has begun (and wiped the partition) when it expires. With the install
-/// gone, node 3 is asked for its inventory before any new offer reaches it. It answers
-/// `InventoryFailed` with `anchor_generation_unlinked`, logged at info with `installing` and
-/// `given_up`: the expected state of an install given up, not an error.
-/// Cut: the guard reads `installs` only, as before round 3, red (the line is logged at error).
+/// node 3's install has begun (and wiped the partition) when it expires. The expiry aborts the
+/// install (`install_abort`), so the lineage is gone, not left unlinked. Node 3 is then asked
+/// for its inventory before any new offer reaches it. It answers `InventoryFailed` with
+/// `anchor_generation_absent`, an expected reason, logged at info, and no `inventory_failed`
+/// line anywhere is at error.
+/// Cut: the abort skipped (`abort_begun` does nothing), red: the lineage stays installing and
+/// unlinked with no install, so the answer is `anchor_generation_unlinked` at error, the round 2
+/// state.
 /// Integration (~4 s): S2-R1's setup and one inventory ask on node 3.
 #[cfg(debug_assertions)]
 #[config_log::retcd_test]
@@ -9878,13 +9886,63 @@ fn t61_r3_an_inventory_asked_after_a_begun_install_expired_fails_at_info_not_err
         matches!(answer, RecoveryEvent::InventoryFailed { copy } if copy == three),
         "{answer:?}"
     );
-    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
-        .into_iter()
-        .filter(|line| line["reason"] == "anchor_generation_unlinked")
+    let failed = logged!(METHOD, "inventory_failed");
+    let asked: Vec<_> = failed
+        .iter()
+        .filter(|line| line["node"] == 3 && line["generation"] == lineage.generation.0)
         .collect();
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert_eq!(failed[0]["@l"], "Information", "{failed:?}");
-    assert_eq!(failed[0]["given_up"], true, "{failed:?}");
+    assert_eq!(asked.len(), 1, "{failed:?}");
+    assert_eq!(asked[0]["reason"], "anchor_generation_absent", "{asked:?}");
+    assert_eq!(asked[0]["@l"], "Information", "{asked:?}");
+    let errors: Vec<_> = failed.iter().filter(|line| line["@l"] == "Error").collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Issue #61 round 3, the re-seed keeps what control installed: as S2-R1, node 1 holds its
+/// offer until node 3, wiped and re-planned, holds a receiver with an A1 view and a control
+/// revision. After the install, node 3's re-seeded receiver at `S` carries both over: its
+/// `authority_seq` and `last_partition_revision` are at least the held ones, never 0. With them
+/// at 0 an A1 view the copy already holds would pass as new, and the fence floor (row 6R) would
+/// drop to revision 0.
+/// Red at 65338f85 (the receiver built with `AppendReceiver::new` alone). Cut: no
+/// `carry_control_from` in `Host::reseed`, red.
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r3_a_reseeded_receiver_keeps_its_authority_view_and_control_revision() {
+    const METHOD: &str = "t61_r3_a_reseeded_receiver_keeps_its_authority_view_and_control_revision";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_offer_held = true;
+        }
+    });
+    let (seq, revision) = trio.until("node 3 holds a viewed receiver", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), p)
+            .filter(|held| held.authority_seq() > 0 && held.last_partition_revision().0 > 0)
+            .map(|held| (held.authority_seq(), held.last_partition_revision()))
+    });
+    trio.nodes[0].0.snapshot_offer_held = false;
+    rebuilt(&mut trio, METHOD, floor);
+    let reseeded = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's re-seeded receiver");
+    assert!(
+        reseeded.authority_seq() >= seq,
+        "authority_seq {} after the re-seed, {seq} held before",
+        reseeded.authority_seq()
+    );
+    assert!(
+        reseeded.last_partition_revision() >= revision,
+        "revision {:?} after the re-seed, {revision:?} held before",
+        reseeded.last_partition_revision()
+    );
 }
 
 /// Issue #61 round 3, a delayed refusal crossing a replacement: as S2-R1, node 1 holds page
@@ -9956,8 +10014,8 @@ fn t61_r3_a_delayed_refusal_of_an_earlier_transfer_ends_nothing() {
 }
 
 /// Issue #61 round 3, a regression guard for promote after a rebuild: as S2-R1, bound to an
-/// instance, node 3 is rebuilt by node 1's snapshot, so its engine floor is the install's `S`.
-/// Node 1 is then cut off and node 3 promoted: its `Recovered` installs `fresh_primary`'s
+/// instance, node 3 is rebuilt by node 1's snapshot, so its engine floor is the install's `S`,
+/// and pinned regular. Node 1 is then cut off and node 3 promoted: its `Recovered` installs `fresh_primary`'s
 /// ladder, whose lowest rung is the genesis 0, below that floor. Node 2 then restarts on an
 /// empty disk and asks node 3 from below its floor. Node 3's ladder was aligned to its floor
 /// (`Host::align_ladders` after the `Recovered`), so the ask refills it dense from the floor,
@@ -9980,6 +10038,9 @@ fn t61_r3_a_copy_below_the_floor_of_a_promoted_rebuilt_copy_is_rebuilt_by_it() {
     let (mut trio, floor) = trimmed(dir.path(), 4, bind);
     bind(&mut trio.nodes[2].0);
     rebuilt(&mut trio, METHOD, floor);
+    trio.until("node 1 pinned node 3 as regular", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary)).then_some(())
+    });
     kill(&trio, 1, &[2, 3]);
     let promote = super::seal_tests::spawn_promote(&trio, 3);
     super::seal_tests::only_until(&mut trio, &[1, 2], "the promote finished", |_| {

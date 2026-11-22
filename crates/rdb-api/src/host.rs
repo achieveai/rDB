@@ -2908,10 +2908,6 @@ struct Host {
     next_transfer_id: u64,
     /// Issue #61 S2: the install this target runs, per partition.
     installs: BTreeMap<PartitionId, snapshot::Install>,
-    /// Round 3: the partitions whose install this target began and gave up
-    /// (`snapshot::Host::abort_begun`), until the next install begins or one finishes. Their
-    /// unlinked anchor is still the install's state, not a fault.
-    installs_given_up: BTreeSet<PartitionId>,
     /// Issue #61 S2: the most entries one snapshot page carries. [`COPY_BATCH_KEYS`]; rows set
     /// it lower to reach a later page with few keys.
     ///
@@ -3262,7 +3258,6 @@ impl Host {
             transfers: BTreeMap::new(),
             next_transfer_id: 1,
             installs: BTreeMap::new(),
-            installs_given_up: BTreeSet::new(),
             snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
             snapshot_page_bytes: snapshot::SNAPSHOT_PAGE_BYTES,
             #[cfg(debug_assertions)]
@@ -13921,8 +13916,7 @@ impl Host {
                 // unlinked anchor is the install's normal state, not a fault: the re-plan that
                 // follows the install asks again.
                 Err(reason @ "anchor_generation_unlinked")
-                    if self.installs.contains_key(&partition)
-                        || self.installs_given_up.contains(&partition) =>
+                    if self.installs.contains_key(&partition) =>
                 {
                     tracing::info!(
                         node = self.node.0,
@@ -13932,7 +13926,6 @@ impl Host {
                         base = anchor.base_seq.0,
                         reason,
                         installing = true,
-                        given_up = self.installs_given_up.contains(&partition),
                         "inventory_failed"
                     );
                     RecoveryEvent::InventoryFailed { copy }

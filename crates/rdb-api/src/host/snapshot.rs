@@ -1428,7 +1428,6 @@ impl Host {
                 return self.install_refused(&install, install_refusal(&error), error.reason());
             }
             install.begun = true;
-            self.installs_given_up.remove(&partition);
             self.offer_tail_held.remove(&partition);
             self.dormant_ladders.remove(&partition);
             self.inventory_ladders.remove(&partition);
@@ -1466,7 +1465,6 @@ impl Host {
         {
             return self.install_refused(&install, install_refusal(&error), error.reason());
         }
-        self.installs_given_up.remove(&partition);
         self.reseed(&install)
     }
 
@@ -1611,7 +1609,6 @@ impl Host {
                     partition.0, offer.at.0
                 ))
             })?;
-        self.installs_given_up.insert(partition);
         let Some(held) = self
             .replication
             .receiver(self.node, partition)
@@ -1620,17 +1617,7 @@ impl Host {
             return Ok(());
         };
         let before = held.accept_head().seq;
-        let receiver = AppendReceiver::new(ReceiverInit {
-            config: held.config().clone(),
-            own: offer.copy,
-            lineage: offer.lineage,
-            head: rdb_core::replication::append::Head {
-                seq: Seq::ZERO,
-                digest: Digest::ROOT,
-            },
-            durable: rdb_core::contracts::ids::DurableSeq(0),
-        })
-        .map_err(|error| {
+        let receiver = held.rewound().map_err(|error| {
             super::Fault::from(format!("snapshot abort re-root refused: {error:?}"))
         })?;
         self.replication.install_receiver(receiver);
@@ -1674,6 +1661,8 @@ impl Host {
             durable: rdb_core::contracts::ids::DurableSeq(offer.at.0),
         })
         .map_err(|error| super::Fault::from(format!("snapshot re-seed refused: {error:?}")))?;
+        let mut receiver = receiver;
+        receiver.carry_control_from(held);
         let ack = reseed_ack(&receiver, offer.at);
         self.replication.install_receiver(receiver);
         self.dormant_ladders.remove(&partition);
