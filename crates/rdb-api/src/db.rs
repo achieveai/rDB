@@ -116,7 +116,7 @@ pub const MAX_KEY: usize = 1_024;
 /// (1 MiB less 4 KiB). A larger value is `TOO_LARGE` ([`Limit::Value`]) before anything is
 /// compiled or sent, and its request id is used up. The same holds for a document that is one
 /// byte string (`Change::Doc` of one `Op::Replace(Value::Bytes(..))`, the shape a byte put
-/// writes): one byte over is `TOO_LARGE` too (PR #178 review r2, T27).
+/// writes): one byte over is `TOO_LARGE` too.
 pub const MAX_VALUE: usize = 1_044_480;
 
 /// The longest object id a [`ScopedDb`] takes (#147): [`MAX_OBJECT_ID`] less the longest scope
