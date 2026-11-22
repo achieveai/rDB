@@ -5190,6 +5190,7 @@ fn t61_a_trimmed_primary_opens_a_transfer_and_pins_its_seq() {
 /// Issue #61: put on whichever trio node admits writes (as `Db` routes a put to the owner)
 /// until one lands, retrying any refusal (a pause, a re-plan) for [`Trio::PATIENCE`]. Answers
 /// the head that node holds after it.
+#[cfg(debug_assertions)]
 pub(super) fn lands(trio: &mut Trio, request: u64) -> u64 {
     let patience = test_patience(Trio::PATIENCE);
     let deadline = Instant::now() + patience;
@@ -5220,12 +5221,14 @@ pub(super) fn lands(trio: &mut Trio, request: u64) -> u64 {
 }
 
 /// Issue #61 Trio rows: `note_tests::tune` on the regular rejoin path (no restart shadow).
+#[cfg(debug_assertions)]
 pub(super) fn trim_tuned(host: &mut Host) {
     super::note_tests::tune(host);
     host.restart_shadow = false;
 }
 
 /// Issue #61: every trio node's `history_floor` and R1 ladder floor, in node order.
+#[cfg(debug_assertions)]
 pub(super) fn floors(trio: &Trio) -> Vec<(u64, Option<Seq>)> {
     trio.nodes
         .iter()
