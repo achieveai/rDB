@@ -369,7 +369,7 @@ fn run_refill(db: &Db, partition: u32, to: u32) -> Result<Refilled, String> {
                     partition,
                     to,
                     took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    line = %answer.line,
+                    answer = %answer.line,
                     "rebalance_refill"
                 );
                 return Ok(Refilled::Done);
@@ -424,7 +424,7 @@ fn run_move(db: &Db, step: Step) -> Result<(), String> {
                     to = step.to,
                     why = %step.why.describe(),
                     took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    line = %answer.line,
+                    answer = %answer.line,
                     "rebalance_move"
                 );
                 return Ok(());
