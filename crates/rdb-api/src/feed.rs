@@ -201,7 +201,9 @@ pub fn resume<E>(
     if held == Some(Some((cursor.generation, cursor.digest))) {
         return Ok(Resume::Serve(cursor));
     }
-    // A fork this copy cannot locate: rewinding further than needed costs only replay (M2).
+    // A fork this copy cannot locate (M2). With the floor at 1 the reader replays from START:
+    // rewinding further than needed costs only replay. Above 1, START is no longer held, so
+    // `start` answers `Trimmed` instead (#170 review r6).
     let Some(at) = at else {
         return Ok(start());
     };
