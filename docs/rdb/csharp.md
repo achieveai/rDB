@@ -27,8 +27,8 @@ the gateway. The gateway's output is `<run>/out/rdb-server.out`, its log `<run>/
 (never keys or values). Each call writes one `rdb_server_call` line: `method`, `kind` (`OK`, the
 error kind, or the gRPC code), `ms`, `request_id`, `no_mutation` (on errors), and `caller_gone`
 (true when the client had given up before the call ended: that is the line an operator settles an
-unknown write from). Each write that landed also writes `rdb_server_write`: `method`, `request_id`,
-`generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
+unknown write from). Each write that landed also writes `rdb_server_write` at debug (target `rdb_server::write`,
+#158): `method`, `request_id`, `generation`, `version`. A gateway past 64 running calls refuses more with `OVERLOADED`
 (`no_mutation`, retried by the client). A stop (Ctrl-C, or `down`) ends within 45 s of being
 asked, however long a call has left: it waits that long in all for running calls to end and write
 their lines, then cuts every open connection (`rdb_server_stop_cut`) and logs the calls still

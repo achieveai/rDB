@@ -262,3 +262,59 @@ async fn harness_real_gossip_observes_peers_and_accepts_injection() {
 
     cluster.shutdown().await;
 }
+
+/// Issue #160: a node's default read and write timeouts are [`DEFAULT_CALL_TIMEOUT`] stretched
+/// by `RETCD_TEST_DEADLINE_SCALE`, like every other deadline the gate scales.
+///
+/// The scale is read from the environment, so the body runs in a child process of this binary
+/// with the variable set on that child alone ([`child_default_call_timeouts_at_scale_3`]). A
+/// process-wide change here would leak into every other row of this binary.
+///
+/// Cut: restore either fixed `Duration::from_secs(2)` initializer in `ClusterConfig::default`,
+/// and the child is red.
+///
+/// [`DEFAULT_CALL_TIMEOUT`]: config_testkit::cluster::DEFAULT_CALL_TIMEOUT
+#[test]
+fn harness_default_call_timeouts_scale_with_the_deadline_scale() {
+    const CHILD: &str = "child_default_call_timeouts_at_scale_3";
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([CHILD, "--exact", "--ignored", "--test-threads=1"])
+        .env("RETCD_TEST_DEADLINE_SCALE", "3")
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{CHILD} failed or ran no test: {}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The body of [`harness_default_call_timeouts_scale_with_the_deadline_scale`], run in a child
+/// process with `RETCD_TEST_DEADLINE_SCALE=3`.
+#[test]
+#[ignore = "run in a child process by harness_default_call_timeouts_scale_with_the_deadline_scale"]
+fn child_default_call_timeouts_at_scale_3() {
+    assert_eq!(
+        config_testkit::poll::deadline_scale(),
+        3,
+        "the parent sets RETCD_TEST_DEADLINE_SCALE=3 on this child"
+    );
+    assert_eq!(
+        config_testkit::cluster::DEFAULT_CALL_TIMEOUT,
+        Duration::from_secs(2),
+        "the unscaled default"
+    );
+    let config = ClusterConfig::default();
+    assert_eq!(
+        config.read_timeout,
+        Duration::from_secs(6),
+        "read_timeout is 2 s times scale 3"
+    );
+    assert_eq!(
+        config.write_timeout,
+        Duration::from_secs(6),
+        "write_timeout is 2 s times scale 3"
+    );
+}

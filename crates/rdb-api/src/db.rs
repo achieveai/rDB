@@ -744,6 +744,10 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the heal's task still runs, sends included, and so may plan a recovery that
+    /// blocked on `CasContention` again ([`admin::heal_settling`]). [`Db::wait_ready`] does
+    /// not end on that block while it does.
+    heal_settling: Arc<AtomicBool>,
     /// Why the running heal is waiting, as its latest `heal_retry` said (R5): `wait_ready`'s
     /// time-out names it. `None` once the heal ends, or before it has waited.
     heal_waiting: Arc<Mutex<Option<String>>>,
@@ -840,6 +844,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_settling: Arc::new(AtomicBool::new(false)),
             heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
             stuck: Mutex::new(None),
@@ -1903,13 +1908,16 @@ pub(crate) async fn heal_in_turn(
     ctxs: Vec<admin::HealCtx>,
     state: Arc<Mutex<HealState>>,
     waiting: Arc<Mutex<Option<String>>>,
-) {
+) -> Vec<(admin::HealCtx, admin::HealProof)> {
     let mut first = None;
     let mut ended = Ok(());
+    let mut handed = Vec::new();
     for ctx in ctxs {
+        let watch = ctx.again();
         match admin::heal_retrying(ctx).await {
-            Ok(healed) => {
+            Ok((healed, proved)) => {
                 first.get_or_insert(healed);
+                handed.push((watch, proved));
             }
             Err(error) => {
                 tracing::error!(%error, "heal_failed");
@@ -1918,12 +1926,41 @@ pub(crate) async fn heal_in_turn(
             }
         }
     }
+    let healed = ended.is_ok();
     *lock(&state) = match (ended, first) {
         (Ok(()), Some(healed)) => HealState::Handed(healed),
         (Err(error), _) => HealState::Failed(error),
         (Ok(()), None) => HealState::NotNeeded,
     };
     *lock(&waiting) = None;
+    if healed {
+        handed
+    } else {
+        Vec::new()
+    }
+}
+
+/// #172 (PR #218 review): after [`heal_in_turn`] handed every owner its plans, watch each
+/// owner's recoveries ([`admin::heal_settling`]): a recovery whose commit lost to an undone
+/// `Fencing` is planned again in this open, and `wait_ready` waits while this runs. A re-plan
+/// that failed is the heal's error from then on, so `wait_ready` names its cause (round 2); the
+/// caller clears the settling flag only after this returns.
+async fn settle_in_turn(
+    handed: Vec<(admin::HealCtx, admin::HealProof)>,
+    state: &Arc<Mutex<HealState>>,
+) {
+    if handed.is_empty() {
+        return;
+    }
+    let watched = futures::future::join_all(
+        handed
+            .into_iter()
+            .map(|(watch, proved)| admin::heal_settling(watch, proved)),
+    )
+    .await;
+    if let Some(error) = watched.into_iter().find_map(Result::err) {
+        *lock(state) = HealState::Failed(error);
+    }
 }
 
 /// Why [`Db::wait_ready`] returned without the owner admitting writes.
@@ -1954,9 +1991,12 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
-    /// The owner's recovery ended `Blocked` before it took writes. It does not try again in this
-    /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
-    /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
+    /// The owner's recovery ended `Blocked` before it took writes, and nothing in this open will
+    /// try it again (ruling F-a), so no wait helps (A-R196). For `CasContention` that holds
+    /// only once the reopen's heal has stopped watching: until then [`admin::heal_settling`]
+    /// plans it again, and a re-plan that failed is answered as [`Self::Heal`] with its cause,
+    /// not as this (#172, PR #218 review). A new open usually gets past it; one that is blocked
+    /// again is not a slow host, so the text says to stop then (review-s1 F-007).
     #[error(
         "the open's recovery stopped before node {node} took writes ({reason}), and it does \
          not try again in this open. If the last open of this folder stopped the same way, stop \
@@ -2794,6 +2834,7 @@ impl Db {
                     boot,
                     heals,
                     &config.local,
+                    config.failover.is_some(),
                     config.timeouts.live_readd,
                 )?;
             }
@@ -3378,7 +3419,8 @@ impl Db {
     /// Start the reopen's heal on `rt`; [`Self::wait_ready`] reports how it ends. Called only
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
-    /// logs how many had started.
+    /// logs how many had started. `failover` is whether this open runs a planner (#172: the
+    /// heal then waits on a frozen grant the planner may clear).
     #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
@@ -3388,6 +3430,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        failover: bool,
         live_readd: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
@@ -3436,6 +3479,7 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                failover,
                 os_boot: self
                     .opened
                     .os_boot
@@ -3450,10 +3494,16 @@ impl Db {
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
         let waiting = Arc::clone(&self.opened.heal_waiting);
+        let settling = Arc::clone(&self.opened.heal_settling);
+        settling.store(true, Ordering::Release);
         // In the opener's span, as the planner's task is: the heal's lines (`heal_retry` among
         // them) land in the opener's test file (issue #200, PR #171 review; R5).
         self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
-            heal_in_turn(ctxs, state, waiting),
+            async move {
+                let handed = heal_in_turn(ctxs, Arc::clone(&state), waiting).await;
+                settle_in_turn(handed, &state).await;
+                settling.store(false, Ordering::Release);
+            },
             tracing::Span::current(),
         )));
         Ok(())
@@ -3474,7 +3524,11 @@ impl Db {
     /// or its restart failed, answers at once: the owner stays out until the folder is opened
     /// again. So does a
     /// recovery that ended `Blocked` on an owner this `Db` runs: only a fresh fence leaves that
-    /// phase, and an open sends one fence only (ruling F-a, A-R196). An owner in another process
+    /// phase (ruling F-a, A-R196). The one exception is `Blocked(CasContention)` while the
+    /// reopen's heal still runs: [`admin::heal_settling`] plans that recovery again with a fresh
+    /// fence (#172, PR #218 review), so this waits on, and answers `Blocked` only once the heal
+    /// has stopped watching; a re-plan that failed answers [`ReadyError::Heal`] with its cause
+    /// instead. An owner in another process
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
@@ -3567,7 +3621,15 @@ impl Db {
                     Some(ReadyError::Blocked {
                         owner: node,
                         reason,
-                    }) if self.runs(node) => {
+                    }) if self.runs(node)
+                        && !(reason == "CasContention"
+                            && self.opened.heal_settling.load(Ordering::Acquire)) =>
+                    {
+                        // A re-plan that failed just before the flag cleared: its cause, not
+                        // the block it left (PR #218 review, round 2).
+                        if let HealState::Failed(error) = &*lock(&self.opened.heal) {
+                            return Err(ReadyError::Heal(error.clone()));
+                        }
                         tracing::warn!(owner = node.0, reason, "ready_blocked");
                         return Err(ReadyError::Blocked {
                             owner: node,
@@ -3575,8 +3637,10 @@ impl Db {
                         });
                     }
                     Some(ReadyError::Blocked { reason, .. }) => {
-                        // Another process's owner is not ended by one blocked recovery: it
-                        // re-plans a rejoin that does not end writable (A-R282, A-R314 item 2).
+                        // Not ended by this block: an owner in another process re-plans a rejoin
+                        // that does not end writable (A-R282, A-R314 item 2), and an owner this
+                        // `Db` runs blocked `CasContention` is planned again while the heal's
+                        // watch runs ([`admin::heal_settling`]).
                         if remote_blocked.as_ref() != Some(&reason) {
                             tracing::info!(owner = owner.node.0, reason, "ready_owner_blocked");
                             remote_blocked = Some(reason);
@@ -6697,9 +6761,11 @@ impl Db {
     /// has nothing left to stop (issue #122). A just-killed or just-faulted owner is waited out
     /// until its last grant expiry plus the safety margin is proven past. The other partitions
     /// the node owned remain not ready until each has its own promote (`Faulted` while the
-    /// faulted host answers, or `NoLink` when sending to it fails); the node's next open fails
+    /// faulted host answers, or `NoLink` when sending to it fails). The node's next open fails
     /// [`admin::HealError::Frozen`] while it still owns any, naming them, and heals nothing
-    /// for a partition it no longer owns.
+    /// for a partition it no longer owns; with [`DbConfig::failover`] set and every partition
+    /// it owns `Serving`, it waits instead for a planner to clear the frozen grant of its old
+    /// boot, then heals them as owner (#172).
     ///
     /// # Errors
     ///
@@ -17856,6 +17922,243 @@ mod tests {
             "the paused put's value reads back"
         );
         db.shutdown();
+    }
+
+    /// #158 option B: an owner refusing writes for several windows logs, at info, one
+    /// `refusal_first` for the key and one `refusal_summary` per window, not one line per
+    /// refusal. Debug keeps every refusal's `reply` line, and the summaries' counts add up to
+    /// them. The window is 100 ms here, so three windows close in well under a second.
+    /// Cut: no `refusal_summary` line is written: the counts never reach the refusals, red.
+    /// Integration (~2 s): three node threads, a real pause and a heal.
+    #[config_log::retcd_test]
+    fn r158_refusals_log_one_first_and_one_summary_per_window_at_info() {
+        const METHOD: &str = "r158_refusals_log_one_first_and_one_summary_per_window_at_info";
+        const WINDOW: Duration = Duration::from_millis(100);
+        let dir = config_testkit::fs::temp_dir();
+        crate::host::set_refusal_window(dir.path(), 100);
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+
+        // Overload: refused puts, back to back, until three windows have passed.
+        let started = Instant::now();
+        let mut refused = 0_u64;
+        let mut hashes = Vec::new();
+        while started.elapsed() < 3 * WINDOW || refused < 20 {
+            let paused = db
+                .put(b"c", &refused.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+            let identity = paused.request.as_ref().expect("the request sent").identity;
+            hashes.push(crate::host::refusals::hash_hex(
+                crate::host::refusals::request_id_hash(identity),
+            ));
+            refused += 1;
+        }
+        let elapsed = started.elapsed();
+        db.links().heal_all();
+
+        // The last window closes one window after its last refusal: wait for its summary.
+        let paused_in = |line: &serde_json::Value| -> u64 {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                    .expect("top is JSON");
+            top.as_array()
+                .expect("top is an array")
+                .iter()
+                .filter(|key| key["reason"] == "ProtectionPaused")
+                .map(|key| key["count"].as_u64().expect("a count"))
+                .sum()
+        };
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        let lines = loop {
+            let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+            let summarised: u64 = lines
+                .iter()
+                .filter(|line| line["@m"] == "refusal_summary")
+                .map(paused_in)
+                .sum();
+            if summarised >= refused {
+                break lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "summaries count {summarised} of {refused} refusals"
+            );
+            std::thread::yield_now();
+        };
+        db.shutdown();
+
+        let with = |message: &'static str| {
+            lines
+                .iter()
+                .filter(move |line| line["@m"] == message)
+                .collect::<Vec<_>>()
+        };
+        // Debug: every refusal, one `reply` line each.
+        let paused_replies: Vec<u64> = with("reply")
+            .into_iter()
+            .filter(|line| {
+                line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .inspect(|line| assert_eq!(line["@l"], "Debug", "{line}"))
+            .map(|line| line["request"].as_u64().expect("a request id"))
+            .collect();
+        assert_eq!(
+            paused_replies.len() as u64,
+            refused,
+            "a debug reply per refusal"
+        );
+        // Info: one first, and at most one summary per window the overload spanned (plus the
+        // window it ended in).
+        let firsts: Vec<_> = with("refusal_first")
+            .into_iter()
+            .filter(|line| line["reason"] == "ProtectionPaused")
+            .collect();
+        assert_eq!(firsts.len(), 1, "one first for the key: {firsts:?}");
+        // Review r1 (PR #182): an identity is logged as its hash, never as the raw id.
+        let first_hash = firsts[0]["request_id_hash"].as_str().expect("a hash");
+        assert!(
+            hashes.iter().any(|hash| hash == first_hash),
+            "{}",
+            firsts[0]
+        );
+        assert!(
+            firsts[0].get("request").is_none() && firsts[0].get("detail").is_none(),
+            "{}",
+            firsts[0]
+        );
+        let summaries: Vec<_> = with("refusal_summary")
+            .into_iter()
+            .filter(|line| paused_in(line) > 0)
+            .collect();
+        let windows = elapsed.as_millis().div_ceil(WINDOW.as_millis()) + 1;
+        assert!(
+            (summaries.len() as u128) <= windows,
+            "{} summaries for {elapsed:?} of refusals: {summaries:?}",
+            summaries.len()
+        );
+        assert!(summaries.len() >= 3, "a summary per window: {summaries:?}");
+        for line in firsts.iter().chain(&summaries) {
+            assert_eq!(line["@l"], "Information", "{line}");
+        }
+        // The summaries' counts are the debug lines, and name requests among them, by hash.
+        let summarised: u64 = summaries.iter().map(|line| paused_in(line)).sum();
+        assert_eq!(summarised, refused, "summaries count every refusal once");
+        for line in &summaries {
+            let top: serde_json::Value =
+                serde_json::from_str(line["top"].as_str().expect("top")).expect("json");
+            for key in top.as_array().expect("array") {
+                for end in ["first", "last"] {
+                    let hash = key[end].as_str().expect("a hash");
+                    assert!(
+                        hashes.iter().any(|refused| refused == hash),
+                        "{end} {hash} is a refused request"
+                    );
+                }
+            }
+        }
+        // No refusal is an info `reply` line any more.
+        assert!(
+            with("reply").iter().all(|line| line["@l"] == "Debug"),
+            "replies stay at debug"
+        );
+    }
+
+    /// #158 option B: a stop summarises the open window. With the production 10 s window, refused
+    /// puts and then a shutdown: the summaries count every refusal the debug lines hold, though
+    /// no window reached its end.
+    /// Cut: the host's stop does not close the open window: no summary, red.
+    /// Integration (~2 s): three node threads, a real pause, then a shutdown.
+    #[config_log::retcd_test]
+    fn r158_a_stop_summarises_the_refusals_of_the_open_window() {
+        const METHOD: &str = "r158_a_stop_summarises_the_refusals_of_the_open_window";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        let refused = 30_u64;
+        for n in 0..refused {
+            let paused = db
+                .put(b"c", &n.to_le_bytes(), None)
+                .expect_err("refused while the txn is unpublished");
+            assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+        }
+        db.shutdown();
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let debug = lines
+            .iter()
+            .filter(|line| {
+                line["@m"] == "reply"
+                    && line["reply"] == "failed"
+                    && line["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("ProtectionPaused"))
+            })
+            .count() as u64;
+        assert_eq!(debug, refused, "a debug reply per refusal");
+        let summarised: u64 = lines
+            .iter()
+            .filter(|line| line["@m"] == "refusal_summary")
+            .flat_map(|line| {
+                let top: serde_json::Value =
+                    serde_json::from_str(line["top"].as_str().expect("top is a string"))
+                        .expect("top is JSON");
+                top.as_array().expect("top is an array").clone()
+            })
+            .filter(|key| key["reason"] == "ProtectionPaused")
+            .map(|key| key["count"].as_u64().expect("a count"))
+            .sum();
+        assert_eq!(
+            summarised, refused,
+            "the stop's summary counts every refusal"
+        );
     }
 
     /// D6 (design-ackfloor §5): a reopen's floor covers only its own open. The first open's

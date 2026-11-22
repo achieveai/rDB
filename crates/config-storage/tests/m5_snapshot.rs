@@ -1590,7 +1590,8 @@ async fn a_r286_store_opens_with_more_background_jobs() {
 
 // --- F-001: a build that overlaps an install --------------------------------------------------
 
-/// Bounds every wait in the F-001 rows, so a red row fails instead of hanging.
+/// Bounds every wait in the F-001 rows, so a red row fails instead of hanging. A row whose
+/// holds are scaled scales this too ([`Handshake::with_patience`]).
 const RACE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One handshake: the store's thread says "reached" and may wait for "release".
@@ -1599,10 +1600,18 @@ struct Handshake {
     reached_rx: Mutex<std::sync::mpsc::Receiver<()>>,
     release_tx: std::sync::mpsc::SyncSender<()>,
     release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    /// Bounds both waits: the store's for the release, and the test's for "reached".
+    patience: std::time::Duration,
 }
 
 impl Handshake {
     fn new() -> Self {
+        Self::with_patience(RACE_PATIENCE)
+    }
+
+    /// A handshake whose waits give up after `patience`. A row whose holds are scaled scales
+    /// this with them, or a hold can outlast the release wait and let the store go on early.
+    fn with_patience(patience: std::time::Duration) -> Self {
         let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         Self {
@@ -1610,6 +1619,7 @@ impl Handshake {
             reached_rx: Mutex::new(reached_rx),
             release_tx,
             release_rx: Mutex::new(release_rx),
+            patience,
         }
     }
 
@@ -1617,7 +1627,7 @@ impl Handshake {
     fn arrive(&self, hold: bool) {
         self.reached_tx.send(()).expect("the test is still waiting");
         if hold {
-            let _ = self.release_rx.lock().unwrap().recv_timeout(RACE_PATIENCE);
+            let _ = self.release_rx.lock().unwrap().recv_timeout(self.patience);
         }
     }
 
@@ -2200,11 +2210,12 @@ impl FaultInjector for PruneBeforeOpen {
 /// Wait on the store-side half of `handshake` from a blocking thread.
 async fn wait_reached<T: Send + Sync + 'static>(owner: Arc<T>, pick: fn(&T) -> &Handshake) {
     tokio::task::spawn_blocking(move || {
-        pick(&owner)
+        let handshake = pick(&owner);
+        handshake
             .reached_rx
             .lock()
             .unwrap()
-            .recv_timeout(RACE_PATIENCE)
+            .recv_timeout(handshake.patience)
             .expect("the operation reaches its hook")
     })
     .await
@@ -2297,6 +2308,82 @@ impl FaultInjector for TwoInstalls {
     }
 }
 
+/// `RETCD_TEST_DEADLINE_SCALE` as `config_testkit::poll::deadline_scale` reads it (this crate
+/// cannot depend on the testkit): a positive integer, and 1 for anything else or nothing.
+fn parse_deadline_scale(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse().ok()).unwrap_or(1).max(1)
+}
+
+/// The real-time budget of [`q_r1_the_install_patience_restarts_for_each_new_install`] at one
+/// deadline scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QR1Timing {
+    /// How long the row holds each install.
+    hold: std::time::Duration,
+    /// The build's install patience: more than one hold, less than two.
+    patience: std::time::Duration,
+    /// How long each hook waits for its release. It must outlast two holds: with a fixed 30 s,
+    /// a 61 s hold at scale 61 let the hooks release on their own and the build publish
+    /// install 1 before install 2 began.
+    hook_bound: std::time::Duration,
+}
+
+impl QR1Timing {
+    fn at(scale: u32) -> Self {
+        Self {
+            hold: std::time::Duration::from_millis(1000) * scale,
+            patience: std::time::Duration::from_millis(1500) * scale,
+            hook_bound: RACE_PATIENCE * scale,
+        }
+    }
+}
+
+/// Q-R1's budget keeps its shape at every scale: each hold is under the patience, two holds are
+/// over it, and every hook outlasts two holds, so no hook releases before the row does.
+#[test]
+fn q_r1_timing_keeps_its_shape_at_every_scale() {
+    for scale in [1, 3, 31, 61, u32::MAX] {
+        let t = QR1Timing::at(scale);
+        assert_eq!(
+            t.hold,
+            std::time::Duration::from_millis(1000) * scale,
+            "hold at {scale}"
+        );
+        assert_eq!(
+            t.patience,
+            std::time::Duration::from_millis(1500) * scale,
+            "patience at {scale}"
+        );
+        assert!(
+            t.hold < t.patience && t.patience < 2 * t.hold && 2 * t.hold < t.hook_bound,
+            "at scale {scale}, need hold < patience < 2 x hold < hook bound: {t:?}"
+        );
+    }
+}
+
+/// The scale is read like the testkit's: 1 unless the input is a positive integer that fits.
+#[test]
+fn q_r1_reads_the_deadline_scale_like_the_testkit() {
+    let max = u32::MAX.to_string();
+    let over = (u64::from(u32::MAX) + 1).to_string();
+    for (raw, want) in [
+        (None, 1),
+        (Some(""), 1),
+        (Some("0"), 1),
+        (Some("-3"), 1),
+        (Some("three"), 1),
+        (Some("1.5"), 1),
+        (Some(over.as_str()), 1),
+        (Some("1"), 1),
+        (Some("3"), 3),
+        (Some("31"), 31),
+        (Some("61"), 61),
+        (Some(max.as_str()), u32::MAX),
+    ] {
+        assert_eq!(parse_deadline_scale(raw), want, "input {raw:?}");
+    }
+}
+
 /// Q-R1: a build's patience for an install restarts when a **new** install begins.
 ///
 /// The patience is shortened to 1.5 s. The build waits on install 1 for 1 s, then, after one
@@ -2305,11 +2392,24 @@ impl FaultInjector for TwoInstalls {
 /// out during install 2 and the build spent an attempt; with every attempt spent it returns the
 /// error OpenRaft turns into a fatal one. The row requires that **no** attempt is spent: whether
 /// a clock that is still wrong spends all three depends on how long a capture takes. The holds
-/// are real time because the patience is a clock: this row takes about 2 s by design.
+/// are real time because the patience is a clock: this row takes about 2 s by design, times
+/// `RETCD_TEST_DEADLINE_SCALE`.
+///
+/// The hold, the patience and the hooks' bound are all scaled ([`QR1Timing`]). The slack
+/// between one hold and the patience is what a loaded host has to stay inside: at 500 ms
+/// unscaled, a gate at load 22 held the row's own thread long enough that install 1 alone
+/// outlasted the patience and an attempt was spent (issue #167). Scaling keeps the shape the
+/// row proves (each hold is under the patience, the two together are over it) and gives the
+/// gate's scale 3 a 1.5 s slack.
 #[retcd_test]
 async fn q_r1_the_install_patience_restarts_for_each_new_install() {
-    const PATIENCE: std::time::Duration = std::time::Duration::from_millis(1500);
-    const HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
+    let QR1Timing {
+        hold,
+        patience,
+        hook_bound,
+    } = QR1Timing::at(parse_deadline_scale(
+        std::env::var("RETCD_TEST_DEADLINE_SCALE").ok().as_deref(),
+    ));
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     {
@@ -2325,13 +2425,13 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
         let race = Arc::new(TwoInstalls {
             boundary_seen: AtomicU64::new(0),
             capture_seen: AtomicU64::new(0),
-            first: Handshake::new(),
-            second: Handshake::new(),
-            first_capture: Handshake::new(),
-            capture: Handshake::new(),
+            first: Handshake::with_patience(hook_bound),
+            second: Handshake::with_patience(hook_bound),
+            first_capture: Handshake::with_patience(hook_bound),
+            capture: Handshake::with_patience(hook_bound),
         });
         let dst = open_as(dst_dir.path(), identity_for(7, 2), race.clone());
-        dst.set_install_patience(PATIENCE);
+        dst.set_install_patience(patience);
         seed(&dst, 3).await;
 
         let install_one = {
@@ -2347,7 +2447,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
         // the installed state, publishes, and never captures again (a slow start on a loaded
         // host did that once).
         wait_reached(race.clone(), |r| &r.first_capture).await;
-        tokio::time::sleep(HOLD).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
+        tokio::time::sleep(hold).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
         race.first.release();
         install_one
             .await
@@ -2363,7 +2463,7 @@ async fn q_r1_the_install_patience_restarts_for_each_new_install() {
         };
         wait_reached(race.clone(), |r| &r.second).await;
         race.capture.release();
-        tokio::time::sleep(HOLD).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
+        tokio::time::sleep(hold).await; // testkit:allow-sleep: elapsed time is the input; the row measures patience against it
         race.second.release();
         install_two
             .await
@@ -2418,4 +2518,74 @@ async fn c5_06b_an_install_that_fails_after_the_rename_leaves_no_install_behind(
             Some(built.snapshot_id)
         );
     }
+}
+
+/// #192 review: a live install publishes the installed schema watermark and a non-default
+/// membership into the applied mirror, and those survive a reopen.
+///
+/// Read through the cheap accessors that answer from the mirror (`max_applied_command_schema`,
+/// `membership`, `is_retired`), right after the install and before the receiver applies
+/// anything, then again after reopen. The expected values are written out, not read from the
+/// source store.
+#[retcd_test]
+async fn i192_live_install_publishes_schema_and_membership_to_the_mirror() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let voters: std::collections::BTreeSet<u64> = [1, 2, 3].into();
+    let nodes: std::collections::BTreeMap<u64, RaftNode> = voters
+        .iter()
+        .map(|id| (*id, RaftNode::same(format!("inproc://{id}"))))
+        .collect();
+    let entries = vec![
+        Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(openraft::Membership::new(vec![voters], nodes)),
+        },
+        put(1, 2, "/i192/a", "v"),
+        // A schema-2 command: it raises the source's watermark to 2.
+        Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(Command::RetireNode { node_id: NodeId(9) }),
+        },
+    ];
+    let check = |what: &str, dst: &RocksStore| {
+        let r = dst.reader();
+        assert_eq!(
+            r.max_applied_command_schema(),
+            config_core::COMMAND_SCHEMA_V2,
+            "{what}: installed schema watermark"
+        );
+        let m = r.membership();
+        assert_eq!(*m.log_id(), Some(log_id(1, 1)), "{what}: membership log id");
+        assert_eq!(
+            m.voter_ids().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "{what}: installed voters"
+        );
+        assert!(r.is_retired(NodeId(9)), "{what}: installed retired set");
+        assert_eq!(
+            r.last_applied(),
+            Some(log_id(1, 3)),
+            "{what}: applied index"
+        );
+    };
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), Arc::new(NoFaults));
+        assert_eq!(
+            dst.reader().max_applied_command_schema(),
+            config_core::COMMAND_SCHEMA_V1,
+            "a fresh receiver starts at schema 1"
+        );
+        src.log_store()
+            .blocking_append(entries.clone())
+            .await
+            .expect("append");
+        src.state_machine().apply(entries).await.expect("apply");
+        let meta = build(&src).await.expect("build succeeds");
+        transfer(&src, &dst, &meta, |_| {}).await.expect("install");
+        check("live, before the receiver applies anything", &dst);
+    }
+    let dst = open_as(dst_dir.path(), identity_for(7, 2), Arc::new(NoFaults));
+    check("after reopen", &dst);
 }

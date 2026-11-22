@@ -5537,6 +5537,63 @@ fn m9_close_a_refused_write_answers_its_key_and_never_logs_it() {
     assert!(leaks.is_empty(), "log lines carry a key's text: {leaks:#?}");
 }
 
+/// Review r1 (PR #182): a refused compile logged `client_compile` at info on every attempt and
+/// returned before the reply, so the refusal log never counted it. Now its `client_compile` is
+/// debug, like a compile that worked, and the refusal is counted: one `refusal_first` at info
+/// for its key, and the host's summary counts every attempt.
+/// Integration (~1 s): Trio, one write and five refused compiles.
+#[config_log::retcd_test]
+fn r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug() {
+    const METHOD: &str = "r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let doc = Change::Doc(Delta(vec![Op::Replace(json_map(&[("a", int(1))]))]));
+    assert_eq!(
+        trio.write(compile_change(1, b"doc", doc, Some(Expected::Absent))),
+        Ok(2)
+    );
+    let refused: Vec<u64> = (10..15).collect();
+    for &request in &refused {
+        let missing = Change::Doc(Delta(vec![Op::Remove(path("/missing"))]));
+        match trio.ask(compile_change(request, b"doc", missing, None)) {
+            Answer::Error { error, .. } => assert_eq!(error.kind, ErrorKind::InvalidArgument),
+            other => panic!("request {request} not refused: {other:?}"),
+        }
+    }
+
+    let compiles: Vec<_> = logged!(METHOD, "client_compile")
+        .into_iter()
+        .filter(|line| {
+            line["request"]
+                .as_u64()
+                .is_some_and(|request| refused.contains(&request))
+        })
+        .collect();
+    assert_eq!(compiles.len(), refused.len(), "{compiles:#?}");
+    for line in &compiles {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
+    let firsts: Vec<_> = logged!(METHOD, "refusal_first")
+        .into_iter()
+        .filter(|line| line["reason"] == "InvalidArgument")
+        .collect();
+    assert_eq!(firsts.len(), 1, "one first for the key: {firsts:#?}");
+    assert_eq!(firsts[0]["@l"], "Information", "{}", firsts[0]);
+    let counted: u64 = trio
+        .nodes
+        .iter_mut()
+        .flat_map(|(host, _, _)| host.refusals.stop())
+        .map(|summary| summary.refusals)
+        .sum();
+    assert_eq!(
+        counted,
+        refused.len() as u64,
+        "every refused compile is counted"
+    );
+}
+
 /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
 /// given without sending are reads, so a node gives them only while a read would be given.
 /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
@@ -7567,6 +7624,104 @@ fn issue_184_a_read_answered_after_the_next_write_committed_waits_and_is_served(
     match trio.answer(&put_answer) {
         Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(published + 1)),
         other => panic!("the write: {other:?}"),
+    }
+}
+
+/// Issue #130 (F-014's identity half): a status query's waiter is taken only by a `Status` or
+/// `Failed` reply under the identity it asked about. A reply of either kind under another
+/// identity leaves the waiter where it is, unanswered: a `Failed` goes on to the pending table
+/// (here empty, so unclaimed), and a `Status` with no query of its own is a fault. The last
+/// step is the control: a `Status` under the asked identity does take and answer it.
+/// Cut: `Host::reply` takes the waiter without comparing the identity, red (the query hears
+/// the other request's refusal).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_status_or_failed_reply_for_another_identity_does_not_take_the_status_waiter() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let (reply, answer) = mpsc::channel();
+    host.answering = Some((identity(1), reply));
+    let asked = |host: &Host| host.answering.as_ref().map(|(asked, _)| *asked);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Failed {
+            identity: identity(2),
+            error: RdbError::UnknownOutcome {
+                partition: PartitionId(1),
+                identity: identity(2),
+            },
+        },
+    )
+    .expect("another request's refusal is unclaimed, not a fault");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Failed");
+    still_waits("the status query, after request 2's refusal", &answer);
+
+    let fault = host
+        .reply(
+            PartitionId(1),
+            &ReplyEffect::Status {
+                identity: identity(2),
+                status: TxnStatus::Unknown,
+            },
+        )
+        .expect_err("a status answer no query asked for");
+    assert!(fault.detail.contains("no status query"), "{fault:?}");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Status");
+    still_waits("the status query, after request 2's status", &answer);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Status {
+            identity: identity(1),
+            status: TxnStatus::Unknown,
+        },
+    )
+    .expect("the asked identity's status");
+    assert_eq!(asked(&host), None, "taken by its own answer");
+    match answer.try_recv() {
+        Ok(Answer::Status(TxnStatus::Unknown)) => {}
+        other => panic!("the status query's own answer: {other:?}"),
+    }
+}
+
+/// Issue #130 (tick 0 is never a real step tick): a host whose clock reads tick 0, here a
+/// guarded clock stepped back as `rdb_node --clock-step-file` steps it, refuses to step a
+/// kernel and faults instead, so no `StepCtx` ever carries tick 0.
+/// Cut: the tick-0 refusal in `Host::offer` removed, red (A1 steps at tick 0).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_host_clock_at_tick_zero_steps_no_kernel() {
+    use rdb_core::contracts::control::{ControlEvent, ControlPrefix};
+    use rdb_core::contracts::ids::{CorrelationId, EventId, Revision};
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    clock.step_back(u64::MAX);
+    assert_eq!(
+        clock.now(),
+        Tick::ZERO,
+        "precondition: the clock reads tick 0"
+    );
+    host.clock = clock;
+    let event = Event {
+        id: EventId(1),
+        at: Tick::ZERO,
+        node: host.node,
+        boot: host.boot,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Control(ControlEvent::WatchProgress {
+            prefix: ControlPrefix::Partitions,
+            revision: Revision(1),
+        }),
+    };
+    match host.offer(ModuleName::Authority, &event) {
+        Err(StepError::Host(fault)) => assert!(fault.detail.contains("tick 0"), "{fault:?}"),
+        Ok(effects) => panic!("A1 stepped at tick 0: {effects:?}"),
+        Err(StepError::Module(error)) => panic!("A1 stepped at tick 0 and failed: {error}"),
     }
 }
 
