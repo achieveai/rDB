@@ -92,8 +92,9 @@ the floor).
   over a current #105 tail.
 - **Disk and memory are bounded only once the automatic trim lands.** Until then History still
   grows unless an operator runs the debug tool. The automatic trim is a later change.
-- `PROTOCOL_VERSION` moved: the probe ask, the snapshot frames, `needs_operator` and `trimmed` are
-  new wire vocabulary, and the handshake requires an exact match.
+- `PROTOCOL_VERSION` moves to 11 (10 is issue #107's and issue #87's): the probe ask, the
+  snapshot frames, `needs_operator` and `trimmed` are new wire vocabulary, and the handshake
+  requires an exact match.
 
 ## Alternatives rejected
 

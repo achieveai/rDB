@@ -42,6 +42,7 @@ use rdb_value::{cbor, Document, Expected};
 use serde::{Deserialize, Serialize};
 
 use crate::db::ApiError;
+use crate::feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
 use crate::host::snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 use crate::host::{
     Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg, NodeStatus,
@@ -177,6 +178,8 @@ pub enum WireMsg {
         correlation: CorrelationId,
         emitter: NodeId,
         not_before: Tick,
+        /// The committing owner's `live_readd` (#107 slice 2b, protocol 10).
+        owner_live_readd: bool,
     },
     Client {
         to: NodeId,
@@ -413,6 +416,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => WireMsg::Landed {
             to,
             result,
@@ -420,6 +424,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         },
         Msg::Client(client) => {
             return match WireCall::try_from(&client.call) {
@@ -443,6 +448,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Fault { .. }
         | Msg::Activated { .. }
         | Msg::OwnerLearned { .. }
+        | Msg::FeedRead { .. }
         | Msg::FenceBound { .. }
         | Msg::ReplanNote { .. }
         | Msg::Inject { .. }
@@ -456,6 +462,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         #[cfg(debug_assertions)]
         local @ Msg::Damage { .. } => {
             return Err(Box::new((WireError::LocalOnly("Damage"), local)))
+        }
+        #[cfg(debug_assertions)]
+        local @ Msg::DropHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("DropHistory"), local)))
         }
         #[cfg(debug_assertions)]
         local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
@@ -473,6 +483,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Fault { .. } => "Fault",
         Msg::Activated { .. } => "Activated",
         Msg::OwnerLearned { .. } => "OwnerLearned",
+        Msg::FeedRead { .. } => "FeedRead",
         Msg::FenceBound { .. } => "FenceBound",
         Msg::ReplanNote { .. } => "ReplanNote",
         Msg::Inject { .. } => "Inject",
@@ -647,6 +658,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
             correlation,
             emitter,
             not_before,
+            owner_live_readd,
         } => Inbound::Plain(
             to,
             Msg::Landed {
@@ -655,6 +667,7 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 correlation,
                 emitter,
                 not_before,
+                owner_live_readd,
             },
         ),
         WireMsg::Client {
@@ -921,6 +934,12 @@ pub enum WireCall {
         no_intact_copy: bool,
         give_up_live_copy: bool,
     },
+    // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
+    Changes {
+        identity: RequestIdentity,
+        from: WireFeedCursor,
+        max: u32,
+    },
 }
 
 impl WireCall {
@@ -936,7 +955,8 @@ impl WireCall {
             | Self::Status { identity, .. }
             | Self::Move { identity, .. }
             | Self::Rebuild { identity, .. }
-            | Self::ForgetTail { identity, .. } => Some(*identity),
+            | Self::ForgetTail { identity, .. }
+            | Self::Changes { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -956,6 +976,7 @@ impl WireCall {
             Self::Rebuild { .. } => "rebuild",
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
+            Self::Changes { .. } => "changes",
         }
     }
 }
@@ -1043,6 +1064,15 @@ impl TryFrom<&ClientCall> for WireCall {
                 through: *through,
                 remaining_millis: *remaining_millis,
             },
+            ClientCall::Changes {
+                identity,
+                from,
+                max,
+            } => Self::Changes {
+                identity: *identity,
+                from: WireFeedCursor::from(*from),
+                max: *max,
+            },
         })
     }
 }
@@ -1120,6 +1150,15 @@ impl TryFrom<WireCall> for ClientCall {
                 generation,
                 through,
                 remaining_millis,
+            },
+            WireCall::Changes {
+                identity,
+                from,
+                max,
+            } => Self::Changes {
+                identity,
+                from: from.into(),
+                max,
             },
         })
     }
@@ -1751,6 +1790,179 @@ impl TryFrom<WireSeen> for Seen {
     }
 }
 
+// ---- the change feed (#87) -------------------------------------------------------------------
+
+/// The shape of the records a [`WireFeedPage`] carries. `1` is the physical form (ruling Q5a):
+/// each `User` write's stored key and stored value bytes, with the object id parsed out. A page
+/// of any other format is refused `INCOMPATIBLE_VERSION`, never read as this one. A change to
+/// the record's meaning, with or without a change to its types, moves this.
+pub const FEED_RECORD_FORMAT: u32 = 1;
+
+/// [`FeedCursor`] on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedCursor {
+    pub generation: Generation,
+    pub seq: Seq,
+    pub digest: Digest,
+}
+
+impl From<FeedCursor> for WireFeedCursor {
+    fn from(cursor: FeedCursor) -> Self {
+        Self {
+            generation: cursor.generation,
+            seq: cursor.seq,
+            digest: cursor.digest,
+        }
+    }
+}
+
+impl From<WireFeedCursor> for FeedCursor {
+    fn from(cursor: WireFeedCursor) -> Self {
+        Self {
+            generation: cursor.generation,
+            seq: cursor.seq,
+            digest: cursor.digest,
+        }
+    }
+}
+
+/// [`FeedWrite`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedWrite {
+    pub group: AffinityId,
+    pub object: Bytes,
+    pub key: Bytes,
+    pub value: Option<Bytes>,
+}
+
+/// [`FeedRecord`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireFeedRecord {
+    pub at: WireFeedCursor,
+    pub request: RequestIdentity,
+    pub writes: Vec<WireFeedWrite>,
+}
+
+/// [`FeedPage`] on the wire, without its format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub enum WireFeedBody {
+    Records {
+        records: Vec<WireFeedRecord>,
+        next: WireFeedCursor,
+        more: bool,
+    },
+    Behind {
+        head: Seq,
+    },
+    Trimmed {
+        floor: Seq,
+    },
+    Rewound {
+        to: WireFeedCursor,
+    },
+}
+
+/// A [`FeedPage`] on the wire: its records' [`FEED_RECORD_FORMAT`], then the page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFeedPage {
+    /// The records' format; this build reads [`FEED_RECORD_FORMAT`] only.
+    pub format: u32,
+    /// The page.
+    pub body: WireFeedBody,
+}
+
+impl From<&FeedPage> for WireFeedPage {
+    fn from(page: &FeedPage) -> Self {
+        let body = match page {
+            FeedPage::Records {
+                records,
+                next,
+                more,
+            } => WireFeedBody::Records {
+                records: records
+                    .iter()
+                    .map(|record| WireFeedRecord {
+                        at: record.at.into(),
+                        request: record.request,
+                        writes: record
+                            .writes
+                            .iter()
+                            .map(|write| WireFeedWrite {
+                                group: write.group,
+                                object: write.object.clone(),
+                                key: write.key.clone(),
+                                value: write.value.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                next: (*next).into(),
+                more: *more,
+            },
+            FeedPage::Behind { head } => WireFeedBody::Behind { head: *head },
+            FeedPage::Trimmed { floor } => WireFeedBody::Trimmed { floor: *floor },
+            FeedPage::Rewound { to } => WireFeedBody::Rewound { to: (*to).into() },
+        };
+        Self {
+            format: FEED_RECORD_FORMAT,
+            body,
+        }
+    }
+}
+
+impl TryFrom<WireFeedPage> for FeedPage {
+    type Error = ApiError;
+
+    /// # Errors
+    /// `INCOMPATIBLE_VERSION` for a page of a format other than [`FEED_RECORD_FORMAT`].
+    fn try_from(page: WireFeedPage) -> Result<Self, ApiError> {
+        if page.format != FEED_RECORD_FORMAT {
+            return Err(ApiError::new(
+                ErrorKind::IncompatibleVersion,
+                format!(
+                    "the node sent change feed records of format {}, and this build reads \
+                     format {FEED_RECORD_FORMAT} only; upgrade this client",
+                    page.format
+                ),
+            ));
+        }
+        Ok(match page.body {
+            WireFeedBody::Records {
+                records,
+                next,
+                more,
+            } => Self::Records {
+                records: records
+                    .into_iter()
+                    .map(|record| FeedRecord {
+                        at: record.at.into(),
+                        request: record.request,
+                        writes: record
+                            .writes
+                            .into_iter()
+                            .map(|write| FeedWrite {
+                                group: write.group,
+                                object: write.object,
+                                key: write.key,
+                                value: write.value,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                next: next.into(),
+                more,
+            },
+            WireFeedBody::Behind { head } => Self::Behind { head },
+            WireFeedBody::Trimmed { floor } => Self::Trimmed { floor },
+            WireFeedBody::Rewound { to } => Self::Rewound { to: to.into() },
+        })
+    }
+}
+
 /// [`Answer`] on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(missing_docs)]
@@ -1786,6 +1998,8 @@ pub enum WireAnswer {
     TailForgotten {
         line: String,
     },
+    // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
+    Changes(WireFeedPage),
 }
 
 impl WireAnswer {
@@ -1827,6 +2041,7 @@ impl WireAnswer {
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
             Answer::Durable => Self::Durable,
+            Answer::Changes(page) => Self::Changes(WireFeedPage::from(page)),
             Answer::Error { error, request } => Self::Error {
                 error: WireApiError::from(error),
                 request: request.clone(),
@@ -1866,6 +2081,13 @@ impl WireAnswer {
             Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::TailForgotten { line } => Answer::TailForgotten(line),
             Self::Durable => Answer::Durable,
+            Self::Changes(page) => match FeedPage::try_from(page) {
+                Ok(page) => Answer::Changes(page),
+                Err(error) => Answer::Error {
+                    error,
+                    request: None,
+                },
+            },
             Self::Error { error, request } => Answer::Error {
                 error: error.into(),
                 request,

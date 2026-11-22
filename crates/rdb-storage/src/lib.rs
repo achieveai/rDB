@@ -27,7 +27,7 @@ mod lineage;
 mod snapshot;
 
 pub use engine::{
-    dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RocksEngine,
+    dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RecordDamage, RocksEngine,
     StorageOptions, TrimRefused, WalSync, DEFAULT_BLOCK_CACHE_BYTES, DEFAULT_MEMTABLE_BUDGET_BYTES,
     DEFAULT_SYNC_STUCK_MILLIS, DEFAULT_WRITE_BUFFER_BYTES, WAL_BUDGETS,
 };

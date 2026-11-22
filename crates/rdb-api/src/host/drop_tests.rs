@@ -7592,6 +7592,14 @@ fn live_return(method: &str, writer: bool) {
             .map(|member| (committed.new_generation, member.boot))
     });
     assert_eq!(shadowed.1, boot, "re-added at the boot it still runs");
+    assert!(
+        trio.nodes[0]
+            .0
+            .live_readd
+            .shadows
+            .contains_key(&(P1, NodeId(3))),
+        "M3 exit: the re-added shadow is held from its commit"
+    );
     let promoted = active_with_three(&mut trio, shadowed.0);
     assert_eq!(
         trio.nodes[2].0.boot, boot,
@@ -7615,6 +7623,23 @@ fn live_return(method: &str, writer: bool) {
         trio.nodes[0].0.live_readd.clocked.is_empty(),
         "the drop is spent"
     );
+    // M3 exit: promoted in time, so it is no longer held, and no clock gives it up later.
+    let owner = &mut trio.nodes[0].0;
+    assert!(
+        owner.live_readd.shadows.is_empty(),
+        "the promoted shadow is still held"
+    );
+    let late = owner
+        .clock
+        .now()
+        .plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS);
+    owner.live_readd_shadow_duty(P1, late);
+    assert!(
+        !owner.rejoins.contains_key(&P1),
+        "a re-plan after the promote"
+    );
+    let unpromoted = logged!(method, "live_readd_shadow_unpromoted");
+    assert!(unpromoted.is_empty(), "{unpromoted:?}");
     holds_the_cutoff(&mut trio, promoted);
     trio.ready();
     match trio.ask(put(request)) {
@@ -7638,7 +7663,9 @@ fn issue107_1_a_copy_dropped_on_the_paused_clock_with_its_link_lost_returns_at_i
 }
 
 /// Row 1, idle: no writer, so the unreachable clock drops node 3, and it returns.
-/// Cut: no same-boot arm in `readd_candidate`, red (never a shadow).
+/// Cuts: no same-boot arm in `readd_candidate`, red (never a shadow); M3 exit: the shadow never
+/// held at its commit, red; a commit pinning it regular leaves it held, red (still held, so a
+/// late clock would give up a promoted copy).
 /// Integration (~5 s): as above, with no pause.
 #[config_log::retcd_test]
 fn issue107_1_a_copy_dropped_on_the_unreachable_clock_returns_at_its_boot() {
@@ -7737,6 +7764,300 @@ fn issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives(
     assert_eq!(promotes[0]["acked"], head, "{promotes:?}");
     assert_eq!(promotes[0]["head"], head, "{promotes:?}");
     holds_the_cutoff(&mut trio, promoted);
+}
+
+/// Node 1's commit left node 3 out, node 3 runs the boot it ran (`boot`), and over five holds
+/// with its link up nothing re-adds it: a live re-add given up is restart-only.
+fn given_up_stays_out(trio: &mut Trio, method: &str, boot: BootId) {
+    let (left_at, _, members) =
+        until_through_blocks(trio, "node 1 committed without node 3", |trio| {
+            commit_of(trio).filter(|(_, _, members)| members.len() == 2)
+        });
+    assert_eq!(members, vec![1, 2]);
+    let left = trio.nodes[0]
+        .0
+        .left_out
+        .get(&P1)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        left.iter()
+            .map(|member| (member.node, member.boot))
+            .collect::<Vec<_>>(),
+        vec![(NodeId(3), boot)],
+        "left out at the boot it runs"
+    );
+    assert!(trio.nodes[0].0.live_readd.shadows.is_empty());
+    assert!(
+        trio.nodes[0].0.live_readd.clocked.is_empty(),
+        "no cause: restart-only"
+    );
+    pass(trio, 5 * LIVE_HOLD_MILLIS);
+    assert_eq!(
+        commit_of(trio).map(|(generation, _, members)| (generation, members)),
+        Some((left_at, vec![1, 2])),
+        "re-added again with no restart"
+    );
+    assert_eq!(
+        trio.nodes[2].0.boot, boot,
+        "node 3's process was never replaced"
+    );
+    assert_eq!(
+        logged!(method, "live_readd_planned").len(),
+        1,
+        "one attempt per drop"
+    );
+    let unpromoted = logged!(method, "live_readd_shadow_unpromoted");
+    assert_eq!(unpromoted.len(), 1, "warned once: {unpromoted:?}");
+}
+
+/// #107 M3 exit, the clock: a shadow the live re-add pinned and that is never promoted is given
+/// up [`LIVE_READD_SHADOW_GIVE_UP_MILLIS`] after its commit. As in
+/// [`issue113_a_live_re_added_shadow_is_promoted_in_the_step_its_catch_up_arrives`], node 3 is
+/// re-added far behind, so no promote starts; then node 1's duty runs on a fake clock read from
+/// the held shadow's commit. One millisecond short, nothing; at the bound, one warn
+/// `live_readd_shadow_unpromoted` (reason `clock`, no blocks), and the re-plan leaves node 3 out
+/// at the boot it runs, where five holds of a live link do not re-add it.
+/// Node 1's duty is the real [`Host::drop_duty`] at both instants (review r1).
+/// Cuts: the bound compared with `>`, red (nothing at the bound); the give-up revoking without
+/// a drop, red (node 3 stays pinned); `drop_duty` without its `live_readd_shadow_duty` call,
+/// red (no re-plan at the bound).
+/// Integration (~6 s): the drop, 100 puts, the re-add, the give-up re-plan, five holds.
+#[config_log::retcd_test]
+fn issue107_m3_an_unpromoted_re_added_shadow_is_given_up_on_the_clock() {
+    const METHOD: &str = "issue107_m3_an_unpromoted_re_added_shadow_is_given_up_on_the_clock";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, false);
+    trio.ready();
+    for _ in 0..100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    trio.links.heal_all();
+    let held = trio.until(
+        "node 1 holds node 3's re-added shadow, between re-plans",
+        |trio| {
+            let owner = &trio.nodes[0].0;
+            let held = owner.live_readd.shadows.get(&(P1, NodeId(3))).copied()?;
+            (!owner.rejoins.contains_key(&P1)).then_some(held)
+        },
+    );
+    let owner = &mut trio.nodes[0].0;
+    let committed = &owner.committed[&P1];
+    assert_eq!(held.generation, committed.new_generation);
+    assert_eq!(held.blocks, 0);
+    let primary = owner
+        .replication
+        .primary(NodeId(1), P1)
+        .expect("node 1 is primary");
+    let copy = committed
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == NodeId(3) && member.role == ReplicaRole::Shadow)
+        .expect("node 3 pinned as a shadow")
+        .copy;
+    let acked = primary
+        .tracker()
+        .peer(copy)
+        .map_or(0, |peer| peer.progress.buffered_applied.0);
+    assert!(
+        primary.tracker().head().0.saturating_sub(acked) > PROMOTE_LAG_RECORDS,
+        "precondition: node 3 is too far behind to be promoted"
+    );
+
+    // Review r1: the real `drop_duty`, so deleting its call of the shadow duty fails the row.
+    owner.drop_duty(held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS - 1));
+    assert!(
+        !owner.rejoins.contains_key(&P1),
+        "given up short of the bound"
+    );
+    assert!(logged!(METHOD, "live_readd_shadow_unpromoted").is_empty());
+
+    owner.drop_duty(held.since.plus_millis(LIVE_READD_SHADOW_GIVE_UP_MILLIS));
+    assert!(
+        matches!(
+            owner.rejoins.get(&P1),
+            Some(Rejoin::Revoking { replan, .. }) if replan.drop == Some(NodeId(3)) && !replan.promote
+        ),
+        "{:?}",
+        owner.rejoins.get(&P1)
+    );
+    let unpromoted = logged!(METHOD, "live_readd_shadow_unpromoted");
+    assert_eq!(unpromoted.len(), 1, "{unpromoted:?}");
+    assert_eq!(unpromoted[0]["@l"], "Warning", "{unpromoted:?}");
+    assert_eq!(unpromoted[0]["partition"], P1.0, "{unpromoted:?}");
+    assert_eq!(unpromoted[0]["shadow"], 3, "{unpromoted:?}");
+    assert_eq!(unpromoted[0]["reason"], "clock", "{unpromoted:?}");
+    assert_eq!(
+        unpromoted[0]["held_ms"], LIVE_READD_SHADOW_GIVE_UP_MILLIS,
+        "{unpromoted:?}"
+    );
+    assert_eq!(unpromoted[0]["blocks"], 0, "{unpromoted:?}");
+    given_up_stays_out(&mut trio, METHOD, boot);
+}
+
+/// #107 M3 exit, review r1: the give-up budget belongs to the process the live re-add pinned.
+/// Node 3 is re-added far behind and held (as in the clock row). A commit that pins it at the
+/// same boot keeps its clock and blocks. Then node 3 restarts mid-catch-up: once node 1 pins
+/// its newer boot, the old tracking is gone, so the restarted copy is never given up on the old
+/// process's clock or blocks; it is promoted regular at the new boot, still with no tracking.
+/// Cut: `Host::rejoin_committed` retaining a held shadow by node and role only (no boot), red
+/// (the old boot's tracking held after the new boot is pinned).
+/// Integration (~10 s): the drop, 100 puts, the re-add, the restart's rejoin and promote.
+#[config_log::retcd_test]
+fn issue107_m3_a_restarted_re_added_shadow_starts_with_no_give_up_budget() {
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    let (after, mut request) = blip_three(&mut trio, before, false);
+    trio.ready();
+    for _ in 0..100 {
+        match trio.ask(put(request)) {
+            Answer::Txn { result, .. } => assert_eq!(result.generation, after),
+            other => panic!("put {request} during the outage: {other:?}"),
+        }
+        request += 1;
+    }
+    trio.links.heal_all();
+    let held = trio.until(
+        "node 1 holds node 3's re-added shadow, between re-plans",
+        |trio| {
+            let owner = &trio.nodes[0].0;
+            let held = owner.live_readd.shadows.get(&(P1, NodeId(3))).copied()?;
+            (!owner.rejoins.contains_key(&P1)).then_some(held)
+        },
+    );
+    assert_eq!(held.boot, boot, "pinned at the boot it runs");
+
+    // The same boot pinned again: the budget it has spent is kept.
+    let owner = &mut trio.nodes[0].0;
+    owner
+        .live_readd
+        .shadows
+        .get_mut(&(P1, NodeId(3)))
+        .expect("held")
+        .blocks = 2;
+    let generation = owner.committed[&P1].new_generation;
+    owner.rejoin_committed(P1, generation);
+    let kept = owner.live_readd.shadows.get(&(P1, NodeId(3))).copied();
+    assert_eq!(
+        kept.map(|kept| (kept.since, kept.blocks, kept.boot)),
+        Some((held.since, 2, boot)),
+        "same boot: clock and blocks kept"
+    );
+
+    // Node 3 restarts mid-catch-up.
+    kill(&trio, 3, &[1, 2]);
+    let three = trio.nodes.remove(2);
+    restart_dead(&mut trio, (three, 3));
+    let reboot = trio.links.boot_of(NodeId(3)).expect("registered");
+    assert_ne!(reboot, boot);
+    let tracked = until_through_blocks(&mut trio, "node 1 pins node 3's new boot", |trio| {
+        let owner = &trio.nodes[0].0;
+        let committed = owner.committed.get(&P1)?;
+        committed
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .any(|member| member.node == NodeId(3) && member.boot == reboot)
+            .then(|| owner.live_readd.shadows.get(&(P1, NodeId(3))).copied())
+    });
+    assert_eq!(tracked, None, "the old boot's clock and blocks are cleared");
+    until_through_blocks(&mut trio, "node 3 regular at its new boot", |trio| {
+        (role_of_three(trio) == Some(ReplicaRole::RegularSecondary)).then_some(())
+    });
+    assert!(
+        trio.nodes[0].0.live_readd.shadows.is_empty(),
+        "promoted: nothing held"
+    );
+}
+
+/// #107 M3 exit, the blocks: a promote re-plan for a re-added shadow that ends without
+/// committing counts one block, whatever ended it, and the third gives the shadow up. Here two
+/// end at a revocation A1 never answers (two `DrainProof`s lost, so `retry_blocked_rejoin`
+/// asks again) and the third at F1's `Blocked(ControlUnavailable)`. One warn
+/// `live_readd_shadow_unpromoted` (reason `blocks`, three blocks), and node 3 is left out at the
+/// boot it runs, restart-only.
+/// Cuts: no count at the unanswered revocation, red (never two blocks); no count at F1's
+/// block, red (the third is the give-up's own unanswered revocation, not F1's block); the
+/// give-up past the limit (`<=`), red (four blocks).
+/// Integration (~10 s): the drop, the re-add, two drop clocks of retries, F1's block, the
+/// give-up re-plan, five holds.
+#[config_log::retcd_test]
+fn issue107_m3_an_unpromoted_re_added_shadow_is_given_up_after_three_blocks() {
+    const METHOD: &str = "issue107_m3_an_unpromoted_re_added_shadow_is_given_up_after_three_blocks";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), live);
+    let boot = trio.nodes[2].0.boot;
+    blip_three(&mut trio, before, false);
+    trio.links.heal_all();
+    trio.until("node 1 holds node 3's re-added shadow", |trio| {
+        trio.nodes[0]
+            .0
+            .live_readd
+            .shadows
+            .contains_key(&(P1, NodeId(3)))
+            .then_some(())
+    });
+    trio.nodes[0].0.drain_proofs_to_lose = 2;
+    let blocks = |trio: &Trio| {
+        trio.nodes[0]
+            .0
+            .live_readd
+            .shadows
+            .get(&(P1, NodeId(3)))
+            .map(|held| held.blocks)
+    };
+    until_through_blocks(
+        &mut trio,
+        "two promote revocations left unanswered",
+        |trio| (blocks(trio) == Some(2)).then_some(()),
+    );
+    until_through_blocks(&mut trio, "the third promote planned", |trio| {
+        matches!(
+            trio.nodes[0].0.rejoins.get(&P1),
+            Some(Rejoin::Planned { replan, .. })
+                if replan.promote && replan.rejoiner == Some(NodeId(3))
+        )
+        .then_some(())
+    });
+    trio.mem
+        .failing_with(config_core::ConfigError::Unavailable {
+            reason: "the control store is down".to_owned(),
+        });
+    until_through_blocks(&mut trio, "the shadow given up", |_| {
+        (!logged!(METHOD, "live_readd_shadow_unpromoted").is_empty()).then_some(())
+    });
+    trio.mem.stop_failing();
+    let unpromoted = logged!(METHOD, "live_readd_shadow_unpromoted");
+    assert_eq!(unpromoted.len(), 1, "{unpromoted:?}");
+    assert_eq!(unpromoted[0]["reason"], "blocks", "{unpromoted:?}");
+    assert_eq!(
+        unpromoted[0]["blocks"], LIVE_READD_SHADOW_GIVE_UP_BLOCKS,
+        "{unpromoted:?}"
+    );
+    assert_eq!(unpromoted[0]["shadow"], 3, "{unpromoted:?}");
+    let ended: Vec<_> = logged!(METHOD, "live_readd_shadow_block")
+        .iter()
+        .map(|line| (line["blocks"].clone(), line["ended"].clone()))
+        .collect();
+    assert_eq!(
+        ended,
+        vec![
+            (1.into(), "revoke_unanswered".into()),
+            (2.into(), "revoke_unanswered".into()),
+            (3.into(), "f1_blocked".into()),
+        ]
+    );
+    given_up_stays_out(&mut trio, METHOD, boot);
 }
 
 /// Row 30a (#107 slice 2a): with the setting off, only the setting differs from row 1's idle
@@ -8160,11 +8481,15 @@ fn issue107_r_a_link_down_near_the_end_of_the_hold_discards_its_uptime() {
 }
 
 /// Review: the hold at its default, `LIVE_READD_HOLD_MILLIS` (the other rows run 300 ms): no
-/// `Inspect` at 4,999 ms of link, one at 5,000 ms.
-/// Cut: `linked_ms >= hold` as `>`, red (no probe at 5,000 ms).
+/// `Inspect` at 4,999 ms of link, one at 5,000 ms. #107 slice 2b manual walk: the probe is
+/// logged `live_readd_probed` at info, so the step between the hold and the plan shows at the
+/// default level.
+/// Cuts: `linked_ms >= hold` as `>`, red (no probe at 5,000 ms); `live_readd_probed` at debug,
+/// red (the level).
 /// Integration (~2 s): bootstrap and the drop; the checks are direct calls.
 #[config_log::retcd_test]
 fn issue107_r_the_default_hold_probes_at_5000_ms_and_not_before() {
+    const METHOD: &str = "issue107_r_the_default_hold_probes_at_5000_ms_and_not_before";
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, t0) = due_return(dir.path(), |host| {
         host.live_readd.hold_millis = LIVE_READD_HOLD_MILLIS;
@@ -8177,6 +8502,15 @@ fn issue107_r_the_default_hold_probes_at_5000_ms_and_not_before() {
     trio.nodes[0].0.live_readd_duty(t0.plus_millis(5_000));
     assert_eq!(probed(&trio), Some(P1), "5,000 ms");
     assert_eq!(inspects_on_three(&trio).len(), 1);
+    let probes: Vec<_> = logged!(METHOD, "live_readd_probed")
+        .into_iter()
+        .map(|line| (line["@l"].clone(), line["probed"].clone()))
+        .collect();
+    assert_eq!(
+        probes,
+        [("Information".into(), 3.into())],
+        "one probe, at info"
+    );
 }
 
 /// Review: a copy whose `Inspect` answers a fault is refused (`live_readd_refused{faulted}`, with
@@ -10471,7 +10805,7 @@ fn t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults()
         partition: p,
         correlation: CorrelationId(0),
     };
-    let landed = host.land(result, site, NodeId(1));
+    let landed = host.land(result, site, NodeId(1), false);
     let refused = logged!(METHOD, "land_inherit_refused");
     let fault = landed.expect_err("the landing faults, it does not anchor at the cutoff");
     assert!(format!("{fault:?}").contains("below_floor"), "{fault:?}");

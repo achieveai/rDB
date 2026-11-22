@@ -232,6 +232,27 @@ pub enum OpenError {
     },
 }
 
+/// **Dev tool only**: how [`RocksEngine::damage_record_as`] (debug builds only) damages one
+/// stored value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDamage {
+    /// Flip every bit of the value's last byte; the frame and version stay
+    /// ([`RocksEngine::damage_record`]).
+    LastByte,
+    /// Drop the value's last byte; the frame and version stay, so a `History` record's
+    /// envelope no longer decodes (its body is one byte short).
+    Truncate,
+    /// Set the frame's kind byte to one no build writes, so the read itself fails `Corrupt`.
+    Frame,
+    /// Replace the value with the one stored, in the same namespace and lineage, at the key
+    /// that is this seq big-endian: a `History` record misplaced, which decodes and matches its
+    /// digest but names another seq.
+    ValueOf(u64),
+    /// Leave the value and store it again under the key's first byte alone: a key no build
+    /// writes, which in `History` sorts before every seq.
+    ShortKey,
+}
+
 /// Why `RocksEngine::damage_record` (debug builds only, a dev tool) refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DamageRefused {
@@ -1350,6 +1371,24 @@ impl RocksEngine {
         ns: Namespace,
         key: &[u8],
     ) -> Result<(), DamageRefused> {
+        self.damage_record_as(partition, generation, ns, key, RecordDamage::LastByte)
+    }
+
+    /// **Dev tool only**: [`Self::damage_record`] with the damage `how` names. Same guards, same
+    /// synced write, same log line (with `how`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`].
+    #[cfg(debug_assertions)]
+    pub fn damage_record_as(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+        how: RecordDamage,
+    ) -> Result<(), DamageRefused> {
         let raw = encode_key(partition, generation, ns, key);
         let cf = self.cf(keys::cf_for(ns));
         let found = self
@@ -1364,7 +1403,29 @@ impl RocksEngine {
             return Err(DamageRefused::NoValue { key_hex: hex(&raw) });
         }
         let last = value.len() - 1;
-        value[last] ^= 0xFF;
+        let mut raw = raw;
+        match how {
+            RecordDamage::LastByte => value[last] ^= 0xFF,
+            RecordDamage::Truncate => {
+                value.pop();
+            }
+            RecordDamage::Frame => value[0] = 0xEE,
+            RecordDamage::ValueOf(seq) => {
+                let other = encode_key(partition, generation, ns, &seq.to_be_bytes());
+                value = self
+                    .db
+                    .get_cf(cf, &other)
+                    .map_err(|e| DamageRefused::WriteFailed {
+                        detail: e.to_string(),
+                    })?
+                    .ok_or_else(|| DamageRefused::NoValue {
+                        key_hex: hex(&other),
+                    })?;
+            }
+            RecordDamage::ShortKey => {
+                raw = encode_key(partition, generation, ns, &key[..1.min(key.len())]);
+            }
+        }
         // A synced write, debug builds only: named like every other, so one made while a sync
         // runs is loud (critic-f4 A5).
         self.note_synced_write("damage");
@@ -1385,9 +1446,72 @@ impl RocksEngine {
             ns = ?ns,
             key_hex = %hex(&raw),
             offset = last,
+            how = ?how,
             "record_damaged"
         );
         Ok(())
+    }
+
+    /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete every
+    /// `History` record with a seq in `seqs` that lineage `(partition, generation)` reaches
+    /// through its chain ([`Self::history_reach`]), from this copy only: an ancestor's records
+    /// above the reach belong to the ancestor and stay. From seq 1 up it is a history trim (#61) would
+    /// make: [`Self::history_floor`] rises to the lowest record left, or to the applied head
+    /// plus one when none is left. Higher up it leaves a hole. Nothing else moves: no `applied`
+    /// mark, no state. A synced write. Answers how many records it deleted.
+    ///
+    /// # Errors
+    ///
+    /// The read or the write failed, named.
+    #[cfg(debug_assertions)]
+    pub fn drop_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        seqs: std::ops::Range<u64>,
+    ) -> Result<u64, String> {
+        let levels = self.history_reach(partition, generation);
+        let cf = self.cf(keys::cf_for(Namespace::History));
+        let mut write = WriteBatch::default();
+        let mut dropped = 0_u64;
+        for (level, reach) in levels {
+            let prefix = encode_key(partition, level, Namespace::History, &[]);
+            for item in self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+            {
+                let (raw, _) = item.map_err(|e| format!("history read: {e}"))?;
+                if !raw.starts_with(&prefix) {
+                    break;
+                }
+                let seq = decode_mark(&raw[keys::PREFIX_LEN..])
+                    .ok_or_else(|| format!("a History key does not decode: {}", hex(&raw)))?;
+                if seq >= seqs.end || reach.is_some_and(|reach| seq > reach) {
+                    break;
+                }
+                if seqs.contains(&seq) {
+                    write.delete_cf(cf, &raw);
+                    dropped += 1;
+                }
+            }
+        }
+        self.note_synced_write("drop_history");
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(write, &opts)
+            .map_err(|e| format!("history delete: {e}"))?;
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::warn!(
+            target: LOG_TARGET,
+            partition = partition.0,
+            generation = generation.0,
+            from = seqs.start,
+            below = seqs.end,
+            dropped,
+            "history_dropped"
+        );
+        Ok(dropped)
     }
 
     fn decode_epochs(
@@ -2161,6 +2285,76 @@ impl RocksEngine {
             .get(partition, generation, Namespace::Progress, PROGRESS_KEY)?
             .map(|(_, _, value)| value);
         Ok(Some((record, progress)))
+    }
+
+    /// The levels whose `History` lineage `(partition, generation)` reads, own level first, each
+    /// with its reach: `None` for the own level, else the lowest [`Link::base`] on the path to it.
+    /// A read falls through a link only for `seq <= base` ([`Self::get`]), so an ancestor's
+    /// records above its reach are not this lineage's (#170 review r3/r4).
+    fn history_reach(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Vec<(Generation, Option<u64>)> {
+        let mut levels = vec![(generation, None)];
+        let mut level = generation;
+        let mut reach: Option<u64> = None;
+        while let Some(link) = self.link(partition, level) {
+            let base = reach.map_or(link.base.0, |reach| reach.min(link.base.0));
+            reach = Some(base);
+            levels.push((link.parent, reach));
+            level = link.parent;
+        }
+        levels
+    }
+
+    /// The lowest `History` seq lineage `(partition, generation)` serves through its chain
+    /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one
+    /// within that level's reach ([`Self::history_reach`]), or the lineage's applied head plus
+    /// one when none does (1 for an empty copy). It assumes no hole above that record: a history
+    /// trim (#61) must revisit it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a `History` key does not decode.
+    pub fn history_floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<Seq, StorageFault> {
+        let levels = self.history_reach(partition, generation);
+        let cf = self.cf(keys::cf_for(Namespace::History));
+        for (level, reach) in levels.into_iter().rev() {
+            let prefix = encode_key(partition, level, Namespace::History, &[]);
+            let first = self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+                .next();
+            let Some(item) = first else { continue };
+            let (raw, _) = item.map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "history_floor_read_failed");
+                StorageFault::Corrupt
+            })?;
+            if !raw.starts_with(&prefix) {
+                continue;
+            }
+            let first = decode_mark(&raw[keys::PREFIX_LEN..]).ok_or_else(|| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    generation = level.0,
+                    key_hex = %hex(&raw),
+                    "history_floor_key_undecodable"
+                );
+                StorageFault::Corrupt
+            })?;
+            // #170 review r3/r4: an ancestor's record above the reach is not this lineage's.
+            if reach.is_some_and(|reach| first > reach) {
+                continue;
+            }
+            return Ok(Seq(first));
+        }
+        Ok(Seq(self.buffered_applied(partition, generation).0 + 1))
     }
 
     /// The record at `key` in `ns` as lineage `(partition, generation)` sees it: the generation

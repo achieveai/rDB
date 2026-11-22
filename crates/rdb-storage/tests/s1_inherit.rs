@@ -1567,3 +1567,77 @@ fn t61_copied_inherit_after_trim_refuses_a_created_key() {
     assert_eq!(engine.staging(P, G2), None, "no copy was staged");
     assert_eq!(dumped(&db), before, "a refused copy wrote something");
 }
+
+/// #170 review r3/r4 (thread 4654331883): a lineage's history floor and the dev tool
+/// `drop_history` see only what its chain reaches. G2 inherits G1 at base 2 (copied), so it
+/// reaches G1's records 1..=2 and holds its own 3..=5; G1's records 3..=10 are G1's.
+/// - The floor is 1 (G1's record 1, within reach).
+/// - Dropping 0..8 through G2 deletes 5 records (G1's 1..=2 and G2's 3..=5), not G1's 3..=7.
+/// - The floor is then G2's applied head plus one, 6, not G1's record 3, and stays 6 once G2
+///   appends seq 6.
+///
+/// Cuts: `history_floor` ignores the reach, red (floor 3 after the drop); `drop_history`
+/// ignores it, red (10 dropped).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn f87_3_the_history_floor_and_drop_stop_at_the_link_base() {
+    let dir = data_dir("f87-3-reach");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 10);
+    assert!(matches!(
+        engine.inherit(P, G1, G2, Seq(2)),
+        Ok(Inherited::Copied { .. })
+    ));
+    write_after(&mut engine, G2, (2, &g1), 5);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(1)));
+
+    assert_eq!(engine.drop_history(P, G2, 0..8), Ok(5));
+    for seq in 3..=10 {
+        assert_eq!(
+            history_from(&engine, G1, seq),
+            Some(G1),
+            "G1's record {seq}"
+        );
+    }
+    for seq in 1..=5 {
+        assert_eq!(history_from(&engine, G2, seq), None, "G2 still reads {seq}");
+    }
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+
+    let g2 = chain(P, G2, (Seq(2), g1.digest(2)), 6);
+    commit_through(&mut engine, &g2, 6);
+    assert_eq!(engine.buffered_applied(P, G2).0, 6);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+}
+
+/// #170 review r5 (thread 4655340442): the reach is the running minimum of the bases on the
+/// path, not each link's own base. G2 inherits G1 (10 records) at base 2, then G3 inherits G2
+/// at base 1 and holds its own 2..=5. G3 reaches G1's record 1 only.
+/// - The floor through G3 is 1.
+/// - Dropping 0..3 through G3 deletes 2 records (G1's 1 and G3's 2), and G1's record 2 stays.
+/// - The floor through G3 is then 3, not G1's record 2.
+///
+/// Cut: `history_reach` taking each link's base for its level, red (3 dropped, G1's 2 gone).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn f87_4_the_reach_is_the_lowest_base_on_the_path() {
+    let dir = data_dir("f87-4-reach");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 10);
+    assert!(matches!(
+        engine.inherit(P, G1, G2, Seq(2)),
+        Ok(Inherited::Copied { .. })
+    ));
+    assert!(matches!(
+        engine.inherit(P, G2, G3, Seq(1)),
+        Ok(Inherited::Copied { .. })
+    ));
+    write_after(&mut engine, G3, (1, &g1), 5);
+    assert_eq!(engine.history_floor(P, G3), Ok(Seq(1)));
+
+    assert_eq!(engine.drop_history(P, G3, 0..3), Ok(2));
+    assert_eq!(history_from(&engine, G1, 2), Some(G1), "G1's record 2");
+    assert_eq!(history_from(&engine, G3, 2), None, "G3 still reads 2");
+    assert_eq!(history_from(&engine, G3, 3), Some(G3));
+    assert_eq!(engine.history_floor(P, G3), Ok(Seq(3)));
+}

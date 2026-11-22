@@ -529,6 +529,37 @@ node whatever the setting, as check B does (slice 1, above).
   capability bit that gates the re-add, so a peer without both guards refuses or is never
   re-added live (issue #107). Any change that weakens check A takes a bump.
 
+**Amended 2026-11-19 (issue #107 slice 2b): protocol 10 and the owner's setting.** Two rules,
+shipped together. They supersede two parts of the slice 2a amendment above: the paragraph that
+says the receiving node reads its own setting, and the **Protocol 9** prerequisite. That text
+stays as written; this amendment replaces it.
+
+- **Protocol 10.** `PROTOCOL_VERSION` moves from 9 to 10, with no capability bit. Every build at
+  10 has check A, check B and the refusal mark. The handshake requires the same version in both
+  directions, so a build at 9 and a build at 10 never link, and each side logs
+  `net_handshake_refused` naming both versions. An owner never sees a link to a peer at 9 come
+  up, so its live re-add never probes that peer and never re-adds it at the boot it still runs.
+  So the operator rule of slice 2a ("only once every node runs a build with both") is now
+  enforced at the handshake. Upgrade: stop every node and every app process that links to
+  them (an app at 9 is refused by nodes at 10 too), upgrade them all, start the nodes, then
+  the apps (#170 review r1).
+  A capability bit was rejected: `wire::Hello` has no field for it, so it would change a wire
+  type and need the bump anyway.
+- **The owner's setting rides on the landing.** `Landed` carries `owner_live_readd`: the
+  `Timeouts::live_readd` of the owner whose F1 committed the generation. A copy refused a
+  landing marks a receiver it keeps only when that flag is on. Its own setting no longer plays
+  a part there; it governs only its own duty as an owner. A re-post of a committed root
+  (`copy_ahead`) relays the flag that root came with, never the relaying node's setting. No
+  stored record carries it: no restart or reopen path lands a generation, and marks live only in
+  memory. A later path that lands from `partitions/{id}` would have to carry it on the record.
+  So an owner with the setting on now protects a copy whose node has it off. A copy whose
+  owner has it off is no longer marked, since that owner never starts a same-boot return. Only
+  a cluster with mixed settings sees a difference. With the setting off everywhere, every
+  landing carries `false` and the logs are as before.
+
+Any change that weakens check A still takes a bump. The setting stays off by default until the
+512-partition acceptance run passes.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
