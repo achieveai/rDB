@@ -2568,7 +2568,7 @@ fn m7v_36_lag_resume_before_every_pinned_copy_reaches_the_barrier_violates() {
     let signature = violated(
         &judge(&trace),
         Invariant::Lag,
-        "resume_without_durable_quorum",
+        "resume_without_every_pinned_copy",
     );
     assert!(
         signature.detail.contains('1') && signature.detail.contains('3'),
@@ -2677,8 +2677,7 @@ fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
 /// self minus lost). Clause (a) quantifies over the pinned set less the copies the resume line
 /// names lost: n3 lost and short of the barrier, the other two at it, is a legal resume. Near-
 /// misses: the lost set excuses only its own nodes, so n1 short beside a lost n3 still reports n1
-/// alone. Since issue #79 (option A) the same run with nothing lost is legal too: n1 and n2 are
-/// the durable quorum. It reported n3 before.
+/// alone; and the same run with nothing lost reports n3, as before the field existed.
 #[retcd_test]
 fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     support::preamble();
@@ -2689,7 +2688,7 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     let signature = violated(
         &judge(&n1_short),
         Invariant::Lag,
-        "resume_without_durable_quorum",
+        "resume_without_every_pinned_copy",
     );
     assert!(
         signature.detail.contains("node(s) 1 short"),
@@ -2697,9 +2696,16 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
         signature.detail
     );
 
-    // Issue #79 (option A): the same run with nothing lost is legal too now. n3 short beside
-    // the primary and n2 at the barrier is the durable quorum (it reported n3 before #79).
-    proven(&judge(&n3_short()), Invariant::Lag);
+    let signature = violated(
+        &judge(&n3_short()),
+        Invariant::Lag,
+        "resume_without_every_pinned_copy",
+    );
+    assert!(
+        signature.detail.contains("node(s) 3 short"),
+        "{}",
+        signature.detail
+    );
 }
 
 #[retcd_test]
@@ -2765,71 +2771,6 @@ fn m7v_38_lag_unsafe_age_reset_by_a_config_version_change_violates() {
         ))
         .build();
     proven(&judge(&retired), Invariant::Lag);
-}
-
-/// Issue #79 (option A, owner ruling 2026-11-20): clauses (a) and (b) read the **durable
-/// quorum** of the pinned set, the primary (the line's own node, n1) plus `min_regular_acks` of
-/// the others, derived from the set's length. Near-misses on both sides of the quorum: n1 and n3
-/// at the barrier with n2 short is a legal resume, and n2 and n3 at it with the primary short is
-/// not, whatever the secondaries hold. Clause (b): a timer drop across a config change is
-/// retired by the paused prefix durable on n1 and n2, and not by n2 and n3.
-/// Cuts: quorum without the primary test, red at the primary-short clause; the old every-copy
-/// quantifier, red at the first clause.
-#[retcd_test]
-fn i79_lag_the_durable_quorum_gates_resume_and_needs_the_primary() {
-    support::preamble();
-    proven(
-        &judge(&lag_cycle(
-            "i79-a",
-            &[(N1, Seq(40)), (N3, Seq(40))],
-            240,
-            8_000,
-        )),
-        Invariant::Lag,
-    );
-    let primary_short = lag_cycle("i79-b", &[(N2, Seq(40)), (N3, Seq(40))], 240, 8_000);
-    let signature = violated(
-        &judge(&primary_short),
-        Invariant::Lag,
-        "resume_without_durable_quorum",
-    );
-    assert!(
-        signature.detail.contains("node(s) 1 short"),
-        "the primary is the one short: {}",
-        signature.detail
-    );
-
-    let reset = |case: &str, durable: &[NodeId]| {
-        let mut b = base(case).at(2_000).push(protection(
-            ProtectionPhase::Paused,
-            1_800,
-            &[N1, N2, N3],
-            ConfigVersion(3),
-            Seq(40),
-            Seq(40),
-            None,
-        ));
-        for node in durable {
-            b = b.flush(*node, Seq(40));
-        }
-        b.at(2_100)
-            .push(protection(
-                ProtectionPhase::Paused,
-                0,
-                &[N1, N2, N3],
-                ConfigVersion(4),
-                Seq(40),
-                Seq(40),
-                None,
-            ))
-            .build()
-    };
-    proven(&judge(&reset("i79-c", &[N1, N2])), Invariant::Lag);
-    violated(
-        &judge(&reset("i79-d", &[N2, N3])),
-        Invariant::Lag,
-        "unsafe_age_reset_across_config_version",
-    );
 }
 
 #[retcd_test]

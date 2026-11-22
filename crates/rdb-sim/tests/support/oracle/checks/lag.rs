@@ -4,7 +4,7 @@
 //!
 //! | Clause | Rule(s) | Says |
 //! |---|---|---|
-//! | (a) | `resume_without_durable_quorum`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when the durable quorum of the pinned `required_copy_set`, less the lost ones, is durable at the barrier, no gating copy is past it, and lag stayed under 250 ms for the 5 s before it |
+//! | (a) | `resume_without_every_pinned_copy`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when every node in the pinned `required_copy_set`, less the lost ones, is durable at the barrier **exactly**, and lag stayed under 250 ms for the 5 s before it |
 //! | (b) | `unsafe_age_reset_across_config_version` | the unsafe-age timer never falls across a `config_version` change without a retirement barrier |
 //! | (c) | `admitted_while_paused` | pausing is an **admission** gate (critic F20) |
 //!
@@ -12,15 +12,10 @@
 //! partitions; that is the property INV-ISO exists to assert separately, and no clause below
 //! reads a partition other than `event.partition`.
 //!
-//! Clause (a)'s quantifier is the **durable quorum** of the pinned set (issue #79, option A,
-//! owner ruling 2026-11-20; it was **every** member, critic F8): the primary, which is the
-//! `protection_state` line's own `event.node`, plus `min(m, n)` of the `n` gating regular
-//! secondaries, with `m` derived from `required_copy_set.len()` by [`DerivedQuorumRule`] and
-//! never read from a trace field (V-R20 (1)). In RF2 and `DegradedRf2` that is still every
-//! copy. The detail still lists **every** gating copy short of the barrier. INV-PUB reads the
-//! same field with its own quantifier (one qualifying *applied* member) and the two readers
-//! still share no helper (§4 convention 3): reading the rule enum is reading the model, not
-//! sharing a predicate. The overshoot test stays over every gating copy.
+//! Clause (a)'s quantifier is **every** member of the pinned set (critic F8). INV-PUB reads the
+//! same `required_copy_set` field with the opposite quantifier — one qualifying member — and the
+//! two readers deliberately share no helper (§4 convention 3): a single `copy_set_satisfied()`
+//! gets one of the two rows wrong.
 //!
 //! The **1 s warn / 2.1 s pause ladder is not asserted here**. It is a timing property whose
 //! 2.1 s figure depends on H1 delivering a health evaluation every ≤50 ms, and a scenario that
@@ -52,7 +47,7 @@ use rdb_core::contracts::ids::{NodeId, ReplicaRole, Seq};
 use rdb_core::contracts::trace::{AdmissionOutcome, ProtectionPhase, TraceEvent, TraceKind};
 
 use super::Checker;
-use crate::support::oracle::model::{DerivedQuorumRule, Model, ProtectionRec};
+use crate::support::oracle::model::{Model, ProtectionRec};
 use crate::support::oracle::{Invariant, Violation};
 
 /// Spec §6.2's resume row: lag below this for [`HOLD_TICKS`] before the phase may go `Healthy`.
@@ -95,7 +90,7 @@ impl Checker for Lag {
                 if let Some(previous) = part.last_protection() {
                     if previous.config_version != *config_version
                         && *oldest_unsafe_age_ms < previous.oldest_unsafe_age_ms
-                        && !retired(part, previous, event.node)
+                        && !retired(part, previous)
                     {
                         return Err(Violation::detailed(
                             "unsafe_age_reset_across_config_version",
@@ -103,8 +98,8 @@ impl Checker for Lag {
                             format!(
                                 "oldest_unsafe_age_ms fell from {} to {oldest_unsafe_age_ms} \
                                  across the config_version change {} -> {}, with no retirement \
-                                 barrier: the paused prefix {} is not durable on the durable \
-                                 quorum of the previous pin",
+                                 barrier: the paused prefix {} is not durable on every newly \
+                                 pinned copy",
                                 previous.oldest_unsafe_age_ms,
                                 previous.config_version.0,
                                 config_version.0,
@@ -122,7 +117,7 @@ impl Checker for Lag {
                 let Some(pin) = pinned_pause(part) else {
                     return Ok(());
                 };
-                resume_is_legal(part, pin, lost_copy_set, event.node, event.logical_tick)
+                resume_is_legal(part, pin, lost_copy_set, event.logical_tick)
             }
 
             TraceKind::AdmissionDecision { outcome, .. } => {
@@ -168,43 +163,12 @@ fn pinned_pause(part: &crate::support::oracle::model::PartitionModel) -> Option<
 }
 
 /// Whether the drop in unsafe age is justified: the prefix the previous configuration was paused
-/// at is durable on the durable quorum of the set it pinned (issue #79), with `primary` the
-/// node that wrote the line.
-fn retired(
-    part: &crate::support::oracle::model::PartitionModel,
-    previous: &ProtectionRec,
-    primary: NodeId,
-) -> bool {
-    quorum_durable(
-        part,
-        &previous.required_copy_set,
-        previous.required_copy_set.len(),
-        primary,
-        previous.paused_prefix_seq,
-    )
-}
-
-/// Whether `seq` is durable on the durable quorum of `gating`: on `primary`, and on
-/// `min(m, n)` of the `n` other gating copies, `m` derived from the pinned set's length
-/// `pinned_len` (V-R20 (1)). A primary outside `gating` holds nothing, so the quorum fails.
-/// A set of a shape no rule covers is judged by every copy, the old quantifier.
-fn quorum_durable(
-    part: &crate::support::oracle::model::PartitionModel,
-    gating: &[NodeId],
-    pinned_len: usize,
-    primary: NodeId,
-    seq: Seq,
-) -> bool {
-    let secondaries: Vec<NodeId> = gating.iter().copied().filter(|n| *n != primary).collect();
-    let m = DerivedQuorumRule::of_len(pinned_len)
-        .map_or(secondaries.len(), DerivedQuorumRule::min_regular_acks);
-    let durable = secondaries
+/// at is durable on **every** node the new configuration pins.
+fn retired(part: &crate::support::oracle::model::PartitionModel, previous: &ProtectionRec) -> bool {
+    previous
+        .required_copy_set
         .iter()
-        .filter(|node| part.durable_through(**node, seq))
-        .count();
-    gating.contains(&primary)
-        && part.durable_through(primary, seq)
-        && durable >= m.min(secondaries.len())
+        .all(|node| part.durable_through(*node, previous.paused_prefix_seq))
 }
 
 /// Clause (a), in the order an operator wants to read it: who was short, then whether the
@@ -213,7 +177,6 @@ fn resume_is_legal(
     part: &crate::support::oracle::model::PartitionModel,
     pin: &ProtectionRec,
     lost: &[NodeId],
-    primary: NodeId,
     healthy_tick: u64,
 ) -> Result<(), Violation> {
     if !part
@@ -244,16 +207,9 @@ fn resume_is_legal(
         .copied()
         .filter(|node| !part.durable_through(*node, pin.resume_barrier_seq))
         .collect();
-    let quorum = quorum_durable(
-        part,
-        &gating,
-        pin.required_copy_set.len(),
-        primary,
-        pin.resume_barrier_seq,
-    );
-    if !quorum {
+    if !short.is_empty() {
         return Err(Violation::detailed(
-            "resume_without_durable_quorum",
+            "resume_without_every_pinned_copy",
             ReplicaRole::Primary,
             format!(
                 "resumed at tick {healthy_tick} with node(s) {} short of the resume barrier {} \
