@@ -24,6 +24,9 @@ struct Proc {
     db: Option<Db>,
     /// `None` once [`Rig::stop`] took the node down: its listener and links are gone.
     _net: Option<Arc<Net>>,
+    /// The faults its net applies, for [`Rig::mute`] and [`Rig::unmute`]; `None` for a
+    /// process a row opened by hand.
+    faults: Option<Arc<Faults>>,
     dir: PathBuf,
     /// The `TempDir` that removes `dir` when dropped.
     _dir: Box<dyn std::any::Any>,
@@ -146,6 +149,33 @@ fn open_node_with(
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
 ) -> Result<(Db, Arc<Net>), OpenError> {
+    open_node_faulted(
+        rt,
+        store,
+        cert_dir,
+        node,
+        dir,
+        listener,
+        addrs,
+        timeouts,
+        Faults::new(),
+    )
+}
+
+/// [`open_node_with`] whose net applies `faults` (PR #181 review round 4: a running node's
+/// links muted and back, as `db::failover_tests` does).
+#[allow(clippy::too_many_arguments)]
+fn open_node_faulted(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
+    faults: Arc<Faults>,
+) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
     let label = Label::Node(node);
@@ -159,7 +189,7 @@ fn open_node_with(
             dial: NetConfig::dial_lower(node, addrs),
             protocol_version: PROTOCOL_VERSION,
             admin_apps: BTreeSet::new(),
-            faults: Faults::new(),
+            faults,
         },
         &links,
         Some(listener),
@@ -370,7 +400,8 @@ impl Rig {
         for (node, (dir, keep)) in nodes.iter().zip(dirs) {
             let listener = self.listen(&self.rt, *node);
             let own_rt = self.own_runtimes.then(runtime);
-            let (db, net) = open_node_with(
+            let faults = Faults::new();
+            let (db, net) = open_node_faulted(
                 own_rt.as_ref().unwrap_or(&self.rt),
                 &self.store,
                 &self.cert_dir,
@@ -379,12 +410,14 @@ impl Rig {
                 listener,
                 &addrs,
                 self.timeouts,
+                Arc::clone(&faults),
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
                 node: *node,
                 db: Some(db),
                 _net: Some(net),
+                faults: Some(faults),
                 dir,
                 _dir: keep,
                 own_rt,
@@ -1419,6 +1452,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
             node,
             db: Some(db),
             _net: Some(net),
+            faults: None,
             dir,
             _dir: keep,
             own_rt: None,
@@ -2669,6 +2703,7 @@ impl Rig {
             dir,
             _dir,
             own_rt,
+            ..
         } = self.procs.remove(at);
         if let Some(mut db) = db {
             db.shutdown();
@@ -2682,7 +2717,8 @@ impl Rig {
         let own_rt = self.own_runtimes.then(runtime);
         let rt = own_rt.as_ref().unwrap_or(&self.rt);
         let listener = rebind(rt, &self.addrs[&node]);
-        let (db, net) = open_node_with(
+        let faults = Faults::new();
+        let (db, net) = open_node_faulted(
             rt,
             &self.store,
             &self.cert_dir,
@@ -2691,6 +2727,7 @@ impl Rig {
             listener,
             &self.addrs,
             timeouts,
+            Arc::clone(&faults),
         )
         .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
         self.procs.insert(
@@ -2699,11 +2736,35 @@ impl Rig {
                 node,
                 db: Some(db),
                 _net: Some(net),
+                faults: Some(faults),
                 dir,
                 _dir,
                 own_rt,
             },
         );
+    }
+}
+
+impl Rig {
+    /// Cut `node`'s running process off from outside. `mute`: its links read nothing, answer
+    /// no probe and write nothing, so its peers' silence timers close the links already up.
+    /// `refuse-links`: it dials none and answers no `Hello`, so no new link comes up and no
+    /// peer learns its boot (`mute` alone still completes every handshake). The process keeps
+    /// running; [`Rig::unmute`] lets its links come back.
+    fn mute(&self, node: NodeId) {
+        self.faults_of(node).apply("mute\nrefuse-links\n");
+    }
+
+    /// Lift [`Rig::mute`]: `node`'s links come back with no restart.
+    fn unmute(&self, node: NodeId) {
+        self.faults_of(node).apply("");
+    }
+
+    fn faults_of(&self, node: NodeId) -> &Faults {
+        self.procs[node.0 as usize - 1]
+            .faults
+            .as_deref()
+            .unwrap_or_else(|| panic!("node {} was opened by the rig", node.0))
     }
 }
 
@@ -2834,6 +2895,675 @@ fn s1b_restart_of_each_of_five_nodes_reopens_its_own_folder() {
     for proc in &rig.procs {
         assert_eq!(copies_in(&proc.dir), [proc.node.0.to_string()]);
     }
+}
+
+// ---- R5: a restarted owner heals with a majority when the OS did not reboot ----
+
+/// The owner of the R5 rows: node 2, which the ring makes primary of some of the 16 partitions.
+const R5_OWNER: NodeId = NodeId(2);
+
+/// R5's scene: five nodes, each process on its own runtime, every partition written once.
+/// Returns the rig, `R5_OWNER`'s partitions with a group in each, and the copy `C` of the first
+/// of them that is not the owner, chosen as the one to take down with it.
+fn r5_scene() -> (Rig, Vec<(u32, AffinityId)>, NodeId) {
+    let rig = declared_rig_with(S1B_K, S1B_P, true);
+    rig.wait_ready();
+    let owned: Vec<(u32, AffinityId)> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == R5_OWNER.0)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    assert!(!owned.is_empty(), "node 2 owns a partition");
+    for (_, group) in &owned {
+        put_lands(rig.of(R5_OWNER), *group, b"before", b"1");
+    }
+    let copy = ring(S1B_K, owned[0].0)
+        .copies
+        .iter()
+        .copied()
+        .find(|node| *node != R5_OWNER.0)
+        .map(NodeId)
+        .expect("a partition has a copy besides its owner");
+    (rig, owned, copy)
+}
+
+/// `node`'s copy folder, where its `os_boot` file lives.
+fn copy_dir(rig: &Rig, node: NodeId) -> PathBuf {
+    rig.procs[node.0 as usize - 1]
+        .dir
+        .join("nodes")
+        .join(node.0.to_string())
+}
+
+/// Give `node`'s copy the OS boot id `id`, on file as a ready open leaves it, and the same id
+/// as the OS's now: the next open of it runs under the same OS boot.
+fn same_os_boot(rig: &Rig, node: NodeId, id: &str) {
+    let dir = copy_dir(rig, node);
+    crate::os_boot::record(&dir, id).expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok(id));
+}
+
+/// R5 (PR #181 ruling A): the heal leaves a copy out only with `Timeouts::live_readd` on.
+fn live_readd_on() -> Timeouts {
+    Timeouts {
+        live_readd: true,
+        ..Timeouts::default()
+    }
+}
+
+/// The heal-decision lines of this row's own log: `heal_proceed_without`, `heal_wait_all` and
+/// `heal_peers_unknown`.
+fn heal_decisions(method: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| {
+            matches!(
+                line["@m"].as_str(),
+                Some("heal_proceed_without" | "heal_wait_all" | "heal_peers_unknown")
+            )
+        })
+        .collect()
+}
+
+/// R5 row 1 (t1's s80s3 fault): owner node 2 and a copy `C` of one of its partitions both stop;
+/// node 2 restarts under the same OS boot, `C` still down. Node 2's heal proceeds with the
+/// majority it has, logs `heal_proceed_without` naming `C`, never `heal_peers_unknown`, and its
+/// partitions read back the values written before and take new puts. Red on main: the heal waits
+/// for `C`'s link and `wait_ready` times out. Integration (~30 s): a formation of five, two
+/// stops, a restart that waits out `C`'s grant.
+/// Cut: `member_boots` never asks `leave_out` (waits for every copy, as before): red at ready.
+#[config_log::retcd_test]
+fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
+    const METHOD: &str = "r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot";
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
+    for (partition, group) in &owned {
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+    let decisions = heal_decisions(METHOD);
+    assert!(
+        !decisions
+            .iter()
+            .any(|line| line["@m"] == "heal_peers_unknown"),
+        "{decisions:?}"
+    );
+    let without: Vec<&serde_json::Value> = decisions
+        .iter()
+        .filter(|line| line["@m"] == "heal_proceed_without")
+        .collect();
+    assert!(!without.is_empty(), "{decisions:?}");
+    for line in &without {
+        assert_eq!(line["reason"], "same_os_boot", "{line}");
+        assert!(
+            matches!(
+                line["evidence"].as_str(),
+                Some("grant_expired" | "grant_frozen")
+            ),
+            "{line}"
+        );
+        assert!(
+            line["missing"]
+                .as_str()
+                .is_some_and(|m| m.contains(&copy.0.to_string())),
+            "{line}"
+        );
+    }
+}
+
+/// R5 row 4 (b): after row 1's heal went on without copy `C`, `C` starts again at a newer
+/// boot. Owner node 2 re-adds it: `partitions/{p}` pins `C` again, the record still names
+/// node 2 as owner, `C`'s process leads none of them, and the values read back. Integration
+/// (~45 s). The heal noted `C` at `UNLINKED_BOOT` (PR #181 ruling A), so its first link is a
+/// #107 live return, taken back by `live_readd_duty`. Cut: the host ignores
+/// `Msg::HealLeftOut`: no clocked return, and `restore_left_out` records `C` at its new live
+/// boot, so it waits for yet another restart (`copy_left_out_until_restart`), red at the pins.
+/// The read back waits first for the owner to serve each partition at its final generation
+/// ([`owner_serves`]): the re-add pins `C` as a shadow, and its promote is one more re-plan,
+/// whose epoch fence refuses a read on purpose (#191). The read itself is plain.
+#[config_log::retcd_test]
+fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
+    let shared: Vec<&(u32, AffinityId)> = owned
+        .iter()
+        .filter(|(partition, _)| ring(S1B_K, *partition).copies.contains(&copy.0))
+        .collect();
+    for (partition, _) in &shared {
+        assert!(
+            !pinned_nodes(&rig, *partition).contains(&copy.0),
+            "partition {partition}: the heal left node {} out",
+            copy.0
+        );
+    }
+    rig.restart(copy, live_readd_on());
+    for (partition, group) in &shared {
+        pins_until(
+            &rig,
+            *partition,
+            Duration::from_secs(60),
+            "the left-out copy is pinned again",
+            |pins| pins.contains(&copy.0),
+        );
+        let record = rig
+            .rt
+            .block_on(rig.store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PartitionId(*partition)).encode()),
+            }))
+            .expect("the store answers")
+            .record
+            .and_then(|found| PartitionRecord::decode(&found.value))
+            .expect("partitions/{p} decodes");
+        assert_eq!(record.owner, R5_OWNER, "partition {partition}: one owner");
+        assert!(
+            rig.of(copy).ownership(PartitionId(*partition)).is_none(),
+            "partition {partition}: node {} leads nothing",
+            copy.0
+        );
+        owner_serves(&rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// Wait until `owner` serves `partition` at its final generation: the record pins `copy` as a
+/// regular copy (a re-add pins it as a shadow first, and its promote is one more re-plan), and
+/// the owner has adopted that record's generation and epoch and still leads under it. Until
+/// then a re-plan's epoch fence refuses reads `RetryAfterRecovery` by design (#191), so a row
+/// that reads before this races the fence. Panics after `within`, with the last state seen.
+fn owner_serves(rig: &Rig, partition: u32, owner: NodeId, copy: NodeId, within: Duration) {
+    let deadline = Instant::now() + crate::host::test_patience(within);
+    let id = PartitionId(partition);
+    loop {
+        let value = rig
+            .rt
+            .block_on(rig.store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(id).encode()),
+            }))
+            .expect("the store answers")
+            .record
+            .map(|found| found.value);
+        let record = value
+            .as_ref()
+            .and_then(|value| PartitionRecord::decode(value));
+        let regular = value
+            .as_ref()
+            .and_then(|value| RecordMember::decode_all(value))
+            .is_some_and(|members| {
+                members.iter().any(|member| {
+                    member.node == copy
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+        let adopted = rig.of(owner).ownership(id);
+        let serves = record
+            .as_ref()
+            .zip(adopted.as_ref())
+            .is_some_and(|(record, adopted)| {
+                record.owner == owner
+                    && adopted.token.generation == record.generation
+                    && adopted.token.owner_epoch == record.owner_epoch
+                    && rig.of(owner).still_owner(id, adopted.token)
+            });
+        if regular && serves {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partition {partition}: node {} never served it with node {} regular: \
+             regular {regular}, record {record:?}, adopted {adopted:?}",
+            owner.0,
+            copy.0
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// PR #181 review (Db forwarding and the deferred marker): node 2's copy holds OS boot `A` and
+/// the OS now says `B`, a reboot. With `C` down and `live_readd` on, node 2's open must keep
+/// waiting past `C`'s grant expiry, `os_boot_changed`, and write no `os_boot` file. Opened
+/// again on `B`, `C` still down, it waits again, now `os_boot_unknown`, and still writes none.
+/// Once `C` is back, it is ready and the file holds `B`. Integration (~45 s): a formation of
+/// five, two stops, three owner opens.
+/// Cuts: the open forwards `Same` to the heal whatever it found: node 2 goes on without `C`,
+/// red; the file written at open rather than once ready: red at its absence.
+#[config_log::retcd_test]
+fn r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready() {
+    const METHOD: &str =
+        "r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready";
+    let (mut rig, _, copy) = r5_scene();
+    let dir = copy_dir(&rig, R5_OWNER);
+    let marker = dir.join(crate::os_boot::OS_BOOT_FILE);
+    crate::os_boot::record(&dir, "os-boot-a").expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok("os-boot-b"));
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    // Past C's grant (6 s plus margins), when a same-boot heal would have gone on.
+    for want in ["os_boot_changed", "os_boot_unknown"] {
+        rig.restart(R5_OWNER, live_readd_on());
+        let waited = rig.of(R5_OWNER).wait_ready(Duration::from_secs(9));
+        assert!(
+            matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+            "{want}: node 2 waits for node {}: {waited:?}",
+            copy.0
+        );
+        assert!(!marker.exists(), "{want}: no os_boot file before ready");
+        let reasons: Vec<String> = heal_decisions(METHOD)
+            .iter()
+            .filter(|line| line["@m"] == "heal_wait_all")
+            .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some(want),
+            "{reasons:?}"
+        );
+    }
+    rig.restart(copy, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("the os_boot file is written once ready")
+            .trim(),
+        "os-boot-b"
+    );
+    let decisions = heal_decisions(METHOD);
+    assert!(
+        !decisions
+            .iter()
+            .any(|line| line["@m"] == "heal_proceed_without"),
+        "{decisions:?}"
+    );
+}
+
+/// `node`'s grant record in the control store, if it has one.
+fn grant_of(rig: &Rig, node: NodeId) -> Option<rdb_core::authority::grant::GrantRecord> {
+    rig.rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+        }))
+        .expect("the store answers")
+        .record
+        .map(|found| {
+            rdb_core::authority::grant::GrantRecord::decode(&found.value)
+                .expect("grants/{node} decodes")
+        })
+}
+
+/// The partitions of `owned` whose ring also places `copy`.
+fn shared_with(owned: &[(u32, AffinityId)], copy: NodeId) -> Vec<(u32, AffinityId)> {
+    owned
+        .iter()
+        .copied()
+        .filter(|(partition, _)| ring(S1B_K, *partition).copies.contains(&copy.0))
+        .collect()
+}
+
+/// Asserts that each of `shared` pins every copy its ring places, `copy` among them, that
+/// `R5_OWNER` serves it with `copy` regular, and that it reads back the value written before
+/// and takes a put.
+fn fully_pinned_and_writable(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId) {
+    for (partition, group) in shared {
+        let placed: BTreeSet<u32> = ring(S1B_K, *partition).copies.iter().copied().collect();
+        pins_until(
+            rig,
+            *partition,
+            Duration::from_secs(60),
+            "every placed copy is pinned",
+            |pins| *pins == placed,
+        );
+        owner_serves(rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// How many lines this row has logged so far: [`left_nothing_out`] reads only those after.
+fn log_mark(method: &str) -> usize {
+    config_testkit::logs::lines_for_current_test(module_path!(), method).len()
+}
+
+/// Asserts this row's log, from line `from` (a [`log_mark`], after the formation), holds no
+/// leave-out: no `heal_proceed_without` and no `heal_left_out_noted`, and that every
+/// `heal_wait_all` of node 2's heal said `live_readd_off`.
+fn left_nothing_out(method: &str, from: usize) {
+    let lines: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .skip(from)
+            .collect();
+    let named = |message: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|line| line["@m"] == message).collect()
+    };
+    assert!(
+        named("heal_proceed_without").is_empty(),
+        "no leave-out decision"
+    );
+    assert!(
+        named("heal_left_out_noted").is_empty(),
+        "no copy noted left out"
+    );
+    let waits: Vec<&serde_json::Value> = named("heal_wait_all")
+        .into_iter()
+        .filter(|line| line["owner"].as_u64() == Some(u64::from(R5_OWNER.0)))
+        .collect();
+    assert!(
+        !waits.is_empty() && waits.iter().all(|line| line["reason"] == "live_readd_off"),
+        "{waits:?}"
+    );
+}
+
+/// PR #181 review round 3, blocker 3: `Timeouts::live_readd` off, the default, through
+/// `Db::open`. Node 2 reopens under the same OS boot while copy `C` is down and has no grant
+/// record (deleted, as a copy that never owned a partition has none). Node 2's heal waits past
+/// one full heal window, when a no-grant copy could first be left out, `live_readd_off` each
+/// time, and is not ready. `C` then starts again: node 2 is ready, each shared partition pins
+/// every placed copy with `C` regular, reads back and takes a put, and nothing was ever left
+/// out. Integration (~60 s): a formation of five, two stops, a wait of one window.
+/// Cut: `may_leave_out` ignores `live_readd`: after the window `C` is left out, node 2 is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written() {
+    const METHOD: &str =
+        "r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written";
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(ControlKey::Grant(copy).encode()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("grants/C is deleted");
+    assert!(
+        grant_of(&rig, copy).is_none(),
+        "no grant record for node {}",
+        copy.0
+    );
+    let from = log_mark(METHOD);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    let window = heal_within(&fast());
+    let waited = rig.of(R5_OWNER).wait_ready(window + Duration::from_secs(2));
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} after one window: {waited:?}",
+        copy.0
+    );
+    rig.restart(copy, Timeouts::default());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    left_nothing_out(METHOD, from);
+}
+
+/// PR #181 review round 3, blocker 4: copy `C`'s grant has expired and names its old boot
+/// `b1`, while `C` already runs again at a new boot `b2` and its own heal is blocked, so that
+/// grant is never cleared. `C`'s heal waits for node `D`, which `C`'s partitions pin and node
+/// 2's do not, kept down (live re-add off, the default, on every node). Node 2 reopens under
+/// the same OS boot with live re-add off while `C` is down, waits past the grant's expiry, and
+/// is not ready; `C` then starts at `b2`. Node 2's heal pins it: node 2 is ready, each shared
+/// partition pins every placed copy with `C` regular, reads back and takes a put, nothing is
+/// left out and `C` is never restarted. At the end `grants/C` still names `b1` and `C`'s heal
+/// still runs. Integration (~60 s).
+/// Cut: `may_leave_out` ignores `live_readd`: node 2 leaves `C` out on its expired grant and is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned() {
+    const METHOD: &str =
+        "r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned";
+    let (mut rig, owned, copy) = r5_scene();
+    let copy_owns: Vec<u32> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == copy.0)
+        .collect();
+    assert!(!copy_owns.is_empty(), "node {} owns a partition", copy.0);
+    let blocker = (1..=S1B_K)
+        .map(NodeId)
+        .find(|node| {
+            *node != R5_OWNER
+                && *node != copy
+                && copy_owns
+                    .iter()
+                    .any(|p| ring(S1B_K, *p).copies.contains(&node.0))
+                && owned
+                    .iter()
+                    .all(|(p, _)| !ring(S1B_K, *p).copies.contains(&node.0))
+        })
+        .expect("a node in C's partitions and in none of node 2's");
+    let b1 = grant_of(&rig, copy)
+        .expect("node {copy} holds a grant: it owns a partition")
+        .boot;
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    let from = log_mark(METHOD);
+    rig.stop(blocker);
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    // Past C's grant: its expiry, the clock margins and a second more.
+    let budgets = fast();
+    let expiry = grant_of(&rig, copy)
+        .expect("grants/C is kept")
+        .expiry_utc_ms;
+    let past = expiry
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("margins fit")
+        + 1_000;
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("now fits")
+    };
+    let wait = Duration::from_millis(u64::try_from((past - now_ms()).max(1_000)).expect("ms"));
+    let waited = rig.of(R5_OWNER).wait_ready(wait);
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} past its grant: {waited:?}",
+        copy.0
+    );
+    assert!(now_ms() > past, "C's grant has expired");
+    rig.restart(copy, Timeouts::default());
+    // Review round 4: the boot C runs now, and the one node 2 pins it at.
+    let b2 = rig.of(copy).boot_of(copy).expect("C runs");
+    assert_ne!(b2, b1, "C runs at a new boot");
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} links: {e}", copy.0));
+    let shared = shared_with(&owned, copy);
+    fully_pinned_and_writable(&rig, &shared, copy);
+    owner_pins_at(&rig, &shared, copy, b2);
+    left_nothing_out(METHOD, from);
+    let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
+    assert_eq!(kept.boot, b1, "grants/C still names the old boot");
+    assert!(
+        matches!(rig.of(copy).heal_state(), HealState::Running),
+        "C's own heal is still blocked: {:?}",
+        rig.of(copy).heal_state()
+    );
+}
+
+/// Asserts that node 2's own status for each of `shared` pins `copy` at `boot`, within a
+/// patience: the boot its heal planned, not only the node.
+fn owner_pins_at(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId, boot: BootId) {
+    for (partition, _) in shared {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+        loop {
+            let pinned: Vec<rdb_core::contracts::membership::Member> = rig
+                .of(R5_OWNER)
+                .node_status_in(PartitionId(*partition))
+                .expect("node 2's status")
+                .into_iter()
+                .find(|status| status.node == R5_OWNER)
+                .map(|status| status.pinned)
+                .unwrap_or_default();
+            let at: Vec<BootId> = pinned
+                .iter()
+                .filter(|member| member.node == copy)
+                .map(|member| member.boot)
+                .collect();
+            if at == [boot] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {partition}: node 2 pins node {} at {boot:?}, not {at:?}",
+                copy.0
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Whether node 2's process has a link up to `node` now.
+fn owner_linked(rig: &Rig, node: NodeId) -> bool {
+    rig.of(R5_OWNER)
+        .links()
+        .net()
+        .and_then(|net| net.connection(node))
+        .is_some()
+}
+
+/// PR #181 review round 4: blocker 4 with C already running and only its link coming back.
+/// As in `r5_b2_`, C's heal is blocked (node D, in C's partitions and none of node 2's, is
+/// down), so `grants/C` keeps naming the old boot `b1`. C restarts at `b2`, and its links are
+/// then cut ([`Rig::mute`]: `mute` closes the links up, `refuse-links` keeps new ones down);
+/// its process keeps running. Node 2 reopens with live re-add off, has no link to C and no
+/// boot for it, and waits past b1's expiry, not ready. C is unmuted: its link comes back with
+/// no restart.
+/// Node 2 is ready, pins C at `b2` in every shared partition, reads back and takes a put;
+/// nothing is left out, C's boot is still `b2`, `grants/C` still names b1 and C's heal is
+/// still `Running`. This restores a link by unmuting a running node, not by a network cut.
+/// Integration (~60 s).
+/// Cut: `may_leave_out` ignores `live_readd`: node 2 leaves C out on its expired grant and is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_link_a_running_b2_whose_link_comes_back_is_pinned_at_b2() {
+    const METHOD: &str = "r5_link_a_running_b2_whose_link_comes_back_is_pinned_at_b2";
+    let (mut rig, owned, copy) = r5_scene();
+    let copy_owns: Vec<u32> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == copy.0)
+        .collect();
+    assert!(!copy_owns.is_empty(), "node {} owns a partition", copy.0);
+    let blocker = (1..=S1B_K)
+        .map(NodeId)
+        .find(|node| {
+            *node != R5_OWNER
+                && *node != copy
+                && copy_owns
+                    .iter()
+                    .any(|p| ring(S1B_K, *p).copies.contains(&node.0))
+                && owned
+                    .iter()
+                    .all(|(p, _)| !ring(S1B_K, *p).copies.contains(&node.0))
+        })
+        .expect("a node in C's partitions and in none of node 2's");
+    let b1 = grant_of(&rig, copy)
+        .expect("C holds a grant: it owns a partition")
+        .boot;
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(blocker);
+    rig.restart(copy, Timeouts::default());
+    let b2 = rig.of(copy).boot_of(copy).expect("C runs");
+    assert_ne!(b2, b1, "C runs at a new boot");
+    rig.mute(copy);
+    let unlinked = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while owner_linked(&rig, copy) {
+        assert!(
+            Instant::now() < unlinked,
+            "node 2's link to C goes down once C is muted"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let from = log_mark(METHOD);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    // Until b1's grant has expired: its expiry, the clock margins and a second more.
+    let budgets = fast();
+    let expiry = grant_of(&rig, copy)
+        .expect("grants/C is kept")
+        .expiry_utc_ms;
+    let past = expiry
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("margins fit")
+        + 1_000;
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("now fits")
+    };
+    let expired = Duration::from_millis(u64::try_from((past - now_ms()).max(1_000)).expect("ms"));
+    let waited = rig.of(R5_OWNER).wait_ready(expired);
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} once b1's grant has expired: {waited:?}",
+        copy.0
+    );
+    assert!(now_ms() > past, "b1's grant has expired");
+    assert!(
+        !owner_linked(&rig, copy),
+        "node 2 has no link to C while C is muted"
+    );
+    // Review round 4: node 2 has not learnt b2 before the unmute: no handshake with C since
+    // its restart, so its net holds no boot for C.
+    let seen = rig
+        .of(R5_OWNER)
+        .links()
+        .net()
+        .and_then(|net| net.boot_of(copy));
+    assert_eq!(seen, None, "node 2 knows no boot for C before the unmute");
+    rig.unmute(copy);
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once C's link is back: {e}"));
+    let shared = shared_with(&owned, copy);
+    fully_pinned_and_writable(&rig, &shared, copy);
+    owner_pins_at(&rig, &shared, copy, b2);
+    left_nothing_out(METHOD, from);
+    assert_eq!(rig.of(copy).boot_of(copy), Some(b2), "C was not restarted");
+    let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
+    assert_eq!(kept.boot, b1, "grants/C still names b1");
+    assert!(
+        matches!(rig.of(copy).heal_state(), HealState::Running),
+        "C's own heal is still blocked: {:?}",
+        rig.of(copy).heal_state()
+    );
 }
 
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
