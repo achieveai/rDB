@@ -408,19 +408,156 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   partition it still owns stops for good until that partition is moved too. Move each one. If
   the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
   those partitions can still be moved while it runs.
-- **A frozen node cannot lead again** in this release. It can start and hold copies once it owns
-  nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
+  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
+  a restart (a new boot) that owns nothing, a failover planner, where one runs
+  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
+  promoted again like any regular copy. With no planner running the frozen grant stays, and the
+  node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
 - **While a node is down, a surviving node that restarts cannot finish opening until the dead
   node returns or the partitions it co-owns are promoted with `--drop`, which costs that
-  surviving node its leadership.** Its open keeps logging `heal_retry` for the dead node. The
+  surviving node its leadership** — after a host crash or reboot. A process restart on the same
+  OS boot can heal without the dead node: see the amendment below. Its open keeps logging `heal_retry` for the dead node. The
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again in this release, and the moved partition stays
-  paused until its other copy is back, because that copy was on the stopped node.
+  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
+  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  until its other copy is back, because that copy was on the stopped node.
+- **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
+  ADR-rdb-0028): after a process restart, an owner with `Timeouts::live_readd` on heals with
+  a majority of its copies.** The bullet above still holds after a host crash, and it holds
+  whenever `live_readd` is off.
+  - **Issue #169 (a restarted owner waits for a down copy) is fixed only with
+    `Timeouts::live_readd` on** (`rdb_node --live-readd`). With it off, the default, the reopen
+    waits for every copy, as before R5, and logs `heal_wait_all` with reason `live_readd_off`.
+    Each open logs the setting as `db_open_live_readd{enabled}`.
+  - **Process restart, same OS boot (Linux), `live_readd` on:** the owner's open does not wait
+    for a copy that is down, when a majority of the partition's pinned non-shadow members, the
+    owner included, is up and the down copy's grant (`grants/{node}`) is frozen or proven
+    expired on the owner's clock. It logs `heal_proceed_without` and leaves that copy out. A
+    copy with a live grant is waited for: it may be alive with a slow link. A copy that has
+    stopped no longer renews its grant. Its expiry can be proven only while the owner's clock
+    has an admissible bound. With no bound established the heal waits as `no_clock_bound`;
+    with a sample that is too old or whose error is too wide it waits as
+    `copy_not_proven_down`. With an admissible bound the expiry is proven at most one grant
+    lifetime plus the clock margins after the copy stopped, and the heal's next look after
+    that leaves it out. A copy that is alive keeps renewing its grant, so while it renews and
+    its link to the owner is missing there is no fixed wait. The wait ends when the link comes
+    up, when the copy's grant is frozen, or when the copy stops renewing and the owner proves
+    its grant expired. A copy with no grant record
+    is waited for one heal window (`no_grant_record`), then
+    left out too (`evidence=no_grant_after_window`). That costs availability only, never an
+    acknowledged write.
+  - **How a left-out copy comes back:** by #107's live re-add, once its link has been up for
+    5 s, whether it never stopped or started again. No record proves which boot a left-out
+    copy runs: a frozen or expired grant can name an older process of a node that already runs
+    again. Memory only: if the owner restarts again before the copy is back, the copy returns
+    only when its own node restarts, as after any drop.
+  - **Set `live_readd` the same on every node.** Each step is the owner's: its setting decides
+    whether the heal leaves a copy out and whether it re-adds it. The setting travels with the
+    landing (protocol 10), so the returning copy follows the owner's, not its own (see "Mixed
+    settings" under `Timeouts::live_readd`). It never loses a write.
+  - **Host crash or reboot:** the owner waits for every copy, as above, or for
+    `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
+    steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
+  - Each attempt that waits logs `heal_wait_all` with its first wait reason, and again when
+    that reason changes. The reasons: `os_boot_changed`, `os_boot_unknown`,
+    `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
+    `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
+    `no_clock_bound`. One more reason is not a wait: `decided_past_deadline`. Only a late
+    **decision** gets it: the heal decided it may leave a copy out, but only after its
+    attempt's deadline. That attempt acts on nothing and logs `heal_leave_out_expired`. A late
+    **wait** keeps its own reason and logs `heal_wait_all` as any wait does: with the attempt's
+    first wait reason, and again when that reason changes. Both end the attempt, and the heal
+    tries again by itself, with a new window. An attempt also ends `PeersUnknown`, keeping its
+    wait reason, when its next look at the links would fall at or past its deadline; it too is
+    retried. After a late decision there is nothing to do. After a late wait the new attempt
+    asks again. With `live_readd` on it leaves the copy out, and needs nothing from you, when
+    the copy's grant is frozen (`evidence=grant_frozen`), its expiry is proven
+    (`evidence=grant_expired`), or it has no grant record past one heal window
+    (`evidence=no_grant_after_window`); the copy comes back later by #107's live re-add. Only
+    a wait that ends in none of those must have that copy back: start node N, as the error
+    says ("start node N, then open again"). A `wait_ready` that times out names the latest
+    reason.
+  - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
+    (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
+    done. Node processes that share one folder each keep their own. A first open, a missing,
+    empty or unreadable id, and macOS or Windows all count as a host crash.
+  - **Containers:** the boot id is the host kernel's, so restarting a container is the same boot.
+    That is correct: the host kept the unsynced data.
+  - **Known limits:** restoring a VM or disk snapshot, or network storage that drops its write
+    cache without a reboot, keeps the boot id but loses data. Before starting a node on a
+    restored snapshot, delete `nodes/<n>/os_boot` from its folder; it then waits for every copy.
+  - **What is still open before `live_readd` is on by default** (#107's table). If one is hit
+    with it on, this is what you see:
+    - **A re-add shadow that is never promoted** (M3 exit): since #170 the owner gives it up
+      after 30 min or 3 failed attempts and logs `live_readd_shadow_unpromoted` (see "A standby
+      that never becomes a full copy" under `Timeouts::live_readd`); until then the partition
+      keeps writing with its other copies. A shadow the owner has no link to is given up after
+      its drop clock (10 s), with `move_shadow_unreachable` and then `move_given_up`.
+    - **Flatten off the owner's thread** (storage): adoption's flatten runs on the owner's
+      thread, so a re-add after a long drop can pause the owner's other partitions while it
+      flattens.
+    - **The WAL watchdog against a frozen process** (storage): how the watchdog treats a
+      process that was frozen and resumed is not yet checked; treat a watchdog fault after a
+      freeze as this case.
+    - **Check B at adoption** (#121) and **the #81 failover row**: with automatic
+      failover on, those paths are not yet proven together with live re-add.
+    - **R4, the 512-partition walk**: the cost of many re-adds at once is not measured; expect
+      pauses on a node with many partitions blipped together.
+
+**Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
+partitions were all promoted away while it was stopped comes back with a frozen grant, and
+nothing at that boot lifts it. `rdb_node` checks for that about once a second. It exits **75**
+(`EX_TEMPFAIL`) when its own `NodeStatus` has shown `replace_stopped` for 5 s, or its host has
+faulted (`fault` is set), **and** no `partitions/` record in the control store names it owner,
+in any lifecycle. A failed read of the control store keeps it up. Before it exits it prints
+`rdb_node restart-wanted node=N reason=R` (`replace_stopped` or `host_faulted`) and logs
+`rdb_node_restart_wanted`, then shuts down and prints `rdb_node stopped node=N` as usual.
+
+- **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
+  flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
+  other non-zero exit as a failure to report, not a restart to loop on.
+- `lr` supervises nothing. `lr status` shows such a node as `stopped: restart wanted` (it reads
+  the printed `restart-wanted` line, not the exit status), and
+  `lr start N` is the restart.
+- `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
+  embedder asks the same.
+- Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
+  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
+  place, as below.
+
+**Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
+supervisor, restarts the node in place:
+
+1. Poll `db.restart_wanted()` about once a second. It blocks, as `node_status` does, and
+   keeps the 5 s hold between calls. It returns `Some(RestartReason::ReplaceStopped)` or
+   `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
+   cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
+   a partition, so a frozen node beside an owning one waits until the owner's partitions move.
+   Run one `Db` per node, as the gateway does, so each restarts on its own.
+2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
+   links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
+   than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
+   `Links` included), the old boot keeps answering its peers' probes, they keep their route
+   to it, and they never meet the new boot.
+3. Drop the `Db`, the `Net` and the `Links`.
+4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
+   at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
+   held.
+5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
+   restart policy, say) restart it. The gateway does this.
+
+Drop before you reopen, so a node never has two `Db`s at once.
+
+A peer sees every link to the old boot end, and its dials refused while nothing listens. When
+the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
+the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
+restart: the control store, the runtime and your app's own state stay as they are.
 
 ### Fencing your own side effects
 
@@ -1085,8 +1222,8 @@ on (below).
 
 **`Timeouts::live_readd`: a dropped copy comes back without a restart.** Off by default. Turn
 it on with `DbConfig::timeouts`, or `rdb_node --live-readd`, on each node process; each reads
-its own, both as an owner (to re-add a copy it dropped) and as a returning copy (to mark a
-landing it refused, see below). With it on, a copy the owner dropped on one of the two clocks
+its own, as an owner, to re-add a copy it dropped. A returning copy follows the setting of the
+owner that re-adds it, not its own (see below). With it on, a copy the owner dropped on one of the two clocks
 above comes back by itself once its link is back:
 
 - **When.** The unreachable clock fired, or the paused clock fired after the owner saw the
@@ -1102,21 +1239,29 @@ above comes back by itself once its link is back:
   again once that clears. A copy that does not answer (`live_readd_unanswered`), answers with a
   fault, or is not taken (`live_readd_not_planned`) waits another 5 s. Each drop gets one
   re-add: if that re-add fails, the copy stays out until its node restarts.
+- **A standby that never becomes a full copy.** If the re-added standby is still not a full
+  copy 30 min after it was added back, or 3 attempts to make it one fail, the owner gives it
+  up. It logs `live_readd_shadow_unpromoted` (warn) once, naming the copy (`shadow`), how long
+  it waited (`held_ms`), the failed attempts (`blocks`), how far it got (`acked`) and why
+  (`reason`: `clock` or `blocks`). The copy stays out until its node restarts.
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
-  older build. The re-add itself needs a partition that takes writes. But if the partition goes
-  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
-  and the partition can then stay read-only until that copy's node restarts. A build older than
-  check B can also be left holding a lineage with a hole in it, which nothing refuses
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (10 at this commit;
+  set at merge), whether or not this setting is on. An older build speaks 9, even one that has
+  this setting, and the two refuse each other when they connect, each logging
+  `net_handshake_refused` with both versions. So an older node is never added back live, and it cannot link at all. The
+  same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
+  10. To upgrade to 10: stop every node and every app process that links to them, upgrade
+  them all, start the nodes, then the apps. A rolling upgrade, with some processes at 9 and
+  some at 10, does not link.
+- **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
+  whose node has the setting off is still protected when an owner with it on adds it back. A
+  copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
+  the same on every node anyway, so a partition behaves the same whichever node owns it
   (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Older builds speak protocol 9 too, so a node cannot tell
-  them apart. Turning it on by default first needs the protocol version raised to 10, or a
-  capability bit that gates the re-add, so a node without these guards is refused or never
-  re-added live (ADR-rdb-0009 section 7). Until then it stays off by default.
+- **Default off.** The wire guard is now in place. The setting still stays off by default
+  until the 512-partition acceptance run passes.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1387,7 +1532,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is version 9, and the handshake refuses any other version.
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (10 at this commit; set
+  at merge; issues #107 and #87), and the handshake
+  refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
@@ -1614,3 +1761,149 @@ docker run --rm rdb-bf-node:dev help
   IP.
 - The build needs `build-essential` and `libclang-dev` in the builder stage and sets no
   `LIBCLANG_PATH`. See `docker/README.md` for a worked run.
+
+## 9. Change feed (read every committed change, in order)
+
+`Db::changes` lets your app read one partition's committed transactions in order. It works from
+any host: a node in your process, or one over the links, from an app that holds no copy as well as
+from a node. **Over the links only an admin app may call it** (`rdb_node --admin-apps`,
+`NetConfig::admin_apps`; `lr` runs as `admin`) until tenants are bound to certificates (#151); see
+"Tenants" below. In the process that runs the nodes, any `Db` may. Every write of the call's
+tenant comes back; a key-prefix filter is not offered yet.
+
+Each write is physical: the stored key, with its group and object id parsed out, and the stored
+value bytes. `FeedWrite.value` is `Some(bytes)`, the stored after-image, when the write stored a
+value, and `None` when it deleted that stored key: remove that one key from your destination;
+there is nothing to decode. A physical delete removes one stored key, not necessarily the whole
+object, which may keep other keys. Decode a value with `rdb-value`: `envelope::open`, then
+`cbor::decode` the payload. A `Db::put` value comes back as `Value::Bytes`. A page names its records' format; a client that does
+not read that format is answered `INCOMPATIBLE_VERSION` (upgrade the client) rather than misreading
+it. From `rdb_dev`: `changes <partition> [--from G:S:HEX] [--at N] [--max K]` (over the links it
+runs as app `admin` by default).
+
+Two uses it is built for:
+
+- **Warm standby.** A process beside a secondary tails that node's copy (`Source::Node(n)`) and
+  lays the partition's files out from the journal as it goes, so a standby is ready without
+  asking the owner for anything.
+- **The compactor.** It reads the feed into packs and uploads each pack once it is durable (see
+  "Lasting effects" below).
+
+```rust
+use rdb_api::{FeedCursor, FeedPage, Source};
+
+let mut cursor = FeedCursor::START; // or the cursor you stored last time
+loop {
+    match db.changes(partition, cursor, 256, Source::Owner)? {
+        FeedPage::Records { records, next, more } => {
+            for record in &records {
+                apply_somewhere(record); // record.writes: group, object, key, value
+            }
+            store_with_your_effects(next); // the cursor, in the same write as the effect
+            cursor = next;
+            if !more {
+                std::thread::sleep(poll_interval); // nothing new yet
+            }
+        }
+        FeedPage::Behind { .. } => std::thread::sleep(poll_interval), // keep the cursor
+        FeedPage::Trimmed { .. } => ask_another_copy_or_rebuild(),
+        FeedPage::Rewound { to } => {
+            retract_everything_above(to.seq); // rDB lost those records
+            cursor = to;
+        }
+    }
+}
+```
+
+- **The cursor.** A `FeedCursor` is the last record you applied: the generation stamped in its
+  header, its `seq` and its digest. Store it with your effect, in one write, and pass it back
+  unchanged. `FeedCursor::START` reads from the first record.
+- **The answers.**
+  - `Records`: whole records after the cursor, and `next`. A page returns at most `max`
+    records (your argument, itself at most 256) and 4 MiB of them, but always at least one
+    when one is due. Apart from that, a call examines at most 1024 records, counting the
+    records it skips (other tenants' writes), and stops once the record bytes it has examined
+    reach 8 MiB. It checks that before each read, so its last read can pass 8 MiB by one
+    whole record. With `more` set, one of those caps stopped the page: call again at once
+    from `next`. `next` is after the last record returned or skipped; a record left out
+    because it would pass 4 MiB comes first on the next call. A page with no records can
+    still have `more` set and a `next` that moved past skipped records; it is not the end.
+    Only `more` unset means nothing more is held now.
+  - `Behind`: the copy you asked has not got that far yet, or not that generation. Keep the
+    cursor; wait, or ask another copy.
+  - `Trimmed`: the copy does not hold the record you need (`floor` is the lowest it serves).
+    Ask another copy, which may still hold it, or rebuild from your own source. No copy
+    trims its `History` on a schedule yet (#61), but this answer can come today: a copy
+    that does not hold your cursor's record, or the record a cut leaves you at, answers it,
+    and that does not fault the copy. Handle it. (A record missing between the lowest the copy
+    serves and what it may serve, met while paging, is damage instead: see below.)
+  - `Rewound`: **records above `to` are not on this copy's history**, usually because a
+    promote cut records you have already applied. It can also mean the copy cannot place your
+    cursor's generation on its chain; `to` is then `FeedCursor::START`, a longer replay than
+    needed, never a gap. That holds only while the copy still holds seq 1: when its `floor` is
+    above 1 it answers `Trimmed { floor }` instead, since a replay from the start would have a
+    gap. A cursor whose record the copy still holds, at the same stamp and
+    digest, is served instead, even after a later generation linked above it. Undo what you
+    applied above `to.seq`, then go on from `to`. A consumer that ignores this keeps data rDB
+    has lost.
+  - `CORRUPT_HISTORY` error: this copy holds your cursor's position with another digest
+    (the cursor may come from another partition, the copies may have diverged, or the record
+    may be damaged), or a stored key in any record the call scans does not parse (keys are
+    parsed before the tenant filter, so another tenant's record counts too); or the copy's
+    stored history is damaged (a record unreadable, misplaced, not matching its digest, or
+    missing below what it serves), and then that node stops serving and every call to it
+    hears the fault. The history at this copy is unreadable from this cursor: read from
+    another copy (the owner or another member), or rebuild from your own source, and report
+    it. Only a feed reply says that; a put, a get or a status read at that node hears the
+    owner-fault step (ask the write's status once another node takes over). The fault names
+    the record's seq, never its digests: those are only in that node's local log line
+    `feed_record_digest_mismatch`.
+- **Which copy.** `Source::Owner` reads the owner, up to what it has published. `Source::Node(n)`
+  reads node `n` alone, so the owner does no work. A regular secondary serves up to what it has
+  applied, which can be ahead of the owner's published position.
+- **The secondary's bound (R2).** A secondary serves only while its own read of
+  `partitions/{p}` in rEtcd began within the grant (`grant_millis`, 6 s by default), names the
+  generation it holds and pins it as a regular copy. Cut off from rEtcd, it stops within about
+  one grant, even while its old owner still talks to it. A call that finds no read within the
+  grant starts one and waits for it, up to half a second, so a consumer that polls less often
+  than once a grant is still served; only if rEtcd does not answer in that time is it refused
+  `UNAVAILABLE`: call again. A shadow, or a copy still landing a new generation, answers
+  `UNAVAILABLE` too: call again.
+- **A copy that holds no current copy says so, for good.** A node that `partitions/{p}` leaves
+  out (dropped while it was cut off from the owner, say) or that never held the partition
+  answers `UNAVAILABLE` with rule `Definitive`, naming the generation that left it out and the
+  owner: "read from the owner or another member". Switch source; calling that node again
+  answers the same until it is a member again. An owner whose grant does not admit refuses
+  as a write's admission would, usually `LEASE_EXPIRED`, with no hint naming the new owner.
+  Right after a promote the new owner answers `LEASE_EXPIRED` until it holds its grant: call
+  again. An old owner the promote left out keeps answering so: on that answer, `Source::Owner`
+  re-reads who owns the partition for the next call only, so call again and that call reaches
+  the new owner; with `Source::Node` of the old owner, switch to `Source::Owner` or another
+  copy.
+- **Lasting effects wait for durability.** A record from a secondary, or a just-published one,
+  may still be cut by a promote, and you then get `Rewound`. A consumer whose effect cannot be
+  undone, such as a compactor that uploads packs to S3, calls `Db::wait_durable` on a pack's last
+  record before uploading it.
+- **One feed per partition.** A feed is one partition's order. Reading several partitions means
+  one cursor each, and there is no order between them.
+- **Tenants (Q3).** The feed returns only the writes of the call's tenant, the tenant of its
+  identity, as every other call uses. A record with none of them is skipped, and `next` still
+  moves past it. **Over the wire a tenant is asserted by the caller, not proved** (#151 tracks
+  binding it to a certificate). So, by the owner's ruling of 2026-11-20, a node fails closed:
+  it serves the feed over the links only to another node or an admin app, which may read every
+  tenant. Any other app is refused `INVALID_ARGUMENT` (no mutation) with "the change feed needs
+  the admin certificate until tenants are bound to certificates (#151)", whatever tenant it
+  names. This also keeps a plain app from mapping other tenants' write positions and digests
+  through `next` and cursors. Do not give an app the admin certificate unless it may read every
+  tenant.
+- **A fault shows seq positions to any app.** A failed History read, an undecodable stored
+  record, a record stored under another seq than its own, a stored record that does not match
+  its digest, or a record missing between the retained floor and what the copy may serve faults
+  the node. A malformed User key is different: it is refused to that caller only and faults
+  nothing. The fault names the offending sequence positions, never a digest or a value. The
+  fault is the node's, not one partition's: its status carries the same text whichever
+  partition is asked about. Any authenticated app may read status over the links, by
+  `WireMsg::Inspect`. `Db::node_status()` and `Db::node_status_in(partition)` ask only the nodes
+  this process runs, so in an app-only process they return no nodes. So an app can learn sequence positions in other
+  tenants' history, but no content. That holds until #154 scopes apps to their certificates (owner
+  ruling R-Q3 on #87: the caller's tenant, with this warning).

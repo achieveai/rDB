@@ -293,6 +293,68 @@ pub fn clear_verdict<E>(
     Ok(ClearVerdict::Clear)
 }
 
+/// Why [`clear_frozen_verdict`] keeps a frozen `grants/{node}` record, in the order the guards
+/// are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenClearRefusal {
+    /// The record is not frozen: [`clear_verdict`]'s case, not this one.
+    NotFrozen,
+    /// The record's boot is not older than the node's live boot, or no live boot is known: a
+    /// same-boot frozen grant still belongs to that process's takeover.
+    BootNotOlder,
+    /// This partition names the node as owner, in any lifecycle (`Fencing` too): a takeover of
+    /// it may still need the freeze.
+    OwnsPartition(crate::contracts::ids::PartitionId),
+    /// Control time is not proven past the frozen record's `E + epsilon + delta`.
+    NotProvenExpired,
+}
+
+/// May the failover planner delete a **frozen** `grants/{node}` record (#81 X2, owner answer
+/// (a) on #81, 2026-11-19)? A frozen record of a boot that is gone blocks the node's new boot
+/// for good: the planner excludes a frozen node from `choose_target`, and a promote onto it is
+/// refused `TargetFrozen`. It may go, by an exact-revision delete, only when **all** hold:
+///
+/// 1. the record is frozen;
+/// 2. its boot is older than `live_boot`, the node's boot as the planner's links know it: the
+///    old process is gone (the folder `LOCK` and a newer boot);
+/// 3. no `partitions/{id}` names the node as owner, in any lifecycle: a takeover needs a
+///    `Fencing` record naming it, so none is in flight;
+/// 4. control time is past `E + epsilon + delta` of the frozen record
+///    ([`crate::authority::clock::expiry_proven`]).
+///
+/// A freeze after the delete recreates the key frozen, so a later takeover still fences.
+///
+/// # Errors
+///
+/// The first guard that keeps the record.
+pub fn clear_frozen_verdict(
+    node: NodeId,
+    record: &GrantRecord,
+    live_boot: Option<BootId>,
+    partitions: &[crate::authority::partition::PartitionRecord],
+    sample: crate::contracts::time::ControlTime,
+    now: crate::contracts::time::Tick,
+    budgets: &crate::contracts::event::Budgets,
+) -> Result<(), FrozenClearRefusal> {
+    use crate::authority::clock::{expiry_proven, ClockView};
+
+    if !record.frozen {
+        return Err(FrozenClearRefusal::NotFrozen);
+    }
+    if !live_boot.is_some_and(|live| record.boot < live) {
+        return Err(FrozenClearRefusal::BootNotOlder);
+    }
+    if let Some(owned) = partitions.iter().find(|partition| partition.owner == node) {
+        return Err(FrozenClearRefusal::OwnsPartition(owned.partition));
+    }
+    let mut clock = ClockView::new();
+    clock.accept(sample);
+    if expiry_proven(&clock, record.expiry_utc_ms, now, budgets).is_none() {
+        return Err(FrozenClearRefusal::NotProvenExpired);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clear_verdict, ClearVerdict, GrantRecord};
@@ -346,5 +408,106 @@ mod tests {
     fn clearing_the_current_boots_grant_is_refused() {
         assert_eq!(verdict(BOOT), ClearVerdict::Current);
         assert_eq!(verdict(BootId(2)), ClearVerdict::Clear);
+    }
+
+    /// #81 X2: a frozen record of boot 1, the node live at boot 2, owning nothing, expiry long
+    /// past: every guard of `clear_frozen_verdict` lets it go. Each case changes one input.
+    fn frozen_verdict(
+        record: GrantRecord,
+        live: Option<BootId>,
+        partitions: &[PartitionRecord],
+        now: Tick,
+    ) -> Result<(), super::FrozenClearRefusal> {
+        let sample = ControlTime {
+            estimate: now,
+            error_millis: Budgets::SPEC_DEFAULTS.clock_error_millis,
+            bound_established: true,
+            sampled_at: now,
+        };
+        super::clear_frozen_verdict(
+            NODE,
+            &record,
+            live,
+            partitions,
+            sample,
+            now,
+            &Budgets::SPEC_DEFAULTS,
+        )
+    }
+
+    fn frozen_record() -> GrantRecord {
+        GrantRecord {
+            frozen: true,
+            ..expired_record()
+        }
+    }
+
+    const LATER: Tick = Tick(1_000_000_000);
+
+    /// All four guards hold: the stale frozen record may go. Unit.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_of_a_gone_boot_owning_nothing_clears() {
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &[], LATER),
+            Ok(())
+        );
+    }
+
+    /// Guard 3: a `Fencing` partition naming the node keeps its frozen record: that takeover
+    /// still needs the freeze. Unit.
+    /// Cut: drop the ownership guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_a_fencing_partition_naming_the_node_keeps_its_frozen_grant() {
+        use crate::authority::partition::PartitionLifecycle;
+        use crate::contracts::ids::PartitionId;
+        let fencing = PartitionRecord {
+            partition: PartitionId(3),
+            owner: NODE,
+            lifecycle: PartitionLifecycle::Fencing,
+            ..PartitionRecord::default()
+        };
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &[fencing], LATER),
+            Err(super::FrozenClearRefusal::OwnsPartition(PartitionId(3)))
+        );
+    }
+
+    /// Guard 2: a frozen record of the live boot (a same-boot return, Q7), or with no live boot
+    /// known, stays. Unit.
+    /// Cut: drop the boot guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_of_the_live_boot_stays() {
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BOOT), &[], LATER),
+            Err(super::FrozenClearRefusal::BootNotOlder)
+        );
+        assert_eq!(
+            frozen_verdict(frozen_record(), None, &[], LATER),
+            Err(super::FrozenClearRefusal::BootNotOlder)
+        );
+    }
+
+    /// Guard 1: an unfrozen record is `clear_verdict`'s, never this one's. Unit.
+    /// Cut: drop the frozen guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_an_unfrozen_grant_is_not_cleared_as_frozen() {
+        assert_eq!(
+            frozen_verdict(expired_record(), Some(BootId(2)), &[], LATER),
+            Err(super::FrozenClearRefusal::NotFrozen)
+        );
+    }
+
+    /// Guard 4: control time not proven past `E + epsilon + delta` keeps it. Unit.
+    /// Cut: drop the expiry guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_not_proven_expired_stays() {
+        let record = GrantRecord {
+            expiry_utc_ms: 1_000_000_000,
+            ..frozen_record()
+        };
+        assert_eq!(
+            frozen_verdict(record, Some(BootId(2)), &[], LATER),
+            Err(super::FrozenClearRefusal::NotProvenExpired)
+        );
     }
 }

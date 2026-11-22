@@ -4,21 +4,22 @@
 //!
 //! A process is stopped, as `kill -STOP` stops one, with the fault file's `mute` and
 //! `cut-control` together: its links read nothing and write nothing, probes included, and its
-//! grant stops renewing. Dropping an in-process `Net` is not a stop: the listener's
-//! per-connection tasks are not its own and keep echoing probes.
+//! grant stops renewing. A stop is a pause, as `resume` shows. An exit is `Net::shutdown` (or
+//! dropping the last `Arc<Net>`): it ends every link, accepted ones too, and stops listening
+//! (`own81_net_shutdown_leaves_no_link_answering`); [`Rig::restart`] uses it.
 
 use super::reopen_tests::{config, fast, open_app, runtime};
 use super::*;
 use crate::net::faults::{CutStore, Faults};
 use crate::net::{certs, wire::Label, Net, NetConfig, PROTOCOL_VERSION};
 use crate::planner::Failover;
-use crate::test_store::{CutCalls, HoldAt, PrefixCut, PutHold};
+use crate::test_store::{ClockOnPut, CutCalls, HoldAt, PrefixCut, PutHold};
 use rdb_core::authority::partition::PartitionLifecycle;
 
 /// One node process.
 struct Proc {
     db: Db,
-    _net: Arc<Net>,
+    net: Arc<Net>,
     faults: Arc<Faults>,
     boot: BootId,
 }
@@ -28,6 +29,8 @@ struct Rig {
     store: Arc<dyn ConfigStore>,
     _dirs: Vec<Box<dyn std::any::Any>>,
     cert_dir: std::path::PathBuf,
+    /// The database folder every process opens (`nodes/{n}` each), for [`Rig::restart`].
+    dir: std::path::PathBuf,
     addrs: BTreeMap<NodeId, String>,
     procs: Vec<Proc>,
     partitions: u32,
@@ -111,6 +114,16 @@ fn opened(partitions: u32, failovers: [Option<Failover>; 3]) -> Rig {
 /// setup takes, until the row lifts it; every other call passes, so it opens (PR #119 review).
 /// Ordinary callers pass `None` and start without faults.
 fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<NodeId>) -> Rig {
+    opened_timed(partitions, failovers, cut, Timeouts::default())
+}
+
+/// [`opened_cut`], with every process opened with `timeouts`.
+fn opened_timed(
+    partitions: u32,
+    failovers: [Option<Failover>; 3],
+    cut: Option<NodeId>,
+    timeouts: Timeouts,
+) -> Rig {
     let mut grant_cuts = BTreeMap::new();
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
@@ -140,56 +153,30 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
             .zip(failovers)
             .map(|((node, listener), failover)| {
                 let node = *node;
-                let boot = next_boot(dir.path()).expect("a boot");
-                let label = Label::Node(node);
-                let links = Links::new();
-                let faults = Faults::new();
-                let net = Net::start(
-                    NetConfig {
-                        tls: certs::load(cert_dir.path(), &label).expect("node certs"),
-                        label,
-                        boot,
-                        peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
-                        dial: NetConfig::dial_lower(node, &addrs),
-                        protocol_version: PROTOCOL_VERSION,
-                        admin_apps: BTreeSet::new(),
-                        faults: Arc::clone(&faults),
+                let grant_cuts = &mut grant_cuts;
+                start_proc(
+                    &rt,
+                    dir.path(),
+                    cert_dir.path(),
+                    &addrs,
+                    &store,
+                    node,
+                    listener,
+                    failover,
+                    timeouts,
+                    |control| {
+                        if cut != Some(node) {
+                            return control;
+                        }
+                        let grant_cut = PrefixCut::new(
+                            control,
+                            &ControlKey::Grant(node).encode(),
+                            CutCalls::Writes,
+                        );
+                        grant_cuts.insert(node, Arc::clone(&grant_cut));
+                        grant_cut
                     },
-                    &links,
-                    Some(listener),
                 )
-                .expect("the node's net starts");
-                let mut control: Arc<dyn ConfigStore> =
-                    CutStore::new(Arc::clone(&store), Arc::clone(&faults));
-                if cut == Some(node) {
-                    let grant_cut = PrefixCut::new(
-                        control,
-                        &ControlKey::Grant(node).encode(),
-                        CutCalls::Writes,
-                    );
-                    grant_cuts.insert(node, Arc::clone(&grant_cut));
-                    control = grant_cut;
-                }
-                let db = rt
-                    .block_on(Db::open_with(
-                        DbConfig {
-                            local: vec![node],
-                            links: Some(links),
-                            boot: Some(boot),
-                            failover,
-                            ..config(dir.path())
-                        },
-                        control,
-                        rt.handle().clone(),
-                        budgets(),
-                    ))
-                    .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
-                Proc {
-                    db,
-                    _net: net,
-                    faults,
-                    boot,
-                }
             })
             .collect()
     };
@@ -197,6 +184,7 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         rt,
         store,
         cert_dir: cert_dir.path().to_path_buf(),
+        dir: dir.path().to_path_buf(),
         _dirs: vec![Box::new(dir), Box::new(cert_dir)],
         addrs,
         procs,
@@ -204,6 +192,124 @@ fn opened_cut(partitions: u32, failovers: [Option<Failover>; 3], cut: Option<Nod
         grant_cuts,
     };
     rig
+}
+
+/// Start node `node`'s process on `listener`, at the next boot of `dir`: its `Net` and its
+/// `Db`, the `Db` reaching `store` through a [`CutStore`] on the process's own faults, and
+/// `wrap` around that (a row's extra cut).
+#[allow(clippy::too_many_arguments)]
+fn start_proc(
+    rt: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+    cert_dir: &std::path::Path,
+    addrs: &BTreeMap<NodeId, String>,
+    store: &Arc<dyn ConfigStore>,
+    node: NodeId,
+    listener: tokio::net::TcpListener,
+    failover: Option<Failover>,
+    timeouts: Timeouts,
+    wrap: impl FnOnce(Arc<dyn ConfigStore>) -> Arc<dyn ConfigStore>,
+) -> Proc {
+    let _entered = rt.enter();
+    let boot = next_boot(dir).expect("a boot");
+    let label = Label::Node(node);
+    let links = Links::new();
+    let faults = Faults::new();
+    let net = Net::start(
+        NetConfig {
+            tls: certs::load(cert_dir, &label).expect("node certs"),
+            label,
+            boot,
+            peers: ALL_NODES.iter().copied().filter(|n| *n != node).collect(),
+            dial: NetConfig::dial_lower(node, addrs),
+            protocol_version: PROTOCOL_VERSION,
+            admin_apps: BTreeSet::new(),
+            faults: Arc::clone(&faults),
+        },
+        &links,
+        Some(listener),
+    )
+    .expect("the node's net starts");
+    let control = wrap(CutStore::new(Arc::clone(store), Arc::clone(&faults)));
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                local: vec![node],
+                links: Some(links),
+                boot: Some(boot),
+                failover,
+                timeouts,
+                ..config(dir)
+            },
+            control,
+            rt.handle().clone(),
+            budgets(),
+        ))
+        .unwrap_or_else(|e| panic!("node {}'s process opens: {e}", node.0));
+    Proc {
+        db,
+        net,
+        faults,
+        boot,
+    }
+}
+
+impl Rig {
+    /// Stop process `i` for good, as a crash and a supervisor's start would, and start node
+    /// `i + 1` again on its folder and address at a new boot, running `failover`.
+    fn restart(&mut self, i: usize, failover: Option<Failover>) {
+        let node = ALL_NODES[i];
+        // `Db::shutdown` leaves the links up; `Net::shutdown` ends them, as the process's exit
+        // would, so the peers meet the new boot when it dials or is dialled.
+        self.procs[i].db.shutdown();
+        self.procs[i].net.shutdown();
+        drop(self.procs.remove(i));
+        let listener = self.rt.block_on(async {
+            let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+            loop {
+                match tokio::net::TcpListener::bind(&self.addrs[&node]).await {
+                    Ok(listener) => break listener,
+                    Err(e) if Instant::now() < deadline => {
+                        tracing::debug!(error = %e, "own81_restart_bind_retry");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(e) => panic!("node {}'s address again: {e}", node.0),
+                }
+            }
+        });
+        let proc = start_proc(
+            &self.rt,
+            &self.dir,
+            &self.cert_dir,
+            &self.addrs,
+            &self.store,
+            node,
+            listener,
+            failover,
+            Timeouts::default(),
+            |control| control,
+        );
+        self.procs.insert(i, proc);
+        self.procs[i]
+            .db
+            .wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the restarted process is ready");
+    }
+
+    /// The members `partitions/{partition}` pins.
+    fn members(&self, partition: u32) -> Vec<rdb_core::authority::partition::RecordMember> {
+        let key = ControlKey::Partition(PartitionId(partition)).encode();
+        self.rt
+            .block_on(self.store.get(config_core::GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("the store answers")
+            .record
+            .and_then(|found| {
+                rdb_core::authority::partition::RecordMember::decode_all(&found.value)
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Rig {
@@ -392,10 +498,58 @@ fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The promotes the planner committed, each logged once: `planner_promoted` when its grant
+/// was still held as the promote returned, `planner_promote_observed` when it lapsed during
+/// the promote. Under load the grant can lapse mid-promote, so a row that counts commits
+/// counts both (PR #171 review: `own81_sweep_restarts_after_freeze` logged the observed line
+/// once at load 31, and failed asserting the held one).
+fn promotes(method: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "planner_promoted" || line["@m"] == "planner_promote_observed")
+        .collect()
+}
+
+/// [`promotes`], polled until it holds at least `n` lines or 10 s (scaled) pass.
+fn promotes_at_least(method: &str, n: usize) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let lines = promotes(method);
+        if lines.len() >= n || Instant::now() >= deadline {
+            return lines;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// B1's allowance for one wave of promotes (`max_concurrent` at once): two looks, the
+/// `Fencing` write, the target's landing and the `Serving` commit, stretched by
+/// `RETCD_TEST_DEADLINE_SCALE` as a wait. Measured on this rig: see [`b1_bound`].
+const T_PROMOTE: Duration = Duration::from_secs(2);
+
+/// B1's stated upper bound on the time from a stop to the last of `moving` partitions moved,
+/// under the rig's [`budgets`] and `failover`:
+/// `max(G + eps + delta, silent_after) + 2 * poll + look_within + T_promote * ceil(moving / max_concurrent)`.
+/// The stopped owner's grant and the planner grant (when the stopped node held it) both run out
+/// by `G + eps + delta` after the stop, since both were renewed before it; the judge also wants
+/// `silent_after` of link silence. One poll for a running planner to take `planner/grant`, one
+/// for its next sweep; the sweep's look at the dead owner waits `look_within`, the read
+/// timeout; then the promotes run `max_concurrent` at a time.
+fn b1_bound(moving: usize, failover: &Failover) -> Duration {
+    let b = budgets();
+    let expired =
+        Duration::from_millis(b.grant_millis + b.clock_error_millis + b.dispatch_margin_millis)
+            .max(failover.silent_after);
+    let waves = u32::try_from(moving.div_ceil(failover.max_concurrent)).expect("few waves");
+    let look_within = Timeouts::default().read;
+    expired + failover.poll * 2 + look_within + crate::host::test_patience(T_PROMOTE) * waves
+}
+
 /// V7 and B1: stop node 1's process for longer than G. Every partition it owned moves to a
-/// node that runs, nothing else moves, and a put lands on each moved partition through an
-/// app linked to the two that run. Returns the time from the stop to the last move.
-fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duration {
+/// node that runs, within [`b1_bound`], nothing else moves, and a put lands on each moved
+/// partition through an app linked to the two that run. Prints and logs the time from the stop
+/// to the last move.
+fn stopped_owner_every_partition_moves(method: &str, partitions: u32) {
     let rig = rig(partitions, Some(failover()));
     let dead = NodeId(1);
     let moving = rig.owned_by(dead);
@@ -412,14 +566,33 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
     // own grant, so this is 0 in a passing run. Counted anyway so that only alerts after the
     // stop count against the running nodes.
     let setup_alerts = logged(method, "planner_owner_alive_not_serving").len();
+    let bound = b1_bound(moving.len(), &failover());
     let stopped = Instant::now();
     rig.stop(0);
+    // The wait outlasts the bound, so a slow move fails on the bound, with its time.
     until(
         "every partition of node 1 moves",
-        Duration::from_secs(60),
+        Duration::from_secs(60).max(bound),
         || moving.iter().all(|p| rig.owner(*p) != dead),
     );
     let took = stopped.elapsed();
+    println!(
+        "own81_b1 partitions={partitions} moved={} time_to_new_primary_ms={} bound_ms={}",
+        moving.len(),
+        took.as_millis(),
+        bound.as_millis()
+    );
+    let floor =
+        budgets().grant_millis + budgets().clock_error_millis + budgets().dispatch_margin_millis;
+    assert!(
+        took >= Duration::from_millis(floor),
+        "moved {took:?} after the stop, before the grant could have run out ({floor} ms)"
+    );
+    assert!(
+        took <= bound,
+        "{} partitions moved {took:?} after the stop, past B1's bound {bound:?}",
+        moving.len()
+    );
 
     for p in &moving {
         let record = rig.record(*p);
@@ -445,8 +618,8 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
         setup_alerts,
         "the running nodes stayed healthy: {alerts:?}"
     );
-    // The record moves at the commit; `planner_promoted` follows when the promote returns.
-    let promoted = logged_at_least(method, "planner_promoted", moving.len());
+    // The record moves at the commit; the promote's line ([`promotes`]) follows when it returns.
+    let promoted = promotes_at_least(method, moving.len());
     let mut moved: Vec<u64> = promoted
         .iter()
         .filter_map(|line| line["partition"].as_u64())
@@ -456,7 +629,7 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
     assert_eq!(
         moved,
         moving.iter().map(|p| u64::from(*p)).collect::<Vec<_>>(),
-        "one planner_promoted per moved partition: {promoted:?}"
+        "one promote line per moved partition: {promoted:?}"
     );
     let (app, _net, _links) = rig.app(&[NodeId(2), NodeId(3)]);
     for p in &moving {
@@ -466,29 +639,29 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) -> Duratio
         partitions,
         moved = moving.len(),
         took_ms = took.as_millis(),
+        bound_ms = bound.as_millis(),
         "own81_b1_time_to_new_primary"
     );
-    took
 }
 
 /// V7 and B1 at a small count: 6 partitions, node 1 owns 2. Integration (~10 s): waits out a
-/// 3 s grant, its margins, a look and the promotes. The same row at 512 is the lead's to
-/// schedule on a quiet host: `stopped_owner_every_partition_moves(METHOD, 512)`.
+/// 3 s grant, its margins, a look and the promotes, then asserts B1's bound ([`b1_bound`]).
 /// Cut: `judge` answers `Alive` for an expired grant; nothing moves, red at the first wait.
 #[config_log::retcd_test]
 fn own81_v7_b1_a_stopped_owner_has_every_partition_moved() {
     const METHOD: &str = "own81_v7_b1_a_stopped_owner_has_every_partition_moved";
-    let took = stopped_owner_every_partition_moves(METHOD, 6);
-    println!(
-        "own81_b1 partitions=6 time_to_new_primary_ms={}",
-        took.as_millis()
-    );
-    let bound =
-        budgets().grant_millis + budgets().clock_error_millis + budgets().dispatch_margin_millis;
-    assert!(
-        took >= Duration::from_millis(bound),
-        "moved {took:?} after the stop, before the grant could have run out ({bound} ms)"
-    );
+    stopped_owner_every_partition_moves(METHOD, 6);
+}
+
+/// B1 at 512 partitions (acceptance: "within a stated bound"), node 1 owns about a third. The
+/// same helper and bound as the 6-partition row; the measured time is printed and logged
+/// (`own81_b1_time_to_new_primary`). Run alone, by hand, on a quiet host:
+/// `cargo test -p rdb-api --lib -- --ignored --nocapture own81_b1_512`.
+#[config_log::retcd_test]
+#[ignore = "perf: 512 partitions, run alone by hand"]
+fn own81_b1_512_partitions_a_stopped_owner_has_every_partition_moved() {
+    const METHOD: &str = "own81_b1_512_partitions_a_stopped_owner_has_every_partition_moved";
+    stopped_owner_every_partition_moves(METHOD, 512);
 }
 
 /// S1 and C4: after the failover, node 1's process resumes. A put sent to it answers
@@ -583,7 +756,7 @@ fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
     let first = rig.record(1);
     let new_owner = first.owner;
     assert!(matches!(new_owner, NodeId(2 | 3)), "{first:?}");
-    let promoted = logged_at_least(METHOD, "planner_promoted", 1);
+    let promoted = promotes_at_least(METHOD, 1);
     assert_eq!(promoted.len(), 1, "the first failover: {promoted:?}");
     // A node that owned nothing held no grant: the failover is complete once the new owner
     // holds one at its own boot.
@@ -630,7 +803,7 @@ fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
         second.is_empty(),
         "no decision against the new owner: {second:?}"
     );
-    let promoted = logged(METHOD, "planner_promoted");
+    let promoted = promotes(METHOD);
     assert_eq!(promoted.len(), 1, "no second promote: {promoted:?}");
 }
 
@@ -1017,11 +1190,25 @@ fn own81_d1_v9_off_by_default_then_a_planner_started_after_the_owner_died_fails_
 }
 
 /// R3 over real links: two planners that both believe they hold the grant sweep at once
-/// after node 1 stops. Each partition commits once: one sweep's promote lands, the other's
-/// reports it lost the race, and the generation rose by one.
+/// after node 1 stops. Each partition commits once and the generation rises by one. One
+/// sweep's promote lands. The other either reports it lost the race, or, when both promotes
+/// dropped the same node, answers Ok for that same commit (A-R448 case 3: "both answer Ok,
+/// each with the commit's generation and revision"). So the row counts the distinct
+/// generations of the Ok answers, not Ok answers (seen once under load in a full `--lib` run:
+/// two Ok answers, both at generation 3 and revision 51). Not the revision too: for one commit
+/// `control_revision` can be a later write at the same generation, so two answers to one
+/// commit may differ there. A second commit raises the generation again, so the distinct
+/// generations, the record's generation and the +1 below each catch it.
+/// Three guards stand between two sweeps and a second commit: the promote's `Fencing` CAS, F1's
+/// commit CAS on `partitions/` at the fence revision, and the node's lineage, which refuses a
+/// plan for a lineage it has moved past.
 /// Integration (~10 s): waits out the grant, then two sweeps.
-/// Cut: none in C1 code: the `Fencing` CAS in `promote_looked` decides it, and its own rows pin
-/// that. This row pins that the planner adds no second write around it.
+/// Cuts (PR #171 round 2): the `Fencing` CAS made unconditional: 3 of 3 green, one commit both
+/// sweeps answered Ok for. That CAS and F1's commit CAS both made unconditional: 6 of 9 red, every
+/// one at the record-equals-answers check (the late `Fencing` write put the record back to
+/// generation 2 while the answers named 3). So that check catches a double write. No cut short
+/// of the lineage refusal made a second commit. This row pins that the planner adds no second
+/// write around them.
 #[config_log::retcd_test]
 fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
     let rig = rig(3, None);
@@ -1041,6 +1228,8 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
             crate::planner::Memory::default(),
             crate::planner::Memory::default(),
         );
+        ma.believe_held(&planners[0]);
+        mb.believe_held(&planners[1]);
         let (a, b) = rig.rt.block_on(async {
             tokio::join!(planners[0].sweep(&mut ma), planners[1].sweep(&mut mb))
         });
@@ -1050,13 +1239,20 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
         assert!(Instant::now() < deadline, "no sweep acted");
         std::thread::sleep(Duration::from_millis(200));
     };
-    let committed: Vec<_> = answers
+    let commits: std::collections::BTreeSet<_> = answers
         .iter()
         .flatten()
-        .filter(|(partition, answer)| *partition == PartitionId(1) && answer.is_ok())
+        .filter(|(partition, _)| *partition == PartitionId(1))
+        .filter_map(|(_, answer)| answer.as_ref().ok())
+        .map(|promoted| promoted.generation)
         .collect();
-    assert_eq!(committed.len(), 1, "one commit: {answers:?}");
+    assert_eq!(commits.len(), 1, "one commit: {answers:?}");
     let after = rig.record(1);
+    let generation = commits.first().copied().expect("one commit");
+    assert_eq!(
+        after.generation, generation,
+        "the Ok answers name the commit: {after:?}"
+    );
     assert_ne!(after.owner, NodeId(1), "{after:?}");
     assert_eq!(
         after.generation.0,
@@ -1358,8 +1554,16 @@ fn own81_stopped_host_releases_its_planner_grant_and_another_fails_over() {
     until("node 1's partition moves", Duration::from_secs(60), || {
         rig.owner(1) != NodeId(1)
     });
-    let silent = logged_at_least(METHOD, "planner_node_silent", 1);
-    assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    // Node 1 is judged silent; under load another node can be judged silent first, for a
+    // look that stalled (node 3 at load 31, PR #171 review), so the row looks for node 1's line
+    // and not at the first one.
+    let silent = logged(METHOD, "planner_node_silent");
+    assert!(
+        silent
+            .iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "silent_and_expired"),
+        "{silent:?}"
+    );
     let released = logged(METHOD, "planner_grant_released_host_stopped");
     assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
 }
@@ -1529,6 +1733,7 @@ fn own81_promote_failure_warns_once() {
     let mut memory = crate::planner::Memory::default();
     let mut failed = 0;
     until("four promotes are tried", lifetimes(20), || {
+        memory.believe_held(&planner);
         let answers = rig.rt.block_on(planner.sweep(&mut memory));
         for (partition, answer) in &answers {
             assert_eq!(partition.0, p, "{answers:?}");
@@ -1550,6 +1755,7 @@ fn own81_promote_failure_warns_once() {
     assert_eq!(decisions.len(), 1, "the pair, once: {decisions:?}");
 
     cut.lift();
+    memory.believe_held(&planner);
     let answers = rig.rt.block_on(planner.sweep(&mut memory));
     assert!(
         answers
@@ -1557,7 +1763,11 @@ fn own81_promote_failure_warns_once() {
             .any(|(partition, answer)| partition.0 == p && answer.is_ok()),
         "{answers:?}"
     );
-    assert_eq!(said("planner_promoted").len(), 1);
+    let promoted: Vec<_> = promotes(METHOD)
+        .into_iter()
+        .filter(|line| line["partition"] == p)
+        .collect();
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
     let recovered: Vec<_> = logged(METHOD, "planner_warn_recovered")
         .into_iter()
         .filter(|line| line["warn"] == "planner_promote_failed")
@@ -1594,6 +1804,7 @@ fn sweep_until_acted(
 )> {
     let mut answers = Vec::new();
     until("a sweep acts", lifetimes(20), || {
+        memory.believe_held(planner);
         answers = rig.rt.block_on(planner.sweep(memory));
         !answers.is_empty()
     });
@@ -1637,6 +1848,7 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
         "a promote reaches the freeze",
         Duration::from_secs(60),
         || {
+            memory.believe_held(&interrupted);
             rig.rt.block_on(async {
                 tokio::select! {
                     answers = interrupted.sweep(&mut memory) => {
@@ -1708,11 +1920,12 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
         before.generation.0 + 1,
         "one new generation: {before:?} -> {after:?}"
     );
-    let promoted: Vec<_> = logged(method, "planner_promoted")
+    let promoted: Vec<_> = promotes(method)
         .into_iter()
         .filter(|line| line["partition"] == 1)
         .collect();
     assert_eq!(promoted.len(), 1, "{promoted:?}");
+    fresh.believe_held(&restarted);
     let again = rig.rt.block_on(restarted.sweep(&mut fresh));
     assert!(again.is_empty(), "moved once: {again:?}");
     assert_eq!(rig.record(1).generation, after.generation);
@@ -1778,6 +1991,411 @@ fn own81_sweep_restarts_after_freeze() {
     interrupted_sweep("own81_sweep_restarts_after_freeze", HoldAt::BeforeReply);
 }
 
+/// #107 across processes: three node processes, each with `Timeouts::live_readd` on. A copy's
+/// process is stopped (mute and cut-control, as `kill -STOP`) past `unreachable_drop_after`,
+/// so its owner drops it on the unreachable clock. Once it runs again (`kill -CONT`), the owner
+/// re-adds it at the boot it still runs: a commit pins it regular at that same boot, three
+/// regular copies, `Active`, and a write after that applies on it. No process restarted.
+/// Cut: `live_readd_duty` returns at once, red (never re-added).
+/// Integration (~20 s): the drop clock, the re-add's 5 s hold, the re-add and the promote.
+#[config_log::retcd_test]
+fn issue107_a_blipped_copy_process_rejoins_live_at_its_boot() {
+    const METHOD: &str = "issue107_a_blipped_copy_process_rejoins_live_at_its_boot";
+    let timeouts = Timeouts {
+        live_readd: true,
+        unreachable_drop_after: Duration::from_millis(
+            crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS,
+        ),
+        ..Timeouts::default()
+    };
+    let rig = opened_timed(1, [None, None, None], None, timeouts);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let owner = rig.owner(1);
+    let copy = ALL_NODES
+        .iter()
+        .copied()
+        .find(|node| *node != owner)
+        .expect("another node");
+    let at = |node: NodeId| usize::try_from(node.0 - 1).expect("a node index");
+    let boot = rig.procs[at(copy)].boot;
+    // The owner's pinned members: (node, role, boot).
+    let pinned = || {
+        rig.procs[at(owner)]
+            .db
+            .node_status_in(PartitionId(1))
+            .expect("partition 1")
+            .into_iter()
+            .find(|status| status.node == owner)
+            .map(|status| {
+                status
+                    .pinned
+                    .iter()
+                    .map(|member| (member.node, member.role, member.boot))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(pinned().len(), 3, "{:?}", pinned());
+
+    rig.stop(at(copy));
+    until(
+        "the owner committed without the stopped copy",
+        lifetimes(10),
+        || {
+            let members = pinned();
+            members.len() == 2 && members.iter().all(|(node, _, _)| *node != copy)
+        },
+    );
+    let dropped = logged(METHOD, "membership_drop_planned");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(
+        (
+            dropped[0]["node"].as_u64(),
+            dropped[0]["dropped"].as_u64(),
+            dropped[0]["clock"].as_str()
+        ),
+        (
+            Some(owner.0.into()),
+            Some(copy.0.into()),
+            Some("unreachable")
+        ),
+        "{dropped:?}"
+    );
+
+    rig.resume(at(copy));
+    until(
+        "the copy pinned regular again at its boot",
+        lifetimes(10),
+        || {
+            let members = pinned();
+            members.len() == 3
+                && members
+                    .iter()
+                    .all(|(_, role, _)| *role != rdb_core::contracts::ids::ReplicaRole::Shadow)
+                && members.iter().any(|(node, role, at_boot)| {
+                    *node == copy
+                        && *role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                        && *at_boot == boot
+                })
+        },
+    );
+    let readded = logged(METHOD, "live_readd_planned");
+    assert_eq!(readded.len(), 1, "{readded:?}");
+    assert_eq!(
+        (readded[0]["node"].as_u64(), readded[0]["readded"].as_u64()),
+        (Some(owner.0.into()), Some(copy.0.into())),
+        "{readded:?}"
+    );
+    let recovered = logged(METHOD, "recovered");
+    let last = recovered
+        .iter()
+        .rfind(|line| line["node"] == owner.0)
+        .expect("the owner logged its commits");
+    assert_eq!(last["mode"], "Active", "{last}");
+
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    let put = put_lands(&app, group_of(&app, 1), lifetimes(3));
+    until(
+        "the write applied on the re-added copy",
+        lifetimes(3),
+        || {
+            rig.procs[at(copy)]
+                .db
+                .node_status_in(PartitionId(1))
+                .expect("partition 1")
+                .into_iter()
+                .find(|status| status.node == copy)
+                .and_then(|status| status.holds)
+                .is_some_and(|holds| {
+                    holds.generation == put.generation && holds.applied >= put.seq.0
+                })
+        },
+    );
+    assert_eq!(
+        rig.procs[at(copy)].boot,
+        boot,
+        "the copy's process was never replaced"
+    );
+}
+
+/// #81 (lead, embedded restart): a process that ends its links goes silent to its peers. Node 1
+/// ends them by `Net::shutdown`, with no mute or cut fault set; node 1 is the one that accepts
+/// links (2 and 3 dial lower nodes), which a plain abort of `Net`'s own tasks left echoing
+/// probes. Then node 2's process is dropped whole, with no shutdown call: the last `Arc<Net>`
+/// goes, and `Drop` ends its links too. Each time, every peer drops its route and stops
+/// hearing the node. Integration (~10 s).
+/// Cut: `Net::shutdown` aborts only `Net`'s own tasks (no link tasks, no conns closed, plain
+/// `serve_with_incoming`); red at "nodes 2 and 3 stop hearing node 1".
+#[config_log::retcd_test]
+fn own81_net_shutdown_leaves_no_link_answering() {
+    let mut rig = rig(1, None);
+    let hears = |rig: &Rig, i: usize, node: NodeId| {
+        rig.procs[i].net.connection(node).is_some()
+            && rig.procs[i].net.heard_within(node, Duration::from_secs(1))
+    };
+    until("every node hears every other", lifetimes(5), || {
+        (0..3).all(|i| {
+            ALL_NODES
+                .iter()
+                .filter(|n| **n != ALL_NODES[i])
+                .all(|n| hears(&rig, i, *n))
+        })
+    });
+
+    rig.procs[0].db.shutdown();
+    rig.procs[0].net.shutdown();
+    until("nodes 2 and 3 stop hearing node 1", lifetimes(3), || {
+        (1..3).all(|i| rig.procs[i].net.connection(NodeId(1)).is_none())
+            && (1..3).all(|i| {
+                !rig.procs[i]
+                    .net
+                    .heard_within(NodeId(1), Duration::from_secs(1))
+            })
+    });
+
+    let proc = rig.procs.remove(1);
+    let net = Arc::downgrade(&proc.net);
+    drop(proc);
+    until("node 2's Net is gone", lifetimes(3), || {
+        net.upgrade().is_none()
+    });
+    // `procs` is now nodes 1 and 3.
+    until("node 3 stops hearing node 2", lifetimes(3), || {
+        rig.procs[1].net.connection(NodeId(2)).is_none()
+            && !rig.procs[1]
+                .net
+                .heard_within(NodeId(2), Duration::from_secs(1))
+    });
+}
+
+/// #81 X2 (owner answer (a), 2026-11-19): a second failover after the first owner returns.
+/// Node 1 stops and partition 1 moves to node 2 or 3, freezing `grants/1`. Node 1 restarts at a
+/// new boot (`Rig::restart`), as its supervisor does on exit 75. The new owner re-adds it as a
+/// regular copy, and the planner deletes the frozen `grants/1` of the gone boot
+/// (`planner_frozen_grant_cleared`). Then the new owner stops, and partition 1 moves again with
+/// no operator: two copies are eligible, node 1 among them, so no `lone_survivor` and no
+/// `TargetFrozen`. A node 1 chosen holds a grant of its own new boot.
+/// Integration (~40 s): two grant lapses, a restart and a re-add.
+/// Cut: `sweep` skips the `clear_frozen` pass; `grants/1` stays frozen, red at "the frozen
+/// grants/1 is cleared" (and, past that wait, the second failure ends `lone_survivor`).
+#[config_log::retcd_test]
+fn own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy() {
+    const METHOD: &str = "own81_x2_promoted_away_owner_returns_as_a_promotable_regular_copy";
+    let mut rig = rig(1, Some(failover()));
+    until("a planner holds its grant", lifetimes(7), || {
+        rig.planner_grant().is_some()
+    });
+    rig.stop(0);
+    until("partition 1 moves and serves", lifetimes(20), || {
+        let record = rig.record(1);
+        record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
+    });
+    let first = rig.record(1);
+    let new_owner = first.owner;
+    assert!(
+        rig.grants()[&NodeId(1)].frozen,
+        "the promote froze grants/1"
+    );
+    let old_boot = rig.procs[0].boot;
+
+    rig.restart(0, Some(failover()));
+    let boot = rig.procs[0].boot;
+    assert!(boot > old_boot, "a new boot: {old_boot:?} -> {boot:?}");
+    until("node 1 is a regular copy again", lifetimes(20), || {
+        rig.members(1).iter().any(|member| {
+            member.node == NodeId(1)
+                && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+        })
+    });
+    until("the frozen grants/1 is cleared", lifetimes(10), || {
+        rig.grants()
+            .get(&NodeId(1))
+            .is_none_or(|grant| !grant.frozen)
+    });
+    let cleared = logged_at_least(METHOD, "planner_frozen_grant_cleared", 1);
+    assert!(
+        cleared
+            .iter()
+            .any(|line| line["node"] == 1 && line["record_boot"] == old_boot.0),
+        "{cleared:?}"
+    );
+    rig.wait_for_owner_grants();
+
+    let refused_before = logged(METHOD, "planner_no_eligible_copy").len();
+    let failed_before = logged(METHOD, "planner_promote_failed").len();
+    rig.stop(new_owner.0 as usize - 1);
+    until("partition 1 moves again and serves", lifetimes(20), || {
+        let record = rig.record(1);
+        record.owner != new_owner && record.lifecycle == PartitionLifecycle::Serving
+    });
+    let second = rig.record(1);
+    assert!(
+        second.generation > first.generation,
+        "a second promotion: {first:?} -> {second:?}"
+    );
+    let refused = logged(METHOD, "planner_no_eligible_copy");
+    assert_eq!(
+        refused.len(),
+        refused_before,
+        "no lone_survivor after the return: {refused:?}"
+    );
+    let failed = logged(METHOD, "planner_promote_failed");
+    assert!(
+        failed[failed_before..]
+            .iter()
+            .all(|line| !line["error"].as_str().unwrap_or("").contains("frozen")),
+        "no TargetFrozen: {failed:?}"
+    );
+    let decided: Vec<_> = logged(METHOD, "planner_promote_decision")
+        .into_iter()
+        .filter(|line| line["dead"] == new_owner.0)
+        .collect();
+    assert!(
+        // `answering` is logged with `?`, as `[1, 3]`.
+        decided
+            .iter()
+            .any(|line| line["answering"].as_str().is_some_and(|nodes| nodes
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(", ")
+                .any(|node| node == "1"))),
+        "node 1 answered the look as a candidate: {decided:?}"
+    );
+    if second.owner == NodeId(1) {
+        until("node 1 holds a grant of its new boot", lifetimes(5), || {
+            rig.grants()
+                .get(&NodeId(1))
+                .is_some_and(|grant| grant.boot == boot && !grant.frozen)
+        });
+    }
+    println!("own81_x2 first={first:?} second={second:?}");
+}
+
+/// `G + eps + delta` on `budgets`, plus one: how far a held planner clock is moved past the
+/// moment node 1 stopped for node 1's grant expiry to be proven on it, whenever its last renewal
+/// was.
+fn past_node_grant(budgets: &Budgets) -> u64 {
+    budgets.grant_millis + budgets.clock_error_millis + budgets.dispatch_margin_millis + 1
+}
+
+/// The planner rows of node 2's process over `store`, on a capped `clock` (#81, the grant
+/// re-check). No planner runs in `rig`, so this one alone writes `planner/grant`.
+fn held_planner(
+    rig: &Rig,
+    store: Arc<dyn ConfigStore>,
+    clock: crate::clock::HostClock,
+) -> crate::planner::Planner {
+    crate::planner::Planner {
+        store,
+        clock,
+        ..rig.procs[1]
+            .db
+            .planner(failover())
+            .expect("a node process's planner")
+    }
+}
+
+/// #81, the planner grant re-check, case (a): the planner holds `planner/grant` on a held
+/// clock, node 1 stops, and the grant runs out before the sweep reaches the promote. The
+/// promote is skipped: no `Fencing` write (partition 1 keeps its owner, generation and
+/// lifecycle), `planner_promote_skipped_grant_expired` said exactly once, and the grant lost.
+/// Integration (~5 s): waits for node 1 to be judged silent.
+/// Cut: no re-check before the promote in `fail_over`; the promote lands, red.
+#[config_log::retcd_test]
+fn own81_a_grant_that_ran_out_before_the_promote_sends_no_fence() {
+    const METHOD: &str = "own81_a_grant_that_ran_out_before_the_promote_sends_no_fence";
+    let rig = rig(1, None);
+    let before = rig.record(1);
+    assert_eq!(before.owner, NodeId(1), "{before:?}");
+    let clock = crate::clock::HostClock::capped(1);
+    let planner = held_planner(&rig, Arc::clone(&rig.store), clock);
+    rig.stop(0);
+    let hold = clock.hold();
+    hold.advance(past_node_grant(&planner.budgets));
+    let mut memory = crate::planner::Memory::default();
+    assert!(
+        rig.rt.block_on(planner.hold(&mut memory)),
+        "the planner holds"
+    );
+    hold.advance(planner.budgets.grant_millis);
+    until("a promote is reached", lifetimes(20), || {
+        let answers = rig.rt.block_on(planner.sweep(&mut memory));
+        assert!(answers.is_empty(), "nothing is promoted: {answers:?}");
+        !logged(METHOD, "planner_promote_skipped_grant_expired").is_empty()
+    });
+    let skipped = logged(METHOD, "planner_promote_skipped_grant_expired");
+    assert_eq!(skipped.len(), 1, "said once: {skipped:?}");
+    assert_eq!(
+        (&skipped[0]["partition"], &skipped[0]["dead"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{skipped:?}"
+    );
+    let after = rig.record(1);
+    assert_eq!(
+        (after.owner, after.generation, after.lifecycle),
+        (before.owner, before.generation, before.lifecycle),
+        "no Fencing write: {before:?} -> {after:?}"
+    );
+    let lost: Vec<_> = logged(METHOD, "planner_grant_lost")
+        .into_iter()
+        .filter(|line| line["reason"] == "expired")
+        .collect();
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    let promoted = promotes(METHOD);
+    assert!(promoted.is_empty(), "{promoted:?}");
+}
+
+/// #81, the planner grant re-check, case (b): the planner holds `planner/grant` on a held
+/// clock, node 1 stops, and the grant runs out during the promote: the clock moves past it as
+/// the first `partitions/` write (the `Fencing` CAS) arrives. The promote still lands, and the
+/// answer is unchanged (`Ok`), but it is logged `planner_promote_observed`, never
+/// `planner_promoted`: the count of promotes made under a held grant stays honest.
+/// Integration (~5 s): waits for node 1 to be judged silent.
+/// Cut: no re-check after the promote answers; `planner_promoted` is said, red.
+#[config_log::retcd_test]
+fn own81_a_grant_that_runs_out_during_the_promote_is_logged_observed() {
+    const METHOD: &str = "own81_a_grant_that_runs_out_during_the_promote_is_logged_observed";
+    let rig = rig(1, None);
+    let before = rig.record(1);
+    let clock = crate::clock::HostClock::capped(1);
+    let grant_millis = budgets().grant_millis;
+    let store = ClockOnPut::new(
+        Arc::clone(&rig.store),
+        ControlPrefix::Partitions.encode(),
+        clock.hold(),
+        grant_millis,
+    );
+    let planner = held_planner(&rig, Arc::clone(&store) as Arc<dyn ConfigStore>, clock);
+    assert_eq!(planner.budgets.grant_millis, grant_millis);
+    rig.stop(0);
+    store.hold.advance(past_node_grant(&planner.budgets));
+    let mut memory = crate::planner::Memory::default();
+    assert!(
+        rig.rt.block_on(planner.hold(&mut memory)),
+        "the planner holds"
+    );
+    let mut answers = Vec::new();
+    until("a promote answers", lifetimes(20), || {
+        answers = rig.rt.block_on(planner.sweep(&mut memory));
+        !answers.is_empty()
+    });
+    assert!(
+        answers
+            .iter()
+            .all(|(partition, answer)| partition.0 == 1 && answer.is_ok()),
+        "the promote lands and its answer is kept: {answers:?}"
+    );
+    let after = rig.record(1);
+    assert_ne!(after.owner, NodeId(1), "{after:?}");
+    assert_eq!(after.generation.0, before.generation.0 + 1, "{after:?}");
+    let observed = logged(METHOD, "planner_promote_observed");
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    assert_eq!(observed[0]["partition"], 1, "{observed:?}");
+    assert_eq!(logged(METHOD, "test_clock_moved_on_put").len(), 1);
+    let promoted = logged(METHOD, "planner_promoted");
+    assert!(promoted.is_empty(), "not counted as held: {promoted:?}");
+}
+
 /// PR #156 review, #127 through the planner `Db` spawns: node 1's process opens with a
 /// planner over a control store whose `planner/grant` read panics. `Db::start_planner`'s task
 /// logs exactly one `planner_panicked`, an error naming node 1 and the panic's message, and
@@ -1815,4 +2433,67 @@ fn pr156_a_spawned_planner_logs_its_panic() {
         1,
         "the planner stopped at its panic"
     );
+}
+
+/// Round 3 (thread 4654331880, lead ask): a record whose digest no longer matches faults its
+/// owner. The stored and computed digests go to the owner's local `feed_record_digest_mismatch`
+/// line only, never into the shared fault. Three node processes: the owner's process damages
+/// the last byte of a landed put's `History` record and reads its own feed into it. Then an app
+/// `Db` in another process reads the owner's status over the links (`WireMsg::Inspect`,
+/// answered as `WireNodeStatus`). Its `fault` names the seq and holds neither digest.
+/// Cut: the digests back in the mismatch's fault detail, red (the stored digest is in the
+/// status the app read).
+/// Integration (~5 s): three processes and one fault.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links() {
+    const METHOD: &str = "f87_3_a_digest_mismatch_fault_names_no_digest_over_the_links";
+    let rig = rig(1, None);
+    rig.wait_ready();
+    rig.wait_for_owner_grants();
+    let owner = rig.owner(1);
+    let at = usize::try_from(owner.0 - 1).expect("a node index");
+    let (app, _net, _links) = rig.app(&ALL_NODES);
+    let put = put_lands(&app, group_of(&app, 1), lifetimes(3));
+    let local = &rig.procs[at].db;
+    local
+        .damage_record_as(
+            owner,
+            put.generation,
+            rdb_core::contracts::storage::Namespace::History,
+            &put.seq.0.to_be_bytes(),
+            rdb_storage::RecordDamage::LastByte,
+        )
+        .expect("damaged");
+    let read = local
+        .changes(PartitionId(1), FeedCursor::START, 10, Source::Owner)
+        .expect_err("the damaged record faults the owner");
+    assert_eq!(read.kind, ErrorKind::CorruptHistory, "{read:?}");
+
+    let lines = logged_at_least_within(METHOD, "feed_record_digest_mismatch", 1, lifetimes(1));
+    let digests: Vec<String> = ["stored", "computed"]
+        .iter()
+        .map(|field| {
+            let digest = lines[0][field].as_str().expect("a digest");
+            assert_eq!(digest.len(), 64, "{field}: {lines:?}");
+            digest[..8].to_owned()
+        })
+        .collect();
+    let mut fault = None;
+    until("the app read the owner's fault", lifetimes(3), || {
+        fault = app.inspect(owner).and_then(|status| status.fault);
+        fault.is_some()
+    });
+    let fault = fault.expect("a fault");
+    assert!(
+        fault.contains(&format!(
+            "the record at seq {} does not match its digest",
+            put.seq.0
+        )),
+        "{fault}"
+    );
+    for digest in &digests {
+        assert!(!fault.contains(digest.as_str()), "{digest} in {fault}");
+    }
+    assert!(!read.detail.contains(digests[0].as_str()), "{read:?}");
 }
