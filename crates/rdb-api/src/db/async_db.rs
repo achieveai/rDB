@@ -23,7 +23,7 @@
 //! send it again with [`AsyncDb::resend_within`].
 
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -62,6 +62,41 @@ const BRIDGE_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct AsyncDb {
     db: Arc<Db>,
+    /// The [`Self::ownership_events`] bridges that hold the `Db` while they register, shared by
+    /// every clone, so [`Self::shutdown`] waits for them and never takes one for a live clone.
+    registering: Arc<Registering>,
+}
+
+/// How many bridges are registering, and the signal each sends when it lets go of the `Db`.
+#[derive(Default)]
+struct Registering {
+    count: Mutex<usize>,
+    done: Condvar,
+}
+
+/// One bridge's share of [`Registering`]. It counts from before the bridge takes the `Db` to
+/// after it lets go, so the count covers every `Arc<Db>` a bridge holds.
+struct Registration(Arc<Registering>);
+
+impl Registration {
+    fn new(registering: Arc<Registering>) -> Self {
+        *count(&registering) += 1;
+        Self(registering)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        *count(&self.0) -= 1;
+        self.0.done.notify_all();
+    }
+}
+
+fn count(registering: &Registering) -> MutexGuard<'_, usize> {
+    registering
+        .count
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One put of [`AsyncDb::txn`]: [`TxnPut`] with owned bytes, since a blocking-pool call needs
@@ -131,8 +166,11 @@ pub(super) fn read_answer<T>(answer: Result<Result<T, ApiError>, String>) -> Res
 impl AsyncDb {
     /// Wrap `db`.
     #[must_use]
-    pub const fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Db>) -> Self {
+        Self {
+            db,
+            registering: Arc::default(),
+        }
     }
 
     /// The `Db`, for the calls that do not block: [`Db::ownership`] and [`Db::still_owner`]
@@ -307,12 +345,16 @@ impl AsyncDb {
     pub fn ownership_events(&self) -> tokio::sync::mpsc::Receiver<OwnershipEvent> {
         // PR #178 review r1 T7: registering takes the nodes lock, which a restart holds, so it
         // runs on the pool too, never on the calling worker. The bridge keeps the `Db` only
-        // while it registers, so a live receiver never makes `shutdown` answer `Err(self)`; a
-        // `Db` already gone ends the receiver at once.
+        // while it registers, and `shutdown` waits for that (review r2), so a receiver never
+        // makes it answer `Err(self)`; a `Db` already gone ends the receiver at once.
         let db = Arc::downgrade(&self.db);
+        let registering = Arc::clone(&self.registering);
         let (tx, rx) = tokio::sync::mpsc::channel(BRIDGE_CAPACITY);
         drop(tokio::task::spawn_blocking(move || {
-            let Some(events) = db.upgrade().map(|db| db.ownership_events()) else {
+            let registration = Registration::new(registering);
+            let events = db.upgrade().map(|db| db.ownership_events());
+            drop(registration);
+            let Some(events) = events else {
                 return;
             };
             loop {
@@ -336,14 +378,27 @@ impl AsyncDb {
     ///
     /// # Errors
     ///
-    /// `Err(self)`, with nothing done, while another `AsyncDb` clone or `Arc<Db>` is alive.
+    /// `Err(self)`, with nothing done, while another `AsyncDb` clone or `Arc<Db>` is alive. An
+    /// [`Self::ownership_events`] bridge still registering (it waits for the nodes lock while a
+    /// restart holds it) is not a clone: shutdown waits for it to let go (PR #178 review r2).
     ///
     /// # Panics
     ///
     /// When the runtime shuts down before the call ran: the `Db` is then dropped unshut, and
     /// there is no `Self` to hand back. As [`Self::wait_ready`].
     pub async fn shutdown(self) -> Result<(), Self> {
-        let mut db = Arc::try_unwrap(self.db).map_err(|db| Self { db })?;
+        let Self { db, registering } = self;
+        let mut db = match Arc::try_unwrap(db) {
+            Ok(db) => db,
+            Err(shared) => {
+                let waited = Arc::clone(&registering);
+                // The wait is for a lock a restart holds, so it runs on the pool, never here.
+                let unwrapped = blocking(move || unwrap_past_bridges(shared, &waited))
+                    .await
+                    .unwrap_or_else(|detail| panic!("shutdown: {detail}"));
+                unwrapped.map_err(|db| Self { db, registering })?
+            }
+        };
         blocking(move || {
             db.shutdown();
             drop(db);
@@ -351,6 +406,27 @@ impl AsyncDb {
         .await
         .unwrap_or_else(|detail| panic!("shutdown: {detail}"));
         Ok(())
+    }
+}
+
+/// `db` unwrapped once no registering bridge holds it, or `db` back while any other holder is
+/// alive. Each bridge drops its `Arc<Db>` before its count, so every holder beyond the bridges
+/// counted is a clone, and the wait ends when a bridge lets go.
+fn unwrap_past_bridges(mut db: Arc<Db>, registering: &Registering) -> Result<Db, Arc<Db>> {
+    loop {
+        let bridges = count(registering);
+        if Arc::strong_count(&db) - 1 > *bridges {
+            return Err(db);
+        }
+        if *bridges > 0 {
+            drop(registering.done.wait(bridges));
+        } else {
+            drop(bridges);
+        }
+        db = match Arc::try_unwrap(db) {
+            Ok(db) => return Ok(db),
+            Err(shared) => shared,
+        };
     }
 }
 
@@ -380,7 +456,11 @@ mod tests {
     /// PR #178 review r1 T7: on a current-thread runtime, subscribing while the nodes lock is
     /// held (as a restart holds it) returns at once; the registration waits on the pool. Cut:
     /// call `self.db.ownership_events()` before `spawn_blocking`, as before: red, the call
-    /// waits out the whole hold. Integration: one database open, which is most of its time.
+    /// waits out the whole hold. Its last line, `shutdown` right after the hold ends, races the
+    /// bridge still registering (red once at cf32654, "no other clone is alive"); review r2
+    /// makes `shutdown` wait for it. Cut: `shutdown` answers `Err(self)` at once again, and the
+    /// bridge holds the `Db` 300 ms past registering, to make the race certain: red. The fix
+    /// with that hold alone: green. Integration: one database open, most of its time.
     #[config_log::retcd_test]
     fn subscribing_while_a_restart_holds_the_nodes_lock_does_not_block_the_worker() {
         const HOLD: Duration = Duration::from_millis(1_500);
