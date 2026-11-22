@@ -32,10 +32,17 @@ Console logs are not useful for that; files queried with DuckDB are.
 - DuckDB is the query tool: `docs/logging.md` records recipes such as
   `SELECT * FROM read_json_auto('target/test-logs/**/*.jsonl') WHERE testMethod='…' ORDER BY "@t"`.
 - Log levels: `error` = invariant violation or fatal; `warn` = rejected/unsafe input, gossip
-  mismatch; `info` = lifecycle and each client-facing mutation outcome (logged once by the
-  engine per client request); `debug` = each RPC and each apply-time entry outcome in
-  `KvState::apply` (hot path: one line per replicated entry on every voter); `trace` = Raft
-  internals per entry.
+  mismatch; `info` = lifecycle and, in rEtcd's engine, each client-facing mutation outcome
+  (logged once by the engine per client request); `debug` = each RPC and each apply-time entry
+  outcome in `KvState::apply` (hot path: one line per replicated entry on every voter);
+  `trace` = Raft internals per entry.
+- rDB (the `rdb_*` crates, `rdb_node`, `rdb-server`) is stricter at `info`, because a node
+  serves hundreds of writes a second (#158, 2026-11): `info` = lifecycle, a change of state, and
+  faults, never one line per request. Each request's lines (`reply`, `client_call`,
+  `client_compile`, `net_client_request`, `batch_commit`, `rdb_server_write`, ...) are `debug`,
+  on targets of their own so a filter can turn them on alone. A refused request is counted:
+  `info` carries `refusal_first` for the first refusal of a `(reason, partition)` key and one
+  `refusal_summary` per 10 s window. `docs/logging.md` lists the targets.
 
 ## Verification
 

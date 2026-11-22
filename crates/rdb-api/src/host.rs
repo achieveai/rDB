@@ -2568,6 +2568,45 @@ pub(crate) fn clear_recovery_send_cap(node_dir: &std::path::Path) {
         .retain(|(dir, _)| dir != node_dir);
 }
 
+/// The target of the events a host logs once or more per write (#158): `reply`, `client_call`,
+/// `client_compile`, `txn_dispatch`, `step_view`, `authority_view` and `publication_fact`. In
+/// production they are debug (the change of state among them info), so `info` keeps them out;
+/// a target of their own lets a filter turn them on, in a test or a diagnosis, without every
+/// other debug line of `rdb_api`.
+pub const WRITE_LOG_TARGET: &str = "rdb_api::host::write";
+
+/// Test-only: node directories whose host, started afterwards, summarises refusals over the
+/// window given instead of [`refusals::WINDOW_MS`], so a row sees several windows close in
+/// well under a second (#158).
+#[cfg(test)]
+static REFUSAL_WINDOW: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+/// Arm [`REFUSAL_WINDOW`] for hosts under `dir`, as `DbConfig::dir` is spelled.
+#[cfg(test)]
+pub(crate) fn set_refusal_window(dir: &std::path::Path, window_ms: u64) {
+    REFUSAL_WINDOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((dir.to_path_buf(), window_ms));
+}
+
+/// The refusal summary window for the host whose store is at `path`.
+#[cfg(test)]
+fn refusal_window_for(path: &std::path::Path) -> u64 {
+    REFUSAL_WINDOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(dir, _)| path.starts_with(dir))
+        .map_or(refusals::WINDOW_MS, |(_, window)| *window)
+}
+
+/// The refusal summary window: always [`refusals::WINDOW_MS`] outside crate tests.
+#[cfg(not(test))]
+const fn refusal_window_for(_path: &std::path::Path) -> u64 {
+    refusals::WINDOW_MS
+}
+
 fn after_commit_for(path: &std::path::Path) -> Option<AfterCommit> {
     AFTER_COMMIT
         .lock()
@@ -3256,6 +3295,9 @@ struct Host {
     /// long, so a row can see a slow step logged (PR #60 review F8, F9).
     #[cfg(test)]
     step_pause: Duration,
+    /// #158: refused requests, counted per window, so info carries a first line per key and
+    /// one summary per window instead of one line per refusal.
+    refusals: refusals::RefusalLog,
 }
 
 impl Host {
@@ -3270,6 +3312,7 @@ impl Host {
         let engine_instance = engine.instance();
         let engine_sync_stuck = engine.storage_options().effective_sync_stuck_millis();
         let after_commit = after_commit_for(engine.path());
+        let refusal_window = refusal_window_for(engine.path());
         Self {
             node,
             boot: BOOT,
@@ -3405,6 +3448,7 @@ impl Host {
             deny_next_publication_check: false,
             #[cfg(test)]
             step_pause: Duration::ZERO,
+            refusals: refusals::RefusalLog::new(refusal_window),
         }
     }
 
@@ -3494,6 +3538,7 @@ impl Host {
             // #83: once per turn, after the views this turn published and before the wait, which
             // is armed for the next horizon (ruling B-1). A faulted node deactivates here too.
             self.ownership_duty();
+            self.refusal_summary_duty();
             let wait = self.wait();
             match rx.recv_timeout(wait) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => break,
@@ -3507,6 +3552,9 @@ impl Host {
     /// What a clean stop does after the run loop ends, in order: answers that need no disk
     /// first, then the work that waits on it.
     fn stop_tail(&mut self, rx: &Receiver<Msg>) {
+        // #158: the open window's refusals are summarised now, so a stop loses no count.
+        let closed = self.refusals.stop();
+        self.refusal_summaries(closed);
         // #83: a stopped node sends no more, so it ends what it held, then its subscribers end
         // everywhere and subscribe again: a restarted node would otherwise never be heard. Before
         // the syncer stops and the final marks (#123 review): both wait on the disk, and a stuck
@@ -3612,6 +3660,64 @@ impl Host {
         guard.reanchor_if_behind();
     }
 
+    /// #158: count a refused request: a failed reply, or a compile refused before anything was
+    /// sent. `refusal_first`, at info, is the first refusal of its `(reason, partition)` key, or
+    /// the first after a whole window in which that key was not refused. Every refusal is also
+    /// in a `refusal_summary` when its window closes, so an isolated refusal costs 2 info lines,
+    /// its first and a summary with count 1. That is intended: the summaries' counts add up to
+    /// the debug `reply` and refused `client_compile` lines.
+    ///
+    /// The request is logged as its `request_id_hash` (M7 field discipline), and the refusal as
+    /// its reason only: its detail can name a request or a key's text. The debug line of the
+    /// same refusal carries the detail.
+    fn note_refusal(
+        &mut self,
+        partition: PartitionId,
+        identity: RequestIdentity,
+        reason: ErrorKind,
+    ) {
+        let request = refusals::request_id_hash(identity);
+        let (closed, first) =
+            self.refusals
+                .record(self.clock.now().0, (reason, partition.0), request);
+        self.refusal_summaries(closed);
+        if first {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                reason = ?reason,
+                request_id_hash = %refusals::hash_hex(request),
+                "refusal_first"
+            );
+        }
+    }
+
+    /// #158: close the refusal windows that have ended, one `refusal_summary` each.
+    fn refusal_summary_duty(&mut self) {
+        let closed = self.refusals.roll(self.clock.now().0);
+        self.refusal_summaries(closed);
+    }
+
+    /// One `refusal_summary` line at info per closed window: its refusals and keys, the top
+    /// keys by count as a JSON array (`reason`, `partition`, `count`, and the `first` and `last`
+    /// requests' `request_id_hash`), the rest folded into `others_keys` and `others_refusals`,
+    /// and the refusals of keys past the window's cap in `over_cap_refusals`.
+    fn refusal_summaries(&self, closed: Vec<refusals::Summary>) {
+        for summary in closed {
+            tracing::info!(
+                node = self.node.0,
+                window_ms = summary.window_ms,
+                keys = summary.keys,
+                refusals = summary.refusals,
+                others_keys = summary.others_keys,
+                others_refusals = summary.others_refusals,
+                over_cap_refusals = summary.over_cap_refusals,
+                top = %summary.top_json(),
+                "refusal_summary"
+            );
+        }
+    }
+
     /// How long to wait for mail: until the next due duty, at most [`IDLE_WAIT`].
     fn wait(&self) -> Duration {
         if self.fault.is_some() {
@@ -3631,6 +3737,7 @@ impl Host {
                 .min(),
             (!self.barriers.is_empty()).then_some(self.next_barrier_duty),
             self.ownership_next_due(),
+            self.refusals.due().map(Tick),
         ]
         .into_iter()
         .flatten()
@@ -6248,19 +6355,42 @@ impl Host {
     fn report_view(&mut self, view: &AuthorityView, fenced: bool) {
         let at = self.stepped_at;
         let margin_ms = margin_ms(view.valid_through_tick, at);
-        tracing::info!(
-            node = self.node.0,
-            partition = view.lineage.partition.0,
-            seq = view.authority_seq,
-            grant = view.grant_id.0,
-            renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
-            valid_through = view.valid_through_tick.0,
-            past_horizon = margin_ms < 0,
-            would_fence_as = ?view.past_horizon,
-            margin_ms,
-            at = at.0,
-            "authority_view"
-        );
+        // Info only for a change of state (#158): the partition's first view, a new grant or
+        // authority seq, a fence, or a view past its horizon. A renewal that moves only the
+        // horizon is debug: each one was a line at info, about 40% of the bytes a write cost.
+        let changed = fenced
+            || margin_ms < 0
+            || self
+                .authority_views
+                .get(&view.lineage.partition)
+                .is_none_or(|previous| {
+                    previous.grant_id != view.grant_id
+                        || previous.authority_seq != view.authority_seq
+                });
+        macro_rules! authority_view {
+            ($level:expr) => {
+                tracing::event!(
+                    target: WRITE_LOG_TARGET,
+                    $level,
+                    node = self.node.0,
+                    partition = view.lineage.partition.0,
+                    seq = view.authority_seq,
+                    grant = view.grant_id.0,
+                    renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
+                    valid_through = view.valid_through_tick.0,
+                    past_horizon = margin_ms < 0,
+                    would_fence_as = ?view.past_horizon,
+                    margin_ms,
+                    at = at.0,
+                    "authority_view"
+                )
+            };
+        }
+        if changed {
+            authority_view!(tracing::Level::INFO);
+        } else {
+            authority_view!(tracing::Level::DEBUG);
+        }
         self.authority_views.insert(view.lineage.partition, *view);
         if fenced || view.valid_through_tick < at {
             self.dead_views.insert(view.lineage.partition);
@@ -6321,7 +6451,8 @@ impl Host {
             return;
         }
         let view = self.authority_views.get(&batch.partition);
-        tracing::info!(
+        tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = batch.partition.0,
             request = admitted.req.identity.request.0,
@@ -6598,7 +6729,8 @@ impl Host {
             .map_err(|fault| {
                 format!("step view of p{} g{}: {fault:?}", partition.0, generation.0)
             })?;
-        tracing::info!(
+        tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
@@ -6925,10 +7057,14 @@ impl Host {
                     PublicationEffect::Snapshot { identity, handle } => {
                         self.previous_answer(site.partition, *identity, *handle)
                     }
-                    PublicationEffect::Status(_)
-                    | PublicationEffect::Mode { .. }
-                    | PublicationEffect::Quarantined { .. } => {
-                        tracing::info!(node, ?effect, "publication_fact");
+                    // A status is published every step (#158): debug. A mode change or a
+                    // quarantine is a change of state: info.
+                    PublicationEffect::Status(_) => {
+                        tracing::debug!(target: WRITE_LOG_TARGET, node, ?effect, "publication_fact");
+                        Ok(())
+                    }
+                    PublicationEffect::Mode { .. } | PublicationEffect::Quarantined { .. } => {
+                        tracing::info!(target: WRITE_LOG_TARGET, node, ?effect, "publication_fact");
                         Ok(())
                     }
                     _ => Err(unsupported(self.node, "publication_effect")),
@@ -14895,6 +15031,8 @@ impl Host {
                     return Ok(());
                 }
                 Err(error) => {
+                    // Refused before anything was sent: counted, as a failed reply is (#158).
+                    self.note_refusal(partition, identity, error.kind);
                     let _ = reply.send(self.redirect(
                         partition,
                         Answer::Error {
@@ -14921,7 +15059,10 @@ impl Host {
                         request: None,
                     },
                 };
-                tracing::info!(
+                // One per write, debug (#158). A refusal is also counted, so info carries its
+                // key's first refusal and one summary per window, not one line per attempt.
+                tracing::debug!(
+                    target: WRITE_LOG_TARGET,
                     node = self.node.0,
                     partition = partition.0,
                     client = identity.client.0,
@@ -14935,6 +15076,9 @@ impl Host {
                     kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
                     "client_compile"
                 );
+                if let Answer::Error { error, .. } = &answer {
+                    self.note_refusal(partition, identity, error.kind);
+                }
                 let _ = reply.send(self.redirect(partition, answer));
                 return Ok(());
             }
@@ -15078,7 +15222,8 @@ impl Host {
             }
             _ => None,
         };
-        tracing::info!(
+        tracing::debug!(
+            target: WRITE_LOG_TARGET,
             node = self.node.0,
             partition = partition.0,
             client = identity.client.0,
@@ -16013,7 +16158,12 @@ impl Host {
             | ReplyEffect::Failed { identity, .. }
             | ReplyEffect::Read { identity, .. } => *identity,
         };
-        tracing::info!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        // Every reply is one line per request, at debug (#158). A refusal is also counted, so
+        // info carries its key's first refusal and one summary per window, not one line each.
+        tracing::debug!(target: WRITE_LOG_TARGET, node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        if let ReplyEffect::Failed { error, .. } = reply {
+            self.note_refusal(partition, identity, error.kind());
+        }
         // A status query's answer, or its refusal, goes to the query being stepped, never to a
         // write waiting under the same identity (F-014).
         let for_status = matches!(
@@ -17515,6 +17665,8 @@ fn head(debug: &str) -> &str {
         .unwrap_or(debug.len());
     &debug[..end]
 }
+
+pub(crate) mod refusals;
 
 #[cfg(test)]
 mod barrier_tests;
