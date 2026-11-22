@@ -141,6 +141,7 @@ fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
             at: Seq(800),
             root: (Seq(120), digest),
             barrier: Bytes::from_static(b"barrier record"),
+            transfer: 17,
         })),
         Msg::SnapshotPull(SnapshotPull {
             partition: PartitionId(1),
@@ -185,6 +186,7 @@ fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
             node: NodeId(3),
             reason,
             through: Some(Seq(812)),
+            transfer: 17,
         }),
     ]
 }

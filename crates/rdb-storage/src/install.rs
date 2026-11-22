@@ -305,6 +305,55 @@ impl RocksEngine {
         Ok(())
     }
 
+    /// Give up lineage `(partition, generation)`'s install at `at` in this boot: remove the
+    /// lineage, its pages and its `installing` record, in one **synced** `WriteBatch`, exactly as
+    /// the open clears one a crash left (`snapshot_install_cleared_at_open`). The partition then
+    /// holds what `install_begin` left it: nothing, so a commit from seq 1 lands on an empty
+    /// lineage instead of meeting the installing guard. The host calls it when an install it
+    /// began ends without `install_finish` (issue #61 round 3, Q1).
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
+    /// [`InstallError::Storage`] when the write fails. Nothing is written, and the lineage stays
+    /// installing.
+    pub fn install_abort(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        let result = self.abort_install(partition, generation, at);
+        match &result {
+            Ok(()) => tracing::warn!(
+                target: LOG_TARGET, partition = partition.0, generation = generation.0,
+                at = at.0, "snapshot_install_aborted"
+            ),
+            Err(e) => install_refused(partition, generation, at, "abort", e),
+        }
+        result
+    }
+
+    fn abort_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        self.check_installing(partition, generation, at)?;
+        let mut write = WriteBatch::default();
+        for (cf, start, end) in lineage_ranges(partition, generation) {
+            write.delete_range_cf(self.cf(cf), start, end);
+        }
+        self.write_batch_synced(write, "install_abort")
+            .map_err(|e| {
+                tracing::error!(target: LOG_TARGET, error = %e, "snapshot_install_write_failed");
+                InstallError::Storage(StorageFault::WriteFailed)
+            })?;
+        self.lineages.remove(&(partition, generation));
+        Ok(())
+    }
+
     /// The `(source generation, at)` of lineage `(partition, generation)`'s install in
     /// progress, `None` when none is.
     #[must_use]

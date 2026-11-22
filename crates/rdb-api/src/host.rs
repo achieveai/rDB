@@ -2894,14 +2894,24 @@ struct Host {
     /// the generation it was served under (lead ruling R18), so a new commit serves it again.
     snapshots_served: BTreeMap<(PartitionId, CopyId), (Generation, Seq)>,
     /// Issue #61 round 2 (B3): per `(partition, copy)`, the `install_retryable` refusals heard
-    /// at one `(generation, barrier)` of [`Self::snapshots_served`]. Under
-    /// [`snapshot::SNAPSHOT_RETRY_LIMIT`] such a refusal forgets the barrier, so R1's next ask
-    /// re-offers it; at the limit the barrier is kept. Cleared on the copy's caught-up release.
-    snapshot_retries: BTreeMap<(PartitionId, CopyId), (Generation, Seq, u32)>,
+    /// at one `(generation, barrier)` of [`Self::snapshots_served`]. The first
+    /// [`snapshot::SNAPSHOT_RETRY_LIMIT`] (3) such refusals each forget the barrier, so R1's next
+    /// ask re-offers it. The 4th keeps the barrier and records the tick it ran out, until
+    /// `Host::retry_duty` re-opens it (round 3, B1). Cleared on the copy's caught-up release.
+    snapshot_retries: BTreeMap<(PartitionId, CopyId), snapshot::RetryCount>,
+    /// Round 3 (B1): how long an exhausted barrier stays kept before the retry duty re-opens
+    /// it and probes the copy. [`snapshot::SNAPSHOT_RETRY_BACKOFF_MILLIS`]; rows set it lower.
+    snapshot_retry_backoff_millis: u64,
     /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
     transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
+    /// Round 3: the next [`snapshot::Transfer`]'s instance.
+    next_transfer_id: u64,
     /// Issue #61 S2: the install this target runs, per partition.
     installs: BTreeMap<PartitionId, snapshot::Install>,
+    /// Round 3: the partitions whose install this target began and gave up
+    /// (`snapshot::Host::abort_begun`), until the next install begins or one finishes. Their
+    /// unlinked anchor is still the install's state, not a fault.
+    installs_given_up: BTreeSet<PartitionId>,
     /// Issue #61 S2: the most entries one snapshot page carries. [`COPY_BATCH_KEYS`]; rows set
     /// it lower to reach a later page with few keys.
     ///
@@ -3248,8 +3258,11 @@ impl Host {
             ladder_passes: 0,
             snapshots_served: BTreeMap::new(),
             snapshot_retries: BTreeMap::new(),
+            snapshot_retry_backoff_millis: snapshot::SNAPSHOT_RETRY_BACKOFF_MILLIS,
             transfers: BTreeMap::new(),
+            next_transfer_id: 1,
             installs: BTreeMap::new(),
+            installs_given_up: BTreeSet::new(),
             snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
             snapshot_page_bytes: snapshot::SNAPSHOT_PAGE_BYTES,
             #[cfg(debug_assertions)]
@@ -4280,7 +4293,10 @@ impl Host {
         }
         self.rebuild_duty(now);
         self.transfer_duty(now);
-        self.install_duty(now);
+        if let Err(fault) = self.install_duty(now) {
+            self.set_fault(fault);
+            return;
+        }
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -13905,7 +13921,8 @@ impl Host {
                 // unlinked anchor is the install's normal state, not a fault: the re-plan that
                 // follows the install asks again.
                 Err(reason @ "anchor_generation_unlinked")
-                    if self.installs.contains_key(&partition) =>
+                    if self.installs.contains_key(&partition)
+                        || self.installs_given_up.contains(&partition) =>
                 {
                     tracing::info!(
                         node = self.node.0,
@@ -13915,6 +13932,7 @@ impl Host {
                         base = anchor.base_seq.0,
                         reason,
                         installing = true,
+                        given_up = self.installs_given_up.contains(&partition),
                         "inventory_failed"
                     );
                     RecoveryEvent::InventoryFailed { copy }

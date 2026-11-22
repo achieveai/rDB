@@ -2447,6 +2447,7 @@ fn t61_pr204_a_late_tail_held_refusal_brings_no_hold_back() {
         node: NodeId(3),
         reason: super::snapshot::SnapshotRefusal::TailHeld,
         through: Some(Seq(cutoff.0 + 3)),
+        transfer: 1,
     });
     assert_eq!(owner.needs_operator(p), None, "no hold came back");
     assert!(
@@ -5644,6 +5645,7 @@ fn t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched() {
         at: Seq(applied.0 + 5),
         root: (Seq::ZERO, Digest::ROOT),
         barrier: barrier.clone(),
+        transfer: 1,
     };
     let offers = [
         SnapshotOffer {
