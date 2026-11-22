@@ -661,14 +661,14 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
     }))
 }
 
-/// The one fixture M7B-78 and its positive control share; `fault` is the only thing that differs
+/// The one fixture M7B-78 and its positive control share; `faults` is the only thing that differs
 /// (plan BA-6; review-l1 R3, tester-l1 D4). Node 1 holds `1..=40` of generation 7, synced; nodes
 /// 2 and 3 hold nothing. `Recovered` lands on all three at tick 0 (no F1 runs, so the members
 /// hear it from the seed, not a control watch). R1 catches both secondaries up from the root
 /// through `SendEnvelopes`, one host flush per secondary at tick 50 makes each durable, and R1's
 /// tracker reports the predicate durable through 40 to L1 as `DurableAdvanced`: nothing about
 /// durability or progress is seeded.
-fn resume_plan(fault: Option<StorageOp>) -> RunPlan {
+fn resume_plan(faults: &[StorageOp]) -> RunPlan {
     let history = canonical_history(resume_lineage(), C1, BARRIER).expect("a canonical history");
     let mut plan = RunPlan::new(rdb_sim::sim::cluster::ClusterConfig {
         partitions: vec![rdb_sim::sim::cluster::PartitionSpec {
@@ -695,7 +695,7 @@ fn resume_plan(fault: Option<StorageOp>) -> RunPlan {
         })
         .collect();
     plan.flushes = vec![(Tick(RESUME_FLUSH), B), (Tick(RESUME_FLUSH), C)];
-    plan.storage_ops = fault.into_iter().collect();
+    plan.storage_ops = faults.to_vec();
     plan.limits = RunLimits {
         max_events: 50_000,
         deadline: Tick(RESUME_DEADLINE),
@@ -706,15 +706,15 @@ fn resume_plan(fault: Option<StorageOp>) -> RunPlan {
 /// One resume run: the recorded lines, what R1 believes is durable, and L1's live mode.
 struct ResumeRun {
     lines: Vec<TraceEvent>,
-    /// The durable watermark node 1's tracker holds for copies 2 and 3, and the predicate's floor
-    /// (`min_required_durable`, the primary included).
+    /// The durable watermark node 1's tracker holds for copies 2 and 3, and the floor L1 reads
+    /// for the pinned predicate (`durable_per_predicate`: the durable quorum, issue #79).
     durable: (u64, u64, u64),
     /// L1's live mode on node 1 at the end.
     mode: Option<rdb_core::protection::Mode>,
 }
 
-fn resume_run(fault: Option<StorageOp>) -> ResumeRun {
-    let plan = resume_plan(fault);
+fn resume_run(faults: &[StorageOp]) -> ResumeRun {
+    let plan = resume_plan(faults);
     let mut runner = Runner::new(&plan).expect("a runner");
     let report = runner.run(plan.limits).expect("a run");
     assert!(
@@ -736,7 +736,11 @@ fn resume_run(fault: Option<StorageOp>) -> ResumeRun {
     let durable = (
         durable_of(2),
         durable_of(3),
-        tracker.min_required_durable().0,
+        tracker
+            .durable_per_predicate()
+            .into_iter()
+            .find(|(version, _)| *version == tracker.config().config_version)
+            .map_or(0, |(_, floor)| floor.0),
     );
     let mode = dispatcher
         .protection(NodeId(1), PARTITION)
@@ -787,7 +791,7 @@ fn admissions(lines: &[TraceEvent]) -> Vec<(u64, bool)> {
 fn m7b_147_the_storage_backed_fixture_without_the_flush_fault_resumes() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
-    let run = resume_run(None);
+    let run = resume_run(&[]);
     assert_eq!(
         run.durable,
         (BARRIER, BARRIER, BARRIER),
@@ -820,10 +824,11 @@ fn m7b_147_the_storage_backed_fixture_without_the_flush_fault_resumes() {
 }
 
 /// M7B-78 (D §4.4 via R1 §3.3 `FlushFailed`; 0006 §4; gate V1; T-B-01). L1 is `Paused` at barrier
-/// 40, and C's one flush at 40 fails: `StorageOp::Fail{node C, fault: FlushFailed}` — the plan's
-/// `StorageOp::FailFlush` is spelled this way in the landed crate. C's durable watermark never
-/// reaches 40 in R1's tracker, so the predicate's floor stays below the barrier and nothing R1
-/// reports can satisfy it. L1 stays `Paused` for the run: every `protection_state` line on node 1
+/// 40, and B's and C's one flush at 40 each fail: `StorageOp::Fail{node, fault: FlushFailed}` —
+/// the plan's `StorageOp::FailFlush` is spelled this way in the landed crate. Neither durable
+/// watermark reaches 40 in R1's tracker, so the predicate's durable quorum floor stays below the
+/// barrier and nothing R1 reports can satisfy it. Both fail since issue #79 (option A): the
+/// floor is the primary and the better secondary, so B's success alone would carry it. L1 stays `Paused` for the run: every `protection_state` line on node 1
 /// has `phase != Resuming` and `phase != Healthy`, the last is `Paused`, admission is never
 /// allowed, and the live instance ends `Paused`.
 ///
@@ -837,7 +842,7 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
 
-    let control = resume_run(None);
+    let control = resume_run(&[]);
     assert!(
         phases(&control.lines)
             .iter()
@@ -845,12 +850,12 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
         "control: without the fault the same fixture resumes"
     );
 
-    let run = resume_run(Some(StorageOp::Fail {
-        node: C,
+    let run = resume_run(&[B, C].map(|node| StorageOp::Fail {
+        node,
         fault: StorageFault::FlushFailed,
     }));
     let (b, c, floor) = run.durable;
-    assert_eq!(b, BARRIER, "B's flush succeeded");
+    assert!(b < BARRIER, "B's failed flush proved nothing: {b}");
     assert!(c < BARRIER, "C's failed flush proved nothing: {c}");
     assert!(
         floor < BARRIER,
@@ -1610,6 +1615,12 @@ const STALL_WRITES: u64 = 300;
 /// write, and the run taken to `STACK_SUBMIT_AT + 3000`. Returns the runner, the trace and the
 /// replies of the last segment.
 fn stall_run(stall: bool) -> (Runner, Vec<TraceEvent>, Vec<(NodeId, ReplyEffect)>) {
+    let every = [cases::B_NODE, cases::C_NODE, cases::A_NODE];
+    stall_nodes_run(if stall { &every } else { &[] })
+}
+
+/// [`stall_run`] with the flushes of `stalled` only stalled.
+fn stall_nodes_run(stalled: &[NodeId]) -> (Runner, Vec<TraceEvent>, Vec<(NodeId, ReplyEffect)>) {
     let plan = a1p1_plan();
     let mut runner = Runner::new(&plan).expect("a runner");
     stack_run_to(&mut runner, STACK_SUBMIT_AT - 1);
@@ -1618,13 +1629,11 @@ fn stall_run(stall: bool) -> (Runner, Vec<TraceEvent>, Vec<(NodeId, ReplyEffect)
         Some(Mode::Healthy),
         "the fixture is Healthy before the stall (A6): the row measures from a Healthy L1"
     );
-    if stall {
-        for node in [cases::B_NODE, cases::C_NODE, cases::A_NODE] {
-            runner
-                .dispatcher_mut()
-                .inject_storage(StorageOp::StallFlush { node })
-                .expect("the stall is planned");
-        }
+    for node in stalled {
+        runner
+            .dispatcher_mut()
+            .inject_storage(StorageOp::StallFlush { node: *node })
+            .expect("the stall is planned");
     }
     for k in 1..=STALL_WRITES {
         runner
@@ -1804,6 +1813,74 @@ fn m7b_68_integration_row_nothing_admitted_after_tick_2100() {
         ),
         "without the stall every write succeeds"
     );
+}
+
+/// Issue #79 (option A, owner ruling 2026-11-20), R1 and L1 composed: L1's floor is the
+/// durable quorum, the primary and its better regular secondary. One regular secondary's
+/// flushes stalled from a `Healthy` L1 (the third copy's stuck disk) leave the primary and the
+/// other secondary durable, so over 3 s of writes every 10 ms, past the 2 s pause age, L1
+/// never warns, never rejects admission and never writes `Paused`, and every write succeeds.
+/// The twin stalls both secondaries: the quorum's last secondary is stuck, so L1 pauses by
+/// `STALL + 2100` as M7B-68 does. INV-LAG is not judged here: the row reads L1's own lines.
+/// Cut: `durable_per_predicate` back to the all-copies minimum; L1 pauses in the first run.
+#[retcd_test]
+fn i79_a_third_copy_that_stops_syncing_never_pauses_l1() {
+    support::preamble();
+    const STALL: u64 = STACK_SUBMIT_AT;
+    let all = usize::try_from(STALL_WRITES + 1).expect("small");
+
+    let (runner, trace, replies) = stall_nodes_run(&[cases::A_NODE]);
+    let engine = runner
+        .dispatcher()
+        .engine(cases::A_NODE)
+        .expect("an engine");
+    assert!(
+        !engine.stalled_syncs().is_empty(),
+        "node 3 took the stall: its syncs are held"
+    );
+    assert!(
+        stack_warns(&trace).is_empty(),
+        "L1 never warns: {:?}",
+        stack_warns(&trace)
+    );
+    let rejects: Vec<_> = admissions(&trace)
+        .into_iter()
+        .filter(|(tick, allow)| *tick >= STALL && !allow)
+        .collect();
+    assert!(rejects.is_empty(), "L1 rejected admission: {rejects:?}");
+    let paused: Vec<_> = phases(&trace)
+        .into_iter()
+        .filter(|(tick, phase)| *tick >= STALL && *phase == ProtectionPhase::Paused)
+        .collect();
+    assert!(paused.is_empty(), "L1 paused: {paused:?}");
+    assert!(
+        stack_applies(&trace)
+            .iter()
+            .any(|(tick, _)| *tick > STALL + 2_100),
+        "writes are admitted past the pause age"
+    );
+    assert_eq!(stack_l1_mode(&runner), Some(Mode::Healthy));
+    assert_eq!(
+        stack_reply_counts(&replies),
+        (all, 0, Vec::new()),
+        "every write succeeds"
+    );
+
+    // Twin: both secondaries stuck. The quorum has no secondary durable, so L1 pauses.
+    let (_, trace, replies) = stall_nodes_run(&[cases::C_NODE, cases::A_NODE]);
+    let pause: Vec<_> = admissions(&trace)
+        .into_iter()
+        .filter(|(tick, allow)| *tick >= STALL && !allow)
+        .collect();
+    assert_eq!(pause.len(), 1, "L1 rejects admission once: {pause:?}");
+    assert!(
+        (STALL + 1_000..=STALL + 2_100).contains(&pause[0].0),
+        "the pause at {} is not by STALL + 2100",
+        pause[0].0
+    );
+    let (_, refused, other) = stack_reply_counts(&replies);
+    assert!(other.is_empty(), "{other:?}");
+    assert!(refused > 0, "the pause refused at least one write");
 }
 
 /// The copy the plan's B is on for M7B-47: it ACKs 98 and then diverges.
