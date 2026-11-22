@@ -3338,18 +3338,19 @@ fn names_in_words(nodes: &[u32]) -> String {
 /// [`PromoteError::Superseded`]'s text: the other run's owner when it is not this run's `to`,
 /// else the nodes it dropped, else that `partitions/1` changed (A-R448 F-001, F-002).
 fn superseded_text(partition: u32, owner: Option<u32>, dropped: &[u32], generation: u64) -> String {
+    use crate::db::error::PROMOTE_SUPERSEDED_STEP;
     match owner {
         Some(owner) => format!(
             "another promote committed instead: node {owner} is the owner, generation \
-             {generation}; run status before promoting again"
+             {generation}; {PROMOTE_SUPERSEDED_STEP}"
         ),
         None if dropped.is_empty() => format!(
-            "partitions/{partition} changed again after a promote (generation {generation}); run status \
-             before promoting again"
+            "partitions/{partition} changed again after a promote (generation {generation}); \
+             {PROMOTE_SUPERSEDED_STEP}"
         ),
         None => format!(
-            "another promote committed instead: node {} dropped, generation {generation}; run \
-             status before promoting again",
+            "another promote committed instead: node {} dropped, generation {generation}; \
+             {PROMOTE_SUPERSEDED_STEP}",
             names_in_words(dropped)
         ),
     }
@@ -3965,6 +3966,8 @@ fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError 
         no_mutation,
         detail: format!("control store: {detail}; {tail}"),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -4046,7 +4049,8 @@ pub enum PromoteError {
         "node {node} holds no configuration since its restart, so the promote cannot tell which \
          members are still catching up; nothing was changed. A promote needs a node that has \
          landed a configuration since it started: start the node that owned partition {partition}, or \
-         promote a node that has not restarted since that node stopped"
+         {step}",
+        step = crate::db::error::PROMOTE_UNCONFIGURED_STEP
     )]
     Unconfigured {
         /// The node asked for.
@@ -4151,7 +4155,8 @@ pub enum PromoteError {
     /// This `Db` has no control store to run the promote against.
     #[error(
         "this Db was opened without a control store, so it cannot run admin commands such as \
-         promote: open it with Db::open, which connects it to one"
+         promote: {step}",
+        step = crate::db::error::PROMOTE_NO_STORE_STEP
     )]
     NoControlStore,
     /// This process's clock bound is lost (`clock_bound_lost`): its guard cannot show the clock
@@ -4166,7 +4171,8 @@ pub enum PromoteError {
     ClockUnbounded,
     /// The promote gave no answer in time, and may have written.
     #[error(
-        "the promote of node {node} did not answer in time; it may have written: promote again"
+        "the promote of node {node} did not answer in time; {step}",
+        step = crate::db::error::PROMOTE_UNANSWERED_STEP
     )]
     Unanswered {
         /// The node asked to take the partition.
@@ -4229,6 +4235,8 @@ impl From<PromoteError> for ApiError {
             no_mutation,
             detail: error.to_string(),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 }
@@ -5497,6 +5505,52 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// #134 audit: a `NotWired` promote refusal whose text already names what to do gets no
+    /// second step. Before, each was followed by "retrying will not help: keep this Db's log and
+    /// report this message", which contradicted `Unanswered`'s "promote again" and misdirected
+    /// the others (start a node, run status, open with `Db::open`). Cut: drop one of their tails
+    /// from `next_step`: red on that variant.
+    #[test]
+    fn a_not_wired_promote_refusal_that_names_its_step_gets_no_second() {
+        for refusal in [
+            PromoteError::Unanswered { node: 2 },
+            PromoteError::Unconfigured {
+                node: 2,
+                partition: 1,
+            },
+            PromoteError::NoControlStore,
+            PromoteError::Superseded {
+                partition: 1,
+                owner: Some(3),
+                dropped: Vec::new(),
+                generation: 4,
+            },
+            PromoteError::Superseded {
+                partition: 1,
+                owner: None,
+                dropped: vec![1],
+                generation: 4,
+            },
+            PromoteError::Superseded {
+                partition: 1,
+                owner: None,
+                dropped: Vec::new(),
+                generation: 4,
+            },
+        ] {
+            let error = ApiError::from(refusal);
+            assert_eq!(error.retry, RetryRule::NotWired, "{error}");
+            assert_eq!(error.next_step(), None, "{error}");
+        }
+        // A record this build cannot read has no step of its own, so it keeps the plain one.
+        let record = ApiError::from(PromoteError::Record("partitions/1: bad".to_owned()));
+        assert_eq!(
+            record.next_step(),
+            Some("retrying will not help: keep this Db's log and report this message"),
+            "{record}"
+        );
+    }
 
     use crate::test_store::{Script, Scripted};
 

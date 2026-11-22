@@ -242,6 +242,65 @@ fn seed() -> Box<DormantSeed> {
     Box::new(seed)
 }
 
+/// #147: the new variants were appended, so every older variant keeps its postcard tag, and a
+/// tag a build does not know is a decode error, not a panic. An older node never sees one: the
+/// handshake refuses a peer whose `PROTOCOL_VERSION` differs. Cut: insert `Delete` before
+/// `Clear`, and `Clear`'s tag moves.
+#[test]
+fn new_scope_variants_are_appended_and_an_unknown_tag_is_refused() {
+    let tag = |bytes: Vec<u8>| bytes[0];
+    let delete = postcard::to_stdvec(&wire::WireChange::Delete).expect("encodes");
+    let clear = postcard::to_stdvec(&wire::WireChange::Clear).expect("encodes");
+    let list = postcard::to_stdvec(&wire::WireLook::List {
+        after: None,
+        limit: 1,
+        rootless: false,
+    })
+    .expect("encodes");
+    let objects = postcard::to_stdvec(&wire::WireSeen::Objects {
+        objects: Vec::new(),
+        full: false,
+    })
+    .expect("encodes");
+    assert_eq!(
+        (
+            tag(clear),
+            tag(delete.clone()),
+            tag(list.clone()),
+            tag(objects.clone())
+        ),
+        (7, 8, 5, 5)
+    );
+    let mut change = delete;
+    change[0] = 9;
+    assert!(postcard::from_bytes::<wire::WireChange>(&change).is_err());
+    let mut look = list;
+    look[0] = 6;
+    assert!(postcard::from_bytes::<wire::WireLook>(&look).is_err());
+    let mut seen = objects;
+    seen[0] = 6;
+    assert!(postcard::from_bytes::<wire::WireSeen>(&seen).is_err());
+    let frame = wire::decode(&[0xff, 0x01]).expect_err("no frame has tag 255");
+    assert!(matches!(frame, wire::WireError::Decode(_)), "{frame}");
+}
+
+/// #134: a call the node could not decode is not an owner fault, so no takeover step: its
+/// detail already says to check both sides run the same build, and its step is "retrying will
+/// not help". It keeps that across the wire. Cut: build it with `ApiError::owner_fault`: red.
+#[test]
+fn an_undecodable_call_keeps_retrying_will_not_help() {
+    let error = super::undecodable_call(NodeId(2), "unknown variant tag 9");
+    let landed = crate::db::ApiError::from(wire::WireApiError::from(&error));
+    for error in [&error, &landed] {
+        assert!(!error.owner_fault, "{error}");
+        assert_eq!(
+            error.next_step(),
+            Some("retrying will not help: keep this Db's log and report this message"),
+            "{error}"
+        );
+    }
+}
+
 /// Every client call shape the API sends: each change, each look.
 fn calls() -> Vec<ClientCall> {
     let upload = [5u8; 16];
@@ -290,6 +349,7 @@ fn calls() -> Vec<ClientCall> {
         },
         Change::Gc { floor: 12 },
         Change::Clear,
+        Change::Delete,
     ];
     let looks = vec![
         Look::Doc,
@@ -311,6 +371,16 @@ fn calls() -> Vec<ClientCall> {
             limit: 2,
         },
         Look::Range { offset: 8, len: 16 },
+        Look::List {
+            after: Some(Bytes::from_static(b"a\x00b")),
+            limit: 1_000,
+            rootless: true,
+        },
+        Look::List {
+            after: None,
+            limit: 1,
+            rootless: false,
+        },
     ];
     let mut calls: Vec<ClientCall> = changes
         .into_iter()
@@ -543,6 +613,28 @@ fn answers() -> Vec<Answer> {
                 },
             },
             bytes: Bytes::from_static(b"rang"),
+        },
+        // #147: every root kind, and a rootless id.
+        Seen::Objects {
+            objects: [
+                rdb_value::envelope::Kind::Document,
+                rdb_value::envelope::Kind::Map,
+                rdb_value::envelope::Kind::Set,
+                rdb_value::envelope::Kind::List,
+                rdb_value::envelope::Kind::Blob,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(n, kind)| rdb_value::keys::Listed {
+                id: vec![n as u8, 0x00],
+                root: Some((n as u64 + 1, kind)),
+            })
+            .chain([rdb_value::keys::Listed {
+                id: b"orphan".to_vec(),
+                root: None,
+            }])
+            .collect(),
+            full: true,
         },
     ];
     let mut answers: Vec<Answer> = seen
@@ -1703,6 +1795,124 @@ async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_do
         "pilot",
         "rebuild",
     );
+}
+
+/// PR #178 review r4 T29, T30: the refusal a non-admin app gets for a delete or a list until
+/// #154's node-side scope check: the call never reaches node 1's node, takes no request number,
+/// is definitive `INVALID_ARGUMENT` with no_mutation, and says why and what to do instead. Then
+/// the admin app sends `call` again and node 1's node gets it.
+async fn assert_unscoped_refused(test: &str, call: ClientCall, verb: &str, done: &str) {
+    let (got, answer) = app_admin_call("pilot", call.clone()).await;
+    assert!(
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
+        "a non-admin app's {verb} never reaches node 1's node: {got:?}"
+    );
+    assert_eq!(
+        client_requests(test),
+        [(1, "status".to_owned())],
+        "a refused {verb} takes no request number and logs no request event"
+    );
+    let Answer::Error { error, request } = answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    for part in [
+        "app pilot is not an admin app on node 1",
+        &format!("a {verb} over a link is refused for a non-admin app"),
+        "(#154)",
+        "--admin-apps",
+        done,
+    ] {
+        assert!(text.contains(part), "{part:?} in {text}");
+    }
+    assert!(!text.contains("  "), "one space between words: {text:?}");
+    let (got, _answer) = app_admin_call("admin", call.clone()).await;
+    let Msg::Client(Client { call: reached, .. }) = got else {
+        panic!("the admin app's {verb} reaches node 1's node: {got:?}");
+    };
+    assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+}
+
+/// PR #178 review r4 T29: a delete, compiled as `Db` sends one, from an app not on node 1's
+/// admin-app list is refused: nothing is deleted. The admin app's still reaches node 1's node.
+/// Cut: drop the delete from `unscoped_verb`, red: node 1's first message is the compile.
+/// Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_t29_a_delete_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let delete = ClientCall::Compile {
+        identity: identity(9, 1),
+        puts: vec![PutOp {
+            group: crate::db::DEFAULT_GROUP,
+            object: Bytes::from_static(b"doc"),
+            change: Change::Delete,
+            expect: None,
+        }],
+        remaining_millis: 1_000,
+    };
+    assert_unscoped_refused(
+        "r4_t29_a_delete_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        delete,
+        "delete",
+        "nothing was deleted",
+    )
+    .await;
+}
+
+/// PR #178 review r5 B2: as the row above, for a put whose change is a delete, not a compile:
+/// nothing is deleted. Cut: drop the put arm from `unscoped_verb`, red: node 1's first message
+/// is the put. Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_b2_a_put_deleting_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let delete = ClientCall::Put {
+        identity: identity(9, 1),
+        object: Bytes::from_static(b"doc"),
+        change: Change::Delete,
+        expect: None,
+        remaining_millis: 1_000,
+    };
+    assert_unscoped_refused(
+        "r5_b2_a_put_deleting_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        delete,
+        "delete",
+        "nothing was deleted",
+    )
+    .await;
+}
+
+/// PR #178 review r4 T30: as the row above, for a list: nothing is listed.
+/// Cut: drop the list from `unscoped_verb`, red: node 1's first message is the get.
+/// Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_nothing() {
+    let list = ClientCall::Get {
+        identity: identity(9, 1),
+        group: crate::db::DEFAULT_GROUP,
+        object: Bytes::new(),
+        look: Look::List {
+            after: None,
+            limit: 10,
+            rootless: true,
+        },
+    };
+    assert_unscoped_refused(
+        "r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_nothing",
+        list,
+        "list",
+        "nothing was listed",
+    )
+    .await;
 }
 
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with

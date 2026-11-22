@@ -35,6 +35,8 @@ use rdb_core::contracts::txn::{TxnRequest, TxnResult, TxnStatus};
 use rdb_value::blob::{Blob, Manifest, Upload};
 use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
 use rdb_value::delta::{Delta, Op};
+use rdb_value::envelope::Kind;
+use rdb_value::keys::Listed;
 use rdb_value::list::{Item, Items, List, Token};
 use rdb_value::path::Path;
 use rdb_value::value::{Int, Value};
@@ -1283,6 +1285,8 @@ pub enum WireChange {
         floor: u64,
     },
     Clear,
+    /// #147. Last, so every earlier variant keeps its number.
+    Delete,
 }
 
 fn elem_ops(ops: &[ElemOp]) -> Result<Vec<WireElemOp>, WireError> {
@@ -1377,6 +1381,7 @@ impl TryFrom<&Change> for WireChange {
             },
             Change::Gc { floor } => Self::Gc { floor: *floor },
             Change::Clear => Self::Clear,
+            Change::Delete => Self::Delete,
         })
     }
 }
@@ -1442,6 +1447,7 @@ impl TryFrom<WireChange> for Change {
             },
             WireChange::Gc { floor } => Self::Gc { floor },
             WireChange::Clear => Self::Clear,
+            WireChange::Delete => Self::Delete,
         })
     }
 }
@@ -1480,10 +1486,28 @@ impl From<WireToken> for Token {
 #[allow(missing_docs)]
 pub enum WireLook {
     Doc,
-    Members { after: Option<Vec<u8>>, limit: u64 },
-    Items { at: i64, limit: u64 },
-    ItemsAfter { token: WireToken, limit: u64 },
-    Range { offset: u64, len: u64 },
+    Members {
+        after: Option<Vec<u8>>,
+        limit: u64,
+    },
+    Items {
+        at: i64,
+        limit: u64,
+    },
+    ItemsAfter {
+        token: WireToken,
+        limit: u64,
+    },
+    Range {
+        offset: u64,
+        len: u64,
+    },
+    /// #147. Last, so every earlier variant keeps its number.
+    List {
+        after: Option<Bytes>,
+        limit: u64,
+        rootless: bool,
+    },
 }
 
 fn limit(limit: u64) -> Result<usize, WireError> {
@@ -1512,6 +1536,15 @@ impl TryFrom<&Look> for WireLook {
                 offset: *offset,
                 len: *len,
             },
+            Look::List {
+                after,
+                limit,
+                rootless,
+            } => Self::List {
+                after: after.clone(),
+                limit: *limit as u64,
+                rootless: *rootless,
+            },
         })
     }
 }
@@ -1535,6 +1568,15 @@ impl TryFrom<WireLook> for Look {
                 limit: limit(n)?,
             },
             WireLook::Range { offset, len } => Self::Range { offset, len },
+            WireLook::List {
+                after,
+                limit: n,
+                rootless,
+            } => Self::List {
+                after,
+                limit: limit(n)?,
+                rootless,
+            },
         })
     }
 }
@@ -1572,8 +1614,11 @@ impl From<WireApiError> for ApiError {
             kind: error.kind,
             retry: error.retry,
             no_mutation: error.no_mutation,
+            owner_fault: ApiError::fault_from_wire(error.retry, &error.detail),
             detail: error.detail,
             retry_after: error.retry_after_millis.map(Duration::from_millis),
+            // Set only on a refusal the `Db` raises before it sends (#148), so never on the wire.
+            too_large: None,
         }
     }
 }
@@ -1639,6 +1684,19 @@ pub enum WireSeen {
         manifest: WireManifest,
         bytes: Bytes,
     },
+    /// #147. Last, so every earlier variant keeps its number.
+    Objects {
+        objects: Vec<WireListed>,
+        full: bool,
+    },
+}
+
+/// [`Listed`] on the wire: the root's version and its envelope kind byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WireListed {
+    pub id: Vec<u8>,
+    pub root: Option<(u64, u8)>,
 }
 
 impl TryFrom<&Seen> for WireSeen {
@@ -1699,6 +1757,16 @@ impl TryFrom<&Seen> for WireSeen {
                     chunk_sha256: blob.manifest.chunk_sha256.clone(),
                 },
                 bytes: bytes.clone(),
+            },
+            Seen::Objects { objects, full } => Self::Objects {
+                objects: objects
+                    .iter()
+                    .map(|listed| WireListed {
+                        id: listed.id.clone(),
+                        root: listed.root.map(|(version, kind)| (version, kind.byte())),
+                    })
+                    .collect(),
+                full: *full,
             },
         })
     }
@@ -1787,6 +1855,28 @@ impl TryFrom<WireSeen> for Seen {
                     },
                 },
                 bytes,
+            },
+            WireSeen::Objects { objects, full } => Self::Objects {
+                objects: objects
+                    .into_iter()
+                    .map(|listed| {
+                        let root = listed
+                            .root
+                            .map(|(version, byte)| {
+                                Kind::from_byte(byte)
+                                    .map(|kind| (version, kind))
+                                    .ok_or_else(|| {
+                                        WireError::Value(format!("object kind byte {byte:#04x}"))
+                                    })
+                            })
+                            .transpose()?;
+                        Ok(Listed {
+                            id: listed.id,
+                            root,
+                        })
+                    })
+                    .collect::<Result<_, WireError>>()?,
+                full,
             },
         })
     }

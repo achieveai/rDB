@@ -92,7 +92,7 @@ use rdb_storage::{
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
-use rdb_value::keys::{root_key, RootKey};
+use rdb_value::keys::{list_objects, parse, root_key, Listed, RootKey};
 use rdb_value::list::{Items, ListOp, Start, Token, DEFAULT_BLOCK_MAX};
 use rdb_value::repair::Cleared;
 use rdb_value::value::Value;
@@ -1122,6 +1122,15 @@ pub enum Change {
     /// Nothing stored compiles to nothing ([`Answer::Unchanged`]) once the view is published;
     /// `UNKNOWN_OUTCOME`, never sent, while it is applied and not yet published.
     Clear,
+    /// Delete the object, whatever its kind, in batches (#147, `rdb_value::repair::delete_object`).
+    /// Write it again until it answers [`Answer::Unchanged`]: nothing is stored under the object,
+    /// once the view is published. Between batches the object reads as valid or absent, never as
+    /// damage (PR #178 review r1): a map, set or list loses entries through its own compile, so
+    /// its count and links stay true; a blob's root goes first, leaving chunks with no root,
+    /// which read as absent; any other object keeps its root to the last batch. `expect`
+    /// `Version(v)` makes every batch a CAS on the root, and the chunks a deleted blob leaves go
+    /// on under it; `Absent` is refused. A re-created object never inherits old records.
+    Delete,
 }
 
 impl Change {
@@ -1137,6 +1146,7 @@ impl Change {
             Self::Publish { .. } => "publish",
             Self::Gc { .. } => "gc",
             Self::Clear => "clear",
+            Self::Delete => "delete",
         }
     }
 }
@@ -1215,6 +1225,18 @@ pub enum Look {
         /// How many bytes.
         len: u64,
     },
+    /// Up to `limit` objects in the group whose id starts with the read's object id, in id
+    /// order, after object `after` when given (#147). Each object costs one seek: a collection's
+    /// entries are never read. An object with no root, such as an unpublished upload's chunks,
+    /// is listed only with `rootless`. Each page is its own view.
+    List {
+        /// Start after this object id.
+        after: Option<Bytes>,
+        /// The most objects to return.
+        limit: usize,
+        /// List objects with no root too.
+        rootless: bool,
+    },
 }
 
 /// What a read saw.
@@ -1222,6 +1244,14 @@ pub enum Look {
 pub enum Seen {
     /// No object at that id.
     Absent,
+    /// A page of object ids ([`Look::List`]). `full`: the page holds `limit` objects, so more
+    /// may follow; ask again after the last.
+    Objects {
+        /// The objects, in id order.
+        objects: Vec<Listed>,
+        /// The page is full.
+        full: bool,
+    },
     /// A document and its version.
     Doc(Document),
     /// A page of a map or set, with its root.
@@ -2973,7 +3003,7 @@ enum PendingKind {
 /// call after with [`Fault::refusal`], except a status query, which gets [`Fault::error`] (#136).
 /// A view that read stored damage refuses as
 /// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
-/// fault is [`ApiError::host`].
+/// fault is [`ApiError::owner_fault`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fault {
     /// The kind of stored damage the node read, when that is why it faulted.
@@ -2985,7 +3015,7 @@ impl Fault {
     fn error(&self) -> ApiError {
         match self.damage {
             Some(kind) => ApiError::new(kind, format!("host fault: {}", self.detail)),
-            None => ApiError::host(&self.detail),
+            None => ApiError::owner_fault(&self.detail),
         }
     }
 
@@ -3020,7 +3050,8 @@ impl Fault {
     }
 }
 
-/// A fault that names no stored damage: [`ApiError::host`], as before A-R178.
+/// A fault that names no stored damage: [`ApiError::owner_fault`] (#134; `ApiError::host`
+/// before it, as before A-R178).
 impl From<String> for Fault {
     fn from(detail: String) -> Self {
         Self {
@@ -12696,6 +12727,8 @@ impl Host {
                 generation.0, partition.0, self.node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         })
     }
 
@@ -16972,6 +17005,15 @@ impl Host {
                 Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
                     .map_err(|e| compile_error(&root, &e)),
                 Change::Clear => self.clear(partition, identity, &root, view, published),
+                Change::Delete => match put.expect {
+                    Some(Expected::Absent) => Err(ApiError::invalid(
+                        "a delete takes no absent expect: deleting nothing is not a write",
+                    )),
+                    Some(Expected::Version(version)) => {
+                        self.delete(partition, &root, view, published, Some(version))
+                    }
+                    None => self.delete(partition, &root, view, published, None),
+                },
                 Change::Chunk {
                     upload,
                     index,
@@ -17118,6 +17160,35 @@ impl Host {
                 }
                 Err(refused)
             }
+        }
+    }
+
+    /// The `Delete` arm (#147): one batch, or "nothing to delete", which is a read and so
+    /// passes A1's read check and needs the view published, as Clear's "nothing to clear" does.
+    fn delete(
+        &self,
+        partition: PartitionId,
+        root: &RootKey,
+        view: &RocksSnapshot,
+        published: Option<(Generation, Seq)>,
+        expect: Option<u64>,
+    ) -> Result<Compiled, ApiError> {
+        match rdb_value::repair::delete_object(view, root, expect) {
+            Ok(Some(compiled)) => Ok(compiled),
+            Ok(None) => {
+                self.read_admitted(partition, "nothing to delete is not confirmed")?;
+                view_published(
+                    view,
+                    published,
+                    "nothing to delete",
+                    "if an earlier delete sent deletes, ask its status",
+                )?;
+                Ok(Compiled {
+                    mutations: Vec::new(),
+                    conditions: Vec::new(),
+                })
+            }
+            Err(error) => Err(compile_error(root, &error)),
         }
     }
 
@@ -17324,6 +17395,22 @@ impl Host {
             return Err(Fault::from("read reply with no step view".to_owned()));
         };
         let (generation, at) = (view.generation(), view.at());
+        if let Look::List {
+            after,
+            limit,
+            rootless,
+        } = look
+        {
+            return list_answer(
+                self.node,
+                view,
+                root,
+                after.as_deref(),
+                *limit,
+                *rootless,
+                outcome,
+            );
+        }
         let Some((version, digest)) = value else {
             return Ok(Answer::Read {
                 outcome,
@@ -18506,6 +18593,11 @@ fn object_answer_unchecked(
                 read => read.map(Seen::Items),
             }
         }
+        Look::List { .. } => {
+            return Err(Fault::from(
+                "a list is answered from the read reply, never as one object".to_owned(),
+            ))
+        }
         Look::Range { offset, len } => rdb_value::blob::read_blob(view, root).and_then(|blob| {
             let blob = blob.ok_or(ApplyError::ObjectAbsent)?;
             upload = Some(blob.manifest.upload);
@@ -18537,6 +18629,53 @@ fn object_answer_unchecked(
             log_stored_damage(node, root, &error, damage, chunk);
             Answer::Error {
                 error,
+                request: None,
+            }
+        }
+    })
+}
+
+/// A [`Look::List`] page from `view`: the objects of `root`'s group whose id starts with `root`'s
+/// object id. Stored damage in the range refuses the page as `CORRUPT_HISTORY` with one warn
+/// line; the outer error faults the node, as [`object_answer`]'s does.
+fn list_answer(
+    node: NodeId,
+    view: &RocksSnapshot,
+    root: &RootKey,
+    after: Option<&[u8]>,
+    limit: usize,
+    rootless: bool,
+    outcome: ReadServiceOutcome,
+) -> Result<Answer, Fault> {
+    let at = parse(root.as_bytes())
+        .map_err(|error| Fault::from(format!("a list's own root key does not parse: {error}")))?;
+    let listed = list_objects(
+        view,
+        at.tenant,
+        at.affinity,
+        &at.object_id,
+        after,
+        limit,
+        rootless,
+    );
+    view_whole(view, "list")?;
+    Ok(match listed {
+        Ok((objects, full)) => Answer::Read {
+            outcome,
+            seen: Seen::Objects { objects, full },
+            generation: view.generation(),
+            at: view.at(),
+            recovery_mode: false,
+        },
+        Err(error) => {
+            tracing::warn!(
+                node = node.0,
+                affinity = at.affinity.0,
+                detail = %error,
+                "list_refused_stored_damage"
+            );
+            Answer::Error {
+                error: ApiError::new(ErrorKind::CorruptHistory, format!("list: {error}")),
                 request: None,
             }
         }
