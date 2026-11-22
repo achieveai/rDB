@@ -11727,7 +11727,24 @@ impl Host {
     /// cutoff's digest. A refused receiver that does still anchors at the cutoff (a proven
     /// prefix, `AppendReceiver::on_recovered`), and would then take the suffix into a
     /// generation this copy never linked, which holds none of the keys before the cutoff. That
-    /// landing faults the node instead, with nothing linked or anchored.
+    /// landing faults the node instead, with nothing linked or anchored: a stopped node is
+    /// loud, lost keys are silent.
+    ///
+    /// Reachability, read from code and not shown to happen. The refusal needs a copied inherit
+    /// with the copy's head past the cutoff (`held > base`; a flatten at `held == base` touches
+    /// nothing and cannot refuse `below_floor`). F1 takes the cutoff as the longest verified
+    /// head (`recovery::lineage::select_prefix`), and answering the inventory seals the
+    /// receiver, which then refuses plain appends (`AppendReceiver::sealed`). So a barrier
+    /// member is past the cutoff only if (a) a record already staged completes after the seal,
+    /// or (b) a required copy proved the cutoff durable without reporting an inventory.
+    ///
+    /// After the fault, also read from code and not run: the landed set is in memory, so on
+    /// reopen the owner re-plans rather than re-sending this landing. The copy's inventory
+    /// links the missed generation by the same copy, which is refused again; that answers
+    /// `InventoryFailed` (an expected `missed_generation_*` reason), the copy is left out, lands
+    /// outside the barrier through `land_link`, and is expected to stay in #79's tail hold
+    /// (`held_past_base`) until `forget-tail` or a snapshot rebuild. No crash loop is expected,
+    /// since the fault is reached only from an in-barrier landing.
     fn inherit(
         &mut self,
         partition: PartitionId,
@@ -11757,8 +11774,11 @@ impl Host {
                         });
                 if holds_cutoff {
                     return Err(Fault::from(format!(
-                        "inherit p{} to g{} at cutoff {}: {at}, and the copy holds the cutoff, so \
-                         it would anchor there on a generation it never linked",
+                        "inherit p{} to g{} at cutoff {}: {at}: this copy's trimmed history \
+                         cannot rebuild its state at the cutoff, and it holds the cutoff, so it \
+                         would serve the new generation without the keys written before it. \
+                         Stopped instead. On reopen the copy is left out of the next plan and \
+                         waits for `forget-tail` or a snapshot rebuild",
                         partition.0, generation.0, result.selected.cutoff_seq.0
                     )));
                 }

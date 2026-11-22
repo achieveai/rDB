@@ -68,6 +68,9 @@ pub(crate) const SNAPSHOT_IDLE_MILLIS: u64 = 60_000;
 /// the frame still cannot be sent.
 pub(crate) const SNAPSHOT_PAGE_BYTES: usize = crate::net::MAX_FRAME / 4;
 
+// Any stored entry is from one write record, at most `MAX_ENVELOPE_BYTES`: it fits a page.
+const _: () = assert!(rdb_core::replication::append::MAX_ENVELOPE_BYTES < SNAPSHOT_PAGE_BYTES);
+
 /// Why a target refused an offer, or stopped an install. Sent back in [`SnapshotOfferRefused`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotRefusal {
