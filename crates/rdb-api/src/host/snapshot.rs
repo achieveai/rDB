@@ -1112,7 +1112,11 @@ impl Host {
     }
 
     /// PR #204 review: whether `frame`, delivered for `partition`, is an ordinary append of the
-    /// lineage an install here owns, and so is not handed to the receiver. Staged, its commit
+    /// lineage an install here owns, contiguous with the receiver's accept head, and so is not
+    /// handed to the receiver. Only such a record would be staged; any other append (a head
+    /// probe or a keepalive past a gap, or a repeat) reaches the receiver's validation, which
+    /// answers it without staging (`NeedPrefix`, or `AlreadyHave` and an ACK), so R1 still
+    /// hears where this copy stands and can ask again (round 2, B2). Staged, its commit
     /// would meet the engine's installing guard (which stays) as `WriteFailed`, and R1 would
     /// fence the partition for this boot. Dropped, it is not lost: R1's retransmit re-sends an
     /// unacked record, and the re-seed's ACK at `S` walks `S + 1 ..= head`. Every other frame
@@ -1130,6 +1134,13 @@ impl Host {
             || rdb_core::replication::wire::classify(&frame.body)
                 != Some(rdb_core::replication::wire::R1Frame::Append)
         {
+            return false;
+        }
+        let contiguous = ReplicationEnvelope::decode_header(&frame.body)
+            .ok()
+            .zip(self.replication.receiver(self.node, partition))
+            .is_some_and(|(header, receiver)| header.seq == receiver.accept_head().seq.next());
+        if !contiguous {
             return false;
         }
         install.deferred += 1;

@@ -9024,13 +9024,122 @@ fn t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier() 
     assert_eq!(logged!(METHOD, "snapshot_transfer_installed").len(), 1);
 }
 
+/// Issue #61 round 2 (B2), a head probe during an install: as the deferral row, node 1 holds
+/// the pull for page 1 and node 3's install owns the partition. An ordinary append of the
+/// install's lineage then reaches node 3 two past its receiver's head, as a head probe past a
+/// gap does. It is not deferred: it reaches the receiver, which answers it without staging.
+/// No `append_deferred_during_install` (live probes from node 1 are past the gap too), the
+/// install finishes with `deferred` 0, nothing fences, and node 3 is rebuilt.
+/// Cut: `append_deferred` without its contiguity check, red (the probe is deferred).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_head_probe_past_the_gap_reaches_the_receiver_during_an_install() {
+    const METHOD: &str =
+        "t61_pr204_a_head_probe_past_the_gap_reaches_the_receiver_during_an_install";
+    use super::snapshot::SnapshotPull;
+    use rdb_core::contracts::digest::Domain;
+    use rdb_core::contracts::envelope::EnvelopeHeader;
+    use rdb_core::contracts::ids::{CorrelationId, LeaseId, MessageId};
+    use rdb_core::contracts::storage::Write;
+    use rdb_core::contracts::transport::{Frame, PeerLabel};
+    use rdb_core::contracts::txn::Outcome;
+    use rdb_core::contracts::version::ENVELOPE_VERSION;
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let boot = trio.nodes[0].0.boot;
+    let three = &mut trio.nodes[2].0;
+    let install = three.installs.get(&p).expect("node 3 installs");
+    assert!(install.begun, "the install owns the partition");
+    let lineage = install.offer.lineage;
+    let pull = SnapshotPull {
+        partition: p,
+        generation: lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    let receiver = three
+        .replication
+        .receiver(three.node, p)
+        .expect("a receiver");
+    assert_eq!(receiver.lineage(), lineage, "the install's lineage");
+    let head = receiver.applied_head();
+    let config = receiver.config().config_version;
+    let seq = head.seq.0 + 2;
+    let mut env = ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: p,
+            generation: lineage.generation,
+            config_version: config,
+            owner_epoch: lineage.owner_epoch,
+            seq: Seq(seq),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: head.digest,
+        request_identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+        conditions_result: Vec::new(),
+        mutations: vec![Write {
+            ns: Namespace::User,
+            key: Bytes::from_static(b"during-install"),
+            value: Some(Bytes::from_static(b"v")),
+        }],
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    };
+    env.record_digest = env.compute_record_digest().expect("digest");
+    three.handle(Msg::Frame {
+        partition: p,
+        correlation: CorrelationId(0),
+        from: PeerLabel {
+            node: NodeId(1),
+            boot,
+            authenticated: true,
+        },
+        frame: Frame {
+            id: MessageId(u32::MAX - 1),
+            protocol: ENVELOPE_VERSION,
+            config,
+            sender: lineage,
+            body: env.encode().expect("encode"),
+        },
+    });
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    rebuilt(&mut trio, METHOD, floor);
+    let failed = logged!(METHOD, "commit_failed");
+    assert!(failed.is_empty(), "{failed:?}");
+    let deferred = logged!(METHOD, "append_deferred_during_install");
+    assert!(deferred.is_empty(), "{deferred:?}");
+    let done = logged!(METHOD, "snapshot_transfer_installed");
+    assert_eq!(done[0]["deferred"], 0, "{done:?}");
+}
+
 /// Issue #61 PR #204 review, an append during an install: as S2-R1, node 1 holds the pull for
 /// page 1, so node 3's install has begun and owns the partition. An ordinary append of the
 /// install's lineage then reaches node 3, contiguous with its receiver's head (seq 1 on the
 /// root, built as `trio::write_chain_in` builds a record, since the trimmed history holds no
 /// record the receiver could take). It is not staged: one
 /// `append_deferred_during_install{seq = 1}`, no `commit_failed`, and the install finishes
-/// with `deferred` at least 1 (a live append R1 sends meanwhile is dropped too). Writes go on after it: node 3 is promoted and a put is durable on it,
+/// with `deferred` at least 1 (a live append contiguous with that head is deferred too; one
+/// past it is not: `t61_pr204_a_head_probe_past_the_gap_reaches_the_receiver_during_an_install`). Writes go on after it: node 3 is promoted and a put is durable on it,
 /// past `S`.
 /// Cut: the drop at `Msg::Frame` delivery removed, red (the receiver stages the append, the
 /// engine's installing guard answers `WriteFailed`: `commit_failed` on node 3).
