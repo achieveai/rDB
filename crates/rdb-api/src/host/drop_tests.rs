@@ -9268,6 +9268,7 @@ fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
         .entries_after(None, owner.snapshot_page_keys)
         .expect("page 0");
     let replay = SnapshotChunk {
+        from: owner.node,
         partition: p,
         generation: offer.lineage.generation,
         at: offer.at,
@@ -9308,6 +9309,149 @@ fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
     trio.nodes[0].0.snapshot_pages_held_from = None;
     trio.nodes[0].0.snapshot_pull(pull);
     rebuilt(&mut trio, METHOD, floor);
+}
+
+/// Issue #61 (#214 folded in), snapshot senders: as S2-R1, node 1 holds the pull for page 2,
+/// so node 3's install stands at two pages. Node 2, a certified member that is not the
+/// primary, then tries three forgeries, each well formed but its own:
+///
+/// 1. page 2 to node 3, built from node 1's view and chained onto node 3's install, from node
+///    2: dropped `snapshot_chunk_dropped{why = not_the_source}`;
+/// 2. an offer for copy 3 naming node 2 itself: refused `not_primary`;
+/// 3. a pull of copy 3's next page naming node 2: dropped
+///    `snapshot_pull_dropped{why = not_the_planned_receiver}`, and nothing is sent.
+///
+/// Node 3's install (cursor, chain, entries, pages) and node 1's transfer (pages) are
+/// unchanged, and the rebuild then completes from node 1. (The net layer refuses each of these
+/// messages first when the claimed node is not the sender's certificate:
+/// `a_snapshot_message_is_held_to_its_certificate_label`.)
+/// Cuts: no source check in `snapshot_chunk`, red (the forged page is written); no primary
+/// check in `offer_check`, red (the forged offer replaces the install); no receiver check in
+/// `snapshot_pull`, red (the pull is not dropped `not_the_planned_receiver`).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_non_primary_cannot_forge_an_offer_a_page_or_a_pull() {
+    const METHOD: &str = "t61_pr204_a_non_primary_cannot_forge_an_offer_a_page_or_a_pull";
+    use super::snapshot::{chunk_chain, SnapshotChunk, SnapshotOffer, SnapshotPull};
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let offer = install.offer.clone();
+    let state = |trio: &Trio| {
+        let install = trio.nodes[2]
+            .0
+            .installs
+            .get(&p)
+            .expect("the install stands");
+        (
+            install.offer.clone(),
+            install.after.clone(),
+            install.chain,
+            install.entries,
+            install.chunks,
+            trio.nodes[0].0.transfers[&(p, offer.copy)].pages,
+        )
+    };
+    let before = state(&trio);
+    assert_eq!(before.4, 2, "two pages written");
+    let owner = &trio.nodes[0].0;
+    let page = owner.transfers[&(p, offer.copy)]
+        .view
+        .entries_after(
+            before.1.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
+            owner.snapshot_page_keys,
+        )
+        .expect("page 2");
+    assert!(!page.is_empty(), "page 2 has entries");
+    let forged_page = SnapshotChunk {
+        from: NodeId(2),
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        chain: chunk_chain(before.2, &page),
+        after: before.1.clone(),
+        entries: page,
+        done: false,
+    };
+    trio.nodes[2]
+        .0
+        .snapshot_chunk(forged_page)
+        .expect("no fault");
+    let forged_offer = SnapshotOffer {
+        from: NodeId(2),
+        boot: trio.nodes[1].0.boot,
+        ..offer.clone()
+    };
+    trio.nodes[2].0.snapshot_offer(forged_offer);
+    let forged_pull = SnapshotPull {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        node: NodeId(2),
+        after: before.1.clone(),
+        prev: before.2,
+    };
+    trio.nodes[0].0.snapshot_pull(forged_pull);
+    assert_eq!(state(&trio), before, "nothing changed");
+    let whys = |message: &str| -> Vec<String> {
+        logged!(METHOD, message)
+            .iter()
+            .map(|line| {
+                line["why"]
+                    .as_str()
+                    .or(line["reason"].as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(whys("snapshot_chunk_dropped"), vec!["not_the_source"]);
+    let refused: Vec<String> = logged!(METHOD, "snapshot_offer_refused")
+        .iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| line["reason"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(refused, vec!["not_primary"]);
+    assert_eq!(
+        whys("snapshot_pull_dropped"),
+        vec!["not_the_planned_receiver"]
+    );
+    let pull = SnapshotPull {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        node: NodeId(3),
+        after: before.1,
+        prev: before.2,
+    };
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    // As `rebuilt`, less its no-refusal check: the forged offer's refusal is this row's claim.
+    trio.until("node 3 was rebuilt and released the transfer", |_| {
+        logged!(METHOD, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["copy"] == offer.copy.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert!(installed[0]["at"].as_u64() >= Some(floor), "{installed:?}");
+    for refused in ["snapshot_install_refused", "snapshot_catchup_unserved"] {
+        let lines = logged!(METHOD, refused);
+        assert!(lines.is_empty(), "{refused}: {lines:?}");
+    }
 }
 
 /// Issue #61 PR #204 review, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so

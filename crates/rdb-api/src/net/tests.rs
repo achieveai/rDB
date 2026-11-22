@@ -152,6 +152,7 @@ fn snapshot_msgs(reason: SnapshotRefusal) -> Vec<Msg> {
             prev: digest,
         }),
         Msg::SnapshotChunk(Box::new(SnapshotChunk {
+            from: NodeId(1),
             partition: PartitionId(1),
             generation: Generation(4),
             at: Seq(800),
@@ -1719,6 +1720,54 @@ fn a_sender_is_held_to_its_certificate_label() {
     for forged in [on_wire(frame_from(3)), on_wire(ask_from(3))] {
         let reason = super::sender_refused(&node2, &forged, &admin_apps()).expect("forged");
         assert!(reason.contains("node 3"), "{reason}");
+    }
+}
+
+/// Issue #61 (#214 folded in): each snapshot message is held to the sender's certificate. The
+/// offer and its pages name the source (node 1 here), a pull and a refusal the target (node 3).
+/// From node 1 the offer and the page pass and the pull and the refusal are refused; from
+/// node 3 the reverse; from node 2, a certified member naming neither, all four are refused,
+/// each naming the node it claimed. An app may send none of them.
+/// Cut: the snapshot arms removed from `sender_refused`, red (node 2's forgeries pass).
+/// Unit.
+#[test]
+fn a_snapshot_message_is_held_to_its_certificate_label() {
+    let on_wire = |msg: Msg| match wire::outbound(NodeId(4), msg) {
+        Ok(Outbound::Plain(wire)) => wire,
+        other => panic!("a plain message: {other:?}"),
+    };
+    let msgs: Vec<WireMsg> = snapshot_msgs(SnapshotRefusal::NotAhead)
+        .into_iter()
+        .map(on_wire)
+        .collect();
+    let names: Vec<&str> = msgs.iter().map(WireMsg::name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "snapshot_offer",
+            "snapshot_pull",
+            "snapshot_chunk",
+            "snapshot_offer_refused"
+        ]
+    );
+    let passes = |peer: u32| -> Vec<bool> {
+        msgs.iter()
+            .map(|msg| {
+                super::sender_refused(&Label::Node(NodeId(peer)), msg, &admin_apps()).is_none()
+            })
+            .collect()
+    };
+    assert_eq!(passes(1), vec![true, false, true, false], "from the source");
+    assert_eq!(passes(3), vec![false, true, false, true], "from the target");
+    assert_eq!(passes(2), vec![false; 4], "from neither");
+    for (msg, claimed) in msgs.iter().zip([1, 3, 1, 3]) {
+        let reason =
+            super::sender_refused(&Label::Node(NodeId(2)), msg, &admin_apps()).expect("forged");
+        assert!(reason.contains(&format!("node {claimed}")), "{reason}");
+        assert!(
+            super::sender_refused(&Label::App("pilot".to_owned()), msg, &admin_apps()).is_some(),
+            "an app sends {msg:?}"
+        );
     }
 }
 

@@ -1264,6 +1264,13 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         (Label::Node(_), WireMsg::Frame { from, .. }) => from.node,
         (Label::Node(_), WireMsg::PeerAsk { asker, .. } | WireMsg::CatchUp { asker, .. }) => *asker,
         (Label::Node(_), WireMsg::Landed { emitter, .. }) => *emitter,
+        // Issue #61: each snapshot message names its sender, so it is held to the certificate
+        // like a frame. The host's checks then read an authenticated node: the offer's primary,
+        // a page's source, and a pull's or a refusal's planned receiver.
+        (Label::Node(_), WireMsg::SnapshotOffer { offer, .. }) => offer.from,
+        (Label::Node(_), WireMsg::SnapshotChunk { chunk, .. }) => chunk.from,
+        (Label::Node(_), WireMsg::SnapshotPull { pull, .. }) => pull.node,
+        (Label::Node(_), WireMsg::SnapshotOfferRefused { refused, .. }) => refused.node,
         (Label::Node(_), _) => return None,
     };
     match peer {

@@ -153,6 +153,9 @@ pub struct SnapshotPull {
 /// One page of the source's view, answering a [`SnapshotPull`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotChunk {
+    /// The source's node. The net layer holds it to the sender's certificate, and the target
+    /// takes a page only from the node its install's offer came from.
+    pub from: NodeId,
     /// The partition.
     pub partition: PartitionId,
     /// The offer's generation, echoed (m-d): a chunk that does not match the install is dropped.
@@ -670,18 +673,27 @@ impl Host {
     /// A pull from the target: answer with the next page, or drop it when no transfer matches.
     pub(super) fn snapshot_pull(&mut self, pull: SnapshotPull) {
         let key = (pull.partition, pull.copy);
-        let matches = self.transfers.get(&key).is_some_and(|transfer| {
-            transfer.lineage.generation == pull.generation
-                && transfer.at == pull.at
-                && transfer.offer.is_none()
-        });
-        if !matches {
+        let why = match self.transfers.get(&key) {
+            None => Some("no_transfer"),
+            Some(transfer) if transfer.node != pull.node => Some("not_the_planned_receiver"),
+            Some(transfer)
+                if transfer.lineage.generation != pull.generation
+                    || transfer.at != pull.at
+                    || transfer.offer.is_some() =>
+            {
+                Some("mismatch")
+            }
+            Some(_) => None,
+        };
+        if let Some(why) = why {
             tracing::info!(
                 node = self.node.0,
                 partition = pull.partition.0,
                 copy = pull.copy.0,
                 generation = pull.generation.0,
                 at = pull.at.0,
+                from = pull.node.0,
+                why,
                 "snapshot_pull_dropped"
             );
             return;
@@ -741,6 +753,7 @@ impl Host {
         transfer.pages += 1;
         let done = !more;
         let chunk = SnapshotChunk {
+            from: self.node,
             partition: pull.partition,
             generation: pull.generation,
             at: pull.at,
@@ -805,7 +818,9 @@ impl Host {
             .transfers
             .get(&(refused.partition, refused.copy))
             .is_some_and(|transfer| {
-                transfer.lineage.generation == refused.generation && transfer.at == refused.at
+                transfer.node == refused.node
+                    && transfer.lineage.generation == refused.generation
+                    && transfer.at == refused.at
             });
         if ours {
             self.end_transfer(
@@ -1149,6 +1164,11 @@ impl Host {
             self.installs.insert(partition, install);
             return Ok(());
         }
+        if chunk.from != offer.from {
+            self.chunk_dropped(&chunk, "not_the_source");
+            self.installs.insert(partition, install);
+            return Ok(());
+        }
         // m-d: a target that re-adopted another lineage drops the install it held.
         let adopted = self
             .replication
@@ -1223,6 +1243,7 @@ impl Host {
             copy = chunk.copy.0,
             generation = chunk.generation.0,
             at = chunk.at.0,
+            from = chunk.from.0,
             why,
             "snapshot_chunk_dropped"
         );
