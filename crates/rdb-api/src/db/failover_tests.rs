@@ -484,6 +484,30 @@ fn logged(method: &str, message: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The promotes the planner committed, each logged once: `planner_promoted` when its grant
+/// was still held as the promote returned, `planner_promote_observed` when it lapsed during
+/// the promote. Under load the grant can lapse mid-promote, so a row that counts commits
+/// counts both (PR #171 review: `own81_sweep_restarts_after_freeze` logged the observed line
+/// once at load 31, and failed asserting the held one).
+fn promotes(method: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "planner_promoted" || line["@m"] == "planner_promote_observed")
+        .collect()
+}
+
+/// [`promotes`], polled until it holds at least `n` lines or 10 s (scaled) pass.
+fn promotes_at_least(method: &str, n: usize) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+    loop {
+        let lines = promotes(method);
+        if lines.len() >= n || Instant::now() >= deadline {
+            return lines;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// B1's allowance for one wave of promotes (`max_concurrent` at once): two looks, the
 /// `Fencing` write, the target's landing and the `Serving` commit, stretched by
 /// `RETCD_TEST_DEADLINE_SCALE` as a wait. Measured on this rig: see [`b1_bound`].
@@ -580,8 +604,8 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) {
         setup_alerts,
         "the running nodes stayed healthy: {alerts:?}"
     );
-    // The record moves at the commit; `planner_promoted` follows when the promote returns.
-    let promoted = logged_at_least(method, "planner_promoted", moving.len());
+    // The record moves at the commit; the promote's line ([`promotes`]) follows when it returns.
+    let promoted = promotes_at_least(method, moving.len());
     let mut moved: Vec<u64> = promoted
         .iter()
         .filter_map(|line| line["partition"].as_u64())
@@ -591,7 +615,7 @@ fn stopped_owner_every_partition_moves(method: &str, partitions: u32) {
     assert_eq!(
         moved,
         moving.iter().map(|p| u64::from(*p)).collect::<Vec<_>>(),
-        "one planner_promoted per moved partition: {promoted:?}"
+        "one promote line per moved partition: {promoted:?}"
     );
     let (app, _net, _links) = rig.app(&[NodeId(2), NodeId(3)]);
     for p in &moving {
@@ -718,7 +742,7 @@ fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
     let first = rig.record(1);
     let new_owner = first.owner;
     assert!(matches!(new_owner, NodeId(2 | 3)), "{first:?}");
-    let promoted = logged_at_least(METHOD, "planner_promoted", 1);
+    let promoted = promotes_at_least(METHOD, 1);
     assert_eq!(promoted.len(), 1, "the first failover: {promoted:?}");
     // A node that owned nothing held no grant: the failover is complete once the new owner
     // holds one at its own boot.
@@ -765,7 +789,7 @@ fn own81_a_second_failure_before_the_old_owner_restarts_is_not_failed_over() {
         second.is_empty(),
         "no decision against the new owner: {second:?}"
     );
-    let promoted = logged(METHOD, "planner_promoted");
+    let promoted = promotes(METHOD);
     assert_eq!(promoted.len(), 1, "no second promote: {promoted:?}");
 }
 
@@ -1152,11 +1176,25 @@ fn own81_d1_v9_off_by_default_then_a_planner_started_after_the_owner_died_fails_
 }
 
 /// R3 over real links: two planners that both believe they hold the grant sweep at once
-/// after node 1 stops. Each partition commits once: one sweep's promote lands, the other's
-/// reports it lost the race, and the generation rose by one.
+/// after node 1 stops. Each partition commits once and the generation rises by one. One
+/// sweep's promote lands. The other either reports it lost the race, or, when both promotes
+/// dropped the same node, answers Ok for that same commit (A-R448 case 3: "both answer Ok,
+/// each with the commit's generation and revision"). So the row counts the distinct
+/// generations of the Ok answers, not Ok answers (seen once under load in a full `--lib` run:
+/// two Ok answers, both at generation 3 and revision 51). Not the revision too: for one commit
+/// `control_revision` can be a later write at the same generation, so two answers to one
+/// commit may differ there. A second commit raises the generation again, so the distinct
+/// generations, the record's generation and the +1 below each catch it.
+/// Three guards stand between two sweeps and a second commit: the promote's `Fencing` CAS, F1's
+/// commit CAS on `partitions/` at the fence revision, and the node's lineage, which refuses a
+/// plan for a lineage it has moved past.
 /// Integration (~10 s): waits out the grant, then two sweeps.
-/// Cut: none in C1 code: the `Fencing` CAS in `promote_looked` decides it, and its own rows pin
-/// that. This row pins that the planner adds no second write around it.
+/// Cuts (PR #171 round 2): the `Fencing` CAS made unconditional: 3 of 3 green, one commit both
+/// sweeps answered Ok for. That CAS and F1's commit CAS both made unconditional: 6 of 9 red, every
+/// one at the record-equals-answers check (the late `Fencing` write put the record back to
+/// generation 2 while the answers named 3). So that check catches a double write. No cut short
+/// of the lineage refusal made a second commit. This row pins that the planner adds no second
+/// write around them.
 #[config_log::retcd_test]
 fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
     let rig = rig(3, None);
@@ -1187,13 +1225,20 @@ fn own81_r3_two_planners_sweeping_at_once_commit_each_partition_once() {
         assert!(Instant::now() < deadline, "no sweep acted");
         std::thread::sleep(Duration::from_millis(200));
     };
-    let committed: Vec<_> = answers
+    let commits: std::collections::BTreeSet<_> = answers
         .iter()
         .flatten()
-        .filter(|(partition, answer)| *partition == PartitionId(1) && answer.is_ok())
+        .filter(|(partition, _)| *partition == PartitionId(1))
+        .filter_map(|(_, answer)| answer.as_ref().ok())
+        .map(|promoted| promoted.generation)
         .collect();
-    assert_eq!(committed.len(), 1, "one commit: {answers:?}");
+    assert_eq!(commits.len(), 1, "one commit: {answers:?}");
     let after = rig.record(1);
+    let generation = commits.first().copied().expect("one commit");
+    assert_eq!(
+        after.generation, generation,
+        "the Ok answers name the commit: {after:?}"
+    );
     assert_ne!(after.owner, NodeId(1), "{after:?}");
     assert_eq!(
         after.generation.0,
@@ -1495,8 +1540,16 @@ fn own81_stopped_host_releases_its_planner_grant_and_another_fails_over() {
     until("node 1's partition moves", Duration::from_secs(60), || {
         rig.owner(1) != NodeId(1)
     });
-    let silent = logged_at_least(METHOD, "planner_node_silent", 1);
-    assert_eq!(silent[0]["node"], 1, "{silent:?}");
+    // Node 1 is judged silent; under load another node can be judged silent first, for a
+    // look that stalled (node 3 at load 31, PR #171 review), so the row looks for node 1's line
+    // and not at the first one.
+    let silent = logged(METHOD, "planner_node_silent");
+    assert!(
+        silent
+            .iter()
+            .any(|line| line["node"] == 1 && line["reason"] == "silent_and_expired"),
+        "{silent:?}"
+    );
     let released = logged(METHOD, "planner_grant_released_host_stopped");
     assert_eq!(released.len(), 1, "said once, not every poll: {released:?}");
 }
@@ -1696,7 +1749,11 @@ fn own81_promote_failure_warns_once() {
             .any(|(partition, answer)| partition.0 == p && answer.is_ok()),
         "{answers:?}"
     );
-    assert_eq!(said("planner_promoted").len(), 1);
+    let promoted: Vec<_> = promotes(METHOD)
+        .into_iter()
+        .filter(|line| line["partition"] == p)
+        .collect();
+    assert_eq!(promoted.len(), 1, "{promoted:?}");
     let recovered: Vec<_> = logged(METHOD, "planner_warn_recovered")
         .into_iter()
         .filter(|line| line["warn"] == "planner_promote_failed")
@@ -1849,7 +1906,7 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
         before.generation.0 + 1,
         "one new generation: {before:?} -> {after:?}"
     );
-    let promoted: Vec<_> = logged(method, "planner_promoted")
+    let promoted: Vec<_> = promotes(method)
         .into_iter()
         .filter(|line| line["partition"] == 1)
         .collect();
@@ -2142,7 +2199,8 @@ fn own81_a_grant_that_ran_out_before_the_promote_sends_no_fence() {
         .filter(|line| line["reason"] == "expired")
         .collect();
     assert_eq!(lost.len(), 1, "{lost:?}");
-    assert!(logged(METHOD, "planner_promoted").is_empty());
+    let promoted = promotes(METHOD);
+    assert!(promoted.is_empty(), "{promoted:?}");
 }
 
 /// #81, the planner grant re-check, case (b): the planner holds `planner/grant` on a held

@@ -327,8 +327,19 @@ struct Shared {
     /// `None` once [`Net::shutdown`] ran: a link accepted after that is aborted at once.
     link_tasks: Mutex<Option<Vec<tokio::task::AbortHandle>>>,
     /// Set by [`Net::shutdown`]: the listener's serve loop stops, and every connection it
-    /// accepted is shut down with it (`serve_with_incoming_shutdown`).
+    /// accepted is shut down with it (`serve_with_incoming_shutdown`). A link registering at
+    /// the same time reads it too ([`stopped`]): under the conns lock before it records its
+    /// connection, and under the routes lock before it publishes its route (PR #171 review).
     stop: tokio::sync::watch::Sender<bool>,
+    /// Run once by [`register`] between recording a connection and publishing its route: a row
+    /// holds a registration there while it runs [`Net::shutdown`].
+    #[cfg(test)]
+    between_conn_and_route: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Whether [`Net::shutdown`] has run.
+fn stopped(shared: &Shared) -> bool {
+    *shared.stop.borrow()
 }
 
 /// The remote backend of one process's [`Links`].
@@ -395,6 +406,8 @@ impl Net {
             on_boot: Mutex::new(None),
             link_tasks: Mutex::new(Some(Vec::new())),
             stop: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            between_conn_and_route: Mutex::new(None),
         });
         // Only a process with peers has a bound to prove: an app with none, or a node alone,
         // stays "no `Net` attached", always established, as before this guard.
@@ -783,6 +796,16 @@ impl Net {
         }
     }
 
+    /// An abort handle of each of this `Net`'s own tasks (serve, dials, release loop), so a row
+    /// can see each one end after [`Net::shutdown`]. Empty once `shutdown` has drained them.
+    #[cfg(test)]
+    fn own_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        lock(&self.tasks)
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect()
+    }
+
     /// Send an already-encoded client call, as [`Net::send`] does after `outbound`. Rows use it
     /// to send a call the far side cannot decode, which `outbound` never produces.
     #[cfg(test)]
@@ -875,6 +898,8 @@ impl Net {
             on_boot: Mutex::new(None),
             link_tasks: Mutex::new(Some(Vec::new())),
             stop: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            between_conn_and_route: Mutex::new(None),
         });
         Arc::new(Self {
             shared,
@@ -883,17 +908,28 @@ impl Net {
         })
     }
 
-    /// Bring a new link to `node` up at `boot` through `install`, replacing (and closing) any
-    /// live one. Returns its id and the frames it sends.
+    /// Bring a new link to `node` up at `boot` through [`register`], as a handshake does,
+    /// replacing (and closing) any live one. Returns its id (0 when refused after a shutdown)
+    /// and the frames it sends.
     pub(crate) fn link_up_unsocketed(
         &self,
         node: NodeId,
         boot: BootId,
     ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Envelope>) {
         let (tx, out) = unbounded_channel();
-        let conn = new_conn(&self.shared, Label::Node(node), tx);
-        install(&self.shared, node, &conn, boot);
-        (conn.id, out)
+        let conn = register(&self.shared, node, tx, boot);
+        (conn.map_or(0, |conn| conn.id), out)
+    }
+
+    /// Run `hook` once, inside the next registration, after its connection is recorded and
+    /// before its route is published.
+    pub(crate) fn hold_next_registration(&self, hook: impl FnOnce() + Send + 'static) {
+        *lock(&self.shared.between_conn_and_route) = Some(Box::new(hook));
+    }
+
+    /// How many connections this process holds.
+    pub(crate) fn conn_count(&self) -> usize {
+        lock(&self.shared.conns).len()
     }
 }
 
@@ -935,12 +971,26 @@ impl Drop for Net {
 /// Bring `conn` up as node `node`'s route, at `boot`; send what waited for it. A known peer
 /// back at another boot restarted: every node this process runs hears it as
 /// [`Msg::PeerBooted`] (#42, ruling A-R251), so the record owner can re-plan around it.
-fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
+///
+/// `false` when [`Net::shutdown`] has run: read under the routes lock, so a shutdown either
+/// finds this route published and frees it when it closes `conn`, or this finds it stopped.
+/// The route is then left as it is and `conn` closed; the caller ends the link.
+fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) -> bool {
     let (new_boot, previous, replaced) = {
         let mut routes = lock(&shared.routes);
+        if stopped(shared) {
+            drop(routes);
+            tracing::info!(
+                node = node.0,
+                conn = conn.id,
+                "net_link_refused_after_shutdown"
+            );
+            close(shared, conn, "this process's links shut down");
+            return false;
+        }
         let Some(route) = routes.get_mut(&node) else {
             tracing::warn!(peer = %conn.peer, "net_link_from_unknown_node");
-            return;
+            return true;
         };
         let previous = route.boot.replace(boot);
         route.refused = None;
@@ -981,6 +1031,27 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
             observer(node, boot);
         }
     }
+    true
+}
+
+/// A link to node `node` that said hello at `boot`: record its connection ([`new_conn`]), then
+/// publish it as the route ([`install`]). `None` when [`Net::shutdown`] ran first or in
+/// between: nothing is left recorded or routed, and dropping `tx` ends the stream.
+fn register(
+    shared: &Arc<Shared>,
+    node: NodeId,
+    tx: UnboundedSender<Envelope>,
+    boot: BootId,
+) -> Option<Arc<Conn>> {
+    let conn = new_conn(shared, Label::Node(node), tx)?;
+    #[cfg(test)]
+    {
+        let hook = lock(&shared.between_conn_and_route).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    install(shared, node, &conn, boot).then_some(conn)
 }
 
 /// Peer `node`, last seen at `old`, is back at `boot`: post [`Msg::PeerBooted`] to each node
@@ -1063,7 +1134,15 @@ fn accepted_streams(
     })
 }
 
-fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<Conn> {
+/// Record a new connection to `peer`. `None` once [`Net::shutdown`] has run, read under the
+/// conns lock: a shutdown either finds the connection recorded and closes it, or this finds it
+/// stopped and records nothing (`tx` is dropped, which ends the stream).
+fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Option<Arc<Conn>> {
+    let mut conns = lock(&shared.conns);
+    if stopped(shared) {
+        tracing::info!(%peer, "net_link_refused_after_shutdown");
+        return None;
+    }
     let conn = Arc::new(Conn {
         id: shared.next_conn.fetch_add(1, Ordering::Relaxed) + 1,
         peer,
@@ -1078,8 +1157,8 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
         probe_echoed: AtomicU64::new(0),
         answered_at: Mutex::new(Instant::now()),
     });
-    lock(&shared.conns).insert(conn.id, Arc::clone(&conn));
-    conn
+    conns.insert(conn.id, Arc::clone(&conn));
+    Some(conn)
 }
 
 /// Read `inbound` until it ends, handling each frame in order. A hold keeps frames back here
@@ -1709,8 +1788,8 @@ async fn dial_once(
             node.0, welcome.label
         ));
     }
-    let conn = new_conn(shared, Label::Node(node), tx);
-    install(shared, node, &conn, welcome.boot);
+    let conn = register(shared, node, tx, welcome.boot)
+        .ok_or_else(|| "this process's links shut down".to_owned())?;
     let reason = read(Arc::clone(shared), Arc::clone(&conn), inbound).await;
     close(shared, &conn, &reason);
     Ok(reason)
@@ -1813,12 +1892,17 @@ impl RdbNet for Service {
             }
             serving(&shared).await;
             let _ = tx.send(envelope(&Frame::Welcome(own_hello(&shared))));
-            let conn = new_conn(&shared, label.clone(), tx);
-            if let Label::Node(node) = &label {
-                install(&shared, *node, &conn, hello.boot);
+            let conn = if let Label::Node(node) = &label {
+                register(&shared, *node, tx, hello.boot)
             } else {
-                tracing::info!(peer = %label, conn = conn.id, "net_app_link_up");
-            }
+                let conn = new_conn(&shared, label.clone(), tx);
+                if let Some(conn) = &conn {
+                    tracing::info!(peer = %label, conn = conn.id, "net_app_link_up");
+                }
+                conn
+            };
+            // Refused: this process's links shut down while the link registered.
+            let Some(conn) = conn else { return };
             let reason = read(Arc::clone(&shared), Arc::clone(&conn), inbound).await;
             close(&shared, &conn, &reason);
         }

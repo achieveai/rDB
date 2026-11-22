@@ -408,8 +408,12 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   partition it still owns stops for good until that partition is moved too. Move each one. If
   the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
   those partitions can still be moved while it runs.
-- **A frozen node cannot lead again** in this release. It can start and hold copies once it owns
-  nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
+  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
+  a restart (a new boot) that owns nothing, a failover planner, where one runs
+  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
+  promoted again like any regular copy. With no planner running the frozen grant stays, and the
+  node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
@@ -420,8 +424,9 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again in this release, and the moved partition stays
-  paused until its other copy is back, because that copy was on the stopped node.
+  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
+  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  until its other copy is back, because that copy was on the stopped node.
 - **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
   ADR-rdb-0028): after a process restart, an owner with `Timeouts::live_readd` on heals with
   a majority of its copies.** The bullet above still holds after a host crash, and it holds
@@ -507,10 +512,14 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
 - **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
   flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
   other non-zero exit as a failure to report, not a restart to loop on.
-- `lr` supervises nothing. `lr status` shows such a node as `exited 75: restart wanted`, and
+- `lr` supervises nothing. `lr status` shows such a node as `stopped: restart wanted` (it reads
+  the printed `restart-wanted` line, not the exit status), and
   `lr start N` is the restart.
 - `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
   embedder asks the same.
+- Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
+  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
+  place, as below.
 
 **Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
 supervisor, restarts the node in place:
@@ -530,6 +539,10 @@ supervisor, restarts the node in place:
 4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
    at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
    held.
+5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
+   restart policy, say) restart it. The gateway does this.
+
+Drop before you reopen, so a node never has two `Db`s at once.
 
 A peer sees every link to the old boot end, and its dials refused while nothing listens. When
 the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and

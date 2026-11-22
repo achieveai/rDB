@@ -3036,7 +3036,8 @@ impl Db {
         *lock(&state) = HealState::Running;
         let waiting = Arc::clone(&self.opened.heal_waiting);
         // R5: the heal runs in the span of the open that started it, so its lines (`heal_retry`
-        // among them) reach that open's log and not an untagged one.
+        // among them) reach that open's log and not an untagged one (also issue #200, PR #171
+        // review).
         self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
             heal_in_turn(ctxs, state, waiting),
             tracing::Span::current(),
@@ -4792,31 +4793,15 @@ impl Db {
     }
 
     /// [`Self::restart_wanted`]'s control read: whether no `partitions/` record names one of
-    /// this `Db`'s nodes owner. A failed or late read is `false`.
+    /// this `Db`'s nodes owner ([`restart::owns_none_within`]). A failed or late read is
+    /// `false`, and a late one is aborted.
     fn owns_no_partition(&self) -> bool {
         let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
             tracing::warn!(error = "no control store", "db_restart_check_unread");
             return false;
         };
         let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
-        let (done, answer) = mpsc::channel();
-        rt.spawn(async move {
-            let _ = done.send(restart::owns_no_partition(&*store, &nodes).await);
-        });
-        match answer.recv_timeout(self.timeouts.read) {
-            Ok(Ok(none)) => none,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "db_restart_check_unread");
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    error = "partitions/ did not answer within the read timeout",
-                    "db_restart_check_unread"
-                );
-                false
-            }
-        }
+        restart::owns_none_within(&rt, store, nodes, self.timeouts.read)
     }
 
     /// Each node's state for `partition`, as [`Self::node_status`] answers for partition 1: in

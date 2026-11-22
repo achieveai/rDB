@@ -15,7 +15,7 @@
 #   scripts/local-rdb.sh move FROM TO                             [--run DIR]
 #   scripts/local-rdb.sh do "LINE"                                [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
-#   (status: a node "exited 75: restart wanted" asks for a restart, #81 V10; `start N` is it)
+#   (status: a node "stopped: restart wanted" asked for a restart, #81 V10; `start N` is it)
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
@@ -39,7 +39,8 @@
 #
 # lr supervises nothing. A node that exits 75 asks its supervisor for a restart (V10, #81: its
 # grant was frozen by a failover, or its host faulted, and it owns no partition); `status` shows
-# it as `exited 75: restart wanted`, and `start N` is the restart. With
+# it as `stopped: restart wanted` (read from its printed `restart-wanted` line, not its exit
+# status), and `start N` is the restart. With
 # `LR_NODE_ARGS=--failover` the nodes run the automatic-failover planner.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
@@ -652,7 +653,7 @@ status() {
         if os_pid_is "$os" rdb_node; then state="running pid $os"
         # V10 (#81): the node asked its supervisor for a restart. lr supervises nothing; `start N`
         # stands in for the supervisor.
-        elif grep -q "^rdb_node restart-wanted" "$RUN/out/node-$n.out" 2>/dev/null; then state="exited 75: restart wanted"
+        elif grep -q "^rdb_node restart-wanted" "$RUN/out/node-$n.out" 2>/dev/null; then state="stopped: restart wanted"
         else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
             "$(last_line "$n" "$state")" \
