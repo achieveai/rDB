@@ -409,8 +409,13 @@ kernel's admission check (`envelope_bytes`) could see it.
 ### Size limits
 
 Every limit below is checked by the `Db` before anything is compiled or sent (#148). Over one,
-the call is refused with `TOO_LARGE`, `retry: Definitive` and `no_mutation: true`, and nothing is
-written. The same call fails the same way, so make it smaller. `ApiError::too_large()` returns a
+the call is refused with `TOO_LARGE` and `retry: Definitive`, and nothing is written. A read, or a
+write under a fresh request id (`put`, `put_in`, `txn`, `write`, `write_in`), also answers
+`no_mutation: true`. A write under the caller's request id (`put_as`, `txn_as`, `write_as`,
+`write_as_in`) answers `no_mutation: false`: this send wrote nothing, but an earlier send under
+that id may have applied, so ask `status` with it. A `resend` carries a request already compiled
+and is checked against no limit here; it answers `no_mutation: false` on every refusal. The same
+call fails the same way, so make it smaller. `ApiError::too_large()` returns a
 `TooLarge { limit, size, max }`: which limit, the size the call carried, and the maximum.
 
 | Limit (`rdb_api::Limit`) | Constant | Maximum | Applies to |
