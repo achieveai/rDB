@@ -145,10 +145,12 @@ plus ids still linked).
     formation record; when N is already removed ("node N is already removed; ids are never
     reused"); when N is not a live member; when fewer than 3 distinct live machines would be
     left (N-2, `MIN_MACHINES`); or when a `partitions/` record names N owner or pins a copy on
-    it ("node N is still pinned by partitions [...]: run admin drain N first"). Then it writes
-    one CAS at the revision it read. It lists `partitions/` again afterwards and logs
-    `remove_node_still_pinned` for any record that pins N (a move that committed in between,
-    S-2).
+    it:
+    "node N is still pinned by partitions [...]: run admin drain N first, or, if node N is
+    down, wait until its copies are dropped (about Timeouts::unreachable_drop_after, or
+    failover's promote) and run this again". Then it writes one CAS at the revision it read.
+    It lists `partitions/` again afterwards and logs `remove_node_still_pinned` for any record
+    that pins N (a move that committed in between, S-2).
 
 13. **A removed node loses its links, and K shrinks (B-2, R8-7).** `Net::set_members` sets
     the members first, then drops each retired node's route and closes every connection to
@@ -187,8 +189,43 @@ plus ids still linked).
     spanning them. remove-node's re-list reports it as `remove_node_still_pinned`. This is
     informational: the pin heals by itself (Consequences).
 
-<!-- TODO (S4, not yet built): drain; rebalance; the `rdb_dev` verbs and their
-`--unreachable-ok` flag; the `scripts/docker-multihost.sh` commands. -->
+18. **A partition below 3 copies is refilled (A-R456 narrowed by the lead, 2026-11-21:
+    refill).** A refill is an add-only host step (`Host::refill_step`). No copy leaves, and
+    the owner does not change. Moves keep A-R456 as it is.
+    - **When.** Only while the partition has fewer than 3 regular copies (RF), and only by
+      the pinned primary.
+    - **Onto what.** The target must be a live member of the owner's `Net` (its `nodes/`
+      record has reached the owner), hold no copy of the partition, and sit on a machine no
+      copy of it uses. `Db::refill_in` checks the record and the machine before sending; the
+      owner re-checks membership and the free slot on its own committed configuration, so a
+      stale read cannot put two copies in one slot.
+    - **How.** Two re-plans, as a move's are. The first pins the target as a shadow at its
+      live boot (`Host::refill_shadow`). Once it has caught up, `Host::shadow_duty` pins it
+      regular in the free slot.
+    - **Given up** as a move's shadow is, and the next ask says why, once, in refill wording
+      ("the refill of node T into partition P was given up: ..."):
+      - unreachable past the drop clock (`Host::shadow_give_up_duty`);
+      - no progress past the catch-up bound (`Host::move_lag_duty`).
+    - **Refused, changing nothing.** Each refusal is logged `refill_refused` with its `guard`
+      and ends with `error::REFILL_STEP`.
+    - **Rebalance plans refills first.** `admin::rebalance` refills the lowest partition below
+      RF onto the first of `refill_candidates` before it plans any copy move, and reports it
+      in `RebalanceReport::refilled`. A refill counts against `max_moves`.
+    - **Drain's last step is "rebalance again"**, so a drain refills each partition its
+      promotes left below RF (`admin::drain`, step 4).
+    - **A left-out target is skipped.** A new or restarted owner's `Host::restore_left_out`
+      re-seats a partition's first-placement nodes that hold no copy as left out. The owner
+      refuses a refill onto such a node (guard `left_out`). Rebalance skips it, logs
+      `rebalance_refill_skipped`, and tries the next candidate; any other refusal still ends
+      the run. With none left, the partition is a `no_refill_target` residual naming the held
+      node. The recovery is a restart of that node: it "comes back only by its own restart"
+      (`error::REFILL_LEFT_OUT`). Narrowing the guard is #207, a follow-up.
+    - **The wire.** `WireCall::Refill` is a new variant, added last, under the same
+      protocol-version placeholder bump as `members_revision` (item 10). The `admin_apps`
+      gate covers it.
+
+<!-- TODO (S4, not yet built): the `rdb_dev` verbs and their `--unreachable-ok` flag; the
+`scripts/docker-multihost.sh` commands. -->
 
 ## Consequences
 
@@ -245,7 +282,18 @@ plus ids still linked).
 - **A removed node keeps the shared `rdb` rEtcd principal** (Q5 b). Only rDB links refuse
   it. It could still write control records.
 
-<!-- TODO (S4): rebalance after an add, drain before a remove, and the copy-skew limit. -->
+- **After a lost host or a drain, run rebalance to get back to 3 copies.** Nothing refills
+  on a new node by itself: failover keeps a partition writable on fewer copies, and only
+  `rebalance` (or `drain`, which ends with it) adds copies back. A restarted node still
+  rejoins by itself (item 5).
+- **A dead host is removed, not drained.** Drain needs the node to answer. Once failover has
+  moved ownership and the drop clock has taken the dead node's copies out, `remove_member`
+  with it in `unreachable_ok`, then `rebalance`, refills its partitions to 3. Until then the
+  remove is refused as still pinned.
+- **A refill can be held up by a left-out node until that node restarts** (#207). The report
+  says so, naming the node.
+- **Copy skew is at most 1 after rebalance.** Before one, a formed ring can be uneven by up
+  to 3 copies per node on 6 or more nodes, and by 2 on 5.
 
 ## Verification
 
@@ -364,6 +412,11 @@ In `crates/rdb-api/src/admin/membership/tests.rs`:
 - `s80s4_start_check_skips_a_removed_peer_and_still_refuses_an_unknown_one` (unit). Cuts: no
   skip; and a removed id still counted as a lower id that must be given.
 
+The pinned refusal in
+`s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_machines`
+asserts both ways on: "run admin drain 2 first" and "if node 2 is down, wait until its copies
+are dropped".
+
 Also in `crates/rdb-api/src/db/s80s4_tests.rs`:
 
 - `s80s4_a_removed_node_loses_its_links_and_k_shrinks` (six processes). Cut: `set_members`
@@ -391,10 +444,38 @@ In `crates/rdb-api/src/db/s80s3_tests.rs`, the remove race:
   (`move_given_up`); heal 10.5-16.0 s, slowest put 0.2-5.0 s. Cut: `shadow_give_up_duty` gives
   nothing up; red "partitions [2] still pin removed node 2 after 60.6s".
 
+Refill, rebalance and drain. In `crates/rdb-api/src/host/drop_tests.rs`:
+
+- `s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one`. Cut: no
+  left_out check; red, the refill taken onto the dead node.
+- `s80s4_a_refill_that_makes_no_progress_is_given_up_and_another_node_refills`. Cut: refill
+  not in `move_lag_duty`; red, node 4 still catching up after 20 s of host time.
+- `s80s4_a_refill_whose_shadow_is_unreachable_is_given_up_and_another_node_refills`. Cut:
+  `shadow_give_up_duty` does not mark the refill; red, refused left_out instead of given up.
+
+In `crates/rdb-api/src/db/s80s4_tests.rs` and `s80s3_tests.rs`:
+
+- `s80s4_rebalance_after_adding_a_node_ends_with_copy_skew_at_most_one` (M10).
+- `s80s4_rebalance_on_the_formed_ring_ends_with_copy_skew_at_most_one` (M10b: 5 nodes, 17
+  partitions, copy skew 2 at the start). Cut: plan but run no copy steps; red on the skew
+  assert.
+- `s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_off`
+  (M11, six node processes; 1 skip and 2 refills each run). Cuts: no skip, red with the
+  left-out refusal; no refill phase, red with `partitions/2` on two regular copies.
+- `s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_on`
+  (M11, failover on; planner promotes counted by generation). Cut: no owner re-read and no
+  lost-CAS-as-done; red.
+
+In `crates/rdb-api/src/admin/drain.rs`:
+
+- `s80s4_drain_targets_refuse_before_the_freeze_for_each_s1_reason` (unit).
+
 Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
 `PROTOCOL_VERSION` instead of pinning a number, because the bump changed what it pinned.
 
-<!-- TODO (S4): rows for rebalance, drain, and the Docker add d6 / remove d2 run (D2). -->
+<!-- TODO (S4): row 2, `s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three`
+(a dead host removed, then refilled), with its cut; row 4 (normal vs `promote: true`); the
+#207 count on a plain 4-node rig; and the Docker add d6 / remove d2 run (D2). -->
 
 ## References
 
@@ -407,6 +488,9 @@ Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
 - `docs/rdb/embed.md`, section 4, "When a host is lost: automatic failover".
 - `crates/rdb-api/src/admin/membership.rs` (S4): `add_member`, `remove_member`,
   `membership_settled`, `add_node`, `remove_node`, `MIN_MACHINES`; `admin::read_removed_nodes`.
+- `crates/rdb-api/src/admin/balance.rs` (S4): `rebalance`, `RebalanceOpts`,
+  `RebalanceReport`, `refill_candidates`; `admin/drain.rs`: `drain`, `drain_targets`,
+  `freeze_grant`; `Db::refill_in`, `Host::refill_step`, `WireCall::Refill`.
 - `crates/rdb-core/src/authority/node.rs` (S4): `NodeRecord::encode_removed`,
   `NodeRecord::decode_removed`.
 - S4 also: `Db::removed` (`db.rs`); `admin::own_removed_refusal`, `admin::removed_node_text`

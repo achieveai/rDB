@@ -574,8 +574,10 @@ The node you remove is asked too, so a stopped node can be removed only if you n
 `unreachable_ok`.
 
 **A remove is refused** when node N is already removed, is not a live member, would leave
-fewer than 3 distinct machines, or still owns or holds a copy of a partition ("run admin
-drain N first").
+fewer than 3 distinct machines, or still owns or holds a copy of a partition: "node N is still
+pinned by partitions [...]: run admin drain N first, or, if node N is down, wait until its
+copies are dropped (about Timeouts::unreachable_drop_after, or failover's promote) and run
+this again".
 
 **A late pin heals by itself.** A re-plan built before the remove and committed after it can
 still name the removed node; the remove logs `remove_node_still_pinned`. Nothing is needed
@@ -583,7 +585,41 @@ from you, and running the remove again is refused because the node is already re
 about 10 to 16 s the owner drops the removed node from those partitions. Writes to them may
 pause until then, inside the 15 s lost-host bound.
 
-<!-- TODO (S4): drain and rebalance. -->
+**Getting back to 3 copies: `admin::rebalance`.** After a host is lost, failover keeps each
+partition writable on the copies left, but nothing adds a copy on another node by itself. (A
+restarted node still rejoins by itself.) Run `admin::rebalance(db, rt, store, &opts)`. It
+first refills every partition below 3 copies onto a node that holds none of its copies, on a
+machine none of them uses. Then it moves copies until no node holds more than one copy more
+than another. A refill adds a copy; it never removes one, and the owner stays.
+
+**Draining before a remove: `admin::drain`.** `admin::drain(db, rt, store, node)` moves every
+copy off the node, promotes another owner for each partition it owned, and ends with a
+rebalance, which refills to 3 copies. Then `admin::remove_member` can take the node out.
+
+**Removing a host that died.** Drain is for a node that still runs: it needs the node to
+answer. For a dead host:
+
+1. Wait for failover. It moves ownership off the dead node, and the drop clock takes the dead
+   node's copies out, within about 10 to 16 s. Until then the remove is refused with "...
+   if node N is down, wait until its copies are dropped ... and run this again".
+2. Call `admin::remove_member` with the dead node named in `unreachable_ok`.
+3. Call `admin::rebalance`. It refills each partition the dead node held back to 3 copies.
+
+Upgrade the dead node before you ever restart it. As a removed node it will not start anyway
+(`rdb_node` exits 2).
+
+**Reading the report.** `RebalanceReport::refilled` and `moved` list what was done.
+`residuals` lists what is still not met, in plain words:
+
+- `no_refill_target: ...: the budget ran out; run the rebalance again`: `max_moves` was
+  reached. Run it again.
+- `no_refill_target: ...: no ok node without a copy sits on an unused machine`: add a node on
+  a new machine, then run it again.
+- `no_refill_target: ...: node N is held as left out by partition P's owner ...; a restart of
+  node N re-adds it`: **restart node N**, then run the rebalance again. This is the only case
+  that needs a restart (#207).
+- `no_live_handoff: ...`: a primary move that rebalance never runs; ownership stays where it
+  is.
 
 **Upgrade the whole cluster first, apps included.** This is the same one-way, whole-cluster
 upgrade as in "Known limits in this release" ("This build's upgrade is one-way ..."). The S4
@@ -1523,7 +1559,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   `scripts/docker-multihost.sh`'s Docker proof (#80 S2), each container on its own IP, all on
   one physical host. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
-  Copies are uneven by up to 3 per node when K does not divide P. A node can be added and
+  After `admin::rebalance`, copy skew is at most 1. Before a rebalance, a formed ring can be
+  uneven by up to 3 copies per node on 6 or more nodes, and by 2 on 5. A node can be added and
   removed (section 4, "Adding and removing a node"). Ids are never reused, so a database has
   8 node ids for its whole life. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node
   process started on a folder of a database that was neither formed nor declared is still
