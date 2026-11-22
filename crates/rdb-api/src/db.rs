@@ -3119,6 +3119,33 @@ impl Db {
     }
 
     fn call(&self, partition: PartitionId, call: ClientCall, wait: Duration) -> Option<Answer> {
+        self.call_by(partition, call, wait, None)
+    }
+
+    /// [`Self::call`], under one `deadline` when given (#170 review r8): the dispatch, a
+    /// refresh of the owner and its resend, and the answer all wait only the time left before
+    /// it, never a fresh `wait` each. The owner still mid-restart when it passes is refused
+    /// ([`feed_restarting`]), nothing sent; `wait` only names the timeout in that refusal.
+    /// Without one, the dispatch waits out a restart, a refresh waits its own read timeout and
+    /// the answer `wait`, as before.
+    fn call_by(
+        &self,
+        partition: PartitionId,
+        call: ClientCall,
+        wait: Duration,
+        deadline: Option<Instant>,
+    ) -> Option<Answer> {
+        let left = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
+        let send = |owner: NodeId, call: ClientCall| match deadline {
+            None => self
+                .send_call(owner, partition, call)
+                .map_err(|_| Unsent::Stopped),
+            Some(deadline) => self.send_call_within(owner, partition, call, left(deadline)),
+        };
+        let refresh = || match deadline {
+            None => self.refresh_owner(partition),
+            Some(deadline) => self.refresh_owners_by(&[partition], deadline),
+        };
         let mut owner = self.route.owner_of(partition);
         // A `Db` that can look again keeps a copy for one resend: when the owner cannot be
         // reached it may have been promoted away by another process, which told nobody here
@@ -3126,15 +3153,22 @@ impl Db {
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
         let carried = carries(&call);
-        let mut sent = self.send_call(owner, partition, call);
-        if let (Err(_), Some(call)) = (&sent, spare) {
-            self.refresh_owner(partition);
+        let mut sent = send(owner, call);
+        if let (Err(Unsent::Stopped), Some(call)) = (&sent, spare) {
+            refresh();
             let now = self.route.owner_of(partition);
             if now != owner {
                 tracing::info!(was = owner.0, owner = now.0, "db_call_rerouted");
                 owner = now;
-                sent = self.send_call(owner, partition, call);
+                sent = send(owner, call);
             }
+        }
+        // Review r8: still mid-restart when the deadline passed; nothing was sent to it.
+        if let Err(Unsent::Restarting) = sent {
+            return Some(Answer::Error {
+                error: feed_restarting(owner, wait),
+                request: None,
+            });
         }
         let Ok(answer) = sent else {
             // An owner in another process with no link up is unavailable, not a host fault:
@@ -3149,10 +3183,10 @@ impl Db {
                 request: None,
             });
         };
-        match answer.recv_timeout(wait) {
+        match answer.recv_timeout(deadline.map_or(wait, left)) {
             Ok(answer) => {
                 if refusal_kind(&answer).is_some_and(rereads_owner) {
-                    self.refresh_owner(partition);
+                    refresh();
                 }
                 Some(answer)
             }
@@ -3183,6 +3217,11 @@ impl Db {
     /// call inside the gap goes on with the owner the last read named. A read that fails keeps
     /// the owner it had and logs why: the next such answer past the gap reads again.
     fn refresh_owners(&self, partitions: &[PartitionId]) {
+        self.refresh_owners_by(partitions, Instant::now() + self.timeouts.read);
+    }
+
+    /// [`Self::refresh_owners`], waiting only until `deadline` (#170 review r8).
+    fn refresh_owners_by(&self, partitions: &[PartitionId], deadline: Instant) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
         };
@@ -3220,7 +3259,6 @@ impl Db {
                 }
             }
         });
-        let deadline = Instant::now() + self.timeouts.read;
         for _ in &due {
             let answer = read.recv_timeout(deadline.saturating_duration_since(Instant::now()));
             match answer {
@@ -3395,12 +3433,14 @@ impl Db {
     /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
     /// copy is left out). A call waiting on that read when the node stops cleanly is answered at
     /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
-    /// `UNAVAILABLE` also when no answer came within the read timeout, or
+    /// `UNAVAILABLE` also when no answer came within the read timeout, which is one deadline
+    /// from the call's start, whichever the source: the wait for a node mid-restart, a refresh
+    /// of the owner and its resend, and the answer all come out of it. Also when
     /// `Source::Node(n)` names a node in another process this one has no link up to
     /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped, or one that
     /// dropped the call unanswered, as one that stops with the call still queued does, or one
-    /// still mid-restart when the read timeout ends: the timeout covers the wait for the
-    /// restart too (all `RetryAfterRecovery`: read another copy now, or that node once it has
+    /// still mid-restart when the deadline passes, the owner too for `Source::Owner`
+    /// (all `RetryAfterRecovery`: read another copy now, or that node once it has
     /// restarted; after a failed restart, the refusal says so before that step). A node in
     /// another process whose link closed before its answer came may have read: that refusal
     /// names the link, says nothing was changed, and is `RetryAfterRecovery` too: another copy
@@ -3479,15 +3519,16 @@ impl Db {
             max,
         };
         let wait = self.timeouts.read;
+        // Review r7/r8: one deadline, taken here, covers every wait of the call, whichever the
+        // source: the dispatch (a node mid-restart included), the owner's refresh and resend,
+        // and the answer.
+        let deadline = Instant::now() + wait;
         let answer = match source {
-            Source::Owner => self.call(partition, call, wait),
+            Source::Owner => self.call_by(partition, call, wait, Some(deadline)),
             Source::Node(node) => {
-                // Review r7: one wait covers both the dispatch and the answer, so a node held
-                // mid-restart cannot hold the caller past it.
-                let started = Instant::now();
-                match self.send_call_within(node, partition, call, wait) {
-                    Ok(answer) => match answer.recv_timeout(wait.saturating_sub(started.elapsed()))
-                    {
+                let left = || deadline.saturating_duration_since(Instant::now());
+                match self.send_call_within(node, partition, call, left()) {
+                    Ok(answer) => match answer.recv_timeout(left()) {
                         Ok(answer) => Some(answer),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         // Review r6 (thread 4655953458): a local node took the call but dropped it

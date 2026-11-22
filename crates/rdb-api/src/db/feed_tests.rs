@@ -2587,3 +2587,82 @@ fn f87_3_a_finished_restart_leaves_the_next_restarts_mark() {
     assert!(b_boot > a_boot, "{b_boot:?} after {a_boot:?}");
     assert_eq!(marked(&db), None, "B's end cleared its own mark");
 }
+
+/// A hand-built `Db` whose nodes 1 (the owner) and 2 never answer on their own, read timeout
+/// `read`, with `target` marked mid-restart as `Db::restart_node` marks it. Returns the `Db`
+/// and `target`'s mailbox.
+fn marked_mid_restart(
+    rt: &tokio::runtime::Runtime,
+    read: Duration,
+    target: NodeId,
+) -> (Arc<Db>, mpsc::Receiver<Msg>) {
+    let (one, one_mailbox) = NodeHandle::unanswered(OWNER);
+    let (two, two_mailbox) = NodeHandle::unanswered(NodeId(2));
+    let timeouts = Timeouts {
+        read,
+        ..Timeouts::default()
+    };
+    let db = Arc::new(Db::by_hand(
+        vec![one, two],
+        store(),
+        rt.handle(),
+        timeouts,
+        None,
+    ));
+    lock(&db.nodes)
+        .iter_mut()
+        .find(|handle| handle.node == target)
+        .expect("the target node")
+        .restarting = Some(u64::MAX);
+    let mailbox = if target == OWNER {
+        one_mailbox
+    } else {
+        two_mailbox
+    };
+    (db, mailbox)
+}
+
+/// A feed call from `source` on its own thread; sends its answer and how long it took.
+fn timed_call(
+    db: &Arc<Db>,
+    source: Source,
+) -> mpsc::Receiver<(Result<FeedPage, ApiError>, Duration)> {
+    let (sent, answered) = mpsc::channel();
+    let db = Arc::clone(db);
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let answer = db.changes(PARTITION, FeedCursor::START, 10, source);
+        let _ = sent.send((answer, started.elapsed()));
+    });
+    answered
+}
+
+/// Review r8 (the r8 verdict's first blocker): an owner-routed feed call to an owner held
+/// mid-restart past the read timeout is refused within it, as a direct call is. Node 1, the
+/// owner, is marked mid-restart and stays so; a `Source::Owner` call, read timeout 1 s, is
+/// refused "node 1 is restarting in this process", `UNAVAILABLE`, `RetryAfterRecovery`, no
+/// mutation, with the stop step, and nothing reaches node 1's mailbox.
+/// Cut: the owner's dispatch waiting out the restart unbounded, red (no answer).
+/// Unit (~1 s): a `Db` built by hand.
+#[config_log::retcd_test]
+fn f87_3_a_owner_routed_call_to_an_owner_held_mid_restart_is_refused_within_its_wait() {
+    let rt = runtime();
+    let read = Duration::from_secs(1);
+    let (db, mailbox) = marked_mid_restart(&rt, read, OWNER);
+    let (answer, took) = timed_call(&db, Source::Owner)
+        .recv_timeout(read + crate::host::test_patience(Duration::from_secs(5)))
+        .expect("the call is answered while the owner is still mid-restart");
+    let error = answer.expect_err("the owner is mid-restart");
+    assert!(
+        error
+            .detail
+            .starts_with("node 1 is restarting in this process"),
+        "{error:?}"
+    );
+    stopped_refusal("the owner, mid-restart", &error);
+    assert!(took >= read, "refused after its wait, not before: {took:?}");
+    assert!(
+        mailbox.try_recv().is_err(),
+        "nothing was sent to the owner mid-restart"
+    );
+}
