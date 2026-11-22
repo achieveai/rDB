@@ -17,7 +17,8 @@
 //!   before its `Hello`), and it answers no peer's `Hello` (the accepted stream ends with no
 //!   `Welcome`), so no peer learns its boot. A link already up is left alone: pair it with
 //!   `mute`, whose silence closes that link at the peer's probe timeout, as the formation
-//!   rig's `Rig::mute` does. A node with `mute` alone still completes every handshake.
+//!   rig's `Rig::mute` does. Since #170, `mute` alone also dials nobody and answers no
+//!   handshake; `refuse-links` refuses links without silencing one already up.
 //!   Logged: each refused accept as `net_handshake_refused_by_fault{peer}` (info), once per
 //!   dial; a refused dial through the dial loop's `net_dial_failed{reason}` with reason
 //!   `fault refuse-links: ...`, once until its reason changes.
@@ -64,7 +65,8 @@ pub struct FaultSet {
     /// `refuse-links`: no handshake either way, dialled or accepted.
     pub refuse_links: bool,
     /// `mute`: every link reads nothing, answers no probe and writes nothing, as a stopped
-    /// process looks from outside (#81: the planner's silence test). Pair it with
+    /// process looks from outside (#81: the planner's silence test). It dials nobody and
+    /// answers no handshake, so a link it closed stays down until the line goes. Pair it with
     /// `cut-control` so the grant stops renewing too.
     pub mute: bool,
 }
