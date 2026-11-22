@@ -329,6 +329,9 @@ pub(crate) struct Install {
     pub(crate) chunks: u64,
     /// When the offer was accepted.
     pub(crate) started: std::time::Instant,
+    /// Ordinary appends of the offer's lineage not delivered while this install owned the
+    /// partition ([`Host::append_deferred`]).
+    pub(crate) deferred: u64,
 }
 
 impl Host {
@@ -925,6 +928,7 @@ impl Host {
             entries: 0,
             chunks: 0,
             started: std::time::Instant::now(),
+            deferred: 0,
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
@@ -1077,6 +1081,42 @@ impl Host {
         self.send_peer(install.offer.from, Msg::SnapshotPull(pull), "snapshot_pull");
     }
 
+    /// PR #204 review: whether `frame`, delivered for `partition`, is an ordinary append of the
+    /// lineage an install here owns, and so is not handed to the receiver. Staged, its commit
+    /// would meet the engine's installing guard (which stays) as `WriteFailed`, and R1 would
+    /// fence the partition for this boot. Dropped, it is not lost: R1's retransmit re-sends an
+    /// unacked record, and the re-seed's ACK at `S` walks `S + 1 ..= head`. Every other frame
+    /// is delivered: replies, recovery appends, other partitions, another lineage's appends.
+    ///
+    /// Queueing the frames for after the install was rejected: during a slow install (8.9 s
+    /// under load) the queue grows with the write rate, and on replay its entries are mostly at
+    /// or below `S`, stale by then. Logged once per install, `append_deferred_during_install`
+    /// with the first seq; the count rides `snapshot_transfer_installed{deferred}`.
+    pub(super) fn append_deferred(&mut self, partition: PartitionId, frame: &Frame) -> bool {
+        let Some(install) = self.installs.get_mut(&partition) else {
+            return false;
+        };
+        if frame.sender != install.offer.lineage
+            || rdb_core::replication::wire::classify(&frame.body)
+                != Some(rdb_core::replication::wire::R1Frame::Append)
+        {
+            return false;
+        }
+        install.deferred += 1;
+        if install.deferred == 1 {
+            let seq = ReplicationEnvelope::decode(&frame.body).map(|envelope| envelope.header.seq.0);
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = install.offer.lineage.generation.0,
+                at = install.offer.at.0,
+                seq = ?seq.ok(),
+                "append_deferred_during_install"
+            );
+        }
+        true
+    }
+
     /// A page reached this target: check its chain, write it, and pull the next or finish.
     pub(super) fn snapshot_chunk(&mut self, chunk: SnapshotChunk) -> Result<(), super::Fault> {
         let partition = chunk.partition;
@@ -1225,6 +1265,7 @@ impl Host {
             at = offer.at.0,
             entries = install.entries,
             chunks = install.chunks,
+            deferred = install.deferred,
             millis = u64::try_from(install.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "snapshot_transfer_installed"
         );

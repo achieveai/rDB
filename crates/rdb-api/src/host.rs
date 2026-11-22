@@ -3728,16 +3728,18 @@ impl Host {
                 frame,
             } => {
                 self.frames_received += 1;
-                let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
-                self.push(
-                    Site {
-                        partition,
-                        correlation,
-                    },
-                    kind,
-                    false,
-                    None,
-                );
+                if !self.append_deferred(partition, &frame) {
+                    let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
+                    self.push(
+                        Site {
+                            partition,
+                            correlation,
+                        },
+                        kind,
+                        false,
+                        None,
+                    );
+                }
                 Ok(())
             }
             Msg::PeerAsk {
