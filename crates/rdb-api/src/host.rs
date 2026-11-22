@@ -75,6 +75,7 @@ use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::append::{
     record_batch, AppendReceiver, CatchUpPlan, Head, ReceiverInit,
 };
+use rdb_core::replication::progress::DigestLookup;
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
@@ -1304,7 +1305,9 @@ pub enum TailAdoption {
     /// A proof failed, named by one of [`ADOPTION_REFUSALS`]. The tail cannot come back.
     Refused(&'static str),
     /// Recorded by a refusal that did not run the adoption proofs (a landing's or a
-    /// survivor's own check). The next landing scan replaces it.
+    /// survivor's own check), or by one whose reason is not in [`ADOPTION_REFUSALS`]: check B's
+    /// `tail_has_no_floor` and `tail_history_read_failed` (#121), or a write that failed after
+    /// the proofs held. The next landing scan replaces it.
     Unchecked,
     /// Issue #61 (lead rulings R10 and R16, #61's protocol version): the proofs could not run because the
     /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
@@ -1315,8 +1318,11 @@ pub enum TailAdoption {
 
 impl TailAdoption {
     /// The state [`Host::adoption`]'s answer names. Issue #61's trimmed-history reasons
-    /// ([`ADOPTION_TRIMMED`]) are [`Self::Trimmed`] (lead ruling R16); any other reason outside
-    /// [`ADOPTION_REFUSALS`] (t4's check-B reasons) is [`Self::Unchecked`].
+    /// ([`ADOPTION_TRIMMED`]) are [`Self::Trimmed`] (lead ruling R16). Any other reason outside
+    /// [`ADOPTION_REFUSALS`], the wire vocabulary, is `Unchecked`, at adoption and at landing
+    /// alike (#153 lead ruling): as `Refused` it would not decode on a peer, so a status naming
+    /// it would close the link, and a bare `forget-tail` over it would need no
+    /// `--give-up-live-copy`.
     pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
@@ -1356,8 +1362,10 @@ pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"]
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
 pub const ADOPTION_NOT_READY: usize = 3;
 
-/// Every reason [`Host::adoption`] answers, [`TailAdoption::NotReady`]'s first
-/// ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Every reason [`Host::adoption`] answers that crosses the wire, [`TailAdoption::NotReady`]'s
+/// first ([`ADOPTION_NOT_READY`] of them). A reason crossing the wire must be one of these.
+/// Check B's two (`tail_has_no_floor`, `tail_history_read_failed`, #121) are not: a peer on an
+/// older build would refuse them, so they hold the tail [`TailAdoption::Unchecked`].
 pub const ADOPTION_REFUSALS: [&str; 11] = [
     "replay_not_ready",
     "tail_parent_copying",
@@ -2704,7 +2712,8 @@ enum PendingKind {
 }
 
 /// Why a node faulted, typed (A-R178): every waiter is refused with [`Fault::error`], and every
-/// call after with [`Fault::refusal`]. A view that read stored damage refuses as
+/// call after with [`Fault::refusal`], except a status query, which gets [`Fault::error`] (#136).
+/// A view that read stored damage refuses as
 /// `CORRUPT_HISTORY` (retry `Quarantine`), as a compile that decodes damage does; any other
 /// fault is [`ApiError::host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2724,7 +2733,9 @@ impl Fault {
 
     /// [`Self::error`] for a call that reached the node after it faulted: refused before
     /// admission, so it mutated nothing (#124, ruling Q15 (b)). Its retry rule is unchanged.
-    /// A call admitted before the fault keeps [`Self::error`].
+    /// A call admitted before the fault keeps [`Self::error`], and so does a status query after
+    /// it: it is about an earlier write that may have applied (#136). A resend takes this
+    /// refusal, as `Db::put`'s first send; `Db::resend` clears `no_mutation` itself.
     fn refusal(&self) -> ApiError {
         let mut error = self.error();
         error.no_mutation = true;
@@ -2907,6 +2918,12 @@ struct Host {
     ///
     /// [`COPY_BATCH_KEYS`]: rdb_storage::COPY_BATCH_KEYS
     snapshot_page_keys: usize,
+    /// PR #204 review: the most bytes one snapshot page carries, in
+    /// [`rdb_storage::snapshot_entry_bytes`]: [`SNAPSHOT_PAGE_BYTES`]. Rows set it lower to
+    /// reach a page cut by size with few keys.
+    ///
+    /// [`SNAPSHOT_PAGE_BYTES`]: snapshot::SNAPSHOT_PAGE_BYTES
+    snapshot_page_bytes: usize,
     /// Issue #61 S2-R3: flip one byte of the page with this index (0 is the first) this source
     /// sends, after its chain is computed. Rows only.
     #[cfg(debug_assertions)]
@@ -2915,6 +2932,11 @@ struct Host {
     /// can land writes past `S` first. Rows only.
     #[cfg(debug_assertions)]
     snapshot_offer_held: bool,
+    /// Issue #61 PR #204 review: while set, this source's next export fails once at its view
+    /// read (`snapshot_catchup_unserved{reason = view_failed}`), as a storage fault there would.
+    /// Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_export_fault: bool,
     /// Issue #61 S2-R2b: while set, this source answers no pull for a page at or past this
     /// index (0 is the first), so a row can stop a target mid-install. Rows only.
     #[cfg(debug_assertions)]
@@ -3237,10 +3259,13 @@ impl Host {
             transfers: BTreeMap::new(),
             installs: BTreeMap::new(),
             snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
+            snapshot_page_bytes: snapshot::SNAPSHOT_PAGE_BYTES,
             #[cfg(debug_assertions)]
             snapshot_chunk_fault: None,
             #[cfg(debug_assertions)]
             snapshot_offer_held: false,
+            #[cfg(debug_assertions)]
+            snapshot_export_fault: false,
             #[cfg(debug_assertions)]
             snapshot_pages_held_from: None,
             committed_correlation: BTreeMap::new(),
@@ -3735,16 +3760,18 @@ impl Host {
                 frame,
             } => {
                 self.frames_received += 1;
-                let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
-                self.push(
-                    Site {
-                        partition,
-                        correlation,
-                    },
-                    kind,
-                    false,
-                    None,
-                );
+                if !self.append_deferred(partition, &frame) {
+                    let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
+                    self.push(
+                        Site {
+                            partition,
+                            correlation,
+                        },
+                        kind,
+                        false,
+                        None,
+                    );
+                }
                 Ok(())
             }
             Msg::PeerAsk {
@@ -4082,8 +4109,17 @@ impl Host {
     fn answer_faulted(&self, msg: Msg, fault: &Fault) {
         match msg {
             Msg::Client(client) => {
+                // A status query is about an earlier write, which may have applied before the
+                // fault: its refusal must not say nothing was applied, or the step sends that
+                // write again as a new one (#136). A resend keeps the refusal: `Db::put` sends
+                // a compiled request first as a resend, and that first send was never admitted
+                // (#124, `m10_124_...`); `Db::resend` clears `no_mutation` for a real resend.
+                let error = match client.call {
+                    ClientCall::Status { .. } => fault.error(),
+                    _ => fault.refusal(),
+                };
                 let _ = client.reply.send(Answer::Error {
-                    error: fault.refusal(),
+                    error,
                     request: None,
                 });
             }
@@ -10729,21 +10765,8 @@ impl Host {
                 through.0
             ));
         }
-        let mut offered = Vec::new();
-        if let Some(through) = release.through {
-            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
-            // writable commit supersedes its tail for the next ordinary offer.
-            for (copy, node, head) in self.offer_holds_released(partition, through) {
-                offered.push(format!(
-                    "copy {} on node {}: seqs {}..={} given up for good",
-                    copy.0,
-                    node.0,
-                    cutoff.0 + 1,
-                    head.0
-                ));
-            }
-        }
-        given_up.extend(offered);
+        // PR #204 review: every check runs before any hold is released, so a refused
+        // combination leaves the held-copy warning standing.
         if release.no_intact_copy {
             let capped = self
                 .recoveries
@@ -10760,6 +10783,23 @@ impl Host {
                     ),
                 );
             }
+        }
+        let mut offered = Vec::new();
+        if let Some(through) = release.through {
+            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
+            // writable commit supersedes its tail for the next ordinary offer.
+            for (copy, node, head) in self.offer_holds_released(partition, through) {
+                offered.push(format!(
+                    "copy {} on node {}: seqs {}..={} given up for good",
+                    copy.0,
+                    node.0,
+                    cutoff.0 + 1,
+                    head.0
+                ));
+            }
+        }
+        given_up.extend(offered);
+        if release.no_intact_copy {
             given_up.push(
                 "no copy of the last writable generation has answered; records confirmed in \
                  that generation, up to an amount the system cannot see, are given up, for \
@@ -11154,7 +11194,42 @@ impl Host {
             );
             return;
         }
-        let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
+        // PR #204 review (item 13): a required copy this node is sending a snapshot to, with a
+        // page pulled within `SNAPSHOT_IDLE_MILLIS`, is being rebuilt, not stalled: the check
+        // waits another pin wait instead of naming a stall. A transfer left idle that long is
+        // abandoned (`transfer_duty`), so a dead one still reaches the line.
+        let now = self.clock.now();
+        let live: Vec<(u8, u64)> = watch
+            .required
+            .iter()
+            .filter_map(|copy| {
+                self.transfers
+                    .get(&(partition, *copy))
+                    .filter(|transfer| {
+                        HostClock::millis_until(transfer.touched, now)
+                            < snapshot::SNAPSHOT_IDLE_MILLIS
+                    })
+                    .map(|transfer| (copy.0, transfer.pages))
+            })
+            .collect();
+        if !live.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                transfers = ?live,
+                "rebuild_check_transfer_live"
+            );
+            self.delay(
+                now.plus_millis(self.rebuild_pin_wait_millis),
+                Delayed::RebuildCheck {
+                    partition,
+                    generation,
+                },
+            );
+            return;
+        }
+        let waited_ms = now.0.saturating_sub(watch.since.0);
         let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
         let phase = f1_phase
             .as_ref()
@@ -11682,6 +11757,29 @@ impl Host {
     /// copy links nothing, logs `land_inherit_refused{reason="inherit_below_floor"}` (warn),
     /// and marks its receiver refused for the generation ([`Replication::refuse_landing`]), so
     /// its `Recovered` anchors at the root and the copy is rebuilt by snapshot.
+    ///
+    /// PR #204 review (item 12): only when its receiver does not hold the cutoff with the
+    /// cutoff's digest. A refused receiver that does still anchors at the cutoff (a proven
+    /// prefix, `AppendReceiver::on_recovered`), and would then take the suffix into a
+    /// generation this copy never linked, which holds none of the keys before the cutoff. That
+    /// landing faults the node instead, with nothing linked or anchored: a stopped node is
+    /// loud, lost keys are silent.
+    ///
+    /// Reachability, read from code and not shown to happen. The refusal needs a copied inherit
+    /// with the copy's head past the cutoff (`held > base`; a flatten at `held == base` touches
+    /// nothing and cannot refuse `below_floor`). F1 takes the cutoff as the longest verified
+    /// head (`recovery::lineage::select_prefix`), and answering the inventory seals the
+    /// receiver, which then refuses plain appends (`AppendReceiver::sealed`). So a barrier
+    /// member is past the cutoff only if (a) a record already staged completes after the seal,
+    /// or (b) a required copy proved the cutoff durable without reporting an inventory.
+    ///
+    /// After the fault, also read from code and not run: the landed set is in memory, so on
+    /// reopen the owner re-plans rather than re-sending this landing. The copy's inventory
+    /// links the missed generation by the same copy, which is refused again; that answers
+    /// `InventoryFailed` (an expected `missed_generation_*` reason), the copy is left out, lands
+    /// outside the barrier through `land_link`, and is expected to stay in #79's tail hold
+    /// (`held_past_base`) until `forget-tail` or a snapshot rebuild. No crash loop is expected,
+    /// since the fault is reached only from an in-barrier landing.
     fn inherit(
         &mut self,
         partition: PartitionId,
@@ -11700,6 +11798,25 @@ impl Host {
             Err(InheritError::HistoryMissing { at })
                 if landing && at.starts_with("below_floor") =>
             {
+                let holds_cutoff =
+                    self.replication
+                        .receiver(self.node, partition)
+                        .is_some_and(|receiver| {
+                            receiver
+                                .history()
+                                .lookup(result.selected.cutoff_seq, result.selected.cutoff_digest)
+                                == DigestLookup::Match
+                        });
+                if holds_cutoff {
+                    return Err(Fault::from(format!(
+                        "inherit p{} to g{} at cutoff {}: {at}: this copy's trimmed history \
+                         cannot rebuild its state at the cutoff, and it holds the cutoff, so it \
+                         would serve the new generation without the keys written before it. \
+                         Stopped instead. On reopen the copy is left out of the next plan and \
+                         waits for `forget-tail` or a snapshot rebuild",
+                        partition.0, generation.0, result.selected.cutoff_seq.0
+                    )));
+                }
                 let marked = self
                     .replication
                     .refuse_landing(self.node, partition, generation);
@@ -12238,14 +12355,10 @@ impl Host {
         Ok((floor, self.digest_at(partition, generation, floor)?))
     }
 
-    /// The newest generation of `partition` this engine holds.
+    /// The newest generation of `partition` this engine holds: a bounded lookup, never a copy
+    /// of every lineage key (PR #204 review; explicit status requests call it).
     fn newest_held(&self, partition: PartitionId) -> Option<Generation> {
-        self.engine
-            .lineages()
-            .into_iter()
-            .filter(|(p, _)| *p == partition)
-            .map(|(_, g)| g)
-            .max()
+        self.engine.newest_generation(partition)
     }
 
     /// Issue #61 (design section 3.4): R1's sides of `partition` hold no rung below this
@@ -13671,15 +13784,10 @@ impl Host {
                                 reason = refusal,
                                 "tail_not_adoptable"
                             );
-                            // A write that failed after the proofs held proves nothing
-                            // about the tail: it stays `Unchecked`.
-                            let adoption = if ADOPTION_REFUSALS.contains(&refusal)
-                                || ADOPTION_TRIMMED.contains(&refusal)
-                            {
-                                TailAdoption::of::<()>(&Err(refusal))
-                            } else {
-                                TailAdoption::Unchecked
-                            };
+                            // A write that failed after the proofs held, or check B's
+                            // refusal, proves nothing the wire can name: `of` holds it
+                            // `Unchecked`. A trimmed-history reason stays `Trimmed`.
+                            let adoption = TailAdoption::of::<()>(&Err(refusal));
                             return self.tail_held(partition, copy, anchor, hit, adoption);
                         }
                     },
@@ -13791,6 +13899,25 @@ impl Host {
                         generation = anchor.lineage.generation.0,
                         base = anchor.base_seq.0,
                         reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+                // PR #204 review: a copy installing a snapshot of this partition has wiped its
+                // old lineages and links the new one only when the install finishes, so its own
+                // unlinked anchor is the install's normal state, not a fault: the re-plan that
+                // follows the install asks again.
+                Err(reason @ "anchor_generation_unlinked")
+                    if self.installs.contains_key(&partition) =>
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        installing = true,
                         "inventory_failed"
                     );
                     RecoveryEvent::InventoryFailed { copy }
@@ -14181,7 +14308,11 @@ impl Host {
     /// * P2: every record from the base through the head reads, verifies, and chains from that
     ///   digest ([`Self::chain`]).
     /// * No lineage at the anchor's generation, or one staging a copy of the whole tail (G4):
-    ///   [`Adopt::Link`], or [`Adopt::Resume`], once [`Self::link_preconditions`] hold (G3).
+    ///   [`Adopt::Link`], or [`Adopt::Resume`], once check B and [`Self::link_preconditions`]
+    ///   hold (G3). Check B (#121): the tail's lineage reaches seq 1 ([`Self::has_floor`]); a
+    ///   hole is `tail_has_no_floor`, a failed seq 1 read `tail_history_read_failed`, logged
+    ///   `adopt_floor_read_failed`. Neither is in [`ADOPTION_REFUSALS`], so
+    ///   [`TailAdoption::of`] holds the tail `Unchecked`.
     ///   One held (walk A's shape):
     ///   [`Adopt::Replay`], only when it is linked and not staging, its head is at or above the
     ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first
@@ -14257,6 +14388,26 @@ impl Host {
         if !self.engine.generations(partition).contains(&to)
             || self.engine.staging(partition, to) == Some((hit.from, hit.head))
         {
+            // Check B at adoption (#121, ADR-rdb-0026): a link or a resume puts the
+            // anchor's generation onto the tail's lineage, so that lineage must reach seq 1, as
+            // landing and the inventory link require. Neither reason is in
+            // `ADOPTION_REFUSALS`, a wire vocabulary: `TailAdoption::of` holds the tail
+            // `Unchecked`, at adoption and at a landing's scan alike.
+            match self.has_floor(partition, hit.from) {
+                Ok(true) => {}
+                Ok(false) => return Err("tail_has_no_floor"),
+                Err(fault) => {
+                    tracing::error!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        from = hit.from.0,
+                        to = to.0,
+                        ?fault,
+                        "adopt_floor_read_failed"
+                    );
+                    return Err("tail_history_read_failed");
+                }
+            }
             return self.link_preconditions(partition, to, hit);
         }
         if self.engine.staging(partition, to).is_some() || self.engine.link(partition, to).is_none()

@@ -56,6 +56,17 @@ const NAMESPACES: [Namespace; 4] = [
 /// One record of a view: namespace, key, value, version, and the generation that holds it.
 pub type SnapshotEntry = (Namespace, Bytes, Bytes, Version, Generation);
 
+/// What one entry adds to a snapshot page on the wire, at most (PR #204 review): its key and
+/// value, plus [`SNAPSHOT_ENTRY_OVERHEAD`] for the namespace, the two length prefixes, the
+/// version and the generation, which postcard writes in far fewer bytes.
+#[must_use]
+pub const fn snapshot_entry_bytes(key: &[u8], value: &[u8]) -> usize {
+    key.len() + value.len() + SNAPSHOT_ENTRY_OVERHEAD
+}
+
+/// The bound [`snapshot_entry_bytes`] adds to each entry's key and value.
+pub const SNAPSHOT_ENTRY_OVERHEAD: usize = 64;
+
 /// The one place that holds a RocksDB snapshot under a `'static` borrow. Its fields are private
 /// to this module, so the rest of the crate reaches the snapshot only through
 /// [`Pinned::snap`], which shortens the borrow to `&self`.
@@ -228,6 +239,25 @@ impl RocksSnapshot {
         after: Option<(Namespace, &[u8])>,
         limit: usize,
     ) -> Result<Vec<SnapshotEntry>, StorageFault> {
+        self.page_after(after, limit, usize::MAX)
+            .map(|(page, _)| page)
+    }
+
+    /// PR #204 review: a page of [`Self::entries_after`] capped by size as well as count. At
+    /// most `limit` entries, stopping before the entry that would take the page's
+    /// [`snapshot_entry_bytes`] past `max_bytes`; the first entry always goes, so a page is
+    /// never empty while the view has more. Answers the page and whether the view holds an
+    /// entry after it: the transfer ends from the cursor, not from a short page.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries_after`].
+    pub fn page_after(
+        &self,
+        after: Option<(Namespace, &[u8])>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<SnapshotEntry>, bool), StorageFault> {
         let (first, from) = match after {
             None => (0, Vec::new()),
             Some((ns, key)) => {
@@ -240,26 +270,32 @@ impl RocksSnapshot {
                     );
                     return Err(StorageFault::Corrupt);
                 };
-                // The smallest key after `key`: the merge seeks at or after its `from`.
                 let mut from = key.to_vec();
                 from.push(0);
                 (at, from)
             }
         };
-        let mut out = Vec::new();
+        let (mut out, mut bytes, mut more) = (Vec::new(), 0_usize, false);
         for (i, ns) in NAMESPACES.iter().copied().enumerate().skip(first) {
-            if out.len() >= limit {
+            if more {
                 break;
             }
             let start: &[u8] = if i == first { &from } else { &[] };
             self.merge(ns, start, |(key, value, version, level)| {
-                if !(ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY) {
-                    out.push((ns, key, value, version, level));
+                if ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY {
+                    return true;
                 }
-                out.len() < limit
+                let size = snapshot_entry_bytes(&key, &value);
+                if out.len() >= limit || (!out.is_empty() && bytes + size > max_bytes) {
+                    more = true;
+                    return false;
+                }
+                bytes += size;
+                out.push((ns, key, value, version, level));
+                true
             })?;
         }
-        Ok(out)
+        Ok((out, more))
     }
 
     /// The record at `key` in `ns`: its value, version and the generation that holds it.

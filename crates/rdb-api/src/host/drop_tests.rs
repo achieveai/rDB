@@ -5564,17 +5564,19 @@ fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_ab
     );
 }
 
-/// S4c: a put P1 can no longer publish, stranded by the rejoin that ends its generation, answers
-/// `UNKNOWN_OUTCOME` when the new lineage arrives, through the `Failed` reply. Before, nothing
-/// answered it and the client waited out its whole 5 s. The Publication check is denied to put
-/// the write in that state on demand, as a revocation staged after its dispatch does. Timed on
-/// the trio's own clock, the one the post-apply deadline runs on, so the answer cannot be that
-/// deadline's. Status then says the write is applied.
-/// Cut: remove the emit in `PubKernel::recovery_unknown_replies`, red (answered after 5,500 ms,
-/// the host's waiter expiry: the recovery has also dropped the candidate's deadline).
+/// S4c: a put P1 can no longer publish, stranded by the rejoin that ends its generation, is
+/// answered when the new lineage arrives. Before, nothing answered it and the client waited out
+/// its whole 5 s. The Publication check is denied to put the write in that state on demand, as
+/// a revocation staged after its dispatch does. Timed on the trio's own clock, the one the
+/// post-apply deadline runs on, so the answer cannot be that deadline's. The new lineage's
+/// cutoff keeps the write, so since #111 the answer is `RecoveredApplied`, the same result its
+/// status query gives (it was `UNKNOWN_OUTCOME` before #111).
+/// Cuts: remove the emit in `PubKernel::recovery_replies`, red (answered after 5,500 ms,
+/// the host's waiter expiry: the recovery has also dropped the candidate's deadline). Answer
+/// `Unknown` for every owed reply (before #111), red at the answer.
 /// Integration (~2 s): bootstrap, the pause age, one rejoin.
 #[config_log::retcd_test]
-fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
+fn s4c_a_put_stranded_by_a_rejoin_answers_recovered_applied_at_the_new_lineage() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), tuned);
     trio.nodes[0].0.deny_next_publication_check = true;
@@ -5589,14 +5591,15 @@ fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
     let answer = trio.until("the stranded put answers", |_| stranded.try_recv().ok());
     let waited = trio.clock.now().0 - sent.0;
     tracing::info!(waited, "s4c_stranded_put_answered");
-    match answer {
-        Answer::Error { error, .. } => assert_eq!(
-            (error.name(), error.retry, error.no_mutation),
-            ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
-            "{error:?}"
-        ),
+    let answered = match answer {
+        Answer::Txn { result, .. } => result,
         other => panic!("the stranded put: {other:?}"),
-    }
+    };
+    assert_eq!(
+        answered.outcome,
+        rdb_core::contracts::txn::Outcome::RecoveredApplied,
+        "{answered:?}"
+    );
     assert!(
         waited < rdb_core::publication::POST_APPLY_DEADLINE_MILLIS,
         "answered after {waited} ms: not by the recovery"
@@ -5622,6 +5625,7 @@ fn s4c_a_put_stranded_by_a_rejoin_answers_unknown_outcome_at_the_new_lineage() {
         rdb_core::contracts::txn::Outcome::RecoveredApplied,
         "{status:?}"
     );
+    assert_eq!(status, answered, "the reply and the status agree (#111)");
 }
 
 // S4a (#93, D1): an idle partition drops a copy out of reach, and a left-out copy comes back
@@ -8921,6 +8925,9 @@ fn t61_s2_r1b_a_rebuilt_copy_walks_the_writes_past_its_snapshot() {
         }
     }
     let head = trio.head().expect("node 1 holds a head");
+    trio.until("the puts' asks reached the open transfer", |_| {
+        (!logged!(METHOD, "snapshot_catchup_in_flight").is_empty()).then_some(())
+    });
     trio.nodes[0].0.snapshot_offer_held = false;
     let installed = rebuilt(&mut trio, METHOD, floor);
     assert!(installed < head, "S {installed} is below the head {head}");
@@ -8983,6 +8990,646 @@ fn rebuilt(trio: &mut Trio, method: &str, floor: u64) -> u64 {
     at
 }
 
+/// Issue #61 PR #204 review, the dedup marker: as S2-R1, but node 1's first export fails at its
+/// view read (`snapshot_export_fault`, once), after the barrier check. No write lands, so R1
+/// asks again at the same barrier, and that ask is served: one
+/// `snapshot_catchup_unserved{reason = view_failed}`, then a transfer opened at that same
+/// barrier, and node 3 is rebuilt.
+/// Cut: `snapshots_served` written before the fallible export steps (as at 67d028c), red (the
+/// retry at the same barrier is dropped and no transfer opens).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier() {
+    const METHOD: &str =
+        "t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| host.snapshot_export_fault = true);
+    let three = copy_of(&trio, 3);
+    trio.until("node 3 was rebuilt and released the transfer", |_| {
+        logged!(METHOD, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+    let unserved = logged!(METHOD, "snapshot_catchup_unserved");
+    assert_eq!(unserved.len(), 1, "{unserved:?}");
+    assert_eq!(unserved[0]["reason"], "view_failed", "{unserved:?}");
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(
+        opened[0]["barrier"], unserved[0]["barrier"],
+        "the same barrier"
+    );
+    assert_eq!(logged!(METHOD, "snapshot_transfer_installed").len(), 1);
+}
+
+/// Issue #61 PR #204 review, an append during an install: as S2-R1, node 1 holds the pull for
+/// page 1, so node 3's install has begun and owns the partition. An ordinary append of the
+/// install's lineage then reaches node 3, contiguous with its receiver's head (seq 1 on the
+/// root, built as `trio::write_chain_in` builds a record, since the trimmed history holds no
+/// record the receiver could take). It is not staged: one
+/// `append_deferred_during_install{seq = 1}`, no `commit_failed`, and the install finishes
+/// with `deferred` at least 1 (a live append R1 sends meanwhile is dropped too). Writes go on after it: node 3 is promoted and a put is durable on it,
+/// past `S`.
+/// Cut: the drop at `Msg::Frame` delivery removed, red (the receiver stages the append, the
+/// engine's installing guard answers `WriteFailed`: `commit_failed` on node 3).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
+    const METHOD: &str = "t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences";
+    use super::snapshot::SnapshotPull;
+    use rdb_core::contracts::digest::Domain;
+    use rdb_core::contracts::envelope::EnvelopeHeader;
+    use rdb_core::contracts::ids::{CorrelationId, LeaseId, MessageId};
+    use rdb_core::contracts::storage::Write;
+    use rdb_core::contracts::transport::{Frame, PeerLabel};
+    use rdb_core::contracts::txn::Outcome;
+    use rdb_core::contracts::version::ENVELOPE_VERSION;
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let boot = trio.nodes[0].0.boot;
+    let three = &mut trio.nodes[2].0;
+    let install = three.installs.get(&p).expect("node 3 installs");
+    assert!(install.begun, "the install owns the partition");
+    let lineage = install.offer.lineage;
+    let pull = SnapshotPull {
+        partition: p,
+        generation: lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    let receiver = three
+        .replication
+        .receiver(three.node, p)
+        .expect("a receiver");
+    assert_eq!(receiver.lineage(), lineage, "the install's lineage");
+    let head = receiver.applied_head();
+    let config = receiver.config().config_version;
+    let seq = head.seq.0 + 1;
+    let mut env = ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: p,
+            generation: lineage.generation,
+            config_version: config,
+            owner_epoch: lineage.owner_epoch,
+            seq: Seq(seq),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: head.digest,
+        request_identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+        conditions_result: Vec::new(),
+        mutations: vec![Write {
+            ns: Namespace::User,
+            key: Bytes::from_static(b"during-install"),
+            value: Some(Bytes::from_static(b"v")),
+        }],
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    };
+    env.record_digest = env.compute_record_digest().expect("digest");
+    three.handle(Msg::Frame {
+        partition: p,
+        correlation: CorrelationId(0),
+        from: PeerLabel {
+            node: NodeId(1),
+            boot,
+            authenticated: true,
+        },
+        frame: Frame {
+            id: MessageId(u32::MAX - 1),
+            protocol: ENVELOPE_VERSION,
+            config,
+            sender: lineage,
+            body: env.encode().expect("encode"),
+        },
+    });
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    let installed = rebuilt(&mut trio, METHOD, floor);
+    promoted_and_durable(&mut trio, 31);
+    let failed = logged!(METHOD, "commit_failed");
+    assert!(failed.is_empty(), "{failed:?}");
+    let deferred = logged!(METHOD, "append_deferred_during_install");
+    assert_eq!(deferred.len(), 1, "{deferred:?}");
+    assert_eq!(deferred[0]["seq"], "Some(1)", "{deferred:?}");
+    // The crafted append, and any live one R1 sent meanwhile: each is re-sent or walked.
+    let done = logged!(METHOD, "snapshot_transfer_installed");
+    assert!(done[0]["deferred"].as_u64() >= Some(1), "{done:?}");
+    let host = &trio.nodes[2].0;
+    let applied = host
+        .replication
+        .receiver(host.node, p)
+        .map(|receiver| receiver.applied_head().seq.0);
+    assert!(
+        applied > Some(installed),
+        "node 3 is past S {installed}: {applied:?}"
+    );
+}
+
+/// Issue #61 PR #204 review, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
+/// rebuilt from a snapshot, its ACK stalled at the root below the cutoff. Node 1 holds the pull
+/// for page 1 and is given a move onto node 3 (catch-up deadline 1 s). A duty at `t` starts the
+/// move clock; one more page served, a duty at `t + 2 s` finds the transfer served more and
+/// starts the clock again, and the move stands. With no page after that, a duty at `t + 4 s`
+/// gives the move up (`move_catch_up_given_up`): the stall is still judged.
+/// Cut: `shadow_duty` passes `pulled = 0` (the transfer not read), red (the move is given up at
+/// `t + 2 s`).
+/// Integration (~4 s): S2-R1's setup; the duties are direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
+    const METHOD: &str = "t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock";
+    use super::snapshot::SnapshotPull;
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+            host.move_catch_up_millis = 1_000;
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    assert_eq!(
+        role_of_three(&trio),
+        Some(ReplicaRole::Shadow),
+        "node 3 is the shadow"
+    );
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let pull = SnapshotPull {
+        partition: p,
+        generation: install.offer.lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    let t = trio.clock.now();
+    let owner = &mut trio.nodes[0].0;
+    owner.moves.insert(
+        p,
+        CopyMove {
+            from: NodeId(2),
+            to: NodeId(3),
+            abandoned: None,
+            filled: false,
+            lagged: false,
+        },
+    );
+    owner.shadow_duty(p, t);
+    let first = owner
+        .move_catching_up
+        .get(&p)
+        .copied()
+        .expect("the clock started");
+    assert_eq!((first.since, first.acked), (t, 0), "{first:?}");
+    owner.snapshot_pages_held_from = Some(2);
+    owner.snapshot_pull(pull);
+    owner.shadow_duty(p, t.plus_millis(2_000));
+    let reset = owner
+        .move_catching_up
+        .get(&p)
+        .copied()
+        .expect("the clock runs");
+    assert_eq!(reset.since, t.plus_millis(2_000), "{reset:?}");
+    assert!(reset.pulled > first.pulled, "{first:?} then {reset:?}");
+    assert!(owner.moves[&p].abandoned.is_none(), "the move stands");
+    assert!(logged!(METHOD, "move_catch_up_given_up").is_empty());
+    owner.shadow_duty(p, t.plus_millis(4_000));
+    assert!(
+        owner.moves[&p].abandoned.is_some(),
+        "no page: the move is given up"
+    );
+    assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
+}
+
+/// Issue #61 PR #204 review, a replayed page: as S2-R1, node 1 holds the pull for page 2, so
+/// node 3 has written pages 0 and 1 and its cursor is past page 1. Page 0 then reaches node 3
+/// again, as node 1 built it (from the barrier, after no key). It is dropped
+/// (`snapshot_chunk_dropped{why = mismatch}`): the install's cursor, chain, entries and pages are
+/// unchanged and nothing is refused. Node 3 then pulls page 2, which is accepted, and the
+/// rebuild completes.
+/// Cut: the cursor check (`install.after != chunk.after`) removed from `snapshot_chunk`, red
+/// (the replay reaches the chain check, and the install is refused `chain`).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
+    const METHOD: &str =
+        "t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands";
+    use super::snapshot::{chunk_chain, SnapshotChunk, SnapshotPull};
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let offer = install.offer.clone();
+    let before = (
+        install.after.clone(),
+        install.chain,
+        install.entries,
+        install.chunks,
+    );
+    assert_eq!(before.3, 2, "two pages written");
+    let barrier = ReplicationEnvelope::decode(&offer.barrier)
+        .expect("the barrier")
+        .record_digest;
+    let owner = &trio.nodes[0].0;
+    let page = owner.transfers[&(p, offer.copy)]
+        .view
+        .entries_after(None, owner.snapshot_page_keys)
+        .expect("page 0");
+    let replay = SnapshotChunk {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        chain: chunk_chain(barrier, &page),
+        after: None,
+        entries: page,
+        done: false,
+    };
+    trio.nodes[2].0.snapshot_chunk(replay).expect("no fault");
+    let install = trio.nodes[2]
+        .0
+        .installs
+        .get(&p)
+        .expect("the install stands");
+    assert_eq!(
+        (
+            install.after.clone(),
+            install.chain,
+            install.entries,
+            install.chunks
+        ),
+        before,
+        "unchanged"
+    );
+    let dropped = logged!(METHOD, "snapshot_chunk_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["why"], "mismatch", "{dropped:?}");
+    let pull = SnapshotPull {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    rebuilt(&mut trio, METHOD, floor);
+}
+
+/// Issue #61 PR #204 review, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
+/// node 3's next pull is never answered. A transfer duty past `SNAPSHOT_IDLE_MILLIS` abandons
+/// the transfer (`snapshot_transfer_abandoned{why = idle}`) and forgets the barrier it served,
+/// so R1's ask at that same barrier opens a fresh transfer; node 3 replaces its install with
+/// the new offer and is rebuilt.
+/// Cuts: the idle check removed from `transfer_duty`, red (the transfer stands); the served
+/// barrier kept by `end_transfer`, red (the ask at the same barrier opens nothing).
+/// Integration (~4 s): S2-R1's setup; the duty and the ask are direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afresh() {
+    const METHOD: &str =
+        "t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afresh";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    let barrier = Seq(opened[0]["barrier"].as_u64().expect("a barrier"));
+    let past = trio
+        .clock
+        .now()
+        .plus_millis(super::snapshot::SNAPSHOT_IDLE_MILLIS);
+    let owner = &mut trio.nodes[0].0;
+    owner.transfer_duty(past);
+    assert!(
+        !owner.transfers.contains_key(&(p, three)),
+        "the idle transfer is abandoned"
+    );
+    let abandoned = logged!(METHOD, "snapshot_transfer_abandoned");
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["why"], "idle", "{abandoned:?}");
+    assert_eq!(
+        owner.snapshots_served.get(&(p, three)),
+        None,
+        "the barrier is forgotten"
+    );
+    owner.snapshot_pages_held_from = None;
+    owner.snapshot_catchup(p, three, barrier);
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 2, "a fresh transfer: {opened:?}");
+    assert_eq!(opened[1]["barrier"], barrier.0, "{opened:?}");
+    trio.until("node 3 replaced its install", |_| {
+        (!logged!(METHOD, "snapshot_install_replaced").is_empty()).then_some(())
+    });
+    rebuilt(&mut trio, METHOD, floor);
+}
+
+/// Issue #61 PR #204 review, item 13: a rebuild watch whose required copy is still being sent a
+/// snapshot does not name a stall. As S2-R1, with node 1 holding page 1 so node 3's transfer
+/// runs longer than the watch, node 1 holds a `ReadOnly` watch that requires node 3's copy,
+/// and its check runs while the transfer is live: no `recovery_rebuild_stalled`, nothing in
+/// `Host.stalled`, the check re-armed (`rebuild_check_transfer_live`). The pages are released
+/// and the rebuild completes with no stall line before `snapshot_transfer_installed`. Control:
+/// the same check after the transfer has ended does name the stall, so the row would see one.
+/// Cut: the check ignores live transfers, red (the stall line before the install).
+/// Integration (~3 s): S2-R1's setup and a watch set on node 1.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live() {
+    const METHOD: &str =
+        "t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let owner = &mut trio.nodes[0].0;
+    let generation = owner.transfers[&(p, three)].lineage.generation;
+    let now = owner.clock.now();
+    owner.rebuild_pin_wait_millis = 50;
+    owner.rebuilds.insert(
+        p,
+        RebuildWatch {
+            generation,
+            mode: PartitionMode::ReadOnly,
+            cutoff: Seq::ZERO,
+            required: vec![three],
+            since: now,
+            pinned: false,
+            unproven: BTreeSet::new(),
+            unreported: false,
+        },
+    );
+    owner.rebuild_check(p, generation);
+    assert!(
+        logged!(METHOD, "recovery_rebuild_stalled").is_empty(),
+        "no stall while live"
+    );
+    assert!(!owner.stalled.contains_key(&p), "nothing in the status");
+    let live = logged!(METHOD, "rebuild_check_transfer_live");
+    assert_eq!(live.len(), 1, "{live:?}");
+    // The held pull is not sent again by itself: answer node 3's cursor.
+    let install = trio.nodes[2].0.installs[&p].clone();
+    let pull = SnapshotPull {
+        partition: p,
+        generation: install.offer.lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    rebuilt(&mut trio, METHOD, floor);
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    let stalled = logged!(METHOD, "recovery_rebuild_stalled");
+    assert!(
+        stalled
+            .iter()
+            .all(|line| line["@t"].as_str() > installed[0]["@t"].as_str()),
+        "no stall before the install: {stalled:?}"
+    );
+    // Control: with the transfer ended, the same check names the stall.
+    trio.until("node 1 ended the transfer", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(p, three))).then_some(())
+    });
+    let before = logged!(METHOD, "recovery_rebuild_stalled").len();
+    let owner = &mut trio.nodes[0].0;
+    owner.rebuild_check(p, generation);
+    assert_eq!(
+        logged!(METHOD, "recovery_rebuild_stalled").len(),
+        before + 1,
+        "the check reaches the stall line once no transfer is live"
+    );
+    assert!(owner.stalled.contains_key(&p));
+}
+
+/// Issue #61 PR #204 review, item 14: a copy asked for its inventory while it installs a
+/// snapshot of the partition answers `InventoryFailed` with `anchor_generation_unlinked`, its
+/// normal state until the install links the lineage, and logs it at info with `installing`,
+/// not at error. As S2-R1, with node 1 holding page 1 so node 3's install stays open.
+/// Cut: the guard on `installs`, red (the line is logged at error).
+/// Integration (~3 s): S2-R1's setup and one inventory ask on node 3.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error() {
+    const METHOD: &str = "t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let (lineage, at) = {
+        let transfer = &trio.nodes[0].0.transfers[&(p, three)];
+        (transfer.lineage, transfer.at)
+    };
+    let target = &mut trio.nodes[2].0;
+    assert!(target.installs.contains_key(&p), "node 3 is installing");
+    let anchor = LineageAnchor {
+        lineage,
+        base_seq: at,
+        base_digest: Digest::ROOT,
+    };
+    let answer = target.inventory(p, three, anchor, None, None);
+    assert!(
+        matches!(answer, RecoveryEvent::InventoryFailed { copy } if copy == three),
+        "{answer:?}"
+    );
+    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
+        .into_iter()
+        .filter(|line| line["reason"] == "anchor_generation_unlinked")
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["@l"], "Information", "{failed:?}");
+    assert_eq!(failed[0]["installing"], true, "{failed:?}");
+}
+
+/// Issue #61 PR #204 review, item 12: a barrier member whose landing needs a copied inherit
+/// that its trim floor refuses must not anchor at the cutoff. As S2-R1 before the wipe: every
+/// copy holds puts 1..=30, trimmed to 26. Node 3 lands the next generation at cutoff 28, so
+/// the inherit copies as of 28, and puts 29 and 30 created keys whose absence at 28 the
+/// trimmed History cannot prove (`below_floor`). Node 3 holds 28 with its digest, so its
+/// receiver would anchor there and take the suffix into a generation it never linked, which
+/// holds none of the keys before the cutoff. The landing faults instead: nothing is linked,
+/// no `Recovered` is pushed, the receiver stays where it was, and every key node 3 held is
+/// still read under the generation it serves.
+/// Cut: the refusal routed as before (`Ok`) when the copy holds the cutoff, red.
+/// Integration (~3 s): S2-R1's setup without the wipe, one landing on node 3.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults() {
+    const METHOD: &str =
+        "t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed_trio(dir.path(), 4, 1, |_| {});
+    let cutoff = Seq(floor + 2);
+    let three = copy_of(&trio, 3);
+    let host = &mut trio.nodes[2].0;
+    let mut result = host.committed[&p].clone();
+    let generation = result.new_generation;
+    let receiver = host
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver");
+    let head = receiver.applied_head();
+    let digest = receiver
+        .history()
+        .digest_at(cutoff)
+        .expect("node 3 holds the cutoff");
+    result.new_generation = Generation(generation.0 + 1);
+    result.retained_status_map.predecessor_generation = generation;
+    result.selected.cutoff_seq = cutoff;
+    result.selected.cutoff_digest = digest;
+    let proof = DurableProof {
+        copy: three,
+        partition: p,
+        seq: DurableSeq(cutoff.0),
+        digest,
+        boot: host.boot,
+    };
+    result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
+        &[proof],
+        &BTreeSet::from([three]),
+        cutoff,
+        digest,
+    )
+    .expect("a barrier over node 3");
+    let site = Site {
+        partition: p,
+        correlation: CorrelationId(0),
+    };
+    let landed = host.land(result, site, NodeId(1));
+    let refused = logged!(METHOD, "land_inherit_refused");
+    let fault = landed.expect_err("the landing faults, it does not anchor at the cutoff");
+    assert!(format!("{fault:?}").contains("below_floor"), "{fault:?}");
+    assert!(refused.is_empty(), "not routed as a refusal: {refused:?}");
+    assert!(
+        !host
+            .engine
+            .lineages()
+            .contains(&(p, Generation(generation.0 + 1))),
+        "nothing linked"
+    );
+    assert_eq!(
+        host.replication
+            .receiver(NodeId(3), p)
+            .map(|r| r.applied_head()),
+        Some(head),
+        "the receiver stays where it was"
+    );
+    assert_eq!(
+        host.committed[&p].new_generation, generation,
+        "nothing committed"
+    );
+    for request in [1, floor, 30] {
+        assert!(
+            matches!(
+                host.engine.get(
+                    p,
+                    generation,
+                    Namespace::User,
+                    root_key(TenantId(1), AffinityId(1), key(request).as_ref()).as_bytes()
+                ),
+                Ok(Some(_))
+            ),
+            "k{request} is still read"
+        );
+    }
+}
+
+/// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
+/// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
+/// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
+/// is at most the cap (`snapshot_transfer_installed{largest_page_bytes}`), it takes several
+/// pages, every entry arrives, and the rebuild completes: the last page is the one after which
+/// the view holds nothing, not the first one cut short by size.
+/// Cuts: the source pages with no byte cap, red (one page over the cap); the source ends the
+/// transfer on a page shorter than the key limit, red (the install stops after one page,
+/// missing entries).
+/// Integration (~5 s): S2-R1's setup with large values.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_pages_of_large_values_stay_under_the_byte_cap_and_the_rebuild_completes() {
+    const METHOD: &str =
+        "t61_pr204_pages_of_large_values_stay_under_the_byte_cap_and_the_rebuild_completes";
+    const CAP: usize = 1024 * 1024;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed_with(dir.path(), 4, 100 * 1024, |host| {
+        host.snapshot_page_keys = rdb_storage::COPY_BATCH_KEYS;
+        host.snapshot_page_bytes = CAP;
+    });
+    rebuilt(&mut trio, METHOD, floor);
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    let largest = installed[0]["largest_page_bytes"].as_u64().expect("a size");
+    assert!(largest <= CAP as u64, "{installed:?}");
+    assert!(
+        largest > CAP as u64 / 2,
+        "pages are filled to the cap: {installed:?}"
+    );
+    assert!(installed[0]["chunks"].as_u64() >= Some(3), "{installed:?}");
+    assert!(
+        installed[0]["entries"].as_u64() >= Some(30),
+        "every key: {installed:?}"
+    );
+    promoted_and_durable(&mut trio, 31);
+}
+
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
 #[cfg(debug_assertions)]
 fn promoted_and_durable(trio: &mut Trio, request: u64) {
@@ -9012,6 +9659,31 @@ fn promoted_and_durable(trio: &mut Trio, request: u64) {
 /// floor.
 #[cfg(debug_assertions)]
 fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio, u64) {
+    trimmed_with(dir, keep, 1, each)
+}
+
+/// [`trimmed`] with each of the 30 puts' values `value_bytes` long.
+#[cfg(debug_assertions)]
+fn trimmed_with(
+    dir: &std::path::Path,
+    keep: u64,
+    value_bytes: usize,
+    each: impl Fn(&mut Host),
+) -> (Trio, u64) {
+    let (mut trio, floor) = trimmed_trio(dir, keep, value_bytes, each);
+    restart_as(&mut trio, dir, 3, true);
+    (trio, floor)
+}
+
+/// [`trimmed_with`] before node 3's wiped restart: every copy holds the 30 puts, trimmed to
+/// `head - keep`, which it answers.
+#[cfg(debug_assertions)]
+fn trimmed_trio(
+    dir: &std::path::Path,
+    keep: u64,
+    value_bytes: usize,
+    each: impl Fn(&mut Host),
+) -> (Trio, u64) {
     // As `note_tests::formed`: the open counter first, so `admin::promote` reads the record
     // (S2-R2); then D9's bootstrap.
     let mut trio = Trio::new(dir, |host| {
@@ -9030,7 +9702,17 @@ fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio,
     trio.bootstrap();
     trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
     for request in 1..=30 {
-        match trio.ask(put(request)) {
+        let put = ClientCall::Put {
+            identity: identity(request),
+            object: key(request),
+            change: Change::Doc(Delta(vec![Op::Replace(Value::Bytes(vec![
+                b'v';
+                value_bytes
+            ]))])),
+            expect: None,
+            remaining_millis: 5_000,
+        };
+        match trio.ask(put) {
             Answer::Txn { .. } => {}
             other => panic!("put {request} with every copy up: {other:?}"),
         }
@@ -9055,7 +9737,6 @@ fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio,
             at + 1
         );
     }
-    restart_as(&mut trio, dir, 3, true);
     (trio, floor)
 }
 

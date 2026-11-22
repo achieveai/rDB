@@ -1202,3 +1202,354 @@ fn own81_bad_partition_entry_warns_once() {
         "partition_entry_undecodable",
     );
 }
+
+/// #81 X2: `grants/1` as a frozen record of node 1's boot `boot`, its expiry long past.
+fn frozen_grant(boot: u64) -> Bytes {
+    GrantRecord {
+        grant: GrantId(1),
+        node: NodeId(1),
+        boot: BootId(boot),
+        authority_generation: AuthorityGeneration::default(),
+        expiry_utc_ms: 1,
+        frozen: true,
+    }
+    .encode()
+}
+
+/// `grants/1`'s record and its store revision.
+fn grant_1_at(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+) -> Option<(GrantRecord, u64)> {
+    rt.block_on(store.get(GetRequest {
+        key: Bytes::from(ControlKey::Grant(NodeId(1)).encode()),
+    }))
+    .expect("the store answers")
+    .record
+    .map(|found| {
+        (
+            GrantRecord::decode(&found.value).expect("a grant record"),
+            found.mod_revision,
+        )
+    })
+}
+
+/// The #81 X2 setting over `store`: a frozen `grants/1` of node 1's boot 1, which is gone (the
+/// links know node 1 at boot 2), and node 1 owning nothing. Every guard of
+/// `clear_frozen_verdict` lets the record go. Returns links on which node 2 is a healthy host,
+/// and the frozen record's revision.
+fn x2_setting(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> (Arc<Links>, u64) {
+    let (links, _host) = healthy(2);
+    let (tx, _mail) = std::sync::mpsc::channel::<Msg>();
+    links.register(NodeId(1), tx, BootId(2));
+    put_raw(
+        rt,
+        store,
+        &ControlKey::Grant(NodeId(1)).encode(),
+        &frozen_grant(1),
+    );
+    let (_, revision) = grant_1_at(rt, store).expect("grants/1 is written");
+    (links, revision)
+}
+
+/// [`x2_setting`], with node 2's planner holding `planner/grant`: a sweep clears `grants/1`
+/// unless a row's store changes something in between. Returns the planner, its memory, and the
+/// frozen record's revision.
+fn x2_held(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> (Planner, Memory, u64) {
+    let (links, revision) = x2_setting(rt, store);
+    let planner = planner(2, store, links);
+    let mut memory = Memory::default();
+    assert!(
+        rt.block_on(planner.hold(&mut memory)),
+        "node 2's planner holds"
+    );
+    (planner, memory, revision)
+}
+
+/// #81 X2, PR #171 review (stale snapshot in the clear): the sweep's snapshot names node 1 a
+/// candidate (frozen `grants/1` of a gone boot, owning nothing). Right after the clear reads
+/// `grants/1`, `partitions/7` comes to name node 1 owner. The clear reads `partitions/` after
+/// the grant, finds it, and deletes nothing: `grants/1` stays at its revision, and no delete is
+/// even sent (`planner_frozen_grant_kept`, `OwnsPartition`, is a debug line). Unit
+/// (in-memory store).
+/// Cut: judge the grant against the sweep's snapshot, read before it (the old order);
+/// `grants/1` is deleted, red.
+#[config_log::retcd_test]
+fn own81_x2_a_partition_naming_the_node_after_the_grant_read_keeps_the_freeze() {
+    const METHOD: &str =
+        "own81_x2_a_partition_naming_the_node_after_the_grant_read_keeps_the_freeze";
+    let rt = crate::db::reopen_tests::runtime();
+    let owning = PartitionRecord {
+        partition: PartitionId(7),
+        owner: NodeId(1),
+        ..PartitionRecord::default()
+    };
+    let after = crate::test_store::PutAfterGet::new(
+        Arc::new(config_testkit::MemStore::new()),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        &ControlKey::Partition(PartitionId(7)).encode(),
+        owning.encode(),
+    );
+    let store: Arc<dyn ConfigStore> = Arc::clone(&after) as Arc<dyn ConfigStore>;
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    after.arm();
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    assert_eq!(messages(METHOD, "test_put_after_get").len(), 1);
+    assert_eq!(
+        grant_1_at(&rt, &store).map(|(_, at)| at),
+        Some(revision),
+        "grants/1 is not deleted"
+    );
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+    assert!(
+        messages(METHOD, "planner_frozen_grant_not_cleared").is_empty(),
+        "kept by the verdict, not by a conflict on the delete"
+    );
+}
+
+/// #81 X2, PR #171 review: right after the clear reads `grants/1`, a later ownership cycle
+/// freezes node 1's live boot 2 there. The verdict judged boot 1's record, and the delete goes
+/// at that read's revision, so it conflicts and deletes nothing: boot 2's frozen record stays
+/// (`planner_frozen_grant_not_cleared`). The next sweep finds boot 2's record and keeps it
+/// (`BootNotOlder`). Unit (in-memory store).
+/// Cut: the delete at no expected revision; boot 2's freeze is deleted, red.
+#[config_log::retcd_test]
+fn own81_x2_a_grant_refrozen_after_the_read_is_not_deleted() {
+    const METHOD: &str = "own81_x2_a_grant_refrozen_after_the_read_is_not_deleted";
+    let rt = crate::db::reopen_tests::runtime();
+    let after = crate::test_store::PutAfterGet::new(
+        Arc::new(config_testkit::MemStore::new()),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        frozen_grant(2),
+    );
+    let store: Arc<dyn ConfigStore> = Arc::clone(&after) as Arc<dyn ConfigStore>;
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    after.arm();
+    for _ in 0..2 {
+        assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    }
+    let (record, at) = grant_1_at(&rt, &store).expect("grants/1 is not deleted");
+    assert!(record.frozen && record.boot == BootId(2), "{record:?}");
+    assert!(at > revision, "boot 2's freeze, written after the read");
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+    assert_eq!(
+        messages(METHOD, "planner_frozen_grant_not_cleared").len(),
+        1,
+        "the first sweep's delete conflicts"
+    );
+}
+
+/// #81 X2, PR #171 review (fail closed): the clear's own `partitions/` read, made after its
+/// `grants/1` read, fails. The clear is refused (`planner_frozen_grant_partitions_unread`) and
+/// `grants/1` stays. The clear is called as the sweep calls it, so only its own read fails.
+/// Unit.
+/// Cut: judge on an empty list when the read fails; `grants/1` is deleted, red.
+#[config_log::retcd_test]
+fn own81_x2_a_failed_partitions_read_refuses_the_clear() {
+    const METHOD: &str = "own81_x2_a_failed_partitions_read_refuses_the_clear";
+    let rt = crate::db::reopen_tests::runtime();
+    let scripted = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script::default(),
+    ));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+    let (planner, memory, revision) = x2_held(&rt, &store);
+    scripted.rescript(crate::test_store::Script {
+        fail_lists: 1,
+        ..crate::test_store::Script::default()
+    });
+    rt.block_on(planner.clear_frozen(NodeId(1), memory.held));
+    let unread = messages(METHOD, "planner_frozen_grant_partitions_unread");
+    assert_eq!(unread.len(), 1, "{unread:?}");
+    assert_eq!(unread[0]["cause"], "partitions_list_failed", "{unread:?}");
+    assert_eq!(
+        grant_1_at(&rt, &store).map(|(_, at)| at),
+        Some(revision),
+        "grants/1 stays"
+    );
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+}
+
+/// #81 X2, PR #171 review (re-check the planner's grant): node 2's planner holds on a held
+/// clock, and its grant runs out after the sweep started and before the clear deletes. The
+/// clear checks the grant again ([`Planner::still_held`]) and deletes nothing
+/// (`planner_frozen_grant_skipped_grant_expired`). Unit.
+/// Cut: no re-check before the delete; `grants/1` is deleted, red.
+#[config_log::retcd_test]
+fn own81_x2_a_clear_after_the_planner_grant_ran_out_deletes_nothing() {
+    const METHOD: &str = "own81_x2_a_clear_after_the_planner_grant_ran_out_deletes_nothing";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let (links, revision) = x2_setting(&rt, &store);
+    let (clock, hold, _) = held_clock();
+    let planner = Planner {
+        clock,
+        ..planner(2, &store, links)
+    };
+    // Past the frozen record's `E + eps + delta` (E = 1), so only the planner's grant is left.
+    hold.advance(takeover_floor(&planner.budgets));
+    let mut memory = Memory::default();
+    assert!(
+        rt.block_on(planner.hold(&mut memory)),
+        "holds on the held clock"
+    );
+    hold.advance(planner.budgets.grant_millis);
+    rt.block_on(planner.clear_frozen(NodeId(1), memory.held));
+    assert_eq!(
+        messages(METHOD, "planner_frozen_grant_skipped_grant_expired").len(),
+        1
+    );
+    assert_eq!(
+        grant_1_at(&rt, &store).map(|(_, at)| at),
+        Some(revision),
+        "grants/1 stays"
+    );
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+}
+
+/// #81 X2, PR #171 review (CAS conflict): the frozen `grants/1` is written again, unchanged,
+/// right after the clear reads it, so the delete at the read's revision conflicts. The clear
+/// is refused and logged (`planner_frozen_grant_not_cleared`), and nothing is deleted; the next
+/// sweep reads the new revision and clears it (`planner_frozen_grant_cleared`). Unit.
+/// Cut: the delete at no expected revision; the first sweep clears, red.
+#[config_log::retcd_test]
+fn own81_x2_a_conflicting_clear_is_refused_then_retried() {
+    const METHOD: &str = "own81_x2_a_conflicting_clear_is_refused_then_retried";
+    let rt = crate::db::reopen_tests::runtime();
+    let after = crate::test_store::PutAfterGet::new(
+        Arc::new(config_testkit::MemStore::new()),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        &ControlKey::Grant(NodeId(1)).encode(),
+        frozen_grant(1),
+    );
+    let store: Arc<dyn ConfigStore> = Arc::clone(&after) as Arc<dyn ConfigStore>;
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    after.arm();
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    let refused = messages(METHOD, "planner_frozen_grant_not_cleared");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["revision"], revision, "{refused:?}");
+    let (_, moved) = grant_1_at(&rt, &store).expect("nothing deleted on the conflict");
+    assert!(moved > revision);
+    assert!(messages(METHOD, "planner_frozen_grant_cleared").is_empty());
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    assert_eq!(grant_1_at(&rt, &store), None, "the retry clears it");
+    let cleared = messages(METHOD, "planner_frozen_grant_cleared");
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!(cleared[0]["revision"], moved, "{cleared:?}");
+}
+
+/// #81 X2, PR #171 review (delete error): the clear's delete fails `Unavailable`. It is warned
+/// (`planner_frozen_grant_clear_failed`) and nothing is deleted; the next sweep clears it. Unit.
+/// Cut: the error arm logs nothing; red at the warn.
+#[config_log::retcd_test]
+fn own81_x2_a_failed_clear_is_warned_then_retried() {
+    const METHOD: &str = "own81_x2_a_failed_clear_is_warned_then_retried";
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script {
+            fail_delete_with: Some(ConfigError::Unavailable {
+                reason: "scripted: the delete failed".to_owned(),
+            }),
+            ..crate::test_store::Script::default()
+        },
+    ));
+    let (planner, mut memory, revision) = x2_held(&rt, &store);
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    let failed = messages(METHOD, "planner_frozen_grant_clear_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["revision"], revision, "{failed:?}");
+    assert_eq!(
+        grant_1_at(&rt, &store).map(|(_, at)| at),
+        Some(revision),
+        "nothing deleted on the error"
+    );
+    assert!(rt.block_on(planner.sweep(&mut memory)).is_empty());
+    assert_eq!(grant_1_at(&rt, &store), None, "the retry clears it");
+    assert_eq!(messages(METHOD, "planner_frozen_grant_cleared").len(), 1);
+}
+
+/// #127: a panic in the planner is logged as `planner_panicked` at error, naming the node and
+/// the panic's message, for a `&str` panic and a formatted one. A planner that ends normally
+/// logs nothing.
+/// Cut: `panics_logged` awaits the future with no `catch_unwind`; the panic escapes the row, red.
+#[config_log::retcd_test]
+fn i127_a_planner_panic_is_logged() {
+    const METHOD: &str = "i127_a_planner_panic_is_logged";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    rt.block_on(panics_logged(NodeId(2), async { panic!("i127 static") }));
+    rt.block_on(panics_logged(NodeId(3), async {
+        panic!("i127 formatted {}", 7)
+    }));
+    rt.block_on(panics_logged(NodeId(4), async {}));
+    let lines = messages(METHOD, "planner_panicked");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["@l"], "Error", "{lines:?}");
+    assert_eq!(lines[0]["node"], 2, "{lines:?}");
+    assert_eq!(lines[0]["panic"], "i127 static", "{lines:?}");
+    assert_eq!(lines[1]["node"], 3, "{lines:?}");
+    assert_eq!(lines[1]["panic"], "i127 formatted 7", "{lines:?}");
+}
+
+/// #122 cost, bounded: an owner whose grant ran out is looked at before it is judged, and an
+/// owner that never answers holds its judge for the whole look. A sweep judges every owner at
+/// once, so four such owners cost one look, not four: a dead owner's failover is not held
+/// back by other owners that are slow in the same sweep (t1 S3, 15 s bound).
+///
+/// The proof is that all four looks are outstanding at the same time, not a wall-clock cap
+/// (PR #156 review: a cap fails on a loaded host even when judging is parallel). The row holds
+/// every look it receives, unanswered, until it holds all four; only then does it let them go,
+/// by dropping their reply channels. Each look waits longer than the row's patience, so a
+/// look still held when the next arrives was outstanding beside it.
+/// Cut: judge the owners in turn in `judge_all`; the second look never comes while the first
+/// is held, red.
+#[config_log::retcd_test]
+fn i122_owners_are_judged_at_once() {
+    let rt = crate::db::reopen_tests::runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(crate::test_store::Scripted::new(
+        crate::test_store::Script::default(),
+    ));
+    let links = Links::new();
+    let mut mailboxes = Vec::new();
+    for node in 1..=4u32 {
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        links.register(NodeId(node), tx, BootId(1));
+        mailboxes.push(rx);
+    }
+    let patience = crate::host::test_patience(Duration::from_secs(5));
+    let look_within = patience * 2;
+    let planner = Planner {
+        look_within,
+        ..planner(9, &store, links)
+    };
+    // Takes each owner's look and keeps it, reply channel and all, until it holds all four or
+    // runs out of patience; then drops them, which answers each judge at once.
+    let holder = std::thread::spawn(move || {
+        let started = Instant::now();
+        let deadline = started + patience;
+        let mut held = Vec::new();
+        for mailbox in &mailboxes {
+            match mailbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(look @ Msg::Inspect { .. }) => held.push(look),
+                Ok(other) => panic!("not a look: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        (held.len(), started.elapsed())
+    });
+    let verdicts = rt.block_on(
+        planner.judge_all((1..=4u32).map(|node| (NodeId(node), None, PartitionId(node)))),
+    );
+    let (outstanding, took) = holder.join().expect("the holder ends");
+    assert_eq!(
+        outstanding, 4,
+        "all four looks were outstanding at once within {patience:?}"
+    );
+    assert!(
+        took < look_within,
+        "held before the first look gave up: {took:?}"
+    );
+    assert_eq!(verdicts, vec![Verdict::Dead("silent_and_expired"); 4]);
+}

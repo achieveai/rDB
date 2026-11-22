@@ -6223,7 +6223,7 @@ fn s1_r10_i_an_idle_partition_trimmed_at_its_head_reopens_and_serves() {
 
 /// Issue #61 (t4's #137 note, design rev 5): a roll-forward that skips every copy below its
 /// trim floor rolls none, and with the owner's copy here and empty the open is refused exactly
-/// as an empty owner is (`empty_owner_refusal`), never let through holding no copy. With a
+/// as an empty owner is (`empty_owner`), never let through holding no copy. With a
 /// non-empty owner it is refused `Stale`, naming the generation no copy could take.
 ///
 /// Function level, on the two halves the open runs (`Db::link_roll`, then `Db::unrolled` when
@@ -6314,7 +6314,9 @@ fn t61_empty_owner_with_every_copy_below_floor_refuses_open() {
     assert_eq!(skipped, 2);
     let instance = root.instance;
     let refused = rt.block_on(Db::unrolled(&engines, &store, &instance, &roll));
-    let expected = rt.block_on(empty_owner_refusal(&store, &instance, &record, &root));
+    let expected = rt
+        .block_on(empty_owner(&store, &instance, &record, &root))
+        .expect_err("an emptied owner of a rolled lineage is refused");
     assert_eq!(format!("{refused:?}"), format!("{expected:?}"));
     assert!(!matches!(refused, OpenError::Stale { .. }), "{refused:?}");
 
@@ -6420,4 +6422,35 @@ fn t61_s3_db_config_history_budget_bytes_reaches_every_host() {
         Some(1),
     );
     assert!(floors.iter().all(|floor| *floor > 0), "{floors:?}");
+}
+
+/// #200 / PR #171 review: the reopen heal's task runs in the opener's span, so its lines land
+/// in the opener's own test file. Reopens a written folder; its owner heals, and that heal logs
+/// `heal_members` from the runtime task. Cut: `Db::start_heal` instruments the task with
+/// `Span::none()` in place of the opener's span; red at "a heal line in this test's file".
+/// Integration (~1 s): one fresh open, one reopen until ready.
+#[config_log::retcd_test]
+fn own200_the_reopen_heal_logs_into_the_openers_test_file() {
+    const METHOD: &str = "own200_the_reopen_heal_logs_into_the_openers_test_file";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    db.shutdown();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let names: std::collections::BTreeSet<_> = lines
+        .iter()
+        .filter_map(|line| line["@m"].as_str())
+        .collect();
+    assert!(
+        names.contains("db_heal_started"),
+        "the reopen heals: {names:?}"
+    );
+    assert!(
+        names.contains("heal_members"),
+        "a heal line in this test's file: {names:?}"
+    );
 }

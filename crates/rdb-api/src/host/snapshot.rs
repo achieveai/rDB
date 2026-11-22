@@ -62,6 +62,15 @@ pub const SNAPSHOT_CHUNK_LABEL: &[u8] = b"rdb snapshot chunk v1";
 /// A source drops a transfer no pull has touched for this long (design section 2, step 6).
 pub(crate) const SNAPSHOT_IDLE_MILLIS: u64 = 60_000;
 
+/// PR #204 review: the most bytes one snapshot page carries by default, a quarter of the
+/// 64 MiB frame ([`crate::net::MAX_FRAME`]), so a page of large values always fits it with the
+/// frame's own fields to spare. A page holds at least one entry, so a single entry larger than
+/// the frame still cannot be sent.
+pub(crate) const SNAPSHOT_PAGE_BYTES: usize = crate::net::MAX_FRAME / 4;
+
+// Any stored entry is from one write record, at most `MAX_ENVELOPE_BYTES`: it fits a page.
+const _: () = assert!(rdb_core::replication::append::MAX_ENVELOPE_BYTES < SNAPSHOT_PAGE_BYTES);
+
 /// Why a target refused an offer, or stopped an install. Sent back in [`SnapshotOfferRefused`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotRefusal {
@@ -329,6 +338,11 @@ pub(crate) struct Install {
     pub(crate) chunks: u64,
     /// When the offer was accepted.
     pub(crate) started: std::time::Instant,
+    /// Ordinary appends of the offer's lineage not delivered while this install owned the
+    /// partition ([`Host::append_deferred`]).
+    pub(crate) deferred: u64,
+    /// The largest page written, in [`rdb_storage::snapshot_entry_bytes`].
+    pub(crate) largest_page: u64,
 }
 
 impl Host {
@@ -431,11 +445,11 @@ impl Host {
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
         // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
+        // Written only beside the transfer, after every fallible step below (PR #204 review):
+        // a step that fails leaves no marker, so R1's next ask at this barrier is served.
         if self.snapshots_served.get(&(partition, copy)) == Some(&(generation, barrier)) {
             return;
         }
-        self.snapshots_served
-            .insert((partition, copy), (generation, barrier));
         let Some(target) = config.members.iter().find(|member| member.copy == copy) else {
             return unserved("copy_not_in_config");
         };
@@ -464,6 +478,10 @@ impl Host {
                 return unserved("barrier_read_failed");
             }
         };
+        #[cfg(debug_assertions)]
+        if std::mem::take(&mut self.snapshot_export_fault) {
+            return unserved("view_failed");
+        }
         let view = match self.engine.snapshot(
             partition,
             generation,
@@ -490,6 +508,8 @@ impl Host {
             root,
             barrier: barrier_record,
         };
+        self.snapshots_served
+            .insert((partition, copy), (generation, barrier));
         let replaced = self
             .transfers
             .insert(
@@ -701,11 +721,14 @@ impl Host {
             );
             return;
         }
-        let page = transfer.view.entries_after(
+        // PR #204 review: capped by size too, so a page of large values fits the frame, and
+        // ended from the cursor: a page cut short by size is not the last.
+        let page = transfer.view.page_after(
             pull.after.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
             self.snapshot_page_keys,
+            self.snapshot_page_bytes,
         );
-        let page = match (page, transfer.view.fault()) {
+        let (page, more) = match (page, transfer.view.fault()) {
             (Ok(page), None) => page,
             (result, fault) => {
                 tracing::warn!(
@@ -733,7 +756,7 @@ impl Host {
             .sum::<u64>();
         let index = transfer.pages;
         transfer.pages += 1;
-        let done = page.len() < self.snapshot_page_keys;
+        let done = !more;
         let chunk = SnapshotChunk {
             partition: pull.partition,
             generation: pull.generation,
@@ -810,8 +833,11 @@ impl Host {
             );
         }
         // Rev 5b: a held tail is recorded, so `admin forget-tail` counts it and the owner's
-        // status names the command.
-        if let (SnapshotRefusal::TailHeld, Some(through)) = (refused.reason, refused.through) {
+        // status names the command. Only for the transfer open now (PR #204 review): a late
+        // refusal of an ended one, after the writable re-plan cleared its hold, records none.
+        if let (true, SnapshotRefusal::TailHeld, Some(through)) =
+            (ours, refused.reason, refused.through)
+        {
             self.offer_holds
                 .entry(refused.partition)
                 .or_default()
@@ -935,6 +961,8 @@ impl Host {
             entries: 0,
             chunks: 0,
             started: std::time::Instant::now(),
+            deferred: 0,
+            largest_page: 0,
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
@@ -1087,6 +1115,43 @@ impl Host {
         self.send_peer(install.offer.from, Msg::SnapshotPull(pull), "snapshot_pull");
     }
 
+    /// PR #204 review: whether `frame`, delivered for `partition`, is an ordinary append of the
+    /// lineage an install here owns, and so is not handed to the receiver. Staged, its commit
+    /// would meet the engine's installing guard (which stays) as `WriteFailed`, and R1 would
+    /// fence the partition for this boot. Dropped, it is not lost: R1's retransmit re-sends an
+    /// unacked record, and the re-seed's ACK at `S` walks `S + 1 ..= head`. Every other frame
+    /// is delivered: replies, recovery appends, other partitions, another lineage's appends.
+    ///
+    /// Queueing the frames for after the install was rejected: during a slow install (8.9 s
+    /// under load) the queue grows with the write rate, and on replay its entries are mostly at
+    /// or below `S`, stale by then. Logged once per install, `append_deferred_during_install`
+    /// with the first seq; the count rides `snapshot_transfer_installed{deferred}`.
+    pub(super) fn append_deferred(&mut self, partition: PartitionId, frame: &Frame) -> bool {
+        let Some(install) = self.installs.get_mut(&partition) else {
+            return false;
+        };
+        if frame.sender != install.offer.lineage
+            || rdb_core::replication::wire::classify(&frame.body)
+                != Some(rdb_core::replication::wire::R1Frame::Append)
+        {
+            return false;
+        }
+        install.deferred += 1;
+        if install.deferred == 1 {
+            let seq =
+                ReplicationEnvelope::decode(&frame.body).map(|envelope| envelope.header.seq.0);
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = install.offer.lineage.generation.0,
+                at = install.offer.at.0,
+                seq = ?seq.ok(),
+                "append_deferred_during_install"
+            );
+        }
+        true
+    }
+
     /// A page reached this target: check its chain, write it, and pull the next or finish.
     pub(super) fn snapshot_chunk(&mut self, chunk: SnapshotChunk) -> Result<(), super::Fault> {
         let partition = chunk.partition;
@@ -1142,6 +1207,12 @@ impl Host {
         }
         install.chain = chunk.chain;
         install.entries += chunk.entries.len() as u64;
+        let page_bytes: usize = chunk
+            .entries
+            .iter()
+            .map(|(_, key, value, ..)| rdb_storage::snapshot_entry_bytes(key, value))
+            .sum();
+        install.largest_page = install.largest_page.max(page_bytes as u64);
         install.chunks += 1;
         install.after = chunk
             .entries
@@ -1235,6 +1306,8 @@ impl Host {
             at = offer.at.0,
             entries = install.entries,
             chunks = install.chunks,
+            deferred = install.deferred,
+            largest_page_bytes = install.largest_page,
             millis = u64::try_from(install.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "snapshot_transfer_installed"
         );

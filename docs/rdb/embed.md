@@ -400,14 +400,22 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
   for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
   for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
+  With `DbConfig::failover` set, the planner does the same by itself: once a faulted owner's
+  grant has run out it moves every partition of that owner, logging `planner_node_silent` with
+  reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
+  owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
   partition it still owns stops for good until that partition is moved too. Move each one. If
   the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
   those partitions can still be moved while it runs.
-- **A frozen node cannot lead again** in this release. It can start and hold copies once it owns
-  nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
+  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
+  a restart (a new boot) that owns nothing, a failover planner, where one runs
+  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
+  promoted again like any regular copy. With no planner running the frozen grant stays, and the
+  node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
@@ -417,8 +425,58 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again in this release, and the moved partition stays
-  paused until its other copy is back, because that copy was on the stopped node.
+  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
+  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  until its other copy is back, because that copy was on the stopped node.
+
+**Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
+partitions were all promoted away while it was stopped comes back with a frozen grant, and
+nothing at that boot lifts it. `rdb_node` checks for that about once a second. It exits **75**
+(`EX_TEMPFAIL`) when its own `NodeStatus` has shown `replace_stopped` for 5 s, or its host has
+faulted (`fault` is set), **and** no `partitions/` record in the control store names it owner,
+in any lifecycle. A failed read of the control store keeps it up. Before it exits it prints
+`rdb_node restart-wanted node=N reason=R` (`replace_stopped` or `host_faulted`) and logs
+`rdb_node_restart_wanted`, then shuts down and prints `rdb_node stopped node=N` as usual.
+
+- **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
+  flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
+  other non-zero exit as a failure to report, not a restart to loop on.
+- `lr` supervises nothing. `lr status` shows such a node as `stopped: restart wanted` (it reads
+  the printed `restart-wanted` line, not the exit status), and
+  `lr start N` is the restart.
+- `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
+  embedder asks the same.
+- Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
+  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
+  place, as below.
+
+**Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
+supervisor, restarts the node in place:
+
+1. Poll `db.restart_wanted()` about once a second. It blocks, as `node_status` does, and
+   keeps the 5 s hold between calls. It returns `Some(RestartReason::ReplaceStopped)` or
+   `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
+   cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
+   a partition, so a frozen node beside an owning one waits until the owner's partitions move.
+   Run one `Db` per node, as the gateway does, so each restarts on its own.
+2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
+   links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
+   than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
+   `Links` included), the old boot keeps answering its peers' probes, they keep their route
+   to it, and they never meet the new boot.
+3. Drop the `Db`, the `Net` and the `Links`.
+4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
+   at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
+   held.
+5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
+   restart policy, say) restart it. The gateway does this.
+
+Drop before you reopen, so a node never has two `Db`s at once.
+
+A peer sees every link to the old boot end, and its dials refused while nothing listens. When
+the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
+the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
+restart: the control store, the runtime and your app's own state stay as they are.
 
 ### Fencing your own side effects
 
@@ -1130,19 +1188,16 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
-  older build. The re-add itself needs a partition that takes writes. But if the partition goes
-  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
-  and the partition can then stay read-only until that copy's node restarts. A build older than
-  check B can also be left holding a lineage with a hole in it, which nothing refuses
-  (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Builds with and without these guards can speak the same
-  protocol version, so a node cannot tell them apart. Turning it on by default first needs a
-  protocol version raised for it, or a capability bit that gates the re-add, so a node without
-  these guards is refused or never re-added live (ADR-rdb-0009 section 7). Until then it stays
-  off by default.
+- **Mixed builds and mixed settings.** Turn it on only on every node at once. Mixed builds
+  cannot pair: this release speaks protocol version 10, and the handshake refuses every older
+  build, node or app, so a copy on a build without these guards is never re-added live. Mixed
+  settings can pair: an owner that has it on can add back a copy whose node has it off. The
+  re-add itself needs a partition that takes writes. But if the partition goes read-only
+  before that copy has caught up, a copy with it off does not mark the landing it refuses, and
+  the partition can then stay read-only until that copy's node restarts (ADR-rdb-0009
+  section 7).
+- **Default.** It stays off by default. The version check above is what keeps a build without
+  these guards from being re-added live; the default itself is not changed by this release.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote
@@ -1336,8 +1391,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. For a declared database, an owner whose
-  folder is lost after its first root and before any admitted write is still refused as
-  unfinished forming; repeating --declare does not recover it (#137).
+  folder is lost after its first root and before any admitted write takes that root back on
+  restart, with nothing lost (#137). One that may have admitted writes is refused and told to
+  move the partition with `admin promote`.
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take
@@ -1407,10 +1463,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
     copies.
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan in the same millisecond a put is sent. The put lands, but its answer is
-  lost. Treat `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
-  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
-  separate issue.
+  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
+  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
+  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
+  last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied": ask
+  `db.status`, send it again with `db.resend`, or read the key back. Never send it again as a
+  new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or

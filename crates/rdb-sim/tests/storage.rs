@@ -1168,3 +1168,43 @@ fn t61_sim_history_bytes_fall_with_the_seq_and_skip_the_trimmed() {
         "the child counts its parent's records through the link"
     );
 }
+
+/// Issue #61 PR #204 review, the sim twin of the page byte cap: four 100 KiB values under a
+/// 250 KiB cap page as 2, 2 and none left. A page stops before the entry that would take it past
+/// the cap, and says whether the view holds more; a page cut short by size is not the last.
+/// A cap smaller than one entry still takes that entry, so the pager always moves.
+/// Cut: `page_after` ignores `max_bytes`, red (one page of all four).
+/// Unit (<10 ms).
+#[retcd_test]
+fn t61_pr204_sim_pages_stop_at_the_byte_cap_and_say_whether_more_remain() {
+    support::preamble();
+    let value: &'static [u8] = Box::leak(vec![b'v'; 100 * 1024].into_boxed_slice());
+    let mut engine = MemoryEngine::new(NODE);
+    for (seq, key) in [b"a", b"b", b"c", b"d"].iter().enumerate() {
+        engine
+            .commit(support::batch(1, seq as u64 + 1, *key, value))
+            .expect("commit");
+    }
+    let cap = 250 * 1024;
+    let (first, more) = engine.page_after(PARTITION, GENERATION, None, 1024, cap);
+    let keys = |page: &[InstallEntry]| page.iter().map(|e| e.1.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        keys(&first),
+        vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+    );
+    assert!(more, "a page cut by size is not the last");
+    let after = (Namespace::User, first[1].1.clone());
+    let (second, more) = engine.page_after(PARTITION, GENERATION, Some(&after), 1024, cap);
+    assert_eq!(
+        keys(&second),
+        vec![Bytes::from_static(b"c"), Bytes::from_static(b"d")]
+    );
+    assert!(!more, "nothing after d");
+    let (one, more) = engine.page_after(PARTITION, GENERATION, None, 1024, 1);
+    assert_eq!(
+        keys(&one),
+        vec![Bytes::from_static(b"a")],
+        "the first entry always goes"
+    );
+    assert!(more);
+}

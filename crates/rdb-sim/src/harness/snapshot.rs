@@ -46,6 +46,10 @@ pub const SNAPSHOT_CHUNK_LABEL: &[u8] = b"rdb snapshot chunk v1";
 /// Entries per page: the host's default `Host::snapshot_page_keys`, `COPY_BATCH_KEYS`.
 pub const SNAPSHOT_PAGE_KEYS: usize = 1024;
 
+/// The most bytes one page carries: the host's `SNAPSHOT_PAGE_BYTES`, a quarter of its 64 MiB
+/// frame (PR #204 review).
+pub const SNAPSHOT_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// One page entry as the chain reads it, the host's `rdb_storage::SnapshotEntry`: namespace,
 /// key, value, version, and the generation that holds it.
 pub type ChunkEntry = (Namespace, Bytes, Bytes, Version, Generation);
@@ -85,8 +89,7 @@ impl SnapshotRefusal {
     }
 }
 
-/// The primary's offer of a snapshot of `lineage` at `at` to `copy`: the host's `SnapshotOffer`
-/// without `released_through`, which is A9c's.
+/// The primary's offer of a snapshot of `lineage` at `at` to `copy`: the host's `SnapshotOffer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotOffer {
     /// The offerer's lineage.

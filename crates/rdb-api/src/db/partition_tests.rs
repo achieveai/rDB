@@ -78,7 +78,7 @@ fn routes_root(rt: &tokio::runtime::Runtime, store: &Arc<dyn ConfigStore>) -> Op
         .expect("routes/0 reads")
 }
 
-fn compile(request: u64, group: AffinityId) -> ClientCall {
+pub(super) fn compile(request: u64, group: AffinityId) -> ClientCall {
     ClientCall::Compile {
         identity: RequestIdentity {
             tenant: TENANT,
