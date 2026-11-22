@@ -3186,18 +3186,18 @@ struct Host {
     /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it. With
     /// the generation it was served under (lead ruling R18), so a new commit serves it again.
     snapshots_served: BTreeMap<(PartitionId, CopyId), (Generation, Seq)>,
-    /// Issue #61 round 2 (B3): per `(partition, copy)`, the `install_retryable` refusals heard
+    /// Issue #61: per `(partition, copy)`, the `install_retryable` refusals heard
     /// at one `(generation, barrier)` of [`Self::snapshots_served`]. The first
     /// [`snapshot::SNAPSHOT_RETRY_LIMIT`] (3) such refusals each forget the barrier, so R1's next
     /// ask re-offers it. The 4th keeps the barrier and records the tick it ran out, until
-    /// `Host::retry_duty` re-opens it (round 3, B1). Cleared on the copy's caught-up release.
+    /// `Host::retry_duty` re-opens it. Cleared on the copy's caught-up release.
     snapshot_retries: BTreeMap<(PartitionId, CopyId), snapshot::RetryCount>,
-    /// Round 3 (B1): how long an exhausted barrier stays kept before the retry duty re-opens
+    /// How long an exhausted barrier stays kept before the retry duty re-opens
     /// it and probes the copy. [`snapshot::SNAPSHOT_RETRY_BACKOFF_MILLIS`]; rows set it lower.
     snapshot_retry_backoff_millis: u64,
     /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
     transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
-    /// Round 3: the next [`snapshot::Transfer`]'s instance.
+    /// The next [`snapshot::Transfer`]'s instance.
     next_transfer_id: u64,
     /// Issue #61 S2: the install this target runs, per partition.
     installs: BTreeMap<PartitionId, snapshot::Install>,
@@ -3229,7 +3229,7 @@ struct Host {
     /// index (0 is the first), so a row can stop a target mid-install. Rows only.
     #[cfg(debug_assertions)]
     snapshot_pages_held_from: Option<u64>,
-    /// Issue #61 round 2 (B4): while above 0, this target's next page write fails as a storage
+    /// Issue #61: while above 0, this target's next page write fails as a storage
     /// fault would (`InstallError::Storage`), once per page, counting down. Rows only.
     #[cfg(debug_assertions)]
     snapshot_install_faults: u32,
@@ -16305,7 +16305,7 @@ impl Host {
                 ),
             );
         }
-        // Round 4 (Q-feed): mid-install the lineage is wiped and the floor reads 1, so a cursor
+        // Mid-install the lineage is wiped and the floor reads 1, so a cursor
         // would be rewound to START over a history this node does not hold.
         if self.installs.contains_key(&partition) {
             return refused(
@@ -16459,7 +16459,7 @@ impl Host {
             match envelope.compute_record_digest() {
                 Ok(digest) if digest == envelope.record_digest => {}
                 computed => {
-                    // Round 3: both digests go to this local line only, never into the fault's
+                    // Both digests go to this local line only, never into the fault's
                     // detail. That detail is shared: every later call and every status read,
                     // over the links too, carries it, and the admin gate guards only `Changes`.
                     tracing::error!(
