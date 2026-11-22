@@ -293,6 +293,33 @@ fn a_not_wired_step_says_another_node_can_take_over() {
     }
 }
 
+/// #170 review r4 (4654680328): a host fault that names stored damage (`CORRUPT_HISTORY`,
+/// `Quarantine`, as the node types a damaged history) takes the `NotWired` step on the wire,
+/// as `ApiError::next_step` does: the damage is the node's, so "write the object again" is
+/// wrong, and only a takeover helps. `no_mutation` still picks how a write goes again.
+/// Cut: `wire_message` passing the error's own retry rule, red ("a damaged entry").
+#[test]
+fn a_damaged_host_fault_takes_the_not_wired_step() {
+    for no_mutation in [false, true] {
+        let mut error = ApiError::new(
+            ErrorKind::CorruptHistory,
+            "host fault: feed: the record at seq 4 does not match its digest",
+        );
+        assert_eq!(error.retry, RetryRule::Quarantine);
+        error.no_mutation = no_mutation;
+        let message = wire_message(&error);
+        let case = format!("no_mutation={no_mutation}: {message}");
+        assert!(message.starts_with("CORRUPT_HISTORY ("), "{case}");
+        assert!(
+            message.contains("retrying at this node will not help"),
+            "{case}"
+        );
+        assert!(!message.contains("a damaged entry"), "{case}");
+        assert!(!message.contains("write the object again"), "{case}");
+        assert_eq!(message.contains("call Status"), !no_mutation, "{case}");
+    }
+}
+
 /// PR #129 review: an undecodable call is `NotWired` and proven unsent too, but no takeover
 /// fixes it, so its step offers the takeover only "if the owner faulted", which keeps it from
 /// contradicting the detail's "sending it again will not help". The detail is the one
