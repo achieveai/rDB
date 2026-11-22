@@ -13841,6 +13841,25 @@ impl Host {
                     );
                     RecoveryEvent::InventoryFailed { copy }
                 }
+                // PR #204 review: a copy installing a snapshot of this partition has wiped its
+                // old lineages and links the new one only when the install finishes, so its own
+                // unlinked anchor is the install's normal state, not a fault: the re-plan that
+                // follows the install asks again.
+                Err(reason @ "anchor_generation_unlinked")
+                    if self.installs.contains_key(&partition) =>
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        installing = true,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
                 Err(reason) => {
                     tracing::error!(
                         node = self.node.0,

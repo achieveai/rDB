@@ -9453,6 +9453,52 @@ fn t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live
     assert!(owner.stalled.contains_key(&p));
 }
 
+/// Issue #61 PR #204 review, item 14: a copy asked for its inventory while it installs a
+/// snapshot of the partition answers `InventoryFailed` with `anchor_generation_unlinked`, its
+/// normal state until the install links the lineage, and logs it at info with `installing`,
+/// not at error. As S2-R1, with node 1 holding page 1 so node 3's install stays open.
+/// Cut: the guard on `installs`, red (the line is logged at error).
+/// Integration (~3 s): S2-R1's setup and one inventory ask on node 3.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error() {
+    const METHOD: &str = "t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let (lineage, at) = {
+        let transfer = &trio.nodes[0].0.transfers[&(p, three)];
+        (transfer.lineage, transfer.at)
+    };
+    let target = &mut trio.nodes[2].0;
+    assert!(target.installs.contains_key(&p), "node 3 is installing");
+    let anchor = LineageAnchor {
+        lineage,
+        base_seq: at,
+        base_digest: Digest::ROOT,
+    };
+    let answer = target.inventory(p, three, anchor, None, None);
+    assert!(
+        matches!(answer, RecoveryEvent::InventoryFailed { copy } if copy == three),
+        "{answer:?}"
+    );
+    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
+        .into_iter()
+        .filter(|line| line["reason"] == "anchor_generation_unlinked")
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["@l"], "Information", "{failed:?}");
+    assert_eq!(failed[0]["installing"], true, "{failed:?}");
+}
+
 /// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
 /// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
 /// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
