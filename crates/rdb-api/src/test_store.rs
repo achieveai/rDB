@@ -967,6 +967,7 @@ impl ConfigStore for SwapPartitionOneInstance {
 pub(crate) struct CallGate {
     inner: std::sync::Arc<dyn ConfigStore>,
     put: Mutex<Option<Vec<u8>>>,
+    puts: Mutex<Option<Vec<u8>>>,
     put_reply: Mutex<Option<Vec<u8>>>,
     delete: Mutex<Option<Vec<u8>>>,
     parked: std::sync::atomic::AtomicU32,
@@ -978,6 +979,7 @@ impl CallGate {
         std::sync::Arc::new(Self {
             inner,
             put: Mutex::new(None),
+            puts: Mutex::new(None),
             put_reply: Mutex::new(None),
             delete: Mutex::new(None),
             parked: std::sync::atomic::AtomicU32::new(0),
@@ -988,6 +990,18 @@ impl CallGate {
     /// Hold the next put under `prefix` before it reaches the store.
     pub(crate) fn arm_put(&self, prefix: &str) {
         *self.put.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Hold every put under `prefix` before it reaches the store, until [`Self::disarm_puts`]:
+    /// a kernel's control call re-sends a held put after its deadline, and the re-send is held
+    /// too.
+    pub(crate) fn arm_puts(&self, prefix: &str) {
+        *self.puts.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Stop holding puts that [`Self::arm_puts`] armed; held ones stay held until released.
+    pub(crate) fn disarm_puts(&self) {
+        *self.puts.lock().expect("gate") = None;
     }
 
     /// Apply the next put under `prefix`, then hold its reply.
@@ -1024,12 +1038,47 @@ impl CallGate {
         tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_parked");
         self.parked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.gate
-            .acquire()
-            .await
-            .expect("the gate is never closed")
-            .forget();
+        match self.gate.acquire().await {
+            Ok(permit) => permit.forget(),
+            // Opened for good by [`ReleaseOnUnwind`]: the row failed, so let every call go on.
+            Err(_closed) => {}
+        }
         tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_released");
+    }
+
+    /// Let every parked and every later held call go on, for good.
+    pub(crate) fn open(&self) {
+        self.gate.close();
+    }
+}
+
+/// Opens every [`CallGate`] it watches when it is dropped during a panic (PR #218 review):
+/// a row whose wait fails while a call is parked would otherwise hang in the scoped join on
+/// the thread that made that call. Create it inside the scope, before the first wait.
+#[derive(Default)]
+pub(crate) struct ReleaseOnUnwind(Mutex<Vec<std::sync::Arc<CallGate>>>);
+
+impl ReleaseOnUnwind {
+    /// Open `gate` too if this is dropped during a panic.
+    pub(crate) fn watch(&self, gate: &std::sync::Arc<CallGate>) {
+        self.0
+            .lock()
+            .expect("gates")
+            .push(std::sync::Arc::clone(gate));
+    }
+}
+
+impl Drop for ReleaseOnUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            for gate in self
+                .0
+                .lock()
+                .map_or_else(|e| e.into_inner().clone(), |g| g.clone())
+            {
+                gate.open();
+            }
+        }
     }
 }
 
@@ -1051,7 +1100,13 @@ impl ConfigStore for CallGate {
     }
 
     async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
-        if Self::take(&self.put, &request.key) {
+        let every = self
+            .puts
+            .lock()
+            .expect("gate")
+            .as_ref()
+            .is_some_and(|prefix| request.key.starts_with(prefix));
+        if every || Self::take(&self.put, &request.key) {
             let key = request.key.clone();
             self.park("put", &key).await;
         }
@@ -1177,4 +1232,47 @@ impl ConfigStore for PutLog {
     async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
         self.inner.watch_leader(request).await
     }
+}
+
+/// PR #218 review (thread io1w): a row whose wait fails while a call is parked at a
+/// [`CallGate`] fails; it does not hang in the scoped join. The early failure is a panic in the
+/// scope's own thread, as an `until` that runs out of patience makes, while a spawned thread's
+/// delete is parked. Unit (well under 1 s): `MemStore`, one delete, no cluster.
+#[config_log::retcd_test]
+fn i172_a_row_that_fails_while_a_call_is_parked_fails_instead_of_hanging() {
+    let gate = CallGate::new(std::sync::Arc::new(MemStore::new()));
+    gate.arm_delete("grants/");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (done, ended) = std::sync::mpsc::channel();
+    let watched = std::sync::Arc::clone(&gate);
+    // The scope runs on its own thread so this row can bound it: without the guard it hangs.
+    std::thread::spawn(move || {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                let release = ReleaseOnUnwind::default();
+                release.watch(&watched);
+                let parked = scope.spawn(|| {
+                    rt.block_on(watched.delete(DeleteRequest {
+                        key: bytes::Bytes::from_static(b"grants/1"),
+                        expected_mod_revision: None,
+                        dedup: None,
+                    }))
+                });
+                while watched.parked() == 0 {
+                    std::thread::yield_now();
+                }
+                let _ = &parked;
+                panic!("the promote failed before its gate opened");
+            });
+        }));
+        let _ = done.send(failed.is_err());
+    });
+    let failed = ended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the row failed rather than hung");
+    assert!(failed, "the scope's panic reached the caller");
+    assert_eq!(gate.parked(), 1);
 }

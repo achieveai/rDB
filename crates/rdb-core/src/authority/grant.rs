@@ -501,6 +501,23 @@ mod tests {
         );
     }
 
+    /// Guard 3 judges only the node's own partitions (PR #218 review, thread io1x): with one
+    /// `Serving` record present, and it names another owner, the frozen grant clears. Unit.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: guard 3 also refuses another owner's
+    /// `Serving` record. Red, `Err(OwnerInTransfer(PartitionId(4)))` against `Ok(())`.
+    #[config_log::retcd_test]
+    fn i172_a_frozen_grant_clears_beside_only_another_owners_serving_record() {
+        use crate::authority::partition::PartitionLifecycle;
+        let partitions = [PartitionRecord {
+            owner: NodeId(2),
+            ..owned(4, PartitionLifecycle::Serving)
+        }];
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &partitions, LATER),
+            Ok(())
+        );
+    }
+
     /// Guard 3: a `Fencing` or `FencingDrained` partition naming the node keeps its frozen
     /// record, `Serving` ones beside it or not: that takeover still needs the freeze. Unit.
     /// Cut: drop the lifecycle test from guard 3 (any lifecycle clears); red,

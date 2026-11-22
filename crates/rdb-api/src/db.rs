@@ -588,6 +588,10 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the heal's task still runs, sends included, and so may plan a recovery that
+    /// blocked on `CasContention` again ([`admin::heal_settling`]). [`Db::wait_ready`] does
+    /// not end on that block while it does.
+    heal_settling: Arc<AtomicBool>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
@@ -646,6 +650,7 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_settling: Arc::new(AtomicBool::new(false)),
             planner_task: None,
             stuck: Mutex::new(None),
             control: None,
@@ -2663,6 +2668,8 @@ impl Db {
         }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
+        let settling = Arc::clone(&self.opened.heal_settling);
+        settling.store(true, Ordering::Release);
         // In the opener's span, as the planner's task is: the heal's lines land in the
         // opener's test file (issue #200, PR #171 review).
         self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
@@ -2671,10 +2678,13 @@ impl Db {
                 // find theirs already expired.
                 let mut first = None;
                 let mut ended = Ok(());
+                let mut handed = Vec::new();
                 for ctx in ctxs {
+                    let watch = ctx.again();
                     match admin::heal_retrying(ctx).await {
                         Ok(healed) => {
                             first.get_or_insert(healed);
+                            handed.push(watch);
                         }
                         Err(error) => {
                             tracing::error!(%error, "heal_failed");
@@ -2683,11 +2693,18 @@ impl Db {
                         }
                     }
                 }
+                let healed = ended.is_ok();
                 *lock(&state) = match (ended, first) {
                     (Ok(()), Some(healed)) => HealState::Handed(healed),
                     (Err(error), _) => HealState::Failed(error),
                     (Ok(()), None) => HealState::NotNeeded,
                 };
+                // #172 (PR #218 review): a recovery whose commit lost to an undone `Fencing`
+                // is planned again in this open; `wait_ready` waits while this runs.
+                if healed && !handed.is_empty() {
+                    futures::future::join_all(handed.into_iter().map(admin::heal_settling)).await;
+                }
+                settling.store(false, Ordering::Release);
             },
             tracing::Span::current(),
         )));
@@ -2699,7 +2716,10 @@ impl Db {
     /// or its restart failed, answers at once: the owner stays out until the folder is opened
     /// again. So does a
     /// recovery that ended `Blocked` on an owner this `Db` runs: only a fresh fence leaves that
-    /// phase, and an open sends one fence only (ruling F-a, A-R196). An owner in another process
+    /// phase (ruling F-a, A-R196). The one exception is `Blocked(CasContention)` while the
+    /// reopen's heal still runs: [`admin::heal_settling`] plans that recovery again with a fresh
+    /// fence (#172, PR #218 review), so this waits on, and answers `Blocked` only once the heal
+    /// has stopped watching. An owner in another process
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
@@ -2782,7 +2802,10 @@ impl Db {
                     Some(ReadyError::Blocked {
                         owner: node,
                         reason,
-                    }) if self.runs(node) => {
+                    }) if self.runs(node)
+                        && !(reason == "CasContention"
+                            && self.opened.heal_settling.load(Ordering::Acquire)) =>
+                    {
                         tracing::warn!(owner = node.0, reason, "ready_blocked");
                         return Err(ReadyError::Blocked {
                             owner: node,

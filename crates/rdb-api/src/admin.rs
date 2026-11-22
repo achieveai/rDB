@@ -2035,8 +2035,13 @@ pub enum HealError {
         /// Why the last answer kept the grant, and the next step, in words (A-R191b).
         last: String,
     },
-    /// The grant is frozen for a takeover that has not finished. Only a promote settles it, so
-    /// the heal stops at its first look instead of waiting out its time (A-R266 follow-up).
+    /// The grant is frozen and the heal could not clear it. Two cases, and `step` says which.
+    /// A takeover of a partition the node owns is under way (`Fencing` or `FencingDrained` at
+    /// the first look), or no failover planner runs: only a promote settles it, so the heal
+    /// stops at its first look instead of waiting out its time (A-R266 follow-up). Or, with a
+    /// planner configured and every owned partition `Serving`, the heal waited for the
+    /// planner to clear the grant (#172) and the deadline passed with it still frozen: `step`
+    /// then says to check the planner, not to promote.
     #[error("the last run's grant for node {node} (grants/{node}) is frozen: {step}")]
     Frozen {
         /// The node.
@@ -2123,6 +2128,21 @@ pub(crate) struct HealCtx {
     /// planner can clear the owner's frozen grant of a gone boot (#172), so [`clear_until`]
     /// waits for that instead of failing at once.
     pub(crate) failover: bool,
+}
+
+impl HealCtx {
+    /// A copy to run another heal with: [`heal`] takes its context by value.
+    pub(crate) fn again(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            owner: self.owner.clone(),
+            member_boot: Arc::clone(&self.member_boot),
+            partitions: self.partitions.clone(),
+            bootstrap: self.bootstrap.clone(),
+            nodes: Arc::clone(&self.nodes),
+            ..*self
+        }
+    }
 }
 
 /// The correlation a heal's two events carry.
@@ -2484,16 +2504,7 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
     let mut attempt: u64 = 0;
     loop {
         attempt += 1;
-        let again = HealCtx {
-            store: Arc::clone(&ctx.store),
-            owner: ctx.owner.clone(),
-            member_boot: Arc::clone(&ctx.member_boot),
-            partitions: ctx.partitions.clone(),
-            bootstrap: ctx.bootstrap.clone(),
-            nodes: Arc::clone(&ctx.nodes),
-            ..ctx
-        };
-        match heal(again).await {
+        match heal(ctx.again()).await {
             Err(HealError::PeersUnknown { nodes, within_ms }) => {
                 let missing = nodes.clone();
                 let error = HealError::PeersUnknown { nodes, within_ms };
@@ -2509,6 +2520,99 @@ pub(crate) async fn heal_retrying(ctx: HealCtx) -> Result<Healed, HealError> {
             }
             ended => return ended,
         }
+    }
+}
+
+/// How often [`heal_settling`] looks at the owner's recoveries.
+const HEAL_WATCH_GAP: Duration = Duration::from_millis(50);
+
+/// How long [`heal_settling`] waits for one look's answer.
+const HEAL_LOOK_WAIT: Duration = Duration::from_secs(1);
+
+/// After a heal has sent its plans, watch each partition's recovery on the owner until it admits
+/// writes, stops for another reason, or the heal's bound (`ctx.within`, from now) passes
+/// (#172, PR #218 review). A recovery the store answered with a definitive conflict on a record
+/// nobody else owns (`Blocked(CasContention)`: a promote's `Fencing` write the heal planned
+/// against was undone) is healed again: `partitions/` is read again and planned afresh, and
+/// the new fence leaves `Blocked` (F1 re-enters on a fresh fence). Only those partitions are
+/// planned again. What it leaves as it is: `Blocked(OvertakenByPeer)` (another owner won), every
+/// unknown outcome (`ControlUnknown`, `ProposalUnresolved`), any other block, and a quarantine;
+/// [`Db::wait_ready`] reports those. A re-read record that names another owner refuses the new
+/// plan in [`plan_heal`], so a competing owner still stops it. Logged `heal_replan_after_conflict`
+/// for each re-plan, and `heal_replan_failed` when the new heal fails; that ends the watch.
+pub(crate) async fn heal_settling(ctx: HealCtx) {
+    let deadline = tokio::time::Instant::now() + ctx.within;
+    let mut attempt: u64 = 0;
+    // Planned again and not yet seen off the block: the owner has not taken the new fence in
+    // yet, so the same block is not a second conflict.
+    let mut replanned: Vec<PartitionId> = Vec::new();
+    loop {
+        let mut pending = false;
+        let mut contended = Vec::new();
+        for &partition in &ctx.partitions {
+            let Some(status) = look_at_owner(&ctx, partition).await else {
+                pending = true;
+                continue;
+            };
+            if status.admits == Some(true) {
+                continue;
+            }
+            let blocked = status.recovery.as_deref() == Some("Blocked(CasContention)");
+            if !blocked {
+                replanned.retain(|seen| *seen != partition);
+            }
+            match status.recovery.as_deref() {
+                Some("Blocked(CasContention)") if replanned.contains(&partition) => pending = true,
+                Some("Blocked(CasContention)") => contended.push(partition),
+                Some(phase) if phase.starts_with("Blocked(") || phase == "Quarantined" => {}
+                _ => pending = true,
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if !contended.is_empty() && now < deadline {
+            attempt += 1;
+            tracing::warn!(
+                owner = ctx.owner_node.0,
+                partitions = ?contended.iter().map(|p| p.0).collect::<Vec<_>>(),
+                attempt,
+                "heal_replan_after_conflict"
+            );
+            replanned.extend(contended.iter().copied());
+            let again = HealCtx {
+                partitions: contended,
+                bootstrap: Vec::new(),
+                within: deadline - now,
+                ..ctx.again()
+            };
+            if let Err(error) = heal(again).await {
+                tracing::error!(owner = ctx.owner_node.0, %error, "heal_replan_failed");
+                return;
+            }
+            continue;
+        }
+        if !pending || now >= deadline {
+            return;
+        }
+        tokio::time::sleep(HEAL_WATCH_GAP).await;
+    }
+}
+
+/// The owner's status for `partition`, or `None` when it does not answer within
+/// [`HEAL_LOOK_WAIT`].
+async fn look_at_owner(ctx: &HealCtx, partition: PartitionId) -> Option<NodeStatus> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    ctx.owner.send(Msg::Inspect { partition, reply }).ok()?;
+    let until = tokio::time::Instant::now() + HEAL_LOOK_WAIT;
+    loop {
+        match answer.try_recv() {
+            Ok(status) => return Some(status),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if tokio::time::Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -2656,12 +2760,22 @@ enum Gone {
 ///
 /// A frozen grant is never cleared by this heal, only by the promote that froze it, or (#172,
 /// option C) by the failover planner once it sees this new boot ([`crate::planner`]'s X2
-/// clear). So with [`HealCtx::failover`] set and every partition the node owns `Serving`, a
-/// frozen record is polled to `deadline` (logged `heal_grant_frozen_waiting` once); once the
-/// planner deletes it, the next look reads it `Absent` and the heal goes on to acquire
-/// create-only. With failover off, or a partition of the node in `Fencing` or
-/// `FencingDrained` (a takeover under way), it fails at once with the `admin promote` advice,
-/// as before.
+/// clear). So with [`HealCtx::failover`] set and every partition the node owns `Serving` at
+/// the first look, a frozen record is polled read-only to `deadline` (logged
+/// `heal_grant_frozen_waiting` once); once the planner deletes it, the next look reads it
+/// `Absent` and the heal goes on to acquire create-only. With failover off, or a partition of
+/// the node in `Fencing` or `FencingDrained` at the first look (a takeover under way), it
+/// fails at once with the `admin promote` advice, as before.
+///
+/// Once that wait has started it is not ended by a racing promote (PR #218 review): a
+/// `Fencing` or `FencingDrained` record seen later is polled through, so a clear the planner
+/// has already queued can still land and the promote resolve (logged
+/// `heal_grant_frozen_fence_seen` once). The `partitions/` read is bounded by `deadline`; one
+/// that does not answer in time is never read as "no transfer". At `deadline` the error
+/// follows the last look, not whether the heal ever waited: [`HealError::Frozen`] while the
+/// grant was last seen frozen (the planner's advice when nothing of the node was moving, the
+/// promote advice when something was), [`HealError::NotCleared`] with that look's words
+/// otherwise, for example a live copy at another path that acquired after the clear.
 async fn clear_until(
     ctx: &HealCtx,
     node: NodeId,
@@ -2669,6 +2783,8 @@ async fn clear_until(
 ) -> Result<Gone, HealError> {
     let mut last = format!("the control store did not answer; {STORE_STEP}");
     let mut waiting_frozen = false;
+    let mut fence_seen = false;
+    let mut last_frozen = false;
     while tokio::time::Instant::now() < deadline {
         match judge(&*ctx.store, node, ctx.boot, &ctx.budgets, ctx.clock).await {
             Ok((Clearance::Cleared(revision), Some(record), _)) => {
@@ -2694,9 +2810,21 @@ async fn clear_until(
                 ..,
             )) => {
                 let moving = if ctx.failover {
-                    match frozen_owner_in_transfer(&*ctx.store, node).await {
-                        Ok(moving) => moving,
-                        Err(error)
+                    let read = tokio::time::timeout_at(
+                        deadline,
+                        frozen_owner_in_transfer(&*ctx.store, node),
+                    )
+                    .await;
+                    match read {
+                        Err(_elapsed) => {
+                            last = format!(
+                                "the control store did not answer the partitions/ read before                                  the heal's deadline; {STORE_STEP}"
+                            );
+                            last_frozen = false;
+                            break;
+                        }
+                        Ok(Ok(moving)) => moving,
+                        Ok(Err(error))
                             if error.retry == RetryRule::BoundedJitter
                                 || error.kind == ErrorKind::UnknownOutcome =>
                         {
@@ -2704,30 +2832,16 @@ async fn clear_until(
                                 "the control store answered: {}; {STORE_STEP}",
                                 error.detail
                             );
+                            last_frozen = false;
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         }
-                        Err(error) => return Err(HealError::Control(error.detail)),
+                        Ok(Err(error)) => return Err(HealError::Control(error.detail)),
                     }
                 } else {
                     None
                 };
-                if ctx.failover && moving.is_none() {
-                    if !waiting_frozen {
-                        waiting_frozen = true;
-                        tracing::info!(
-                            node = node.0,
-                            boot = ctx.boot.0,
-                            partitions = ?ctx.partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
-                            within_ms = ctx.within.as_millis(),
-                            "heal_grant_frozen_waiting"
-                        );
-                    }
-                    last = format!(
-                        "the failover planner did not clear it in time; {}",
-                        frozen_advice(ctx, clearance, node)
-                    );
-                } else {
+                if !ctx.failover || (moving.is_some() && !waiting_frozen) {
                     tracing::warn!(
                         node = node.0,
                         failover = ctx.failover,
@@ -2739,20 +2853,48 @@ async fn clear_until(
                         step: frozen_advice(ctx, clearance, node),
                     });
                 }
+                last_frozen = true;
+                if let Some(partition) = moving {
+                    if !fence_seen {
+                        fence_seen = true;
+                        tracing::info!(
+                            node = node.0,
+                            partition = partition.0,
+                            "heal_grant_frozen_fence_seen"
+                        );
+                    }
+                    last = frozen_advice(ctx, clearance, node);
+                } else {
+                    if !waiting_frozen {
+                        waiting_frozen = true;
+                        tracing::info!(
+                            node = node.0,
+                            boot = ctx.boot.0,
+                            partitions = ?ctx.partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
+                            within_ms = ctx.within.as_millis(),
+                            "heal_grant_frozen_waiting"
+                        );
+                    }
+                    last = planner_step(node, &ctx.partitions);
+                }
             }
-            Ok((clearance, ..)) => last = kept_in_words(clearance, node, ctx.clock.now()),
+            Ok((clearance, ..)) => {
+                last = kept_in_words(clearance, node, ctx.clock.now());
+                last_frozen = false;
+            }
             // A lost delete reply is read again next time round, as `clear_grant` advises.
             Err(error)
                 if error.retry == RetryRule::BoundedJitter
                     || error.kind == ErrorKind::UnknownOutcome =>
             {
                 last = format!("the control store answered: {}; {STORE_STEP}", error.detail);
+                last_frozen = false;
             }
             Err(error) => return Err(HealError::Control(error.detail)),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if waiting_frozen {
+    if last_frozen {
         tracing::warn!(
             node = node.0,
             within_ms = ctx.within.as_millis(),
@@ -2768,6 +2910,21 @@ async fn clear_until(
         within_ms: ctx.within.as_millis(),
         last,
     })
+}
+
+/// The next step when the heal waited on a frozen grant whose node owns only `Serving`
+/// partitions and the failover planner did not clear it before the deadline (PR #218 review,
+/// #213's text for this case). No takeover is unfinished, so no promote is advised: a promote
+/// is refused while the owner answers.
+fn planner_step(node: NodeId, partitions: &[PartitionId]) -> String {
+    let names: Vec<u32> = partitions.iter().map(|partition| partition.0).collect();
+    format!(
+        "node {node} still owns partition {owned}, and no takeover of it is under way, but the \
+         failover planner did not clear the frozen grant before the deadline; check that a \
+         failover planner runs and sees node {node}'s new boot, then open again",
+        node = node.0,
+        owned = names_in_words(&names)
+    )
 }
 
 /// What [`HealError::Frozen`] advises for `node`'s frozen grant: above one partition, a
@@ -2933,9 +3090,16 @@ pub enum Clearance {
 /// - A delete after a freeze that wrote cannot apply: the freeze moved the grant's revision,
 ///   so this delete's compare fails, and guard 1 refuses a frozen record on any later pass.
 /// - A delete after a freeze that wrote nothing (`promote_frozen_already`: the record was
-///   already frozen) applies, at the unchanged revision. The promote then cannot bind its proof
-///   on its target, which needs the frozen grant the proof names (`bind_routed_fence`), so it
-///   commits nothing, and the owner's next heal takes the partition back (#172).
+///   already frozen) applies, at the unchanged revision (#172). Two orders follow, by when the
+///   promote's target binds the proof (`bind_routed_fence`, which needs the frozen grant the
+///   proof names and the record at the proof's revision):
+///   - bound after the delete: refused at bind, and nothing is written; the owner's heal takes
+///     the partition back;
+///   - bound before the delete: the target's F1 commit and the owner's heal commit are both
+///     CASes on `partitions/{p}` at the `Fencing` revision. Whichever lands first owns the
+///     partition; the other is refused, and its recovery blocks (`OvertakenByPeer` for the
+///     heal; the promote ends `Superseded`). The partition compare keeps one owner, not the
+///     grant's absence.
 /// - A delete between the `Fencing` write and the freeze: when the promote judged the owner
 ///   dead, the freeze finds the record moved and refuses with [`PromoteError::OwnerAlive`], and
 ///   the promote undoes its `Fencing` write (or rereads and reports, when the undo is unproven);
@@ -7820,6 +7984,240 @@ mod tests {
                 "{held:?}: the re-run sends node 2 its plan and fence"
             );
         }
+    }
+
+    /// A heal with [`HealCtx::failover`] set over `partitions` of a database of `count`.
+    fn heal_failover(
+        store: Arc<dyn ConfigStore>,
+        rt: &tokio::runtime::Runtime,
+        within: Duration,
+        partitions: Vec<PartitionId>,
+        count: u32,
+        meanwhile: impl std::future::Future<Output = ()>,
+    ) -> (Result<Healed, HealError>, Vec<Msg>) {
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            partition_count: count,
+            nodes: crate::db::ALL_NODES.into(),
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within,
+            member_boot: Arc::new(|_| Some(OPEN_2)),
+            failover: true,
+            owner_node: OWNER,
+            partitions,
+            bootstrap: Vec::new(),
+        };
+        let (healed, ()) = rt.block_on(async { tokio::join!(heal(ctx), meanwhile) });
+        (healed, mailbox.try_iter().collect())
+    }
+
+    /// `grants/1` as [`old_grant`] wrote it, frozen, as a promote's freeze leaves it.
+    fn frozen_grant(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) -> u64 {
+        let written = old_grant(store, rt, GrantId(4));
+        let frozen = GrantRecord {
+            grant: GrantId(4),
+            node: OWNER,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: OLD_EXPIRY_UTC_MS,
+            frozen: true,
+        };
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+            value: frozen.encode(),
+            expected_mod_revision: Some(written),
+            dedup: None,
+        }))
+        .expect("freeze grants/1")
+        .revision
+    }
+
+    /// The `mod_revision` of `key`, or 0 when it is absent.
+    fn revision_of(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime, key: String) -> u64 {
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(key),
+        }))
+        .expect("get")
+        .record
+        .map_or(0, |found| found.mod_revision)
+    }
+
+    /// PR #218 review (thread io1p): with failover on, a heal whose node owns `partitions/1` in
+    /// `Fencing` or `FencingDrained` at the first look fails `Frozen` at that look, with the
+    /// promote advice and no planner text, and writes nothing.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: `frozen_owner_in_transfer` always
+    /// answers "no transfer". Red: the heal waits out its 10 s and answers the planner text.
+    /// Unit (~100 ms per case): `MemStore`.
+    #[config_log::retcd_test]
+    fn i172_a_failover_heal_into_an_owned_fence_fails_at_its_first_look() {
+        const HEAL_WITHIN: Duration = Duration::from_secs(10);
+        let rt = runtime();
+        for lifecycle in [
+            PartitionLifecycle::Fencing,
+            PartitionLifecycle::FencingDrained,
+        ] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let written = rooted(&*store, &rt, BootId(5));
+            let found = rt
+                .block_on(store.get(GetRequest {
+                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                }))
+                .expect("get")
+                .record
+                .expect("partitions/1");
+            let root = PartitionRoot::decode(&found.value).expect("root");
+            let moving = PartitionRecord {
+                lifecycle,
+                ..PartitionRecord::decode(&found.value).expect("record")
+            };
+            put(&store, &rt, moving.encode_with(&root), written);
+            frozen_grant(&*store, &rt);
+            let partitions = ControlKey::Partition(PARTITION).encode();
+            let grants = ControlKey::Grant(OWNER).encode();
+            let before = (
+                revision_of(&*store, &rt, partitions.clone()),
+                revision_of(&*store, &rt, grants.clone()),
+            );
+            let started = std::time::Instant::now();
+            let (healed, sent) = heal_failover(
+                Arc::clone(&store),
+                &rt,
+                HEAL_WITHIN,
+                vec![PARTITION],
+                1,
+                async {},
+            );
+            let took = started.elapsed();
+            let refused = healed.expect_err("a takeover is under way");
+            let HealError::Frozen { node: 1, step } = &refused else {
+                panic!("{lifecycle:?}: {refused:?}");
+            };
+            assert_eq!(
+                step, "a takeover from node 1 is unfinished; run `admin promote <the node you chose>` again",
+                "{lifecycle:?}"
+            );
+            assert!(!step.contains("planner"), "{lifecycle:?}: {step}");
+            let at_once = Duration::from_secs(1) * config_testkit::poll::deadline_scale();
+            assert!(took < at_once, "{lifecycle:?}: answered after {took:?}");
+            assert!(sent.is_empty(), "{lifecycle:?}: the heal sent nothing");
+            assert_eq!(
+                (
+                    revision_of(&*store, &rt, partitions),
+                    revision_of(&*store, &rt, grants)
+                ),
+                before,
+                "{lifecycle:?}: nothing was written"
+            );
+        }
+    }
+
+    /// PR #218 review (thread io1u, #213's text for this case): a failover heal that waits to
+    /// its deadline on a frozen grant whose node owns only `Serving` partitions says what is
+    /// true: no takeover is under way, the planner did not clear the grant; check the planner
+    /// runs and sees the new boot, then open again. No promote is advised. One partition and
+    /// two. Cut, 2026-11-22, reverted: the takeover text at the timeout, as before. Red, "the
+    /// failover planner did not clear it in time; a takeover from node 1 is unfinished; ...".
+    /// Unit (~0.6 s per case): `MemStore`.
+    #[config_log::retcd_test]
+    fn i172_a_failover_heal_the_planner_never_clears_says_check_the_planner() {
+        let rt = runtime();
+        for (partitions, owned) in [
+            (vec![PARTITION], "partition 1"),
+            (vec![PARTITION, PartitionId(2)], "partition 1 and 2"),
+        ] {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            rooted(&*store, &rt, BootId(5));
+            if partitions.len() > 1 {
+                rooted_copy(&*store, &rt, PartitionId(2), OWNER);
+            }
+            frozen_grant(&*store, &rt);
+            let count = u32::try_from(partitions.len()).expect("count");
+            let (healed, sent) = heal_failover(
+                Arc::clone(&store),
+                &rt,
+                Duration::from_millis(600),
+                partitions,
+                count,
+                async {},
+            );
+            let refused = healed.expect_err("nothing clears the grant");
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "the last run's grant for node 1 (grants/1) is frozen: node 1 still owns \
+                     {owned}, and no takeover of it is under way, but the failover planner did \
+                     not clear the frozen grant before the deadline; check that a failover \
+                     planner runs and sees node 1's new boot, then open again"
+                )
+            );
+            assert!(!refused.to_string().contains("admin promote"), "{refused}");
+            assert!(sent.is_empty());
+        }
+    }
+
+    /// PR #218 review (thread io1y): the timeout's error follows the last look, not whether the
+    /// heal ever waited. The grant is frozen at the first look (the heal waits), then a live
+    /// copy at another path holds `grants/1` unexpired and not frozen; the heal times out with
+    /// [`HealError::NotCleared`] and that look's advice, not the frozen text.
+    /// Cut, 2026-11-22, reverted: the error chosen from "ever waited", as before. Red, the
+    /// heal answered `Frozen` carrying the live-copy words.
+    /// Unit (~1.5 s): `MemStore`.
+    #[config_log::retcd_test]
+    fn i172_a_failover_heal_whose_frozen_grant_is_then_held_says_another_open_holds_it() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let frozen_at = frozen_grant(&*store, &rt);
+        let writer = Arc::clone(&store);
+        let held = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let live = GrantRecord {
+                grant: GrantId(9),
+                node: OWNER,
+                boot: BootId(OPEN_2.0 + 5),
+                authority_generation: AuthorityGeneration(1),
+                expiry_utc_ms: i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_millis(),
+                )
+                .expect("now in ms")
+                    + 600_000,
+                frozen: false,
+            };
+            writer
+                .put(PutRequest {
+                    key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+                    value: live.encode(),
+                    expected_mod_revision: Some(frozen_at),
+                    dedup: None,
+                })
+                .await
+                .expect("the live copy acquires");
+        };
+        let (healed, sent) = heal_failover(
+            Arc::clone(&store),
+            &rt,
+            Duration::from_millis(1500),
+            vec![PARTITION],
+            1,
+            held,
+        );
+        let refused = healed.expect_err("another open holds the grant");
+        assert!(
+            matches!(&refused, HealError::NotCleared { node: 1, .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains(OTHER_OPEN_STEP),
+            "the live-copy advice: {refused}"
+        );
+        assert!(sent.is_empty());
     }
 
     /// A-R260: after a promote the owner is node 2, so a heal whose owner's thread is gone

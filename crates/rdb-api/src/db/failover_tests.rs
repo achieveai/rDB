@@ -2655,6 +2655,9 @@ fn i172_a_promote_fencing_between_the_clears_read_and_delete_makes_no_second_own
     // untagged file; each thread enters the test span so `logged` can read them.
     let span = tracing::Span::current();
     let (answer, fenced) = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
         let sweep = scope.spawn(|| {
             let _test = span.enter();
             rig.rt.block_on(planner.sweep(&mut memory))
@@ -2823,6 +2826,9 @@ fn i172_a_freeze_before_the_clears_delete_lets_the_restarted_owner_heal_first() 
     let handle = rig.rt.handle().clone();
     let node3 = rig.procs.remove(2);
     let (answer, at_park) = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
         let sweep = scope.spawn(|| {
             let _test = span.enter();
             handle.block_on(planner.sweep(&mut memory))
@@ -2916,20 +2922,20 @@ fn i172_a_freeze_before_the_clears_delete_lets_the_restarted_owner_heal_first() 
 /// `OwnerAlive` and CASes `partitions/p` back to `Serving`. Then node 1's held commit goes, at
 /// the `Fencing` revision, which is no longer the record's.
 ///
-/// Observed, and pinned here: the store refuses that commit, node 1's kernel ends the recovery
-/// with the terminal `BlockPromotion { reason: CasContention }`, and the open fails
-/// `Blocked { owner: 1, reason: "CasContention" }` (`ready_blocked`). **Nothing retries it**:
-/// `heal_retrying` retries only `PeersUnknown`, and a heal returns once its plans are sent. So
-/// `p` stays `Serving` at its old generation with no process owning it, which is safe and not
-/// live, until the node is opened again; that next open heals `p` (asserted, with a put).
-/// Integration (~17 s alone): a grant lapse, a hand promote, three restarts.
-/// Cut, run on 2026-11-21, reverted and checked byte-identical with `cmp`: every `partitions/`
-/// CAS in `control::cas` made unconditional. Red: node 1's commit applied over the undone record,
-/// "the Fencing write was undone, nothing committed", left generation 3 owned by node 1, right
-/// generation 2. So the refusal this row pins is that compare.
+/// Pinned here (PR #218 review, thread io1l): the store refuses that commit and node 1's kernel
+/// blocks the recovery `CasContention`, as before; then, **in the same open**, the heal's
+/// watch (`admin::heal_settling`) reads `partitions/` again, plans afresh against the `Serving`
+/// record, and the fresh fence takes `p` to node 1 at the next generation
+/// (`heal_replan_after_conflict`). `wait_ready` answers `Ok`, and a put lands. A competing
+/// owner (`OvertakenByPeer`, or a re-read record naming another owner) and an unknown outcome
+/// still stop the heal; this row reaches neither.
+/// Integration (~17 s alone): a grant lapse, a hand promote, two restarts.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: `heal_settling` never plans again. Red,
+/// "the heal planned p again in this open".
 #[config_log::retcd_test]
-fn i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again() {
-    const METHOD: &str = "i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again";
+fn i172_a_heal_planned_against_an_undone_fencing_plans_again_in_the_same_open() {
+    const METHOD: &str =
+        "i172_a_heal_planned_against_an_undone_fencing_plans_again_in_the_same_open";
     let log = crate::test_store::PutLog::new(
         Arc::new(config_testkit::MemStore::new()),
         ControlPrefix::Partitions.encode(),
@@ -2949,6 +2955,9 @@ fn i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again() {
     let handle = rig.rt.handle().clone();
     let node3 = rig.procs.remove(2);
     let (answer, healed) = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
         let sweep = scope.spawn(|| {
             let _test = span.enter();
             handle.block_on(planner.sweep(&mut memory))
@@ -2983,6 +2992,7 @@ fn i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again() {
             gate
         });
         let gate1 = gate1.expect("node 1's restarted store is gated");
+        release.watch(&gate1);
         until(
             "node 1's heal commit parks at its CAS",
             lifetimes(5),
@@ -3024,17 +3034,13 @@ fn i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again() {
         ),
         "{answer:?}"
     );
-    assert_eq!(
-        after, before,
-        "the Fencing write was undone, nothing committed"
-    );
     assert!(
         log.refused()
             .iter()
             .any(|(_, written, value)| written.as_slice() == key.as_bytes()
                 && PartitionRecord::decode(value).is_some_and(|record| record.owner == NodeId(1)
                     && record.generation.0 == before.generation.0 + 1)),
-        "node 1's commit of the next generation was refused"
+        "node 1's first commit of the next generation was refused"
     );
     assert!(
         facts
@@ -3042,39 +3048,289 @@ fn i172_a_heal_planned_against_an_undone_fencing_blocks_until_opened_again() {
             .any(|effect| effect == "BlockPromotion { reason: CasContention }"),
         "{facts:?}"
     );
-    assert!(
-        healed
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("CasContention")),
-        "{healed:?}"
-    );
-    let owners: Vec<_> = rig
-        .procs
-        .iter()
-        .filter_map(|proc| proc.db.ownership(PartitionId(p)))
+    let replans: Vec<_> = logged(METHOD, "heal_replan_after_conflict")
+        .into_iter()
+        .filter(|line| line["owner"] == 1)
         .collect();
-    assert!(
-        owners.is_empty(),
-        "no process admits writes on p: {owners:?}"
-    );
-
-    // The way back: open node 1 again; that heal meets the `Serving` record and commits.
-    rig.restart(0, None);
-    let healed_again = rig.record(p);
+    assert!(!replans.is_empty(), "the heal planned p again in this open");
+    assert!(healed.is_ok(), "the same open became ready: {healed:?}");
     assert_eq!(
-        (
-            healed_again.owner,
-            healed_again.generation.0,
-            healed_again.lifecycle
-        ),
+        (after.owner, after.generation.0, after.lifecycle),
         (
             NodeId(1),
             before.generation.0 + 1,
             PartitionLifecycle::Serving
         ),
-        "{healed_again:?}"
+        "{after:?}"
     );
-    assert_one_owner_per_generation(&partition_history(&log, p));
+    assert_only_the_owner_admits(&rig, p, NodeId(1));
+    let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
+    let put = put_lands(&app, group_of(&app, p), lifetimes(5));
+    assert_eq!(put.partition, PartitionId(p), "{put:?}");
+}
+
+/// PR #218 review (thread io1o): a heal already waiting on the frozen `grants/1` (failover on)
+/// is not ended by a promote's racing `Fencing`. Node 1 restarts with a planner configured, so
+/// its heal waits (`heal_grant_frozen_waiting`). Node 2's planner's clear reads and parks its
+/// delete; node 3's promote of `p` writes `Fencing` and parks on that reply. The waiting heal
+/// sees the `Fencing` (`heal_grant_frozen_fence_seen`) and keeps polling; the row checks it has
+/// not failed before the delete is released. Then the delete lands, the heal reads the grant
+/// absent and commits `p` at the `Fencing` revision, and the promote, released, loses.
+/// Asserted first: one owner per generation; then node 1 owns `p` at the next generation, the
+/// open is ready, only node 1 admits, and a put lands.
+/// Integration (~20 s alone): a grant lapse, a hand promote, two restarts.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: a `Fencing` at any look ends the wait with
+/// `Frozen`, as before. Red, "the heal did not end before the queued delete: Failed(Frozen {
+/// node: 1, step: \"a takeover from node 1 is unfinished and it still owns partition 4; ...\" })".
+#[config_log::retcd_test]
+fn i172_a_waiting_heal_is_not_ended_by_a_racing_fencing() {
+    const METHOD: &str = "i172_a_waiting_heal_is_not_ended_by_a_racing_fencing";
+    let log = crate::test_store::PutLog::new(
+        Arc::new(config_testkit::MemStore::new()),
+        ControlPrefix::Partitions.encode(),
+    );
+    let RaceSetup {
+        mut rig,
+        gate3,
+        clear_gate,
+        planner,
+        mut memory,
+        p,
+        old_boot: _,
+        before,
+    } = race_setup(Arc::clone(&log) as Arc<dyn ConfigStore>);
+    let key = ControlKey::Partition(PartitionId(p)).encode();
+    rig.restart_unready(0, Some(failover()));
+    let boot = rig.procs[0].boot;
+    until(
+        "node 1's heal waits on the frozen grant",
+        lifetimes(5),
+        || !logged(METHOD, "heal_grant_frozen_waiting").is_empty(),
+    );
+    until(
+        "nodes 2 and 3 know node 1's newest boot",
+        lifetimes(5),
+        || {
+            [1, 2]
+                .iter()
+                .all(|i| rig.procs[*i].db.links().boot_of(NodeId(1)) == Some(boot))
+        },
+    );
+    let span = tracing::Span::current();
+    let handle = rig.rt.handle().clone();
+    let answer = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
+        let sweep = scope.spawn(|| {
+            let _test = span.enter();
+            handle.block_on(planner.sweep(&mut memory))
+        });
+        until(
+            "the clear has read and parks its delete",
+            lifetimes(5),
+            || clear_gate.parked() == 1,
+        );
+        gate3.arm_put_reply(&key);
+        let promote = scope.spawn(|| {
+            let _test = span.enter();
+            rig.procs[2]
+                .db
+                .promote_partition(PartitionId(p), NodeId(3), Some(NodeId(1)))
+        });
+        until(
+            "the promote's Fencing write lands and parks",
+            lifetimes(5),
+            || gate3.parked() == 1,
+        );
+        until(
+            "the waiting heal sees the Fencing, or ends",
+            lifetimes(5),
+            || {
+                !logged(METHOD, "heal_grant_frozen_fence_seen").is_empty()
+                    || matches!(
+                        rig.procs[0].db.heal_state(),
+                        crate::db::HealState::Failed(_)
+                    )
+            },
+        );
+        let heal = rig.procs[0].db.heal_state();
+        assert!(
+            !matches!(heal, crate::db::HealState::Failed(_)),
+            "the heal did not end before the queued delete: {heal:?}"
+        );
+        clear_gate.release();
+        sweep.join().expect("the sweep thread");
+        until("node 1's heal commits p", lifetimes(5), || {
+            rig.record(p).generation > before.generation
+        });
+        gate3.release();
+        promote.join().expect("the promote thread")
+    });
+    let healed = rig.procs[0]
+        .db
+        .wait_ready(crate::host::test_patience(Duration::from_secs(30)));
+    let after = rig.record(p);
+    let history = partition_history(&log, p);
+    println!("i172 waiting p={p} before={before:?} after={after:?} answer={answer:?}");
+    for (revision, record) in &history {
+        println!("i172 waiting history {revision}: {record:?}");
+    }
+    assert_one_owner_per_generation(&history);
+    assert!(healed.is_ok(), "{healed:?}");
+    assert!(answer.is_err(), "the promote lost: {answer:?}");
+    assert_eq!(
+        (after.owner, after.generation.0, after.lifecycle),
+        (
+            NodeId(1),
+            before.generation.0 + 1,
+            PartitionLifecycle::Serving
+        ),
+        "{after:?}"
+    );
+    assert_only_the_owner_admits(&rig, p, NodeId(1));
+    let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
+    let put = put_lands(&app, group_of(&app, p), lifetimes(5));
+    assert_eq!(put.partition, PartitionId(p), "{put:?}");
+}
+
+/// PR #218 review, Q1 order (b): the promote's proof binds on node 3 **before** the clear's
+/// delete, and the heal commits first, so the promote's own F1 commit write (its CAS on
+/// `partitions/p` at the `Fencing` revision) is the one refused. Setup as the freeze-first rows:
+/// the clear parks its delete; node 3's promote writes `Fencing`, finds `grants/1` frozen
+/// (`promote_frozen_already`) and parks on its plan's create. Then every put of node 3 under
+/// `partitions/p` is held (re-sends after a control call's deadline too), the promote goes on,
+/// and node 3 binds the proof while `grants/1` is still there (`routed_fence_bound`); its F1
+/// commit write parks. Then the delete lands, node 1 restarts, and its heal commits `p` at the
+/// `Fencing` revision. Then node 3's held writes go.
+/// Asserted first: one owner per generation. Then node 3's commit of the next generation was
+/// refused by the store (`PutLog`), node 1 owns `p` there, the promote ends `Superseded`
+/// naming node 1, only node 1 admits, and a put lands.
+/// Integration (~20 s alone): a grant lapse, a hand promote, two restarts.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: every `partitions/` CAS in `control::cas`
+/// made unconditional, so node 3's F1 commit applies over the heal's. Red, "generation 3 names
+/// node 1 and, at revision 101, node 3".
+#[config_log::retcd_test]
+fn i172_a_promote_bound_before_the_delete_loses_its_commit_to_the_heal() {
+    const METHOD: &str = "i172_a_promote_bound_before_the_delete_loses_its_commit_to_the_heal";
+    let log = crate::test_store::PutLog::new(
+        Arc::new(config_testkit::MemStore::new()),
+        ControlPrefix::Partitions.encode(),
+    );
+    let RaceSetup {
+        mut rig,
+        gate3,
+        clear_gate,
+        planner,
+        mut memory,
+        p,
+        old_boot: _,
+        before,
+    } = race_setup(Arc::clone(&log) as Arc<dyn ConfigStore>);
+    let key = ControlKey::Partition(PartitionId(p)).encode();
+    let span = tracing::Span::current();
+    let handle = rig.rt.handle().clone();
+    let node3 = rig.procs.remove(2);
+    let answer = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
+        let sweep = scope.spawn(|| {
+            let _test = span.enter();
+            handle.block_on(planner.sweep(&mut memory))
+        });
+        until(
+            "the clear has read and parks its delete",
+            lifetimes(5),
+            || clear_gate.parked() == 1,
+        );
+        gate3.arm_put_reply("operations/");
+        let promote = scope.spawn(|| {
+            let _test = span.enter();
+            node3
+                .db
+                .promote_partition(PartitionId(p), NodeId(3), Some(NodeId(1)))
+        });
+        until(
+            "the promote stores its plan and parks",
+            lifetimes(5),
+            || gate3.parked() == 1,
+        );
+        gate3.arm_puts(&key);
+        gate3.release();
+        until(
+            "node 3 binds the proof and its commit parks",
+            lifetimes(5),
+            || gate3.parked() >= 2,
+        );
+        let bound: Vec<_> = logged(METHOD, "routed_fence_bound")
+            .into_iter()
+            .filter(|line| line["node"] == 3 && line["partition"] == p)
+            .collect();
+        assert!(
+            !bound.is_empty(),
+            "node 3 bound the proof before the delete"
+        );
+        assert!(
+            grant_revision(&rig, NodeId(1)).is_some(),
+            "grants/1 was still there when node 3 bound"
+        );
+        clear_gate.release();
+        until("the clear deletes grants/1", lifetimes(5), || {
+            grant_revision(&rig, NodeId(1)).is_none()
+        });
+        sweep.join().expect("the sweep thread");
+        rig.restart(0, None);
+        gate3.disarm_puts();
+        for _ in 1..gate3.parked() {
+            gate3.release();
+        }
+        promote.join().expect("the promote thread")
+    });
+    rig.procs.push(node3);
+    let node3_commit = |value: &Bytes| {
+        PartitionRecord::decode(value).is_some_and(|record| {
+            record.owner == NodeId(3) && record.generation.0 == before.generation.0 + 1
+        })
+    };
+    until("node 3's held commit was answered", lifetimes(5), || {
+        log.refused()
+            .iter()
+            .chain(log.applied().iter())
+            .any(|(_, written, value)| written.as_slice() == key.as_bytes() && node3_commit(value))
+    });
+    let after = rig.record(p);
+    let history = partition_history(&log, p);
+    println!("i172 bound-first p={p} before={before:?} after={after:?} answer={answer:?}");
+    for (revision, record) in &history {
+        println!("i172 bound-first history {revision}: {record:?}");
+    }
+    assert_one_owner_per_generation(&history);
+    assert!(
+        log.refused()
+            .iter()
+            .any(|(_, written, value)| written.as_slice() == key.as_bytes()
+                && PartitionRecord::decode(value).is_some_and(|record| record.owner == NodeId(3)
+                    && record.generation.0 == before.generation.0 + 1)),
+        "node 3's commit of the next generation was refused: {:?}",
+        log.refused()
+    );
+    assert_eq!(
+        (after.owner, after.generation.0, after.lifecycle),
+        (
+            NodeId(1),
+            before.generation.0 + 1,
+            PartitionLifecycle::Serving
+        ),
+        "{after:?}"
+    );
+    assert!(
+        matches!(
+            &answer,
+            Err(admin::PromoteError::Superseded { owner: Some(1), .. })
+        ),
+        "{answer:?}"
+    );
     assert_only_the_owner_admits(&rig, p, NodeId(1));
     let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
     let put = put_lands(&app, group_of(&app, p), lifetimes(5));
@@ -3162,6 +3418,9 @@ fn i172_a_freeze_before_the_clears_delete_leaves_the_promote_no_fence_to_bind() 
     let handle = rig.rt.handle().clone();
     let node3 = rig.procs.remove(2);
     let (answer, at_park, healed) = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
         let sweep = scope.spawn(|| {
             let _test = span.enter();
             handle.block_on(planner.sweep(&mut memory))
@@ -3197,6 +3456,7 @@ fn i172_a_freeze_before_the_clears_delete_leaves_the_promote_no_fence_to_bind() 
             gate
         });
         let gate1 = gate1.expect("node 1's restarted store is gated");
+        release.watch(&gate1);
         until(
             "node 1's heal commit parks at its CAS",
             lifetimes(5),

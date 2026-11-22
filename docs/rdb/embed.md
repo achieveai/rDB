@@ -419,28 +419,43 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   then restarted while one of its partitions had no second copy to move to. The planner clears
   each frozen node on its own; several at once (a rack after a power cycle) is not tested. The
   wait ends at the heal's deadline (the grant, its margins and 10 s).
-- **Without a planner, or with a move under way, the open still fails.** With failover off, or
-  any partition the node owns in `Fencing` (a promote is under way), its open fails with
-  `HealError::Frozen` at once, naming what it still owns; those partitions can still be moved
-  while it runs.
+- **Without a planner, or with a move under way at the first look, the open still fails.**
+  With failover off, or any partition the node owns in `Fencing` or `FencingDrained` when the
+  heal first reads the frozen grant (a promote is under way), its open fails with
+  `HealError::Frozen` at once; those partitions can still be moved while it runs. Above one
+  partition the error names the partitions it still owns; with one partition it names only the
+  node. Once the open has started waiting for the planner, a promote's `Fencing` seen later
+  does not end the wait: it keeps polling to its deadline (`heal_grant_frozen_fence_seen`), so
+  a clear the planner already queued can land and the promote resolve.
+- **If the planner never clears it, the open says so.** At the deadline, with every owned
+  partition still `Serving`, the open fails `HealError::Frozen` saying the planner did not
+  clear the frozen grant before the deadline: check that a failover planner runs and sees the
+  node's new boot, then open again. It does not advise `admin promote`, which is refused while
+  the node answers. If the grant was last seen held, not frozen (another open, such as a live
+  copy of the folder at another path, acquired it), the open fails `HealError::NotCleared`
+  with that advice instead.
 - **A promote that races the clear never makes a second owner.** If a promote of a partition
   the restarted node owns runs while the planner clears its grant, one of these happens:
   - A planner promote, or an operator promote over more than one partition, that wrote
-    `Fencing` before the clear's delete and froze after it: refused as `PromoteError::OwnerAlive` ("it came back
-    during the promote"), and its `Fencing` write is undone. Nothing moves.
+    `Fencing` before the clear's delete and froze after it: refused as
+    `PromoteError::OwnerAlive` ("it came back during the promote"), and its `Fencing` write is
+    undone. Nothing moves.
   - A single-partition operator promote in the same place: it recreates the grant frozen and
     takes the partition over.
-  - A promote whose freeze came before the clear's delete: it cannot commit. Its target refuses
-    the proof (`routed_fence_refused`), the node's heal commits, and the promote ends
-    `PromoteError::Superseded` naming the node.
+  - A promote whose freeze came before the clear's delete, and whose target binds the proof
+    after the delete: it cannot commit. The target refuses the proof (`routed_fence_refused`),
+    the node's heal commits, and the promote ends `PromoteError::Superseded` naming the node.
+  - The same, with the target binding the proof before the delete: the target's commit and
+    the node's heal commit race on one compare of the partition record, and only one lands.
+    If the target lands first it owns the partition, and the node's heal stops
+    (`OvertakenByPeer`). If the heal lands first, the promote ends `PromoteError::Superseded`
+    naming the node.
 
-  One case needs a second open. If the node's heal planned against a `Fencing` write that the
-  promote then undid, the heal's commit is refused and the open fails `Blocked` with
-  `CasContention` (`ready_blocked`). It does not retry; the partition has no owner until you
-  open the node again, and that open heals it. An embedder that exits on a failed reopen and
-  is restarted by its supervisor, as the gateway is, recovers after that one extra restart; a
-  node with no supervisor stays down until an operator opens it again. A retry inside the
-  heal's deadline is tracked in [#211](https://github.com/achieveai/rDB/issues/211).
+  If the node's heal planned against a `Fencing` write that the promote then undid, the heal's
+  first commit is refused (`CasContention`). The same open plans it again against the record
+  as it now is and heals the partition (`heal_replan_after_conflict`); no second open is
+  needed. Until that commit, no process admits writes on the partition, though its record
+  still names the node.
 - **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
   but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
   boot) whose partitions are all `Serving` (none at all included), a failover planner, where
@@ -478,8 +493,7 @@ in any lifecycle. A failed read of the control store keeps it up. Before it exit
 - `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
   embedder asks the same.
 - Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
-  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
-  place, as below.
+  restarts on it. An embedder that runs `Db` itself restarts in place, as below.
 
 **Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
 supervisor, restarts the node in place:
@@ -489,7 +503,7 @@ supervisor, restarts the node in place:
    `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
    cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
    a partition, so a frozen node beside an owning one waits until the owner's partitions move.
-   Run one `Db` per node, as the gateway does, so each restarts on its own.
+   Run one `Db` per node, so each restarts on its own.
 2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
    links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
    than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
@@ -499,8 +513,10 @@ supervisor, restarts the node in place:
 4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
    at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
    held.
-5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
-   restart policy, say) restart it. The gateway does this.
+5. If the reopen fails, either exit the process non-zero and let your own supervisor (a
+   container restart policy, say) restart it, or open again yourself. rDB does not restart a
+   failed reopen for you, and SBX's gateway integration, which would need one of these, is
+   not built yet.
 
 Drop before you reopen, so a node never has two `Db`s at once.
 
