@@ -40,6 +40,8 @@ struct Rig {
     procs: Vec<Proc>,
     /// [`HELD`]'s `nodes/` lists, cut and lifted by the row.
     held: Arc<PrefixCut>,
+    /// The failover every node opens with ([`DbConfig::failover`]); `None` but in M11's on row.
+    failover: Option<crate::planner::Failover>,
 }
 
 impl Drop for Rig {
@@ -114,6 +116,7 @@ fn open_node(
                     app: None,
                 }),
                 partitions: Some(PARTITIONS),
+                failover: rig.failover,
                 ..config(dir.path())
             },
             store,
@@ -132,6 +135,11 @@ fn open_node(
 
 /// Nodes 1 to 5 declared and ready, node 6's listener bound on 127.0.0.6 and not yet used.
 fn five_ready() -> (Rig, tokio::net::TcpListener) {
+    five_ready_with(None)
+}
+
+/// [`five_ready`], every node opened with `failover`.
+fn five_ready_with(failover: Option<crate::planner::Failover>) -> (Rig, tokio::net::TcpListener) {
     let rt = runtime();
     let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
     let cert_dir = config_testkit::fs::temp_dir();
@@ -179,6 +187,7 @@ fn five_ready() -> (Rig, tokio::net::TcpListener) {
         addrs: addrs.clone(),
         procs: Vec::new(),
         held,
+        failover,
     };
     let five: BTreeMap<NodeId, String> = addrs.into_iter().filter(|(n, _)| n.0 <= 5).collect();
     for n in 1..=5 {
@@ -267,7 +276,12 @@ struct Admitted {
 /// 6. `move_copy_in` moves partition p's (p != 1) copy on a regular secondary x to node 6, until
 ///    `done`; a put to p lands, and `partitions/p` pins node 6 regular and leaves x out.
 fn admitted() -> Admitted {
-    let (mut rig, six) = five_ready();
+    admitted_with(None)
+}
+
+/// [`admitted`], every node opened with `failover`.
+fn admitted_with(failover: Option<crate::planner::Failover>) -> Admitted {
+    let (mut rig, six) = five_ready_with(failover);
     rig.held.recut();
     let added = rig
         .rt
@@ -1120,4 +1134,252 @@ fn s80s4_rebalance_after_adding_a_node_ends_with_copy_skew_at_most_one() {
         puts,
         "s80s4_m10_done"
     );
+}
+
+/// The node M11 drains and removes.
+const DRAINED: NodeId = NodeId(2);
+
+/// M11's body, with every node opened with `failover`: after M7 (six nodes, node 6 holding a
+/// copy), `admin::drain` of node 2 through node 1's `Db`, then `admin::remove_member` of it.
+/// Asserts: node 2 owns a partition before; after the drain `grants/2` is frozen (the freeze
+/// ran, after S-1's checks), no `partitions/*` record pins node 2, every partition has three
+/// regular copies on three machines, copy skew is at most 1 (inventory and report), and each
+/// partition node 2 owned was promoted exactly once, by the planner or by the drain, never
+/// both (planner lines count once per generation: `planner_promoted` and another planner's
+/// `planner_promote_observed` of the same commit are one promote, seen 2026-11-21 on p7,
+/// generation 2); `remove_member` (with `membership_settled`) is `Ok`, node 2's `Db` reports
+/// removed within 10 s, and a put lands in every partition.
+fn drain_then_remove(failover: Option<crate::planner::Failover>) {
+    let Admitted { rig, .. } = admitted_with(failover);
+    let machines: BTreeMap<NodeId, String> = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("nodes/ reads")
+        .into_iter()
+        .map(|(node, record)| (node, record.machine))
+        .collect();
+    let owned: BTreeSet<u32> = (1..=PARTITIONS)
+        .filter(|p| rig.record(PartitionId(*p)).0.owner == DRAINED)
+        .collect();
+    assert!(
+        !owned.is_empty(),
+        "node 2 owns a partition before the drain"
+    );
+    let one = &rig.of(NodeId(1)).db;
+    let report = admin::drain(one, rig.rt.handle(), &*rig.store, DRAINED)
+        .unwrap_or_else(|e| panic!("node 2 drains: {e}"));
+    let grant = rig
+        .rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(DRAINED).encode()),
+        }))
+        .expect("grants/2 reads")
+        .record
+        .expect("grants/2 exists");
+    assert!(
+        rdb_core::authority::grant::GrantRecord::decode(&grant.value)
+            .expect("a grant record")
+            .frozen,
+        "grants/2 is frozen after the drain"
+    );
+    let (_, again) = rig
+        .rt
+        .block_on(admin::freeze_grant(&*rig.store, DRAINED))
+        .unwrap_or_else(|e| panic!("a second freeze of grants/2 answers: {e}"));
+    assert_eq!(
+        again, grant.mod_revision,
+        "a second freeze writes nothing: grants/2 stays at its revision"
+    );
+    for p in 1..=PARTITIONS {
+        let (_, members) = rig.record(PartitionId(p));
+        let regular: Vec<NodeId> = members
+            .iter()
+            .filter(|(_, role)| *role != ReplicaRole::Shadow)
+            .map(|(node, _)| *node)
+            .collect();
+        let on: BTreeSet<&str> = regular.iter().map(|node| machines[node].as_str()).collect();
+        assert!(
+            members.iter().all(|(node, _)| *node != DRAINED),
+            "partitions/{p} still pins node 2: {members:?}"
+        );
+        assert!(
+            regular.len() == 3 && on.len() == 3,
+            "partitions/{p} pins {members:?}, not three regular copies on three machines"
+        );
+    }
+    let mut draining = BTreeSet::new();
+    draining.insert(DRAINED);
+    let inventory = rig
+        .rt
+        .block_on(admin::inventory(&*rig.store, &draining))
+        .expect("the inventory reads");
+    let counts = rdb_core::placement::copy_counts(&inventory);
+    assert!(
+        rdb_core::placement::copy_skew(&inventory) <= 1 && report.rebalance.copy_skew <= 1,
+        "copy skew at most 1: {counts:?}, report {report:?}"
+    );
+    config_log::layer::flush_test_logs();
+    let method = if failover.is_some() {
+        "s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_on"
+    } else {
+        "s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_off"
+    };
+    let mut promotes: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut promote_lines: BTreeMap<u32, Vec<serde_json::Value>> = BTreeMap::new();
+    let mut frozen_lines = Vec::new();
+    let mut skipped: Vec<(u64, u64, String)> = Vec::new();
+    for line in config_testkit::logs::lines_for_current_test(module_path!(), method) {
+        let by = line["@m"].as_str().unwrap_or_default();
+        if by == "rebalance_refill_skipped" {
+            skipped.push((
+                line["partition"].as_u64().expect("a partition field"),
+                line["to"].as_u64().expect("a to field"),
+                line["guard"].as_str().expect("a guard field").to_owned(),
+            ));
+        }
+        if by == "grant_frozen" && line["node"] == DRAINED.0 {
+            frozen_lines.push(line["already"].as_bool().expect("an already field"));
+        }
+        if matches!(
+            by,
+            "drain_promoted" | "planner_promoted" | "planner_promote_observed"
+        ) {
+            let partition = line["partition"].as_u64().expect("a partition field");
+            let partition = u32::try_from(partition).expect("a partition");
+            promote_lines
+                .entry(partition)
+                .or_default()
+                .push(line.clone());
+            // One promote is one committed generation. A planner that commits logs
+            // `planner_promoted`, and one whose grant lapsed while its promote ran logs
+            // `planner_promote_observed` for the same commit, so planner lines count by
+            // generation. The drain's line carries no generation and counts once each.
+            let promote = if by == "drain_promoted" {
+                by.to_owned()
+            } else {
+                format!(
+                    "planner generation {}",
+                    line["generation"].as_u64().expect("a generation field")
+                )
+            };
+            let seen = promotes.entry(partition).or_default();
+            if by == "drain_promoted" || !seen.contains(&promote) {
+                seen.push(promote);
+            }
+        }
+    }
+    assert_eq!(
+        frozen_lines,
+        [false, true],
+        "the drain froze grants/2, and the second freeze found it frozen"
+    );
+    if failover.is_none() {
+        // After M7's move, node 6's `Host::restore_left_out` re-seats a first-placement node
+        // the move took the copy off as left out, so the drain's rebalance skips it (#207).
+        assert!(
+            skipped.iter().any(|(_, _, guard)| guard == "left_out"),
+            "the drain's rebalance skipped a target held as left out: {skipped:?}, report \
+             {report:?}"
+        );
+        assert!(
+            promotes.values().flatten().all(|by| by == "drain_promoted"),
+            "no planner promotes with failover off: {promotes:?}"
+        );
+        assert_eq!(
+            report
+                .promoted_by_drain
+                .iter()
+                .copied()
+                .collect::<BTreeSet<u32>>(),
+            owned,
+            "the drain promoted every partition node 2 owned: {report:?}"
+        );
+    }
+    let once: BTreeSet<u32> = promotes
+        .iter()
+        .filter(|(_, by)| by.len() == 1)
+        .map(|(p, _)| *p)
+        .collect();
+    assert_eq!(
+        (once.clone(), promotes.len()),
+        (owned.clone(), owned.len()),
+        "each partition node 2 owned is promoted exactly once: {promotes:?}, lines \
+         {promote_lines:?}, report {report:?}"
+    );
+    let reported: BTreeSet<u32> = report
+        .promoted_by_drain
+        .iter()
+        .chain(&report.promoted_elsewhere)
+        .copied()
+        .collect();
+    assert_eq!(
+        reported, owned,
+        "the report names every promote: {report:?}"
+    );
+    admin::remove_member(
+        one,
+        rig.rt.handle(),
+        &rig.store,
+        DRAINED,
+        &[],
+        crate::host::test_patience(Duration::from_secs(5)),
+    )
+    .unwrap_or_else(|e| panic!("node 2 is removed: {e}"));
+    let two = &rig.of(DRAINED).db;
+    until(
+        "node 2's Db reports removed",
+        Duration::from_secs(10),
+        || two.removed(),
+    );
+    for p in 1..=PARTITIONS {
+        put_landing(
+            one,
+            group_in(one, PartitionId(p)),
+            b"m11",
+            p.to_string().as_bytes(),
+        );
+    }
+    tracing::info!(
+        owned = ?owned,
+        promotes = ?promotes,
+        by_drain = ?report.promoted_by_drain,
+        by_planner = promotes
+            .values()
+            .filter(|by| by.iter().any(|b| b != "drain_promoted"))
+            .count(),
+        elsewhere = ?report.promoted_elsewhere,
+        counts = ?counts,
+        skipped = ?skipped,
+        "s80s4_m11_done"
+    );
+}
+
+/// #80 S4 M11 (S-1), failover off: [`drain_then_remove`] with no planner, so the drain promotes
+/// every partition node 2 owned, and its rebalance skips at least one target held as left out
+/// (`rebalance_refill_skipped{guard: "left_out"}`) and refills onto the next. Integration (six
+/// node processes).
+/// Cut 1: no skip (`run_refill` treats the left-out refusal as any other refusal). Red,
+/// observed 2026-11-21 at load 62: "node 2 drains: rebalance: the refill of partition 2 onto
+/// node 3: node 3 was left out of partition 2 and comes back only by its own restart ...".
+/// Cut 2: `rebalance` skips its refill phase (`next_refill` answers `None`). Red, observed
+/// 2026-11-21 at load 74: "partitions/2 pins [(NodeId(4), RegularSecondary), (NodeId(6),
+/// Primary)], not three regular copies on three machines".
+#[config_log::retcd_test]
+fn s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_off() {
+    drain_then_remove(None);
+}
+
+/// #80 S4 M11 (S-1), failover on: [`drain_then_remove`] with the default failover planner on
+/// every node, which judges node 2 dead once its grant is frozen and may promote its partitions
+/// during the drain's wait. Integration (six node processes).
+/// Cut: keep the drain's wait but drop its re-read of the owner and the lost-CAS-as-done rule,
+/// so it promotes every partition node 2 owned at the freeze and fails on one the planner took.
+/// The design's cut (b) also drops the wait; kept here, the red does not hang on which of the
+/// planner and the drain goes first, and the re-read is the part that keeps the drain correct.
+/// Red, observed 2026-11-21 at load 35: "node 2 drains: drain of node 2: the promote of
+/// partition 2 to node 6 failed and node 2 still owns it: another promote committed instead:
+/// node 4 is the owner, generation 4 ...".
+#[config_log::retcd_test]
+fn s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_failover_on() {
+    drain_then_remove(Some(crate::planner::Failover::default()));
 }

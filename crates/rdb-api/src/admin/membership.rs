@@ -341,8 +341,10 @@ pub enum RemoveNodeError {
 /// Refused, writing nothing, in this order:
 /// - no formation record, or `node` already removed, or `node` not a live member;
 /// - fewer than [`MIN_MACHINES`] distinct live machines afterwards (N-2);
-/// - a `partitions/` record that names `node` owner or pins a copy on it, naming them and
-///   "run admin drain N" first.
+/// - a `partitions/` record that names `node` owner or pins a copy on it, naming them and both
+///   ways on: "run admin drain N" first while `node` answers, or, if it is down, wait until its
+///   copies are dropped (about `Timeouts::unreachable_drop_after`, or failover's promote) and
+///   run this again.
 ///
 /// After the CAS it lists `partitions/` again and logs `remove_node_still_pinned{node,
 /// partitions}` for any record that pins `node` (a move that committed between the check and
@@ -393,8 +395,10 @@ pub async fn remove_node(
     let pinned = pinning(&**store, node).await?;
     if !pinned.is_empty() {
         return Err(refused(format!(
-            "node {} is still pinned by partitions {pinned:?}: run admin drain {} first",
-            node.0, node.0
+            "node {} is still pinned by partitions {pinned:?}: run admin drain {} first, or, if \
+             node {} is down, wait until its copies are dropped (about \
+             Timeouts::unreachable_drop_after, or failover's promote) and run this again",
+            node.0, node.0, node.0
         )));
     }
     let key = ControlKey::Node(node).encode();

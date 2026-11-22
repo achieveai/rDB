@@ -363,7 +363,8 @@ fn remove_refusal(answer: Result<NodeRecord, super::RemoveNodeError>) -> String 
 }
 
 /// M5 (#80 S4, N-2 and S-2). On a database declared with 5 nodes:
-/// - node 2, which the generation-0 records pin, is refused "run admin drain 2";
+/// - node 2, which the generation-0 records pin, is refused naming both ways on: "run admin
+///   drain 2" and, if node 2 is down, waiting until its copies are dropped;
 /// - node 7, never added, is refused as not a live member;
 /// - node 6, added and pinned by nothing, is removed: `nodes/6` becomes layout 3 at node 6's
 ///   address and machine, and every other key keeps its bytes and revisions;
@@ -384,7 +385,11 @@ fn s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_
     let before = snapshot(&rt, &*store);
 
     let why = remove_refusal(rt.block_on(super::remove_node(&store, NodeId(2))));
-    assert!(why.contains("run admin drain 2"), "{why}");
+    assert!(
+        why.contains("run admin drain 2 first")
+            && why.contains("if node 2 is down, wait until its copies are dropped"),
+        "{why}"
+    );
     let why = remove_refusal(rt.block_on(super::remove_node(&store, NodeId(7))));
     assert!(why.contains("node 7 is not a live member"), "{why}");
     assert_eq!(snapshot(&rt, &*store), before, "a refusal writes nothing");

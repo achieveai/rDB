@@ -63,6 +63,10 @@ pub(crate) const REBUILD_STEP: &str = "the rebuild did nothing more than this sa
 /// The tail every `admin move` refusal ends with (M11): its detail names the step.
 pub(crate) const MOVE_STEP: &str = "the move did nothing more than this says";
 
+/// What a refill refusal onto a node its owner holds as left out says (#80 S4); `rebalance`
+/// skips that target on it and tries the next.
+pub(crate) const REFILL_LEFT_OUT: &str = "comes back only by its own restart";
+
 /// The tail every refill refusal ends with (#80 S4, A-R456 narrowed: refill): its detail names
 /// the step.
 pub(crate) const REFILL_STEP: &str = "the refill did nothing more than this says";

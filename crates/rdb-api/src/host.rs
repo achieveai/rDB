@@ -9243,9 +9243,12 @@ impl Host {
                 "left_out",
                 false,
                 format!(
-                    "node {} was left out of partition {} and comes back only by its own \
-                     restart (or `admin rebuild {}`): name a node with no copy",
-                    to.0, partition.0, to.0
+                    "node {} was left out of partition {} and {} (or `admin rebuild {}`): name a \
+                     node with no copy",
+                    to.0,
+                    partition.0,
+                    crate::db::error::REFILL_LEFT_OUT,
+                    to.0
                 ),
             ));
         }

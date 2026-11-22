@@ -123,13 +123,17 @@ pub struct RebalanceReport {
 /// Refill and move copies until every partition has RF regular copies and `placement::plan` has
 /// no copy step left, or `opts.max_moves` refills and moves ran (#80 S4 T12). Each round reads
 /// the inventory again ([`inventory`]), so a run stopped part way resumes where the records are.
-/// A round first refills the lowest partition below RF onto [`refill_target`] through `db`'s
-/// [`Db::refill_in`] (A-R456 narrowed by the lead, 2026-11-21); with none below RF, it plans
-/// afresh and runs the plan's first copy step through [`Db::move_copy_in`]. Either is followed
-/// every [`MOVE_POLL`] until it answers `done`. A primary step is never run (Q4 a); the report
-/// names it `no_live_handoff`, and a partition below RF with no node to take a copy
-/// `no_refill_target`. Blocking: run it off any runtime thread. Logged `rebalance_refill` per
-/// refill, `rebalance_move` per move and `rebalance_done` at the end.
+/// A round first refills the lowest partition below RF onto the first of [`refill_candidates`]
+/// through `db`'s [`Db::refill_in`] (A-R456 narrowed by the lead, 2026-11-21); with none below
+/// RF, it plans afresh and runs the plan's first copy step through [`Db::move_copy_in`]. Either
+/// is followed every [`MOVE_POLL`] until it answers `done`. A primary step is never run (Q4 a);
+/// the report names it `no_live_handoff`, and a partition below RF with no node to take a copy
+/// `no_refill_target`. A target the owner refuses as left out is skipped, logged
+/// `rebalance_refill_skipped`, and the next candidate tried; that is expected after a move,
+/// because a new or restarted owner's `Host::restore_left_out` re-seats the partition's
+/// first-placement nodes that hold no copy as left out (narrowing that is #207). Blocking: run
+/// it off any runtime thread. Logged `rebalance_refill` per refill, `rebalance_move` per move
+/// and `rebalance_done` at the end.
 ///
 /// # Errors
 ///
@@ -143,13 +147,19 @@ pub fn rebalance(
 ) -> Result<RebalanceReport, String> {
     let mut moved: Vec<Step> = Vec::new();
     let mut refilled: Vec<(u32, u32)> = Vec::new();
+    // Per partition, the targets its owner refused as left out in this run.
+    let mut skipped: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     loop {
         let inventory = rt.block_on(inventory(store, &opts.draining))?;
         let budget = opts.max_moves.saturating_sub(moved.len() + refilled.len());
-        let refill = next_refill(&inventory);
+        let refill = next_refill(&inventory, &skipped);
         if let Some((partition, Some(to))) = refill.filter(|_| budget > 0) {
-            run_refill(db, partition, to)?;
-            refilled.push((partition, to));
+            match run_refill(db, partition, to)? {
+                Refilled::Done => refilled.push((partition, to)),
+                Refilled::LeftOut => {
+                    skipped.entry(partition).or_default().insert(to);
+                }
+            }
             continue;
         }
         let plan = placement::plan(&inventory, budget.max(1))
@@ -188,21 +198,7 @@ pub fn rebalance(
                         .partitions
                         .iter()
                         .filter(|p| p.copies.len() < crate::admin::RF)
-                        .map(|p| {
-                            let why = if refill_target(&inventory, p.id).is_some() {
-                                "the budget ran out"
-                            } else {
-                                "no ok node without a copy sits on an unused machine"
-                            };
-                            format!(
-                            "no_refill_target: partition {} has {} of {} regular copies (copies: \
-                             {:?}): {why}",
-                            p.id,
-                            p.copies.len(),
-                            crate::admin::RF,
-                            p.copies
-                        )
-                        }),
+                        .map(|p| refill_residual(&inventory, p, skipped.get(&p.id))),
                 );
                 let report = RebalanceReport {
                     moved,
@@ -256,11 +252,14 @@ fn move_given_up(detail: &str) -> bool {
         && detail.contains(" was given up: ")
 }
 
-/// Where a partition below RF copies takes its next one: a node that is not draining, holds no
-/// copy of it, and sits on a machine none of its copies uses; of those, the one holding fewest
-/// copies, ties to the lowest id. Pure; `None` when no node qualifies.
-pub(crate) fn refill_target(inventory: &Inventory, partition: u32) -> Option<u32> {
-    let p = inventory.partitions.iter().find(|p| p.id == partition)?;
+/// Where a partition below RF copies may take its next one, best first: each node that is not
+/// draining, holds no copy of it, and sits on a machine none of its copies uses, by fewest
+/// copies held, ties to the lowest id. Pure; empty when no node qualifies or the partition is
+/// not in `inventory`.
+pub(crate) fn refill_candidates(inventory: &Inventory, partition: u32) -> Vec<u32> {
+    let Some(p) = inventory.partitions.iter().find(|p| p.id == partition) else {
+        return Vec::new();
+    };
     let machine = |id: u32| {
         inventory
             .nodes
@@ -275,27 +274,91 @@ pub(crate) fn refill_target(inventory: &Inventory, partition: u32) -> Option<u32
             *held.entry(*id).or_default() += 1;
         }
     }
-    inventory
+    let mut candidates: Vec<&Node> = inventory
         .nodes
         .iter()
         .filter(|n| n.state == NodeState::Ok)
         .filter(|n| !p.copies.contains(&n.id) && !used.contains(n.machine.as_str()))
-        .min_by_key(|n| (held.get(&n.id).copied().unwrap_or(0), n.id))
-        .map(|n| n.id)
+        .collect();
+    candidates.sort_by_key(|n| (held.get(&n.id).copied().unwrap_or(0), n.id));
+    candidates.into_iter().map(|n| n.id).collect()
 }
 
-/// The lowest partition in `inventory` with fewer than RF regular copies, with its
-/// [`refill_target`]. `None` when every partition has RF.
-fn next_refill(inventory: &Inventory) -> Option<(u32, Option<u32>)> {
+/// The lowest partition in `inventory` with fewer than RF regular copies, with its first
+/// [`refill_candidates`] entry its owner has not refused as left out in this run (`skipped`).
+/// A partition with no such candidate left is passed over once some were skipped, and named
+/// as the partition with `None` when none qualified at all. `None` when every partition has RF
+/// or every short one had all its candidates skipped.
+fn next_refill(
+    inventory: &Inventory,
+    skipped: &BTreeMap<u32, BTreeSet<u32>>,
+) -> Option<(u32, Option<u32>)> {
     inventory
         .partitions
         .iter()
-        .find(|p| p.copies.len() < crate::admin::RF)
-        .map(|p| (p.id, refill_target(inventory, p.id)))
+        .filter(|p| p.copies.len() < crate::admin::RF)
+        .find_map(|p| {
+            let refused = skipped.get(&p.id);
+            let next = refill_candidates(inventory, p.id)
+                .into_iter()
+                .find(|to| refused.is_none_or(|refused| !refused.contains(to)));
+            match (next, refused) {
+                (Some(to), _) => Some((p.id, Some(to))),
+                (None, None) => Some((p.id, None)),
+                (None, Some(_)) => None,
+            }
+        })
 }
 
-/// Refill `partition` onto `to` through `db` until it answers `done`. Logged `rebalance_refill`.
-fn run_refill(db: &Db, partition: u32, to: u32) -> Result<(), String> {
+/// The residual for partition `p`, still below RF when [`rebalance`] ends: every target its
+/// owner held as left out (`skipped`), the budget, or no candidate at all.
+fn refill_residual(
+    inventory: &Inventory,
+    p: &Partition,
+    skipped: Option<&BTreeSet<u32>>,
+) -> String {
+    let head = format!(
+        "no_refill_target: partition {} has {} of {} regular copies (copies: {:?})",
+        p.id,
+        p.copies.len(),
+        crate::admin::RF,
+        p.copies
+    );
+    let candidates = refill_candidates(inventory, p.id);
+    let skipped: Vec<u32> = skipped.into_iter().flatten().copied().collect();
+    if candidates.iter().any(|to| !skipped.contains(to)) {
+        return format!("{head}: the budget ran out; run the rebalance again");
+    }
+    if skipped.is_empty() {
+        return format!("{head}: no ok node without a copy sits on an unused machine");
+    }
+    let held: Vec<String> = skipped
+        .iter()
+        .map(|node| {
+            format!(
+                "node {node} is held as left out by partition {}'s owner (a first-placement seat \
+                 or a drop); a restart of node {node} re-adds it",
+                p.id
+            )
+        })
+        .collect();
+    format!(
+        "{head}: {}; no other ok node without a copy sits on an unused machine",
+        held.join("; ")
+    )
+}
+
+/// How [`run_refill`] ended without an error.
+enum Refilled {
+    /// The refill answered done.
+    Done,
+    /// The owner refused the target as left out, changing nothing: try the next candidate.
+    LeftOut,
+}
+
+/// Refill `partition` onto `to` through `db` until it answers `done`, or its owner refuses `to`
+/// as left out. Logged `rebalance_refill`, or `rebalance_refill_skipped{guard: "left_out"}`.
+fn run_refill(db: &Db, partition: u32, to: u32) -> Result<Refilled, String> {
     let started = Instant::now();
     let deadline = started + MOVE_WITHIN;
     let mut last: String;
@@ -309,9 +372,22 @@ fn run_refill(db: &Db, partition: u32, to: u32) -> Result<(), String> {
                     line = %answer.line,
                     "rebalance_refill"
                 );
-                return Ok(());
+                return Ok(Refilled::Done);
             }
             Ok(answer) => last = answer.line,
+            Err(error)
+                if error.retry == RetryRule::Definitive
+                    && error.detail.contains(crate::db::error::REFILL_LEFT_OUT) =>
+            {
+                tracing::info!(
+                    partition,
+                    to,
+                    guard = "left_out",
+                    detail = %error.detail,
+                    "rebalance_refill_skipped"
+                );
+                return Ok(Refilled::LeftOut);
+            }
             // Refused for good, or given up: the host says why once, and the next ask would
             // start afresh.
             Err(error) if error.retry == RetryRule::Definitive || move_given_up(&error.detail) => {
