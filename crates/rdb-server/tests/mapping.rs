@@ -9,7 +9,7 @@ use rdb_server::{
 
 /// Every kind, in the proto's order. `wire_kind` is exhaustive, so a new kind fails to compile
 /// there first; this list is then one more place to add it.
-const KINDS: [ErrorKind; 22] = [
+const KINDS: [ErrorKind; 23] = [
     ErrorKind::NotPrimary,
     ErrorKind::RouteChanged,
     ErrorKind::LeaseExpired,
@@ -32,6 +32,7 @@ const KINDS: [ErrorKind; 22] = [
     ErrorKind::UploadChunkConflict,
     ErrorKind::CorruptBlob,
     ErrorKind::DurabilityUnconfirmed,
+    ErrorKind::TooLarge,
 ];
 
 const RULES: [RetryRule; 8] = [
@@ -48,7 +49,7 @@ const RULES: [RetryRule; 8] = [
 /// Each kind's fixed place on the wire, written out by hand: its name and number in
 /// `proto/rdb/v1/rdb.proto`, and its advisory gRPC code. Not derived from the code under test,
 /// so swapping two arms of `wire_kind` or `code_for` turns a row red (review F-007).
-const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 22] = {
+const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 23] = {
     use tonic::Code as C;
     use ErrorKind as K;
     [
@@ -129,6 +130,7 @@ const KIND_TABLE: [(ErrorKind, &str, i32, tonic::Code); 22] = {
             22,
             C::Unavailable,
         ),
+        (K::TooLarge, "TOO_LARGE", 23, C::InvalidArgument),
     ]
 };
 
@@ -290,6 +292,33 @@ fn a_not_wired_step_says_another_node_can_take_over() {
             !no_mutation,
             "{case}"
         );
+    }
+}
+
+/// #170 review r4 (4654680328): a host fault that names stored damage (`CORRUPT_HISTORY`,
+/// `Quarantine`, as the node types a damaged history) takes the `NotWired` step on the wire,
+/// as `ApiError::next_step` does: the damage is the node's, so "write the object again" is
+/// wrong, and only a takeover helps. `no_mutation` still picks how a write goes again.
+/// Cut: `wire_message` passing the error's own retry rule, red ("a damaged entry").
+#[test]
+fn a_damaged_host_fault_takes_the_not_wired_step() {
+    for no_mutation in [false, true] {
+        let mut error = ApiError::new(
+            ErrorKind::CorruptHistory,
+            "host fault: feed: the record at seq 4 does not match its digest",
+        );
+        assert_eq!(error.retry, RetryRule::Quarantine);
+        error.no_mutation = no_mutation;
+        let message = wire_message(&error);
+        let case = format!("no_mutation={no_mutation}: {message}");
+        assert!(message.starts_with("CORRUPT_HISTORY ("), "{case}");
+        assert!(
+            message.contains("retrying at this node will not help"),
+            "{case}"
+        );
+        assert!(!message.contains("a damaged entry"), "{case}");
+        assert!(!message.contains("write the object again"), "{case}");
+        assert_eq!(message.contains("call Status"), !no_mutation, "{case}");
     }
 }
 

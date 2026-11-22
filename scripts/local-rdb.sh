@@ -15,6 +15,7 @@
 #   scripts/local-rdb.sh move FROM TO                             [--run DIR]
 #   scripts/local-rdb.sh do "LINE"                                [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
+#   (status: a node "stopped: restart wanted" asked for a restart, #81 V10; `start N` is it)
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
@@ -35,6 +36,12 @@
 # each node; when it does not, they print its last not-ready line and exit 1, leaving it running.
 # When that line says no link reaches the owner, they also print the `promote` that ends the wait.
 # Any other verb is refused with the list of verbs, exit 2.
+#
+# lr supervises nothing. A node that exits 75 asks its supervisor for a restart (V10, #81: its
+# grant was frozen by a failover, or its host faulted, and it owns no partition); `status` shows
+# it as `stopped: restart wanted` (read from its printed `restart-wanted` line, not its exit
+# status), and `start N` is the restart. With
+# `LR_NODE_ARGS=--failover` the nodes run the automatic-failover planner.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
 # named <sha>-<base port>-<HHMMSS>. The last `up` is recorded in <root>/current, and every other
@@ -64,7 +71,9 @@
 #   drop-reply N    the N-th client call is served and its answer lost
 #   cut-control N   node N's rEtcd calls fail Unavailable and its watches end
 # Every client call is logged `net_client_request{n, client, request}` in that node's log, so a
-# discovery run finds N before a fault run names it.
+# discovery run finds N before a fault run names it. That line is debug under target
+# `rdb_api::net::request` (#158), so nodes start with RUST_LOG=info,rdb_api::net::request=debug;
+# set RUST_LOG to override.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
 # config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
@@ -137,7 +146,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -245,10 +254,19 @@ os_pid_is() { # os-pid exe-name: true while that pid runs that program
     fi
 }
 
-os_pid_of_child() { # $! of a child of this shell, program name: prints its OS pid
+os_pid_of_child() { # $! of a child of this shell, program name: prints its OS pid once the
+    # child runs that program. Until it execs, it is a copy of this shell, so a check of its name
+    # made then fails a start that is fine (#107 manual walk: 1 `up` in 12 at load 85).
     local pid="$1" name="$2" i
-    if [ ! -r "/proc/$pid/winpid" ]; then echo "$pid"; return 0; fi
-    for i in $(seq 1 100); do
+    if ! is_msys; then
+        for i in $(seq 1 200); do
+            [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$name" ] && { echo "$pid"; return 0; }
+            kill -0 "$pid" 2>/dev/null || return 1
+            sleep 0.05
+        done
+        return 1
+    fi
+    for i in $(seq 1 200); do
         case "$(cat "/proc/$pid/exename" 2>/dev/null)" in
             *"$name"*) cat "/proc/$pid/winpid"; return 0 ;;
         esac
@@ -286,16 +304,20 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
     # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
+    RUST_LOG="${RUST_LOG:-info,rdb_api::net::request=debug}" \
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
         --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" --admin-apps admin \
         ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
-    os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
+    os="$(os_pid_of_child "$pid" rdb_node)" || {
+        cat "$err" >&2 2>/dev/null || true
+        die "node $n exited at start, or did not run rdb_node within 10s (see $err)"
+    }
     record_pid "node-$n" "$os"
     if ! wait_line "$out" "^rdb_node listening" 30 "$os"; then
-        cat "$err" >&2
+        cat "$err" >&2 2>/dev/null || true
         die "node $n did not start listening (see $err)"
     fi
     say "node $n started: pid $os, $(head -n1 "$out")"
@@ -643,7 +665,11 @@ status() {
     echo "control  $CONTROL"
     for n in $(all_nodes); do
         os="$(pid_of "node-$n")"
-        if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
+        if os_pid_is "$os" rdb_node; then state="running pid $os"
+        # V10 (#81): the node asked its supervisor for a restart. lr supervises nothing; `start N`
+        # stands in for the supervisor.
+        elif grep -q "^rdb_node restart-wanted" "$RUN/out/node-$n.out" 2>/dev/null; then state="stopped: restart wanted"
+        else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
             "$(last_line "$n" "$state")" \
             "$(tr '\n' ';' 2>/dev/null < "$RUN/faults/node-$n.txt" || echo none)"

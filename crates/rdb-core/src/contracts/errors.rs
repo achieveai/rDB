@@ -143,6 +143,12 @@ pub enum ErrorKind {
     /// says which copies are owed is not known. It says nothing about the write it was asked
     /// about.
     DurabilityUnconfirmed,
+    /// A call carries more than a fixed size limit allows: an object id, a key, a value, a whole
+    /// write, a change's ops or a blob chunk (#148). The `Db` raises it before anything is
+    /// compiled or sent, and its error names the limit, the size and the maximum. Definitive:
+    /// the same call fails the same way. The kernel never raises it, so no [`RdbError`] variant
+    /// carries it.
+    TooLarge,
 }
 
 /// Every error the rDB kernel may return to a caller or to the harness.

@@ -98,7 +98,7 @@ async fn m5_05_snapshot_id_unique_per_build_at_the_same_last_log_id() {
     let leader = cluster.leader().await;
 
     // The first build's id comes from `published_id`, not from the trigger's answer: the trigger
-    // stops waiting after the node's `write_timeout` (2 s, not scaled) and then answers
+    // stops waiting after the node's `write_timeout` (2 s times `RETCD_TEST_DEADLINE_SCALE`, #160) and then answers
     // `snapshot_id: None` while the build carries on (#29, ruling A-R203).
     let first_id = published_id(trigger_in_background(&cluster, leader)).await;
     let first_log_index = published_log_index(&cluster, leader, &first_id);
@@ -380,7 +380,7 @@ fn trigger_in_background(cluster: &Arc<Cluster>, id: NodeId) -> BackgroundBuild 
 
 /// The `snapshot_id` a background build published.
 ///
-/// The trigger stops waiting after the node's `write_timeout` (2 s in the testkit, not scaled)
+/// The trigger stops waiting after the node's `write_timeout` (2 s in the testkit, times `RETCD_TEST_DEADLINE_SCALE` since #160)
 /// and then answers `Started { snapshot_id: None, .. }` while the build carries on. A row that
 /// holds the build paused for longer than that on a loaded host gets that answer. So `None`
 /// is followed by a wait, under a scaled deadline, for the node's current snapshot to change
@@ -1115,10 +1115,18 @@ const REPAIR_PROFILE: config_storage::SnapshotConfig = config_storage::SnapshotC
 /// no exclusion argument.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m5_17_startup_rebuilds_the_snapshot_a_purged_store_lost() {
+    // The 40 seed puts run while REPAIR_PROFILE builds a snapshot every 8 entries, and a synced
+    // log write waits for the store's checkpoint (A-R286; see `MAX_BACKGROUND_JOBS` in
+    // config-storage). On a loaded host one put's log flush took 1.95 s behind a running
+    // checkpoint and the put missed the testkit's 2 s unscaled `write_timeout` (issue #77, load
+    // ~150 on 32 cores). The row asserts the startup rebuild, not write latency, so its budget
+    // is a scaled deadline, as in `a_follower_behind_the_purge_point_rejoins_over_a_slow_link`.
+    let write_budget = TestTimers::DEFAULT.multiple(2);
     let cluster = Cluster::builder()
         .nodes(1)
         .storage(StorageKind::ROCKS)
         .snapshot(REPAIR_PROFILE)
+        .timeouts(write_budget, write_budget)
         .start()
         .await;
     cluster

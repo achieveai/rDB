@@ -16,7 +16,7 @@
 
 use bytes::Bytes;
 use rdb_core::contracts::txn::{key_scope, scoped_key, KEY_SCOPE_LEN};
-use rdb_core::{AffinityId, TenantId};
+use rdb_core::{AffinityId, Namespace, SnapshotRead, TenantId};
 
 use crate::delta::ApplyError;
 use crate::value::{Decimal, Float, Int, Timestamp, Value};
@@ -672,4 +672,246 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
         list_id,
         slot,
     })
+}
+
+// ------------------------------------------------------------------ scopes (#147)
+
+/// The most bytes in each part of a [`Scope`]: the app, and the sub-tenant.
+pub const MAX_SCOPE_PART: usize = 64;
+
+/// The longest scope header: `len | app | 0x01 | len | sub`, both parts at [`MAX_SCOPE_PART`].
+pub const MAX_SCOPE_LEN: usize = 1 + MAX_SCOPE_PART + 1 + 1 + MAX_SCOPE_PART;
+
+/// The longest part of a scoped object id that is not the caller's: the scope header and the
+/// 8-byte workspace group.
+pub const MAX_SCOPE_HEADER: usize = MAX_SCOPE_LEN + 8;
+
+/// Why a scope cannot be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeError {
+    /// The app is empty.
+    #[error("the app is empty")]
+    EmptyApp,
+    /// A sub-tenant was given and is empty; no sub-tenant is `None`.
+    #[error("the sub-tenant is empty; pass none for no sub-tenant")]
+    EmptySub,
+    /// The app is over [`MAX_SCOPE_PART`] bytes.
+    #[error("the app is {len} bytes, over the {MAX_SCOPE_PART}-byte limit")]
+    AppTooLong {
+        /// Its length.
+        len: usize,
+    },
+    /// The sub-tenant is over [`MAX_SCOPE_PART`] bytes.
+    #[error("the sub-tenant is {len} bytes, over the {MAX_SCOPE_PART}-byte limit")]
+    SubTooLong {
+        /// Its length.
+        len: usize,
+    },
+}
+
+/// A two-level tenant scope: an app, and an optional sub-tenant. Its header `S` is written at the
+/// start of every object id the scope stores:
+///
+/// ```text
+/// S = len(app) u8 | app | 0x00                      (no sub-tenant)
+/// S = len(app) u8 | app | 0x01 | len(sub) u8 | sub  (sub-tenant)
+/// ```
+///
+/// No two scopes' headers are prefixes of each other, and the 8-byte group that follows keeps
+/// that for `S || group` (the isolation argument in `docs/rdb/embed.md`). Only [`Scope::new`]
+/// makes one. The bytes are a permanent format: they are stored in keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Scope(Bytes);
+
+impl Scope {
+    /// The scope of `app`, under sub-tenant `sub` when there is one. Any byte is allowed in
+    /// either.
+    ///
+    /// # Errors
+    /// [`ScopeError`]: an empty app, an empty sub-tenant, or a part over [`MAX_SCOPE_PART`].
+    pub fn new(app: &[u8], sub: Option<&[u8]>) -> Result<Self, ScopeError> {
+        if app.is_empty() {
+            return Err(ScopeError::EmptyApp);
+        }
+        if app.len() > MAX_SCOPE_PART {
+            return Err(ScopeError::AppTooLong { len: app.len() });
+        }
+        let mut out = Vec::with_capacity(MAX_SCOPE_LEN);
+        out.push(u8::try_from(app.len()).expect("checked against MAX_SCOPE_PART"));
+        out.extend_from_slice(app);
+        match sub {
+            None => out.push(0x00),
+            Some([]) => return Err(ScopeError::EmptySub),
+            Some(sub) if sub.len() > MAX_SCOPE_PART => {
+                return Err(ScopeError::SubTooLong { len: sub.len() })
+            }
+            Some(sub) => {
+                out.push(0x01);
+                out.push(u8::try_from(sub.len()).expect("checked against MAX_SCOPE_PART"));
+                out.extend_from_slice(sub);
+            }
+        }
+        Ok(Self(Bytes::from(out)))
+    }
+
+    /// The header `S`.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// `S || group BE`: the start of every object id of workspace `group` in this scope.
+    #[must_use]
+    pub fn prefix(&self, group: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.0.len() + 8);
+        out.extend_from_slice(&self.0);
+        out.extend_from_slice(&group.to_be_bytes());
+        out
+    }
+}
+
+fn scope_hash(domain: &[u8], scope: &Scope, group: u64, tail: &[u8]) -> [u8; 8] {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(scope.as_bytes());
+    hash.update(group.to_be_bytes());
+    hash.update(tail);
+    let digest: [u8; 32] = hash.finalize().into();
+    digest[..8].try_into().expect("8 of 32 bytes")
+}
+
+/// The affinity group of workspace `group` in `scope`: the first 8 bytes, big-endian, of
+/// `SHA-256("RDBSCOPE1" || S || group BE)`. It places data only. Two workspaces whose affinity
+/// collides still hold disjoint keys, because the object id starts with `S || group`.
+#[must_use]
+pub fn scope_affinity(scope: &Scope, group: u64) -> AffinityId {
+    AffinityId(u64::from_be_bytes(scope_hash(
+        b"RDBSCOPE1",
+        scope,
+        group,
+        &[],
+    )))
+}
+
+/// The 63-bit request number of the app's request `n` in workspace `group` of `scope`: the first
+/// 8 bytes, big-endian, of `SHA-256("RDBREQ1" || S || group BE || n BE)`, top bit cleared. The
+/// caller marks it as an app's id.
+#[must_use]
+pub fn scoped_request(scope: &Scope, group: u64, n: u64) -> u64 {
+    u64::from_be_bytes(scope_hash(b"RDBREQ1", scope, group, &n.to_be_bytes())) & !(1 << 63)
+}
+
+/// [`esc`] without the terminator: every escaped id that starts with `bytes` starts with this.
+fn esc_body(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    esc(bytes, &mut out);
+    out.truncate(out.len() - 2);
+    out
+}
+
+/// The first key above every record of object `id`, and below every longer id's records:
+/// `esc_body(id) || 00 02`. A record of `id` is `esc_body(id) || 00 01 | sub | tail`; a longer id
+/// escapes to `esc_body(id) || 00 FF ..` or `esc_body(id) || b>=01 ..`.
+fn skip_key(tenant: TenantId, affinity: AffinityId, id: &[u8]) -> Vec<u8> {
+    let mut user = esc_body(id);
+    user.extend_from_slice(&[0x00, 0x02]);
+    scoped_key(tenant, affinity, &user).to_vec()
+}
+
+/// One object a [`list_objects`] walk found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// The object id, unescaped and whole.
+    pub id: Vec<u8>,
+    /// The root's version and kind; `None` for an object with no root, such as the chunks of an
+    /// upload never published.
+    pub root: Option<(u64, crate::envelope::Kind)>,
+}
+
+/// Why a list walk stopped short: stored damage.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ListError {
+    /// A key in the range does not parse.
+    #[error("key {key:02x?} does not parse: {error}")]
+    Key {
+        /// The key.
+        key: Vec<u8>,
+        /// Why.
+        error: KeyError,
+    },
+    /// A root record that does not open, or one with no version.
+    #[error("the root of object {id:02x?} is damaged: {why}")]
+    Root {
+        /// The object id.
+        id: Vec<u8>,
+        /// Why.
+        why: String,
+    },
+}
+
+/// Up to `limit` objects in `(tenant, affinity)` whose id starts with `prefix`, in id order,
+/// starting after the object `after` when it is given. Each object costs one seek, whatever it
+/// holds: a map's entries are never read or counted. An object with no root is returned only
+/// with `rootless`; skipped, it does not count. The second value says the page is full, so more
+/// may follow.
+///
+/// # Errors
+/// [`ListError`]: stored damage in the range.
+pub fn list_objects(
+    snapshot: &dyn SnapshotRead,
+    tenant: TenantId,
+    affinity: AffinityId,
+    prefix: &[u8],
+    after: Option<&[u8]>,
+    limit: usize,
+    rootless: bool,
+) -> Result<(Vec<Listed>, bool), ListError> {
+    let start = scoped_key(tenant, affinity, &esc_body(prefix)).to_vec();
+    let mut from = match after {
+        Some(after) => start.clone().max(skip_key(tenant, affinity, after)),
+        None => start.clone(),
+    };
+    let mut found = Vec::new();
+    while found.len() < limit {
+        let Some((key, bytes)) = snapshot.scan(Namespace::User, &from, 1).into_iter().next() else {
+            break;
+        };
+        if !key.starts_with(&start) {
+            break;
+        }
+        // Only the id is decoded: the record's own tail is never read, so a newer build's
+        // element key under a rootless object does not stop the walk.
+        let (id, rest) =
+            unesc(&key[KEY_SCOPE_LEN..], KEY_SCOPE_LEN).map_err(|error| ListError::Key {
+                key: key.to_vec(),
+                error,
+            })?;
+        // A root sorts first among its object's records (`sub` 0x00), so a first record that is
+        // not one means the object has none.
+        if rest == [SUB_ROOT] {
+            let damaged = |why: String| ListError::Root {
+                id: id.clone(),
+                why,
+            };
+            let version = snapshot
+                .version(Namespace::User, &key)
+                .ok_or_else(|| damaged("a value with no version".to_owned()))?;
+            let kind = crate::envelope::open(&bytes)
+                .map_err(|e| damaged(e.to_string()))?
+                .kind;
+            from = skip_key(tenant, affinity, &id);
+            found.push(Listed {
+                id,
+                root: Some((version, kind)),
+            });
+        } else {
+            from = skip_key(tenant, affinity, &id);
+            if rootless {
+                found.push(Listed { id, root: None });
+            }
+        }
+    }
+    let full = found.len() == limit;
+    Ok((found, full))
 }

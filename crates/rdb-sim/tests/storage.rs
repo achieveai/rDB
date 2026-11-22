@@ -9,6 +9,7 @@
 //! | M7F-44 | a snapshot taken before a multi-write batch never sees any of it, and one taken after sees all of it, across two namespaces and a delete |
 //! | M7F-45 | every crash boundary lands on a batch boundary: both crash kinds, every key of a surviving batch readable and every key of a lost one gone |
 //! | M7F-46 | `sync_wal_through` answers `min(captured, applied, short_flush)` — a commit that arrived after the capture is never covered by it |
+//! | t61 A9a | the snapshot install twins (issue #61 S2): `install_begin` wipes every level in one step; `install_finish` reads as a lineage trimmed at its barrier, moves no durable mark, and survives a host crash; an installing lineage refuses commit and inherit and is cleared at open; a host crash before a sync covers the begin brings the old copy back |
 //!
 //! Log fields are sequences and counts; never a key or value byte.
 
@@ -26,7 +27,7 @@ use rdb_core::contracts::storage::{
 };
 use rdb_core::contracts::trace::Version;
 use rdb_sim::storage::crash_image::{CrashImage, SurvivingPrefix};
-use rdb_sim::storage::memory::MemoryEngine;
+use rdb_sim::storage::memory::{InstallEntry, InstallError, MemoryEngine};
 use rdb_sim::storage::snapshot::EmptySnapshot;
 use rdb_sim::storage::StorageOp;
 
@@ -796,4 +797,347 @@ fn m7f_46_sync_wal_through_answers_under_the_write_order() {
         confirmed = confirmed.0,
         "m7f_46 write order"
     );
+}
+
+// ---- issue #61 A9a: the snapshot install twins ----
+
+const INSTALL_AT: u64 = 4;
+
+/// Generation 1 committed through 3, and generation 2 inherited from it at 2 and committed at 3.
+fn engine_with_two_levels() -> MemoryEngine {
+    let mut engine = MemoryEngine::new(NODE);
+    for seq in 1..=3 {
+        engine
+            .commit(support::batch(1, seq, b"k", b"v"))
+            .expect("commit");
+    }
+    engine
+        .inherit(PARTITION, Generation(1), Generation(2), Seq(2))
+        .expect("inherit");
+    engine
+        .commit(support::batch(2, 3, b"j", b"w"))
+        .expect("commit");
+    engine
+}
+
+/// The record and progress value T1 commits at `seq` of generation 3: a barrier the source
+/// would send.
+fn barrier(seq: u64) -> (Bytes, Bytes) {
+    let history = rdb_sim::storage::history::canonical_history(
+        rdb_core::contracts::authority::Lineage {
+            partition: PARTITION,
+            generation: Generation(3),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+        },
+        rdb_core::contracts::ids::ConfigVersion(1),
+        seq,
+    )
+    .expect("a canonical history");
+    let (record, progress) =
+        rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+            .expect("the record");
+    (record, progress.expect("the progress value"))
+}
+
+fn chunk_entry(key: &'static [u8], value: &'static [u8], version: Version) -> InstallEntry {
+    (
+        Namespace::User,
+        Bytes::from_static(key),
+        Bytes::from_static(value),
+        version,
+    )
+}
+
+#[retcd_test]
+fn t61_sim_install_begin_wipes_every_level() {
+    support::preamble();
+    let mut engine = engine_with_two_levels();
+    // Control: both levels are there to be wiped.
+    assert_eq!(
+        engine.buffered_applied(PARTITION, Generation(2)),
+        AppliedSeq(3)
+    );
+    assert_eq!(engine.version_of(PARTITION, Namespace::User, b"k"), Some(3));
+
+    // A begin for an older generation than the copy holds is refused and writes nothing.
+    assert_eq!(
+        engine.install_begin(PARTITION, Generation(1), Seq(INSTALL_AT)),
+        Err(InstallError::NewerGeneration {
+            held: Generation(2)
+        })
+    );
+    assert_eq!(
+        engine.buffered_applied(PARTITION, Generation(1)),
+        AppliedSeq(3)
+    );
+
+    engine
+        .install_begin(PARTITION, Generation(3), Seq(INSTALL_AT))
+        .expect("begin");
+    for level in [Generation(1), Generation(2)] {
+        assert_eq!(engine.buffered_applied(PARTITION, level), AppliedSeq(0));
+        assert_eq!(engine.parent(PARTITION, level), None);
+    }
+    assert_eq!(engine.version_of(PARTITION, Namespace::User, b"k"), None);
+    assert_eq!(engine.version_of(PARTITION, Namespace::User, b"j"), None);
+    assert_eq!(
+        engine.installing(PARTITION, Generation(3)),
+        Some((Generation(3), Seq(INSTALL_AT)))
+    );
+    let view = engine.snapshot(PARTITION, Generation(3), SnapshotHandle(1));
+    assert_eq!(view.scan(Namespace::User, b"", 10), Vec::new());
+}
+
+#[retcd_test]
+fn t61_sim_install_finish_reads_trimmed_moves_no_durable_and_survives_a_host_crash() {
+    support::preamble();
+    let mut engine = engine_with_two_levels();
+    let (g, at) = (Generation(3), Seq(INSTALL_AT));
+    engine.install_begin(PARTITION, g, at).expect("begin");
+
+    // Entries the export never sends are refused, and nothing of the chunk lands.
+    let history = (
+        Namespace::History,
+        Bytes::copy_from_slice(&1_u64.to_be_bytes()),
+        Bytes::from_static(b"r"),
+        1,
+    );
+    let head = (
+        Namespace::Progress,
+        Bytes::from_static(rdb_core::replication::append::PROGRESS_KEY),
+        Bytes::from_static(b"p"),
+        1,
+    );
+    for foreign in [history, head] {
+        let ns = foreign.0;
+        assert_eq!(
+            engine.install_chunk(PARTITION, g, at, &[chunk_entry(b"k", b"s", 3), foreign]),
+            Err(InstallError::ForeignEntry { ns })
+        );
+    }
+    assert_eq!(engine.version_of(PARTITION, Namespace::User, b"k"), None);
+    assert_eq!(
+        engine.install_chunk(PARTITION, g, at, &[chunk_entry(b"k", b"s", 3)]),
+        Ok(1)
+    );
+
+    // A barrier at another seq is refused, and the lineage stays installing.
+    let (wrong, _) = barrier(INSTALL_AT - 1);
+    let root = (Seq::ZERO, rdb_core::contracts::digest::Digest::ROOT);
+    assert_eq!(
+        engine.install_finish(PARTITION, g, at, &wrong, root),
+        Err(InstallError::BadBarrier { at })
+    );
+    assert_eq!(engine.installing(PARTITION, g), Some((g, at)));
+
+    let (record, progress) = barrier(INSTALL_AT);
+    engine
+        .install_finish(PARTITION, g, at, &record, root)
+        .expect("finish");
+    assert_eq!(engine.installing(PARTITION, g), None);
+    assert_eq!(
+        engine.buffered_applied(PARTITION, g),
+        AppliedSeq(INSTALL_AT)
+    );
+    assert_eq!(
+        engine.durable(PARTITION, g),
+        DurableSeq(0),
+        "install_finish moves no durable mark"
+    );
+    assert_eq!(engine.floor_seq(PARTITION, g), at);
+    assert_eq!(
+        engine.history_at(PARTITION, g, at),
+        Some((record.clone(), Some(progress.clone()))),
+        "the barrier record and the head progress T1 would commit beside it"
+    );
+    assert_eq!(engine.history_at(PARTITION, g, Seq(INSTALL_AT - 1)), None);
+    let view = engine.snapshot(PARTITION, g, SnapshotHandle(1));
+    assert_eq!(
+        view.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"s"))
+    );
+    assert_eq!(view.version(Namespace::User, b"k"), Some(3));
+
+    // A recovery inheriting at the barrier reads the installed state through the link.
+    engine
+        .inherit(PARTITION, g, Generation(4), at)
+        .expect("inherit at the barrier");
+    let child = engine.snapshot(PARTITION, Generation(4), SnapshotHandle(3));
+    assert_eq!(
+        child.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"s"))
+    );
+
+    // The lineage takes commits again; an unsynced one above the barrier is lost by a host
+    // crash, the install is not.
+    engine
+        .commit(support::batch(3, INSTALL_AT + 1, b"k", b"t"))
+        .expect("a commit after the install");
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(
+        reopened.buffered_applied(PARTITION, g),
+        AppliedSeq(INSTALL_AT)
+    );
+    assert_eq!(reopened.durable(PARTITION, g), DurableSeq(0));
+    assert_eq!(reopened.floor_seq(PARTITION, g), at);
+    assert_eq!(
+        reopened.history_at(PARTITION, g, at),
+        Some((record, Some(progress)))
+    );
+    let view = reopened.snapshot(PARTITION, g, SnapshotHandle(2));
+    assert_eq!(
+        view.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"s"))
+    );
+    assert_eq!(view.version(Namespace::User, b"k"), Some(3));
+}
+
+#[retcd_test]
+fn t61_sim_an_installing_lineage_refuses_commit_and_inherit_and_is_cleared_at_open() {
+    support::preamble();
+    let mut engine = engine_with_two_levels();
+    let (g, at) = (Generation(3), Seq(INSTALL_AT));
+    engine.install_begin(PARTITION, g, at).expect("begin");
+    engine
+        .install_chunk(PARTITION, g, at, &[chunk_entry(b"k", b"s", 3)])
+        .expect("chunk");
+
+    assert_eq!(
+        engine.commit(support::batch(3, 1, b"k", b"x")),
+        Err(StorageFault::WriteFailed)
+    );
+    assert_eq!(engine.buffered_applied(PARTITION, g), AppliedSeq(0));
+    assert_eq!(engine.version_of(PARTITION, Namespace::User, b"k"), Some(3));
+    let refused = Err(rdb_sim::SimError::Config {
+        field: "inherit_installing",
+    });
+    assert_eq!(
+        engine.inherit(PARTITION, g, Generation(4), Seq(0)),
+        refused,
+        "nothing inherits from a half-written view"
+    );
+    assert_eq!(engine.parent(PARTITION, Generation(4)), None);
+    assert_eq!(
+        engine.inherit(PARTITION, Generation(1), g, Seq(0)),
+        refused,
+        "nothing links under an installing lineage"
+    );
+    assert_eq!(engine.parent(PARTITION, g), None);
+
+    // A crash mid install: the reopened engine clears it and the copy rejoins empty.
+    let reopened = CrashImage::of(&engine, StorageFault::ProcessCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(reopened.installing(PARTITION, g), None);
+    assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
+    assert_eq!(reopened.buffered_applied(PARTITION, g), AppliedSeq(0));
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened.commit(support::batch(3, 1, b"k", b"x")),
+        Ok(AppliedSeq(1)),
+        "the cleared lineage takes writes again"
+    );
+}
+
+#[retcd_test]
+fn t61_sim_a_host_crash_after_an_unsynced_begin_brings_the_old_copy_back() {
+    support::preamble();
+    let mut engine = engine_with_two_levels();
+    let synced = engine
+        .sync_wal_through(
+            [Generation(1), Generation(2)]
+                .into_iter()
+                .map(|generation| CapturedPrefix {
+                    partition: PARTITION,
+                    generation,
+                    through: AppliedSeq(3),
+                })
+                .collect(),
+        )
+        .expect("flush");
+    assert_eq!(synced.len(), 2, "both levels are durable through 3");
+    let (g, at) = (Generation(3), Seq(INSTALL_AT));
+    engine.install_begin(PARTITION, g, at).expect("begin");
+    engine
+        .install_chunk(PARTITION, g, at, &[chunk_entry(b"k", b"s", 3)])
+        .expect("chunk");
+
+    // No sync covered the begin: the host loses it with its wipe.
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(reopened.installing(PARTITION, g), None);
+    for level in [Generation(1), Generation(2)] {
+        assert_eq!(reopened.buffered_applied(PARTITION, level), AppliedSeq(3));
+        assert_eq!(reopened.durable(PARTITION, level), DurableSeq(3));
+    }
+    assert_eq!(
+        reopened.parent(PARTITION, Generation(2)),
+        Some(Generation(1))
+    );
+    assert_eq!(reopened.base(PARTITION, Generation(2)), Seq(2));
+    let view = reopened.snapshot(PARTITION, Generation(2), SnapshotHandle(1));
+    assert_eq!(
+        view.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"v"))
+    );
+    assert_eq!(view.version(Namespace::User, b"k"), Some(2));
+    assert_eq!(
+        view.get(Namespace::User, b"j"),
+        Some(Bytes::from_static(b"w"))
+    );
+
+    // Control: once a sync covers the begin, a host crash keeps the wipe, and the open clears
+    // the unfinished install.
+    engine.sync_wal_through(Vec::new()).expect("flush");
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("image")
+        .reopen(NODE);
+    assert_eq!(reopened.installing(PARTITION, g), None);
+    for level in [Generation(1), Generation(2), g] {
+        assert_eq!(reopened.buffered_applied(PARTITION, level), AppliedSeq(0));
+    }
+    assert_eq!(reopened.version_of(PARTITION, Namespace::User, b"k"), None);
+}
+
+/// Issue #61 PR #204 review, the sim twin of the page byte cap: four 100 KiB values under a
+/// 250 KiB cap page as 2, 2 and none left. A page stops before the entry that would take it past
+/// the cap, and says whether the view holds more; a page cut short by size is not the last.
+/// A cap smaller than one entry still takes that entry, so the pager always moves.
+/// Cut: `page_after` ignores `max_bytes`, red (one page of all four).
+/// Unit (<10 ms).
+#[retcd_test]
+fn t61_pr204_sim_pages_stop_at_the_byte_cap_and_say_whether_more_remain() {
+    support::preamble();
+    let value: &'static [u8] = Box::leak(vec![b'v'; 100 * 1024].into_boxed_slice());
+    let mut engine = MemoryEngine::new(NODE);
+    for (seq, key) in [b"a", b"b", b"c", b"d"].iter().enumerate() {
+        engine
+            .commit(support::batch(1, seq as u64 + 1, *key, value))
+            .expect("commit");
+    }
+    let cap = 250 * 1024;
+    let (first, more) = engine.page_after(PARTITION, GENERATION, None, 1024, cap);
+    let keys = |page: &[InstallEntry]| page.iter().map(|e| e.1.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        keys(&first),
+        vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+    );
+    assert!(more, "a page cut by size is not the last");
+    let after = (Namespace::User, first[1].1.clone());
+    let (second, more) = engine.page_after(PARTITION, GENERATION, Some(&after), 1024, cap);
+    assert_eq!(
+        keys(&second),
+        vec![Bytes::from_static(b"c"), Bytes::from_static(b"d")]
+    );
+    assert!(!more, "nothing after d");
+    let (one, more) = engine.page_after(PARTITION, GENERATION, None, 1024, 1);
+    assert_eq!(
+        keys(&one),
+        vec![Bytes::from_static(b"a")],
+        "the first entry always goes"
+    );
+    assert!(more);
 }

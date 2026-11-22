@@ -3149,6 +3149,96 @@ fn a_read_never_serves_a_view_above_the_published_prefix() {
     );
 }
 
+/// Issue #184: the host commits T1's batch when it delivers the effect and queues the
+/// completion, so a `Read` answer already queued reaches P1 with the view at the next seq and no
+/// candidate yet. The read waits for that candidate, and its publish answers it there, waited.
+/// Before the fix it was answered at once against a view above the published one: refused
+/// `Unavailable`.
+#[retcd_test]
+fn issue_184_a_read_admitted_with_the_next_seq_applied_waits_for_its_candidate() {
+    let mut rig = Rig::new();
+    rig.snapshot_at(START + 1);
+    assert_eq!(rig.admitted(read(21)), vec![], "parked, not answered");
+    assert_eq!(rig.view().waiters, vec![req(21)]);
+    assert!(rig.view().pending.is_none());
+    let c = rig.pending_with_recheck(START + 1);
+    let effects = rig.step(answer(Checkpoint::Publication, c, Verdict::Admit));
+    assert!(
+        effects.contains(&read_reply(
+            21,
+            ReadServiceOutcome::WaitedAtBarrier,
+            Some(value_at(START + 1))
+        )),
+        "{effects:?}"
+    );
+    assert!(rig.view().waiters.is_empty());
+}
+
+/// Issue #184, the controls: only the next seq **in the published generation** parks a read. A
+/// view at the next seq of another generation, or two seqs ahead in this one (a batch storage
+/// reports at the wrong position: T1 sends no candidate, hunt_16), is answered as before.
+#[retcd_test]
+fn issue_184_a_view_in_another_generation_or_two_ahead_parks_nothing() {
+    for (label, generation, at) in [
+        ("another generation", Generation(GEN.0 + 1), START + 1),
+        ("two ahead", GEN, START + 2),
+    ] {
+        let mut rig = Rig::new();
+        rig.snapshot.generation = generation;
+        rig.snapshot_at(at);
+        assert_eq!(
+            rig.admitted(read(21)),
+            vec![
+                ignored(AuthorityIgnoreReason::ReadViewNotPublished),
+                rejected_read(21, ErrorKind::Unavailable),
+            ],
+            "{label}"
+        );
+        assert!(rig.view().waiters.is_empty(), "{label}");
+    }
+}
+
+/// Issue #184: a read parked on the next seq is answered by whatever ends the wait instead of its
+/// candidate's publish, never left behind. A storage fence (the failed batch's) answers it with
+/// the fence's code. A refused candidate — same generation, another owner epoch — and a re-emit
+/// of the lineage served answer it as a new reader would be answered: the view is still ahead,
+/// so `Unavailable`.
+#[retcd_test]
+fn issue_184_a_parked_read_is_answered_by_a_fence_a_refused_candidate_or_a_re_emit() {
+    let mut foreign = candidate_of(P, START + 1, 5);
+    foreign.lineage.owner_epoch = OwnerEpoch(EPOCH.0 + 1);
+    let unavailable = vec![
+        ignored(AuthorityIgnoreReason::ReadViewNotPublished),
+        rejected_read(21, ErrorKind::Unavailable),
+    ];
+    let mut refused = vec![ignored(AuthorityIgnoreReason::CandidateUnreachable)];
+    refused.extend(unavailable.clone());
+    for (label, end, expected) in [
+        (
+            "storage fence",
+            fence(FenceScope::Partition(P), DenyReason::LocalStorageFenced),
+            vec![rejected_read(21, ErrorKind::ProtectionPaused)],
+        ),
+        (
+            "refused candidate",
+            EventKind::Kernel(KernelEvent::AppliedCandidate(Box::new(foreign))),
+            refused,
+        ),
+        (
+            "re-emit",
+            reemitted(PartitionMode::Active, START),
+            unavailable,
+        ),
+    ] {
+        let mut rig = Rig::new();
+        gate_serving(&mut rig);
+        rig.snapshot_at(START + 1);
+        assert_eq!(rig.admitted(read(21)), vec![], "{label}: parked");
+        assert_eq!(rig.step(end), expected, "{label}");
+        assert!(rig.view().waiters.is_empty(), "{label}");
+    }
+}
+
 /// Invariant 2, the generation half (tester-p1 F1, gate5 N23): the published position is a
 /// generation **and** a seq, so a view at the published seq under another generation serves
 /// nothing. In both modes that serve: a successor's view over the installed position, and the
@@ -3422,7 +3512,9 @@ fn every_view_p1_opens_is_released_exactly_once() {
 /// `PreviousPublished` answers from it once storage binds it; design §4.2's `Recovered` row
 /// rebases `published_snapshot`. A read-only recovery serves **both** reads there: it refuses
 /// writes, never reads. Near-miss: storage above the position is never visible — a `Fresh` read
-/// over it is refused, and a view bound there is released rather than kept.
+/// over it is refused, and a view bound there is released rather than kept. One above in the
+/// read-only recovery is refused at once and parks nothing: only `Serving` makes a fresh read
+/// wait for the next seq's candidate (issue #184; PR #178 review r6 B3).
 #[retcd_test]
 fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
     let next = Generation(GEN.0 + 1);
@@ -3468,8 +3560,13 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
         ("install", |_| {}, 0, GEN, START),
     ];
     for (label, enter, n, generation, at) in entries {
-        for above in [false, true] {
-            let label = format!("{label}, bound above: {above}");
+        for above in [0, 1, 2] {
+            // One above in `Serving` (the install) makes a fresh read wait for that seq's
+            // candidate instead (issue #184, its own rows).
+            if above == 1 && label == "install" {
+                continue;
+            }
+            let label = format!("{label}, bound above by: {above}");
             let mut rig = Rig::new();
             enter(&mut rig);
             assert_eq!(
@@ -3486,9 +3583,9 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
                 "{label}: the gap before storage binds it"
             );
             rig.snapshot.generation = generation;
-            if above {
-                rig.snapshot_at(at + 1);
-                assert_eq!(rig.step(ready(n, at + 1)), vec![release(n)], "{label}");
+            if above > 0 {
+                rig.snapshot_at(at + above);
+                assert_eq!(rig.step(ready(n, at + above)), vec![release(n)], "{label}");
                 assert_eq!(
                     rig.admitted(read_previous(31)),
                     vec![previous(31, Err(ErrorKind::Unavailable))],
@@ -3502,6 +3599,7 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
                     ],
                     "{label}: the row above the position is never visible"
                 );
+                assert!(rig.view().waiters.is_empty(), "{label}: parked nothing");
             } else {
                 rig.snapshot_at(at);
                 assert_eq!(rig.step(ready(n, at)), vec![], "{label}");
@@ -5634,7 +5732,8 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   `retained_through`, the recovered cutoff, which is the published position — and expose
 ///   whether that read is still owed; neither hands back a view or a sequence above it.
 ///   `status_len` (M10 S2, A-R272) is how many status entries are held: a number, never a
-///   sequence or a view.
+///   sequence or a view. `apply_viewing` (`pub(crate)`, issue #184) is the step taking one bool
+///   in, whether the step's view is the next seq: an input, and it hands nothing out.
 /// - `status.rs`: the KA-9 wire map and the status index. `entry` hands back a status entry: its
 ///   `seq` is the request's own position and its `snapshot` is `None` while pending, so it names no
 ///   view anyone can read. `restore` and `recovered_outcome` (M7A-194) are the seed's write and
@@ -5670,6 +5769,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
         include_str!("../src/publication/kernel.rs"),
         &[
             "apply",
+            "apply_viewing",
             "boot",
             "is_publication_snapshot",
             "lineage",

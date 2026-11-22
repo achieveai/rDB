@@ -6,7 +6,8 @@
 //!
 //! Environment:
 //! * `RETCD_TEST_LOG_DIR` — override the test log directory;
-//! * `RETCD_TEST_LOG` — filter directive (default `trace` for `config_*` crates, `info` else).
+//! * `RETCD_TEST_LOG` — filter directive (default `trace` for `config_*` crates, `info` else,
+//!   plus `debug` for rDB's per-write targets, so rows can read those lines: #158).
 //!
 //! Query with DuckDB:
 //! ```sql
@@ -88,7 +89,9 @@ pub fn init_test_logging() {
         let filter = std::env::var("RETCD_TEST_LOG").unwrap_or_else(|_| {
             "info,config_log=trace,config_core=trace,config_storage=trace,config_engine=trace,\
              config_gossip=trace,config_grpc=trace,config_client=trace,config_server=trace,\
-             config_testkit=trace,openraft=debug,rdb_api::authority_check=debug"
+             config_testkit=trace,openraft=debug,rdb_api::authority_check=debug,\
+             rdb_api::host::write=debug,rdb_api::net::request=debug,rdb_storage::engine::batch=debug,\
+             rdb_api::route_addr=debug"
                 .to_string()
         });
         let cfg = LogConfig {
@@ -99,6 +102,9 @@ pub fn init_test_logging() {
             include_location: true,
             also_stderr: false,
             test_log_dir: Some(dir),
+            // The untagged file holds only lines outside a test span; a test binary does not
+            // run long enough to need rotation.
+            rotate: None,
         };
         let (layer, filter, guards) = build(&cfg).expect("test logging init");
         let installed = tracing_subscriber::registry()

@@ -1903,3 +1903,505 @@ async fn i186_apply_without_append_is_refused_at_reopen() {
         Ok(_) => panic!("applied state with no log behind it must not open"),
     }
 }
+
+// --- #186: readers answer from the applied mirror, never ahead of the disk ----------------
+
+/// What the cheap readers report, gathered in one place so "before" and "during" compare
+/// as one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheapReads {
+    last_applied: Option<LogId<RaftNodeId>>,
+    membership_log_id: Option<LogId<RaftNodeId>>,
+    voters: Vec<u64>,
+    cluster_revision: u64,
+    retired_9: bool,
+    retired: Vec<NodeId>,
+    max_applied_command_schema: u16,
+}
+
+fn cheap_reads(r: &dyn config_storage::StateReader) -> CheapReads {
+    let membership = r.membership();
+    CheapReads {
+        last_applied: r.last_applied(),
+        membership_log_id: *membership.log_id(),
+        voters: membership.voter_ids().collect(),
+        cluster_revision: r.cluster_revision(),
+        retired_9: r.is_retired(NodeId(9)),
+        retired: r.retired_nodes().into_iter().collect(),
+        max_applied_command_schema: r.max_applied_command_schema(),
+    }
+}
+
+/// [`cheap_reads`] on its own thread, failing if it does not answer within one second.
+///
+/// The thread is left behind on failure rather than joined: joining a reader that is stuck on
+/// the lock the test is holding would hang the test instead of failing it.
+fn cheap_reads_promptly(r: Arc<dyn config_storage::StateReader>) -> CheapReads {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cheap_reads(&*r));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(1))
+        .expect("the cheap readers waited for the apply's write")
+}
+
+fn membership_entry(index: u64, voters: &[u64]) -> Entry<TypeConfig> {
+    use config_storage::RaftNode;
+    let voters: std::collections::BTreeSet<u64> = voters.iter().copied().collect();
+    let nodes: BTreeMap<u64, RaftNode> = voters
+        .iter()
+        .map(|id| (*id, RaftNode::same(format!("inproc://{id}"))))
+        .collect();
+    Entry {
+        log_id: log_id(1, index),
+        payload: EntryPayload::Membership(openraft::Membership::new(vec![voters], nodes)),
+    }
+}
+
+fn retire(index: u64, node: u64) -> Entry<TypeConfig> {
+    Entry {
+        log_id: log_id(1, index),
+        payload: EntryPayload::Normal(Command::RetireNode {
+            node_id: NodeId(node),
+        }),
+    }
+}
+
+/// Holds the first apply after [`ParkWrite::arm`] at `before_state_write`: the batch is built,
+/// the state-machine lock is held, and nothing has been written.
+#[derive(Default)]
+struct ParkWrite {
+    armed: std::sync::atomic::AtomicBool,
+    reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl ParkWrite {
+    /// Arm the next write; returns (reached, release).
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.reached.lock().unwrap() = Some(reached_tx);
+        *self.release.lock().unwrap() = Some(release_rx);
+        self.armed.store(true, Ordering::SeqCst);
+        (reached_rx, release_tx)
+    }
+}
+
+impl FaultInjector for ParkWrite {
+    fn before(&self, _boundary: Boundary) -> FaultAction {
+        FaultAction::Proceed
+    }
+
+    fn before_state_write(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(reached) = self.reached.lock().unwrap().take() {
+            let _ = reached.send(());
+        }
+        if let Some(release) = self.release.lock().unwrap().take() {
+            release
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the test releases the write");
+        }
+    }
+}
+
+/// #186 row 2: an apply parked under the state-machine lock, just before its synced write,
+/// does not hold up the cheap readers — and they report the values from before the batch,
+/// because the mirror moves only once the batch is on disk.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i186_readers_report_the_old_state_while_an_apply_is_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let s = open_at(tmp.path(), park.clone());
+    append_apply(&s, vec![membership_entry(1, &[1]), put(1, 2, "/a", "1")])
+        .await
+        .unwrap();
+    let reader = s.reader();
+    let before = cheap_reads(&*reader);
+    assert_eq!(before.last_applied, Some(log_id(1, 2)));
+    assert_eq!(before.cluster_revision, 1);
+    assert_eq!(
+        before.max_applied_command_schema,
+        config_core::COMMAND_SCHEMA_V1
+    );
+
+    // Appended first, as Raft does: the apply alone would leave applied past the log (I1).
+    let batch = vec![
+        membership_entry(3, &[1, 2, 3]),
+        put(1, 4, "/b", "2"),
+        retire(5, 9),
+    ];
+    s.log_store()
+        .blocking_append(batch.clone())
+        .await
+        .expect("append");
+    let (reached, release) = park.arm();
+    let mut sm = s.state_machine();
+    let applying = tokio::spawn(async move { sm.apply(batch).await });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the apply reaches its write");
+
+    let during = cheap_reads_promptly(Arc::clone(&reader));
+    assert_eq!(
+        during, before,
+        "while the batch is not yet on disk the readers must report the state before it"
+    );
+
+    release.send(()).unwrap();
+    applying.await.unwrap().expect("the apply completes");
+    let after = cheap_reads(&*reader);
+    assert_eq!(after.last_applied, Some(log_id(1, 5)));
+    assert_eq!(after.membership_log_id, Some(log_id(1, 3)));
+    assert_eq!(after.voters, vec![1, 2, 3]);
+    assert_eq!(after.cluster_revision, 2);
+    assert!(
+        after.retired_9,
+        "the retire in the batch is visible once it is durable"
+    );
+    assert_eq!(after.retired, vec![NodeId(9)]);
+    assert_eq!(
+        after.max_applied_command_schema,
+        config_core::COMMAND_SCHEMA_V2,
+        "the RetireNode in the batch raises the schema watermark once it is durable"
+    );
+}
+
+/// #186 row 4 (TA-14): a crash before the batch leaves the mirror as it was, and a crash after
+/// it leaves a mirror that agrees with what a reopen reads back from disk.
+#[retcd_test]
+async fn i186_mirror_agrees_with_the_disk_across_a_state_batch_crash() {
+    for boundary in [Boundary::BeforeStateBatch, Boundary::AfterStateBatch] {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let s = open_plain(tmp.path());
+            append_apply(&s, vec![membership_entry(1, &[1]), put(1, 2, "/a", "1")])
+                .await
+                .unwrap();
+        }
+        let (seeded, at_crash) = {
+            let s = open_at(tmp.path(), FailAt::new(boundary, FaultAction::Crash));
+            let reader = s.reader();
+            let seeded = cheap_reads(&*reader);
+            let _ = append_apply(
+                &s,
+                vec![
+                    membership_entry(3, &[1, 2, 3]),
+                    put(1, 4, "/b", "2"),
+                    retire(5, 9),
+                ],
+            )
+            .await;
+            assert!(s.is_poisoned(), "{boundary}: Crash must poison the store");
+            assert_eq!(s.counters().get(boundary), 1, "{boundary}: was reached");
+            (seeded, cheap_reads(&*reader))
+        };
+        // Independent oracles, written out rather than read from the live mirror, so a
+        // mirror and a disk that were wrong the same way could not agree their way to green.
+        let expected = if boundary == Boundary::BeforeStateBatch {
+            CheapReads {
+                last_applied: Some(log_id(1, 2)),
+                membership_log_id: Some(log_id(1, 1)),
+                voters: vec![1],
+                cluster_revision: 1,
+                retired_9: false,
+                retired: vec![],
+                max_applied_command_schema: config_core::COMMAND_SCHEMA_V1,
+            }
+        } else {
+            CheapReads {
+                last_applied: Some(log_id(1, 5)),
+                membership_log_id: Some(log_id(1, 3)),
+                voters: vec![1, 2, 3],
+                cluster_revision: 2,
+                retired_9: true,
+                retired: vec![NodeId(9)],
+                max_applied_command_schema: config_core::COMMAND_SCHEMA_V2,
+            }
+        };
+        if boundary == Boundary::BeforeStateBatch {
+            assert_eq!(
+                at_crash, seeded,
+                "{boundary}: nothing was written, nothing moved"
+            );
+        }
+        assert_eq!(
+            at_crash, expected,
+            "{boundary}: the live mirror at the crash"
+        );
+        let reopened = open_plain(tmp.path());
+        assert_eq!(
+            cheap_reads(&*reopened.reader()),
+            expected,
+            "{boundary}: what the disk holds after reopen"
+        );
+    }
+}
+
+/// #186 row 5: `compact_revision` stays on the state-machine lock. A replay reads a page, then
+/// reads the watermark as its witness that nothing in the page was deleted (M4-32). While a
+/// compacting apply holds the lock across its write, that witness must wait or report the new
+/// floor — never the old one, which a mirror updated after the write would still hold.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i186_compact_revision_never_reports_the_old_floor_during_a_compacting_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let s = open_at(tmp.path(), park.clone());
+    append_apply(
+        &s,
+        (1..=5)
+            .map(|i| put(1, i, &format!("/c/{i}"), "v"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    let reader = s.reader();
+    let page = reader.read_events(0, 5, b"", usize::MAX).unwrap();
+    assert_eq!(
+        page.len(),
+        5,
+        "the replay page is read before the compaction"
+    );
+    assert_eq!(reader.compact_revision().unwrap(), 0);
+
+    // Appended first, as Raft does: the apply alone would leave applied past the log (I1).
+    let batch = vec![Entry {
+        log_id: log_id(1, 6),
+        payload: EntryPayload::Normal(Command::Compact {
+            up_to_revision: 3,
+            dedup_trim_below: None,
+        }),
+    }];
+    s.log_store()
+        .blocking_append(batch.clone())
+        .await
+        .expect("append");
+    let (reached, release) = park.arm();
+    let mut sm = s.state_machine();
+    let compacting = tokio::spawn(async move { sm.apply(batch).await });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the compaction reaches its write");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let witness = Arc::clone(&reader);
+    std::thread::spawn(move || {
+        let _ = tx.send(witness.compact_revision().unwrap());
+    });
+    // `None`: blocked on the lock the compaction holds, so the witness waits for the deletion.
+    let during = rx.recv_timeout(std::time::Duration::from_millis(300)).ok();
+    if let Some(floor) = during {
+        assert_eq!(
+            floor, 3,
+            "the watermark witness reported the old floor while the deletion was in flight"
+        );
+    }
+
+    release.send(()).unwrap();
+    compacting.await.unwrap().expect("the compaction applies");
+    if during.is_none() {
+        let floor = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the blocked witness answers once the compaction is durable");
+        assert_eq!(floor, 3, "the witness that waited reports the new floor");
+    }
+    assert_eq!(reader.compact_revision().unwrap(), 3);
+    let after = cheap_reads(&*reader);
+    assert_eq!(after.last_applied, Some(log_id(1, 6)));
+    assert_eq!(after.cluster_revision, 5, "a Compact allocates no revision");
+    assert_eq!(
+        after.max_applied_command_schema,
+        config_core::COMMAND_SCHEMA_V2,
+        "Compact is a schema-2 command"
+    );
+}
+
+// --- #194: journal stats answer from the mirror, and never ahead of the delete -------------
+
+/// Run `f` on its own thread and fail unless it answers within one second. Left behind on
+/// failure rather than joined, as in [`cheap_reads_promptly`].
+fn promptly<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap_or_else(|_| panic!("{what} waited for the apply's write"))
+}
+
+/// #194 order row: `compact_journal` lowers the stats in memory before its `delete_range`
+/// is written. With that compaction parked under the lock, after the in-memory change and
+/// before the write, `journal_stats` and `retention_inputs` answer at once with the old
+/// (higher) stats and the old floor, which is what the disk still holds; once the write lands
+/// they report the lowered stats and the new floor.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i194_journal_stats_stay_old_until_the_compaction_is_written() {
+    use config_storage::JournalStats;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let park = Arc::new(ParkWrite::default());
+    let s = open_at(tmp.path(), park.clone());
+    append_apply(
+        &s,
+        (1..=5)
+            .map(|i| put(1, i, &format!("/j/{i}"), "v"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    let reader = s.reader();
+    let before = reader.journal_stats().unwrap();
+    assert_eq!(before.count, 5);
+    assert_eq!(before.oldest_revision, Some(1));
+    assert_eq!(before.newest_revision, Some(5));
+    assert_eq!(reader.retention_inputs().unwrap(), (before, 0));
+    // The byte oracle, taken from the events on disk before the compaction and measured the
+    // way the store writes them. Only revisions 4 and 5 survive `Compact { up_to: 3 }`.
+    let on_disk = reader.read_events(0, 5, b"", usize::MAX).unwrap();
+    assert_eq!(
+        on_disk.iter().map(config_storage::event_bytes).sum::<u64>(),
+        before.bytes,
+        "the stats count every event's encoded bytes"
+    );
+    let kept_bytes: u64 = on_disk
+        .iter()
+        .filter(|e| e.revision > 3)
+        .map(config_storage::event_bytes)
+        .sum();
+
+    // Appended first, as Raft does: the apply alone would leave applied past the log (I1).
+    let batch = vec![Entry {
+        log_id: log_id(1, 6),
+        payload: EntryPayload::Normal(Command::Compact {
+            up_to_revision: 3,
+            dedup_trim_below: None,
+        }),
+    }];
+    s.log_store()
+        .blocking_append(batch.clone())
+        .await
+        .expect("append");
+    let (reached, release) = park.arm();
+    let mut sm = s.state_machine();
+    let compacting = tokio::spawn(async move { sm.apply(batch).await });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the compaction reaches its write");
+
+    let r = Arc::clone(&reader);
+    let during: (JournalStats, (JournalStats, u64), usize) =
+        promptly("the journal readers", move || {
+            (
+                r.journal_stats().unwrap(),
+                r.retention_inputs().unwrap(),
+                r.read_events(0, 5, b"", usize::MAX).unwrap().len(),
+            )
+        });
+    assert_eq!(
+        during.2, 5,
+        "nothing is deleted on disk before the batch is written"
+    );
+    assert_eq!(
+        during.0, before,
+        "journal_stats reported the lowered stats before the delete_range was written"
+    );
+    assert_eq!(
+        during.1,
+        (before, 0),
+        "retention_inputs ran ahead of the disk while the compaction was writing"
+    );
+
+    release.send(()).unwrap();
+    compacting.await.unwrap().expect("the compaction applies");
+    let after = reader.journal_stats().unwrap();
+    assert_eq!(
+        after,
+        JournalStats {
+            oldest_revision: Some(4),
+            newest_revision: Some(5),
+            count: 2,
+            bytes: kept_bytes,
+        },
+        "after the compaction the stats hold exactly revisions 4 and 5"
+    );
+    assert_eq!(
+        reader.read_events(3, 5, b"", usize::MAX).unwrap().len() as u64,
+        after.count,
+        "the lowered count is what the disk holds"
+    );
+    assert_eq!(reader.retention_inputs().unwrap(), (after, 3));
+}
+
+/// #192 review: a batch that fails after changing memory leaves the mirror at the last batch
+/// that was written. A store pinned at command schema 1 applies a Put in memory, then refuses
+/// the schema-2 Compact behind it in the same batch, so nothing is written. The cheap readers
+/// and `journal_stats` must still report the batch before, not the Put's revision and index.
+#[retcd_test]
+async fn i192_a_batch_that_errors_after_its_memory_change_leaves_the_mirror_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = RocksStore::open_with(
+        tmp.path(),
+        identity(),
+        Limits::DEFAULT,
+        Arc::new(NoFaults),
+        Span::none(),
+        RocksOptions {
+            command_schema: config_core::COMMAND_SCHEMA_V1,
+            ..RocksOptions::DEFAULT
+        },
+        Arc::new(NoopSink),
+    )
+    .expect("a pinned store opens");
+    append_apply(&s, vec![membership_entry(1, &[1]), put(1, 2, "/m/1", "v")])
+        .await
+        .expect("a schema-1 batch applies on a pinned store");
+    let reader = s.reader();
+    let written = CheapReads {
+        last_applied: Some(log_id(1, 2)),
+        membership_log_id: Some(log_id(1, 1)),
+        voters: vec![1],
+        cluster_revision: 1,
+        retired_9: false,
+        retired: vec![],
+        max_applied_command_schema: config_core::COMMAND_SCHEMA_V1,
+    };
+    assert_eq!(cheap_reads(&*reader), written);
+    let stats = reader.journal_stats().unwrap();
+    assert_eq!(stats.count, 1);
+
+    let refused = append_apply(
+        &s,
+        vec![
+            put(1, 3, "/m/2", "v"),
+            Entry {
+                log_id: log_id(1, 4),
+                payload: EntryPayload::Normal(Command::Compact {
+                    up_to_revision: 1,
+                    dedup_trim_below: None,
+                }),
+            },
+        ],
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a pinned store refuses the schema-2 Compact"
+    );
+    assert_eq!(
+        cheap_reads(&*reader),
+        written,
+        "the mirror must keep the last written revision and index"
+    );
+    assert_eq!(
+        reader.journal_stats().unwrap(),
+        stats,
+        "journal_stats must not count the Put that was never written"
+    );
+    assert_eq!(reader.retention_inputs().unwrap(), (stats, 0));
+}
