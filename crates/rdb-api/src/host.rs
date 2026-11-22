@@ -75,6 +75,7 @@ use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::append::{
     record_batch, AppendReceiver, CatchUpPlan, Head, ReceiverInit,
 };
+use rdb_core::replication::progress::DigestLookup;
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
@@ -11721,6 +11722,12 @@ impl Host {
     /// copy links nothing, logs `land_inherit_refused{reason="inherit_below_floor"}` (warn),
     /// and marks its receiver refused for the generation ([`Replication::refuse_landing`]), so
     /// its `Recovered` anchors at the root and the copy is rebuilt by snapshot.
+    ///
+    /// PR #204 review (item 12): only when its receiver does not hold the cutoff with the
+    /// cutoff's digest. A refused receiver that does still anchors at the cutoff (a proven
+    /// prefix, `AppendReceiver::on_recovered`), and would then take the suffix into a
+    /// generation this copy never linked, which holds none of the keys before the cutoff. That
+    /// landing faults the node instead, with nothing linked or anchored.
     fn inherit(
         &mut self,
         partition: PartitionId,
@@ -11739,6 +11746,22 @@ impl Host {
             Err(InheritError::HistoryMissing { at })
                 if landing && at.starts_with("below_floor") =>
             {
+                let holds_cutoff =
+                    self.replication
+                        .receiver(self.node, partition)
+                        .is_some_and(|receiver| {
+                            receiver
+                                .history()
+                                .lookup(result.selected.cutoff_seq, result.selected.cutoff_digest)
+                                == DigestLookup::Match
+                        });
+                if holds_cutoff {
+                    return Err(Fault::from(format!(
+                        "inherit p{} to g{} at cutoff {}: {at}, and the copy holds the cutoff, so \
+                         it would anchor there on a generation it never linked",
+                        partition.0, generation.0, result.selected.cutoff_seq.0
+                    )));
+                }
                 let marked = self
                     .replication
                     .refuse_landing(self.node, partition, generation);

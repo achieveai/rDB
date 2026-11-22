@@ -9499,6 +9499,100 @@ fn t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error() {
     assert_eq!(failed[0]["installing"], true, "{failed:?}");
 }
 
+/// Issue #61 PR #204 review, item 12: a barrier member whose landing needs a copied inherit
+/// that its trim floor refuses must not anchor at the cutoff. As S2-R1 before the wipe: every
+/// copy holds puts 1..=30, trimmed to 26. Node 3 lands the next generation at cutoff 28, so
+/// the inherit copies as of 28, and puts 29 and 30 created keys whose absence at 28 the
+/// trimmed History cannot prove (`below_floor`). Node 3 holds 28 with its digest, so its
+/// receiver would anchor there and take the suffix into a generation it never linked, which
+/// holds none of the keys before the cutoff. The landing faults instead: nothing is linked,
+/// no `Recovered` is pushed, the receiver stays where it was, and every key node 3 held is
+/// still read under the generation it serves.
+/// Cut: the refusal routed as before (`Ok`) when the copy holds the cutoff, red.
+/// Integration (~3 s): S2-R1's setup without the wipe, one landing on node 3.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults() {
+    const METHOD: &str =
+        "t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed_trio(dir.path(), 4, 1, |_| {});
+    let cutoff = Seq(floor + 2);
+    let three = copy_of(&trio, 3);
+    let host = &mut trio.nodes[2].0;
+    let mut result = host.committed[&p].clone();
+    let generation = result.new_generation;
+    let receiver = host
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver");
+    let head = receiver.applied_head();
+    let digest = receiver
+        .history()
+        .digest_at(cutoff)
+        .expect("node 3 holds the cutoff");
+    result.new_generation = Generation(generation.0 + 1);
+    result.retained_status_map.predecessor_generation = generation;
+    result.selected.cutoff_seq = cutoff;
+    result.selected.cutoff_digest = digest;
+    let proof = DurableProof {
+        copy: three,
+        partition: p,
+        seq: DurableSeq(cutoff.0),
+        digest,
+        boot: host.boot,
+    };
+    result.barrier = rdb_core::contracts::recovery::RecoveryBarrier::try_new(
+        &[proof],
+        &BTreeSet::from([three]),
+        cutoff,
+        digest,
+    )
+    .expect("a barrier over node 3");
+    let site = Site {
+        partition: p,
+        correlation: CorrelationId(0),
+    };
+    let landed = host.land(result, site, NodeId(1));
+    let refused = logged!(METHOD, "land_inherit_refused");
+    let fault = landed.expect_err("the landing faults, it does not anchor at the cutoff");
+    assert!(format!("{fault:?}").contains("below_floor"), "{fault:?}");
+    assert!(refused.is_empty(), "not routed as a refusal: {refused:?}");
+    assert!(
+        !host
+            .engine
+            .lineages()
+            .contains(&(p, Generation(generation.0 + 1))),
+        "nothing linked"
+    );
+    assert_eq!(
+        host.replication
+            .receiver(NodeId(3), p)
+            .map(|r| r.applied_head()),
+        Some(head),
+        "the receiver stays where it was"
+    );
+    assert_eq!(
+        host.committed[&p].new_generation, generation,
+        "nothing committed"
+    );
+    for request in [1, floor, 30] {
+        assert!(
+            matches!(
+                host.engine.get(
+                    p,
+                    generation,
+                    Namespace::User,
+                    root_key(TenantId(1), AffinityId(1), key(request).as_ref()).as_bytes()
+                ),
+                Ok(Some(_))
+            ),
+            "k{request} is still read"
+        );
+    }
+}
+
 /// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
 /// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
 /// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
@@ -9576,6 +9670,20 @@ fn trimmed_with(
     value_bytes: usize,
     each: impl Fn(&mut Host),
 ) -> (Trio, u64) {
+    let (mut trio, floor) = trimmed_trio(dir, keep, value_bytes, each);
+    restart_as(&mut trio, dir, 3, true);
+    (trio, floor)
+}
+
+/// [`trimmed_with`] before node 3's wiped restart: every copy holds the 30 puts, trimmed to
+/// `head - keep`, which it answers.
+#[cfg(debug_assertions)]
+fn trimmed_trio(
+    dir: &std::path::Path,
+    keep: u64,
+    value_bytes: usize,
+    each: impl Fn(&mut Host),
+) -> (Trio, u64) {
     // As `note_tests::formed`: the open counter first, so `admin::promote` reads the record
     // (S2-R2); then D9's bootstrap.
     let mut trio = Trio::new(dir, |host| {
@@ -9629,7 +9737,6 @@ fn trimmed_with(
             at + 1
         );
     }
-    restart_as(&mut trio, dir, 3, true);
     (trio, floor)
 }
 
