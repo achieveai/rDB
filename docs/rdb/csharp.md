@@ -125,8 +125,9 @@ answer was lost with no request id (read the object, then decide).
   (`Kind = TooLarge`, `NoMutation = true`, never retried), and the message names the limit, the
   size and the most it allows. (The whole-write limit's `TOO_LARGE` covers byte puts and
   transactions only. The embedded API's map, set, list and non-byte document writes, which this
-  client does not send, are `INVALID_ARGUMENT` over the record. Its object id and key limits
-  answer `TOO_LARGE` on any call, a list page's `after` cursor included.)
+  client does not send, are `INVALID_ARGUMENT` over the record. Its object id limit answers
+  `TOO_LARGE` on any call, an object list's `after` cursor included. Its key limit applies only
+  to map and set writes and to a members page's `after` cursor.)
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an
