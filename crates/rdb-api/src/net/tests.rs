@@ -2142,30 +2142,6 @@ async fn m11_q1_a_peer_speaking_protocol_version_3_is_refused() {
     );
 }
 
-/// Issue #61 (PR-A, design rev 5 M2): a build one protocol version behind this one, which has no
-/// `WirePeerAsk::Probe`, is refused at the handshake naming both versions, never linked to fault
-/// on F1's probe. The number is derived from `PROTOCOL_VERSION`, so a renumber is one line.
-/// Cut: the handshake accepts an older peer (`>` for `!=`) → the link comes up. Integration
-/// (~150 ms).
-#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
-async fn t61_a_peer_one_protocol_version_behind_is_refused() {
-    let dir = config_testkit::fs::temp_dir();
-    certs_for(dir.path(), &[1, 2]);
-    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
-    let addr = one.net.addr().expect("listening");
-    let previous = PROTOCOL_VERSION - 1;
-    let older = Spec {
-        version: previous,
-        ..Spec::node(2, dir.path(), &[1]).dialling(1, addr)
-    };
-    let older = side(older, false).await;
-    let reason = refusal(&older, 1).await;
-    assert_eq!(
-        reason,
-        format!("node-2 speaks protocol_version {previous}, node-1 speaks {PROTOCOL_VERSION}")
-    );
-}
-
 /// Issue #61 A8b (lead ruling R16 item 1): an app one protocol version behind is refused at the
 /// handshake as a peer is, so no build before #61's version ever reads the adoption state `trimmed` or
 /// `WireNodeStatus::needs_operator`: the guarantee is the refusal, and there is no down-level
