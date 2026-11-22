@@ -1411,10 +1411,12 @@ pub struct NodeStatus {
     pub boot: BootId,
     /// The host fault, once one happened: the node's, the same text whichever partition is
     /// asked about. A fault from stored feed damage names the offending sequence positions,
-    /// never a digest or a value. Any authenticated app may read it over the links
-    /// (`WireMsg::Inspect`), so it shows sequence positions in other tenants' history, and no
-    /// content, until #154 scopes apps to their certificates (#170 review r6/r7; owner ruling
-    /// R-Q3 on #87).
+    /// never a digest or a value. Any authenticated app may read it over the links: a status
+    /// read is `WireMsg::Inspect`, the app-readable route. `Db::node_status` and
+    /// `Db::node_status_in` ask only the nodes their process runs, so in an app-only process they
+    /// return no nodes. So it shows sequence positions in other tenants' history, and no content,
+    /// until #154 scopes apps to their certificates (#170 review r6/r7/r9; owner ruling R-Q3 on
+    /// #87).
     pub fault: Option<String>,
     /// What this node holds for the partition; `None` before it holds any lineage.
     pub holds: Option<Holding>,

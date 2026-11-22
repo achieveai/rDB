@@ -1814,10 +1814,13 @@ loop {
   through `next` and cursors. Do not give an app the admin certificate unless it may read every
   tenant.
 - **A fault shows seq positions to any app.** A failed History read, an undecodable stored
-  record, or a hole below the cap faults the node; a malformed User key is refused to that
-  caller. The fault names the offending sequence positions, never a digest or a value. The
-  fault is the node's, not one partition's: a node's status (`Db::node_status`,
-  `WireMsg::Inspect`) carries the same text whichever partition is asked about, and any
-  authenticated app may read status. So an app can learn sequence positions in other tenants'
-  history, but no content. That holds until #154 scopes apps to their certificates (owner
+  record, a record stored under another seq than its own, a stored record that does not match
+  its digest, or a record missing between the retained floor and what the copy may serve faults
+  the node. A malformed User key is different: it is refused to that caller only and faults
+  nothing. The fault names the offending sequence positions, never a digest or a value. The
+  fault is the node's, not one partition's: its status carries the same text whichever
+  partition is asked about. Any authenticated app may read status over the links, by
+  `WireMsg::Inspect`. `Db::node_status()` and `Db::node_status_in(partition)` ask only the nodes
+  this process runs, so in an app-only process they return no nodes. So an app can learn sequence positions in other
+  tenants' history, but no content. That holds until #154 scopes apps to their certificates (owner
   ruling R-Q3 on #87: the caller's tenant, with this warning).
