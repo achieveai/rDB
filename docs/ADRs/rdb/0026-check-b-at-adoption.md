@@ -1,6 +1,6 @@
 # ADR-rdb-0026: Check B at adoption — supersedes ADR-rdb-0021 decision 7
 
-**Status:** Accepted (owner ruling, 2026-11-21, on PR #156)
+**Status:** Accepted by the owner, 2026-11-21 ([#156 comment](https://github.com/achieveai/rDB/pull/156#issuecomment-7067308624)).
 **Date:** 2026-11-20
 **Spec:** `docs/rdb/design-specification.md` §8.1, §8.2
 **Supersedes:** [ADR-rdb-0021](0021-check-b-floor-guard-on-landing-and-inventory.md) decision 7

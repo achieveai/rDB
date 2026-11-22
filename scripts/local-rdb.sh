@@ -15,6 +15,7 @@
 #   scripts/local-rdb.sh move FROM TO                             [--run DIR]
 #   scripts/local-rdb.sh do "LINE"                                [--run DIR]
 #   scripts/local-rdb.sh env                                      [--run DIR]
+#   (status: a node "stopped: restart wanted" asked for a restart, #81 V10; `start N` is it)
 #
 # `up` starts a three-voter rEtcd (scripts/local-cluster.sh), makes certificates, forms the
 # database once in one process (rdb_node --form, ruling A-R231), then starts rdb_node 1, 2 and 3,
@@ -35,6 +36,12 @@
 # each node; when it does not, they print its last not-ready line and exit 1, leaving it running.
 # When that line says no link reaches the owner, they also print the `promote` that ends the wait.
 # Any other verb is refused with the list of verbs, exit 2.
+#
+# lr supervises nothing. A node that exits 75 asks its supervisor for a restart (V10, #81: its
+# grant was frozen by a failover, or its host faulted, and it owns no partition); `status` shows
+# it as `stopped: restart wanted` (read from its printed `restart-wanted` line, not its exit
+# status), and `start N` is the restart. With
+# `LR_NODE_ARGS=--failover` the nodes run the automatic-failover planner.
 #
 # Each run gets its own folder under --root (default $RDB_LR_ROOT, else C:/rdb_test_data/lr),
 # named <sha>-<base port>-<HHMMSS>. The last `up` is recorded in <root>/current, and every other
@@ -137,7 +144,7 @@ while [ $# -gt 0 ]; do
 done
 
 usage() {
-    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -655,7 +662,11 @@ status() {
     echo "control  $CONTROL"
     for n in $(all_nodes); do
         os="$(pid_of "node-$n")"
-        if os_pid_is "$os" rdb_node; then state="running pid $os"; else state="stopped"; fi
+        if os_pid_is "$os" rdb_node; then state="running pid $os"
+        # V10 (#81): the node asked its supervisor for a restart. lr supervises nothing; `start N`
+        # stands in for the supervisor.
+        elif grep -q "^rdb_node restart-wanted" "$RUN/out/node-$n.out" 2>/dev/null; then state="stopped: restart wanted"
+        else state="stopped"; fi
         printf 'node %s   %-20s %s  faults: %s\n' "$n" "$state" \
             "$(last_line "$n" "$state")" \
             "$(tr '\n' ';' 2>/dev/null < "$RUN/faults/node-$n.txt" || echo none)"
