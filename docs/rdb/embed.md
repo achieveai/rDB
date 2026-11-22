@@ -405,15 +405,30 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
-  partition it still owns stops for good until that partition is moved too. Move each one. If
-  the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
-  those partitions can still be moved while it runs.
-- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
-  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
-  a restart (a new boot) that owns nothing, a failover planner, where one runs
-  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
-  promoted again like any regular copy. With no planner running the frozen grant stays, and the
-  node only holds copies.
+  partition it still owns stops until that partition is moved too, or the node restarts with
+  a failover planner running (below). Move each one, or restart it. A partition the planner
+  cannot move (`lone_survivor`: fewer than two other copies answer) stays on the node, still
+  `Serving`.
+- **A restarted node takes back what it still owns, when a planner runs** (#172). With
+  `DbConfig::failover` set, the restarted node's open waits for the planner instead of failing:
+  once the planner sees the new boot, and every partition the node still owns is `Serving`, it
+  deletes the old boot's frozen grant, and the open heals those partitions with the node as
+  owner at a new generation. No `admin promote` is needed. The open logs
+  `heal_grant_frozen_waiting` once while it waits; the planner logs
+  `planner_frozen_grant_cleared`. This is what brings back a host that was killed or hung and
+  then restarted while one of its partitions had no second copy to move to, and a rack of
+  such hosts after a power cycle: each one is cleared on its own. The wait ends at the heal's
+  deadline (the grant, its margins and 10 s).
+- **Without a planner, or with a move under way, the open still fails.** With failover off, or
+  any partition the node owns in `Fencing` (a promote is under way), its open fails with
+  `HealError::Frozen` at once, naming what it still owns; those partitions can still be moved
+  while it runs.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
+  but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
+  boot) whose partitions are all `Serving` (none at all included), a failover planner, where
+  one runs (`DbConfig::failover`), deletes the frozen grant (#81 X2, #172), and the new boot
+  can be chosen and promoted again like any regular copy. With no planner running the frozen
+  grant stays, and the node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
@@ -423,8 +438,8 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
-  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  copies from then on and cannot lead again at that boot (after a restart, a running failover
+  planner clears the freeze, #81 X2 and #172), and the moved partition stays paused
   until its other copy is back, because that copy was on the stopped node.
 
 **Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
