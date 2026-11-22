@@ -1759,3 +1759,9 @@ loop {
   names. This also keeps a plain app from mapping other tenants' write positions and digests
   through `next` and cursors. Do not give an app the admin certificate unless it may read every
   tenant.
+- **A fault shows seq positions to any app.** When a feed read meets stored damage, the node
+  faults, and its fault names the partition and the seq, never a digest or a value. A node's
+  status (`Db::node_status`, `WireMsg::Inspect`) carries that fault, and any authenticated app
+  may read status. So an app can learn how many records a partition holds, other tenants' too,
+  but no content. That holds until #154 scopes apps to their certificates (owner ruling R-Q3
+  on #87: the caller's tenant, with this warning).

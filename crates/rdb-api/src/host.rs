@@ -1409,7 +1409,11 @@ pub struct NodeStatus {
     pub node: NodeId,
     /// The boot of the node's running process.
     pub boot: BootId,
-    /// The host fault, once one happened.
+    /// The host fault, once one happened. A fault from stored feed damage names the partition
+    /// and seq, never a digest or a value. Any authenticated app may read it over the links
+    /// (`WireMsg::Inspect`), so it shows how many records a partition holds, other tenants'
+    /// too, and no content, until #154 scopes apps to their certificates (#170 review r6;
+    /// owner ruling R-Q3 on #87).
     pub fault: Option<String>,
     /// What this node holds for the partition; `None` before it holds any lineage.
     pub holds: Option<Holding>,
@@ -16634,7 +16638,8 @@ fn feed_no_copy(node: NodeId, partition: PartitionId, why: &str) -> ApiError {
 /// #87 review r1: stored damage a feed read met, as the node's fault: `CORRUPT_HISTORY`. A feed
 /// call answered with it hears [`Fault::feed_error`], which adds the feed's step
 /// ([`FEED_HISTORY_STEP`]); a put or a get hears [`Fault::error`] without it (review r2), and
-/// with the owner-fault step (review r4).
+/// with the owner-fault step (review r4). `detail` names seqs, never a digest: it becomes
+/// [`NodeStatus::fault`], which any authenticated app may read until #154 (#170 review r6).
 fn feed_damage(detail: String) -> Fault {
     Fault {
         damage: Some(ErrorKind::CorruptHistory),

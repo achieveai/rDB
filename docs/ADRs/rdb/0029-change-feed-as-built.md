@@ -47,6 +47,10 @@ and its dated amendments, still hold; they give the detail of each point below.
 
 - `History`'s encoding is a public contract. The feed carries its own format number; a page in
   another format lands as `INCOMPATIBLE_VERSION`.
+- A fault from stored feed damage names a seq, never a digest or a value, and any
+  authenticated app may read a node's fault through `Inspect`/`Status`. So it shows how many
+  records a partition holds, other tenants' too, and no content. This stands under the owner's
+  R-Q3 ruling on #87, with this warning, until #154 scopes apps to their certificates.
 - A plain app cannot read the feed until #151 lands. An operator who wants one to read it puts
   that app on `admin_apps`, which trusts it with every tenant.
 - Retention (#61) and long-poll (slice 4) are still open. The prefix filter (slice 3) is dropped:
