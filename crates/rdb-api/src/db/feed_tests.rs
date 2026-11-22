@@ -2637,6 +2637,62 @@ fn timed_call(
     answered
 }
 
+/// Review r8 (thread 4657621997, the r8 verdict's blockers): one read deadline, taken when the
+/// call starts, covers the wait at a restart's guard and the answer, from either source. For
+/// `Source::Owner` and then `Source::Node(2)`: the target is marked mid-restart; the call is
+/// counted waiting at the guard (`Db::restart_waiters`); once 3 s of its 4 s read timeout have
+/// passed, the mark is cleared as a restart's end clears it; the call reaches the target's
+/// mailbox, which holds it unanswered. The call ends at its original deadline, refused "no feed
+/// answer", not 4 s later at a fresh full answer wait.
+/// Cuts: the owner's answer wait given a fresh full timeout, red; the direct node's answer
+/// wait given a fresh full timeout, red.
+/// Unit (~8 s): a `Db` built by hand, no restart; the clock is real, the stages are barriers.
+#[config_log::retcd_test]
+fn f87_3_a_call_waited_out_on_a_restart_ends_at_its_first_deadline() {
+    let rt = runtime();
+    let read = Duration::from_secs(4);
+    let part = Duration::from_secs(3);
+    for (source, target) in [(Source::Owner, OWNER), (Source::Node(NodeId(2)), NodeId(2))] {
+        let (db, mailbox) = marked_mid_restart(&rt, read, target);
+        let started = Instant::now();
+        let answered = timed_call(&db, source);
+        until("the call waits at the restart's guard", || {
+            db.restart_waiters() == 1
+        });
+        until("part of the read deadline has gone on the restart", || {
+            started.elapsed() >= part
+        });
+        for handle in lock(&db.nodes).iter_mut() {
+            handle.restarting = None;
+        }
+        db.opened.restarted.notify_all();
+        let held = mailbox.recv_timeout(read).unwrap_or_else(|error| {
+            panic!("{source:?}: the call reaches node {}: {error:?}", target.0)
+        });
+        assert!(matches!(held, Msg::Client(_)), "{source:?}: a feed call");
+        let (answer, took) = answered
+            .recv_timeout(read + patience())
+            .unwrap_or_else(|error| panic!("{source:?}: the call ends: {error:?}"));
+        let error = answer.expect_err("the held call is not answered");
+        assert_eq!(error.kind, ErrorKind::Unavailable, "{source:?}: {error:?}");
+        assert!(
+            error.detail.starts_with("no feed answer"),
+            "{source:?}: {error:?}"
+        );
+        assert!(error.no_mutation, "{source:?}: {error:?}");
+        assert!(
+            took >= read,
+            "{source:?}: not before its deadline: {took:?}"
+        );
+        assert!(
+            took < part + read - Duration::from_millis(1500),
+            "{source:?}: ended at its first deadline, not a fresh wait: {took:?}"
+        );
+        assert_eq!(db.restart_waiters(), 0, "{source:?}");
+        drop(held);
+    }
+}
+
 /// Review r8 (the r8 verdict's first blocker): an owner-routed feed call to an owner held
 /// mid-restart past the read timeout is refused within it, as a direct call is. Node 1, the
 /// owner, is marked mid-restart and stays so; a `Source::Owner` call, read timeout 1 s, is
