@@ -350,11 +350,13 @@ db.shutdown().await.ok();
   `txn` or `write` already on the pool runs on and may apply, and its request id is lost with
   the future. That is intended. When exactly-once matters, write under a request id you saved
   before the call (`app_request_id(n)`): `txn_as` here (a one-put transaction for a single put),
-  or `Db::put_as` and `Db::txn_as` on the sync `Db`. Then ask `status` with that id, or send it
-  again with `resend_within`.
-- A call the pool never ran (the runtime shut down first) sent nothing: a write answers
-  `no_mutation` true. `wait_ready` and `shutdown` panic then instead, having no error to
-  return.
+  or `Db::put_as` and `Db::txn_as` on the sync `Db`. Then ask `status` with that id first.
+  `resend_within` takes the request as sent (`PutOk::sent`, or `PutError::request` when one
+  was sent), which a dropped future never handed back.
+- A call the pool never ran (the runtime shut down first) sent nothing. `put`, `write` and
+  `txn` answer `no_mutation` true; `txn_as` and `resend_within` answer false for a reused id,
+  because an earlier send may have applied. `wait_ready` and `shutdown` panic then instead,
+  having no error to return.
 - Dropping the last `AsyncDb` (and the last `Arc<Db>`) inside a task drops the `Db`, whose
   `Drop` stops and joins its node threads, on that task's thread. End with
   `db.shutdown().await`, which does that on the blocking pool. It answers `Err(db)`, doing
