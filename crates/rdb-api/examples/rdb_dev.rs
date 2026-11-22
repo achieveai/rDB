@@ -2697,10 +2697,11 @@ const MEMBERSHIP_LOOK: Duration = Duration::from_secs(5);
 const ADD_NODE_USAGE: &str = "admin add-node --addr <host:port> [--machine <label>] \
                               [--unreachable-ok <n>]..: name each live member that is down";
 
-/// `admin remove-node`'s usage (#80 S4 T12): the dead-host path is named here.
-const REMOVE_NODE_USAGE: &str = "admin remove-node <n> [--unreachable-ok <m>]..: run admin drain \
-                                 <n> first; if n's host is down, name it as well: admin \
-                                 remove-node <n> --unreachable-ok <n>";
+/// `admin remove-node`'s usage (#80 S4 T12): the rdb_node path comes first, because drain
+/// does not yet work for a node run as rdb_node (#226).
+const REMOVE_NODE_USAGE: &str = "admin remove-node <n> [--unreachable-ok <m>]..: for a node run \
+                                 as rdb_node, stop it, then remove-node <n> --unreachable-ok \
+                                 <n>; for an in-process Db, run admin drain <n> first";
 
 /// `admin rebalance`'s usage (#80 S4 T12).
 const REBALANCE_USAGE: &str = "admin rebalance [--max-moves <k>]";
@@ -10129,11 +10130,14 @@ mod tests {
             let why = parse_remove_node(&words(bad)).expect_err(bad);
             assert!(why.ends_with(REMOVE_NODE_USAGE), "{bad:?}: {why}");
         }
-        assert!(
-            REMOVE_NODE_USAGE.contains("if n's host is down")
-                && REMOVE_NODE_USAGE.contains("admin remove-node <n> --unreachable-ok <n>"),
-            "{REMOVE_NODE_USAGE}"
-        );
+        // The rdb_node path (#226) is named, and before the drain path.
+        let rdb_node = REMOVE_NODE_USAGE
+            .find("for a node run as rdb_node, stop it, then remove-node <n> --unreachable-ok <n>")
+            .expect(REMOVE_NODE_USAGE);
+        let drain = REMOVE_NODE_USAGE
+            .find("for an in-process Db, run admin drain <n> first")
+            .expect(REMOVE_NODE_USAGE);
+        assert!(rdb_node < drain, "{REMOVE_NODE_USAGE}");
         assert_eq!(parse_rebalance(&words("")), Ok(None));
         assert_eq!(parse_rebalance(&words("--max-moves 0")), Ok(Some(0)));
         assert_eq!(parse_rebalance(&words("--max-moves 12")), Ok(Some(12)));
