@@ -9198,6 +9198,87 @@ fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
     assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
 }
 
+/// Issue #61 PR #204 review, a replayed page: as S2-R1, node 1 holds the pull for page 2, so
+/// node 3 has written pages 0 and 1 and its cursor is past page 1. Page 0 then reaches node 3
+/// again, as node 1 built it (from the barrier, after no key). It is dropped
+/// (`snapshot_chunk_dropped{why = mismatch}`): the install's cursor, chain, entries and pages are
+/// unchanged and nothing is refused. Node 3 then pulls page 2, which is accepted, and the
+/// rebuild completes.
+/// Cut: the cursor check (`install.after != chunk.after`) removed from `snapshot_chunk`, red
+/// (the replay reaches the chain check, and the install is refused `chain`).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
+    const METHOD: &str =
+        "t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands";
+    use super::snapshot::{chunk_chain, SnapshotChunk, SnapshotPull};
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let offer = install.offer.clone();
+    let before = (
+        install.after.clone(),
+        install.chain,
+        install.entries,
+        install.chunks,
+    );
+    assert_eq!(before.3, 2, "two pages written");
+    let barrier = ReplicationEnvelope::decode(&offer.barrier)
+        .expect("the barrier")
+        .record_digest;
+    let owner = &trio.nodes[0].0;
+    let page = owner.transfers[&(p, offer.copy)]
+        .view
+        .entries_after(None, owner.snapshot_page_keys)
+        .expect("page 0");
+    let replay = SnapshotChunk {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        chain: chunk_chain(barrier, &page),
+        after: None,
+        entries: page,
+        done: false,
+    };
+    trio.nodes[2].0.snapshot_chunk(replay).expect("no fault");
+    let install = trio.nodes[2].0.installs.get(&p).expect("the install stands");
+    assert_eq!(
+        (
+            install.after.clone(),
+            install.chain,
+            install.entries,
+            install.chunks
+        ),
+        before,
+        "unchanged"
+    );
+    let dropped = logged!(METHOD, "snapshot_chunk_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["why"], "mismatch", "{dropped:?}");
+    let pull = SnapshotPull {
+        partition: p,
+        generation: offer.lineage.generation,
+        at: offer.at,
+        copy: offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    rebuilt(&mut trio, METHOD, floor);
+}
+
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
 #[cfg(debug_assertions)]
 fn promoted_and_durable(trio: &mut Trio, request: u64) {
