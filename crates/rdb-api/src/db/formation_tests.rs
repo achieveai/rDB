@@ -4105,6 +4105,24 @@ enum NodePut {
     RivalLost(Bytes),
 }
 
+impl NodePut {
+    /// The step's name, all `test_addr_put` logs of it (PR #159 review r6): [`NodePut::Rival`]
+    /// and [`NodePut::RivalLost`] carry raw record bytes, which may hold an app address with a
+    /// credential, and docs/logging.md forbids raw value bytes in any log line.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Late => "late",
+            Self::LateUnread => "late_unread",
+            Self::Park => "park",
+            Self::AppliedLost => "applied_lost",
+            Self::AppliedUnread => "applied_unread",
+            Self::Rival(_) => "rival",
+            Self::RivalLost(_) => "rival_lost",
+        }
+    }
+}
+
 /// A memory store whose `nodes/` puts follow a script (#83 B2): each scripted put records
 /// whether the folder's pending marker was on disk when it arrived.
 struct AddrPuts {
@@ -4217,7 +4235,7 @@ impl ConfigStore for AddrPuts {
         if let Some(marker) = self.marker.lock().expect("marker").as_ref() {
             self.marked.lock().expect("marked").push(marker.exists());
         }
-        tracing::info!(?step, "test_addr_put");
+        tracing::info!(step = step.label(), "test_addr_put");
         match step {
             NodePut::Pass => self.inner.put(request).await,
             NodePut::Late => {
@@ -4673,6 +4691,96 @@ fn own83_b2_7_a_record_changed_mid_registration_refuses_the_open() {
         assert_eq!(Some(revision), rival_at, "{what}: the rival's revision");
         assert!(!fence.marked(), "{what}: resolved");
     }
+}
+
+/// The synthetic credential the raw-log rows put in a rival's record (PR #159 review r6).
+const RIVAL_CRED: &str = "rdb-test-cred-5f3a9c";
+
+/// A rival's record for node 1 whose app address carries [`RIVAL_CRED`].
+fn rival_with_cred(fence: &Fence) -> Bytes {
+    fence.bytes_with(&format!("https://svc:{RIVAL_CRED}@gw-1.rival:8443/sbx"))
+}
+
+/// This test's log lines name the `test_addr_put` step only by `label`, and no line holds the
+/// rival record's raw bytes, as their debug text, or [`RIVAL_CRED`].
+fn rival_step_logged_by_label_only(method: &str, label: &str, rival: &Bytes) {
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), method);
+    let steps: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "test_addr_put")
+        .collect();
+    assert!(!steps.is_empty(), "the control: the step is logged");
+    // The payload as a `step` of `?step` would hold it, escaped as a JSON line holds it.
+    let debug = serde_json::to_string(&format!("{rival:?}")).expect("a string");
+    let debug = debug.trim_matches('"');
+    for line in &lines {
+        let text = line.to_string();
+        assert!(
+            !text.contains(RIVAL_CRED),
+            "the credential is logged: {text}"
+        );
+        assert!(
+            !text.contains(debug),
+            "the record's bytes are logged: {text}"
+        );
+    }
+    assert!(
+        steps.iter().any(|line| line["step"] == label),
+        "the {label} step is logged by its label: {steps:?}"
+    );
+}
+
+/// own83_b2_22 (#83 B2, PR #159 review r6, raw-log row): a [`NodePut::Rival`] step writes a
+/// rival record whose app address carries a synthetic credential, and the open is refused.
+/// The store's `test_addr_put` line names the step `rival`, and no line of this test holds the
+/// record's bytes or the credential. Cut: `test_addr_put` logs `?step`, red at "the
+/// credential is logged". Integration (~2 s): one node, two opens.
+#[config_log::retcd_test]
+fn own83_b2_22_a_rival_step_logs_its_label_not_the_record() {
+    let fence = Fence::new("gw-1.a:8443");
+    let rival = rival_with_cred(&fence);
+    fence.store.next(NodePut::Rival(rival.clone()));
+    let refused = fence.open("gw-1.b:9443").expect_err("a rival wrote");
+    assert!(
+        refused
+            .to_string()
+            .contains("changed after this open read it"),
+        "{refused}"
+    );
+    assert_eq!(
+        node_record(&fence.rig, NodeId(1)).0,
+        rival,
+        "the rival's record"
+    );
+    rival_step_logged_by_label_only(
+        "own83_b2_22_a_rival_step_logs_its_label_not_the_record",
+        "rival",
+        &rival,
+    );
+}
+
+/// own83_b2_23 (#83 B2, PR #159 review r6, raw-log row): a [`NodePut::RivalLost`] step writes
+/// a rival record whose app address carries a synthetic credential, and answers the open's
+/// write unknown: refused, naming other bytes. The store's `test_addr_put` line names the step
+/// `rival_lost`, and no line of this test holds the record's bytes or the credential. Cut:
+/// `test_addr_put` logs `?step`, red at "the credential is logged". Integration (~2 s).
+#[config_log::retcd_test]
+fn own83_b2_23_a_rival_lost_step_logs_its_label_not_the_record() {
+    let fence = Fence::new("gw-1.a:8443");
+    let rival = rival_with_cred(&fence);
+    fence.store.next(NodePut::RivalLost(rival.clone()));
+    let refused = fence.open("gw-1.b:9443").expect_err("a rival wrote");
+    assert!(refused.to_string().contains("other bytes"), "{refused}");
+    assert_eq!(
+        node_record(&fence.rig, NodeId(1)).0,
+        rival,
+        "the rival's record"
+    );
+    rival_step_logged_by_label_only(
+        "own83_b2_23_a_rival_lost_step_logs_its_label_not_the_record",
+        "rival_lost",
+        &rival,
+    );
 }
 
 /// Node 1's record holds A, and an open with B sent its write at revision r, whose reply was
