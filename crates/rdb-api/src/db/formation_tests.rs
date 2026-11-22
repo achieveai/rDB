@@ -3202,8 +3202,14 @@ fn left_nothing_out(method: &str, from: usize) {
     let named = |message: &str| -> Vec<&serde_json::Value> {
         lines.iter().filter(|line| line["@m"] == message).collect()
     };
-    assert!(named("heal_proceed_without").is_empty(), "no leave-out decision");
-    assert!(named("heal_left_out_noted").is_empty(), "no copy noted left out");
+    assert!(
+        named("heal_proceed_without").is_empty(),
+        "no leave-out decision"
+    );
+    assert!(
+        named("heal_left_out_noted").is_empty(),
+        "no copy noted left out"
+    );
     let waits: Vec<&serde_json::Value> = named("heal_wait_all")
         .into_iter()
         .filter(|line| line["owner"].as_u64() == Some(u64::from(R5_OWNER.0)))
@@ -3237,14 +3243,16 @@ fn r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_
             dedup: None,
         }))
         .expect("grants/C is deleted");
-    assert!(grant_of(&rig, copy).is_none(), "no grant record for node {}", copy.0);
+    assert!(
+        grant_of(&rig, copy).is_none(),
+        "no grant record for node {}",
+        copy.0
+    );
     let from = log_mark(METHOD);
     rig.stop(R5_OWNER);
     rig.restart(R5_OWNER, Timeouts::default());
     let window = heal_within(&fast());
-    let waited = rig
-        .of(R5_OWNER)
-        .wait_ready(window + Duration::from_secs(2));
+    let waited = rig.of(R5_OWNER).wait_ready(window + Duration::from_secs(2));
     assert!(
         matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
         "node 2 still waits for node {} after one window: {waited:?}",
@@ -3302,7 +3310,9 @@ fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinn
     rig.restart(R5_OWNER, Timeouts::default());
     // Past C's grant: its expiry, the clock margins and a second more.
     let budgets = fast();
-    let expiry = grant_of(&rig, copy).expect("grants/C is kept").expiry_utc_ms;
+    let expiry = grant_of(&rig, copy)
+        .expect("grants/C is kept")
+        .expiry_utc_ms;
     let past = expiry
         + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
             .expect("margins fit")
