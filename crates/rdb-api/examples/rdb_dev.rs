@@ -2706,7 +2706,8 @@ const REMOVE_NODE_USAGE: &str = "admin remove-node <n> [--unreachable-ok <m>]..:
 const REBALANCE_USAGE: &str = "admin rebalance [--max-moves <k>]";
 
 /// `admin drain`'s usage (#80 S4 T12).
-const DRAIN_USAGE: &str = "admin drain <n>: n is a node 1 to 8";
+const DRAIN_USAGE: &str = "admin drain <n>: n is a node 1 to 8; for a node run as rdb_node, see \
+                           #226: stop it and use remove-node --unreachable-ok";
 
 /// `admin placement`'s usage (#80 S4 T12).
 const PLACEMENT_USAGE: &str = "admin placement";
