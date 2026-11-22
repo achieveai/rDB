@@ -2297,8 +2297,9 @@ fn stopped_refusal(who: &str, error: &ApiError) {
 /// feed call sent to node 2 is counted waiting at the restart's guard (`Db::restart_waiters`),
 /// a feed read from node 3 in the same `Db` is served, and the restart state reads
 /// (`Db::restart_note`, `Db::boot_of`) answer. The join is let go; the restart succeeds, and the
-/// waiting call is answered by the restarted node: a page, or a retryable no-mutation refusal
-/// of a node still catching up (`BoundedJitter`), after which a retry is served a page. The
+/// waiting call is answered by the restarted node: a page, or a no-mutation refusal of a node
+/// still catching up (`BoundedJitter`), or the documented no-copy refusal of one that holds no
+/// generation yet (`Definitive`, read another copy), after which a retry is served a page. The
 /// read timeout is the row's patience, so the call never times out at the guard.
 /// Cuts: `Db::nodes_for` waiting on every restart, red (node 3's read waits for the release);
 /// `Db::restart_note` taking the settled lock, red (the note waits for the release).
@@ -2377,11 +2378,23 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
     match to_two.join().expect("the node 2 caller") {
         Ok(page) => assert!(matches!(page, FeedPage::Records { .. }), "{page:?}"),
         Err(error) => {
-            assert!(
+            // A node still catching up refuses retryably; one that holds no generation yet
+            // answers the documented no-copy refusal (`feed_no_copy`): `Definitive`, read
+            // another copy. Nothing else is accepted.
+            let catching_up =
                 matches!(error.kind, ErrorKind::Unavailable | ErrorKind::LeaseExpired)
-                    && error.retry == RetryRule::BoundedJitter
-                    && error.no_mutation,
-                "the restarted node's refusal, retryable: {error:?}"
+                    && error.retry == RetryRule::BoundedJitter;
+            let no_copy_yet = error.kind == ErrorKind::Unavailable
+                && error.retry == RetryRule::Definitive
+                && error
+                    .detail
+                    .starts_with("node 2 holds no current copy of partition 1")
+                && error
+                    .detail
+                    .ends_with(crate::db::error::FEED_OTHER_COPY_STEP);
+            assert!(
+                (catching_up || no_copy_yet) && error.no_mutation,
+                "the restarted node's documented refusal: {error:?}"
             );
             let page = page_from(&db, FeedCursor::START, Source::Node(NodeId(2)));
             assert!(
