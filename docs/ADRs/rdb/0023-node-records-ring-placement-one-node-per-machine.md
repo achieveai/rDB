@@ -140,8 +140,9 @@
      node's data exists and the folder holds no pending (`app-addr-pending`) or fence
      (`app-addr-fence`) debt. On a new, wiped or owed folder (no data yet, or `app-addr-fence`
      still there) it CASes the record's own bytes at the revision it read (an own-bytes fence,
-     below), and can be refused with `OpenError::Control` when the record cannot be read, is
-     absent, changed after the read, or the fence's outcome is unknown. While
+     below). An absent record is refused with `OpenError::Config` before the fence (the node
+     is not declared); the fence can be refused with `OpenError::Control` when the record
+     cannot be read, changed after that check, or the fence's outcome is unknown. While
      `app-addr-pending` is there (an earlier write may still be in flight, below) it is
      refused with `OpenError::Config`, before any host starts, with the step to open again
      with the address the node should hold. An address cannot be cleared: `None` keeps it,

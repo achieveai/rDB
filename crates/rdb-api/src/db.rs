@@ -296,9 +296,10 @@ pub struct DbConfig {
 /// `app-addr-pending` file (pending debt) nor an `app-addr-fence` file (fence debt), does that
 /// behave as before: no address write, and the stored address is kept. On a new, wiped or owed
 /// folder (no data yet, or `app-addr-fence` still there) an open with `None` writes the record:
-/// it CASes the record's own bytes back at the revision it read (an own-bytes fence), and is
-/// refused with [`OpenError::Control`] when the record cannot be read, is absent, changed
-/// after the read, or the fence's outcome is unknown. While `app-addr-pending` is there, an
+/// it CASes the record's own bytes back at the revision it read (an own-bytes fence). An absent
+/// record is refused with [`OpenError::Config`] before the fence (the node is not declared).
+/// The fence is refused with [`OpenError::Control`] when the record cannot be read, changed
+/// after that check, or the fence's outcome is unknown. While `app-addr-pending` is there, an
 /// open with `None` is refused with [`OpenError::Config`]. See [`Self::app`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAddresses {
@@ -2398,7 +2399,7 @@ impl Db {
         }
         // #83 B2: after the engines' `LOCK`s, so of two opens of one folder only one writes,
         // and before any host starts, so no boot leads a partition before its address is in.
-        // An open given no address writes none, so it is refused while a write may be pending.
+        // An open given no address is refused while a write may be pending.
         // A new or emptied folder fences either way (r3): with an address, here, by writing it;
         // with none, below, by writing the record's own bytes back.
         match (app, config.local.as_slice()) {

@@ -3110,10 +3110,10 @@ fn s1b_declare_refuses_two_spellings_of_one_ip_as_one_machine() {
 }
 
 /// #80 S1b, PR #144 review: a declared address no peer can dial is refused before anything is
-/// written, since a node record is never rewritten: port 0, a bracketed host that is not an IPv6
-/// address (`[::gg]`), and (PR #144 review r2) an unspecified, broadcast or multicast host
-/// (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`, `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same
-/// store then takes the corrected addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
+/// written: port 0, a bracketed host that is not an IPv6 address (`[::gg]`), and (PR #144 review
+/// r2) an unspecified, broadcast or multicast host (`0.0.0.0`, `[::]`, `[::ffff:0.0.0.0]`,
+/// `255.255.255.255`, `224.0.0.1`, `[ff02::1]`). The same store then takes the corrected
+/// addresses. Unit (<100 ms). Cut: `parse_addr` accepts port 0 and
 /// parses no bracketed host; both declare, red at the first. Cut: `dialable` refuses nothing; red
 /// at `255.255.255.255`. Cut: `dialable` skips `is_unspecified`; red at `0.0.0.0`.
 #[config_log::retcd_test]

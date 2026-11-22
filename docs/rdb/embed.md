@@ -842,7 +842,7 @@ record. Use it to send a request to the right node.
   can no longer apply and never replaces the address of an open that succeeded.
   - The file counts by being there: one whose text is damaged works the same. One that is
     there but cannot be read refuses the open; make it readable and open again.
-  - An open with no app address cannot write, so while the file is there it is refused.
+  - While the file is there, an open with no app address is refused.
     Open the node again with the address it should hold; that settles it, and later opens
     can leave the address out.
   - **A new or emptied folder fences.** A node folder with no data yet, new or emptied to
@@ -936,9 +936,10 @@ on a settled folder: the node's data exists and the folder holds neither `app-ad
 (pending debt) nor `app-addr-fence` (fence debt). On a new, wiped or owed folder (no data yet,
 or `app-addr-fence` still there), an open with `app: None` writes the node's record: it CASes
 the record's own bytes back at the revision it read (an own-bytes fence, above), so it keeps the
-stored address but moves the revision on, and it can be refused with `OpenError::Control` (the
-record cannot be read or is absent, it changed after the read, or the fence's outcome is
-unknown; open again). While `app-addr-pending` is there, it is refused with
+stored address but moves the revision on. An absent record is refused with `OpenError::Config`
+before the fence (the node is not declared). The fence can be refused with
+`OpenError::Control` (the record cannot be read, it changed after that check, or the fence's
+outcome is unknown; open again). While `app-addr-pending` is there, it is refused with
 `OpenError::Config` (above). `RouteInfo` is no longer
 `Copy` (it owns the address): add `.clone()` where an answer is used after it moved, and
 match it with `..`. It can no longer be built with a struct literal outside rDB, since the
