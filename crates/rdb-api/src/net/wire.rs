@@ -427,6 +427,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::FenceBound { .. }
         | Msg::ReplanNote { .. }
         | Msg::Inject { .. }
+        | Msg::HealLeftOut { .. }
         | Msg::PeerBooted { .. }
         | Msg::Rebuild { .. }
         | Msg::Synced(_)
@@ -458,6 +459,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::FenceBound { .. } => "FenceBound",
         Msg::ReplanNote { .. } => "ReplanNote",
         Msg::Inject { .. } => "Inject",
+        Msg::HealLeftOut { .. } => "HealLeftOut",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::Rebuild { .. } => "Rebuild",
         #[cfg(test)]

@@ -41,6 +41,7 @@ ADR that supersedes.
 | [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 | [0024](0024-tls-to-the-control-store.md) | TLS to the control store — plaintext to rEtcd only when every node is on a loopback IP (extends 0023) | Proposed |
 | [0026](0026-check-b-at-adoption.md) | Check B at adoption (supersedes 0021 decision 7) | **Accepted** |
+| [0028](0028-reopen-heal-on-a-majority-within-one-os-boot.md) | Reopen heal on a majority within one OS boot — only with `live_readd` on (extends 0009, amends 0022) | Proposed |
 | [0029](0029-change-feed-as-built.md) | The change feed as built (supersedes 0020's Decision) | **Accepted** |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
