@@ -473,9 +473,22 @@ In `crates/rdb-api/src/admin/drain.rs`:
 Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
 `PROTOCOL_VERSION` instead of pinning a number, because the bump changed what it pinned.
 
-<!-- TODO (S4): row 2, `s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three`
-(a dead host removed, then refilled), with its cut; row 4 (normal vs `promote: true`); the
-#207 count on a plain 4-node rig; and the Docker add d6 / remove d2 run (D2). -->
+In `crates/rdb-api/src/db/s80s3_tests.rs`, a dead host removed and refilled:
+
+- `s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three` (row 2). After R1's
+  kill, with failover on, once no `partitions/` record pins the dead node, `remove_member`
+  with it in `unreachable_ok`, then `rebalance`. Every partition the dead node owned or held a
+  copy of is in the report's `refilled`; every `rebalance_refill_skipped` is followed by a
+  refill of that partition onto another node; every record pins three regular copies on three
+  machines without the dead node, and a put lands in each. Cut: `next_refill` answers none;
+  red "a partition was refilled" with `refilled: []`.
+
+The #207 count: on a plain 4-node ring, after the first loss, 0 partitions were stuck (12 of
+12 refilled). A stuck refill needs an earlier move or refill that emptied a first-placement
+seat.
+
+<!-- TODO (S4): row 4 (normal vs `promote: true`) and the Docker add d6 / remove d2 run
+(D2). -->
 
 ## References
 
