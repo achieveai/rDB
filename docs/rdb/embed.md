@@ -437,7 +437,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   One case needs a second open. If the node's heal planned against a `Fencing` write that the
   promote then undid, the heal's commit is refused and the open fails `Blocked` with
   `CasContention` (`ready_blocked`). It does not retry; the partition has no owner until you
-  open the node again, and that open heals it.
+  open the node again, and that open heals it. An embedder that exits on a failed reopen and
+  is restarted by its supervisor, as the gateway is, recovers after that one extra restart; a
+  node with no supervisor stays down until an operator opens it again. A retry inside the
+  heal's deadline is tracked in [#211](https://github.com/achieveai/rDB/issues/211).
 - **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
   but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
   boot) whose partitions are all `Serving` (none at all included), a failover planner, where
