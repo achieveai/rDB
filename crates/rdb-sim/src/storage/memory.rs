@@ -732,25 +732,6 @@ impl MemoryEngine {
             .and_then(|batch| history_writes(batch, seq))
     }
 
-    /// The bytes of `History` lineage `(partition, generation)` shows from `from` through its
-    /// applied head (issue #61 S3), the twin of the proposed `RocksEngine::history_bytes`: each
-    /// record's value and the `Progress` value its batch committed beside it, read through the
-    /// same chain as [`Self::history_at`], so nothing below the trim floor counts. Logical bytes,
-    /// where the host may answer RocksDB's approximate sizes; the retention cap
-    /// (`rdb_core::replication::retention::cap_seq`) needs only that it never grows as `from`
-    /// does. 0 when `from` is above the head.
-    #[must_use]
-    pub fn history_bytes(&self, partition: PartitionId, generation: Generation, from: Seq) -> u64 {
-        let head = self.buffered_applied(partition, generation).0;
-        (from.0..=head)
-            .filter_map(|seq| self.history_at(partition, generation, Seq(seq)))
-            .map(|(record, progress)| {
-                let progress = progress.map_or(0, |value| value.len());
-                u64::try_from(record.len() + progress).unwrap_or(u64::MAX)
-            })
-            .fold(0_u64, u64::saturating_add)
-    }
-
     /// The trim mark lineage `(partition, generation)` reads under, with the generation whose
     /// level holds it (issue #61), the twin of `RocksEngine::floor`: the **highest** mark that
     /// cuts what the lineage reads. A level's mark counts only while it is at most one past the
