@@ -2995,6 +2995,25 @@ impl Db {
                 return handle.send(msg);
             }
         }
+        self.post_to(node, msg)
+    }
+
+    /// [`Self::send_to`], waiting at most `bound` for a node of this process mid-restart
+    /// (#170 review r7): [`Unsent::Restarting`] then, with nothing sent to it.
+    fn send_to_within(&self, node: NodeId, msg: Msg, bound: Duration) -> Result<(), Unsent> {
+        {
+            let Some(nodes) = self.nodes_for_within(node, bound) else {
+                return Err(Unsent::Restarting);
+            };
+            if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
+                return handle.send(msg).map_err(|_| Unsent::Stopped);
+            }
+        }
+        self.post_to(node, msg).map_err(|_| Unsent::Stopped)
+    }
+
+    /// Post `msg` over the peer links to `node`, which this process does not run.
+    fn post_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
         self.links.post(node, msg).map_err(|fault| {
             tracing::warn!(node = node.0, ?fault, "db_send_unreachable");
             NodeStopped(node)
@@ -3083,13 +3102,20 @@ impl Db {
         partition: PartitionId,
         call: ClientCall,
     ) -> Result<mpsc::Receiver<Answer>, NodeStopped> {
-        let (reply, answer) = mpsc::channel();
-        let msg = Msg::Client(Client {
-            partition,
-            call,
-            reply,
-        });
+        let (msg, answer) = client_msg(partition, call);
         self.send_to(node, msg).map(|()| answer)
+    }
+
+    /// [`Self::send_call`] through [`Self::send_to_within`].
+    fn send_call_within(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        call: ClientCall,
+        bound: Duration,
+    ) -> Result<mpsc::Receiver<Answer>, Unsent> {
+        let (msg, answer) = client_msg(partition, call);
+        self.send_to_within(node, msg, bound).map(|()| answer)
     }
 
     fn call(&self, partition: PartitionId, call: ClientCall, wait: Duration) -> Option<Answer> {
@@ -3371,10 +3397,11 @@ impl Db {
     /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
     /// `UNAVAILABLE` also when no answer came within the read timeout, or
     /// `Source::Node(n)` names a node in another process this one has no link up to
-    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped, or a node
-    /// that dropped the call unanswered, as one that stops with the call still queued does
-    /// (both `RetryAfterRecovery`: read another copy now, or that node once it has restarted).
-    /// Every such refusal has `no_mutation` set.
+    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped, or one that
+    /// dropped the call unanswered, as one that stops with the call still queued does, or one
+    /// still mid-restart when the read timeout ends: the timeout covers the wait for the
+    /// restart too (all `RetryAfterRecovery`: read another copy now, or that node once it has
+    /// restarted). Every such refusal has `no_mutation` set.
     /// `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
@@ -3451,54 +3478,66 @@ impl Db {
         let wait = self.timeouts.read;
         let answer = match source {
             Source::Owner => self.call(partition, call, wait),
-            Source::Node(node) => match self.send_call(node, partition, call) {
-                Ok(answer) => match answer.recv_timeout(wait) {
-                    Ok(answer) => Some(answer),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    // Review r6 (thread 4655953458): the node took the call but dropped it
-                    // unread, as a thread that stops with it still queued does. The same rule
-                    // as a clean stop's drain and a stopped thread: a feed call writes nothing.
-                    Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                        error: feed_dropped(node),
+            Source::Node(node) => {
+                // Review r7: one wait covers both the dispatch and the answer, so a node held
+                // mid-restart cannot hold the caller past it.
+                let started = Instant::now();
+                match self.send_call_within(node, partition, call, wait) {
+                    Ok(answer) => match answer.recv_timeout(wait.saturating_sub(started.elapsed()))
+                    {
+                        Ok(answer) => Some(answer),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        // Review r6 (thread 4655953458): the node took the call but dropped it
+                        // unread, as a thread that stops with it still queued does. The same rule
+                        // as a clean stop's drain and a stopped thread: a feed call writes nothing.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
+                            error: feed_dropped(node),
+                            request: None,
+                        }),
+                    },
+                    // Review r7 (thread 4657364897): still mid-restart when the wait ended. Nothing
+                    // was sent to it, the half-restarted handle least of all.
+                    Err(Unsent::Restarting) => Some(Answer::Error {
+                        error: feed_restarting(node, wait),
                         request: None,
                     }),
-                },
-                // Review r3/r4/r5 (thread 4654680317): the cause kept, local or remote. A local
-                // node whose thread has stopped serves the feed again once it has restarted,
-                // and another copy can serve now, so a feed reader gets that step, not a host
-                // fault's owner-takeover step; a node in another process with no link up can
-                // come back.
-                Err(_) => Some(Answer::Error {
-                    error: if lock(&self.nodes).iter().any(|handle| handle.node == node) {
-                        let mut error = ApiError::new(
-                            ErrorKind::Unavailable,
-                            format!(
-                                "node {}'s node thread has stopped, in this process; nothing \
+                    // Review r3/r4/r5 (thread 4654680317): the cause kept, local or remote. A local
+                    // node whose thread has stopped serves the feed again once it has restarted,
+                    // and another copy can serve now, so a feed reader gets that step, not a host
+                    // fault's owner-takeover step; a node in another process with no link up can
+                    // come back.
+                    Err(_) => Some(Answer::Error {
+                        error: if lock(&self.nodes).iter().any(|handle| handle.node == node) {
+                            let mut error = ApiError::new(
+                                ErrorKind::Unavailable,
+                                format!(
+                                    "node {}'s node thread has stopped, in this process; nothing \
                                  was read; next: {}",
-                                node.0,
-                                error::FEED_STOPPED_STEP
-                            ),
-                        );
-                        error.retry = RetryRule::RetryAfterRecovery;
-                        error.no_mutation = true;
-                        error
-                    } else {
-                        let mut error = ApiError::new(
-                            ErrorKind::Unavailable,
-                            format!(
-                                "node {} is not reachable from this process: no link to it is \
+                                    node.0,
+                                    error::FEED_STOPPED_STEP
+                                ),
+                            );
+                            error.retry = RetryRule::RetryAfterRecovery;
+                            error.no_mutation = true;
+                            error
+                        } else {
+                            let mut error = ApiError::new(
+                                ErrorKind::Unavailable,
+                                format!(
+                                    "node {} is not reachable from this process: no link to it is \
                                  up (its process may have stopped); nothing was read; a retry \
                                  can succeed once node {} is back, or read from the owner or \
                                  another member",
-                                node.0, node.0
-                            ),
-                        );
-                        error.retry = RetryRule::RetryAfterRecovery;
-                        error
-                    },
-                    request: None,
-                }),
-            },
+                                    node.0, node.0
+                                ),
+                            );
+                            error.retry = RetryRule::RetryAfterRecovery;
+                            error
+                        },
+                        request: None,
+                    }),
+                }
+            }
         };
         let answered = match answer {
             Some(Answer::Changes(page)) => Ok(page),
@@ -4853,6 +4892,26 @@ impl Db {
             .restarted
             .wait_while(nodes, |nodes| mid_restart(nodes, Some(node)))
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Self::nodes_for`], waiting at most `bound` (#170 review r7): `None` once `bound` has
+    /// passed with `node` still mid-restart. Nothing has been sent to it then.
+    fn nodes_for_within(
+        &self,
+        node: NodeId,
+        bound: Duration,
+    ) -> Option<MutexGuard<'_, Vec<NodeHandle>>> {
+        let nodes = lock(&self.nodes);
+        if !mid_restart(&nodes, Some(node)) {
+            return Some(nodes);
+        }
+        let _waiting = self.restart_wait(node);
+        let (nodes, waited) = self
+            .opened
+            .restarted
+            .wait_timeout_while(nodes, bound, |nodes| mid_restart(nodes, Some(node)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!waited.timed_out()).then_some(nodes)
     }
 
     /// Count a call waiting on `node`'s restart until the returned guard drops.
@@ -6687,6 +6746,44 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(refused));
     }
     Ok(())
+}
+
+/// A client call's message to a node and the receiver its answer comes back on.
+fn client_msg(partition: PartitionId, call: ClientCall) -> (Msg, mpsc::Receiver<Answer>) {
+    let (reply, answer) = mpsc::channel();
+    (
+        Msg::Client(Client {
+            partition,
+            call,
+            reply,
+        }),
+        answer,
+    )
+}
+
+/// Why [`Db::send_to_within`] sent nothing.
+enum Unsent {
+    /// The node's thread has stopped, or no link to it is up.
+    Stopped,
+    /// A node of this process was still mid-restart when the wait ended (#170 review r7).
+    Restarting,
+}
+
+/// The refusal of a feed call to `node` while it stayed mid-restart for all of `wait` (#170
+/// review r7): nothing was sent to it. Retryable after recovery with the stopped-node step.
+fn feed_restarting(node: NodeId, wait: Duration) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "node {} is restarting in this process and was not running again within {wait:?}; \
+             nothing was read; next: {}",
+            node.0,
+            error::FEED_STOPPED_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
 }
 
 /// The refusal of a feed call `node` dropped unanswered (#170 review r6): taken, then dropped

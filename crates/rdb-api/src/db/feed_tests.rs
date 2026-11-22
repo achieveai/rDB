@@ -2224,6 +2224,27 @@ fn call_two(db: &Arc<Db>) -> std::thread::JoinHandle<Result<FeedPage, ApiError>>
     })
 }
 
+/// The feed refusal of a stopped or restarting node: `UNAVAILABLE`, `RetryAfterRecovery`, no
+/// mutation, not a host fault, ending with the stop step and no other.
+fn stopped_refusal(who: &str, error: &ApiError) {
+    assert!(!error.is_host_fault(), "{who}: {error:?}");
+    assert_eq!(
+        (error.kind, error.retry),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery),
+        "{who}: {error:?}"
+    );
+    assert!(error.no_mutation, "{who}: {error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_STOPPED_STEP),
+        "{who}: {error:?}"
+    );
+    assert_eq!(
+        error.next_step(),
+        None,
+        "{who}: its own step only: {error:?}"
+    );
+}
+
 /// Review r6/r7 (threads 4655953455, 4657364900): a restart stops and starts its node outside
 /// the node lock. While node 2's restart waits in its WAL join ([`restart_held_in_join`]), a
 /// feed call sent to node 2 is counted waiting at the restart's guard (`Db::restart_waiters`),
@@ -2323,6 +2344,63 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
         }
     }
     assert_eq!(db.restart_waiters(), 0);
+    held.put.join().expect("the put thread").expect("k2");
+}
+
+/// Review r7 (thread 4657364897): a feed call sent to a node held mid-restart past the read
+/// timeout is answered within it, not left waiting on the restart. Node 2's restart waits in
+/// its WAL join ([`restart_held_in_join`]); a call to node 2, read timeout 1 s, is refused
+/// "node 2 is restarting in this process", `UNAVAILABLE`, `RetryAfterRecovery`, no mutation,
+/// with the stop step, while the join is still held. Then the join is let go.
+/// Cut: `Db::nodes_for_within` waiting without its bound, red (no answer while held).
+/// Integration (~5 s): one open, one restart.
+#[config_log::retcd_test]
+fn f87_3_a_call_to_a_node_held_mid_restart_is_refused_within_its_wait() {
+    const METHOD: &str = "f87_3_a_call_to_a_node_held_mid_restart_is_refused_within_its_wait";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let read = Duration::from_secs(1);
+    let timeouts = Timeouts {
+        read,
+        ..Timeouts::default()
+    };
+    let db = Arc::new(opened_timed(&rt, dir.path(), &store, timeouts));
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    let held = restart_held_in_join(&db, dir.path(), METHOD);
+    let (sent, answered) = mpsc::channel();
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let answer = db.changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)));
+            let _ = sent.send((answer, started.elapsed()));
+        });
+    }
+    let (answer, took) = answered
+        .recv_timeout(read + crate::host::test_patience(Duration::from_secs(5)))
+        .expect("the call to node 2 is answered while its join is held");
+    assert!(!held.restart.is_finished(), "the join is still held");
+    let error = answer.expect_err("node 2 is mid-restart");
+    assert!(
+        error
+            .detail
+            .starts_with("node 2 is restarting in this process"),
+        "{error:?}"
+    );
+    stopped_refusal("node 2, mid-restart", &error);
+    assert!(took >= read, "refused after its wait, not before: {took:?}");
+    drop(held.release);
+    held.restart
+        .join()
+        .expect("the restart thread")
+        .expect("node 2 restarted");
     held.put.join().expect("the put thread").expect("k2");
 }
 
