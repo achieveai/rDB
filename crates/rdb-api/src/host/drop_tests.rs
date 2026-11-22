@@ -8925,6 +8925,9 @@ fn t61_s2_r1b_a_rebuilt_copy_walks_the_writes_past_its_snapshot() {
         }
     }
     let head = trio.head().expect("node 1 holds a head");
+    trio.until("the puts' asks reached the open transfer", |_| {
+        (!logged!(METHOD, "snapshot_catchup_in_flight").is_empty()).then_some(())
+    });
     trio.nodes[0].0.snapshot_offer_held = false;
     let installed = rebuilt(&mut trio, METHOD, floor);
     assert!(installed < head, "S {installed} is below the head {head}");
