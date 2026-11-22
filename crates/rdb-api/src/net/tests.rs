@@ -1619,6 +1619,27 @@ async fn r4_t29_a_delete_from_an_app_not_on_the_admin_list_is_refused_and_does_n
     .await;
 }
 
+/// PR #178 review r5 B2: as the row above, for a put whose change is a delete, not a compile:
+/// nothing is deleted. Cut: drop the put arm from `unscoped_verb`, red: node 1's first message
+/// is the put. Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_b2_a_put_deleting_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let delete = ClientCall::Put {
+        identity: identity(9, 1),
+        object: Bytes::from_static(b"doc"),
+        change: Change::Delete,
+        expect: None,
+        remaining_millis: 1_000,
+    };
+    assert_unscoped_refused(
+        "r5_b2_a_put_deleting_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        delete,
+        "delete",
+        "nothing was deleted",
+    )
+    .await;
+}
+
 /// PR #178 review r4 T30: as the row above, for a list: nothing is listed.
 /// Cut: drop the list from `unscoped_verb`, red: node 1's first message is the get.
 /// Integration (~300 ms).
