@@ -114,15 +114,15 @@
 #                certificate (--issue-node), start <name>-dN like up's nodes, ready in 120 s.
 #                Later sessions name it in --nodes (S-6). Records A3's baseline.
 #   rebalance    one `admin rebalance`; prints its lines; fails unless the session exits 0.
-#   remove N     a running node: `admin drain N`, then `admin remove-node N`, then N must exit 0
-#                after `rdb_node removed node=N`. A node whose container is not running:
-#                `admin remove-node N --unreachable-ok N`, again every 5 s for up to 90 s while
-#                it is still pinned. Other live nodes not running are named --unreachable-ok.
+#   remove N     no drain (#226): a running node is stopped with `docker stop`, which Docker's
+#                restart policy never undoes; then `admin remove-node N --unreachable-ok N`,
+#                again every 5 s for up to 90 s while it is still pinned. Other live nodes not
+#                running are named --unreachable-ok.
 #   check-members  D2's A1-A11, once per rig (A8-A10 change it): A1 the added node ready; A2
 #                its record at its own IP and machine; A3 no older node restarted since the add;
 #                A4 copy_skew <= 1; A5 3 copies on 3 machines everywhere; A6 a put and its get
-#                in every partition; A7 the removed node pinned nowhere, holding no copy, exited
-#                0 with `removed`; A8 started again it exits 2, "ids are never reused"; A11 d3,
+#                in every partition; A7 the removed node pinned nowhere, holding no copy, its
+#                nodes/ record no longer a live one; A8 started again it exits 2, "ids are never reused"; A11 d3,
 #                whose --peers names it, restarts and logs start_peer_removed_skipped; A10 kill
 #                the owner most often sharing a partition with the new node; where the new node
 #                is chosen owner, a fresh session writes and reads back; A9 a node from the
@@ -933,7 +933,8 @@ def ids(text):
     return [] if text == "-" else [int(x) for x in text.split(",") if x]
 
 def members(status_path, placement_path, partitions, removed, added):
-    """A2 (machine), A4, A5 and A7 (no pin, no copy) over one status and one placement."""
+    """A2 (machine), A4, A5 and A7 (no pin, no copy, out of membership) over one status and
+    one placement."""
     nodes, (copy_skew, primary_skew) = placement(placement_path)
     parts = status(status_path)
     for spec in added:
@@ -958,6 +959,22 @@ def members(status_path, placement_path, partitions, removed, added):
         verdict(not pinned, f"A7 no partition's status names removed node {n}", [f"named by {pinned}"])
         held = nodes.get(n, (None, 0))[1]
         verdict(held == 0, f"A7 the placement gives removed node {n} no copy (copies={held})")
+        # rdb_dev's `admin status` decodes only a live node record (layouts 1 and 2), so the
+        # record remove-node leaves (layout 3, state removed) prints as `<undecodable>`. A live
+        # record prints `node=N addr=.. machine=..`; no line means no record at all.
+        body = node_records(status_path).get(n, "<no nodes/ line>")
+        verdict(body == "<undecodable>",
+                f"A7 removed node {n} is out of membership: nodes/{n} is not a live record",
+                [f"nodes/{n}: {body}"])
+
+def node_records(path):
+    """{n: body} for each `nodes/N rev=R <body>` line of `admin status`; the last line wins."""
+    out = {}
+    for line in lines(path):
+        m = re.match(r"nodes/(\d+) rev=\d+ (.*)$", line)
+        if m:
+            out[int(m.group(1))] = m.group(2)
+    return out
 
 def owners_of(n, path):
     return sorted(p for p, (owner, _, _) in status(path).items() if owner == n)
@@ -1657,33 +1674,17 @@ rebalance_cmd() {
     rebalance_run || die "rebalance"
 }
 
-# A drained rdb_node owns nothing and shows replace_stopped, so about 5 s after the drain it
-# prints `rdb_node restart-wanted` and exits 75 (#81 V10; D2 run 1, 2026-11-22). remove-node
-# asks every live member for a status, so the remove waits for the supervisor's restart: up
-# to 15 s for the exit, then up to 60 s for the new boot to be ready. Both are printed on their
-# own lines. A 75 with no restart policy stops the remove, saying so.
-drained_restart() { # node, restart count before the drain, drain end (Unix seconds)
-    local n="$1" c="$NAME-d$1" i st
-    for i in $(seq 1 15); do
-        st="$(docker inspect -f '{{.State.Running}} {{.RestartCount}} {{.State.ExitCode}}' "$c" 2>/dev/null || true)"
-        [ "$st" = "true $2 0" ] || break
-        sleep 1
-    done
-    [ "$st" = "true $2 0" ] && { say "remove $n: node $n kept running after the drain"; return 0; }
-    docker logs --since "$3" "$c" 2>&1 | grep -E '^rdb_node (restart-wanted|stopped) ' | sed "s/^/multihost: remove $n: after the drain: /"
-    say "remove $n: after the drain $c exited 75 or restarted (running restarts exit: $st)"
-    [ "$(setting restart)" != none ] \
-        || die "remove $n: $c stopped after the drain, and up ran without --restart-on-exit, so nothing starts it; remove it with --unreachable-ok, or restart it"
-    node_ready_since "$n" "$3" 60 || die "remove $n: node $n not ready again within 60 s of its restart"
-    say "remove $n: node $n restarted by Docker (restarts $(docker inspect -f '{{.RestartCount}}' "$c")) and is ready; removing it"
-}
-
-# remove N: a running node is drained, then removed, and must exit 0 saying `removed`; a node
-# whose container is not running is removed with --unreachable-ok N, again every 5 s for up to
-# 90 s while its copies are still pinned (about Timeouts::unreachable_drop_after).
+# remove N (#80 S4, lead ruling B, 2026-11-22). The script does not drain: a drained rdb_node
+# owns nothing and shows replace_stopped, so about 5 s later it exits 75 for its supervisor
+# (#81 V10), comes back, and is added again, and then remove-node or the drain's refill is
+# refused (#226; D2 runs 1 and 2). So a running node is stopped first, with `docker stop`:
+# Docker never restarts a container stopped that way, whatever its restart policy, and the
+# remove checks that it stayed stopped (exited, RestartCount unchanged) before going on. Then,
+# as for a node that was not running, `admin remove-node N --unreachable-ok N`, again every 5 s
+# for up to 90 s while its copies are still pinned (about Timeouts::unreachable_drop_after).
 remove_node() {
     load
-    local n="$TARGET" state ok rc line
+    local n="$TARGET" c="$NAME-d$TARGET" state ok rc line
     state="$(node_state "$n")"
     [ "$state" = live ] \
         || { echo "docker-multihost: remove $n: node $n is ${state:-not one this rig gave}, not live" >&2; exit 2; }
@@ -1691,42 +1692,27 @@ remove_node() {
     local tmp="$CHECK_TMP"
     ok="$(unreachable_args "$n")"
     [ -z "$ok" ] || say "remove $n: naming the other nodes not running: $ok"
-    if [ "$(docker inspect -f '{{.State.Running}}' "$NAME-d$n" 2>/dev/null)" = true ]; then
-        local restarts0 drained_at
-        restarts0="$(docker inspect -f '{{.RestartCount}}' "$NAME-d$n")" || die "remove $n: inspect $NAME-d$n"
-        rc=0; session_run "$tmp/drain.out" "admin drain $n" || rc=$?
-        grep -E '^(drain: |moved |refilled |residual: |rebalance: |drained |err )' "$tmp/drain.out" | sed 's/^/  /'
-        if [ "$rc" != 0 ] || ! grep -q "^drained node=$n " "$tmp/drain.out"; then
-            die "remove $n: the drain session exited $rc without 'drained node=$n'"
-        fi
-        drained_at="$(date +%s)"
-        drained_restart "$n" "$restarts0" "$drained_at"
-        rc=0; session_run "$tmp/remove.out" "admin remove-node $n $ok" || rc=$?
-        line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
-        if [ "$rc" != 0 ] || [ "${line%% addr=*}" != "removed node=$n" ]; then
-            die "remove $n: the session exited $rc: ${line:-<no removed line>}"
-        fi
-        set_state "$n" removed
-        say "remove $n: $line"
-        line="$(stopped_for_good "$NAME-d$n" 60)" || die "remove $n: $NAME-d$n still runs 60 s after the remove ($line)"
-        case "$line" in "exited 0 "*) ;; *) die "remove $n: $NAME-d$n stopped as '$line', not exit 0" ;; esac
-        docker logs "$NAME-d$n" 2>&1 | grep -q "^rdb_node removed node=$n\$" \
-            || die "remove $n: $NAME-d$n exited 0 without printing 'rdb_node removed node=$n'"
-        say "remove $n: $NAME-d$n exited 0 after 'rdb_node removed node=$n'"
-    else
-        local deadline=$((SECONDS + 90))
-        while :; do
-            rc=0; session_run "$tmp/remove.out" "admin remove-node $n --unreachable-ok $n $ok" || rc=$?
-            line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
-            [ "$rc" = 0 ] && [ "${line%% addr=*}" = "removed node=$n" ] && break
-            case "$line" in *"is still pinned by partitions"*) ;; *) die "remove $n: the session exited $rc: ${line:-<no removed line>}" ;; esac
-            [ "$SECONDS" -lt "$deadline" ] || die "remove $n: still pinned after 90 s: $line"
-            say "remove $n: still pinned; asking again in 5 s"
-            sleep 5
-        done
-        set_state "$n" removed
-        say "remove $n: $line. Its copies come back with rebalance"
+    if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ]; then
+        local restarts0
+        restarts0="$(docker inspect -f '{{.RestartCount}}' "$c")" || die "remove $n: inspect $c"
+        docker stop "$c" > /dev/null || die "remove $n: docker stop $c"
+        line="$(stopped_for_good "$c" 30)" || die "remove $n: $c not stopped 30 s after docker stop ($line)"
+        [ "${line##* }" = "$restarts0" ] \
+            || die "remove $n: $c restarted after docker stop (restarts $restarts0 then ${line##* })"
+        say "remove $n: stopped $c with docker stop ($line); Docker does not restart it"
     fi
+    local deadline=$((SECONDS + 90))
+    while :; do
+        rc=0; session_run "$tmp/remove.out" "admin remove-node $n --unreachable-ok $n $ok" || rc=$?
+        line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
+        [ "$rc" = 0 ] && [ "${line%% addr=*}" = "removed node=$n" ] && break
+        case "$line" in *"is still pinned by partitions"*) ;; *) die "remove $n: the session exited $rc: ${line:-<no removed line>}" ;; esac
+        [ "$SECONDS" -lt "$deadline" ] || die "remove $n: still pinned after 90 s: $line"
+        say "remove $n: still pinned; asking again in 5 s"
+        sleep 5
+    done
+    set_state "$n" removed
+    say "remove $n: $line. Its copies come back with rebalance"
 }
 
 # check-members: D2's A1 to A11 (arch-80-s34 D2). A1-A7 read the rig; A8, A11, A10 and A9, in
@@ -1769,11 +1755,6 @@ check_members() {
         "$(echo "$removed" | paste -sd, -)" "${spec:--}" > "$tmp/members.txt"; rc=$?
     claims < "$tmp/members.txt"
     [ "$rc" = 0 ]; verdict "A2/A4/A5/A7 the placement and status lines could be read (analyze exit $rc)" $?
-    for r in $removed; do
-        line="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$NAME-d$r")"
-        [ "$line" = "exited 0" ] && docker logs "$NAME-d$r" 2>&1 | grep -q "^rdb_node removed node=$r\$"
-        verdict "A7 $NAME-d$r exited 0 after 'rdb_node removed node=$r' ($line)" $?
-    done
 
     # A6: a put and its get in every partition, through the live nodes.
     { for g in $(seq 1 400); do echo "admin where $g"; done; echo quit; } | dev > "$tmp/where.out" 2>&1
@@ -2657,14 +2638,17 @@ selftest_s4() {
         [ "$2" = 0 ] || echo "placement node=2 machine=$ip.12 state=ok copies=$2 primaries=0"
         echo "placement: copy_skew=$1 primary_skew=1"
     }
-    s4_status() { # members of partition 2
+    s4_status() { # members of partition 2, node 2's record body (default: removed)
         echo "partitions/1 rev=5 PartitionRecord { owner: NodeId(1), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=[1:owner,3:regular,6:regular]"
         echo "partitions/2 rev=6 PartitionRecord { owner: NodeId(4), generation: Generation(1), owner_epoch: OwnerEpoch(2) } members=$1"
+        echo "nodes/1 rev=2 node=1 addr=$ip.11:7101 machine=$ip.11"
+        [ "${2-<undecodable>}" = - ] || echo "nodes/2 rev=9 ${2-<undecodable>}"
+        echo "nodes/6 rev=8 node=6 addr=$ip.16:7101 machine=$ip.16"
     }
     s4_placement 1 0 > "$t/pl.ok"; s4_status "[4:owner,5:regular,6:regular]" > "$t/stat.ok"
     out="$(analyze members "$t/stat.ok" "$t/pl.ok" 2 2 "6=$ip.16")"; rc=$?
-    [ "$rc" = 0 ] && [ "$(grep -c '^PASS ' <<< "$out")" = 5 ] && ! grep -q '^FAIL' <<< "$out"
-    st "members passes A2 A4 A5 and both A7 claims on a good rig (exit $rc)" $?
+    [ "$rc" = 0 ] && [ "$(grep -c '^PASS ' <<< "$out")" = 6 ] && ! grep -q '^FAIL' <<< "$out"
+    st "members passes A2 A4 A5 and the three A7 claims on a good rig (exit $rc)" $?
     out="$(analyze members "$t/stat.ok" "$t/pl.ok" 2 2 "6=$ip.17")"
     grep -q '^FAIL A2 nodes/6' <<< "$out"; st "members fails A2 on another machine" $?
     s4_placement 2 0 > "$t/pl.skew"
@@ -2682,6 +2666,13 @@ selftest_s4() {
     s4_placement 1 1 > "$t/pl.held"
     grep -q '^FAIL A7 the placement gives removed node 2 no copy (copies=1)' <<< "$(analyze members "$t/stat.ok" "$t/pl.held" 2 2 -)"
     st "members fails A7 when the placement gives the removed node a copy" $?
+    s4_status "[4:owner,5:regular,6:regular]" "node=2 addr=$ip.12:7101 machine=$ip.12" > "$t/stat.live"
+    grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$(analyze members "$t/stat.live" "$t/pl.ok" 2 2 -)"
+    st "members fails A7 when nodes/2 is still a live record" $?
+    s4_status "[4:owner,5:regular,6:regular]" - > "$t/stat.norec"
+    out="$(analyze members "$t/stat.norec" "$t/pl.ok" 2 2 -)"
+    grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$out" && grep -q 'nodes/2: <no nodes/ line>' <<< "$out"
+    st "members fails A7 when the status shows no nodes/2 line" $?
     printf 'placement node=x\n' > "$t/pl.bad"
     analyze members "$t/stat.ok" "$t/pl.bad" 2 2 - > /dev/null 2>&1; rc=$?
     [ "$rc" = 2 ]; st "members stops on a placement line it cannot read (exit $rc)" $?
@@ -2760,25 +2751,48 @@ SH
     PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" remove 9 --name rdbst-s4 > "$t/out" 2>&1; rc=$?
     [ "$rc" = 2 ] && grep -q "remove 9: node 9 is not one this rig gave, not live" "$t/out"
     st "remove of an id the rig never gave is refused (exit $rc)" $?
+    # remove of a running node (ruling B, #226): docker stop, then remove-node --unreachable-ok,
+    # and no drain. RESTART_AFTER_STOP=1 has the container come back after the stop.
+    cat > "$t/bin/docker-rm" <<'SH'
+#!/bin/sh
+echo "$*" >> "$CALLS"
+case "$*" in
+    "network inspect -f"*multihost.nodes*) echo 5; exit 0 ;;
+    "network inspect -f"*multihost.subnet*) echo 10.9.9.0/24; exit 0 ;;
+    "network inspect -f"*) echo 3; exit 0 ;;
+    "network inspect "*) exit 0 ;;
+    *"--entrypoint cat"*nodes.txt) printf '1 live\n2 removed\n3 live\n4 live\n5 live\n6 live\n'; exit 0 ;;
+    *"--entrypoint sh"*) cat > /dev/null; exit 0 ;;
+    "stop rdbst-s4-d3") touch "$CALLS.stopped"; echo rdbst-s4-d3; exit 0 ;;
+    "inspect -f {{.State.Running}} rdbst-s4-d3")
+        [ -e "$CALLS.stopped" ] && echo false || echo true; exit 0 ;;
+    "inspect -f {{.State.Running}} "*) echo true; exit 0 ;;
+    "inspect -f {{.RestartCount}} rdbst-s4-d3") echo 0; exit 0 ;;
+    "inspect -f {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} rdbst-s4-d3")
+        echo "exited 143 ${RESTART_AFTER_STOP:-0}"; exit 0 ;;
+    *" dev "*) cat >> "$CALLS"; echo "removed node=3 addr=10.9.9.13:7101 machine=10.9.9.13"; exit 0 ;;
+esac
+exit 1
+SH
+    chmod +x "$t/bin/docker-rm"; mkdir -p "$t/rm"; cp "$t/bin/docker-rm" "$t/rm/docker"
+    : > "$t/calls"; rm -f "$t/calls.stopped"
+    PATH="$t/rm:$PATH" CALLS="$t/calls" "$0" remove 3 --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 0 ] && grep -qx "stop rdbst-s4-d3" "$t/calls" \
+        && grep -q "^admin remove-node 3 --unreachable-ok 3 " "$t/calls" && ! grep -q "admin drain" "$t/calls" \
+        && grep -q "remove 3: stopped rdbst-s4-d3 with docker stop (exited 143 0); Docker does not restart it" "$t/out" \
+        && grep -q "remove 3: removed node=3 addr=10.9.9.13:7101" "$t/out"
+    st "remove of a running node stops it, then removes it --unreachable-ok, no drain (exit $rc)" $?
+    : > "$t/calls"; rm -f "$t/calls.stopped"
+    RESTART_AFTER_STOP=1 PATH="$t/rm:$PATH" CALLS="$t/calls" "$0" remove 3 --name rdbst-s4 > "$t/out" 2>&1; rc=$?
+    [ "$rc" = 1 ] && grep -q "remove 3: rdbst-s4-d3 restarted after docker stop (restarts 0 then 1)" "$t/out" \
+        && ! grep -q "admin remove-node" "$t/calls"
+    st "remove stops when the stopped container was restarted (exit $rc)" $?
+    rm -f "$t/calls.stopped"
     # A rig from before S4 (no nodes.txt) is refused by every command that loads it.
     sed -i 's/nodes.txt) printf.*/nodes.txt) exit 1 ;;/' "$t/bin/docker"
     PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" rebalance --name rdbst-s4 > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -q "FAILED at load: rdbst-s4-init has no nodes.txt" "$t/out"
     st "a rig without nodes.txt is refused (exit $rc)" $?
-    # A drained node that exited 75 on a rig with no restart policy: the remove stops, naming it.
-    cat > "$t/bin/docker" <<'SH'
-#!/bin/sh
-case "$*" in
-    "inspect -f"*RestartCount*) echo "false 0 75"; exit 0 ;;
-    "logs "*) echo "rdb_node restart-wanted node=2 reason=replace_stopped"; exit 0 ;;
-    *multihost.restart*) echo none; exit 0 ;;
-esac
-exit 1
-SH
-    out="$(PATH="$t/bin:$PATH" NAME=rdbst-s4 NET=rdbst-s4-net; ( drained_restart 2 0 0 ) 2>&1)"; rc=$?
-    [ "$rc" = 1 ] && grep -q "after the drain: rdb_node restart-wanted node=2 reason=replace_stopped" <<< "$out" \
-        && grep -q "up ran without --restart-on-exit, so nothing starts it" <<< "$out"
-    st "remove stops, printing the 75, when a drained node exits with no restart policy (exit $rc)" $?
     rm -rf "$t"
 }
 
