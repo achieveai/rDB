@@ -3265,15 +3265,61 @@ fn where_line(db: &Db, group: rdb_api::AffinityId) -> String {
 }
 
 /// `admin route G` (#83): `Db::route`'s answer, the partition and the owner and token its record
-/// names, or `err admin route G: <why>`.
+/// names, and the owner's app address, or `err admin route G: <why>`. `addr none` when the
+/// owner registered none, or when no read of the owner's address has succeeded yet in this
+/// `Db` (a failed read serves the last good address, and before any there is none), so it
+/// does not prove that no address is recorded. The address is the app's own bytes, so it is shown through
+/// [`console_safe`]: a stored CR, LF or ESC cannot start a forged line or drive the terminal.
 fn route_line(db: &Db, group: rdb_api::AffinityId) -> String {
     match db.route(group) {
         Ok(route) => format!(
-            "route group {} partition {} owner node {} token {}",
-            group.0, route.partition.0, route.owner.0, route.token
+            "route group {} partition {} owner node {} token {} addr {}",
+            group.0,
+            route.partition.0,
+            route.owner.0,
+            route.token,
+            route
+                .app_address()
+                .map_or_else(|| "none".to_owned(), console_safe)
         ),
         Err(e) => format!("err admin route {}: {e}", group.0),
     }
+}
+
+/// `text` for one console line (#83 B2, PR #159 review): each control character and each
+/// backslash as its Rust escape (`\r`, `\n`, `\u{1b}`, `\\`), each Unicode line separator and
+/// bidi format control as a visible `\u{..}` escape ([`console_reorders`]), every other
+/// character as it is. So the escape cannot be confused with a stored backslash, the line
+/// stays one line, and what it shows is in the stored order.
+fn console_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || c == '\\' {
+                c.escape_debug().to_string()
+            } else if console_reorders(c) {
+                let code = u32::from(c);
+                format!("\\u{{{code:x}}}")
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Characters that are not `is_control()`, yet break a console line or reorder what follows
+/// (PR #159 review r2): the line and paragraph separators U+2028 and U+2029, and the bidi
+/// format controls U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069.
+fn console_reorders(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}'
+            | '\u{2029}'
+            | '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The first `txn` op that names no group, refused above one partition (issue #79).
@@ -9776,6 +9822,107 @@ mod tests {
             .expect("opens");
         db.wait_ready(Duration::from_secs(60)).expect("ready");
         (rt, cluster, db)
+    }
+
+    /// #83 B2 (PR #159 review r2): `console_safe` shows each Unicode line separator and bidi
+    /// format control as a visible `\u{..}` escape, exactly, beside the control-character and
+    /// backslash escapes, and leaves other text, non-ASCII included, as it is. Cut: the
+    /// `console_reorders` arm removed, red at U+2028 (passed through raw). Unit (<1 ms).
+    #[test]
+    fn console_safe_escapes_line_separators_and_bidi_controls() {
+        for (c, shown) in [
+            ('\u{2028}', r"\u{2028}"),
+            ('\u{2029}', r"\u{2029}"),
+            ('\u{061c}', r"\u{61c}"),
+            ('\u{200e}', r"\u{200e}"),
+            ('\u{200f}', r"\u{200f}"),
+            ('\u{202a}', r"\u{202a}"),
+            ('\u{202b}', r"\u{202b}"),
+            ('\u{202c}', r"\u{202c}"),
+            ('\u{202d}', r"\u{202d}"),
+            ('\u{202e}', r"\u{202e}"),
+            ('\u{2066}', r"\u{2066}"),
+            ('\u{2067}', r"\u{2067}"),
+            ('\u{2068}', r"\u{2068}"),
+            ('\u{2069}', r"\u{2069}"),
+            ('\r', r"\r"),
+            ('\u{1b}', r"\u{1b}"),
+            ('\\', r"\\"),
+        ] {
+            assert_eq!(
+                console_safe(&format!("a{c}b")),
+                format!("a{shown}b"),
+                "{c:?}"
+            );
+        }
+        assert_eq!(
+            console_safe("gw-é.例:8443/ü?x=1"),
+            "gw-é.例:8443/ü?x=1",
+            "other text as it is"
+        );
+    }
+
+    /// #83 B2 (PR #159 review): `admin route G` ends `addr none` while the owner's record is
+    /// layout 1, and names the owner's app address once its record holds one (layout 2). The
+    /// address is stored with CR, LF, ESC, a backslash, U+2028 and two bidi controls: the line
+    /// stays one physical line, with each shown as its escape, while `RouteInfo::app_address`
+    /// still returns the stored bytes exactly. The records are written before the first lookup, and the second after the
+    /// one-second address cache, so no cached answer masks either. Cut: `route_line` prints
+    /// the raw address, red at "one line". Integration (~5 s): three real rEtcd voters and one
+    /// open.
+    #[test]
+    fn route_line_names_the_owners_app_address_on_one_line() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let (rt, cluster, mut db) = ready_on_voters(root.path());
+        let group = rdb_core::contracts::ids::AffinityId(7);
+        let write = |node: u32, app: Option<&str>| {
+            let record = rdb_core::authority::node::NodeRecord {
+                node: rdb_api::NodeId(node),
+                addr: format!("127.0.0.{node}:7100"),
+                machine: format!("m{node}"),
+            };
+            let value = app.map_or_else(|| record.encode(), |app| record.encode_with_app(app));
+            let leader = cluster.leader_now().expect("a control leader");
+            rt.block_on(cluster.client(leader).put(PutRequest {
+                key: Bytes::from(ControlKey::Node(rdb_api::NodeId(node)).encode()),
+                value,
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("the node record is written");
+        };
+        for node in 1..=3 {
+            write(node, None);
+        }
+        let line = route_line(&db, group);
+        assert!(line.ends_with(" addr none"), "{line}");
+        let owner = db.route(group).expect("a route").owner.0;
+
+        let stored =
+            "gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y\u{2028}\u{202e}z\u{2066}";
+        write(owner, Some(stored));
+        std::thread::sleep(Duration::from_millis(1_100));
+        let line = route_line(&db, group);
+        assert!(
+            !line.contains(['\r', '\n', '\u{1b}', '\u{2028}', '\u{202e}', '\u{2066}']),
+            "one line: {line:?}"
+        );
+        assert!(
+            line.ends_with(
+                r" addr gw-1:8443\r\nroute group 7 partition 1 owner node 9 \u{1b}[31mx\\y\u{2028}\u{202e}z\u{2066}"
+            ),
+            "{line}"
+        );
+        assert_eq!(
+            db.route(group).expect("a route").app_address(),
+            Some(stored),
+            "the accessor returns the stored bytes"
+        );
+        db.shutdown();
+        rt.block_on(cluster.shutdown());
     }
 
     /// Review F-004 (A-R219): `control lifecycle` rewrote `partitions/1` with
