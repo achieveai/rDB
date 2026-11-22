@@ -981,11 +981,15 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 - `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
   With no root left it is `ObjectAbsent`, even when only chunks remain, since they may be a
   later upload's: finish a blob's leftover chunks with `expect: None`.
-  `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
+  `Some(Expected::Absent)` deletes only records with no root, such as an unpublished upload's
+  chunks, each batch guarded by the root's absence: a root there is `CONDITION_FAILED`, and
+  nothing is deleted. Nothing stored answers `Ok(None)`.
 - `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload
   chunks with no root included, and returns how many. **It is not atomic.** On an error,
   `PrefixDeleteError { deleted, error }` says how far it got; run it again to finish. An object
-  created under the prefix while it runs may survive.
+  created under the prefix while it runs may survive. So does a root committed, after its page
+  was read, at an id that page listed with no root: that id is drained with
+  `Some(Expected::Absent)`.
 - Offboarding a tenant is one `delete_prefix(workspace, "")` per workspace in your index.
 
 **What a scope does not stop.**

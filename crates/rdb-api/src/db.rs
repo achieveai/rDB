@@ -4187,7 +4187,8 @@ impl Db {
     /// `deadline` is each send's kernel deadline.
     ///
     /// **It is not atomic.** An error says how far it got, and running it again finishes the
-    /// job. An object created under the prefix after its page was read survives.
+    /// job. An object created under the prefix after its page was read survives, as does a root
+    /// committed after its page was read at an id listed with no root.
     ///
     /// # Errors
     ///
@@ -4231,12 +4232,18 @@ impl Db {
                     Err(error) => return Err(stop(deleted, error)),
                 }
             };
+            #[cfg(test)]
+            after_page(self, prefix);
             for listed in &objects {
-                if matches!(listed.root, Some((_, ObjectKind::Document))) {
-                    continue;
-                }
+                // PR #178 review r4 N1: an id listed with no root is drained only while it has
+                // none, so a root committed there after the page was read survives.
+                let expect = match listed.root {
+                    Some((_, ObjectKind::Document)) => continue,
+                    Some(_) => None,
+                    None => Some(Expected::Absent),
+                };
                 let emptied = self
-                    .drain(group, &listed.id, None, deadline)
+                    .drain(group, &listed.id, expect, deadline)
                     .map_err(|error| stop(deleted, error))?;
                 deleted += u64::from(emptied);
             }
@@ -4275,7 +4282,12 @@ impl Db {
                 None if take > 1 => take /= 2,
                 None => {
                     let (id, version) = pack[0];
-                    *deleted += u64::from(self.drain(group, id, Some(version), deadline)?);
+                    *deleted += u64::from(self.drain(
+                        group,
+                        id,
+                        Some(Expected::Version(version)),
+                        deadline,
+                    )?);
                     rest = &rest[1..];
                 }
             }
@@ -4330,13 +4342,14 @@ impl Db {
         self.finished(identity.request, answer)
     }
 
-    /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch at
-    /// root version `version` when given. Whether any batch deleted something.
+    /// Delete object `id` with [`Change::Delete`] until it answers `Ok(None)`, each batch under
+    /// `expect` when given. Whether any batch deleted something. Under [`Expected::Absent`], a
+    /// root found there ends the drain and the object survives (PR #178 review r4 N1).
     fn drain(
         &self,
         group: AffinityId,
         id: &[u8],
-        version: Option<u64>,
+        expect: Option<Expected>,
         deadline: Duration,
     ) -> Result<bool, PutError> {
         let mut emptied = false;
@@ -4345,11 +4358,18 @@ impl Db {
                 group,
                 object: Bytes::copy_from_slice(id),
                 change: Change::Delete,
-                expect: version.map(Expected::Version),
+                expect,
             };
-            match self.changes(vec![put], deadline)? {
-                Some(_) => emptied = true,
-                None => return Ok(emptied),
+            match self.changes(vec![put], deadline) {
+                Ok(Some(_)) => emptied = true,
+                Ok(None) => return Ok(emptied),
+                Err(error)
+                    if expect == Some(Expected::Absent)
+                        && error.error.kind == ErrorKind::ConditionFailed =>
+                {
+                    return Ok(emptied);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -7534,6 +7554,34 @@ fn send_wait(deadline: Duration) -> Duration {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A [`Db::delete_prefix_in`] step, run once by the next walk of that prefix.
+#[cfg(test)]
+type PageStep = Box<dyn FnOnce(&Db) + Send>;
+
+/// Test-only (PR #178 review r4 N1): steps run between a prefix page's read and its drains.
+#[cfg(test)]
+static AFTER_PAGE: Mutex<Vec<(Vec<u8>, PageStep)>> = Mutex::new(Vec::new());
+
+/// Test-only: the next [`Db::delete_prefix_in`] of `prefix` runs `step` after its first page
+/// is read and its documents are deleted, before any other object on it is drained.
+#[cfg(test)]
+fn on_page(prefix: &[u8], step: PageStep) {
+    lock(&AFTER_PAGE).push((prefix.to_vec(), step));
+}
+
+/// Run and disarm the step [`on_page`] armed for `prefix`, if any.
+#[cfg(test)]
+fn after_page(db: &Db, prefix: &[u8]) {
+    let step = {
+        let mut steps = lock(&AFTER_PAGE);
+        let at = steps.iter().position(|(armed, _)| armed == prefix);
+        at.map(|at| steps.remove(at).1)
+    };
+    if let Some(step) = step {
+        step(db);
+    }
 }
 
 /// Test-only (#62): open directories whose next roll-forward stops before it links the named
@@ -16127,5 +16175,63 @@ mod tests {
         }
         assert!(with(2, false).is_ok(), "the floor off takes cap 2");
         assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
+    }
+
+    /// PR #178 review r4 N1: a delete prefix lists an unpublished upload's chunk, an id with no
+    /// root; the upload is published there before the drain runs. The drain expects the root to
+    /// stay absent, so it stops at the blob: the walk empties nothing and the blob reads back
+    /// whole. Cut: drain a rootless id with no `expect` again (`None` for `listed.root` `None`
+    /// in `delete_prefix_in`), and the walk deletes the blob and its chunk. Integration (~3 s):
+    /// one open; the publish runs from the walk's own page step (`on_page`), so the race is
+    /// deterministic.
+    #[test]
+    fn r4_n1_a_root_committed_after_the_page_at_a_rootless_id_survives_the_drain() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r4-n1/";
+        let id: &[u8] = b"r4-n1/blob";
+        let bytes = Bytes::from_static(b"rootless until published");
+        let size = bytes.len() as u64;
+        let sha256: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        let upload = [0x41; 16];
+        let chunk = Change::Chunk {
+            upload,
+            index: 0,
+            bytes: bytes.clone(),
+        };
+        db.write_in(GROUP, id, chunk, None).expect("the chunk");
+        on_page(
+            prefix,
+            Box::new(move |db: &Db| {
+                let publish = Change::Publish {
+                    upload,
+                    size,
+                    chunk_size: size,
+                    sha256,
+                };
+                db.write_in(GROUP, b"r4-n1/blob", publish, None)
+                    .expect("the publish after the page")
+                    .expect("the publish writes the root");
+            }),
+        );
+        let emptied = db
+            .delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("delete prefix: {} after {}", e.error, e.deleted));
+        let read = db
+            .read_in(
+                GROUP,
+                id,
+                Look::Range {
+                    offset: 0,
+                    len: size,
+                },
+            )
+            .unwrap_or_else(|e| panic!("the blob reads back: {e}"));
+        match read.seen {
+            Seen::Range { bytes: seen, .. } => assert_eq!(seen, bytes, "the blob's bytes"),
+            other => panic!("a range read answered {other:?}"),
+        }
+        assert_eq!(emptied, 0, "the walk emptied nothing");
     }
 }
