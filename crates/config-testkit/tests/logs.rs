@@ -228,8 +228,9 @@ fn a_reader_whose_long_line_never_comes_fails_within_its_patience() {
 /// The bound here is short ([`MISSING_PATIENCE`] times [`scale`]) because the whole of it is
 /// spent; the rows above derive theirs the same way, from a patience, with [`child_bound`].
 ///
-/// Cut: drop the kill branch, and the parent polls a child that never ends, so this row never
-/// ends either.
+/// Cut: remove the kill in [`run_bounded_child`]. The row then fails in bounded time, once the
+/// child is still alive [`REAP_PATIENCE`] times [`scale`] after the bound, and the child is
+/// killed and reaped in cleanup.
 #[test]
 fn a_child_that_never_exits_is_killed_at_its_bound() {
     const CHILD: &str = "child_never_exits";
@@ -293,8 +294,11 @@ impl std::fmt::Display for ChildRun {
 }
 
 /// Run the ignored test `child` alone in a child process of this binary, with its log root a
-/// fresh directory in the system temp dir. If it is still running after `bound`, kill it. It is
-/// always reaped before this returns, so no row leaves a child behind.
+/// fresh directory in the system temp dir. If it is still running after `bound`, kill it.
+///
+/// Every wait is bounded, the one after the kill too: a child still alive [`REAP_PATIENCE`]
+/// times [`scale`] after its kill fails the row, which then kills and reaps it on the way out
+/// ([`Reaped`]). So no row hangs on a child and none leaves one behind.
 fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
     let root = tempfile::Builder::new()
         .prefix("retcd-132-")
@@ -304,8 +308,12 @@ fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
     // the child. The log glob only reaches `<root>/<run>/*/*.jsonl`, so these are not in it.
     let stdout_path = root.path().join("child.stdout");
     let stderr_path = root.path().join("child.stderr");
+    let read = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read the child's output {}: {e}", path.display()))
+    };
     let started = std::time::Instant::now();
-    let mut process =
+    let mut process = Reaped(
         std::process::Command::new(std::env::current_exe().expect("this test binary"))
             .args([child, "--exact", "--ignored", "--test-threads=1"])
             .env("RETCD_TEST_LOG_DIR", root.path())
@@ -313,22 +321,24 @@ fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
             .stdout(std::fs::File::create(&stdout_path).expect("child stdout file"))
             .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
             .spawn()
-            .expect("spawn the child");
-    let (status, killed) = loop {
-        match process.try_wait().expect("try_wait on the child") {
-            Some(status) => break (status, false),
-            None if started.elapsed() >= bound => {
-                process.kill().expect("kill the child");
-                break (process.wait().expect("reap the killed child"), true);
-            }
-            // A bounded poll on a child process, not synchronization: the loop ends on the
-            // child's exit or on `bound`, never on the sleep itself.
-            None => std::thread::sleep(std::time::Duration::from_millis(20)), // testkit:allow-sleep
+            .expect("spawn the child"),
+    );
+    let (status, killed) = match poll_exit(&mut process.0, started + bound) {
+        Some(status) => (status, false),
+        None => {
+            process.0.kill().expect("kill the child");
+            let reap = REAP_PATIENCE * scale();
+            let status = poll_exit(&mut process.0, std::time::Instant::now() + reap)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{child} was still alive {reap:?} after its kill at {bound:?}\n\
+                         stdout:\n{}\nstderr:\n{}",
+                        read(&stdout_path),
+                        read(&stderr_path)
+                    )
+                });
+            (status, true)
         }
-    };
-    let read = |path: &std::path::Path| {
-        std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read the child's output {}: {e}", path.display()))
     };
     ChildRun {
         success: status.success(),
@@ -337,6 +347,40 @@ fn run_bounded_child(child: &str, bound: std::time::Duration) -> ChildRun {
         stdout: read(&stdout_path),
         stderr: read(&stderr_path),
         root,
+    }
+}
+
+/// How long [`run_bounded_child`] waits, before [`scale`], for a killed child to exit.
+const REAP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The child's exit status, or `None` if it is still running at `until`.
+fn poll_exit(
+    process: &mut std::process::Child,
+    until: std::time::Instant,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = process.try_wait().expect("try_wait on the child") {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        // A bounded poll on a child process, not synchronization: the loop ends on the
+        // child's exit or on `until`, never on the sleep itself.
+        std::thread::sleep(std::time::Duration::from_millis(20)); // testkit:allow-sleep
+    }
+}
+
+/// A child process that is killed and reaped when dropped, if it is still running: the
+/// cleanup for a row that failed while its child was alive.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
