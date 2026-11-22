@@ -213,6 +213,10 @@ plus ids still linked).
       in `RebalanceReport::refilled`. A refill counts against `max_moves`.
     - **Drain's last step is "rebalance again"**, so a drain refills each partition its
       promotes left below RF (`admin::drain`, step 4).
+    - **A drained `rdb_node` exits 75 about 5 s after the drain** (restart wanted, reason
+      `replace_stopped`), because the drain's freeze is not lifted (issue #226). Under a
+      supervisor it restarts, and `remove_member` then works. Without one, remove it with it
+      in `unreachable_ok` (`rdb_dev`: `admin remove-node N --unreachable-ok N`).
     - **A left-out target is skipped.** A new or restarted owner's `Host::restore_left_out`
       re-seats a partition's first-placement nodes that hold no copy as left out. The owner
       refuses a refill onto such a node (guard `left_out`). Rebalance skips it, logs

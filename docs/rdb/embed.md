@@ -685,6 +685,11 @@ than another. A refill adds a copy; it never removes one, and the owner stays.
 **Draining before a remove: `admin::drain`.** `admin::drain(db, rt, store, node)` moves every
 copy off the node, promotes another owner for each partition it owned, and ends with a
 rebalance, which refills to 3 copies. Then `admin::remove_member` can take the node out.
+A drained `rdb_node` does not stay up for that: about 5 s after the drain it exits 75
+(restart wanted, reason `replace_stopped`), because the drain's freeze is not lifted (issue
+#226). Under a supervisor it restarts, and the remove then works. Without one, remove it as a
+node that is down: `admin::remove_member` with it in `unreachable_ok` (in `rdb_dev`,
+`admin remove-node N --unreachable-ok N`).
 
 **Removing a host that died.** Drain is for a node that still runs: it needs the node to
 answer. For a dead host:
