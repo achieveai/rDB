@@ -222,12 +222,9 @@ plus ids still linked).
       the run. With none left, the partition is a `no_refill_target` residual naming the held
       node. The recovery is a restart of that node: it "comes back only by its own restart"
       (`error::REFILL_LEFT_OUT`). Narrowing the guard is #207, a follow-up.
-    - **The wire.** `WireCall::Refill` is a new variant, added last, under the same
-      protocol-version placeholder bump as `members_revision` (item 10). The `admin_apps`
-      gate covers it.
-
-<!-- TODO (S4, not yet built): the `rdb_dev` verbs and their `--unreachable-ok` flag; the
-`scripts/docker-multihost.sh` commands. -->
+    - **The wire.** `WireCall::Refill` is a new variant, added after main's variants, under
+      the same protocol bump as `members_revision` (item 10): `PROTOCOL_VERSION` 13, main's
+      12 + 1. The `admin_apps` gate covers it.
 
 ## Consequences
 
