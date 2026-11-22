@@ -439,9 +439,11 @@ fn after_loss(lost: &Lost, test: &str) {
         "grants/{} is frozen: {frozen:?}",
         lost.dead.0
     );
-    let clock = match lost.copy_class {
-        OutageClass::SecondarySilent => "paused",
-        _ => "unreachable",
+    // A silent copy drops on either clock: `paused` while its link is up, `unreachable` once
+    // the link closes, because #107's mute refuses the redial (ruling (a), 2026-11-22).
+    let clocks: &[&str] = match lost.copy_class {
+        OutageClass::SecondarySilent => &["paused", "unreachable"],
+        _ => &["unreachable"],
     };
     let lines = config_testkit::logs::lines_for_current_test(module_path!(), test);
     for (p, _) in lost.seats.iter().filter(|(_, s)| **s == Seat::Copy) {
@@ -454,8 +456,11 @@ fn after_loss(lost: &Lost, test: &str) {
             })
             .collect();
         assert!(
-            !drops.is_empty() && drops.iter().all(|line| line["clock"] == clock),
-            "partition {p}: the dead copy is dropped by the {clock} clock: {drops:?}"
+            !drops.is_empty()
+                && drops
+                    .iter()
+                    .all(|line| clocks.iter().any(|clock| line["clock"] == *clock)),
+            "partition {p}: the dead copy is dropped by a {clocks:?} clock: {drops:?}"
         );
     }
 }
@@ -510,9 +515,13 @@ fn s80s3_killing_one_of_five_declared_nodes_keeps_every_partition_writable() {
 
 /// #80 S3 R1s (critic B-1): as R1, but the lost node goes silent with its sockets open: its
 /// links mute and it is cut from rEtcd (the fault file's `mute` and `cut-control`, as a pause
-/// or a power loss). The copy class is dropped by the paused clock, logged against the stated
+/// or a power loss). The copy class is dropped by the paused clock or the unreachable one, logged
+/// against the stated
 /// 17 s, and fails only above the owner's 25 s ceiling, unscaled (`OutageBound::silent`, B-1
-/// ruling (a)). Integration (~20-50 s).
+/// ruling (a)). Both clocks happen since main's #107: a muted node is a stopped process, so its
+/// copy is paused until the silent link closes, then unreachable, because the mute refuses the
+/// redial. The silent-but-linked path, a real pause, is the Docker d1 pause step's (P1 to P5,
+/// SIGSTOP). Integration (~20-50 s).
 /// Cut (a): `failover: None`; the owner seats take no put, red, observed 2026-11-20.
 /// Cut (b): the host's paused clock at `u64::MAX` (`Host`'s `peer_drop_after_millis`); the
 /// silent copy is never dropped and its seats stay `PROTECTION_PAUSED` past the 25 s ceiling,
@@ -520,6 +529,9 @@ fn s80s3_killing_one_of_five_declared_nodes_keeps_every_partition_writable() {
 /// Cut (c): `Db::call`'s timeout arm does not re-read the owner; the prober's route stays on the
 /// silent node and the owner seats take no put, red, observed 2026-11-20. This row found that
 /// defect: before the fix it was red the same way.
+/// Cut (d): `DropClock::Unreachable` named `unreachable-cut`; every dead-copy drop is off the
+/// allowed clocks, red, observed 2026-11-22. Naming `DropClock::Paused` so stayed green: since
+/// #107 the dead copy here drops on the unreachable clock in every run seen.
 #[config_log::retcd_test]
 fn s80s3_a_silently_stopped_node_of_five_keeps_every_partition_writable() {
     let lost = lose_one(Loss::Silent, probe_timeouts(), Some(Failover::default()));
