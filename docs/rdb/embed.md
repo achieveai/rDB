@@ -408,8 +408,12 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   partition it still owns stops for good until that partition is moved too. Move each one. If
   the node comes back first, its open fails with `HealError::Frozen`, naming what it still owns;
   those partitions can still be moved while it runs.
-- **A frozen node cannot lead again** in this release. It can start and hold copies once it owns
-  nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`.
+- **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies
+  once it owns nothing, but a promote onto it is refused as `PromoteError::TargetFrozen`. After
+  a restart (a new boot) that owns nothing, a failover planner, where one runs
+  (`DbConfig::failover`), deletes the frozen grant (#81 X2), and the new boot can be chosen and
+  promoted again like any regular copy. With no planner running the frozen grant stays, and the
+  node only holds copies.
 - **Other partitions that had a copy on the dead node pause too.** A partition keeps writing for
   about 2 s after losing a copy, then pauses. It drops that copy by itself about 12 s after the
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
@@ -419,8 +423,58 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
-  copies from then on and cannot lead again in this release, and the moved partition stays
-  paused until its other copy is back, because that copy was on the stopped node.
+  copies from then on and cannot lead again at that boot (after a restart that owns nothing, a
+  running failover planner clears the freeze, #81 X2), and the moved partition stays paused
+  until its other copy is back, because that copy was on the stopped node.
+
+**Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
+partitions were all promoted away while it was stopped comes back with a frozen grant, and
+nothing at that boot lifts it. `rdb_node` checks for that about once a second. It exits **75**
+(`EX_TEMPFAIL`) when its own `NodeStatus` has shown `replace_stopped` for 5 s, or its host has
+faulted (`fault` is set), **and** no `partitions/` record in the control store names it owner,
+in any lifecycle. A failed read of the control store keeps it up. Before it exits it prints
+`rdb_node restart-wanted node=N reason=R` (`replace_stopped` or `host_faulted`) and logs
+`rdb_node_restart_wanted`, then shuts down and prints `rdb_node stopped node=N` as usual.
+
+- **Your supervisor restarts the process on exit 75**, on the same `--dir`, with the same
+  flags. The new boot opens as a non-owner and the owners re-add it as a copy. Treat any
+  other non-zero exit as a failure to report, not a restart to loop on.
+- `lr` supervises nothing. `lr status` shows such a node as `stopped: restart wanted` (it reads
+  the printed `restart-wanted` line, not the exit status), and
+  `lr start N` is the restart.
+- `rdb_node` asks `db.restart_wanted()`, so the rule above lives in one place, and an
+  embedder asks the same.
+- Exit 75 is for operators and scripts that run `rdb_node`. No supervisor in this repository
+  restarts on it, and the gateway does not use it: the gateway embeds `Db` and restarts in
+  place, as below.
+
+**Embedded restart** (#81). A process that runs `Db` itself, with no `rdb_node` and no
+supervisor, restarts the node in place:
+
+1. Poll `db.restart_wanted()` about once a second. It blocks, as `node_status` does, and
+   keeps the 5 s hold between calls. It returns `Some(RestartReason::ReplaceStopped)` or
+   `Some(RestartReason::HostFaulted)` by the rule above, and `None` when the control store
+   cannot be read. With several nodes in one `Db`, it stays `None` while **any** of them owns
+   a partition, so a frozen node beside an owning one waits until the owner's partitions move.
+   Run one `Db` per node, as the gateway does, so each restarts on its own.
+2. On `Some`: call `db.shutdown()`, then `net.shutdown()`. **`Db::shutdown` does not stop the
+   links**, because the `Db` does not own the `Net`: you attached it to the `Links`, and more
+   than one `Db` may share them. Without `net.shutdown()` (or dropping every `Arc<Net>`, the
+   `Links` included), the old boot keeps answering its peers' probes, they keep their route
+   to it, and they never meet the new boot.
+3. Drop the `Db`, the `Net` and the `Links`.
+4. `Db::open` again on the same folder, with a fresh `Links` and a `Net` on the same address,
+   at the next boot (`next_boot`). Retry the bind for a few seconds if the address is still
+   held.
+5. If the reopen fails, exit the process non-zero and let its own supervisor (a container
+   restart policy, say) restart it. The gateway does this.
+
+Drop before you reopen, so a node never has two `Db`s at once.
+
+A peer sees every link to the old boot end, and its dials refused while nothing listens. When
+the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
+the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
+restart: the control store, the runtime and your app's own state stay as they are.
 
 ### Fencing your own side effects
 

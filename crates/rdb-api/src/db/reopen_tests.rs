@@ -6331,3 +6331,34 @@ fn t61_empty_owner_with_every_copy_below_floor_refuses_open() {
         other => panic!("Stale: {other:?}"),
     }
 }
+
+/// #200 / PR #171 review: the reopen heal's task runs in the opener's span, so its lines land
+/// in the opener's own test file. Reopens a written folder; its owner heals, and that heal logs
+/// `heal_members` from the runtime task. Cut: `Db::start_heal` instruments the task with
+/// `Span::none()` in place of the opener's span; red at "a heal line in this test's file".
+/// Integration (~1 s): one fresh open, one reopen until ready.
+#[config_log::retcd_test]
+fn own200_the_reopen_heal_logs_into_the_openers_test_file() {
+    const METHOD: &str = "own200_the_reopen_heal_logs_into_the_openers_test_file";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    db.shutdown();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let names: std::collections::BTreeSet<_> = lines
+        .iter()
+        .filter_map(|line| line["@m"].as_str())
+        .collect();
+    assert!(
+        names.contains("db_heal_started"),
+        "the reopen heals: {names:?}"
+    );
+    assert!(
+        names.contains("heal_members"),
+        "a heal line in this test's file: {names:?}"
+    );
+}
