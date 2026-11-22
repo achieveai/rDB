@@ -293,6 +293,77 @@ pub fn clear_verdict<E>(
     Ok(ClearVerdict::Clear)
 }
 
+/// Why [`clear_frozen_verdict`] keeps a frozen `grants/{node}` record, in the order the guards
+/// are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenClearRefusal {
+    /// The record is not frozen: [`clear_verdict`]'s case, not this one.
+    NotFrozen,
+    /// The record's boot is not older than the node's live boot, or no live boot is known: a
+    /// same-boot frozen grant still belongs to that process's takeover.
+    BootNotOlder,
+    /// This partition names the node as owner and is not `Serving` (`Fencing` or
+    /// `FencingDrained`): a takeover of it is under way and still needs the freeze (#172).
+    OwnerInTransfer(crate::contracts::ids::PartitionId),
+    /// Control time is not proven past the frozen record's `E + epsilon + delta`.
+    NotProvenExpired,
+}
+
+/// May the failover planner delete a **frozen** `grants/{node}` record (#81 X2, owner answer
+/// (a) on #81, 2026-11-19; widened by #172 option C, owner-approved 2026-11-20)? A frozen
+/// record of a boot that is gone blocks the node's new boot for good: the planner excludes a
+/// frozen node from `choose_target`, a promote onto it is refused `TargetFrozen`, and the new
+/// boot's heal cannot take back a partition the node still owns. It may go, by an
+/// exact-revision delete, only when **all** hold:
+///
+/// 1. the record is frozen;
+/// 2. its boot is older than `live_boot`, the node's boot as the planner's links know it: the
+///    old process is gone (the folder `LOCK` and a newer boot), so nothing renews under it;
+/// 3. every `partitions/{id}` naming the node as owner is `Serving`: a takeover needs a
+///    `Fencing` (then `FencingDrained`) record naming it, so none is in flight. A node that
+///    still owns `Serving` partitions (a `lone_survivor` left behind by a partial failover)
+///    is cleared too, so its new boot can heal them as owner at a new generation;
+/// 4. control time is past `E + epsilon + delta` of the frozen record
+///    ([`crate::authority::clock::expiry_proven`]).
+///
+/// A promote whose `Fencing` write lands after the caller's `partitions/` read and before its
+/// delete is settled on the promote side, never by this verdict: spec §7.3, "The clearing
+/// service does not race a fence", lists the outcomes (#172).
+///
+/// # Errors
+///
+/// The first guard that keeps the record.
+pub fn clear_frozen_verdict(
+    node: NodeId,
+    record: &GrantRecord,
+    live_boot: Option<BootId>,
+    partitions: &[crate::authority::partition::PartitionRecord],
+    sample: crate::contracts::time::ControlTime,
+    now: crate::contracts::time::Tick,
+    budgets: &crate::contracts::event::Budgets,
+) -> Result<(), FrozenClearRefusal> {
+    use crate::authority::clock::{expiry_proven, ClockView};
+    use crate::authority::partition::PartitionLifecycle;
+
+    if !record.frozen {
+        return Err(FrozenClearRefusal::NotFrozen);
+    }
+    if !live_boot.is_some_and(|live| record.boot < live) {
+        return Err(FrozenClearRefusal::BootNotOlder);
+    }
+    if let Some(moving) = partitions.iter().find(|partition| {
+        partition.owner == node && partition.lifecycle != PartitionLifecycle::Serving
+    }) {
+        return Err(FrozenClearRefusal::OwnerInTransfer(moving.partition));
+    }
+    let mut clock = ClockView::new();
+    clock.accept(sample);
+    if expiry_proven(&clock, record.expiry_utc_ms, now, budgets).is_none() {
+        return Err(FrozenClearRefusal::NotProvenExpired);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clear_verdict, ClearVerdict, GrantRecord};
@@ -346,5 +417,179 @@ mod tests {
     fn clearing_the_current_boots_grant_is_refused() {
         assert_eq!(verdict(BOOT), ClearVerdict::Current);
         assert_eq!(verdict(BootId(2)), ClearVerdict::Clear);
+    }
+
+    /// #81 X2: a frozen record of boot 1, the node live at boot 2, owning nothing, expiry long
+    /// past: every guard of `clear_frozen_verdict` lets it go. Each case changes one input.
+    fn frozen_verdict(
+        record: GrantRecord,
+        live: Option<BootId>,
+        partitions: &[PartitionRecord],
+        now: Tick,
+    ) -> Result<(), super::FrozenClearRefusal> {
+        let sample = ControlTime {
+            estimate: now,
+            error_millis: Budgets::SPEC_DEFAULTS.clock_error_millis,
+            bound_established: true,
+            sampled_at: now,
+        };
+        super::clear_frozen_verdict(
+            NODE,
+            &record,
+            live,
+            partitions,
+            sample,
+            now,
+            &Budgets::SPEC_DEFAULTS,
+        )
+    }
+
+    fn frozen_record() -> GrantRecord {
+        GrantRecord {
+            frozen: true,
+            ..expired_record()
+        }
+    }
+
+    const LATER: Tick = Tick(1_000_000_000);
+
+    /// All four guards hold: the stale frozen record may go. Unit.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_of_a_gone_boot_owning_nothing_clears() {
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &[], LATER),
+            Ok(())
+        );
+    }
+
+    /// A partition of `NODE` in `lifecycle`.
+    fn owned(
+        partition: u32,
+        lifecycle: crate::authority::partition::PartitionLifecycle,
+    ) -> PartitionRecord {
+        PartitionRecord {
+            partition: crate::contracts::ids::PartitionId(partition),
+            owner: NODE,
+            lifecycle,
+            ..PartitionRecord::default()
+        }
+    }
+
+    /// #172 option C, guard 3: a frozen record of a gone boot whose node still owns `Serving`
+    /// partitions (a `lone_survivor` a partial failover left behind) clears, so the new boot
+    /// can heal them as owner. A partition another node owns, in any lifecycle, is no bar.
+    /// Unit.
+    /// Cut, run 2026-11-21, reverted, `cmp`-identical: guard 3 as #81 X2 had it (any record
+    /// the node owns refuses, here under the new variant); red, left
+    /// `Err(OwnerInTransfer(PartitionId(3)))`, right `Ok(())`. The fencing row and the expiry
+    /// row went red with it.
+    #[config_log::retcd_test]
+    fn i172_a_frozen_grant_of_a_gone_boot_owning_only_serving_partitions_clears() {
+        use crate::authority::partition::PartitionLifecycle;
+        let elsewhere = PartitionRecord {
+            owner: NodeId(2),
+            ..owned(4, PartitionLifecycle::Fencing)
+        };
+        let partitions = [
+            owned(3, PartitionLifecycle::Serving),
+            owned(5, PartitionLifecycle::Serving),
+            elsewhere,
+        ];
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &partitions, LATER),
+            Ok(())
+        );
+    }
+
+    /// Guard 3 judges only the node's own partitions (PR #218 review, thread io1x): with one
+    /// `Serving` record present, and it names another owner, the frozen grant clears. Unit.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: guard 3 also refuses another owner's
+    /// `Serving` record. Red, `Err(OwnerInTransfer(PartitionId(4)))` against `Ok(())`.
+    #[config_log::retcd_test]
+    fn i172_a_frozen_grant_clears_beside_only_another_owners_serving_record() {
+        use crate::authority::partition::PartitionLifecycle;
+        let partitions = [PartitionRecord {
+            owner: NodeId(2),
+            ..owned(4, PartitionLifecycle::Serving)
+        }];
+        assert_eq!(
+            frozen_verdict(frozen_record(), Some(BootId(2)), &partitions, LATER),
+            Ok(())
+        );
+    }
+
+    /// Guard 3: a `Fencing` or `FencingDrained` partition naming the node keeps its frozen
+    /// record, `Serving` ones beside it or not: that takeover still needs the freeze. Unit.
+    /// Cut: drop the lifecycle test from guard 3 (any lifecycle clears); red,
+    /// `Ok(())` against `Err(OwnerInTransfer(PartitionId(3)))`.
+    #[config_log::retcd_test]
+    fn own81_x2_a_fencing_partition_naming_the_node_keeps_its_frozen_grant() {
+        use crate::authority::partition::PartitionLifecycle;
+        use crate::contracts::ids::PartitionId;
+        for lifecycle in [
+            PartitionLifecycle::Fencing,
+            PartitionLifecycle::FencingDrained,
+        ] {
+            for partitions in [
+                vec![owned(3, lifecycle)],
+                vec![owned(1, PartitionLifecycle::Serving), owned(3, lifecycle)],
+            ] {
+                assert_eq!(
+                    frozen_verdict(frozen_record(), Some(BootId(2)), &partitions, LATER),
+                    Err(super::FrozenClearRefusal::OwnerInTransfer(PartitionId(3))),
+                    "{lifecycle:?} {partitions:?}"
+                );
+            }
+        }
+    }
+
+    /// Guard 2: a frozen record of the live boot (a same-boot return, Q7), or with no live boot
+    /// known, stays. Unit.
+    /// Cut: drop the boot guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_of_the_live_boot_stays() {
+        use crate::authority::partition::PartitionLifecycle;
+        // #172: with a `Serving` partition owned too, which guard 3 no longer refuses.
+        for partitions in [vec![], vec![owned(3, PartitionLifecycle::Serving)]] {
+            assert_eq!(
+                frozen_verdict(frozen_record(), Some(BOOT), &partitions, LATER),
+                Err(super::FrozenClearRefusal::BootNotOlder)
+            );
+            assert_eq!(
+                frozen_verdict(frozen_record(), None, &partitions, LATER),
+                Err(super::FrozenClearRefusal::BootNotOlder)
+            );
+        }
+    }
+
+    /// Guard 1: an unfrozen record is `clear_verdict`'s, never this one's. Unit.
+    /// Cut: drop the frozen guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_an_unfrozen_grant_is_not_cleared_as_frozen() {
+        assert_eq!(
+            frozen_verdict(expired_record(), Some(BootId(2)), &[], LATER),
+            Err(super::FrozenClearRefusal::NotFrozen)
+        );
+    }
+
+    /// Guard 4: control time not proven past `E + epsilon + delta` keeps it. Unit.
+    /// Cut: drop the expiry guard; red.
+    #[config_log::retcd_test]
+    fn own81_x2_a_frozen_grant_not_proven_expired_stays() {
+        let record = GrantRecord {
+            expiry_utc_ms: 1_000_000_000,
+            ..frozen_record()
+        };
+        // #172: with a `Serving` partition owned too, which guard 3 no longer refuses.
+        let serving = [owned(
+            3,
+            crate::authority::partition::PartitionLifecycle::Serving,
+        )];
+        for partitions in [&[][..], &serving[..]] {
+            assert_eq!(
+                frozen_verdict(record, Some(BootId(2)), partitions, LATER),
+                Err(super::FrozenClearRefusal::NotProvenExpired)
+            );
+        }
     }
 }

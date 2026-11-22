@@ -20,10 +20,12 @@
 pub mod context;
 pub mod init;
 pub mod layer;
+pub mod rotate;
 pub mod testing;
 
 pub use context::{TraceContext, HEADER_PARENT_SPAN, HEADER_REQUEST_ID, HEADER_TRACE_ID};
 pub use init::{init, LogConfig, LogGuard, LogInitError};
+pub use rotate::{SizeRotatingFile, SizeRotation};
 pub use testing::retcd_test;
 
 /// Re-export so downstream crates use one `tracing` version.

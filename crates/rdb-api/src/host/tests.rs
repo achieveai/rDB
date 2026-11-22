@@ -5537,6 +5537,63 @@ fn m9_close_a_refused_write_answers_its_key_and_never_logs_it() {
     assert!(leaks.is_empty(), "log lines carry a key's text: {leaks:#?}");
 }
 
+/// Review r1 (PR #182): a refused compile logged `client_compile` at info on every attempt and
+/// returned before the reply, so the refusal log never counted it. Now its `client_compile` is
+/// debug, like a compile that worked, and the refusal is counted: one `refusal_first` at info
+/// for its key, and the host's summary counts every attempt.
+/// Integration (~1 s): Trio, one write and five refused compiles.
+#[config_log::retcd_test]
+fn r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug() {
+    const METHOD: &str = "r158_a_refused_compile_is_counted_as_a_refusal_and_its_line_is_debug";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let doc = Change::Doc(Delta(vec![Op::Replace(json_map(&[("a", int(1))]))]));
+    assert_eq!(
+        trio.write(compile_change(1, b"doc", doc, Some(Expected::Absent))),
+        Ok(2)
+    );
+    let refused: Vec<u64> = (10..15).collect();
+    for &request in &refused {
+        let missing = Change::Doc(Delta(vec![Op::Remove(path("/missing"))]));
+        match trio.ask(compile_change(request, b"doc", missing, None)) {
+            Answer::Error { error, .. } => assert_eq!(error.kind, ErrorKind::InvalidArgument),
+            other => panic!("request {request} not refused: {other:?}"),
+        }
+    }
+
+    let compiles: Vec<_> = logged!(METHOD, "client_compile")
+        .into_iter()
+        .filter(|line| {
+            line["request"]
+                .as_u64()
+                .is_some_and(|request| refused.contains(&request))
+        })
+        .collect();
+    assert_eq!(compiles.len(), refused.len(), "{compiles:#?}");
+    for line in &compiles {
+        assert_eq!(line["@l"], "Debug", "{line}");
+    }
+    let firsts: Vec<_> = logged!(METHOD, "refusal_first")
+        .into_iter()
+        .filter(|line| line["reason"] == "InvalidArgument")
+        .collect();
+    assert_eq!(firsts.len(), 1, "one first for the key: {firsts:#?}");
+    assert_eq!(firsts[0]["@l"], "Information", "{}", firsts[0]);
+    let counted: u64 = trio
+        .nodes
+        .iter_mut()
+        .flat_map(|(host, _, _)| host.refusals.stop())
+        .map(|summary| summary.refusals)
+        .sum();
+    assert_eq!(
+        counted,
+        refused.len() as u64,
+        "every refused compile is counted"
+    );
+}
+
 /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers
 /// given without sending are reads, so a node gives them only while a read would be given.
 /// Admitting: a healthy object and one with only upload chunks are CONDITION_FAILED, a
@@ -7567,5 +7624,298 @@ fn issue_184_a_read_answered_after_the_next_write_committed_waits_and_is_served(
     match trio.answer(&put_answer) {
         Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(published + 1)),
         other => panic!("the write: {other:?}"),
+    }
+}
+
+/// Issue #61: put on node 2 (index 1) with only nodes 2 and 3 stepped, node 1 being gone,
+/// until one lands; refusals (a pause, a re-plan) are retried. Answers node 2's head after it.
+#[cfg(debug_assertions)]
+fn lands_on_two(trio: &mut Trio, request: u64) -> u64 {
+    let patience = test_patience(Trio::PATIENCE);
+    let deadline = Instant::now() + patience;
+    loop {
+        let (reply, answer) = mpsc::channel();
+        trio.nodes[1]
+            .1
+            .send(Msg::Client(Client {
+                partition: PartitionId(1),
+                call: super::seal_tests::put(request, b"k", 2_000),
+                reply,
+            }))
+            .expect("node 2's mailbox");
+        let last = super::seal_tests::only_until(trio, &[1, 2], "node 2 answers", |_| {
+            answer.try_recv().ok()
+        });
+        if matches!(last, Answer::Txn { .. }) {
+            return trio.status(1).holds.map_or(0, |held| held.applied);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no put landed on node 2: {last:?}"
+        );
+    }
+}
+
+/// Issue #61: every copy of a formed trio applied `writes` puts, then each was trimmed to
+/// `head - keep`; node 1, the primary, is then lost (never stepped again) and node 2 is
+/// promoted. Answers `(through, the generation node 2 committed)` once node 2 serves it.
+#[cfg(debug_assertions)]
+fn trimmed_then_primary_lost(trio: &mut Trio, writes: u64, keep: u64) -> (u64, Generation) {
+    let mut head = 0;
+    let mut request = 1;
+    while head < writes {
+        head = super::catchup_tests::lands(trio, request);
+        request += 1;
+    }
+    trio.until("every copy applied the head", |trio| {
+        (0..3)
+            .all(|at| {
+                trio.status(at)
+                    .holds
+                    .is_some_and(|held| held.applied >= head)
+            })
+            .then_some(())
+    });
+    let through = head - keep;
+    for at in 0..3 {
+        assert_eq!(super::trio::trim(trio, at, through), Ok(Seq(through)));
+    }
+    let committed = |trio: &Trio| {
+        trio.nodes[1]
+            .0
+            .committed
+            .get(&PartitionId(1))
+            .map(|result| result.new_generation)
+    };
+    let before = committed(trio).expect("the bootstrap committed");
+    let promote = super::seal_tests::spawn_promote(trio, 2);
+    let generation = super::seal_tests::only_until(trio, &[1, 2], "node 2 committed", |trio| {
+        committed(trio).filter(|generation| *generation > before)
+    });
+    super::seal_tests::only_until(trio, &[1, 2], "the promote finished", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    (through, generation)
+}
+
+/// Issue #61 S1-R2 (design section 2, A5): the survivor check after a trim. 12 writes, every
+/// copy trimmed to `head - 4`, then the primary (node 1) is lost and node 2 promoted. F1 takes
+/// both survivors, nodes 2 and 3: their inventories prove the anchor's base (seq 0, below F)
+/// from their trim marks, never from a record. The commit pins nodes 2 and 3 and node 2 serves
+/// writes.
+/// Cut: `survivor` reads the base record below F (no mark branch), red (nodes 2 and 3 each log
+/// `inventory_failed{reason=below_floor}`, and node 2 never commits).
+/// Integration (~3 s): bootstrap, writes, the promote's window.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r2_a_trimmed_trio_loses_its_primary_and_lands_on_two_survivors() {
+    const METHOD: &str = "s1_r2_a_trimmed_trio_loses_its_primary_and_lands_on_two_survivors";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), super::catchup_tests::trim_tuned);
+    let (through, generation) = trimmed_then_primary_lost(&mut trio, 12, 4);
+    let reported: BTreeSet<u64> = logged!(METHOD, "inventory_reported")
+        .into_iter()
+        .filter(|line| line["generation"] == generation.0 - 1)
+        .filter_map(|line| line["node"].as_u64())
+        .collect();
+    assert_eq!(reported, BTreeSet::from([2, 3]), "both survivors reported");
+    let pinned: Vec<NodeId> = trio.nodes[1].0.committed[&PartitionId(1)]
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .map(|member| member.node)
+        .collect();
+    assert!(
+        pinned.contains(&NodeId(2)) && pinned.contains(&NodeId(3)),
+        "the commit holds both survivors: {pinned:?}"
+    );
+    let head = lands_on_two(&mut trio, 1_000);
+    assert!(head > through, "node 2 serves past the floor: {head}");
+    assert!(logged!(METHOD, "inventory_failed").is_empty());
+}
+
+/// Issue #61 S1-R10 cut (ii) (design B1): an idle partition trimmed at its head, F = head, then
+/// the primary is lost and node 2 promoted. Both survivors prove the base from their marks and
+/// the record at F, F1 commits, and node 2 serves writes.
+/// Cut: the trim deletes `<= F` (the record at F too), red (node 2 never commits).
+/// Integration (~3 s).
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r10_ii_an_idle_partition_trimmed_at_its_head_survives_its_primary() {
+    const METHOD: &str = "s1_r10_ii_an_idle_partition_trimmed_at_its_head_survives_its_primary";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), super::catchup_tests::trim_tuned);
+    let (through, _) = trimmed_then_primary_lost(&mut trio, 3, 0);
+    let head = lands_on_two(&mut trio, 1_000);
+    assert!(head > through, "node 2 serves past the floor: {head}");
+    assert!(logged!(METHOD, "inventory_failed").is_empty());
+}
+
+/// Issue #130 (F-014's identity half): a status query's waiter is taken only by a `Status` or
+/// `Failed` reply under the identity it asked about. A reply of either kind under another
+/// identity leaves the waiter where it is, unanswered: a `Failed` goes on to the pending table
+/// (here empty, so unclaimed), and a `Status` with no query of its own is a fault. The last
+/// step is the control: a `Status` under the asked identity does take and answer it.
+/// Cut: `Host::reply` takes the waiter without comparing the identity, red (the query hears
+/// the other request's refusal).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_status_or_failed_reply_for_another_identity_does_not_take_the_status_waiter() {
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let (reply, answer) = mpsc::channel();
+    host.answering = Some((identity(1), reply));
+    let asked = |host: &Host| host.answering.as_ref().map(|(asked, _)| *asked);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Failed {
+            identity: identity(2),
+            error: RdbError::UnknownOutcome {
+                partition: PartitionId(1),
+                identity: identity(2),
+            },
+        },
+    )
+    .expect("another request's refusal is unclaimed, not a fault");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Failed");
+    still_waits("the status query, after request 2's refusal", &answer);
+
+    let fault = host
+        .reply(
+            PartitionId(1),
+            &ReplyEffect::Status {
+                identity: identity(2),
+                status: TxnStatus::Unknown,
+            },
+        )
+        .expect_err("a status answer no query asked for");
+    assert!(fault.detail.contains("no status query"), "{fault:?}");
+    assert_eq!(asked(&host), Some(identity(1)), "kept after a Status");
+    still_waits("the status query, after request 2's status", &answer);
+
+    host.reply(
+        PartitionId(1),
+        &ReplyEffect::Status {
+            identity: identity(1),
+            status: TxnStatus::Unknown,
+        },
+    )
+    .expect("the asked identity's status");
+    assert_eq!(asked(&host), None, "taken by its own answer");
+    match answer.try_recv() {
+        Ok(Answer::Status(TxnStatus::Unknown)) => {}
+        other => panic!("the status query's own answer: {other:?}"),
+    }
+}
+
+/// Issue #130 (tick 0 is never a real step tick): a host whose clock reads tick 0, here a
+/// guarded clock stepped back as `rdb_node --clock-step-file` steps it, refuses to step a
+/// kernel and faults instead, so no `StepCtx` ever carries tick 0.
+/// Cut: the tick-0 refusal in `Host::offer` removed, red (A1 steps at tick 0).
+/// Unit (one host, no cluster).
+#[config_log::retcd_test]
+fn a_host_clock_at_tick_zero_steps_no_kernel() {
+    use rdb_core::contracts::control::{ControlEvent, ControlPrefix};
+    use rdb_core::contracts::ids::{CorrelationId, EventId, Revision};
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let mut host = host_over(dir.path(), &rt);
+    let clock = HostClock::guarded(0);
+    clock.step_back(u64::MAX);
+    assert_eq!(
+        clock.now(),
+        Tick::ZERO,
+        "precondition: the clock reads tick 0"
+    );
+    host.clock = clock;
+    let event = Event {
+        id: EventId(1),
+        at: Tick::ZERO,
+        node: host.node,
+        boot: host.boot,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Control(ControlEvent::WatchProgress {
+            prefix: ControlPrefix::Partitions,
+            revision: Revision(1),
+        }),
+    };
+    match host.offer(ModuleName::Authority, &event) {
+        Err(StepError::Host(fault)) => assert!(fault.detail.contains("tick 0"), "{fault:?}"),
+        Ok(effects) => panic!("A1 stepped at tick 0: {effects:?}"),
+        Err(StepError::Module(error)) => panic!("A1 stepped at tick 0 and failed: {error}"),
+    }
+}
+
+/// #87 review r1: a feed read's storage fault is typed only when it is stored damage.
+/// `Corrupt` is `CORRUPT_HISTORY`, ending with the feed's step on a feed reply
+/// ([`Fault::feed_error`], review r2) and without it as the node's fault; any other storage
+/// fault stays the
+/// generic host fault ([`ApiError::host`]: `UNAVAILABLE`, `NotWired`). The real damage paths
+/// (a broken frame, an envelope that does not decode) are
+/// `f87_2_damaged_history_answers_every_feed_caller_corrupt_history`.
+/// Review r4: the damage's own fault takes the owner-fault step, and an untyped fault's feed
+/// reply ends with the other-copy step.
+/// Cuts: `feed_storage_fault` typing every fault, red (`WriteFailed` typed); `next_step` back to
+/// `NotWired`-only host faults, red (`write over`); `feed_error` without the other-copy step,
+/// red.
+/// Unit (~1 ms).
+#[test]
+fn f87_2_a_feed_storage_fault_is_typed_only_when_it_is_damage() {
+    let damage = feed_storage_fault("feed: history floor".to_owned(), StorageFault::Corrupt);
+    let error = damage.feed_error();
+    assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_HISTORY_STEP),
+        "{error:?}"
+    );
+    // Review r2 (4647111500): the step is for a feed reply; the node's fault itself, which
+    // a put or a get hears, does not carry it.
+    let error = damage.error();
+    assert_eq!(error.kind, ErrorKind::CorruptHistory, "{error:?}");
+    assert!(
+        !error.detail.contains(crate::db::error::FEED_HISTORY_STEP),
+        "{error:?}"
+    );
+    // Review r4 (4647111500, 4654680328): that fault's step is the owner-fault step, not
+    // `CORRUPT_HISTORY`'s "write over its key": the damage is the node's, not the caller's
+    // entry. Admitted (may have applied): ask the status with the same id. Refused: a new write.
+    assert!(error.is_host_fault(), "{error:?}");
+    let step = error.next_step().expect("a step");
+    assert!(step.contains("`Db::status` with its request id"), "{step}");
+    assert!(!step.contains("write over"), "{step}");
+    let step = damage.refusal().next_step().expect("a step");
+    assert!(step.contains("this send wrote nothing"), "{step}");
+    assert!(!step.contains("write over"), "{step}");
+    for fault in [
+        StorageFault::WriteFailed,
+        StorageFault::FlushFailed,
+        StorageFault::ProcessCrash,
+        StorageFault::HostCrash,
+    ] {
+        let error = feed_storage_fault("feed: history floor".to_owned(), fault).feed_error();
+        assert_eq!(
+            (error.kind, error.retry),
+            (ErrorKind::Unavailable, RetryRule::NotWired),
+            "{fault:?}: {error:?}"
+        );
+        assert!(
+            !error.detail.contains(crate::db::error::FEED_HISTORY_STEP),
+            "{fault:?}: {error:?}"
+        );
+        // Review r4: a feed read off a faulted node with no damage goes to another copy.
+        assert!(
+            error
+                .detail
+                .ends_with(crate::db::error::FEED_OTHER_COPY_STEP),
+            "{fault:?}: {error:?}"
+        );
     }
 }

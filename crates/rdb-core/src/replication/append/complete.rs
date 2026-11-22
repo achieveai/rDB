@@ -9,7 +9,6 @@
 use crate::contracts::authority::AuthorityView;
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendOutcome, AppendReject};
-use crate::contracts::errors::ErrorKind;
 use crate::contracts::event::EffectKind;
 use crate::contracts::ids::{
     BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq, ReplicaRole, Seq,
@@ -161,13 +160,19 @@ impl AppendReceiver {
             }
             DigestLookup::Differs { .. } => None,
             DigestLookup::Match | DigestLookup::NotRetained => {
-                let Some((seq, digest)) = self.history.at_or_below(selected.cutoff_seq) else {
-                    // Nothing held at or below the cutoff to anchor on. Unreachable from a
-                    // receiver that started at its partition's root; a handoff question.
-                    return vec![ignored(KernelIgnoredReason::Error(
-                        ErrorKind::InvalidArgument,
-                    ))];
-                };
+                // Issue #61: nothing held at or below the cutoff means the ladder was trimmed
+                // above it (its floor is past the cutoff, `(0, ROOT)` gone with it). Anchor at
+                // the root, as the refused-landing arm does: the primary's ladder holds no rung
+                // there either once trimmed, so the walk asks for a snapshot, which is the only
+                // answer an engine below its floor has.
+                let (seq, digest) = self
+                    .history
+                    .at_or_below(selected.cutoff_seq)
+                    .unwrap_or_else(|| {
+                        self.history.truncate_above(Seq::ZERO);
+                        self.history.insert(Seq::ZERO, Digest::ROOT);
+                        (Seq::ZERO, Digest::ROOT)
+                    });
                 Some(Head { seq, digest })
             }
         };

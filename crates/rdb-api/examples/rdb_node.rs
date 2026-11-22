@@ -13,7 +13,15 @@
 //!          [--ready-secs S] [--admin-apps a,b] [--partitions P]
 //!          [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
 //!          [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
+//! every form: [--log-max-mb M] [--log-files N]
 //! ```
+//!
+//! * `--log-dir` is where the JSONL log goes (default `.`), as `rdb_node-N.jsonl`. It rotates
+//!   by size (#158): before a write would take it past `--log-max-mb` (default 256), it becomes
+//!   `rdb_node-N.jsonl.1`, the older ones shift up, and at most `--log-files` (default 8, at
+//!   least 2) files are kept, the live one included. `--log-max-mb 0` never rotates. A second
+//!   process writing the same log is refused at start (exit 2). At info a node logs state
+//!   changes and faults, not each write; `RUST_LOG` sets the filter.
 //!
 //! * `--gen-certs` writes a fresh development CA and certificates for nodes 1 to `--nodes`
 //!   (default 3) and each app named by `--apps` into `--cert-dir`, then exits. `--cert-dir` pointing at another run's
@@ -70,6 +78,15 @@
 //!   `--live-readd` lets this node, as an owner, add back a copy its own drop clock left out
 //!   once that copy's link is back, with no restart of the copy (`Timeouts::live_readd`, #107).
 //!   Off unless given.
+//!   `--app-addr A` writes A, the address this node's app takes forwarded requests on, into the
+//!   node's `nodes/{id}` record before the node starts, so `Db::route` names it (#83 B2). Only
+//!   a declared database has the record: a node of a database made by `--form` is refused it at
+//!   open. `--form`, `--declare` and `--gen-certs` each refuse the flag, since none of them starts
+//!   a node that would write it. Unset, the record keeps what an earlier start wrote; an address
+//!   cannot be cleared. Unset is refused while the folder's `app-addr-pending` file says an
+//!   earlier start's write may still apply: start again with `--app-addr` and the address the
+//!   node should hold, which settles it. On a new or emptied `--dir`, an unset start fences the
+//!   record (it writes the record's own bytes back), so no late write replaces its address.
 //!   `--clock-offset-ms` shifts this process's `Tick` once at start, real skew (#80 S2c).
 //!   `--clock-step-file` names a file it polls every 20 ms: its contents, whole milliseconds,
 //!   step `Tick` back once, then the file is removed. `kill -STOP`, wait, write the file,
@@ -93,8 +110,15 @@
 //! with `deadline_in_ms=D` (time left until writes stop), or `state=deactivated`. The host logs
 //! each as `ownership_event` with its clock tick; a dropped subscriber subscribes again
 //! (`rdb_node_ownership_resubscribed`).
+//! V10 (#81): about once a second the node reads its own `NodeStatus`. When its self-replace
+//! has stayed stopped for 5 s (its grant was frozen by a promote), or its host faulted, and no
+//! `partitions/` record in the control store names it owner in any lifecycle, it prints
+//! `rdb_node restart-wanted node=N reason=R` (logged `rdb_node_restart_wanted`), shuts down,
+//! prints `rdb_node stopped node=N` and exits 75: its supervisor should start it again, at a new
+//! boot, and the owner re-adds it. A failed list keeps it up (`db_restart_check_unread`). The
+//! rule is `Db::restart_wanted`'s, which an embedder polls the same way.
 //! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
-//! step failed, 2 bad arguments.
+//! step failed, 2 bad arguments, 75 restart wanted (V10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -110,7 +134,10 @@ use rdb_api::net::faults::{CutStore, Faults};
 use rdb_api::net::wire::Label;
 use rdb_api::net::{certs, Net, NetConfig, PROTOCOL_VERSION};
 use rdb_api::transport::Links;
-use rdb_api::{Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, Timeouts};
+use rdb_api::{
+    Db, DbConfig, NodeId, OwnerToken, Ownership, OwnershipEvent, PartitionId, RestartReason,
+    Timeouts,
+};
 
 #[derive(Debug, Default)]
 struct Args {
@@ -121,6 +148,9 @@ struct Args {
     node: Option<u32>,
     dir: Option<PathBuf>,
     listen: Option<String>,
+    /// #83 B2: `--app-addr`, the address this node's app takes forwarded requests on. Unset is
+    /// refused while an earlier start's write may still apply (`app-addr-pending`).
+    app_addr: Option<String>,
     peers: BTreeMap<NodeId, String>,
     control: Vec<String>,
     cert_dir: Option<PathBuf>,
@@ -128,6 +158,10 @@ struct Args {
     faults: Option<PathBuf>,
     stop_file: Option<PathBuf>,
     log_dir: Option<PathBuf>,
+    /// `--log-max-mb`; `None` is `SizeRotation::DEFAULT`'s, 0 never rotates (#158).
+    log_max_mb: Option<u64>,
+    /// `--log-files`; `None` is `SizeRotation::DEFAULT`'s.
+    log_files: Option<usize>,
     ready_secs: Option<u64>,
     /// `--gen-certs`: certificates for nodes 1 to this (M11 WS A); `None` is 3.
     nodes: Option<u32>,
@@ -175,7 +209,8 @@ const USAGE: &str = "usage:
            [--admin-apps a,b] [--partitions P]
            [--clock-offset-ms M] [--clock-step-file F] [--unreachable-drop-after-ms M]
            [--failover] [--failover-silent-ms M] [--failover-max-concurrent K]
-           [--live-readd]
+           [--live-readd] [--app-addr A]
+  every form: [--log-max-mb M] [--log-files N] (default 256 MiB x 8 files; M = 0 never rotates)
   --faults F: a file of lines, each one of
            hold N | hold all | drop-request N | drop-reply N | cut-control | mute
 ";
@@ -223,6 +258,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--dir" => args.dir = Some(value("--dir")?.into()),
             "--listen" => args.listen = Some(value("--listen")?),
+            "--app-addr" => args.app_addr = Some(value("--app-addr")?),
             "--peers" => {
                 for pair in value("--peers")?.split(',') {
                     let (n, addr) = pair
@@ -279,6 +315,20 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--faults" => args.faults = Some(value("--faults")?.into()),
             "--stop-file" => args.stop_file = Some(value("--stop-file")?.into()),
             "--log-dir" => args.log_dir = Some(value("--log-dir")?.into()),
+            "--log-max-mb" => {
+                args.log_max_mb = Some(
+                    value("--log-max-mb")?
+                        .parse()
+                        .map_err(|_| "--log-max-mb takes whole megabytes".to_owned())?,
+                );
+            }
+            "--log-files" => {
+                args.log_files = Some(
+                    value("--log-files")?
+                        .parse()
+                        .map_err(|_| "--log-files takes a file count".to_owned())?,
+                );
+            }
             "--nodes" => {
                 let k: u32 = value("--nodes")?
                     .parse()
@@ -354,6 +404,23 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     failover_refusal(&args)?;
     declare_refusal(&args)?;
+    // #83 B2, PR #159 review: only a node process writes `--app-addr`. Forming opens with no
+    // addresses, declaring writes control records only, and making certificates opens nothing,
+    // so each would drop the flag without a word.
+    if args.app_addr.is_some() {
+        for (given, mode) in [
+            (args.form, "--form"),
+            (args.declare, "--declare"),
+            (args.gen_certs, "--gen-certs"),
+        ] {
+            if given {
+                return Err(format!(
+                    "--app-addr is written by a node process of a declared database, not with \
+                     {mode}"
+                ));
+            }
+        }
+    }
     control_certs_refusal(&args)?;
     Ok(args)
 }
@@ -503,18 +570,24 @@ fn need<T: Clone>(value: Option<&T>, name: &str) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
-    run(std::env::args().skip(1), |config| {
-        config_log::init(config)
-            .map(Some)
-            .map_err(|e| e.to_string())
-    })
+    run(
+        std::env::args().skip(1),
+        |config| {
+            config_log::init(config)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        },
+        serve,
+    )
 }
 
-/// `main`, with how logging starts passed in: a row runs this same path under the subscriber
-/// its `#[config_log::retcd_test]` installed, where a second `config_log::init` is refused.
+/// `main`, with how logging starts and how a node process serves passed in: a row runs this
+/// same path under the subscriber its `#[config_log::retcd_test]` installed, where a second
+/// `config_log::init` is refused, and over its own store in place of [`serve`]'s `--control`.
 fn run(
     argv: impl Iterator<Item = String>,
     start_logging: impl FnOnce(config_log::LogConfig) -> Result<Option<config_log::LogGuard>, String>,
+    serve: impl FnOnce(&Args, &tokio::runtime::Runtime) -> Result<Served, String>,
 ) -> ExitCode {
     let args = match parse(argv) {
         Ok(args) => args,
@@ -538,6 +611,13 @@ fn run(
     let mut config = config_log::LogConfig::for_application("rdb_node");
     config.dir.clone_from(&log_dir);
     config.file_name = format!("{name}.jsonl");
+    config.rotate = match config_log::SizeRotation::from_flags(args.log_max_mb, args.log_files) {
+        Ok(rotate) => rotate,
+        Err(e) => {
+            eprintln!("rdb_node: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let guard = match start_logging(config) {
         Ok(guard) => guard,
         Err(e) => {
@@ -552,20 +632,13 @@ fn run(
     {
         Ok(rt) => {
             let result = if args.form {
-                form(&args, &rt)
+                form(&args, &rt).map(|()| Served::Stopped)
             } else if args.declare {
-                declare(&args, &rt)
+                declare(&args, &rt).map(|()| Served::Stopped)
             } else {
                 serve(&args, &rt)
             };
-            match result {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(message) => {
-                    tracing::error!(%message, "rdb_node_failed");
-                    eprintln!("rdb_node: {message}");
-                    ExitCode::from(1)
-                }
-            }
+            exit_code(result)
         }
         Err(e) => {
             eprintln!("rdb_node: runtime: {e}");
@@ -574,6 +647,20 @@ fn run(
     };
     drop(guard);
     code
+}
+
+/// The exit code for how a run ended: 0 at the stop file, [`RESTART_EXIT`] when it asks its
+/// supervisor for a restart (V10, #81), 1 on a failure, which is logged and printed.
+fn exit_code(result: Result<Served, String>) -> ExitCode {
+    match result {
+        Ok(Served::Stopped) => ExitCode::SUCCESS,
+        Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
+        Err(message) => {
+            tracing::error!(%message, "rdb_node_failed");
+            eprintln!("rdb_node: {message}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn gen_certs(args: &Args) -> ExitCode {
@@ -955,7 +1042,7 @@ fn peer_set(node: NodeId, peers: &BTreeMap<NodeId, String>) -> Result<BTreeSet<N
     Ok(all)
 }
 
-fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<Served, String> {
     // The client may start tasks as it connects, so it is made inside the runtime.
     let store = {
         let _entered = rt.enter();
@@ -969,7 +1056,7 @@ fn serve_on(
     args: &Args,
     rt: &tokio::runtime::Runtime,
     store: Arc<dyn ConfigStore>,
-) -> Result<(), String> {
+) -> Result<Served, String> {
     serve_on_ready(args, rt, store, None, &|_| {})
 }
 
@@ -984,7 +1071,7 @@ fn serve_on_ready(
     store: Arc<dyn ConfigStore>,
     bound: Option<tokio::net::TcpListener>,
     on_ready: &(dyn Fn(NodeId) + Sync),
-) -> Result<(), String> {
+) -> Result<Served, String> {
     let node = NodeId(need(args.node.as_ref(), "--node")?);
     let dir = need(args.dir.as_ref(), "--dir")?;
     let listen = need(args.listen.as_ref(), "--listen")?;
@@ -1067,6 +1154,7 @@ fn serve_on_ready(
         addresses: Some(rdb_api::NodeAddresses {
             listen: listen.clone(),
             peers: args.peers.clone(),
+            app: args.app_addr.clone(),
         }),
     };
     let mut db = rt
@@ -1084,10 +1172,26 @@ fn serve_on_ready(
     let mut retrying = report_ready(node, first);
     let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
     let done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch_ownership(&db, node, &done));
-        scope.spawn(|| print_ownership_events(&db, &done));
+    // Each watcher logs in the span this serve runs in, as the node's own lines do, so a row's
+    // node logs land in that row's file, not untagged.
+    let span = tracing::Span::current();
+    let served = std::thread::scope(|scope| {
+        scope.spawn(|| span.in_scope(|| watch_ownership(&db, node, &done)));
+        scope.spawn(|| span.in_scope(|| print_ownership_events(&db, &done)));
+        let mut served = Served::Stopped;
+        let mut checked = std::time::Instant::now();
         while !stopped() {
+            // V10 (#81): about once a second, not every turn: `node_status` can wait out the
+            // read timeout.
+            if checked.elapsed() >= RESTART_CHECK_EVERY {
+                checked = std::time::Instant::now();
+                if let Some(reason) = db.restart_wanted() {
+                    tracing::warn!(node = node.0, %reason, "rdb_node_restart_wanted");
+                    println!("rdb_node restart-wanted node={} reason={reason}", node.0);
+                    served = Served::Restart(reason);
+                    break;
+                }
+            }
             if !retrying {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
@@ -1105,22 +1209,45 @@ fn serve_on_ready(
             }
         }
         done.store(true, Ordering::Relaxed);
+        served
     });
-    if let Some(stop) = &args.stop_file {
+    if let (Served::Stopped, Some(stop)) = (served, &args.stop_file) {
         tracing::info!(node = node.0, stop = %stop.display(), "rdb_node_stop_file");
     }
     db.shutdown();
+    // `Db::shutdown` leaves the links up; the process exits next anyway, but a peer should
+    // see this boot go at once, not when the sockets close.
+    net.shutdown();
     drop(db);
     drop(net);
     println!("rdb_node stopped node={}", node.0);
-    Ok(())
+    Ok(served)
 }
+
+/// How a node process's serve ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// `--stop-file` appeared: exit 0.
+    Stopped,
+    /// V10 (#81): this boot can serve nothing again, so it asks its supervisor for a restart,
+    /// [`RESTART_EXIT`]. The reason `Db::restart_wanted` gave.
+    Restart(RestartReason),
+}
+
+/// The exit code that asks the supervisor to start this node process again (V10, #81):
+/// `EX_TEMPFAIL`. `docs/rdb/embed.md` states the contract.
+const RESTART_EXIT: u8 = 75;
+
+/// How often the serve loop reads its own `NodeStatus` for V10.
+const RESTART_CHECK_EVERY: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore};
+    use super::{
+        admin_apps, declare_on, parse, serve_on, serve_on_ready, ConfigStore, RestartReason, Served,
+    };
 
     /// The `--peers` value of three nodes on three loopback hosts (#80 S1b).
     const PEERS: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
@@ -1485,7 +1612,10 @@ mod tests {
     /// partition: each `partitions/{p}` gains its root, and every node reaches ready (its
     /// `ready` line, through `serve_on_ready`). Only then is the stop file written, so no node
     /// is still in a readiness wait when its peers go. Stopped through `--stop-file`, each ends
-    /// cleanly and its folder holds only its own `nodes/N`. Cluster row (~0.5 s measured,
+    /// cleanly and its folder holds only its own `nodes/N`. #83 B2 (PR #159 review): nodes 1
+    /// to 3 start with `--app-addr`, node 4 without; each of the first three records holds its
+    /// flag's bytes unchanged, node 4's none. Cut: `serve_on_ready` passes `app: None`, red at
+    /// node 1's record. Cluster row (~0.5 s measured,
     /// bounded at 30 s): four nodes link over TLS, form four partitions and admit writes. The
     /// node threads log outside this row's span, so their lines land in the run's
     /// `_untagged-<pid>.jsonl`.
@@ -1550,14 +1680,20 @@ mod tests {
         let dirs: Vec<std::path::PathBuf> = (1..=K)
             .map(|n| root.path().join(format!("node-{n}")))
             .collect();
+        let (certs_path, stop_path) = (path(&certs), path(&stop));
+        let apps: Vec<String> = (1..K)
+            .map(|n| format!("https://u:p@gw-{n}.example:8443/sbx"))
+            .collect();
         let ended = std::thread::scope(|scope| {
             let running: Vec<_> = (1..=K)
                 .map(|n| {
-                    let args = parsed(&[
+                    let node = n.to_string();
+                    let dir = path(&dirs[n as usize - 1]);
+                    let mut argv = vec![
                         "--node",
-                        &n.to_string(),
+                        &node,
                         "--dir",
-                        &path(&dirs[n as usize - 1]),
+                        &dir,
                         "--listen",
                         &addrs[n as usize - 1],
                         "--peers",
@@ -1565,13 +1701,17 @@ mod tests {
                         "--control",
                         "http://127.0.0.1:1",
                         "--cert-dir",
-                        &path(&certs),
+                        &certs_path,
                         "--stop-file",
-                        &path(&stop),
+                        &stop_path,
                         "--ready-secs",
                         "30",
-                    ])
-                    .expect("parses");
+                    ];
+                    // #83 B2: nodes 1 to 3 register an app address, node 4 none.
+                    if n < K {
+                        argv.extend(["--app-addr", &apps[n as usize - 1]]);
+                    }
+                    let args = parsed(&argv).expect("parses");
                     let store = Arc::clone(&store);
                     let (rt, on_ready) = (&rt, &on_ready);
                     let bound = handed[n as usize - 1].take();
@@ -1603,7 +1743,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             std::fs::write(&stop, b"").expect("the stop file");
-            let ended: Vec<Result<(), String>> = running
+            let ended: Vec<Result<Served, String>> = running
                 .into_iter()
                 .map(|handle| handle.join().expect("a node thread"))
                 .collect();
@@ -1617,7 +1757,7 @@ mod tests {
         });
         drop(kept);
         for (n, outcome) in (1..=K).zip(ended) {
-            assert_eq!(outcome, Ok(()), "node {n} ends cleanly");
+            assert_eq!(outcome, Ok(Served::Stopped), "node {n} ends cleanly");
             let held: Vec<String> = std::fs::read_dir(dirs[n as usize - 1].join("nodes"))
                 .expect("its nodes/ folder")
                 .map(|entry| {
@@ -1629,6 +1769,22 @@ mod tests {
                 })
                 .collect();
             assert_eq!(held, [n.to_string()], "node {n} holds only its own copy");
+            let key = rdb_core::contracts::control::ControlKey::Node(rdb_api::NodeId(n)).encode();
+            let body = rt
+                .block_on(store.get(config_core::GetRequest {
+                    key: bytes::Bytes::from(key),
+                }))
+                .expect("a read")
+                .record
+                .expect("the node's record")
+                .value;
+            let app = rdb_core::authority::node::NodeRecord::decode_with_app(&body)
+                .and_then(|(_, app)| app);
+            assert_eq!(
+                app.as_deref(),
+                apps.get(n as usize - 1).map(String::as_str),
+                "node {n}'s --app-addr reached its record unchanged"
+            );
         }
     }
 
@@ -1642,6 +1798,40 @@ mod tests {
             Err("--failover runs only in a node process, not with --form".to_owned())
         );
         assert!(parsed(&["--form"]).is_ok_and(|args| args.form && !args.failover));
+    }
+
+    /// #83 B2, PR #159 review: `--app-addr` reaches a node process's args byte for byte, a
+    /// URL with a credential and a space included; a node process without it has none.
+    /// `--form` with `--app-addr` is a parse error, since forming would drop it; plain
+    /// `--form` still parses. `--declare` and `--gen-certs` refuse it too, for the same reason;
+    /// plain `--gen-certs` still parses. Cut: `--declare` dropped from the refusal's list, red
+    /// at `--declare`. Unit.
+    #[test]
+    fn own83_b2_app_addr_parses_and_form_refuses_it() {
+        let app = "https://user:s3cret@gw-1.example:8443/sbx path";
+        let args = parsed(&["--node", "1", "--app-addr", app]).expect("parses");
+        assert_eq!(args.app_addr.as_deref(), Some(app));
+        let args = parsed(&["--node", "1"]).expect("parses");
+        assert_eq!(args.app_addr, None);
+        for mode in ["--form", "--declare", "--gen-certs"] {
+            let mut argv = vec![mode, "--app-addr", "gw:1"];
+            if mode == "--declare" {
+                argv.extend([
+                    "--peers",
+                    "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100",
+                ]);
+            }
+            assert_eq!(
+                parsed(&argv).map(|_| ()),
+                Err(format!(
+                    "--app-addr is written by a node process of a declared database, not with \
+                     {mode}"
+                )),
+                "{mode}"
+            );
+        }
+        assert!(parsed(&["--form"]).is_ok_and(|args| args.form && args.app_addr.is_none()));
+        assert!(parsed(&["--gen-certs"]).is_ok_and(|args| args.gen_certs));
     }
 
     /// PR #119 review: `--failover` with `--gen-certs` is a parse error; plain `--gen-certs`
@@ -1740,7 +1930,7 @@ mod tests {
         ]
         .into();
         argv.extend(extra.iter().map(|a| (*a).to_owned()));
-        let code = super::run(argv.into_iter(), |_| Ok(None));
+        let code = super::run(argv.into_iter(), |_| Ok(None), super::serve);
         assert_eq!(code, std::process::ExitCode::from(2), "{extra:?}: exit 2");
         assert!(
             !dir.exists(),
@@ -1915,6 +2105,336 @@ mod tests {
             started.elapsed() < OWNERSHIP_POLL * 50,
             "joined after {:?}",
             started.elapsed()
+        );
+    }
+
+    /// V10 (#81), PR #171 review: `run`, the node process's whole `main` after logging starts,
+    /// exits 75 (`EX_TEMPFAIL`) when its serve asks for a restart, whichever reason it gave; a
+    /// stop file exits 0 and a failure 1. The row runs `run` itself, with a serve that ends as
+    /// told, so what `run` returns for each outcome is what the process exits with. The serve
+    /// really ending `Restart` is `own81_v10_frozen_returning_node_exits_after_the_sweep`'s.
+    /// Unit (no store, no sockets).
+    /// Cut: `run` returns 0 for a `Restart` serve; red at the first reason.
+    #[config_log::retcd_test]
+    fn own81_v10_a_restart_wanted_exits_75() {
+        use std::process::ExitCode;
+        let run = |ended: Result<Served, String>| {
+            let mut served = 0;
+            let code = super::run(
+                ["--node", "1"].iter().map(|a| (*a).to_owned()),
+                |_| Ok(None),
+                |args, _| {
+                    served += 1;
+                    assert_eq!(args.node, Some(1), "run serves the node it parsed");
+                    ended
+                },
+            );
+            assert_eq!(served, 1, "run served once");
+            code
+        };
+        for reason in [RestartReason::ReplaceStopped, RestartReason::HostFaulted] {
+            assert_eq!(
+                run(Ok(Served::Restart(reason))),
+                ExitCode::from(75),
+                "{reason}"
+            );
+        }
+        assert_eq!(run(Ok(Served::Stopped)), ExitCode::SUCCESS);
+        assert_eq!(run(Err("a failure".to_owned())), ExitCode::from(1));
+    }
+
+    /// #81 D1 (ADR-0019: off by default): a node process started without `--failover` runs no
+    /// planner (`DbConfig::failover` is `None`); with it, the library's defaults. Unit.
+    /// Cut: `failover` answers `Some` whatever `--failover` says; the first assertion is red.
+    #[config_log::retcd_test]
+    fn own81_d1_no_failover_flag_runs_no_planner() {
+        let plain = parsed(&["--node", "1"]).expect("parses");
+        assert_eq!(super::failover(&plain), None, "no --failover, no planner");
+        let on = parsed(&["--node", "1", "--failover"]).expect("parses");
+        assert_eq!(super::failover(&on), Some(rdb_api::Failover::default()));
+    }
+
+    /// The node owning each partition, and each one's members, read from `partitions/`.
+    fn placement(
+        rt: &tokio::runtime::Runtime,
+        store: &dyn ConfigStore,
+    ) -> Vec<(
+        rdb_core::authority::partition::PartitionRecord,
+        Vec<rdb_core::authority::partition::RecordMember>,
+    )> {
+        let prefix = rdb_core::contracts::control::ControlPrefix::Partitions.encode();
+        rt.block_on(store.list(config_core::ListRequest {
+            prefix: bytes::Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        }))
+        .expect("the store answers")
+        .records
+        .iter()
+        .map(|found| {
+            (
+                rdb_core::authority::partition::PartitionRecord::decode(&found.value)
+                    .expect("a partition record"),
+                rdb_core::authority::partition::RecordMember::decode_all(&found.value)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+    }
+
+    /// V10 (#81) over three node processes' start paths (`serve_on_ready`, one thread each) on
+    /// a declared database of 12 partitions, each node with `--failover
+    /// --failover-max-concurrent 1`, so the planner's sweep moves node 1's four partitions one
+    /// at a time. Node 1 is stopped as `kill -STOP` stops it (its fault file: `mute` and
+    /// `cut-control`), resumed once the first of its partitions has moved, and its serve
+    /// returns `Restart` (exit 75) only once no `partitions/` record names it owner. Then it is
+    /// started again on its folder, as a supervisor would, at a new boot: it says ready, the
+    /// owners take it back as a regular copy of every partition, and at the stop file it
+    /// ends `Stopped`, not `Restart` again.
+    /// Cluster row (~30 s): one grant lapse (6 s), four promotes, the 5 s hold, a re-add. Every
+    /// node thread runs in this row's span, so the nodes log into this row's own file: each of
+    /// the four serves says `rdb_node_listening`, and each node's ownership watcher says
+    /// `ownership_held` (PR #171 review). The library's own node and sync threads still log
+    /// untagged from here: they enter the opener's span only under rdb-api's own `cfg(test)`.
+    /// No cut is red here for the owns-none guard: the four promotes took 1.2 s in all
+    /// (measured), well inside the 5 s hold, so the guard is pinned by the `restart_due` units
+    /// (`rdb_api::db::restart`).
+    /// Cut: `Db::restart_wanted` always answers `None` (no V10); node 1 never returns, red at
+    /// "node 1's serve returns".
+    #[config_log::retcd_test]
+    fn own81_v10_frozen_returning_node_exits_after_the_sweep() {
+        const METHOD: &str = "own81_v10_frozen_returning_node_exits_after_the_sweep";
+        use rdb_api::NodeId;
+        use rdb_core::contracts::ids::ReplicaRole;
+        use std::time::{Duration, Instant};
+        let scale = config_testkit::poll::deadline_scale();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = config_testkit::fs::temp_dir();
+        let certs = root.path().join("certs");
+        let labels: Vec<rdb_api::net::wire::Label> = (1..=3)
+            .map(|n| rdb_api::net::wire::Label::Node(NodeId(n)))
+            .collect();
+        rdb_api::net::certs::generate(&certs, &labels).expect("certificates");
+        let mut handed: Vec<Option<tokio::net::TcpListener>> = Vec::new();
+        let addrs: Vec<String> = (1..=3u8)
+            .map(|n| {
+                let host = std::net::Ipv4Addr::new(127, 0, 0, n);
+                let (listener, addr) =
+                    rt.block_on(config_testkit::ports::ephemeral_listener_on(host));
+                handed.push(Some(listener));
+                addr.to_string()
+            })
+            .collect();
+        let peers: Vec<String> = addrs
+            .iter()
+            .zip(1..)
+            .map(|(addr, n)| format!("{n}={addr}"))
+            .collect();
+        let peers = peers.join(",");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        declare_on(
+            &parsed(&["--declare", "--peers", &peers, "--partitions", "12"]).expect("parses"),
+            &store,
+            &rt,
+        )
+        .expect("declared");
+        let stop = root.path().join("stop");
+        let path = |p: &std::path::Path| p.display().to_string();
+        let faults: Vec<std::path::PathBuf> = (1..=3)
+            .map(|n| root.path().join(format!("faults-{n}.txt")))
+            .collect();
+        for file in &faults {
+            std::fs::write(file, b"").expect("a fault file");
+        }
+        let args_of = |n: usize| {
+            parsed(&[
+                "--node",
+                &n.to_string(),
+                "--dir",
+                &path(&root.path().join(format!("node-{n}"))),
+                "--listen",
+                &addrs[n - 1],
+                "--peers",
+                &peers,
+                "--control",
+                "http://127.0.0.1:1",
+                "--cert-dir",
+                &path(&certs),
+                "--faults",
+                &path(&faults[n - 1]),
+                "--stop-file",
+                &path(&stop),
+                "--ready-secs",
+                "30",
+                "--failover",
+                "--failover-max-concurrent",
+                "1",
+            ])
+            .expect("parses")
+        };
+        let ready = std::sync::Mutex::new(Vec::new());
+        let on_ready = |node: NodeId| ready.lock().expect("the ready list").push(node.0);
+        let ready_count = |n: u32| {
+            ready
+                .lock()
+                .expect("the ready list")
+                .iter()
+                .filter(|r| **r == n)
+                .count()
+        };
+        let wait = |what: &str, within: Duration, done: &mut dyn FnMut() -> bool| {
+            let deadline = Instant::now() + within * scale;
+            while !done() {
+                assert!(Instant::now() < deadline, "not within {within:?}: {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let owned_by = |n: u32| -> Vec<u32> {
+            placement(&rt, &*store)
+                .iter()
+                .filter(|(record, _)| record.owner == NodeId(n))
+                .map(|(record, _)| record.partition.0)
+                .collect()
+        };
+        /// Writes the stop file when dropped, so a failed assertion inside the scope ends every
+        /// node thread and the scope's join returns the panic instead of waiting forever.
+        struct StopOnDrop<'a>(&'a std::path::Path);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"");
+            }
+        }
+        let span = tracing::Span::current();
+        std::thread::scope(|scope| {
+            let _stop_on_panic = StopOnDrop(&stop);
+            let mut running: Vec<_> = (1..=3usize)
+                .map(|n| {
+                    let args = args_of(n);
+                    let store = Arc::clone(&store);
+                    let (rt, on_ready, span) = (&rt, &on_ready, &span);
+                    let bound = handed[n - 1].take();
+                    scope.spawn(move || {
+                        span.in_scope(|| serve_on_ready(&args, rt, store, bound, on_ready))
+                    })
+                })
+                .collect();
+            wait("every node is ready", Duration::from_secs(30), &mut || {
+                (1..=3).all(|n| ready_count(n) == 1)
+            });
+            let moving = owned_by(1);
+            assert_eq!(moving.len(), 4, "node 1 owns a third of 12");
+
+            std::fs::write(&faults[0], b"mute\ncut-control\n").expect("stop node 1");
+            wait(
+                "the first partition of node 1 moves",
+                Duration::from_secs(60),
+                &mut || owned_by(1).len() < moving.len(),
+            );
+            std::fs::write(&faults[0], b"").expect("resume node 1");
+            let first = running.remove(0);
+            wait(
+                "node 1's serve returns",
+                Duration::from_secs(90),
+                &mut || first.is_finished(),
+            );
+            let still = owned_by(1);
+            let served = first.join().expect("node 1's thread");
+            assert!(
+                matches!(
+                    served,
+                    Ok(Served::Restart(
+                        RestartReason::ReplaceStopped | RestartReason::HostFaulted
+                    ))
+                ),
+                "node 1 asks for a restart: {served:?}"
+            );
+            assert_eq!(
+                still,
+                Vec::<u32>::new(),
+                "node 1 owns none when it asked for a restart"
+            );
+            println!("own81_v10 node 1 served {served:?}");
+
+            // The supervisor's part: start node 1 again on its folder, at a new boot. The ended
+            // serve ran `Net::shutdown`, so nothing answers the peers at the old boot (#81).
+            // Its listener closes as its tasks wind down, so the address is bound again with a
+            // bounded retry, as `Rig::restart` does, and handed to the new serve.
+            let rebound = rt.block_on(async {
+                let deadline = Instant::now() + Duration::from_secs(5) * scale;
+                loop {
+                    match tokio::net::TcpListener::bind(&addrs[0]).await {
+                        Ok(listener) => break listener,
+                        Err(e) if Instant::now() < deadline => {
+                            tracing::debug!(error = %e, "own81_restart_bind_retry");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => panic!("node 1's address again: {e}"),
+                    }
+                }
+            });
+            let again = {
+                let args = args_of(1);
+                let store = Arc::clone(&store);
+                let (rt, on_ready, span) = (&rt, &on_ready, &span);
+                scope.spawn(move || {
+                    span.in_scope(|| serve_on_ready(&args, rt, store, Some(rebound), on_ready))
+                })
+            };
+            wait(
+                "node 1 is ready again",
+                Duration::from_secs(60),
+                &mut || ready_count(1) == 2,
+            );
+            wait(
+                "node 1 is a regular copy of every partition again",
+                Duration::from_secs(90),
+                &mut || {
+                    placement(&rt, &*store).iter().all(|(_, members)| {
+                        members.iter().any(|member| {
+                            member.node == NodeId(1) && member.role == ReplicaRole::RegularSecondary
+                        })
+                    })
+                },
+            );
+            std::fs::write(&stop, b"").expect("the stop file");
+            assert_eq!(
+                again.join().expect("node 1's second thread"),
+                Ok(Served::Stopped),
+                "node 1's new boot ends at the stop file, not with a second restart"
+            );
+            for (handle, n) in running.into_iter().zip(2..) {
+                assert_eq!(
+                    handle.join().expect("a node thread"),
+                    Ok(Served::Stopped),
+                    "node {n} ends cleanly"
+                );
+            }
+        });
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let nodes_saying = |message: &str| -> Vec<u64> {
+            let mut nodes: Vec<u64> = lines
+                .iter()
+                .filter(|line| line["@m"] == message)
+                .filter_map(|line| line["node"].as_u64())
+                .collect();
+            nodes.sort_unstable();
+            nodes
+        };
+        assert_eq!(
+            nodes_saying("rdb_node_listening"),
+            [1, 1, 2, 3],
+            "each serve logs into this row's file"
+        );
+        let mut held = nodes_saying("ownership_held");
+        held.dedup();
+        assert_eq!(
+            held,
+            [1, 2, 3],
+            "each node's ownership watcher logs into this row's file"
         );
     }
 
@@ -2104,7 +2624,7 @@ mod tests {
         .iter()
         .map(|a| (*a).to_owned())
         .collect();
-        let code = super::run(argv.into_iter(), |_| Ok(None));
+        let code = super::run(argv.into_iter(), |_| Ok(None), super::serve);
         assert_eq!(code, std::process::ExitCode::SUCCESS);
         let control = dir.join(rdb_api::net::certs::CONTROL_DIR);
         let loaded = rdb_api::net::certs::load_control(&control).expect("control/ loads");

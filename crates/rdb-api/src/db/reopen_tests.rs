@@ -471,6 +471,199 @@ impl ConfigStore for CasFault {
     }
 }
 
+// ---- #172 (PR #218 review, round 3): a failed re-plan's cause reaches `wait_ready` ----
+
+/// Where a [`ReplanReadFault`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplanStage {
+    /// Every call passes.
+    Off,
+    /// The next recovery CAS on `partitions/1` meets a conflict.
+    Armed,
+    /// The CAS met it; the next read of `partitions/1` (F1's, after the conflict) passes.
+    Conflicted,
+    /// Every read of `partitions/1` is refused from now on.
+    Refusing,
+}
+
+/// A `MemStore` that, once armed, makes the reopen's recovery CAS on `partitions/1` meet a
+/// conflict: it writes the record again unchanged first, so its revision moves past the fence's
+/// and nobody else owns it (`Blocked(CasContention)`). It lets F1's one read after that conflict
+/// through, then refuses every later read of `partitions/1` with `PermissionDenied`, an error
+/// no retry gets past: the first of them is the heal's re-plan's.
+struct ReplanReadFault {
+    inner: config_testkit::MemStore,
+    stage: Mutex<ReplanStage>,
+    /// Reads of `partitions/1` refused so far.
+    refused: AtomicU64,
+}
+
+impl ReplanReadFault {
+    fn new() -> Self {
+        Self {
+            inner: config_testkit::MemStore::new(),
+            stage: Mutex::new(ReplanStage::Off),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    fn stage(&self) -> ReplanStage {
+        *lock(&self.stage)
+    }
+}
+
+impl ConfigStore for ReplanReadFault {
+    fn get<'a, 'b>(
+        &'a self,
+        request: config_core::GetRequest,
+    ) -> Reply<'b, config_core::GetResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        if request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes() {
+            let mut stage = lock(&self.stage);
+            match *stage {
+                ReplanStage::Conflicted => *stage = ReplanStage::Refusing,
+                ReplanStage::Refusing => {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                    return Box::pin(std::future::ready(Err(
+                        config_core::ConfigError::PermissionDenied {
+                            detail: "scripted: the read was refused".to_owned(),
+                        },
+                    )));
+                }
+                ReplanStage::Off | ReplanStage::Armed => {}
+            }
+        }
+        self.inner.get(request)
+    }
+
+    fn list<'a, 'b>(
+        &'a self,
+        request: config_core::ListRequest,
+    ) -> Reply<'b, config_core::ListResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.list(request)
+    }
+
+    fn put<'a, 'b>(
+        &'a self,
+        request: config_core::PutRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let cas = request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes()
+                && request.expected_mod_revision != Some(0);
+            if cas && self.stage() == ReplanStage::Armed {
+                let found = self
+                    .inner
+                    .get(config_core::GetRequest {
+                        key: request.key.clone(),
+                    })
+                    .await?
+                    .record
+                    .expect("the reopen's CAS is over a record");
+                self.inner
+                    .put(config_core::PutRequest {
+                        key: request.key.clone(),
+                        value: found.value,
+                        expected_mod_revision: Some(found.mod_revision),
+                        dedup: None,
+                    })
+                    .await?;
+                *lock(&self.stage) = ReplanStage::Conflicted;
+            }
+            self.inner.put(request).await
+        })
+    }
+
+    fn delete<'a, 'b>(
+        &'a self,
+        request: config_core::DeleteRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.delete(request)
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn watch<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.watch(request)
+    }
+}
+
+/// PR #218 review, round 3 (thread kmMs): the reopen's heal hands node 1 its plan; the
+/// recovery CAS then meets a conflict on a record nobody else owns, so F1 blocks
+/// `CasContention` and the heal's watch plans it again. That re-plan's first read is refused
+/// with an error no retry gets past. Public `wait_ready` then answers `ReadyError::Heal` with
+/// that read's own words, not the block it left. `wait_ready` is called once the watch has
+/// logged `heal_replan_failed`, so its own owner reads cannot take F1's read.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: the watch's `HealState::Failed` update
+/// removed. Red: `Err(Blocked { owner: NodeId(1), reason: "CasContention" })`.
+/// Integration (~4 s): one fresh open until ready, one reopen.
+#[config_log::retcd_test]
+fn i172_a_wait_ready_reports_the_failed_replan_cause() {
+    const METHOD: &str = "i172_a_wait_ready_reports_the_failed_replan_cause";
+    let rt = runtime();
+    let faulty = Arc::new(ReplanReadFault::new());
+    let store: Arc<dyn ConfigStore> = faulty.clone();
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    *lock(&faulty.stage) = ReplanStage::Armed;
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + patience;
+    let logged = |message: &str| {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .count()
+    };
+    while logged("heal_replan_failed") == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-plan did not fail within {patience:?}: stage {:?}, heal {:?}, node 1 {:?}",
+            faulty.stage(),
+            db.heal_state(),
+            db.node_status().into_iter().next().map(|n| n.recovery)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(logged("heal_replan_after_conflict"), 1, "one re-plan");
+    assert_eq!(
+        faulty.refused.load(Ordering::Relaxed),
+        1,
+        "the re-plan's first read alone was refused, and not retried"
+    );
+    assert_eq!(
+        db.wait_ready(patience),
+        Err(ReadyError::Heal(admin::HealError::Control(
+            "get partitions/1: permission denied: scripted: the read was refused".to_owned()
+        )))
+    );
+    db.shutdown();
+}
+
 /// a=1 reads back, and a new write lands and reads back.
 fn reads_back_and_writes(db: &Db, case: &str) {
     let got = db
@@ -1399,6 +1592,10 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     let (owner, mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1408,6 +1605,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(move |_| Some(open)),
+        failover: false,
         owner_node: crate::admin::OWNER,
         partitions: vec![PARTITION],
         bootstrap: Vec::new(),
@@ -1504,6 +1702,10 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
     let (owner, _mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1513,6 +1715,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(|_| Some(BootId((1 << 16) + 1))),
+        failover: false,
         owner_node: crate::admin::OWNER,
         partitions: vec![PARTITION],
         bootstrap: Vec::new(),
@@ -3701,6 +3904,134 @@ fn m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart
         2,
         "nodes 2 and 3 opened as copies: {logged:?}"
     );
+}
+
+/// R5 side fixes: node 1's process opens alone, so its heal waits for nodes 2 and 3 and logs
+/// `heal_retry`. (1) That line lands in this row's own log file: the heal task runs in the span
+/// of the open that started it, not untagged. (2) `wait_ready`'s time-out names what the heal
+/// waits for, the `heal_retry` error, not only "none". Cuts: the heal task spawned without
+/// `instrument`: no `heal_retry` in this row's file, red at the wait for it; `wait_ready`'s
+/// `timed_out` leaves `heal_waiting` out: the text names no heal reason, red.
+/// Integration (~16 s): the first attempt must run out the heal's window (`heal_within`).
+#[config_log::retcd_test]
+fn r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why() {
+    const METHOD: &str = "r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut one = rt
+        .block_on(Db::open_with(
+            node_config(dir.path(), &[1]),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 1's process opens");
+    let window = heal_within(&fast());
+    let deadline =
+        std::time::Instant::now() + crate::host::test_patience(window + Duration::from_secs(10));
+    let retry = loop {
+        let found = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .find(|line| line["@m"] == "heal_retry");
+        if let Some(line) = found {
+            break line;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no heal_retry in this row's own log within {window:?} and patience"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let reason = retry["error"].as_str().expect("heal_retry names its error");
+    assert!(reason.contains("no link to node"), "{retry}");
+    let timed_out = one
+        .wait_ready(Duration::from_millis(300))
+        .expect_err("node 1 cannot heal alone");
+    assert!(
+        matches!(timed_out, ReadyError::TimedOut { .. }),
+        "{timed_out:?}"
+    );
+    let text = timed_out.to_string();
+    assert!(
+        text.contains(&format!("the reopen's heal is waiting: {reason}")),
+        "{text}"
+    );
+    one.shutdown();
+}
+
+/// PR #181 review questions 1 and 2: node processes share one folder, each with its own
+/// copy, so the OS boot marker is per copy (`nodes/<n>/os_boot`). After a reboot (copies on
+/// `boot-a`, the OS on `boot-b`), owner node 1's process opens and dies before it is ready;
+/// then node 3's process, which leads neither partition, is ready at once and records its own
+/// copy's boot. Node 1's marker stays absent, so its next open is `Unknown` and waits for every
+/// copy, never `Same`. Integration (~2 s): a fresh open, three node-process opens.
+/// Cut: one marker for the whole folder, at `config.dir`: node 3's ready stamps it and node
+/// 1's reopen reads `Same`, red.
+#[config_log::retcd_test]
+fn r5_o_a_node_that_leads_nothing_never_stamps_an_owners_os_boot() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(2),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    db.shutdown();
+    drop(db);
+    assert_eq!(admin::initial_owner(PartitionId(1)), NodeId(1));
+    assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
+    let copy = |node: u32| dir.path().join("nodes").join(node.to_string());
+    let marker = |node: u32| copy(node).join(crate::os_boot::OS_BOOT_FILE);
+    for node in 1..=3 {
+        crate::os_boot::record(&copy(node), "boot-a").expect("the marker is written");
+        crate::os_boot::inject(&copy(node), Ok("boot-b"));
+    }
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Changed)
+    );
+    owner.shutdown();
+    drop(owner);
+    assert!(!marker(1).exists(), "a reboot removes node 1's marker");
+
+    let mut third = open_node(&rt, dir.path(), &store, &[3]).expect("node 3's process opens");
+    third
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("node 3 leads nothing, so it is ready at once");
+    third.shutdown();
+    drop(third);
+    assert_eq!(
+        std::fs::read_to_string(marker(3))
+            .expect("node 3's marker")
+            .trim(),
+        "boot-b"
+    );
+    assert!(!marker(1).exists(), "node 3 never writes node 1's marker");
+    assert!(
+        !dir.path().join(crate::os_boot::OS_BOOT_FILE).exists(),
+        "no folder-wide marker"
+    );
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Unknown),
+        "node 1 waits for every copy"
+    );
+    owner.shutdown();
 }
 
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----
@@ -6110,5 +6441,255 @@ fn m10_r357_d1_an_owner_that_went_out_of_reach_mid_call_is_unavailable_not_a_hos
     assert!(
         local.contains("host fault: the owner dropped the call unanswered"),
         "{local}"
+    );
+}
+
+/// Issue #61: open a fresh folder, write until the owner's head is at least `writes`, trim every
+/// copy to `head - keep` (`Db::trim_history`), shut down and open the folder again. Answers the
+/// floor, after asserting that the reopen is ready, every copy reports it as `history_floor`
+/// before and after, a put lands, every key written reads back, and no inventory failed.
+#[cfg(debug_assertions)]
+fn trimmed_then_reopened(method: &str, writes: u64, keep: u64) -> u64 {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let patience = crate::host::test_patience(Duration::from_secs(10));
+    let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+    db.wait_ready(patience).expect("the fresh open is ready");
+    let applied = |db: &Db| -> Vec<u64> {
+        db.node_status()
+            .iter()
+            .map(|status| status.holds.map_or(0, |held| held.applied))
+            .collect()
+    };
+    let mut written = 0;
+    while applied(&db).first().copied().unwrap_or(0) < writes {
+        written += 1;
+        put_through_pauses(&db, format!("k{written}").as_bytes(), b"v", "a write");
+    }
+    let head = applied(&db).into_iter().max().expect("a node");
+    let deadline = Instant::now() + patience;
+    while applied(&db) != vec![head; 3] {
+        assert!(
+            Instant::now() < deadline,
+            "every copy applies {head}: {:?}",
+            applied(&db)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let through = head - keep;
+    for node in ALL_NODES {
+        assert_eq!(
+            db.trim_history(node, through),
+            Ok(through),
+            "node {}",
+            node.0
+        );
+    }
+    let floors = |db: &Db| -> Vec<u64> {
+        db.node_status()
+            .iter()
+            .map(|status| status.lengths.map_or(0, |lengths| lengths.history_floor))
+            .collect()
+    };
+    assert_eq!(floors(&db), vec![through; 3], "trimmed");
+    db.shutdown();
+    drop(db);
+
+    let db = open(&rt, dir.path(), &store).expect("the trimmed folder opens");
+    db.wait_ready(patience).expect("the reopen is ready");
+    put_through_pauses(&db, b"after", b"v", "a write after the reopen");
+    assert_eq!(
+        floors(&db),
+        vec![through; 3],
+        "the floor survives the reopen"
+    );
+    for key in (1..=written)
+        .map(|n| format!("k{n}"))
+        .chain(["after".to_owned()])
+    {
+        assert!(db.get(key.as_bytes()).is_ok(), "{key} reads back");
+    }
+    let failed = config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| line["@m"] == "inventory_failed")
+        .count();
+    assert_eq!(failed, 0, "every inventory answered");
+    through
+}
+
+/// Issue #61 S1-R1, every node (design section 2, A5): a trimmed folder opens again. 12 writes,
+/// every copy trimmed to `head - 4`, then the folder is shut down and opened again: every
+/// node restarts. Each copy reports its inventory from F (the root rung from its trim mark, then
+/// F through its head), the reopen is ready, a put lands, everything written reads back, and
+/// every copy reports `history_floor` F. The per-node restart, with the ladders read directly,
+/// is `host::catchup_tests::s1_r1_a_trimmed_trio_restarts_and_serves_with_its_ladders_at_the_floor`.
+/// Cut: `survivor` reads the base record below F (no mark branch), red (the reopen is not
+/// ready: `Blocked{NoEligibleRegular}`).
+/// Integration (~3-5 s): two opens.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r1_a_trimmed_folder_reopens_and_serves() {
+    let through = trimmed_then_reopened("s1_r1_a_trimmed_folder_reopens_and_serves", 12, 4);
+    assert!(through >= 8, "{through}");
+}
+
+/// Issue #61 S1-R10 cut (i) (design B1): an idle partition trimmed at its head, F = head, so the
+/// record at F is the only one kept. Every node restarts (the folder opens again), and the
+/// partition serves: the reopen's inventories prove the base from the mark and the record at F.
+/// Cut: the trim deletes `<= F` (the record at F too), red (the reopen is not ready:
+/// `Blocked{NoEligibleRegular}`).
+/// Integration (~3-5 s): two opens.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r10_i_an_idle_partition_trimmed_at_its_head_reopens_and_serves() {
+    trimmed_then_reopened(
+        "s1_r10_i_an_idle_partition_trimmed_at_its_head_reopens_and_serves",
+        3,
+        0,
+    );
+}
+
+/// Issue #61 (t4's #137 note, design rev 5): a roll-forward that skips every copy below its
+/// trim floor rolls none, and with the owner's copy here and empty the open is refused exactly
+/// as an empty owner is (`empty_owner`), never let through holding no copy. With a
+/// non-empty owner it is refused `Stale`, naming the generation no copy could take.
+///
+/// Function level, on the two halves the open runs (`Db::link_roll`, then `Db::unrolled` when
+/// it rolled none): a real open would need a store record ahead of copies 32 levels deep. Three
+/// writes, shut down; nodes 2 and 3 then link generations 2..=32 at the head (the depth
+/// ceiling) and are trimmed one below it. The roll takes 33 at that seq, so its copied inherit
+/// must undo the last write, which created its key, and proving the key absent before it needs
+/// History below the floor (`HistoryMissing{below_floor}`). Node 1's copy is emptied.
+/// Cut: `unrolled`'s empty-owner arm removed, red (`Stale`).
+/// Integration (~1 s): one open, then direct calls.
+#[config_log::retcd_test]
+fn t61_empty_owner_with_every_copy_below_floor_refuses_open() {
+    const METHOD: &str = "t61_empty_owner_with_every_copy_below_floor_refuses_open";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    {
+        let mut db = open(&rt, dir.path(), &store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        for key in [b"a", b"b", b"c"] {
+            put_through_pauses(&db, key, b"1", "a write");
+        }
+        db.shutdown();
+    }
+    let (record, root) = match rt
+        .block_on(partition_states(&store, 1))
+        .expect("the record")
+        .pop()
+    {
+        Some((_, PartitionState::Rooted(record, root))) => (record, root),
+        _ => panic!("partition 1 holds a rooted record"),
+    };
+    let top = u64::try_from(rdb_storage::MAX_CHAIN_DEPTH).expect("a small ceiling");
+    let nodes = dir.path().join("nodes");
+    let mut engines: BTreeMap<NodeId, RocksEngine> = BTreeMap::new();
+    let mut head = Seq::ZERO;
+    for node in [2, 3] {
+        let mut engine = RocksEngine::open(nodes.join(node.to_string())).expect("open copy");
+        head = Seq(engine.buffered_applied(PARTITION, record.generation).0);
+        for to in record.generation.0 + 1..=top {
+            engine
+                .inherit(PARTITION, Generation(to - 1), Generation(to), head)
+                .expect("link one level deeper");
+        }
+        engine
+            .stage_trim_history(
+                PARTITION,
+                Generation(top),
+                rdb_storage::TrimFloor {
+                    seq: Seq(head.0 - 1),
+                    root_base: Seq::ZERO,
+                    root_digest: rdb_core::contracts::digest::Digest::ROOT,
+                },
+            )
+            .expect("trimmed below the head");
+        engines.insert(NodeId(node), engine);
+    }
+    assert!(head > Seq(1), "a write below the head: {head:?}");
+    std::fs::remove_dir_all(nodes.join("1")).expect("empty the owner's copy");
+    engines.insert(
+        NodeId(1),
+        RocksEngine::open(nodes.join("1")).expect("the owner's empty copy"),
+    );
+    assert_eq!(record.owner, NodeId(1));
+    let roll = Roll {
+        count: admin::Count {
+            n: 1,
+            activated: record.generation,
+        },
+        revision: 0,
+        from: Generation(top),
+        to: Generation(top + 1),
+        base: Seq(head.0 - 1),
+        copies: vec![NodeId(2), NodeId(3)],
+        record,
+        root,
+    };
+    let rolled = Db::link_roll(&mut engines, dir.path(), PARTITION, &roll).expect("no fault");
+    assert!(
+        rolled.is_empty(),
+        "every copy is below its floor: {rolled:?}"
+    );
+    let skipped = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .into_iter()
+        .filter(|line| line["@m"] == "roll_forward_below_floor")
+        .count();
+    assert_eq!(skipped, 2);
+    let instance = root.instance;
+    let refused = rt.block_on(Db::unrolled(&engines, &store, &instance, &roll));
+    let expected = rt
+        .block_on(empty_owner(&store, &instance, &record, &root))
+        .expect_err("an emptied owner of a rolled lineage is refused");
+    assert_eq!(format!("{refused:?}"), format!("{expected:?}"));
+    assert!(!matches!(refused, OpenError::Stale { .. }), "{refused:?}");
+
+    // The owner's copy not empty: refused Stale, naming the generation.
+    let owner = engines.remove(&NodeId(1)).expect("node 1");
+    drop(owner);
+    let held = engines.remove(&NodeId(2)).expect("node 2's copy");
+    engines.insert(NodeId(1), held);
+    match rt.block_on(Db::unrolled(&engines, &store, &instance, &roll)) {
+        OpenError::Stale { generation, detail } => {
+            assert_eq!(generation, top + 1);
+            assert!(detail.contains("trimmed"), "{detail}");
+        }
+        other => panic!("Stale: {other:?}"),
+    }
+}
+
+/// #200 / PR #171 review: the reopen heal's task runs in the opener's span, so its lines land
+/// in the opener's own test file. Reopens a written folder; its owner heals, and that heal logs
+/// `heal_members` from the runtime task. Cut: `Db::start_heal` instruments the task with
+/// `Span::none()` in place of the opener's span; red at "a heal line in this test's file".
+/// Integration (~1 s): one fresh open, one reopen until ready.
+#[config_log::retcd_test]
+fn own200_the_reopen_heal_logs_into_the_openers_test_file() {
+    const METHOD: &str = "own200_the_reopen_heal_logs_into_the_openers_test_file";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+        .expect("the reopen is ready");
+    db.shutdown();
+    let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let names: std::collections::BTreeSet<_> = lines
+        .iter()
+        .filter_map(|line| line["@m"].as_str())
+        .collect();
+    assert!(
+        names.contains("db_heal_started"),
+        "the reopen heals: {names:?}"
+    );
+    assert!(
+        names.contains("heal_members"),
+        "a heal line in this test's file: {names:?}"
     );
 }

@@ -5,6 +5,9 @@ use super::trio::{
     current_thread, host_over, logged, write_chain, write_chain_after, write_chain_in, Trio,
 };
 use super::*;
+// `host.rs` imports `TrimFloor` only under `debug_assertions`, but these rows also build in
+// the gate's release check (`cargo check --release --tests`).
+use rdb_storage::TrimFloor;
 
 /// M9 serves only an empty copy, so a copy that holds anything must answer
 /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
@@ -288,7 +291,7 @@ fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
         if armed {
             host.engine
                 .inject_fault(rdb_storage::InjectedFault::WalFlush);
-            let outcome = host.land(Box::new(result), site, NodeId(3));
+            let outcome = host.land(Box::new(result), site, NodeId(3), false);
             assert!(
                 outcome
                     .as_ref()
@@ -297,7 +300,8 @@ fn a_link_that_cannot_be_synced_never_reaches_activate_through_land_link() {
             );
             assert_eq!(asked(&host), Generation::default(), "activate never ran");
         } else {
-            host.land(Box::new(result), site, NodeId(3)).expect("land");
+            host.land(Box::new(result), site, NodeId(3), false)
+                .expect("land");
             assert_eq!(
                 host.engine.link(PartitionId(1), Generation(2)),
                 Some(rdb_storage::Link {
@@ -340,7 +344,8 @@ fn a_copy_that_lands_outside_its_barrier_links_at_the_cutoff_and_reports_caught_
         .expect("node 2 is pinned")
         .copy;
     assert_eq!(
-        host.land_link(PartitionId(1), &result).expect("no fault"),
+        host.land_link(PartitionId(1), &result, false)
+            .expect("no fault"),
         Some(RecoveryEvent::CopyCaughtUp {
             copy,
             head: Seq(2),
@@ -389,7 +394,7 @@ fn a_copy_that_lands_outside_its_barrier_past_the_cutoff_or_off_its_digest_links
     let mut host = host_over(&path, &rt);
     let held = host.engine.lineages();
     for result in [&past, &off] {
-        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), result, false), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -433,7 +438,8 @@ fn a_copy_that_lands_outside_its_barrier_below_the_cutoff_links_at_its_own_head(
     let rt = current_thread();
     let mut host = host_over(&path, &rt);
     assert_eq!(
-        host.land_link(PartitionId(1), &result).expect("no fault"),
+        host.land_link(PartitionId(1), &result, false)
+            .expect("no fault"),
         None,
         "not caught up"
     );
@@ -494,7 +500,7 @@ fn a_landing_with_nothing_to_link_is_refused_by_name() {
     let mut holding = host_over(&path, &rt);
     let refuses = |host: &mut Host, result: &RecoveryResult| {
         let held = host.engine.lineages();
-        assert_eq!(host.land_link(PartitionId(1), result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), result, false), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         assert!(host
             .replication
@@ -548,7 +554,9 @@ fn m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root() {
     });
 
     let mut host = empty(root_dir.path());
-    let answered = host.land_link(PartitionId(1), &at_root).expect("no fault");
+    let answered = host
+        .land_link(PartitionId(1), &at_root, false)
+        .expect("no fault");
     assert!(
         matches!(
             answered,
@@ -576,7 +584,8 @@ fn m10_bb_69_a_copy_holding_nothing_lands_as_head_zero_at_the_root() {
 
     let mut host = empty(above_dir.path());
     assert_eq!(
-        host.land_link(PartitionId(1), &above).expect("no fault"),
+        host.land_link(PartitionId(1), &above, false)
+            .expect("no fault"),
         None,
         "behind the cutoff, not caught up"
     );
@@ -666,10 +675,13 @@ fn m10_s2_59_a_landing_whose_receiver_is_refused_faults_by_name() {
     }
     broken.committed.pinned_config.partition = PartitionId(9);
     let [(primary_host, _), (broken_host, _)] = &mut hosts;
-    assert_eq!(primary_host.land_link(PartitionId(1), &primary), Ok(None));
+    assert_eq!(
+        primary_host.land_link(PartitionId(1), &primary, false),
+        Ok(None)
+    );
     assert_eq!(logged!(METHOD, "land_receiver_primary").len(), 1);
     let fault = broken_host
-        .land_link(PartitionId(1), &broken)
+        .land_link(PartitionId(1), &broken, false)
         .expect_err("a refused receiver faults");
     assert!(
         fault
@@ -711,7 +723,7 @@ fn m10_s2_59_a_second_landing_in_one_boot_keeps_the_live_receiver() {
     for result in [&first, &second] {
         assert!(
             matches!(
-                host.land_link(PartitionId(1), result),
+                host.land_link(PartitionId(1), result, false),
                 Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
             ),
             "generation {} caught up at the cutoff",
@@ -826,7 +838,8 @@ fn m10_s2_59_a_post_commit_sync_before_the_landing_ends_the_re_sends() {
             );
             crate::host::drop_first_caught_up(&path);
         }
-        host.land(Box::new(result), site, NodeId(1)).expect("land");
+        host.land(Box::new(result), site, NodeId(1), false)
+            .expect("land");
         assert_eq!(
             host.caught_up_resends.len(),
             kept,
@@ -1412,32 +1425,48 @@ fn d7_a_catch_up_goes_to_its_source_and_reports_to_the_node_that_asked() {
     );
 }
 
-/// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired` on the primary is served from its
-/// engine, never by faulting the node. The first ask restores the primary's ladder at its
-/// generation and logs `snapshot_catchup_served` with every rung, root through the head; a
-/// repeat `(copy, barrier)` is dropped; a new ask at that generation logs
-/// `snapshot_catchup_unservable`; and a node that hosts no primary logs
-/// `snapshot_catchup_unserved{reason=no_primary}`. Before H2 every one of these faulted the
-/// node `host_unsupported: kernel_effect SnapshotCatchupRequired`.
-/// Cuts: the arm removed, red (a fault); the dedup removed, red (the repeat logs
-/// `unservable`); the ladder check removed, red (the new ask is served again).
+/// H2 (A-R223, A-R254; issue #61 lead ruling 1): R1's `SnapshotCatchupRequired` on the primary
+/// is served, never by faulting the node, by one of two branches. When the primary's ladder is
+/// thinner than its engine (its first rung above the engine's floor), the ladder is refilled
+/// from the engine and logged `snapshot_catchup_served{how = "ladder"}` with every rung, root
+/// through the head. Once it is dense, a new ask opens a snapshot transfer at the head
+/// (`snapshot_transfer_opened`): copy 2's second ask, at the same barrier, since a refill is
+/// never deduped. Its third reaches the open transfer and is dropped
+/// (`snapshot_catchup_in_flight{at = S}`, lead ruling 2), and a node that hosts no primary logs
+/// `snapshot_catchup_unserved{reason = no_primary}`.
+/// Cuts: the arm removed, red (a fault); the in-flight check removed, red (the third ask is
+/// deduped silently, no `in_flight` line); a refill deduped, red (the second ask is dropped, no transfer); the transfer
+/// branch always taken, red (the first ask opens a transfer).
 /// Integration (~2 s): bootstrap's discovery window, then direct calls.
 #[config_log::retcd_test]
-fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
+fn h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer() {
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), Trio::fast);
     trio.bootstrap();
     trio.ready();
     let head = trio.head().expect("node 1 holds a head");
+    let p = PartitionId(1);
+    // Thin the primary's ladder only: its engine still holds every record from the root.
+    let primary = &mut trio.nodes[0].0;
+    let rung = primary
+        .replication
+        .primary(NodeId(1), p)
+        .and_then(|primary| primary.tracker().history().digest_at(Seq(head)))
+        .expect("node 1's ladder holds its head");
+    primary
+        .replication
+        .trim_history(NodeId(1), p, Seq(head), rung)
+        .expect("thin the primary's ladder");
+    assert_eq!(super::trio::ladder_floor(primary), Some(Seq(head)));
     let site = Site {
-        partition: PartitionId(1),
+        partition: p,
         correlation: CorrelationId(u64::MAX),
     };
     let ask = |copy: u8, barrier: u64| KernelEffect::SnapshotCatchupRequired {
         copy: CopyId(copy),
         barrier: Seq(barrier),
     };
-    for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 3, head), (1, 3, head)] {
+    for (node, copy, barrier) in [(0, 2, head), (0, 2, head), (0, 2, head), (1, 3, head)] {
         let host = &mut trio.nodes[node].0;
         assert_eq!(
             host.kernel(
@@ -1453,39 +1482,31 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
         );
         assert_eq!(host.fault, None, "node {} faulted", host.node.0);
     }
-    let generation = trio.nodes[0]
-        .0
-        .replication
-        .primary(NodeId(1), PartitionId(1))
-        .expect("node 1 is primary")
-        .tracker()
-        .lineage()
-        .generation;
-    assert!(
-        trio.nodes[0]
-            .0
-            .primary_ladders
-            .contains(&(PartitionId(1), generation)),
-        "node 1's primary holds its ladder at generation {}",
-        generation.0
+    assert_eq!(
+        super::trio::ladder_floor(&trio.nodes[0].0),
+        Some(Seq::ZERO),
+        "the refill made node 1's ladder dense from the root"
     );
     let lines: Vec<_> = config_testkit::logs::lines_for_current_test(
         module_path!(),
-        "h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine",
+        "h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer",
     )
     .into_iter()
     .filter(|line| {
         line["@m"]
             .as_str()
-            .is_some_and(|m| m.starts_with("snapshot_catchup_"))
+            .is_some_and(|m| m.starts_with("snapshot_catchup_") || m == "snapshot_transfer_opened")
     })
     .map(|line| {
         (
             line["@m"].as_str().unwrap_or_default().to_owned(),
             line["node"].as_u64(),
             line["copy"].as_u64(),
-            line["rungs"].as_u64(),
-            line["reason"].as_str().map(str::to_owned),
+            line["rungs"].as_u64().or(line["at"].as_u64()),
+            line["how"]
+                .as_str()
+                .or(line["reason"].as_str())
+                .map(str::to_owned),
         )
     })
     .collect();
@@ -1497,13 +1518,20 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
                 Some(1),
                 Some(2),
                 Some(head + 1),
+                Some("ladder".to_owned())
+            ),
+            (
+                "snapshot_transfer_opened".to_owned(),
+                Some(1),
+                Some(2),
+                Some(head),
                 None
             ),
             (
-                "snapshot_catchup_unservable".to_owned(),
+                "snapshot_catchup_in_flight".to_owned(),
                 Some(1),
-                Some(3),
-                None,
+                Some(2),
+                Some(head),
                 None
             ),
             (
@@ -1514,7 +1542,12 @@ fn h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine() {
                 Some("no_primary".to_owned())
             ),
         ],
-        "served once, the repeat dropped, a new ask unservable, no primary unserved"
+        "refilled, then a transfer at the head, the third ask in flight, no primary unserved"
+    );
+    assert_eq!(
+        trio.nodes[0].0.transfers.keys().collect::<Vec<_>>(),
+        [&(p, CopyId(2))],
+        "node 1 holds copy 2's transfer only"
     );
 }
 
@@ -2094,6 +2127,75 @@ fn m11_a1_a_a_reopened_node_reads_its_first_ladder_from_the_base() {
     );
 }
 
+/// Issue #61 R26: node 2 holds generation 2 as a snapshot install leaves it: 6 records with no
+/// link (no parent) and its own trim mark at 4, rooted at `(4, digest 4)` (B1). Answers the
+/// host over it and the digests.
+fn installed_at_four(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> (Host, Vec<Digest>) {
+    let digests = {
+        let mut engine = RocksEngine::open(path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(2), 6);
+        engine
+            .stage_trim_history(
+                PartitionId(1),
+                Generation(2),
+                TrimFloor {
+                    seq: Seq(4),
+                    root_base: Seq(4),
+                    root_digest: digests[3],
+                },
+            )
+            .expect("the mark is staged");
+        digests
+    };
+    let host = host_over(path, rt);
+    assert_eq!(
+        host.engine.link(PartitionId(1), Generation(2)),
+        None,
+        "unlinked"
+    );
+    (host, digests)
+}
+
+/// Issue #61 R26 (i): a lineage a snapshot installed has no link, only its own trim mark at the
+/// barrier. A re-plan anchored at that barrier asks it for an inventory, and it answers, where
+/// it was refused `anchor_generation_unlinked`: the first re-plan after every snapshot rebuild
+/// then dropped the rebuilt copy as `Stalled` and committed `ReadOnly` again (R26, manual D1).
+/// Cut: the old `ok_or("anchor_generation_unlinked")` on the link, red.
+/// Unit.
+#[test]
+fn t61_r26_an_installed_lineage_answers_an_inventory_at_its_barrier() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 4, digests[3]), None);
+    assert!(answer.is_ok(), "{:?}", answer.err());
+}
+
+/// Issue #61 R26 (ii): an unlinked lineage answers only from its own mark's root up. Anchored
+/// at 2, below the mark's root at 4, it is still refused `anchor_generation_unlinked`.
+/// Cut: the root-base condition skipped, red (refused `base_below_floor` instead).
+/// Unit.
+#[test]
+fn t61_r26_an_unlinked_lineage_rooted_above_the_base_is_refused_unlinked() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 2, digests[1]), None);
+    assert_eq!(answer.err(), Some("anchor_generation_unlinked"));
+}
+
+/// Issue #61 R26 (iii): an unlinked lineage rooted at the base still proves the base by its
+/// digest there. Anchored at 4 with record 3's digest, it is refused `base_digest_differs`.
+/// Unit.
+#[test]
+fn t61_r26_an_unlinked_lineage_with_another_digest_at_the_base_is_refused() {
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let (mut host, digests) = installed_at_four(&dir.path().join("node"), &rt);
+    let answer = host.survivor(PartitionId(1), CopyId(1), anchor_at(2, 4, digests[2]), None);
+    assert_eq!(answer.err(), Some("base_digest_differs"));
+}
+
 /// Critic-s1b A2: `ladder_duty` warmed partitions in a fixed order, [`WARM_RUNGS`] records a
 /// pass across all of them, so while partition 1 had more to read than that, partition 2 was
 /// never reached. Here partition 1 holds two passes' worth and partition 2 holds 10 records:
@@ -2286,6 +2388,86 @@ fn u2_b1_a_target_restore_installs_a_receiver_holding_the_plan_and_its_cutoff() 
     assert_eq!(plan.cutoff, cutoff, "the plan carries the cutoff");
 }
 
+/// Issue #61: a held copy's offer hold (rev 5b) survives a refused combined
+/// forget-tail. `--through H --no-intact-copy --give-up-live-copy`, while the intact rule is
+/// not what holds the partition, is refused, and the owner's `needs_operator` still names the
+/// held copy: no hold was released, since no re-plan follows a refusal.
+/// Cut: the intact-rule check run after `offer_holds_released` (as at 67d028c), red
+/// (`needs_operator` is `None`).
+#[config_log::retcd_test]
+fn t61_pr204_a_refused_combined_forget_tail_keeps_the_held_copy_warning() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let cutoff = trio.nodes[0].0.committed[&p].selected.cutoff_seq;
+    let head = Seq(cutoff.0 + 3);
+    let owner = &mut trio.nodes[0].0;
+    owner.offer_holds.entry(p).or_default().insert(
+        CopyId(2),
+        crate::host::snapshot::OfferHold {
+            node: NodeId(3),
+            head,
+        },
+    );
+    let warning = owner.needs_operator(p).expect("the held copy is named");
+    let error = owner
+        .forget_tail_asked(
+            p,
+            TailRelease {
+                through: Some(head),
+                no_intact_copy: true,
+            },
+            true,
+        )
+        .expect_err("the intact rule does not hold the partition");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains("the intact rule is not what holds"),
+        "{error:?}"
+    );
+    assert_eq!(owner.needs_operator(p), Some(warning), "the warning stands");
+    assert!(!owner.rejoins.contains_key(&p), "no re-plan");
+}
+
+/// Issue #61: a `tail_held` refusal that arrives after its transfer ended (the
+/// writable re-plan cleared the transfer and the hold) records no hold: the owner's
+/// `needs_operator` stays `None` and `offer_hold_recorded` is not logged.
+/// Cut: the hold inserted whether or not the refusal matches the open transfer (as at
+/// 67d028c), red (a hold comes back).
+#[config_log::retcd_test]
+fn t61_pr204_a_late_tail_held_refusal_brings_no_hold_back() {
+    const METHOD: &str = "t61_pr204_a_late_tail_held_refusal_brings_no_hold_back";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let owner = &mut trio.nodes[0].0;
+    let committed = &owner.committed[&p];
+    let (generation, cutoff) = (committed.new_generation, committed.selected.cutoff_seq);
+    assert!(owner.transfers.is_empty(), "no transfer is open");
+    assert_eq!(owner.needs_operator(p), None);
+    owner.snapshot_refused_heard(&super::snapshot::SnapshotOfferRefused {
+        partition: p,
+        generation,
+        at: cutoff,
+        copy: CopyId(2),
+        node: NodeId(3),
+        reason: super::snapshot::SnapshotRefusal::TailHeld,
+        through: Some(Seq(cutoff.0 + 3)),
+        transfer: 1,
+    });
+    assert_eq!(owner.needs_operator(p), None, "no hold came back");
+    assert!(
+        owner.offer_holds.get(&p).is_none_or(BTreeMap::is_empty),
+        "{:?}",
+        owner.offer_holds
+    );
+    assert!(logged!(METHOD, "offer_hold_recorded").is_empty());
+}
+
 /// Issue #105 (design section 8.1): `admin forget-tail` on the owner. Each refusal is
 /// `no_mutation`, names why, and ends "nothing was given up": no flag; a node that is not the
 /// owner; `--through` at or below the cutoff; `--through` with no tail anywhere to give up; a
@@ -2406,6 +2588,66 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
     assert_eq!(refusals, 5, "node 1 refused five times");
 }
 
+/// Issue #61 (lead rulings R10 and R16): a tail whose adoption could not run because its history
+/// is trimmed is `Trimmed`. A bare `--through` over it is refused, and the refusal says the
+/// seqs cannot come back and names the whole command, `admin forget-tail --partition 1
+/// --through H --give-up-live-copy`; never "not checked". With the flag it is accepted. Both
+/// trimmed reasons map to `Trimmed` and need the flag. Planted on the owner's status.
+/// Cut: `TailAdoption::of` maps the trimmed reasons to `Refused`, red (the bare ask is accepted).
+#[config_log::retcd_test]
+fn t61_forget_tail_over_a_trimmed_tail_needs_the_flag_and_says_it_cannot_come_back() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let (before, cutoff) = {
+        let committed = &trio.nodes[0].0.committed[&p];
+        (committed.new_generation, committed.selected.cutoff_seq)
+    };
+    let head = Seq(cutoff.0 + 3);
+    let through = TailRelease {
+        through: Some(head),
+        no_intact_copy: false,
+    };
+    for reason in crate::host::ADOPTION_TRIMMED {
+        let adoption = TailAdoption::of::<()>(&Err(reason));
+        assert_eq!(adoption, TailAdoption::Trimmed(reason), "{reason}");
+        assert!(adoption.needs_give_up_flag(), "{reason}");
+    }
+    let owner = &mut trio.nodes[0].0;
+    owner.tail_refused.insert(
+        p,
+        TailRefused {
+            generation: before,
+            head,
+            base: cutoff,
+            reason: "tail_on_older_lineage",
+            adoption: TailAdoption::of::<()>(&Err("tail_below_floor")),
+        },
+    );
+    let error = owner
+        .forget_tail_asked(p, through, false)
+        .expect_err("a bare --through over a trimmed tail");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.starts_with(&format!(
+            "node 1 holds seqs {} to {} of partition 1; they cannot come back: the history \
+             needed to adopt them is trimmed. To give them up anyway, for good, run admin \
+             forget-tail --partition 1 --through {} --give-up-live-copy",
+            cutoff.0 + 1,
+            head.0,
+            head.0
+        )),
+        "{error:?}"
+    );
+    assert!(!error.detail.contains("not been checked"), "{error:?}");
+    let line = owner
+        .forget_tail_asked(p, through, true)
+        .expect("accepted with the flag");
+    assert!(line.contains("given up, for good"), "{line}");
+}
+
 /// Issue #105 unit 2 (lead ruling on the forget-tail narrowing, architect section 14 item 2):
 /// `--give-up-live-copy` is needed only for a live tail that could come back. Planted on the
 /// owner's status, one state at a time: `Adoptable`, `NotReady` and `Unchecked` each refuse a
@@ -2413,7 +2655,7 @@ fn issue105_forget_tail_refuses_by_name_and_re_plans_once_it_names_what_it_gives
 /// too, naming that member. A `Refused` tail alone (a failed proof, here `base_digest_differs`)
 /// is accepted with no flag, and the owner re-plans with the release.
 /// Cuts: every live tail needs the flag (unit 1's rule), red (the `Refused` ask is refused);
-/// `TailAdoption::could_return` true only for `Adoptable`, red (the `NotReady` ask is accepted).
+/// `TailAdoption::needs_give_up_flag` true only for `Adoptable`, red (the `NotReady` ask is accepted).
 #[config_log::retcd_test]
 fn u2_forget_tail_needs_the_live_copy_flag_only_for_a_tail_that_could_return() {
     const METHOD: &str =
@@ -3641,7 +3883,7 @@ fn u2_r7_8_a_tail_whose_set_aside_is_still_copying_is_not_ready_until_it_finishe
     let adoption = host.tail_refused.get(&p).map(|refused| refused.adoption);
     assert_eq!(adoption, Some(copying), "the inventory");
     assert!(!copying.is_adoptable(), "the repair holds");
-    assert!(copying.could_return(), "forget-tail needs the flag");
+    assert!(copying.needs_give_up_flag(), "forget-tail needs the flag");
 
     host.engine
         .inherit(p, Generation(2), Generation(3), Seq(2))
@@ -3858,8 +4100,9 @@ fn quarantine(receiver: &mut AppendReceiver, config: &PartitionConfig) {
 /// refuses `held_past_base`. In a commit that takes writes (`DegradedRf2`) the live receiver is
 /// removed, quarantined or not, and `land_receiver_dropped` names the reason, so the copy
 /// walks up from seq 1 rather than re-anchoring over a hole. In a `ReadOnly` commit the
-/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With `live_readd`
-/// off it stays unchanged. With it on (#107 slice 2a, row 31b) it is also marked refused at
+/// receiver stays, as the held tail does, with no `land_receiver_dropped`. With the owner's
+/// `live_readd` off (slice 2b: the flag `land_link` is handed) it stays unchanged. With it on
+/// (#107 slice 2a, row 31b) it is also marked refused at
 /// this generation (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused` per
 /// case), so its `Recovered` never anchors it below the cutoff: at the cutoff it holds, or at
 /// the root. Nothing links in any case.
@@ -3903,11 +4146,14 @@ fn issue107_a_refused_landing_drops_a_live_receiver_only_in_a_writable_commit() 
             quarantine(&mut receiver, &result.committed.pinned_config);
         }
         let mut host = host_over(&path, &rt);
-        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        let case = format!("{mode:?}, quarantined {quarantined}, live_readd {live}");
-        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None), "{case}");
+        let case = format!("{mode:?}, quarantined {quarantined}, owner_live_readd {live}");
+        assert_eq!(
+            host.land_link(PartitionId(1), &result, live),
+            Ok(None),
+            "{case}"
+        );
         assert_eq!(host.engine.lineages(), held, "{case}: nothing linked");
         let after = host.replication.receiver(NodeId(2), PartitionId(1));
         if mode == PartitionMode::ReadOnly {
@@ -4002,7 +4248,7 @@ fn issue107_a_linked_landing_keeps_a_live_receiver_only_at_the_linked_head() {
         host.replication.install_receiver(receiver.clone());
         assert!(
             matches!(
-                host.land_link(PartitionId(1), &result),
+                host.land_link(PartitionId(1), &result, false),
                 Ok(Some(RecoveryEvent::CopyCaughtUp { head: Seq(2), .. }))
             ),
             "{case}: linked and caught up"
@@ -4159,7 +4405,8 @@ fn issue107_a_landing_above_a_holed_head_refuses_and_writes_nothing() {
 /// holds generation 1 to seq 3 and a dormant receiver there (one restored to source a
 /// catch-up); the commit's cutoff is 2, so `land_at` refuses `held_past_base` in a commit that
 /// takes writes (`DegradedRf2`). The dormant receiver stays installed and no
-/// `land_receiver_dropped` is logged. Nothing links. With `live_readd` off it stays unchanged.
+/// `land_receiver_dropped` is logged. Nothing links. With the owner's `live_readd` off (slice
+/// 2b: the flag `land_link` is handed) it stays unchanged.
 /// With it on (#107 slice 2a) it is also marked refused at generation 2
 /// (`AppendReceiver::refuse_landing`, one `land_receiver_marked_refused`). Generation 2's own
 /// `Recovered` does not read that mark: `Replication::recovered` removes a dormant receiver
@@ -4201,10 +4448,9 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
     assert!(receiver.is_dormant());
     for live in [false, true] {
         let mut host = host_over(&path, &rt);
-        host.live_readd.on = live;
         host.replication.install_receiver(receiver.clone());
         let held = host.engine.lineages();
-        assert_eq!(host.land_link(PartitionId(1), &result), Ok(None));
+        assert_eq!(host.land_link(PartitionId(1), &result, live), Ok(None));
         assert_eq!(host.engine.lineages(), held, "nothing linked");
         let mut kept = receiver.clone();
         if live {
@@ -4236,7 +4482,8 @@ fn issue107_a_refused_writable_landing_keeps_a_dormant_receiver() {
 /// #107 slice 2a review, round 3: the round-2 question (an earlier barrier and a later refused
 /// `ReadOnly` landing in one due batch, over a dormant receiver) through the host's own wiring,
 /// with no mark set by hand. Node 2 holds generation 1 at seqs 3 to 5 only, holed below 5, and
-/// a dormant receiver there, with `live_readd` on. Two `Landed` messages arrive and fall due in
+/// a dormant receiver there, and both `Landed` messages carry the owner's `live_readd` on
+/// (slice 2b; node 2's own setting stays off). They arrive and fall due in
 /// one `run_due`: generation 2, whose barrier node 2 is in, at cutoff 5 (`inherit` links it),
 /// then generation 3, `ReadOnly`, not in its barrier, at cutoff 7. `land_link` refuses 3
 /// `from_has_no_floor` (check B: 2 is linked onto the holed 1) and marks the dormant receiver,
@@ -4300,7 +4547,6 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
         RecoveryBarrier::try_new(&[], &BTreeSet::new(), Seq(7), Digest([7; 32])).expect("empty");
 
     let mut host = host_over(&path, &rt);
-    host.live_readd.on = true;
     let dormant = AppendReceiver::dormant(receiver_init(&barrier, 1, at_five), Revision(1))
         .expect("a dormant receiver");
     host.replication.install_receiver(dormant);
@@ -4312,6 +4558,7 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
             correlation: CorrelationId(0),
             emitter: NodeId(1),
             not_before: now,
+            owner_live_readd: true,
         });
     }
     host.run_due();
@@ -4356,6 +4603,172 @@ fn issue107_r3_a_dormant_receivers_mark_outlives_an_earlier_barrier_in_the_same_
         ),
         "generation 3's Recovered anchors it at the root, not at seq 5"
     );
+}
+
+/// #107 slice 2b: a copy marks a refused landing by the committing owner's setting, carried on
+/// the `Landed`, not by its own. Node 2 holds generation 1 to seq 3 and a live receiver there;
+/// a `ReadOnly` landing at cutoff 2, outside its barrier, is refused `held_past_base`. Each of
+/// the four (owner's flag on the `Landed`, node 2's own `live_readd`) cases goes through
+/// `Host::handle` and `run_due`, so the `Delayed::Landing` hop is in the path. The receiver is
+/// marked refused, with one `land_receiver_marked_refused`, exactly when the owner's flag is
+/// on, whatever node 2's own setting.
+/// Cuts: `land_link` reads `self.live_readd.on`, red (owner on, own off: no mark); either
+/// setting marks, red (owner off, own on: a mark); `Delayed::Landing` or `land` drops the flag
+/// for a constant, red.
+/// Unit, under a second here (one trio bootstrap, for the commit it lands).
+#[config_log::retcd_test]
+fn issue107_a_copy_marks_a_refused_landing_by_the_owners_setting_not_its_own() {
+    const METHOD: &str =
+        "issue107_a_copy_marks_a_refused_landing_by_the_owners_setting_not_its_own";
+    use rdb_core::contracts::recovery::RecoveryBarrier;
+    let rt = current_thread();
+    let mut landing: Option<RecoveryResult> = None;
+    for (owner, own) in [(false, false), (false, true), (true, false), (true, true)] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = write_chain(
+            &mut RocksEngine::open(&path).expect("open engine"),
+            Generation(1),
+            3,
+        );
+        let result = landing
+            .get_or_insert_with(|| {
+                let mut result = landing_at(2, digests[1]);
+                result.mode = PartitionMode::ReadOnly;
+                result.barrier =
+                    RecoveryBarrier::try_new(&[], &BTreeSet::new(), Seq(2), digests[1])
+                        .expect("empty");
+                result
+            })
+            .clone();
+        let receiver = live_receiver(
+            &result,
+            1,
+            Head {
+                seq: Seq(3),
+                digest: digests[2],
+            },
+        );
+        let mut host = host_over(&path, &rt);
+        host.live_readd.on = own;
+        host.replication.install_receiver(receiver.clone());
+        let case = format!("owner_live_readd {owner}, own live_readd {own}");
+        let before = logged!(METHOD, "land_receiver_marked_refused").len();
+        let now = host.clock.now();
+        host.handle(Msg::Landed {
+            result: Box::new(result.clone()),
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+            emitter: NodeId(1),
+            not_before: now,
+            owner_live_readd: owner,
+        });
+        host.run_due();
+        assert_eq!(host.fault, None, "{case}");
+        let mut kept = receiver.clone();
+        if owner {
+            kept.refuse_landing(result.new_generation);
+        }
+        assert_eq!(
+            host.replication.receiver(NodeId(2), PartitionId(1)),
+            Some(&kept),
+            "{case}: marked only by the owner's setting"
+        );
+        assert_eq!(
+            logged!(METHOD, "land_receiver_marked_refused").len() - before,
+            usize::from(owner),
+            "{case}"
+        );
+    }
+    let refused: Vec<_> = logged!(METHOD, "land_link_refused")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        refused,
+        ["held_past_base"; 4].map(serde_json::Value::from),
+        "every case refused"
+    );
+}
+
+/// #107 slice 2b: the `Landed` carries the committing owner's setting, and a re-post relays it.
+/// Node 1, the owner, runs with `live_readd` `owner`; node 3 with the other value. Node 1's
+/// fan-out of its bootstrap commit reaches node 3, which keeps the flag beside the root it
+/// landed. Node 3's `CopyAheadOnControl` for node 2's copy then re-posts that root, and the
+/// `Landed` node 2 receives carries node 1's value, not node 3's. Both ways round.
+/// Cuts: the fan-out stamps a constant, red (one orientation); `copy_ahead` stamps
+/// `self.live_readd.on`, red (both); `land` stores a constant beside `committed`, red.
+/// Integration (~4 s): two trio bootstraps.
+#[config_log::retcd_test]
+fn issue107_the_fanout_and_a_repost_carry_the_committing_owners_setting() {
+    for owner in [true, false] {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.nodes[0].0.live_readd.on = owner;
+        trio.nodes[2].0.live_readd.on = !owner;
+        trio.bootstrap();
+        trio.ready();
+        let committed = trio.nodes[0].0.committed[&PartitionId(1)].new_generation;
+        trio.until("node 3 landed node 1's commit", |trio| {
+            trio.nodes[2]
+                .0
+                .committed
+                .get(&PartitionId(1))
+                .filter(|result| result.new_generation == committed)
+                .map(|_| ())
+        });
+        assert_eq!(
+            trio.nodes[2].0.committed_correlation[&PartitionId(1)].1,
+            owner,
+            "owner {owner}: node 3 kept the fan-out's flag"
+        );
+        let copy = trio.nodes[0].0.committed[&PartitionId(1)]
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| member.node == NodeId(2))
+            .expect("node 2 is a member")
+            .copy;
+        // Node 2's mailbox is drained now, so a `Landed` in it later is the re-post.
+        while let Ok(msg) = trio.nodes[1].2.try_recv() {
+            trio.nodes[1].0.handle(msg);
+        }
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(u64::MAX),
+        };
+        let host = &mut trio.nodes[2].0;
+        assert_eq!(
+            host.kernel(
+                ModuleName::Replication,
+                &KernelEffect::CopyAheadOnControl { copy },
+                site,
+                &[],
+                &StepFences::default(),
+            ),
+            Ok(()),
+            "owner {owner}"
+        );
+        assert_eq!(host.fault, None, "owner {owner}: node 3 faulted");
+        let mut landed = Vec::new();
+        while let Ok(msg) = trio.nodes[1].2.try_recv() {
+            if let Msg::Landed {
+                result,
+                emitter,
+                owner_live_readd,
+                ..
+            } = msg
+            {
+                landed.push((emitter, result.new_generation, owner_live_readd));
+            }
+        }
+        assert_eq!(
+            landed,
+            [(NodeId(3), committed, owner)],
+            "owner {owner}: node 3's re-post relays node 1's setting"
+        );
+    }
 }
 
 /// Generation 1 of partition 1 at `path`, seqs 1 to 3, with the stored `History` value at seq 1
@@ -4495,6 +4908,1022 @@ fn issue107_an_inventory_whose_floor_read_fails_refuses_and_writes_nothing() {
         })
         .collect();
     assert_eq!(logged, [(1.into(), 1.into(), true)]);
+}
+
+// ------------------------------------------------------------------ issue #61 (A5) rows
+
+/// Issue #61: trim `generation`'s History on `engine` to `seq`, rooted at `(0, ROOT)`, as the
+/// host's trim stages it. The record at `seq` is kept.
+fn trimmed_to(engine: &mut RocksEngine, generation: Generation, seq: u64) {
+    trimmed_at(engine, generation, seq, (0, Digest::ROOT));
+}
+
+/// [`trimmed_to`], with the mark rooted at `(root_base, root_digest)`.
+fn trimmed_at(engine: &mut RocksEngine, generation: Generation, seq: u64, root: (u64, Digest)) {
+    engine
+        .stage_trim_history(
+            PartitionId(1),
+            generation,
+            TrimFloor {
+                seq: Seq(seq),
+                root_base: Seq(root.0),
+                root_digest: root.1,
+            },
+        )
+        .expect("the trim is staged");
+}
+
+/// Issue #61 (t4's note, design rev 5): check B after a trim. Generation 1 holds seqs 1-6,
+/// trimmed to 4: seqs 4-6 are kept and 1-3 are gone. `has_floor` reads the record at the floor
+/// and finds it, so the trimmed lineage passes check B: a landing of 2 at base 6 links onto it,
+/// as does a missed generation 2 asked of an inventory at base 6.
+/// Cut: `has_floor` reads seq 1 (not the floor), red (`Ok(false)`, the landing refused
+/// `from_has_no_floor`). Unit.
+#[config_log::retcd_test]
+fn t61_trimmed_lineage_passes_check_b() {
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 6);
+        trimmed_to(&mut engine, Generation(1), 4);
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(4));
+    assert_eq!(
+        host.has_floor(p, Generation(1)),
+        Ok(true),
+        "the record at F reads"
+    );
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 6, digests[5])),
+        Ok((Generation(1), Seq(6), digests[5])),
+        "a landing links onto the trimmed lineage"
+    );
+}
+
+/// Issue #61 S1-R3: check B after a trim, both paths and the hole. Generation 1 trimmed to 4
+/// (seqs 4-6 kept): the landing (`land_at`) and the missed link (`inherit_missed_link`, through
+/// an inventory) both pass. A lineage whose floor is 4 and which holds only 5-6, the record at
+/// F missing, is refused `from_has_no_floor` by the landing and
+/// `missed_generation_from_has_no_floor` by the inventory, and nothing is written.
+/// The design's damaged record is a written hole here: `damage_record` leaves a record that
+/// still reads as a value, which is the read-error arm's case, not a hole at F.
+/// Cut: `has_floor` reads seq 1, red (both passing cases refused). Unit.
+#[config_log::retcd_test]
+fn s1_r3_check_b_after_a_trim_links_and_a_hole_at_the_floor_refuses() {
+    const METHOD: &str = "s1_r3_check_b_after_a_trim_links_and_a_hole_at_the_floor_refuses";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    // The trimmed lineage: a landing links, and so does a missed generation.
+    for path_of in ["land", "inventory"] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 6);
+            trimmed_to(&mut engine, Generation(1), 4);
+            digests
+        };
+        let mut host = host_over(&path, &rt);
+        if path_of == "land" {
+            assert_eq!(
+                host.land_at(p, anchor_at(2, 6, digests[5])),
+                Ok((Generation(1), Seq(6), digests[5]))
+            );
+        } else {
+            let answer = host.inventory(p, CopyId(1), anchor_at(2, 6, digests[5]), None, None);
+            assert!(
+                matches!(&answer, RecoveryEvent::InventoryReported(inventory)
+                    if inventory.head == (Seq(6), digests[5])),
+                "the missed generation links onto the trimmed lineage: {answer:?}"
+            );
+            assert!(
+                host.engine.lineages().contains(&(p, Generation(2))),
+                "generation 2 linked"
+            );
+        }
+    }
+
+    // The record at F missing: seqs 5-6 only, floor 4.
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain_after(&mut engine, Generation(1), vec![Digest::ROOT; 4], 2);
+        trimmed_to(&mut engine, Generation(1), 4);
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    let held = host.engine.lineages();
+    assert_eq!(
+        host.land_at(p, anchor_at(2, 6, digests[5])),
+        Err("from_has_no_floor")
+    );
+    assert_eq!(
+        host.inventory(p, CopyId(1), anchor_at(2, 6, digests[5]), None, None),
+        RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+    );
+    assert_eq!(host.engine.lineages(), held, "nothing linked");
+    let failed: Vec<_> = logged!(METHOD, "inventory_failed")
+        .into_iter()
+        .map(|line| line["reason"].clone())
+        .collect();
+    assert_eq!(
+        failed,
+        [serde_json::Value::from(
+            "missed_generation_from_has_no_floor"
+        )]
+    );
+}
+
+/// Issue #61 (design rev 4 m-e): `survivor` takes its root rung from a trim mark only when the
+/// mark is the anchor's own generation's and its `root_base` is the anchor's base.
+/// * Own mark: generation 1 holds seqs 1-3, generation 2 is linked onto it at 3 and holds 4-8,
+///   trimmed to 5 at root `(3, d3)`. An anchor at generation 2, base 3, answers: its ladder is
+///   the root rung `(3, d3)` and then the kept records 5-8.
+/// * The same, trimmed at root `(0, ROOT)`: the mark is not rooted at the anchor's base:
+///   `base_below_floor`, never `base_digest_differs`.
+/// * Parent mark: generation 1 holds seqs 1-6, trimmed to 5 at root `(3, d3)`, and generation 2
+///   is linked onto it at 6 (an adopted tail's link, above the anchor's base 3). The mark that
+///   cuts generation 2 is its parent's: `base_below_floor`.
+///
+/// Cut: drop the generation check (`level != generation`), red (the parent mark answers).
+/// Unit.
+#[config_log::retcd_test]
+fn t61_survivor_refuses_a_parent_mark() {
+    let p = PartitionId(1);
+    let rt = current_thread();
+    for root_base in [3, 0] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        let digests = {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            let digests = write_chain(&mut engine, Generation(1), 3);
+            engine
+                .inherit(p, Generation(1), Generation(2), Seq(3))
+                .expect("link generation 2 at 3");
+            let digests = write_chain_after(&mut engine, Generation(2), digests, 5);
+            let root_digest = if root_base == 3 {
+                digests[2]
+            } else {
+                Digest::ROOT
+            };
+            trimmed_at(&mut engine, Generation(2), 5, (root_base, root_digest));
+            digests
+        };
+        let mut host = host_over(&path, &rt);
+        assert_eq!(
+            host.engine.floor(p, Generation(2)).map(|(level, _)| level),
+            Some(Generation(2))
+        );
+        let answer = host.survivor(p, CopyId(1), anchor_at(2, 3, digests[2]), None);
+        if root_base == 3 {
+            let own = answer.expect("its own mark at its base");
+            assert_eq!(own.head, (Seq(8), digests[7]));
+            assert_eq!(
+                own.ladder,
+                [
+                    (Seq(3), digests[2]),
+                    (Seq(5), digests[4]),
+                    (Seq(6), digests[5]),
+                    (Seq(7), digests[6]),
+                    (Seq(8), digests[7]),
+                ]
+            );
+        } else {
+            assert_eq!(
+                answer.map(|_| ()),
+                Err("base_below_floor"),
+                "rooted elsewhere"
+            );
+        }
+    }
+
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let digests = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let digests = write_chain(&mut engine, Generation(1), 6);
+        trimmed_at(&mut engine, Generation(1), 5, (3, digests[2]));
+        engine
+            .inherit(p, Generation(1), Generation(2), Seq(6))
+            .expect("link generation 2 at 6");
+        digests
+    };
+    let mut host = host_over(&path, &rt);
+    assert_eq!(
+        host.engine.floor(p, Generation(2)).map(|(level, _)| level),
+        Some(Generation(1)),
+        "generation 2 reads under its parent's mark"
+    );
+    assert_eq!(
+        host.survivor(p, CopyId(1), anchor_at(2, 3, digests[2]), None)
+            .map(|_| ()),
+        Err("base_below_floor")
+    );
+}
+
+/// Issue #61 (design rev 4 m-a, N4; rev 5e): a probe is answered in the generation of the
+/// anchor it names, never in a newer one this copy landed since. Generation 1 holds seqs 1-6;
+/// generation 2 takes it at seq 4 and holds its own 5 and 6, whose digests differ from
+/// generation 1's, and is trimmed to 3.
+/// * Generation 1 at seq 6: generation 1's digest. Generation 2 at seq 6: generation 2's.
+/// * Generation 2 at seq 2 (below its floor) and generation 1 at seq 7 (above its head):
+///   `ProbeUnavailable`.
+/// * Generation 3, not held: no answer, `probe_unanswered{anchor_generation_not_held}`.
+///
+/// Cut: answer from the newest held generation, red (generation 1's seq 6 answered with 2's).
+/// Unit.
+#[config_log::retcd_test]
+fn t61_probe_is_answered_in_the_pinned_generation() {
+    const METHOD: &str = "t61_probe_is_answered_in_the_pinned_generation";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    let dir = config_testkit::fs::temp_dir();
+    let path = dir.path().join("node");
+    let (one, two) = {
+        let mut engine = RocksEngine::open(&path).expect("open engine");
+        let one = write_chain(&mut engine, Generation(1), 6);
+        engine
+            .inherit(p, Generation(1), Generation(2), Seq(4))
+            .expect("generation 2 at 4");
+        let two = write_chain_after(&mut engine, Generation(2), one[..4].to_vec(), 2);
+        trimmed_to(&mut engine, Generation(2), 3);
+        (one, two)
+    };
+    assert_ne!(one[5], two[5], "the generations differ at seq 6");
+    let host = host_over(&path, &rt);
+    let probe = |generation: u64, seq: u64| {
+        host.probe(
+            p,
+            CopyId(1),
+            anchor_at(generation, 0, Digest::ROOT),
+            Seq(seq),
+        )
+    };
+    assert_eq!(
+        probe(1, 6),
+        Some(RecoveryEvent::ProbeAnswered {
+            copy: CopyId(1),
+            seq: Seq(6),
+            digest: one[5]
+        })
+    );
+    assert_eq!(
+        probe(2, 6),
+        Some(RecoveryEvent::ProbeAnswered {
+            copy: CopyId(1),
+            seq: Seq(6),
+            digest: two[5]
+        })
+    );
+    for (generation, seq) in [(2, 2), (1, 7)] {
+        assert_eq!(
+            probe(generation, seq),
+            Some(RecoveryEvent::ProbeUnavailable {
+                copy: CopyId(1),
+                seq: Seq(seq)
+            }),
+            "generation {generation} holds no record at {seq}"
+        );
+    }
+    assert_eq!(probe(3, 6), None, "generation 3 is not held");
+    let unanswered: Vec<_> = logged!(METHOD, "probe_unanswered")
+        .into_iter()
+        .map(|line| (line["generation"].clone(), line["reason"].clone()))
+        .collect();
+    assert_eq!(
+        unanswered,
+        [(3.into(), "anchor_generation_not_held".into())]
+    );
+}
+
+/// Issue #61 (design rev 4 m-c): after boot a copy is not trimmed until it has adopted the
+/// partition's newest lineage, or the inventory pin's time has passed. Generation 1 holds seqs
+/// 1-6, trimmed to 2 before this boot. The restarted host refuses a trim to 4
+/// `inventory_pinned` (logged `history_trim_pinned`) and the floor stays 2. Once it lands a
+/// newer generation the pin is released and the same trim goes on; on a second host the pin
+/// expires instead (`inventory_pin_expired`) and the trim goes on too.
+/// Cut: `Host::new` seeds no boot pin, red (the first trim goes on). Unit.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_restarted_holder_does_not_trim_before_adopting() {
+    const METHOD: &str = "t61_a_restarted_holder_does_not_trim_before_adopting";
+    let p = PartitionId(1);
+    let rt = current_thread();
+    for release in ["landed", "expired"] {
+        let dir = config_testkit::fs::temp_dir();
+        let path = dir.path().join("node");
+        {
+            let mut engine = RocksEngine::open(&path).expect("open engine");
+            write_chain(&mut engine, Generation(1), 6);
+            trimmed_to(&mut engine, Generation(1), 2);
+        }
+        let mut host = host_over(&path, &rt);
+        assert_eq!(
+            host.trim_history_through(p, Seq(4)),
+            Err("inventory_pinned".to_owned()),
+            "{release}: pinned after boot"
+        );
+        assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(2));
+        if release == "landed" {
+            host.landed.insert((p, Generation(2)));
+        } else {
+            host.inventory_pin_millis = 0;
+        }
+        assert_eq!(
+            host.trim_history_through(p, Seq(4)),
+            Ok(Seq(4)),
+            "{release}: released"
+        );
+        assert_eq!(host.engine.floor_seq(p, Generation(1)), Seq(4));
+    }
+    assert_eq!(logged!(METHOD, "history_trim_pinned").len(), 2);
+    assert_eq!(logged!(METHOD, "inventory_pin_expired").len(), 1);
+    assert_eq!(logged!(METHOD, "host_history_trimmed").len(), 2);
+}
+
+/// Issue #61 S2 (A8a, lead ruling 1, the transfer branch): a primary trimmed to its head holds a
+/// ladder as dense as its engine, so R1's `SnapshotCatchupRequired` for node 3's copy opens a transfer
+/// at its applied seq `S` (`snapshot_transfer_opened{at = S, floor = F}`) and refills nothing.
+/// While it is open the transfer pins `S`: with node 3's links held, two more puts land and a
+/// trim past `S` is refused `transfer_pinned` (`history_trim_transfer_pinned{pin = S}`). Then
+/// the heal ends the transfer one of two ways, whichever lands first: the offer reaches copy 3,
+/// which already applied `S` and refuses `not_ahead` (`why = refused`), or R1's cursor sends it
+/// the two puts and its `CopyCaughtUp` releases the pin (`why = caught_up`). Either way the
+/// transfer is released once and the same trim goes through. Accepting either ending is sound
+/// only because S2-R5 (`t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched`)
+/// pins the `not_ahead` refusal on its own; drop that row and this one must pin it.
+/// Replaces A5's `t61_a_trimmed_copy_behind_the_floor_is_refused_below_floor`, whose refusal
+/// A8a deletes.
+/// Cuts: the refill branch always taken, red (no transfer); the pin ignored, red (the trim
+/// past `S` lands); the transfer never released, red (the trim stays pinned).
+/// Integration (~3 s): bootstrap's discovery window, a hold and a heal.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_a_trimmed_primary_opens_a_transfer_and_pins_its_seq() {
+    const METHOD: &str = "t61_a_trimmed_primary_opens_a_transfer_and_pins_its_seq";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    let p = PartitionId(1);
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    assert_eq!(
+        super::trio::trim(&mut trio, 0, head),
+        Ok(Seq(head)),
+        "node 1 trimmed to its head"
+    );
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    let site = Site {
+        partition: p,
+        correlation: CorrelationId(u64::MAX),
+    };
+    let host = &mut trio.nodes[0].0;
+    assert_eq!(
+        host.kernel(
+            ModuleName::Replication,
+            &KernelEffect::SnapshotCatchupRequired {
+                copy: three,
+                barrier: Seq(head),
+            },
+            site,
+            &[],
+            &StepFences::default(),
+        ),
+        Ok(())
+    );
+    assert_eq!(host.fault, None);
+    assert!(
+        host.transfers.contains_key(&(p, three)),
+        "a transfer opened"
+    );
+    for request in 4..=5 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let past = trio.head().expect("node 1 holds a head");
+    assert!(past > head, "the puts moved the head past S");
+    assert_eq!(
+        super::trio::trim(&mut trio, 0, past),
+        Err("transfer_pinned".to_owned()),
+        "a trim past S is refused while the transfer is open"
+    );
+    trio.links.heal_all();
+    trio.until("the refusal frees the pin", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(p, three))).then_some(())
+    });
+    assert_eq!(super::trio::trim(&mut trio, 0, past), Ok(Seq(past)));
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(
+        (&opened[0]["copy"], &opened[0]["at"], &opened[0]["floor"]),
+        (
+            &serde_json::json!(three.0),
+            &serde_json::json!(head),
+            &serde_json::json!(head)
+        )
+    );
+    assert!(
+        logged!(METHOD, "snapshot_catchup_served").is_empty(),
+        "nothing refilled"
+    );
+    let pinned = logged!(METHOD, "history_trim_transfer_pinned");
+    assert_eq!(pinned.len(), 1, "{pinned:?}");
+    assert_eq!(pinned[0]["pin"], head);
+    let released = logged!(METHOD, "snapshot_transfer_released");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert!(
+        released[0]["why"] == "refused" || released[0]["why"] == "caught_up",
+        "{released:?}"
+    );
+    for refused in logged!(METHOD, "snapshot_offer_refused") {
+        assert_eq!(refused["reason"], "not_ahead", "{refused:?}");
+    }
+}
+
+/// Issue #61: put on whichever trio node admits writes (as `Db` routes a put to the owner)
+/// until one lands, retrying any refusal (a pause, a re-plan) for [`Trio::PATIENCE`]. Answers
+/// the head that node holds after it.
+#[cfg(debug_assertions)]
+pub(super) fn lands(trio: &mut Trio, request: u64) -> u64 {
+    let patience = test_patience(Trio::PATIENCE);
+    let deadline = Instant::now() + patience;
+    loop {
+        let owner = (0..trio.nodes.len()).find(|at| trio.status(*at).admits == Some(true));
+        if let Some(at) = owner {
+            let (reply, answer) = mpsc::channel();
+            trio.nodes[at]
+                .1
+                .send(Msg::Client(Client {
+                    partition: PartitionId(1),
+                    call: super::seal_tests::put(request, b"k", 2_000),
+                    reply,
+                }))
+                .expect("the node's mailbox");
+            if matches!(trio.answer(&answer), Answer::Txn { .. }) {
+                return trio.status(at).holds.map_or(0, |held| held.applied);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no put landed within {patience:?}"
+        );
+        for _ in 0..20 {
+            trio.step();
+        }
+    }
+}
+
+/// Issue #61 Trio rows: `note_tests::tune` on the regular rejoin path (no restart shadow).
+#[cfg(debug_assertions)]
+pub(super) fn trim_tuned(host: &mut Host) {
+    super::note_tests::tune(host);
+    host.restart_shadow = false;
+}
+
+/// Issue #61: every trio node's `history_floor` and R1 ladder floor, in node order.
+#[cfg(debug_assertions)]
+pub(super) fn floors(trio: &Trio) -> Vec<(u64, Option<Seq>)> {
+    trio.nodes
+        .iter()
+        .map(|(host, _, _)| {
+            (
+                host.status(PartitionId(1))
+                    .lengths
+                    .map_or(0, |lengths| lengths.history_floor),
+                super::trio::ladder_floor(host),
+            )
+        })
+        .collect()
+}
+
+/// Issue #61 S1-R1 (design section 2, A5): write, trim every copy, restart every node. Puts
+/// land, each copy is trimmed to `head - 4` (`Msg::TrimHistory`), and every copy then reports
+/// `history_floor` = its R1 ladder's first rung = F. Nodes 3 and then 2 restart one at a
+/// time (a restarted owner stays out until the folder is opened again, `Db::restart_node`, so
+/// the owner's half is `s1_r1_a_trimmed_folder_reopens_and_serves`, a reopen of every node).
+/// Each restarted copy reports its inventory from its engine, the ladder rebuilt from F
+/// (the root rung, then F through its head: `inventory_ladder{rungs = head - F + 2}`), never
+/// from `(0, ROOT)`, and a put lands after every restart. Every copy keeps `history_floor` F and
+/// no R1 ladder holds a rung below F. After a re-plan the receivers of the new generation start
+/// at its cutoff, above F (A3's `on_recovered`), so "first rung = F" is asserted right after
+/// the trim and "no rung below F" after each restart. The design's 1,000 writes and F = 800
+/// are 12 and 8 here: the claim is about where the ladder starts, not how long it is.
+/// Right after the trim, every node's full ladder read (`dormant_rungs`, what a dormant restore
+/// gives its receiver) starts at F with the digest kept there; that clause is function level,
+/// since no row restores a dormant copy of a trimmed generation. The inventory builds its own
+/// base (`inventory_ladder`), so the restarts do not reach `first_rung`.
+/// Cut: `first_rung` ignores the floor (`(0, ROOT)`), red (the full read is refused
+/// `below_floor`).
+/// Integration (~2 s): bootstrap, two restarts and their re-plans.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn s1_r1_a_trimmed_trio_restarts_and_serves_with_its_ladders_at_the_floor() {
+    const METHOD: &str = "s1_r1_a_trimmed_trio_restarts_and_serves_with_its_ladders_at_the_floor";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), trim_tuned);
+    let mut request = 1;
+    let mut head = 0;
+    while head < 12 {
+        head = lands(&mut trio, request);
+        request += 1;
+    }
+    let through = head - 4;
+    // Every copy must hold `through` before it is trimmed there.
+    trio.until("every copy applied the head", |trio| {
+        (0..3)
+            .all(|at| {
+                trio.status(at)
+                    .holds
+                    .is_some_and(|held| held.applied >= head)
+            })
+            .then_some(())
+    });
+    for at in 0..3 {
+        assert_eq!(
+            super::trio::trim(&mut trio, at, through),
+            Ok(Seq(through)),
+            "node {} trimmed",
+            at + 1
+        );
+    }
+    assert_eq!(floors(&trio), vec![(through, Some(Seq(through))); 3]);
+    // Function level: no row here restores a dormant copy of the trimmed generation, the one
+    // caller that reads `first_rung` there, so the full read it would restore is checked direct.
+    for (at, (host, _, _)) in trio.nodes.iter().enumerate() {
+        let generation = host.newest_held(PartitionId(1)).expect("a held generation");
+        let first = host
+            .dormant_rungs(PartitionId(1), generation)
+            .map(|rungs| rungs.first().copied());
+        let at_floor = host
+            .digest_at(PartitionId(1), generation, Seq(through))
+            .expect("the record at the floor is kept");
+        assert_eq!(
+            first,
+            Ok(Some((Seq(through), at_floor))),
+            "node {}'s full read starts at F",
+            at + 1
+        );
+    }
+    for n in [3, 2] {
+        // (base, head, rungs) of each inventory this node reported: its ladder holds the root
+        // and then F through its head when its base is below F, else its base through its head.
+        let ladders = |node: u32| -> Vec<(u64, u64, u64)> {
+            let rungs = logged!(METHOD, "inventory_ladder")
+                .into_iter()
+                .filter(|line| line["node"] == node)
+                .map(|line| line["rungs"].as_u64().expect("rungs"));
+            logged!(METHOD, "inventory_reported")
+                .into_iter()
+                .filter(|line| line["node"] == node)
+                .map(|line| {
+                    (
+                        line["base"].as_u64().expect("base"),
+                        line["head"].as_u64().expect("head"),
+                    )
+                })
+                .zip(rungs)
+                .map(|((base, head), rungs)| (base, head, rungs))
+                .collect()
+        };
+        let before = ladders(n).len();
+        super::note_tests::restart(&mut trio, dir.path(), n, trim_tuned);
+        head = lands(&mut trio, request);
+        request += 1;
+        trio.until("every copy holds a ladder", |trio| {
+            trio.nodes
+                .iter()
+                .all(|(host, _, _)| super::trio::ladder_floor(host).is_some())
+                .then_some(())
+        });
+        let (base, held, rungs) = ladders(n).get(before).copied().expect("an inventory");
+        let expected = if base < through {
+            held - through + 2
+        } else {
+            held - base + 1
+        };
+        assert_eq!(
+            rungs, expected,
+            "node {n}'s inventory ladder after its restart, base {base}, head {held}"
+        );
+        if n == 3 {
+            assert!(base < through, "the first restart reports below the floor");
+        }
+        for (node, (floor, ladder)) in floors(&trio).into_iter().enumerate() {
+            assert_eq!(floor, through, "node {}'s history_floor", node + 1);
+            assert!(
+                ladder.is_some_and(|first| first >= Seq(through)),
+                "node {}'s ladder starts at {ladder:?}, below {through}",
+                node + 1
+            );
+        }
+    }
+    assert!(
+        logged!(METHOD, "inventory_failed").is_empty(),
+        "every inventory answered"
+    );
+    tracing::info!(head, through, floors = ?floors(&trio), "s1_r1_done");
+}
+
+/// Issue #61 (t3's minor, design rev 5): with live re-add off, a refused receiver re-anchors on
+/// its highest rung at or below the cutoff; the host keeps its ladder floor at the engine's trim
+/// floor, so for a cutoff below F there is none and it anchors at the root (A3's
+/// `on_recovered`). Node 2, a secondary of a formed trio, applied 8 or more records and holds a
+/// live receiver whose ladder is dense from the root. The host trims node 2 to `head - 2`: the
+/// engine and the ladder both start there. Node 2 then hears generation `g + 1` committed
+/// `ReadOnly` at cutoff 2 (from node 1's commit), a prefix it holds past: its landing is
+/// refused `held_past_base`, and with re-add off its receiver stays, unmarked. The `Recovered`
+/// finds no rung at or below 2: the receiver anchors at the new generation's root `(0, ROOT)`,
+/// never on rung 2, whose History is gone.
+/// Cut: the host's trim leaves R1's ladder whole (no `Replication::trim_history`, no
+/// `align_ladders`), red (the receiver anchors at rung 2). The design's cut, `align_ladders`
+/// skipped after `Recovered`, is not observable in one step: that alignment runs after the
+/// step that re-anchors, so it guards the next `Recovered`, not this one.
+/// Integration (~2 s): bootstrap, writes, then direct calls on node 2.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_refused_receiver_without_live_readd_anchors_at_root_below_floor() {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = super::note_tests::formed(dir.path(), trim_tuned);
+    let mut head = 0;
+    let mut request = 1;
+    while head < 8 {
+        head = lands(&mut trio, request);
+        request += 1;
+    }
+    trio.until("node 2 applied the head", |trio| {
+        trio.status(1)
+            .holds
+            .is_some_and(|held| held.applied >= head)
+            .then_some(())
+    });
+    let generation = trio.status(1).holds.expect("node 2 holds").generation;
+    assert_eq!(
+        super::trio::ladder_floor(&trio.nodes[1].0),
+        Some(Seq::ZERO),
+        "node 2's ladder is dense from the root"
+    );
+    let cutoff_digest = trio.nodes[1]
+        .0
+        .digest_at(p, generation, Seq(2))
+        .expect("node 2 holds seq 2");
+    let mut result = (*trio.nodes[0].0.committed[&p]).clone();
+    result.new_generation = Generation(generation.0 + 1);
+    result.selected.root.generation = result.new_generation;
+    result.selected.cutoff_seq = Seq(2);
+    result.selected.cutoff_digest = cutoff_digest;
+    result.retained_status_map.predecessor_generation = generation;
+    result.mode = PartitionMode::ReadOnly;
+    let through = head - 2;
+    assert_eq!(super::trio::trim(&mut trio, 1, through), Ok(Seq(through)));
+    let host = &mut trio.nodes[1].0;
+    host.live_readd.on = false;
+    assert_eq!(
+        super::trio::ladder_floor(host),
+        Some(Seq(through)),
+        "the ladder is trimmed too"
+    );
+    assert_eq!(
+        host.land_link(p, &result, false),
+        Ok(None),
+        "the landing is refused"
+    );
+    host.push(
+        Site {
+            partition: p,
+            correlation: CorrelationId::default(),
+        },
+        EventKind::Kernel(KernelEvent::Recovered(Box::new(result.clone()))),
+        true,
+        None,
+    );
+    host.drain();
+    assert_eq!(host.fault, None);
+    let receiver = host
+        .replication
+        .receiver(NodeId(2), p)
+        .expect("the receiver stays");
+    assert_eq!(receiver.lineage().generation, result.new_generation);
+    assert_eq!(
+        receiver.applied_head(),
+        Head {
+            seq: Seq::ZERO,
+            digest: Digest::ROOT
+        },
+        "anchored at the root, not at rung 2"
+    );
+}
+
+/// Issue #61 S2 (A8a): the chunk chain's known answer, so the sim's twin and any later change to
+/// the encoding are caught: two pages chained from a barrier digest, pinned in hex. Each part's
+/// change moves the answer: the label, `prev`, a namespace, a key, a value, a version and a
+/// generation. Cut: drop any one part from [`super::snapshot::chunk_chain`], red (the pin).
+/// Unit.
+#[test]
+fn t61_chunk_chain_known_answer() {
+    use super::snapshot::chunk_chain;
+    let hex = |digest: Digest| -> String { digest.0.iter().map(|b| format!("{b:02x}")).collect() };
+    let barrier = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let entry = |ns, key: &'static [u8], value: &'static [u8], version, generation| {
+        (
+            ns,
+            Bytes::from_static(key),
+            Bytes::from_static(value),
+            version,
+            Generation(generation),
+        )
+    };
+    let first = [
+        entry(Namespace::User, b"a", b"1", 7, 2),
+        entry(Namespace::Dedup, b"b", b"", 8, 3),
+    ];
+    let second = [entry(Namespace::Progress, b"c", b"3", 9, 3)];
+    let one = chunk_chain(barrier, &first);
+    let two = chunk_chain(one, &second);
+    assert_eq!(
+        (hex(one), hex(two), hex(chunk_chain(barrier, &[]))),
+        (
+            "0e0607de51f50f0fcd0ce19c419996f45880bf894411fb348032f30ac9c5fc75".to_owned(),
+            "164ff67cfb79c6342b15d1979f39cc50e3236363bd94e89cfc375a05466aa64e".to_owned(),
+            "cebb77f7a3478e41f2072ae75121888594fd5b50dbfeecf20da013017ef16be8".to_owned()
+        ),
+        "the chunk chain's encoding moved"
+    );
+    let moved = [
+        chunk_chain(Digest::ROOT, &first),
+        chunk_chain(
+            barrier,
+            &[
+                entry(Namespace::Progress, b"a", b"1", 7, 2),
+                first[1].clone(),
+            ],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"x", b"1", 7, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"2", 7, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"1", 6, 2), first[1].clone()],
+        ),
+        chunk_chain(
+            barrier,
+            &[entry(Namespace::User, b"a", b"1", 7, 1), first[1].clone()],
+        ),
+        chunk_chain(barrier, &first[..1]),
+    ];
+    for (at, digest) in moved.iter().enumerate() {
+        assert_ne!(*digest, one, "change {at} left the chain unmoved");
+    }
+}
+
+/// Issue #61 lead ruling 1, density: `snapshot::ladder_dense` holds only for a ladder with a
+/// rung at every seq from the engine floor through its highest. `fresh_primary`'s
+/// `{(0, ROOT), cutoff}` on an untrimmed engine is not dense (a gap), nor is a ladder whose
+/// first rung is above the floor or below it, nor an empty one. The real promote path is
+/// `seal_tests::t61_a_copy_behind_a_promote_on_an_untrimmed_engine_is_caught_up_from_a_refilled_ladder`.
+/// Cut: the count check dropped (floor equality only), red (`{0, 3}` reads dense).
+/// Unit.
+#[test]
+fn t61_ladder_dense_needs_every_rung_from_the_engine_floor() {
+    use super::snapshot::ladder_dense;
+    use rdb_core::contracts::digest::Domain;
+    use rdb_core::replication::progress::DigestLadder;
+    let ladder = |seqs: &[u64]| {
+        let mut ladder = DigestLadder::new();
+        for &seq in seqs {
+            ladder.insert(Seq(seq), Digest::of(Domain::Record, &[&seq.to_le_bytes()]));
+        }
+        ladder
+    };
+    let cases = [
+        (&[0, 1, 2, 3][..], 0, true),
+        (&[0, 3][..], 0, false),
+        (&[2, 3][..], 0, false),
+        (&[2, 3][..], 2, true),
+        (&[0, 1, 2, 3][..], 2, false),
+        (&[2, 4][..], 2, false),
+        (&[][..], 0, false),
+    ];
+    let got: Vec<_> = cases
+        .iter()
+        .map(|&(seqs, floor, _)| ladder_dense(&ladder(seqs), Seq(floor)))
+        .collect();
+    let want: Vec<_> = cases.iter().map(|&(_, _, dense)| dense).collect();
+    assert_eq!(got, want, "{cases:?}");
+}
+
+/// Issue #61 S2-R5 (design section 2 step 2, rev 5 M1): an offer the target did not ask for is
+/// refused before anything is written. Node 3, a live copy at `applied`, is handed offers
+/// built from its own adopted view with one thing wrong each: the owner epoch below its own
+/// (a deposed primary of the same generation), the generation below its own (an older offer
+/// replayed), the primary's boot changed, `S` at its own applied seq, and a barrier that names
+/// another seq. Each logs `snapshot_offer_refused` with its reason, in that order
+/// (`not_adopted`, `not_adopted`, `not_primary`, `not_ahead`, `bad_barrier`), no install
+/// starts, and node 3's engine is record-for-record what it was (`rdb_storage::dump`).
+/// Cut: the authority check skipped, red (the first offer is accepted and pulls).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls on node 3.
+#[config_log::retcd_test]
+fn t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched() {
+    const METHOD: &str = "t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    let p = PartitionId(1);
+    trio.bootstrap();
+    trio.ready();
+    for request in 1..=3 {
+        assert!(matches!(
+            trio.ask(super::seal_tests::put(request, b"k", 5_000)),
+            Answer::Txn { .. }
+        ));
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), p)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+    let barrier_at = |seq: u64| {
+        trio.nodes[0]
+            .0
+            .engine
+            .history_at(
+                p,
+                trio.nodes[0]
+                    .0
+                    .replication
+                    .primary(NodeId(1), p)
+                    .expect("primary")
+                    .tracker()
+                    .lineage()
+                    .generation,
+                Seq(seq),
+            )
+            .expect("read")
+            .expect("held")
+            .0
+    };
+    let barrier = barrier_at(head);
+    let host = &mut trio.nodes[2].0;
+    let receiver = host
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("node 3's receiver");
+    let lineage = receiver.lineage();
+    let applied = receiver.applied_head().seq;
+    let primary = *receiver
+        .config()
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .expect("a primary");
+    assert!(
+        lineage.generation.0 > 0 && lineage.owner_epoch.0 > 0,
+        "{lineage:?}"
+    );
+    let good = SnapshotOffer {
+        lineage,
+        config_version: receiver.config().config_version,
+        from: primary.node,
+        boot: primary.boot,
+        copy: receiver.copy(),
+        at: Seq(applied.0 + 5),
+        root: (Seq::ZERO, Digest::ROOT),
+        barrier: barrier.clone(),
+        transfer: 1,
+    };
+    let offers = [
+        SnapshotOffer {
+            lineage: Lineage {
+                owner_epoch: OwnerEpoch(lineage.owner_epoch.0 - 1),
+                ..lineage
+            },
+            ..good.clone()
+        },
+        SnapshotOffer {
+            lineage: Lineage {
+                generation: Generation(lineage.generation.0 - 1),
+                ..lineage
+            },
+            ..good.clone()
+        },
+        SnapshotOffer {
+            boot: BootId(primary.boot.0 + 1),
+            ..good.clone()
+        },
+        SnapshotOffer {
+            at: applied,
+            ..good.clone()
+        },
+        good,
+    ];
+    let before = format!(
+        "{:?}",
+        rdb_storage::dump(dir.path().join("3")).expect("dump")
+    );
+    for offer in offers {
+        host.snapshot_offer(offer).expect("the offer is taken");
+        assert!(host.installs.is_empty(), "an install started");
+        assert_eq!(host.fault, None);
+    }
+    let after = format!(
+        "{:?}",
+        rdb_storage::dump(dir.path().join("3")).expect("dump")
+    );
+    assert!(before == after, "node 3's engine changed");
+    let reasons: Vec<_> = logged!(METHOD, "snapshot_offer_refused")
+        .iter()
+        .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "not_adopted",
+            "not_adopted",
+            "not_primary",
+            "not_ahead",
+            "bad_barrier"
+        ]
+    );
+    assert!(logged!(METHOD, "snapshot_offer_accepted").is_empty());
+}
+
+/// Issue #61 S2 (A8a, lead ruling on the re-seed, condition 1): a re-seeded receiver ACKs `S`
+/// only when it is durable through `S`. Over node 3's adopted config, copy and lineage, a
+/// receiver at head `S` with `durable = S - 1` gets no ACK from [`super::snapshot::reseed_ack`]
+/// (the re-seed would log `snapshot_reseed_ack_withheld` and wait for its flush); with
+/// `durable = S` it gets an ACK at `S`, durable `S`, with the barrier's digest.
+/// Cut: the durable check dropped, red (the first receiver ACKs `S`).
+/// Integration (~2 s): bootstrap's discovery window, then direct calls.
+#[config_log::retcd_test]
+fn t61_a_reseed_below_its_durable_does_not_ack_s() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let held = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), PartitionId(1))
+        .expect("node 3's receiver");
+    let at = Seq(7);
+    let digest = Digest::of(rdb_core::contracts::digest::Domain::Record, &[b"barrier"]);
+    let reseeded = |durable: u64| {
+        AppendReceiver::new(ReceiverInit {
+            config: held.config().clone(),
+            own: held.copy(),
+            lineage: held.lineage(),
+            head: Head { seq: at, digest },
+            durable: DurableSeq(durable),
+        })
+        .expect("a live receiver")
+    };
+    assert_eq!(super::snapshot::reseed_ack(&reseeded(at.0 - 1), at), None);
+    let ack = super::snapshot::reseed_ack(&reseeded(at.0), at).expect("an ACK at S");
+    assert_eq!(
+        (
+            ack.progress.buffered_applied.0,
+            ack.progress.durable.0,
+            ack.digest_at_buffered
+        ),
+        (at.0, at.0, digest)
+    );
 }
 
 /// What a tail held `Unchecked` by check B must still be, whichever path held it (PR #156

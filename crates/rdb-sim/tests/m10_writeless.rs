@@ -599,6 +599,10 @@ fn m10_d3_a_copy_behind_two_writeless_reopens_catches_up() {
 /// served`, three rungs), the keepalive draws A's next `NeedPrefix`, and B sends record 2,
 /// sealed in generation 1, which A admits as historical. Nothing is refused, unconsumed or
 /// faulted; A holds 2 in generation 2; and the first write publishes there and lands on A.
+///
+/// Issue #61 A9b (lead ruling 1, "not dense"; design N4): B's ladder lacks rung 1, which its
+/// engine holds, so the ask is a refill, `how="ladder"`, and no transfer starts. Cut: the A8a
+/// host's first-rung test, red (B's ladder starts at the root, so it opens a transfer).
 #[retcd_test]
 fn m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine() {
     let method = "m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine";
@@ -629,26 +633,34 @@ fn m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine() {
         vec![(PRIOR.0, 2, CUTOFF.0 - 1, CUTOFF.0)],
         "A links generation 2 at its own head, below the base"
     );
-    let served: Vec<(u64, u64, u64)> = logged(method, "snapshot_catchup_served")
+    let served: Vec<(u64, u64, u64, String)> = logged(method, "snapshot_catchup_served")
         .iter()
         .map(|line| {
             (
                 line["node"].as_u64().unwrap_or(0),
                 line["barrier"].as_u64().unwrap_or(0),
                 line["rungs"].as_u64().unwrap_or(0),
+                line["how"].as_str().unwrap_or("").to_owned(),
             )
         })
         .collect();
     assert_eq!(
         served,
-        vec![(u64::from(B_NODE.0), CUTOFF.0, CUTOFF.0 + 1)],
-        "B's ask is served once, from its engine: rungs 0 through the cutoff"
+        vec![(
+            u64::from(B_NODE.0),
+            CUTOFF.0,
+            CUTOFF.0 + 1,
+            "ladder".to_owned()
+        )],
+        "B's ask is served once, by a refill from its engine: rungs 0 through the cutoff"
     );
     for message in [
         "land_link_refused",
         "kernel effect refused: no consumer",
         "snapshot_catchup_unserved",
-        "snapshot_catchup_unservable",
+        "snapshot_transfer_opened",
+        "snapshot_offer_sent",
+        "snapshot_transfer_installed",
     ] {
         let lines = logged(method, message);
         assert!(lines.is_empty(), "no {message}: {lines:?}");
@@ -685,6 +697,230 @@ fn m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine() {
         .buffered_applied(PARTITION, Generation(2))
         .0;
     assert_eq!(on_a, CUTOFF.0 + 1, "A applies the write");
+}
+
+/// The world of [`m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine`], run
+/// until just before A is back, with B's generation 2 then trimmed through the cutoff, and with
+/// page `fault` of every transfer corrupted when given.
+fn trimmed_while_a_is_away(fault: Option<u64>) -> Runner {
+    let mut runner =
+        Runner::new(&plan_with(Seq(CUTOFF.0 - 1))).expect("the harness takes the plan");
+    if let Some(index) = fault {
+        runner.dispatcher_mut().fault_snapshot_chunk(index);
+    }
+    let quiet = run_to(&mut runner, BACK_AT - 1);
+    assert!(quiet.is_empty(), "nothing is written before A is back");
+    let held = runner
+        .dispatcher()
+        .engine(B_NODE)
+        .expect("B's engine")
+        .buffered_applied(PARTITION, Generation(2))
+        .0;
+    assert_eq!(
+        held, CUTOFF.0,
+        "B holds generation 2 at the cutoff before A is back"
+    );
+    runner
+        .dispatcher_mut()
+        .trim_history(B_NODE, PARTITION, CUTOFF)
+        .expect("B trims generation 2 through the cutoff");
+    runner
+}
+
+/// Issue #61 A9b, the transfer twin at the head (A8a; S2-R1's sim side): the world of
+/// [`m10_s2_a_copy_below_a_fresh_primarys_cutoff_is_walked_from_its_engine`], with B trimmed
+/// through the cutoff while A is away. A's `NeedPrefix{1}` meets `NotRetained`, and B's ladder
+/// now holds every rung its engine has (the cutoff alone), so B opens a transfer at `S` = its
+/// head, the cutoff, and offers it once `S` is durable. A accepts, installs, is re-seeded at
+/// `S` and ACKs it unsolicited (lead ruling A), which at the head is B's `CopyCaughtUp` and
+/// releases the transfer. A then holds the cutoff in generation 2 at floor `S`, its
+/// generation-1 level wiped, and the first write publishes there and lands on A. Cuts:
+/// `NeedPrefix(S)` instead of the ACK, or no ACK, red (no release); no release on
+/// `CopyCaughtUp`, red; the re-seed or the finish skipped, red.
+#[retcd_test]
+fn t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head() {
+    let method =
+        "t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head";
+    support::preamble();
+    let mut runner = trimmed_while_a_is_away(None);
+    let quiet = run_to(&mut runner, FIRST_AT - 100);
+    assert!(
+        quiet.is_empty(),
+        "nothing is written before the first write"
+    );
+
+    let (a, b) = (u64::from(A_NODE.0), u64::from(B_NODE.0));
+    let behind: Vec<(u64, u64, u64, u64)> = logged(method, "land_link_behind")
+        .iter()
+        .filter(|line| line["node"].as_u64() == Some(a))
+        .map(|line| {
+            (
+                line["from"].as_u64().unwrap_or(0),
+                line["to"].as_u64().unwrap_or(0),
+                line["head"].as_u64().unwrap_or(0),
+                line["base"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        behind,
+        vec![(PRIOR.0, 2, CUTOFF.0 - 1, CUTOFF.0)],
+        "A links generation 2 at its own head, below the base"
+    );
+    let steps = |message: &str| -> Vec<(u64, u64, String)> {
+        logged(method, message)
+            .iter()
+            .map(|line| {
+                (
+                    line["node"].as_u64().unwrap_or(0),
+                    line["at"].as_u64().unwrap_or(0),
+                    line["why"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let none = String::new;
+    assert_eq!(
+        steps("snapshot_transfer_opened"),
+        vec![(b, CUTOFF.0, none())],
+        "B opens one transfer at its head"
+    );
+    assert_eq!(steps("snapshot_offer_sent"), vec![(b, CUTOFF.0, none())]);
+    assert_eq!(
+        steps("snapshot_offer_accepted"),
+        vec![(a, CUTOFF.0, none())]
+    );
+    assert_eq!(
+        steps("snapshot_transfer_installed"),
+        vec![(a, CUTOFF.0, none())],
+        "A installs at S"
+    );
+    assert_eq!(
+        steps("snapshot_transfer_released"),
+        vec![(b, CUTOFF.0, "caught_up".to_owned())],
+        "A's ACK at S is B's CopyCaughtUp, which releases the transfer"
+    );
+    for message in [
+        "land_link_refused",
+        "kernel effect refused: no consumer",
+        "snapshot_catchup_served",
+        "snapshot_catchup_unserved",
+        "snapshot_offer_refused",
+        "snapshot_install_refused",
+        "snapshot_reseed_ack_withheld",
+        "snapshot_transfer_abandoned",
+    ] {
+        let lines = logged(method, message);
+        assert!(lines.is_empty(), "no {message}: {lines:?}");
+    }
+    let faults: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("m10_writeless", method)
+            .into_iter()
+            .filter(|line| {
+                line["@l"] == "Error"
+                    || line["kernel"]
+                        .as_str()
+                        .is_some_and(|kernel| kernel.contains("Quarantined"))
+            })
+            .collect();
+    assert!(faults.is_empty(), "nothing faults: {faults:?}");
+    let engine = runner.dispatcher().engine(A_NODE).expect("A's engine");
+    assert_eq!(
+        (
+            engine.buffered_applied(PARTITION, Generation(2)).0,
+            engine.floor_seq(PARTITION, Generation(2)),
+            engine.buffered_applied(PARTITION, PRIOR).0,
+        ),
+        (CUTOFF.0, CUTOFF, 0),
+        "A holds the cutoff in generation 2 at floor S, and its generation-1 level is gone"
+    );
+
+    runner.queue(&submit(FIRST_AT, 1)).expect("queue");
+    let first = run_to(&mut runner, FIRST_AT + 1_000);
+    assert_eq!(
+        first,
+        vec![(1, Ok((Generation(2), Seq(CUTOFF.0 + 1))))],
+        "the first write publishes in generation 2"
+    );
+    let on_a = runner
+        .dispatcher()
+        .engine(A_NODE)
+        .expect("A's engine")
+        .buffered_applied(PARTITION, Generation(2))
+        .0;
+    assert_eq!(on_a, CUTOFF.0 + 1, "A applies the write");
+}
+
+/// Issue #61 A9b, the sim side of S2-R3: the world of
+/// [`t61_sim_a_copy_below_a_trimmed_primarys_floor_is_rebuilt_by_a_snapshot_at_the_head`], with
+/// the transfer's first page corrupted after its chain is computed. A checks the chain before
+/// it writes the page, so it refuses the install `chain` before `install_begin`: nothing is
+/// switched, its generation-1 level is intact and generation 2 has no floor. B hears the
+/// refusal and ends the transfer `refused`, keeping the barrier, so R1's next ask at the same
+/// barrier opens nothing. Cut: the chain unchecked, red (A installs the corrupt page).
+#[retcd_test]
+fn t61_sim_a_corrupt_page_is_refused_and_nothing_is_switched() {
+    let method = "t61_sim_a_corrupt_page_is_refused_and_nothing_is_switched";
+    support::preamble();
+    let mut runner = trimmed_while_a_is_away(Some(0));
+    let quiet = run_to(&mut runner, FIRST_AT - 100);
+    assert!(quiet.is_empty(), "nothing is written: {quiet:?}");
+
+    let (a, b) = (u64::from(A_NODE.0), u64::from(B_NODE.0));
+    assert_eq!(
+        logged(method, "snapshot_chunk_corrupted").len(),
+        1,
+        "one page corrupted"
+    );
+    let refused: Vec<(u64, u64, String, bool)> = logged(method, "snapshot_install_refused")
+        .iter()
+        .map(|line| {
+            (
+                line["node"].as_u64().unwrap_or(0),
+                line["at"].as_u64().unwrap_or(0),
+                line["reason"].as_str().unwrap_or("").to_owned(),
+                line["begun"].as_bool().unwrap_or(true),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![(a, CUTOFF.0, "chain".to_owned(), false)],
+        "A refuses the page before it begins the install"
+    );
+    let released: Vec<(u64, String)> = logged(method, "snapshot_transfer_released")
+        .iter()
+        .map(|line| {
+            (
+                line["node"].as_u64().unwrap_or(0),
+                line["why"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        released,
+        vec![(b, "refused".to_owned())],
+        "B ends the transfer"
+    );
+    assert_eq!(
+        logged(method, "snapshot_transfer_opened").len(),
+        1,
+        "no second transfer at the same barrier"
+    );
+    for message in ["snapshot_install_begun", "snapshot_transfer_installed"] {
+        let lines = logged(method, message);
+        assert!(lines.is_empty(), "no {message}: {lines:?}");
+    }
+    let engine = runner.dispatcher().engine(A_NODE).expect("A's engine");
+    assert_eq!(
+        (
+            engine.buffered_applied(PARTITION, PRIOR).0,
+            engine.floor_seq(PARTITION, Generation(2)),
+            engine.installing(PARTITION, Generation(2)),
+        ),
+        (CUTOFF.0 - 1, Seq::ZERO, None),
+        "A's store is not switched"
+    );
 }
 
 /// The client's read of the written key from the primary B at `at`.

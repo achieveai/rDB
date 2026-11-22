@@ -33,6 +33,7 @@ use bytes::Bytes;
 use rdb_core::contracts::ids::{Generation, PartitionId, Seq, SnapshotHandle};
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageFault};
 use rdb_core::contracts::trace::Version;
+use rdb_core::replication::append::PROGRESS_KEY;
 use rocksdb::ReadOptions;
 
 use crate::engine::{RocksEngine, LOG_TARGET};
@@ -40,6 +41,11 @@ use crate::keys::{encode_key, unframe, Frame, PREFIX_LEN};
 
 /// The namespaces a view shows, in the order [`RocksSnapshot::entries`] lists them. Not
 /// `History` (M10 decision 2, quick fix): no kernel module reads it through [`SnapshotRead`].
+/// `Meta` is listed but format 1 stores none: commit refuses a Meta write and the open refuses a
+/// stored Meta key (pinned by `m8s_25a_a_meta_write_is_refused_at_commit` and
+/// `m8s_25b_open_refuses_a_stored_meta_key`), so a snapshot transfer never carries one, and
+/// [`crate::RocksEngine::install_chunk`] refuses it (issue #61). The first Meta writer must
+/// decide whether Meta is exported and installed, or skipped as per-copy state.
 const NAMESPACES: [Namespace; 4] = [
     Namespace::User,
     Namespace::Dedup,
@@ -49,6 +55,17 @@ const NAMESPACES: [Namespace; 4] = [
 
 /// One record of a view: namespace, key, value, version, and the generation that holds it.
 pub type SnapshotEntry = (Namespace, Bytes, Bytes, Version, Generation);
+
+/// What one entry adds to a snapshot page on the wire, at most: its key and
+/// value, plus `SNAPSHOT_ENTRY_OVERHEAD` (64) for the namespace, the two length prefixes, the
+/// version and the generation, which postcard writes in far fewer bytes.
+#[must_use]
+pub const fn snapshot_entry_bytes(key: &[u8], value: &[u8]) -> usize {
+    key.len() + value.len() + SNAPSHOT_ENTRY_OVERHEAD
+}
+
+/// The bound [`snapshot_entry_bytes`] adds to each entry's key and value.
+pub const SNAPSHOT_ENTRY_OVERHEAD: usize = 64;
 
 /// The one place that holds a RocksDB snapshot under a `'static` borrow. Its fields are private
 /// to this module, so the rest of the crate reaches the snapshot only through
@@ -204,6 +221,81 @@ impl RocksSnapshot {
             })?;
         }
         Ok(out)
+    }
+
+    /// One page of the view for a snapshot transfer (issue #61, M3): at most `limit` records
+    /// strictly after `after` in [`Self::entries`]'s `(namespace, key)` order, from the start
+    /// when `after` is `None`. The head `Progress` record (`PROGRESS_KEY`) is left out: the
+    /// installer writes its own from the barrier. A page is read by the paged merge, which
+    /// stops at the limit, so the source never holds more than one page. An empty page means
+    /// the view is done; `limit` 0 returns an empty page.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when a read fails or a stored value's frame does not decode,
+    /// or when `after` names `History`, which no view shows (logs `snapshot_cursor_invalid`).
+    pub fn entries_after(
+        &self,
+        after: Option<(Namespace, &[u8])>,
+        limit: usize,
+    ) -> Result<Vec<SnapshotEntry>, StorageFault> {
+        self.page_after(after, limit, usize::MAX)
+            .map(|(page, _)| page)
+    }
+
+    /// A page of [`Self::entries_after`] capped by size as well as count. At
+    /// most `limit` entries, stopping before the entry that would take the page's
+    /// [`snapshot_entry_bytes`] past `max_bytes`; the first entry always goes, so a page is
+    /// never empty while the view has more. Answers the page and whether the view holds an
+    /// entry after it: the transfer ends from the cursor, not from a short page.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries_after`].
+    pub fn page_after(
+        &self,
+        after: Option<(Namespace, &[u8])>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<SnapshotEntry>, bool), StorageFault> {
+        let (first, from) = match after {
+            None => (0, Vec::new()),
+            Some((ns, key)) => {
+                let Some(at) = NAMESPACES.iter().position(|held| *held == ns) else {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        partition = self.partition.0,
+                        ns = ?ns,
+                        "snapshot_cursor_invalid"
+                    );
+                    return Err(StorageFault::Corrupt);
+                };
+                let mut from = key.to_vec();
+                from.push(0);
+                (at, from)
+            }
+        };
+        let (mut out, mut bytes, mut more) = (Vec::new(), 0_usize, false);
+        for (i, ns) in NAMESPACES.iter().copied().enumerate().skip(first) {
+            if more {
+                break;
+            }
+            let start: &[u8] = if i == first { &from } else { &[] };
+            self.merge(ns, start, |(key, value, version, level)| {
+                if ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY {
+                    return true;
+                }
+                let size = snapshot_entry_bytes(&key, &value);
+                if out.len() >= limit || (!out.is_empty() && bytes + size > max_bytes) {
+                    more = true;
+                    return false;
+                }
+                bytes += size;
+                out.push((ns, key, value, version, level));
+                true
+            })?;
+        }
+        Ok((out, more))
     }
 
     /// The record at `key` in `ns`: its value, version and the generation that holds it.
