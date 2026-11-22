@@ -1114,19 +1114,16 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds and mixed settings.** Turn it on only once every node runs a build that has
-  it, and then on every node. Older builds speak the same wire version, so nothing refuses the
-  pairing for you. An owner that has it on can add back a copy whose node has it off or runs an
-  older build. The re-add itself needs a partition that takes writes. But if the partition goes
-  read-only before that copy has caught up, such a copy does not mark the landing it refuses,
-  and the partition can then stay read-only until that copy's node restarts. A build older than
-  check B can also be left holding a lineage with a hole in it, which nothing refuses
-  (ADR-rdb-0009 section 7).
-- **Before it can be on by default.** Builds with and without these guards can speak the same
-  protocol version, so a node cannot tell them apart. Turning it on by default first needs a
-  protocol version raised for it, or a capability bit that gates the re-add, so a node without
-  these guards is refused or never re-added live (ADR-rdb-0009 section 7). Until then it stays
-  off by default.
+- **Mixed builds and mixed settings.** Turn it on only on every node at once. Mixed builds
+  cannot pair: this release speaks protocol version 10, and the handshake refuses every older
+  build, node or app, so a copy on a build without these guards is never re-added live. Mixed
+  settings can pair: an owner that has it on can add back a copy whose node has it off. The
+  re-add itself needs a partition that takes writes. But if the partition goes read-only
+  before that copy has caught up, a copy with it off does not mark the landing it refuses, and
+  the partition can then stay read-only until that copy's node restarts (ADR-rdb-0009
+  section 7).
+- **Default.** It stays off by default. The version check above is what keeps a build without
+  these guards from being re-added live; the default itself is not changed by this release.
 
 `did_it_land` above does the "ask" part. A request that may have applied (`no_mutation` false)
 is resent unchanged until it lands or is answered, once the pause ends. A write that wrote

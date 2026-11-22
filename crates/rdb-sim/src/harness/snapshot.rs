@@ -85,8 +85,7 @@ impl SnapshotRefusal {
     }
 }
 
-/// The primary's offer of a snapshot of `lineage` at `at` to `copy`: the host's `SnapshotOffer`
-/// without `released_through`, which is A9c's.
+/// The primary's offer of a snapshot of `lineage` at `at` to `copy`: the host's `SnapshotOffer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotOffer {
     /// The offerer's lineage.
