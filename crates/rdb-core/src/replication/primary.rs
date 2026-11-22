@@ -343,7 +343,7 @@ impl Primary {
                 if let Some(copy) = admitted.filter(|copy| self.cursors.contains_key(copy)) {
                     effects.extend(self.drive(copy, AppendOutcome::Accepted(ack)));
                 }
-                // Issue #61 PR-B: the ladder asked for a snapshot with no cursor behind it (an
+                // Issue #61: the ladder asked for a snapshot with no cursor behind it (an
                 // ACK it no longer holds). Start one, or the re-seed's ACK reaches none and the
                 // transfer is never released `caught_up`. The tracker's request stands.
                 let asked: Vec<CopyId> = effects
@@ -819,7 +819,7 @@ impl Primary {
         self.tracker.history().lookup(at, ack.digest_at_buffered) == DigestLookup::NotRetained
     }
 
-    /// Issue #61 PR-B (lead ruling 2026-11-22): a snapshot of `copy` is asked for at the head,
+    /// Issue #61 (lead ruling 2026-11-22): a snapshot of `copy` is asked for at the head,
     /// with `copy`'s cursor started, or re-armed, catching up and with nothing in flight
     /// ([`CatchupCursor::await_snapshot`]). So every `SnapshotCatchupRequired` has a cursor
     /// behind it, and the copy's ACK at the head after the install ends it with
@@ -827,6 +827,10 @@ impl Primary {
     pub(crate) fn await_snapshot(&mut self, copy: CopyId) -> EffectKind {
         let head = self.tracker.head();
         let started = !self.cursors.contains_key(&copy);
+        let was_catching_up = self
+            .cursors
+            .get(&copy)
+            .is_some_and(CatchupCursor::catching_up);
         self.cursors
             .entry(copy)
             .or_insert_with(|| CatchupCursor::new(copy))
@@ -836,6 +840,7 @@ impl Primary {
             copy = copy.0,
             head = head.0,
             started,
+            was_catching_up,
             "r1.snapshot_cursor_awaiting"
         );
         EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {

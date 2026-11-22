@@ -1173,3 +1173,160 @@ fn t61_s3_r24_a_repeat_recovered_in_the_same_generation_keeps_the_grace_start() 
     assert_eq!(logged!(METHOD, "history_grace_begun").len(), 1);
     assert!(logged!(METHOD, "history_grace_ended").is_empty());
 }
+
+/// The world of the NeedPrefix-path rows: node 3 applies the first put, its links are held, three more
+/// puts land on nodes 1 and 2, and node 1's retention round (byte cap 0) trims past copy 3, which
+/// it reports behind the floor. Then the links heal, and `past` more puts follow. Answers copy
+/// 3, the floor and node 1's head after those puts.
+fn trimmed_past_three(trio: &mut Trio, past: u64) -> (CopyId, u64, u64) {
+    trio.bootstrap();
+    trio.ready();
+    put_durable(trio, 1);
+    let first = trio.head().expect("node 1 holds a head");
+    trio.until("node 3 applied the first put", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= first)
+            .then_some(())
+    });
+    rounds_until(trio, "node 1's grace ends", |host| grace_of(host).is_none());
+    let three = trio.nodes[2]
+        .0
+        .replication
+        .receiver(NodeId(3), P)
+        .expect("node 3's receiver")
+        .copy();
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    for request in 2..=4 {
+        put_durable(trio, request);
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    let two = trio.nodes[1]
+        .0
+        .replication
+        .receiver(NodeId(2), P)
+        .expect("node 2's receiver")
+        .copy();
+    trio.until("node 1 knows copy 2 durable through the head", |trio| {
+        (known_durable(trio, two) >= head).then_some(())
+    });
+    trio.nodes[0].0.history_retention = HistoryRetention {
+        keep_millis: u64::MAX,
+        budget_bytes: 0,
+    };
+    let trimmed = floor_round(trio, "the capped round");
+    assert_eq!(trimmed.floor, Seq(head), "the cap trims past copy 3");
+    let behind = floor_round(trio, "the round after");
+    assert_eq!(behind.behind, vec![three], "copy 3 is below the floor");
+    trio.links.heal_all();
+    for request in 5..5 + past {
+        put_durable(trio, request);
+    }
+    (three, head, trio.head().expect("node 1 holds a head"))
+}
+
+/// Run until node 1 has opened a transfer for `three` and released it, then answer how
+/// (`snapshot_transfer_released` / `snapshot_transfer_abandoned` lines, with `why`).
+fn transfer_ends(trio: &mut Trio, method: &str, three: CopyId) -> Vec<String> {
+    trio.until("node 1 opens a transfer for copy 3", |trio| {
+        trio.nodes[0]
+            .0
+            .transfers
+            .contains_key(&(P, three))
+            .then_some(())
+    });
+    trio.until("copy 3's transfer ends", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(P, three))).then_some(())
+    });
+    ["snapshot_transfer_released", "snapshot_transfer_abandoned"]
+        .iter()
+        .flat_map(|message| logged!(method, *message))
+        .map(|line| {
+            format!(
+                "{} {}",
+                line["@m"].as_str().unwrap_or(""),
+                line["why"].as_str().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// The NeedPrefix path (lead ruling 2026-11-22), writes stopped: retention
+/// trims node 1 past a lagging copy 3 and no write follows the heal. Copy 3 asks for a prefix
+/// below the floor (`CatchupCursor::on_need_prefix`, `NotRetained`), which starts its
+/// catching-up cursor and opens a transfer; after the install, copy 3's ACK at the head
+/// releases it `caught_up`. R1's ladder also asks for copy 3 once it is open
+/// (`r1.snapshot_cursor_awaiting{was_catching_up = true}`), and that ask is swallowed. This row
+/// does not guard `Primary::await_snapshot`: with it cut the row stays green (2026-11-22), since
+/// the NeedPrefix cursor is already catching up.
+/// Cut: no `end_transfer` on the host's `CopyCaughtUp`, red (copy 3's transfer never ends).
+/// Integration (~5 s): bootstrap, four puts, a hold, two rounds and a heal.
+#[config_log::retcd_test]
+fn t61_pr_b_a_copy_trimmed_past_by_retention_asks_a_prefix_and_is_released_caught_up() {
+    const METHOD: &str =
+        "t61_pr_b_a_copy_trimmed_past_by_retention_asks_a_prefix_and_is_released_caught_up";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), held_copy_tune);
+    let (three, _floor, head) = trimmed_past_three(&mut trio, 0);
+    let ends = transfer_ends(&mut trio, METHOD, three);
+    assert_eq!(
+        ends,
+        vec!["snapshot_transfer_released caught_up".to_owned()]
+    );
+    let asked = logged!(METHOD, "r1.snapshot_cursor_awaiting");
+    assert!(
+        asked
+            .iter()
+            .filter(|line| line["copy"] == three.0)
+            .all(|line| line["was_catching_up"] == true),
+        "the prefix ask's cursor was already catching up: {asked:?}"
+    );
+    trio.until("node 3 applies the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+}
+
+/// [`t61_pr_b_a_copy_trimmed_past_by_retention_asks_a_prefix_and_is_released_caught_up`] with
+/// one write past the floor after the heal: the transfer opens at the new head and is still
+/// released `caught_up`. Like that row, it covers the NeedPrefix path and does not guard
+/// `Primary::await_snapshot`.
+/// Cut: as there, red.
+/// Integration (~5 s).
+#[config_log::retcd_test]
+fn t61_pr_b_a_copy_trimmed_past_by_retention_with_a_write_after_is_released_caught_up() {
+    const METHOD: &str =
+        "t61_pr_b_a_copy_trimmed_past_by_retention_with_a_write_after_is_released_caught_up";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), held_copy_tune);
+    let (three, floor, head) = trimmed_past_three(&mut trio, 1);
+    assert!(head > floor, "one write past the floor");
+    let ends = transfer_ends(&mut trio, METHOD, three);
+    assert_eq!(
+        ends,
+        vec!["snapshot_transfer_released caught_up".to_owned()]
+    );
+    let asked = logged!(METHOD, "r1.snapshot_cursor_awaiting");
+    assert!(
+        asked
+            .iter()
+            .filter(|line| line["copy"] == three.0)
+            .all(|line| line["was_catching_up"] == true),
+        "the prefix ask's cursor was already catching up: {asked:?}"
+    );
+    trio.until("node 3 applies the head", |trio| {
+        trio.nodes[2]
+            .0
+            .replication
+            .receiver(NodeId(3), P)
+            .is_some_and(|receiver| receiver.applied_head().seq.0 >= head)
+            .then_some(())
+    });
+}
