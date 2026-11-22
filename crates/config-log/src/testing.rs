@@ -90,7 +90,8 @@ pub fn init_test_logging() {
             "info,config_log=trace,config_core=trace,config_storage=trace,config_engine=trace,\
              config_gossip=trace,config_grpc=trace,config_client=trace,config_server=trace,\
              config_testkit=trace,openraft=debug,rdb_api::authority_check=debug,\
-             rdb_api::host::write=debug,rdb_api::net::request=debug,rdb_storage::engine::batch=debug"
+             rdb_api::host::write=debug,rdb_api::net::request=debug,rdb_storage::engine::batch=debug,\
+             rdb_api::route_addr=debug"
                 .to_string()
         });
         let cfg = LogConfig {
