@@ -2381,3 +2381,77 @@ fn m9_s0_11_l1_gained_alone_without_peer_progress_stays_reprotecting() {
     let mut twin = reprotecting_at(0);
     assert_eq!(run(&mut twin, 0, 20_000, |_, _| true), Some(5_100));
 }
+
+/// Issue #79 (option A): R1's floor is now the durable quorum, so it falls when the quorum's
+/// best secondary diverges and leaves the set, not only when a copy reboots. L1 already stores
+/// each view as reported (B-R46d), and this pins what a fall after a drain does:
+/// 1. A drained record stays drained, nothing panics and no admission edge comes of it; a
+///    record applied after the fall is exposure and pauses at the pause age, as before.
+/// 2. Resume reads the floor as it is now: durable through the barrier, then a fall below it
+///    before the evaluation, stays `Paused`; reported through the barrier again, it resumes.
+/// 3. Retirement reads it as it is now: the old predicate at 40, then a fall to 10, does not
+///    retire at 40, and the drain at 40 stands; reported at 40 again, it retires.
+///
+/// Cut: `record_durable` keeps the higher of the stored and reported views, red at clause 2
+/// (it reprotects on the stale 11).
+/// Unit (< 10 ms).
+#[retcd_test]
+fn i79_l1_a_floor_that_falls_after_a_drain_neither_resumes_nor_retires() {
+    // 1.
+    let mut p = golden();
+    for seq in 1..=10 {
+        step(&mut p, T0, applied(seq, 1));
+    }
+    step(&mut p, T0, durable(&[(C1, 10)]));
+    assert_eq!(p.unsafe_len(), 0, "drained through 10");
+    assert_eq!(
+        step(&mut p, T0, durable(&[(C1, 4)])),
+        ignored(ReplicaIgnoreReason::Recorded)
+    );
+    assert_eq!(
+        p.unsafe_len(),
+        0,
+        "a fall does not re-queue a drained record"
+    );
+    assert_eq!(
+        health(&mut p, T0 + 2_000),
+        ignored(ReplicaIgnoreReason::NothingOutstanding)
+    );
+    assert_eq!(p.mode(), Some(Mode::Healthy));
+    step(&mut p, T0 + 2_000, applied(11, 1));
+    assert!(!admission(&health(&mut p, T0 + 4_000)).allow);
+    assert_eq!(state(&p, T0 + 4_000).resume_barrier, Seq(11));
+
+    // 2.
+    let now = T0 + 4_100;
+    step(&mut p, now, durable(&[(C1, 11)]));
+    step(&mut p, now, durable(&[(C1, 4)]));
+    assert_eq!(
+        health(&mut p, now),
+        ignored(ReplicaIgnoreReason::BarrierNotDurable)
+    );
+    assert_eq!(p.mode(), Some(Mode::Paused));
+    step(&mut p, now, durable(&[(C1, 11)]));
+    let effects = health(&mut p, now);
+    assert_eq!(effects, ignored(ReplicaIgnoreReason::ResumeHeld));
+    assert!(no_allow(&effects));
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+
+    // 3.
+    let mut p = two_predicates_durable_10_and_50();
+    step(&mut p, T0, durable(&[(C1, 40)]));
+    assert_eq!(p.unsafe_len(), 10, "drained through 40");
+    step(&mut p, T0, durable(&[(C1, 10)]));
+    assert_eq!(p.unsafe_len(), 10, "the drain at 40 stands");
+    assert_eq!(
+        step(&mut p, T0, confirm_c1(40)),
+        ignored(ReplicaIgnoreReason::BarrierNotDurable)
+    );
+    assert_eq!(state(&p, T0).required_config_versions, vec![C2, C1]);
+    step(&mut p, T0, durable(&[(C1, 40)]));
+    assert_eq!(
+        step(&mut p, T0, confirm_c1(40)),
+        ignored(ReplicaIgnoreReason::Recorded)
+    );
+    assert_eq!(state(&p, T0).required_config_versions, vec![C2]);
+}

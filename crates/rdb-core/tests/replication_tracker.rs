@@ -361,17 +361,22 @@ fn a_valid_ack_advances_its_copy_and_the_first_one_to_qualify_is_the_gained_edge
     assert!(!tracker.qualifies_now(Seq(HEAD)));
     assert_eq!(
         deliver(&mut tracker, &b(HEAD, HEAD, 10)),
-        vec![peer_progress(B, HEAD), gained(&[COPY_B])]
+        vec![
+            peer_progress(B, HEAD),
+            gained(&[COPY_B]),
+            durable_advanced(&[(CONFIG, 10)])
+        ]
     );
     assert_eq!(
         tracker.peer(COPY_B).expect("B").progress,
         progress(HEAD, HEAD, 10)
     );
     assert!(tracker.qualifies_now(Seq(HEAD)));
-    // The predicate already holds, so no edge. C was the durable floor at 0, so the view moves.
+    // The predicate already holds, so no edge. B already carried the durable quorum to 10, so
+    // C at 10 does not move the view (issue #79).
     assert_eq!(
         deliver(&mut tracker, &c(11, 11, 10)),
-        vec![peer_progress(C, 11), durable_advanced(&[(CONFIG, 10)])]
+        vec![peer_progress(C, 11)]
     );
     assert_eq!(tracker.qualified_copies(Seq(11)), vec![COPY_B, COPY_C]);
     assert_eq!(tracker.qualified_copies(Seq(HEAD)), vec![COPY_B]);
@@ -690,13 +695,18 @@ fn m7b_54_diverged_copy_leaves_the_durable_views_and_empty_floor_blocks() {
     deliver(&mut tracker, &b(HEAD, HEAD, HEAD));
     deliver(&mut tracker, &c(HEAD, HEAD, 10));
     assert_eq!(tracker.min_required_durable(), DurableSeq(10));
+    // L1's view is the durable quorum, already at HEAD on A and B, so C leaving moves only the
+    // all-copies views (issue #79).
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(HEAD))]
+    );
     assert_eq!(
         deliver(&mut tracker, &forked(c(HEAD, HEAD, 10))),
         vec![
             kernel(KernelEffect::DivergenceDetected { copy: COPY_C }),
             alert(),
             copy_lost(COPY_C),
-            durable_advanced(&[(CONFIG, HEAD)]),
         ]
     );
     assert!(tracker.all_durable_through(Seq(HEAD)));
@@ -843,7 +853,11 @@ fn a_configuration_that_is_not_newer_or_does_not_keep_us_primary_is_invalid() {
 
 #[retcd_test]
 fn retired_predicates_keep_their_copies_until_the_barrier_is_confirmed() {
-    let mut tracker = both_caught_up();
+    // B has proved nothing durable, so each predicate's durable quorum is its other secondary:
+    // C for `CONFIG`, D for `NEW_CONFIG` (issue #79).
+    let mut tracker = tracker();
+    deliver(&mut tracker, &b(HEAD, HEAD, 0));
+    deliver(&mut tracker, &c(HEAD, HEAD, HEAD));
     let next = config_with(
         NEW_CONFIG,
         vec![
@@ -866,7 +880,7 @@ fn retired_predicates_keep_their_copies_until_the_barrier_is_confirmed() {
         deliver(&mut tracker, &c(HEAD, HEAD, HEAD)),
         vec![peer_progress(C, HEAD)]
     );
-    let mut b_next = b(HEAD, HEAD, HEAD);
+    let mut b_next = b(HEAD, HEAD, 0);
     b_next.config_version = NEW_CONFIG;
     let mut d_next = ack(D, RegularSecondary, HEAD, HEAD, 10);
     d_next.config_version = NEW_CONFIG;
@@ -1688,7 +1702,11 @@ fn tester_r1s_an_ack_claiming_more_than_the_primary_holds_is_inconsistent() {
     // The copy is not wedged: its honest ACK still lands and qualifies.
     assert_eq!(
         deliver(&mut tracker, &b(HEAD, HEAD, HEAD)),
-        vec![peer_progress(B, HEAD), gained(&[COPY_B])]
+        vec![
+            peer_progress(B, HEAD),
+            gained(&[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
+        ]
     );
 }
 
@@ -1794,7 +1812,8 @@ fn local_applied_grows_received_applied_and_the_ladder_together() {
         vec![
             peer_progress(B, HEAD + 1),
             gained(&[COPY_B]),
-            gained_at(HEAD + 1, &[COPY_B])
+            gained_at(HEAD + 1, &[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
         ]
     );
 }
@@ -1837,7 +1856,11 @@ fn local_applied_past_the_anchor_emits_no_edge_and_keeps_the_cached_value() {
     let mut tracker = tracker();
     assert_eq!(
         deliver(&mut tracker, &b(HEAD, HEAD, HEAD)),
-        vec![peer_progress(B, HEAD), gained(&[COPY_B])]
+        vec![
+            peer_progress(B, HEAD),
+            gained(&[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
+        ]
     );
     for seq in HEAD + 1..=HEAD + 3 {
         assert_eq!(
@@ -1867,6 +1890,8 @@ fn a_divergence_after_local_writes_still_flips_lost_at_the_anchor() {
             alert(),
             copy_lost(COPY_B),
             lost(QualificationCause::DivergenceDetected(COPY_B)),
+            // B was the durable quorum's secondary; C never ACKed (issue #79).
+            durable_advanced(&[(CONFIG, 0)]),
         ]
     );
 }
@@ -2224,7 +2249,8 @@ fn routing_hands_local_applied_to_the_tracker_before_an_ack_naming_its_seq() {
         vec![
             peer_progress(B, HEAD + 1),
             gained(&[COPY_B]),
-            gained_at(HEAD + 1, &[COPY_B])
+            gained_at(HEAD + 1, &[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
         ]
     );
 
@@ -3921,6 +3947,8 @@ fn m7b_134_set_change_without_a_predicate_flip_emits_nothing() {
     assert!(twin.qualifies_now(Seq(HEAD)));
     let mut want = vector.to_vec();
     want.push(lost(QualificationCause::DivergenceDetected(COPY_B)));
+    // B was also the durable quorum's secondary, so the view falls to C's 0 (issue #79).
+    want.push(durable_advanced(&[(CONFIG, 0)]));
     assert_eq!(deliver(&mut twin, &forked(b(HEAD, HEAD, HEAD))), want);
     assert!(!twin.qualifies_now(Seq(HEAD)));
     // C is still a live regular secondary, so the floor is not gone and nothing blocks.
@@ -4275,7 +4303,9 @@ fn entries(tracker: &ProgressTracker) -> Vec<CopyId> {
 #[retcd_test]
 fn m7b_145_retired_predicates_keep_their_copies_until_the_barrier_is_confirmed() {
     let mut tracker = rf3_tracker();
-    deliver(&mut tracker, &b(HEAD, HEAD, HEAD));
+    // B has proved nothing durable, so C is `c`'s durable quorum secondary and `c+1`'s view
+    // waits on D (issue #79: the view is the primary capped by the best secondary).
+    deliver(&mut tracker, &b(HEAD, HEAD, 0));
     deliver(&mut tracker, &c(HEAD, HEAD, 10));
     assert_eq!(entries(&tracker), vec![COPY_A, COPY_B, COPY_C]);
     assert_eq!(
@@ -4838,6 +4868,8 @@ fn m7b_140_catch_up_side_divergence_has_one_writer_and_one_vector() {
                 alert(),
                 copy_lost(COPY_B),
                 lost(QualificationCause::DivergenceDetected(COPY_B)),
+                // B was the durable quorum's secondary too (issue #79).
+                durable_advanced(&[(CONFIG, 0)]),
             ],
         ),
         // C already diverged by rule 9: the edge and the block, four wide.
@@ -7044,7 +7076,11 @@ fn m7b_223_qualification_is_gained_at_the_head_once_per_edge() {
     let mut one = tracker();
     assert_eq!(
         deliver(&mut one, &b(HEAD, HEAD, HEAD)),
-        vec![peer_progress(B, HEAD), gained(&[COPY_B])],
+        vec![
+            peer_progress(B, HEAD),
+            gained(&[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
+        ],
         "at the anchor, one edge"
     );
     assert_eq!(
@@ -7056,7 +7092,7 @@ fn m7b_223_qualification_is_gained_at_the_head_once_per_edge() {
         deliver(&mut one, &b(HEAD + 1, HEAD + 1, HEAD)),
         vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
     );
-    // C's ACKs move the durable view, and no edge: the head stayed qualified.
+    // C's ACKs land, and no edge: the head stayed qualified.
     for (ack, why) in [
         (c(HEAD + 1, HEAD + 1, HEAD), "still qualified: no repeat"),
         (c(HEAD + 1, HEAD + 1, HEAD + 1), "a flush ACK: no repeat"),
@@ -7079,7 +7115,8 @@ fn m7b_223_qualification_is_gained_at_the_head_once_per_edge() {
         vec![
             peer_progress(B, HEAD + 1),
             gained(&[COPY_B]),
-            gained_at(HEAD + 1, &[COPY_B])
+            gained_at(HEAD + 1, &[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
         ],
         "one ACK flips the anchor and the head"
     );
@@ -7600,5 +7637,82 @@ fn m10_r197_c4_a_kept_copy_s_received_is_clamped_to_its_applied_head() {
     assert_eq!(
         tracker.peer(COPY_B).map(|peer| peer.progress),
         Some(progress(HEAD, HEAD, HEAD))
+    );
+}
+
+/// Issue #79, option A (owner ruling 2026-11-20): the durable view L1 reads is a quorum. Per
+/// predicate it is the primary's durable seq capped by the `min_regular_acks` most-durable
+/// regular secondaries, `k = min(min_regular_acks, secondaries)`. The primary always counts, a
+/// lagging third copy does not hold it down, and RF2 keeps the old minimum. The all-copies
+/// views keep their meaning.
+#[retcd_test]
+fn i79_the_protection_floor_is_the_primary_and_the_best_secondary() {
+    // 1. RF3, C silent: the quorum is A and B. The all-copies view still reads C's 0.
+    let mut tracker = rf3_tracker();
+    assert_eq!(
+        deliver(&mut tracker, &b(HEAD, HEAD, HEAD)),
+        vec![
+            peer_progress(B, HEAD),
+            gained(&[COPY_B]),
+            durable_advanced(&[(CONFIG, HEAD)])
+        ]
+    );
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(HEAD))]
+    );
+    assert_eq!(tracker.min_required_durable(), DurableSeq(0));
+    assert!(!tracker.all_durable_through(Seq(1)));
+
+    // 2. Both secondaries durable, at different seqs: the better one counts.
+    let mut tracker = rf3_tracker();
+    deliver(&mut tracker, &b(HEAD, HEAD, 5));
+    deliver(&mut tracker, &c(HEAD, HEAD, 10));
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(10))]
+    );
+
+    // 3. The primary is required: its own lag caps the floor, whatever the secondaries hold.
+    let mut init = init(rf3());
+    init.local = progress(HEAD, HEAD, 5);
+    let mut tracker = ProgressTracker::new(init).expect("tracker");
+    deliver(&mut tracker, &b(HEAD, HEAD, HEAD));
+    deliver(&mut tracker, &c(HEAD, HEAD, HEAD));
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(5))]
+    );
+
+    // 4. RF2: the one secondary is the quorum, so the floor is the old minimum, and a
+    //    threshold above the secondaries there are is capped at them.
+    let rf2 = config_with(
+        CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+        ],
+    );
+    for min_regular_acks in [1, 2] {
+        let mut config = rf2.clone();
+        config.min_regular_acks = min_regular_acks;
+        let mut tracker = ProgressTracker::new(self::init(config)).expect("RF2 tracker");
+        deliver(&mut tracker, &b(HEAD, HEAD, 10));
+        assert_eq!(
+            tracker.durable_per_predicate(),
+            vec![(CONFIG, DurableSeq(10))],
+            "RF2, min_regular_acks {min_regular_acks}"
+        );
+    }
+
+    // 5. RF3 with a threshold of 2: both secondaries are the quorum, so the lower one counts.
+    let mut config = rf3();
+    config.min_regular_acks = 2;
+    let mut tracker = ProgressTracker::new(self::init(config)).expect("tracker");
+    deliver(&mut tracker, &b(HEAD, HEAD, 5));
+    deliver(&mut tracker, &c(HEAD, HEAD, 10));
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(5))]
     );
 }
