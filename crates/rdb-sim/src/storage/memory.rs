@@ -34,6 +34,10 @@ use crate::storage::history::history_writes;
 use crate::storage::snapshot::MemorySnapshot;
 use crate::storage::StorageOp;
 
+/// The bound the host's `snapshot_entry_bytes` adds to each entry's key and value: the twin of
+/// `rdb_storage::SNAPSHOT_ENTRY_OVERHEAD`.
+pub const SNAPSHOT_ENTRY_OVERHEAD: usize = 64;
+
 /// One lineage's watermarks and the batches behind them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Lineage {
@@ -617,16 +621,46 @@ impl MemoryEngine {
         after: Option<&(Namespace, Bytes)>,
         limit: usize,
     ) -> Vec<InstallEntry> {
-        self.view(partition, generation)
+        self.page_after(partition, generation, after, limit, usize::MAX)
+            .0
+    }
+
+    /// The twin of `RocksSnapshot::page_after` (PR #204 review): [`Self::entries_after`]
+    /// capped by size as well as count, stopping before the entry that would take the page's
+    /// `key + value + SNAPSHOT_ENTRY_OVERHEAD` bytes past `max_bytes` (the first always goes),
+    /// and whether the view holds an entry after the page.
+    #[must_use]
+    pub fn page_after(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        after: Option<&(Namespace, Bytes)>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> (Vec<InstallEntry>, bool) {
+        let mut rest = self
+            .view(partition, generation)
             .into_iter()
             .filter(|((ns, key), _)| {
                 !matches!(ns, Namespace::History | Namespace::Meta)
                     && !(*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
             })
             .filter(|(cursor, _)| after.is_none_or(|after| cursor > after))
-            .take(limit)
-            .map(|((ns, key), (value, version))| (ns, key, value, version))
-            .collect()
+            .peekable();
+        let (mut page, mut bytes) = (Vec::new(), 0_usize);
+        while let Some(((_, key), (value, _))) = rest.peek() {
+            let size = key.len() + value.len() + SNAPSHOT_ENTRY_OVERHEAD;
+            if page.len() >= limit || (!page.is_empty() && bytes + size > max_bytes) {
+                break;
+            }
+            bytes += size;
+            let Some(((ns, key), (value, version))) = rest.next() else {
+                break;
+            };
+            page.push((ns, key, value, version));
+        }
+        let more = rest.peek().is_some();
+        (page, more)
     }
 
     /// Apply `generation`'s history to `records`: its predecessor's through the base it was cut

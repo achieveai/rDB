@@ -2901,6 +2901,12 @@ struct Host {
     ///
     /// [`COPY_BATCH_KEYS`]: rdb_storage::COPY_BATCH_KEYS
     snapshot_page_keys: usize,
+    /// PR #204 review: the most bytes one snapshot page carries, in
+    /// [`rdb_storage::snapshot_entry_bytes`]: [`SNAPSHOT_PAGE_BYTES`]. Rows set it lower to
+    /// reach a page cut by size with few keys.
+    ///
+    /// [`SNAPSHOT_PAGE_BYTES`]: snapshot::SNAPSHOT_PAGE_BYTES
+    snapshot_page_bytes: usize,
     /// Issue #61 S2-R3: flip one byte of the page with this index (0 is the first) this source
     /// sends, after its chain is computed. Rows only.
     #[cfg(debug_assertions)]
@@ -3232,6 +3238,7 @@ impl Host {
             transfers: BTreeMap::new(),
             installs: BTreeMap::new(),
             snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
+            snapshot_page_bytes: snapshot::SNAPSHOT_PAGE_BYTES,
             #[cfg(debug_assertions)]
             snapshot_chunk_fault: None,
             #[cfg(debug_assertions)]

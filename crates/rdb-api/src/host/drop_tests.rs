@@ -9017,7 +9017,10 @@ fn t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier() 
     assert_eq!(unserved[0]["reason"], "view_failed", "{unserved:?}");
     let opened = logged!(METHOD, "snapshot_transfer_opened");
     assert_eq!(opened.len(), 1, "{opened:?}");
-    assert_eq!(opened[0]["barrier"], unserved[0]["barrier"], "the same barrier");
+    assert_eq!(
+        opened[0]["barrier"], unserved[0]["barrier"],
+        "the same barrier"
+    );
     assert_eq!(logged!(METHOD, "snapshot_transfer_installed").len(), 1);
 }
 
@@ -9068,7 +9071,10 @@ fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
         after: install.after.clone(),
         prev: install.chain,
     };
-    let receiver = three.replication.receiver(three.node, p).expect("a receiver");
+    let receiver = three
+        .replication
+        .receiver(three.node, p)
+        .expect("a receiver");
     assert_eq!(receiver.lineage(), lineage, "the install's lineage");
     let head = receiver.applied_head();
     let config = receiver.config().config_version;
@@ -9134,7 +9140,10 @@ fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
         .replication
         .receiver(host.node, p)
         .map(|receiver| receiver.applied_head().seq.0);
-    assert!(applied > Some(installed), "node 3 is past S {installed}: {applied:?}");
+    assert!(
+        applied > Some(installed),
+        "node 3 is past S {installed}: {applied:?}"
+    );
 }
 
 /// Issue #61 PR #204 review, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
@@ -9162,7 +9171,11 @@ fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
     trio.until("node 1 held page 1", |_| {
         (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
     });
-    assert_eq!(role_of_three(&trio), Some(ReplicaRole::Shadow), "node 3 is the shadow");
+    assert_eq!(
+        role_of_three(&trio),
+        Some(ReplicaRole::Shadow),
+        "node 3 is the shadow"
+    );
     let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
     let pull = SnapshotPull {
         partition: p,
@@ -9186,18 +9199,29 @@ fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
         },
     );
     owner.shadow_duty(p, t);
-    let first = owner.move_catching_up.get(&p).copied().expect("the clock started");
+    let first = owner
+        .move_catching_up
+        .get(&p)
+        .copied()
+        .expect("the clock started");
     assert_eq!((first.since, first.acked), (t, 0), "{first:?}");
     owner.snapshot_pages_held_from = Some(2);
     owner.snapshot_pull(pull);
     owner.shadow_duty(p, t.plus_millis(2_000));
-    let reset = owner.move_catching_up.get(&p).copied().expect("the clock runs");
+    let reset = owner
+        .move_catching_up
+        .get(&p)
+        .copied()
+        .expect("the clock runs");
     assert_eq!(reset.since, t.plus_millis(2_000), "{reset:?}");
     assert!(reset.pulled > first.pulled, "{first:?} then {reset:?}");
     assert!(owner.moves[&p].abandoned.is_none(), "the move stands");
     assert!(logged!(METHOD, "move_catch_up_given_up").is_empty());
     owner.shadow_duty(p, t.plus_millis(4_000));
-    assert!(owner.moves[&p].abandoned.is_some(), "no page: the move is given up");
+    assert!(
+        owner.moves[&p].abandoned.is_some(),
+        "no page: the move is given up"
+    );
     assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
 }
 
@@ -9254,7 +9278,11 @@ fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
         done: false,
     };
     trio.nodes[2].0.snapshot_chunk(replay).expect("no fault");
-    let install = trio.nodes[2].0.installs.get(&p).expect("the install stands");
+    let install = trio.nodes[2]
+        .0
+        .installs
+        .get(&p)
+        .expect("the install stands");
     assert_eq!(
         (
             install.after.clone(),
@@ -9322,7 +9350,11 @@ fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afres
     let abandoned = logged!(METHOD, "snapshot_transfer_abandoned");
     assert_eq!(abandoned.len(), 1, "{abandoned:?}");
     assert_eq!(abandoned[0]["why"], "idle", "{abandoned:?}");
-    assert_eq!(owner.snapshots_served.get(&(p, three)), None, "the barrier is forgotten");
+    assert_eq!(
+        owner.snapshots_served.get(&(p, three)),
+        None,
+        "the barrier is forgotten"
+    );
     owner.snapshot_pages_held_from = None;
     owner.snapshot_catchup(p, three, barrier);
     let opened = logged!(METHOD, "snapshot_transfer_opened");
@@ -9332,6 +9364,43 @@ fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afres
         (!logged!(METHOD, "snapshot_install_replaced").is_empty()).then_some(())
     });
     rebuilt(&mut trio, METHOD, floor);
+}
+
+/// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
+/// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
+/// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
+/// is at most the cap (`snapshot_transfer_installed{largest_page_bytes}`), it takes several
+/// pages, every entry arrives, and the rebuild completes: the last page is the one after which
+/// the view holds nothing, not the first one cut short by size.
+/// Cuts: the source pages with no byte cap, red (one page over the cap); the source ends the
+/// transfer on a page shorter than the key limit, red (the install stops after one page,
+/// missing entries).
+/// Integration (~5 s): S2-R1's setup with large values.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_pages_of_large_values_stay_under_the_byte_cap_and_the_rebuild_completes() {
+    const METHOD: &str =
+        "t61_pr204_pages_of_large_values_stay_under_the_byte_cap_and_the_rebuild_completes";
+    const CAP: usize = 1024 * 1024;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed_with(dir.path(), 4, 100 * 1024, |host| {
+        host.snapshot_page_keys = rdb_storage::COPY_BATCH_KEYS;
+        host.snapshot_page_bytes = CAP;
+    });
+    rebuilt(&mut trio, METHOD, floor);
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    let largest = installed[0]["largest_page_bytes"].as_u64().expect("a size");
+    assert!(largest <= CAP as u64, "{installed:?}");
+    assert!(
+        largest > CAP as u64 / 2,
+        "pages are filled to the cap: {installed:?}"
+    );
+    assert!(installed[0]["chunks"].as_u64() >= Some(3), "{installed:?}");
+    assert!(
+        installed[0]["entries"].as_u64() >= Some(30),
+        "every key: {installed:?}"
+    );
+    promoted_and_durable(&mut trio, 31);
 }
 
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
@@ -9363,6 +9432,17 @@ fn promoted_and_durable(trio: &mut Trio, request: u64) {
 /// floor.
 #[cfg(debug_assertions)]
 fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio, u64) {
+    trimmed_with(dir, keep, 1, each)
+}
+
+/// [`trimmed`] with each of the 30 puts' values `value_bytes` long.
+#[cfg(debug_assertions)]
+fn trimmed_with(
+    dir: &std::path::Path,
+    keep: u64,
+    value_bytes: usize,
+    each: impl Fn(&mut Host),
+) -> (Trio, u64) {
     // As `note_tests::formed`: the open counter first, so `admin::promote` reads the record
     // (S2-R2); then D9's bootstrap.
     let mut trio = Trio::new(dir, |host| {
@@ -9381,7 +9461,17 @@ fn trimmed(dir: &std::path::Path, keep: u64, each: impl Fn(&mut Host)) -> (Trio,
     trio.bootstrap();
     trio.admits_for(4 * Trio::PAUSE_AGE_MILLIS);
     for request in 1..=30 {
-        match trio.ask(put(request)) {
+        let put = ClientCall::Put {
+            identity: identity(request),
+            object: key(request),
+            change: Change::Doc(Delta(vec![Op::Replace(Value::Bytes(vec![
+                b'v';
+                value_bytes
+            ]))])),
+            expect: None,
+            remaining_millis: 5_000,
+        };
+        match trio.ask(put) {
             Answer::Txn { .. } => {}
             other => panic!("put {request} with every copy up: {other:?}"),
         }

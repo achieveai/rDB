@@ -62,6 +62,12 @@ pub const SNAPSHOT_CHUNK_LABEL: &[u8] = b"rdb snapshot chunk v1";
 /// A source drops a transfer no pull has touched for this long (design section 2, step 6).
 pub(crate) const SNAPSHOT_IDLE_MILLIS: u64 = 60_000;
 
+/// PR #204 review: the most bytes one snapshot page carries by default, a quarter of the
+/// 64 MiB frame ([`crate::net::MAX_FRAME`]), so a page of large values always fits it with the
+/// frame's own fields to spare. A page holds at least one entry, so a single entry larger than
+/// the frame still cannot be sent.
+pub(crate) const SNAPSHOT_PAGE_BYTES: usize = crate::net::MAX_FRAME / 4;
+
 /// Why a target refused an offer, or stopped an install. Sent back in [`SnapshotOfferRefused`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotRefusal {
@@ -332,6 +338,8 @@ pub(crate) struct Install {
     /// Ordinary appends of the offer's lineage not delivered while this install owned the
     /// partition ([`Host::append_deferred`]).
     pub(crate) deferred: u64,
+    /// The largest page written, in [`rdb_storage::snapshot_entry_bytes`].
+    pub(crate) largest_page: u64,
 }
 
 impl Host {
@@ -693,11 +701,14 @@ impl Host {
             );
             return;
         }
-        let page = transfer.view.entries_after(
+        // PR #204 review: capped by size too, so a page of large values fits the frame, and
+        // ended from the cursor: a page cut short by size is not the last.
+        let page = transfer.view.page_after(
             pull.after.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
             self.snapshot_page_keys,
+            self.snapshot_page_bytes,
         );
-        let page = match (page, transfer.view.fault()) {
+        let (page, more) = match (page, transfer.view.fault()) {
             (Ok(page), None) => page,
             (result, fault) => {
                 tracing::warn!(
@@ -725,7 +736,7 @@ impl Host {
             .sum::<u64>();
         let index = transfer.pages;
         transfer.pages += 1;
-        let done = page.len() < self.snapshot_page_keys;
+        let done = !more;
         let chunk = SnapshotChunk {
             partition: pull.partition,
             generation: pull.generation,
@@ -929,6 +940,7 @@ impl Host {
             chunks: 0,
             started: std::time::Instant::now(),
             deferred: 0,
+            largest_page: 0,
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
@@ -1104,7 +1116,8 @@ impl Host {
         }
         install.deferred += 1;
         if install.deferred == 1 {
-            let seq = ReplicationEnvelope::decode(&frame.body).map(|envelope| envelope.header.seq.0);
+            let seq =
+                ReplicationEnvelope::decode(&frame.body).map(|envelope| envelope.header.seq.0);
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -1172,6 +1185,12 @@ impl Host {
         }
         install.chain = chunk.chain;
         install.entries += chunk.entries.len() as u64;
+        let page_bytes: usize = chunk
+            .entries
+            .iter()
+            .map(|(_, key, value, ..)| rdb_storage::snapshot_entry_bytes(key, value))
+            .sum();
+        install.largest_page = install.largest_page.max(page_bytes as u64);
         install.chunks += 1;
         install.after = chunk
             .entries
@@ -1266,6 +1285,7 @@ impl Host {
             entries = install.entries,
             chunks = install.chunks,
             deferred = install.deferred,
+            largest_page_bytes = install.largest_page,
             millis = u64::try_from(install.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "snapshot_transfer_installed"
         );

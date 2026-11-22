@@ -37,4 +37,6 @@ pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
 pub use install::InstallError;
 pub use keys::{Link, PublishMark, TrimFloor, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
-pub use snapshot::{RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};
+pub use snapshot::{
+    snapshot_entry_bytes, RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH, SNAPSHOT_ENTRY_OVERHEAD,
+};

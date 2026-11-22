@@ -79,7 +79,7 @@ use crate::harness::run::{FaultTag, StepAction};
 use crate::harness::semantic;
 use crate::harness::snapshot::{
     chunk_chain, ladder_dense, reseed_ack, ChunkEntry, SnapshotOffer, SnapshotRefusal,
-    SnapshotTransfer, SNAPSHOT_PAGE_KEYS,
+    SnapshotTransfer, SNAPSHOT_PAGE_BYTES, SNAPSHOT_PAGE_KEYS,
 };
 use crate::harness::trace::Site;
 use crate::harness::transfer::{Step, Transfer, TransferPlan};
@@ -2297,18 +2297,25 @@ impl Dispatcher {
                     .insert((to, partition), (generation, at, chunks));
                 return Ok(());
             }
-            // The source's page, answering the pull `(after, chain)`.
-            let page: Vec<ChunkEntry> =
-                self.engines
-                    .get(&offer.from)
-                    .map_or_else(Vec::new, |engine| {
-                        engine
-                            .entries_after(partition, generation, after.as_ref(), page_keys)
-                            .into_iter()
-                            .map(|(ns, key, value, version)| (ns, key, value, version, generation))
-                            .collect()
-                    });
-            let done = page.len() < page_keys;
+            // The source's page, answering the pull `(after, chain)`: capped by size as well as
+            // count, as the host's, and the last only when the view holds nothing after it.
+            let (page, more) = self.engines.get(&offer.from).map_or_else(
+                || (Vec::new(), false),
+                |engine| {
+                    engine.page_after(
+                        partition,
+                        generation,
+                        after.as_ref(),
+                        page_keys,
+                        SNAPSHOT_PAGE_BYTES,
+                    )
+                },
+            );
+            let page: Vec<ChunkEntry> = page
+                .into_iter()
+                .map(|(ns, key, value, version)| (ns, key, value, version, generation))
+                .collect();
+            let done = !more;
             let sent = chunk_chain(chain, &page);
             let page = self.snapshot_chunk_corrupted(chunks, page);
             // The target's side of the page.
