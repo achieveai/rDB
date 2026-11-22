@@ -3413,7 +3413,8 @@ impl Db {
     /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
     /// rebuild from the app's own source): the cursor's record, or the record a cut leaves you
     /// at, that this copy no longer holds answers `Trimmed` and does not fault the node (only a
-    /// record missing between the floor and the cap, met while paging, does);
+    /// record missing between the retained floor and what the copy may serve, met while paging,
+    /// does);
     /// [`FeedPage::Rewound`] means records above `to` are not on this copy's history: a promote
     /// cut them, or this copy cannot place the cursor's generation on its chain and `to` is
     /// [`FeedCursor::START`] (a longer replay than needed, never a gap). That last holds only
@@ -3423,7 +3424,9 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Every error claims `no_mutation`: a feed call writes nothing. `UNAVAILABLE` when the copy
+    /// Every error claims `no_mutation`: a feed call writes nothing. Before anything is
+    /// sent, `INVALID_ARGUMENT` (`Definitive`) when the read timeout is too large to set a
+    /// deadline from now. `UNAVAILABLE` when the copy
     /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
     /// nothing in its generation, or (a secondary) has not established freshness: no read of
     /// `partitions/{p}` within the grant naming its generation with it pinned. A call to a
@@ -3522,7 +3525,11 @@ impl Db {
         // Review r7/r8: one deadline, taken here, covers every wait of the call, whichever the
         // source: the dispatch (a node mid-restart included), the owner's refresh and resend,
         // and the answer.
-        let deadline = Instant::now() + wait;
+        // Review r9 (thread 4657822746): `Timeouts::read` has no upper bound, so a deadline it
+        // cannot name is refused here, before either source is sent anything.
+        let Some(deadline) = Instant::now().checked_add(wait) else {
+            return Err(feed_unrepresentable(wait));
+        };
         let answer = match source {
             Source::Owner => self.call_by(partition, call, wait, Some(deadline)),
             Source::Node(node) => {
@@ -6843,6 +6850,19 @@ fn feed_restarting(node: NodeId, wait: Duration) -> ApiError {
         ),
     );
     error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
+}
+
+/// The refusal of a feed call whose read timeout `wait` is too large to set a deadline from
+/// now (#170 review r9): nothing was sent. `INVALID_ARGUMENT`, `Definitive`: the same open
+/// refuses every such call until it is opened with a smaller `Timeouts::read`.
+fn feed_unrepresentable(wait: Duration) -> ApiError {
+    let mut error = ApiError::invalid(format!(
+        "the read timeout {wait:?} is too large to set a deadline from now; nothing was sent: \
+         open the database with a smaller `Timeouts::read`"
+    ));
+    error.retry = RetryRule::Definitive;
     error.no_mutation = true;
     error
 }

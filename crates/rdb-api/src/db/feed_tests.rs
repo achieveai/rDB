@@ -2637,62 +2637,6 @@ fn timed_call(
     answered
 }
 
-/// Review r8 (thread 4657621997, the r8 verdict's blockers): one read deadline, taken when the
-/// call starts, covers the wait at a restart's guard and the answer, from either source. For
-/// `Source::Owner` and then `Source::Node(2)`: the target is marked mid-restart; the call is
-/// counted waiting at the guard (`Db::restart_waiters`); once 3 s of its 4 s read timeout have
-/// passed, the mark is cleared as a restart's end clears it; the call reaches the target's
-/// mailbox, which holds it unanswered. The call ends at its original deadline, refused "no feed
-/// answer", not 4 s later at a fresh full answer wait.
-/// Cuts: the owner's answer wait given a fresh full timeout, red; the direct node's answer
-/// wait given a fresh full timeout, red.
-/// Unit (~8 s): a `Db` built by hand, no restart; the clock is real, the stages are barriers.
-#[config_log::retcd_test]
-fn f87_3_a_call_waited_out_on_a_restart_ends_at_its_first_deadline() {
-    let rt = runtime();
-    let read = Duration::from_secs(4);
-    let part = Duration::from_secs(3);
-    for (source, target) in [(Source::Owner, OWNER), (Source::Node(NodeId(2)), NodeId(2))] {
-        let (db, mailbox) = marked_mid_restart(&rt, read, target);
-        let started = Instant::now();
-        let answered = timed_call(&db, source);
-        until("the call waits at the restart's guard", || {
-            db.restart_waiters() == 1
-        });
-        until("part of the read deadline has gone on the restart", || {
-            started.elapsed() >= part
-        });
-        for handle in lock(&db.nodes).iter_mut() {
-            handle.restarting = None;
-        }
-        db.opened.restarted.notify_all();
-        let held = mailbox.recv_timeout(read).unwrap_or_else(|error| {
-            panic!("{source:?}: the call reaches node {}: {error:?}", target.0)
-        });
-        assert!(matches!(held, Msg::Client(_)), "{source:?}: a feed call");
-        let (answer, took) = answered
-            .recv_timeout(read + patience())
-            .unwrap_or_else(|error| panic!("{source:?}: the call ends: {error:?}"));
-        let error = answer.expect_err("the held call is not answered");
-        assert_eq!(error.kind, ErrorKind::Unavailable, "{source:?}: {error:?}");
-        assert!(
-            error.detail.starts_with("no feed answer"),
-            "{source:?}: {error:?}"
-        );
-        assert!(error.no_mutation, "{source:?}: {error:?}");
-        assert!(
-            took >= read,
-            "{source:?}: not before its deadline: {took:?}"
-        );
-        assert!(
-            took < part + read - Duration::from_millis(1500),
-            "{source:?}: ended at its first deadline, not a fresh wait: {took:?}"
-        );
-        assert_eq!(db.restart_waiters(), 0, "{source:?}");
-        drop(held);
-    }
-}
-
 /// Review r8 (the r8 verdict's first blocker): an owner-routed feed call to an owner held
 /// mid-restart past the read timeout is refused within it, as a direct call is. Node 1, the
 /// owner, is marked mid-restart and stays so; a `Source::Owner` call, read timeout 1 s, is
@@ -2720,5 +2664,394 @@ fn f87_3_a_owner_routed_call_to_an_owner_held_mid_restart_is_refused_within_its_
     assert!(
         mailbox.try_recv().is_err(),
         "nothing was sent to the owner mid-restart"
+    );
+}
+
+/// Which call a feed-deadline case makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    /// `Source::Owner`: the owner `Db::call_by` routes to, refreshed and resent as any call is.
+    Owner,
+    /// `Source::Node(n)`: node `n` alone, never refreshed.
+    Direct,
+}
+
+/// What a feed-deadline case does to the call ([`f87_3_a_feed_deadline_closure_table`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spend {
+    /// The read timeout is `Duration::MAX`; the direct target is node 3, which nothing links.
+    TooLarge,
+    /// The read timeout is zero; the target is marked mid-restart.
+    Zero,
+    /// The read timeout is 1 ns, past before the call dispatches; the target is marked.
+    Expired,
+    /// The target is marked; part of the budget goes at its guard; then it holds the call.
+    HeldAnswer,
+    /// Owner only: node 1 is marked and its mailbox gone; part of the budget goes at its guard;
+    /// its send then fails and the owner refresh is held.
+    HeldRefresh,
+    /// Owner only: as `HeldRefresh`, but the refresh names node 2, which is marked: the resend
+    /// waits at node 2's guard.
+    HeldResendDispatch,
+    /// Owner only: as `HeldRefresh`, but the refresh names node 2, which holds the resent call.
+    HeldResendAnswer,
+    /// Owner only: node 1 answers `NOT_PRIMARY` once part of the budget has gone, and the refresh
+    /// that answer asks for is held.
+    HeldRefusalRefresh,
+}
+
+/// A feed call on its own thread, timed by its own clock: `started` hears the caller's start
+/// before it calls; `answered` hears the answer and the time since that start. The thread first
+/// waits `lag`, as a caller scheduled late would, so a row cannot lean on a prompt start.
+struct Caller {
+    started: mpsc::Receiver<Instant>,
+    answered: mpsc::Receiver<(Result<FeedPage, ApiError>, Duration)>,
+}
+
+fn caller(db: &Arc<Db>, source: Source, lag: Duration) -> Caller {
+    let (start, started) = mpsc::channel();
+    let (sent, answered) = mpsc::channel();
+    let db = Arc::clone(db);
+    std::thread::spawn(move || {
+        std::thread::sleep(lag);
+        let began = Instant::now();
+        let _ = start.send(began);
+        let answer = db.changes(PARTITION, FeedCursor::START, 10, source);
+        let _ = sent.send((answer, began.elapsed()));
+    });
+    Caller { started, answered }
+}
+
+/// Fail as a setup overrun, not as the contract, when a stage was reached after the moment the
+/// case acts at: the row could not then tell the deadline from a fresh wait.
+fn on_time(case: &str, began: Instant, at: Duration, stage: &str) {
+    let now = began.elapsed();
+    assert!(
+        now < at,
+        "{case}: setup overrun: {stage} was reached {now:?} after the caller's start, past the \
+         {at:?} the case acts at"
+    );
+}
+
+/// One case of [`f87_3_a_feed_deadline_closure_table`]: what it ended with, by its caller's
+/// clock, and whether a marked or held target was sent anything it should not have been.
+#[allow(clippy::too_many_lines)]
+fn deadline_case(rt: &tokio::runtime::Runtime, via: Via, spend: Spend) {
+    let case = format!("{via:?} x {spend:?}");
+    let read = match spend {
+        Spend::TooLarge => Duration::MAX,
+        Spend::Zero => Duration::ZERO,
+        Spend::Expired => Duration::from_nanos(1),
+        _ => DEADLINE_READ,
+    };
+    let gated = GatedStore::new();
+    let refreshes = matches!(
+        spend,
+        Spend::HeldRefresh | Spend::HeldResendDispatch | Spend::HeldResendAnswer
+    );
+    if matches!(spend, Spend::HeldResendDispatch | Spend::HeldResendAnswer) {
+        put_owner_record(rt, &gated, NodeId(2));
+    }
+    if matches!(spend, Spend::HeldRefresh | Spend::HeldRefusalRefresh) {
+        gated.close();
+    }
+    let (one, one_mailbox) = NodeHandle::unanswered(OWNER);
+    let (two, two_mailbox) = NodeHandle::unanswered(NodeId(2));
+    let timeouts = Timeouts {
+        read,
+        ..Timeouts::default()
+    };
+    let mut db = Db::by_hand(vec![one, two], store(), rt.handle(), timeouts, None);
+    db.route.refresh = Some((
+        Arc::clone(&gated) as Arc<dyn ConfigStore>,
+        rt.handle().clone(),
+    ));
+    let db = Arc::new(db);
+    let target = match (via, spend) {
+        (Via::Direct, Spend::TooLarge) => NodeId(3),
+        (Via::Direct, _) => NodeId(2),
+        (Via::Owner, _) => OWNER,
+    };
+    let mark = |node: NodeId, on: bool| {
+        for handle in lock(&db.nodes)
+            .iter_mut()
+            .filter(|handle| handle.node == node)
+        {
+            handle.restarting = on.then_some(u64::MAX);
+        }
+        db.opened.restarted.notify_all();
+    };
+    let marked = !matches!(spend, Spend::TooLarge | Spend::HeldRefusalRefresh);
+    if marked {
+        mark(target, true);
+    }
+    if spend == Spend::HeldResendDispatch {
+        mark(NodeId(2), true);
+    }
+    let (one_mailbox, two_mailbox) = if refreshes {
+        drop(one_mailbox);
+        (None, Some(two_mailbox))
+    } else {
+        (Some(one_mailbox), Some(two_mailbox))
+    };
+    let source = match via {
+        Via::Owner => Source::Owner,
+        Via::Direct => Source::Node(target),
+    };
+    // Review r9 (thread 4657621997): the held-answer cells start their caller late on purpose;
+    // every hold below is timed from the start the caller sends, not from this thread's.
+    let lag = if spend == Spend::HeldAnswer {
+        DEADLINE_LAG
+    } else {
+        Duration::ZERO
+    };
+    let call = caller(&db, source, lag);
+    let began = call
+        .started
+        .recv_timeout(lag + patience())
+        .unwrap_or_else(|error| panic!("{case}: the caller starts: {error:?}"));
+    // Every timed case acts once `DEADLINE_PART` of its budget has gone, by the caller's clock.
+    let mut held = None;
+    match spend {
+        Spend::TooLarge | Spend::Zero | Spend::Expired => {}
+        Spend::HeldRefusalRefresh => {
+            let msg = one_mailbox
+                .as_ref()
+                .expect("node 1's mailbox")
+                .recv_timeout(patience())
+                .unwrap_or_else(|error| panic!("{case}: node 1 takes the call: {error:?}"));
+            on_time(&case, began, DEADLINE_PART, "node 1 taking the call");
+            until("part of the budget has gone", || {
+                began.elapsed() >= DEADLINE_PART
+            });
+            let Msg::Client(client) = msg else {
+                panic!("{case}: a feed call, not {msg:?}");
+            };
+            let refused = ApiError::new(ErrorKind::NotPrimary, "node 1 no longer owns partition 1");
+            let _ = client.reply.send(Answer::Error {
+                error: refused,
+                request: None,
+            });
+        }
+        _ => {
+            until("the call waits at its target's guard", || {
+                db.restart_waiters() == 1
+            });
+            on_time(&case, began, DEADLINE_PART, "the guard");
+            until("part of the budget has gone", || {
+                began.elapsed() >= DEADLINE_PART
+            });
+            mark(target, false);
+            if spend == Spend::HeldAnswer {
+                let mailbox = if via == Via::Owner {
+                    &one_mailbox
+                } else {
+                    &two_mailbox
+                };
+                held = Some(
+                    mailbox
+                        .as_ref()
+                        .expect("the target's mailbox")
+                        .recv_timeout(DEADLINE_READ)
+                        .unwrap_or_else(|error| panic!("{case}: the call reaches it: {error:?}")),
+                );
+            }
+        }
+    }
+    if spend == Spend::HeldResendAnswer {
+        held = Some(
+            two_mailbox
+                .as_ref()
+                .expect("node 2's mailbox")
+                .recv_timeout(DEADLINE_READ)
+                .unwrap_or_else(|error| panic!("{case}: the resend reaches node 2: {error:?}")),
+        );
+    }
+    let (answer, took) = call
+        .answered
+        .recv_timeout(DEADLINE_READ + patience())
+        .unwrap_or_else(|error| panic!("{case}: the call ends: {error:?}"));
+    let took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(case = %case, took_ms, ok = answer.is_ok(), "feed_deadline_cell");
+    let error = answer.expect_err("no case is answered with a page");
+    assert!(error.no_mutation, "{case}: {error:?}");
+    // What each case is refused with.
+    let (kind, starts) = match spend {
+        Spend::TooLarge => (ErrorKind::InvalidArgument, "the read timeout".to_owned()),
+        Spend::Zero | Spend::Expired => (
+            ErrorKind::Unavailable,
+            format!("node {} is restarting in this process", target.0),
+        ),
+        Spend::HeldAnswer | Spend::HeldResendAnswer => {
+            (ErrorKind::Unavailable, "no feed answer".to_owned())
+        }
+        Spend::HeldRefresh => (ErrorKind::Unavailable, String::new()),
+        Spend::HeldResendDispatch => (
+            ErrorKind::Unavailable,
+            "node 2 is restarting in this process".to_owned(),
+        ),
+        Spend::HeldRefusalRefresh => (
+            ErrorKind::NotPrimary,
+            "node 1 no longer owns partition 1".to_owned(),
+        ),
+    };
+    assert_eq!(error.kind, kind, "{case}: {error:?}");
+    assert!(error.detail.starts_with(&starts), "{case}: {error:?}");
+    if spend == Spend::HeldRefresh {
+        assert!(
+            error.detail.contains("the owner's node thread has stopped"),
+            "{case}: {error:?}"
+        );
+    }
+    if spend == Spend::TooLarge {
+        assert_eq!(error.retry, RetryRule::Definitive, "{case}: {error:?}");
+    }
+    if matches!(
+        spend,
+        Spend::Zero | Spend::Expired | Spend::HeldResendDispatch
+    ) {
+        stopped_refusal(&case, &error);
+    }
+    // When it ended: at once, or at the caller's original deadline, never a fresh wait later.
+    match spend {
+        Spend::TooLarge | Spend::Zero | Spend::Expired => assert!(
+            took < DEADLINE_PROMPT,
+            "{case}: refused at once, not after a wait: {took:?}"
+        ),
+        _ => {
+            assert!(
+                took >= DEADLINE_READ,
+                "{case}: not before its deadline: {took:?}"
+            );
+            assert!(
+                took < DEADLINE_READ + DEADLINE_SLACK,
+                "{case}: ended at its original deadline, not a fresh wait: {took:?}"
+            );
+        }
+    }
+    // Nothing reached a target that was still marked, or one never meant to be called.
+    let quiet = |mailbox: &Option<mpsc::Receiver<Msg>>, who: &str| {
+        if let Some(mailbox) = mailbox {
+            assert!(
+                mailbox.try_recv().is_err(),
+                "{case}: {who} was sent the call"
+            );
+        }
+    };
+    match spend {
+        Spend::TooLarge | Spend::Zero | Spend::Expired => {
+            quiet(&one_mailbox, "node 1");
+            quiet(&two_mailbox, "node 2");
+        }
+        Spend::HeldResendDispatch | Spend::HeldRefresh => quiet(&two_mailbox, "node 2"),
+        _ => {}
+    }
+    if matches!(spend, Spend::HeldRefresh | Spend::HeldRefusalRefresh) {
+        assert!(gated.held() >= 1, "{case}: the refresh was held");
+        gated.open();
+    }
+    assert_eq!(db.restart_waiters(), 0, "{case}");
+    drop(held);
+}
+
+/// The budget of a timed case, the part of it each spends before it acts, the most past the
+/// budget a case may end, and how soon an untimed case is refused.
+const DEADLINE_READ: Duration = Duration::from_secs(2);
+const DEADLINE_PART: Duration = Duration::from_millis(1500);
+const DEADLINE_SLACK: Duration = Duration::from_millis(750);
+const DEADLINE_PROMPT: Duration = Duration::from_millis(500);
+/// How late the held-answer cells start their caller.
+const DEADLINE_LAG: Duration = Duration::from_millis(600);
+
+/// Put a `partitions/1` record naming `owner` into `gated`'s store, as a promote would.
+fn put_owner_record(rt: &tokio::runtime::Runtime, gated: &GatedStore, owner: NodeId) {
+    use rdb_core::authority::partition::RecordMode;
+    use rdb_core::contracts::ids::{OwnerEpoch, Revision};
+    let record = PartitionRecord {
+        partition: PARTITION,
+        owner,
+        generation: Generation(3),
+        owner_epoch: OwnerEpoch(3),
+        config_version: admin::CONFIG_VERSION,
+        lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+    };
+    let root = PartitionRoot {
+        mode: RecordMode::Active,
+        owner_boot: BootId(5),
+        base_seq: Seq(7),
+        base_digest: Digest::ROOT,
+        predecessor_generation: Generation(2),
+        predecessor_cutoff: Seq(7),
+        instance: [7; INSTANCE_LEN],
+        run: Revision(1),
+    };
+    rt.block_on(gated.put(config_core::PutRequest {
+        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+        value: record.encode_with(&root),
+        expected_mod_revision: Some(0),
+        dedup: None,
+    }))
+    .expect("put partitions/1");
+}
+
+/// Review r9 (threads 4657822746, 4657822748, 4657822752, the r9 verdict and its closure
+/// table): every wait of a feed call comes out of one deadline taken at its start, by the
+/// caller's own clock. Cells, each on its own `Db` built by hand, run side by side:
+/// - `TooLarge`, owner and an unlinked direct node: `INVALID_ARGUMENT`, `Definitive`, no
+///   mutation, at once, nothing sent;
+/// - `Zero` and `Expired`, both paths, target marked mid-restart: the stopped node's refusal
+///   naming the restart, at once, nothing sent to it;
+/// - `HeldAnswer`, both paths: 1.5 s of a 2 s budget at the guard, then the answer held;
+/// - owner only: `HeldRefresh`, `HeldResendDispatch`, `HeldResendAnswer`, `HeldRefusalRefresh`
+///   (a real `NOT_PRIMARY` answer near the deadline, its refresh held, the same refusal back).
+///
+/// Each timed cell ends at its original deadline: at least 2 s and under 2.75 s; a fresh wait
+/// would end at 3.5 s. The `HeldAnswer` cells start their caller 0.6 s late, so both fresh-answer
+/// cuts are pinned under delayed caller scheduling, by the start the caller sends. A stage reached after the moment its cell acts fails as a setup overrun.
+/// Cuts: the deadline built unchecked (`TooLarge` red: overflow); `nodes_for_within` sending
+/// past its bound (`Zero`, `Expired` red: a marked target sent the call); a fresh full answer
+/// wait, owner (`HeldAnswer`, `HeldResendAnswer`) and direct (`HeldAnswer`); a fresh refresh
+/// timeout (`HeldRefresh`, `HeldRefusalRefresh`); a fresh dispatch bound
+/// (`HeldResendDispatch`), each red at 3.5 s.
+/// Unit (~2.5 s): real clocks, as the waits are `std` ones; the cells share the wall time.
+#[config_log::retcd_test]
+fn f87_3_a_feed_deadline_closure_table() {
+    let rt = Arc::new(runtime());
+    let cells = [
+        (Via::Owner, Spend::TooLarge),
+        (Via::Direct, Spend::TooLarge),
+        (Via::Owner, Spend::Zero),
+        (Via::Direct, Spend::Zero),
+        (Via::Owner, Spend::Expired),
+        (Via::Direct, Spend::Expired),
+        (Via::Owner, Spend::HeldAnswer),
+        (Via::Direct, Spend::HeldAnswer),
+        (Via::Owner, Spend::HeldRefresh),
+        (Via::Owner, Spend::HeldResendDispatch),
+        (Via::Owner, Spend::HeldResendAnswer),
+        (Via::Owner, Spend::HeldRefusalRefresh),
+    ];
+    let span = tracing::Span::current();
+    let runs: Vec<_> = cells
+        .into_iter()
+        .map(|(via, spend)| {
+            let rt = Arc::clone(&rt);
+            let span = span.clone();
+            (
+                format!("{via:?} x {spend:?}"),
+                std::thread::spawn(move || {
+                    let _span = span.enter();
+                    deadline_case(&rt, via, spend);
+                }),
+            )
+        })
+        .collect();
+    let failed: Vec<String> = runs
+        .into_iter()
+        .filter_map(|(case, run)| run.join().is_err().then_some(case))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "cells failed (each one's panic is above): {failed:?}"
     );
 }
