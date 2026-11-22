@@ -242,20 +242,33 @@ fn list_cfs(dir: &Path) -> Vec<String> {
 async fn seed_three(dir: &Path) {
     let s = open_plain(dir);
     s.log_store().save_vote(&Vote::new(1, 1)).await.unwrap();
-    s.state_machine()
-        .apply(vec![
-            put(1, "/a", "1"),
-            put(2, "/b", "2"),
-            put(3, "/c", "3"),
-        ])
-        .await
-        .unwrap();
+    append_apply(
+        &s,
+        vec![put(1, "/a", "1"), put(2, "/b", "2"), put(3, "/c", "3")],
+    )
+    .await
+    .unwrap();
     // Explicit: on Windows the directory lock outlives an implicit drop just long enough for
     // the next raw open in the same test to fail.
     drop(s);
 }
 
 // --- §3.1 the event journal ---------------------------------------------------------------
+
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
+}
 
 /// M4-01: one mutation produces exactly one journal event, inside the *same* state batch — no
 /// second batch and no second fsync. Counted rather than read out of the source, so a future
@@ -467,10 +480,12 @@ async fn m4_09_journal_stats_track_bytes_and_oldest() {
     let reader = s.reader();
     assert_eq!(reader.journal_stats().unwrap(), JournalStats::default());
 
-    s.state_machine()
-        .apply(vec![put(1, "/a", "1"), put(2, "/b", "a much longer value")])
-        .await
-        .unwrap();
+    append_apply(
+        &s,
+        vec![put(1, "/a", "1"), put(2, "/b", "a much longer value")],
+    )
+    .await
+    .unwrap();
 
     let stats = reader.journal_stats().unwrap();
     assert_eq!(stats.count, 2);
@@ -707,8 +722,7 @@ async fn m4_15_migration_is_idempotent() {
 
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![put(4, "/d", "4"), put(5, "/e", "5")])
+        append_apply(&s, vec![put(4, "/d", "4"), put(5, "/e", "5")])
             .await
             .unwrap();
         assert_eq!(s.reader().compact_revision().unwrap(), 3);
@@ -854,17 +868,19 @@ async fn m4_21_compact_command_deletes_the_range() {
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(RecordingSink::default());
     let s = open_full(tmp.path(), Arc::new(NoFaults), sink.clone());
-    s.state_machine()
-        .apply(vec![
+    append_apply(
+        &s,
+        vec![
             put(1, "/a", "1"),
             put(2, "/b", "2"),
             put(3, "/c", "3"),
             put(4, "/d", "4"),
-        ])
-        .await
-        .unwrap();
+        ],
+    )
+    .await
+    .unwrap();
 
-    s.state_machine().apply(vec![compact(5, 2)]).await.unwrap();
+    append_apply(&s, vec![compact(5, 2)]).await.unwrap();
 
     let reader = s.reader();
     assert_eq!(reader.compact_revision().unwrap(), 2);
@@ -995,7 +1011,7 @@ async fn m4_89_crash_before_state_batch_leaves_no_event() {
             tmp.path(),
             FailAt::new(Boundary::BeforeStateBatch, FaultAction::Crash),
         );
-        let _ = s.state_machine().apply(vec![put(4, "/d", "4")]).await;
+        let _ = append_apply(&s, vec![put(4, "/d", "4")]).await;
         assert!(s.is_poisoned());
     }
 
@@ -1033,7 +1049,7 @@ async fn m4_90_crash_after_state_batch_has_kv_and_event() {
                 FailAt::new(boundary, FaultAction::Crash),
                 sink.clone(),
             );
-            let _ = s.state_machine().apply(vec![put(4, "/d", "4")]).await;
+            let _ = append_apply(&s, vec![put(4, "/d", "4")]).await;
             assert!(s.is_poisoned(), "{boundary}: Crash must poison the store");
         }
         assert!(
@@ -1077,7 +1093,7 @@ async fn m4_91_crash_after_state_batch_before_publish() {
             FailAt::new(Boundary::AfterStateBatchBeforePublish, FaultAction::Crash),
             sink.clone(),
         );
-        let _ = s.state_machine().apply(vec![compact(4, 2)]).await;
+        let _ = append_apply(&s, vec![compact(4, 2)]).await;
         assert!(s.is_poisoned());
     }
 
@@ -1103,7 +1119,7 @@ async fn m4_92_crash_during_compact_apply() {
 
         {
             let s = open_at(tmp.path(), FailAt::new(boundary, FaultAction::Crash));
-            let _ = s.state_machine().apply(vec![compact(4, 2)]).await;
+            let _ = append_apply(&s, vec![compact(4, 2)]).await;
             assert!(s.is_poisoned(), "{boundary}");
         }
 
@@ -1148,7 +1164,7 @@ async fn m4_93_io_error_on_journal_write_is_fatal_not_silent() {
         tmp.path(),
         FailAt::new(Boundary::AfterStateBatch, FaultAction::Crash),
     );
-    let _ = s.state_machine().apply(vec![put(4, "/d", "4")]).await;
+    let _ = append_apply(&s, vec![put(4, "/d", "4")]).await;
     assert!(s.is_poisoned());
 
     let reader = s.reader();

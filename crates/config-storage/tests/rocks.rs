@@ -118,6 +118,21 @@ impl FaultInjector for Recorder {
 
 // --- open, identity, freshness ----------------------------------------------------------
 
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
+}
+
 #[retcd_test]
 async fn m2_storage_01_fresh_open_reports_fresh_and_persistent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -456,7 +471,7 @@ async fn m2_storage_09_applied_state_reloads_with_the_same_state_hash() {
                 payload: EntryPayload::Normal(cmd.clone()),
             });
         }
-        let responses = s.state_machine().apply(entries).await.unwrap();
+        let responses = append_apply(&s, entries).await.unwrap();
         assert_eq!(
             responses.len(),
             commands.len() + 1,
@@ -509,8 +524,9 @@ async fn m2_storage_10_membership_and_revision_survive_reopen() {
 
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![
+        append_apply(
+            &s,
+            vec![
                 Entry {
                     log_id: log_id(1, 1),
                     payload: EntryPayload::Membership(Membership::new(
@@ -519,9 +535,10 @@ async fn m2_storage_10_membership_and_revision_survive_reopen() {
                     )),
                 },
                 put(1, 2, "/a", "1"),
-            ])
-            .await
-            .unwrap();
+            ],
+        )
+        .await
+        .unwrap();
     }
     {
         let s = open_plain(tmp.path());

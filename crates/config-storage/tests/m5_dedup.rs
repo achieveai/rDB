@@ -134,6 +134,21 @@ fn raw_dedup_count(dir: &Path) -> usize {
     n
 }
 
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
+}
+
 /// M5-102 (durability half): the dedup record is written in the **same** synced batch as the
 /// KV change, so the two can never be observed apart.
 ///
@@ -220,7 +235,7 @@ async fn m5_102_dedup_record_survives_with_its_mutation_at_after_state_batch() {
                 seen: AtomicU64::new(0),
             }),
         );
-        let result = s.state_machine().apply(vec![put(1, "/a", "1", 7)]).await;
+        let result = append_apply(&s, vec![put(1, "/a", "1", 7)]).await;
         assert!(result.is_err(), "the crash lands after the synced write");
         drop(s);
     }
@@ -231,11 +246,7 @@ async fn m5_102_dedup_record_survives_with_its_mutation_at_after_state_batch() {
     assert_eq!(s.reader().cluster_revision(), 1);
     assert_eq!(s.reader().dedup_stats().records, 1);
 
-    let responses = s
-        .state_machine()
-        .apply(vec![put(2, "/a", "1", 7)])
-        .await
-        .unwrap();
+    let responses = append_apply(&s, vec![put(2, "/a", "1", 7)]).await.unwrap();
     let CommandResponse::Mutation {
         response,
         dedup_hit,
@@ -260,14 +271,16 @@ async fn m5_dedup_index_and_retired_set_survive_a_restart() {
     {
         let s = open_plain(tmp.path());
         s.log_store().save_vote(&Vote::new(1, 1)).await.unwrap();
-        s.state_machine()
-            .apply(vec![
+        append_apply(
+            &s,
+            vec![
                 put(1, "/a", "1", 1),
                 put(2, "/b", "2", 2),
                 entry(3, Command::RetireNode { node_id: NodeId(3) }),
-            ])
-            .await
-            .unwrap();
+            ],
+        )
+        .await
+        .unwrap();
         drop(s);
     }
 
@@ -288,11 +301,7 @@ async fn m5_dedup_index_and_retired_set_survive_a_restart() {
     drop(reader);
 
     // The rebuilt index is the *same* index: a resubmission is still a hit after the restart.
-    let responses = s
-        .state_machine()
-        .apply(vec![put(4, "/a", "1", 1)])
-        .await
-        .unwrap();
+    let responses = append_apply(&s, vec![put(4, "/a", "1", 1)]).await.unwrap();
     assert!(matches!(
         responses[0],
         CommandResponse::Mutation {
@@ -310,24 +319,28 @@ async fn m5_100_compact_trims_the_dedup_family() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![
+        append_apply(
+            &s,
+            vec![
                 put(1, "/a", "1", 1),
                 put(2, "/b", "2", 2),
                 put(3, "/c", "3", 3),
-            ])
-            .await
-            .unwrap();
-        s.state_machine()
-            .apply(vec![entry(
+            ],
+        )
+        .await
+        .unwrap();
+        append_apply(
+            &s,
+            vec![entry(
                 4,
                 Command::Compact {
                     up_to_revision: 2,
                     dedup_trim_below: Some(3),
                 },
-            )])
-            .await
-            .unwrap();
+            )],
+        )
+        .await
+        .unwrap();
         assert_eq!(s.reader().dedup_stats().records, 1);
         drop(s);
     }

@@ -64,6 +64,21 @@ fn open_with_ceiling(dir: &Path, max_format_version: u32) -> Result<RocksStore, 
     )
 }
 
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
+}
+
 /// M6-98 `downgrading_a_v2_store_is_refused_with_one_specific_message`.
 ///
 /// The `UnsupportedFormat`/`MissingColumnFamily` pair is the whole point: a current directory
@@ -334,9 +349,7 @@ async fn f015_a_pinned_store_refuses_to_apply_a_committed_schema_2_command() {
 
     // An ordinary write first: the fence is about the *dedup/maintenance* grammar, not about
     // writing. A rolling upgrade that stopped ordinary traffic would be its own outage.
-    pinned
-        .state_machine()
-        .apply(vec![put(1, "/f015/plain", "v")])
+    append_apply(&pinned, vec![put(1, "/f015/plain", "v")])
         .await
         .expect("a schema-1 command must still apply on a pinned node");
     assert_eq!(watermark(&pinned), COMMAND_SCHEMA_V1);
