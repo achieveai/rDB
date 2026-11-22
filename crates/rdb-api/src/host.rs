@@ -4118,10 +4118,7 @@ impl Host {
                 self.restore_dormant(partition, &seed, false);
                 Ok(())
             }
-            Msg::SnapshotOffer(offer) => {
-                self.snapshot_offer(*offer);
-                Ok(())
-            }
+            Msg::SnapshotOffer(offer) => self.snapshot_offer(*offer),
             Msg::SnapshotPull(pull) => {
                 self.snapshot_pull(pull);
                 Ok(())
@@ -16161,6 +16158,14 @@ impl Host {
                     "node {node} is still copying generation {} of partition {p}",
                     newest.0
                 ),
+            );
+        }
+        // Round 4 (Q-feed): mid-install the lineage is wiped and the floor reads 1, so a cursor
+        // would be rewound to START over a history this node does not hold.
+        if self.installs.contains_key(&partition) {
+            return refused(
+                ErrorKind::Unavailable,
+                format!("node {node} is installing a snapshot of partition {p}"),
             );
         }
         let mut chain = vec![feed::Level {

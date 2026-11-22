@@ -10018,7 +10018,10 @@ fn t61_pr204_a_non_primary_cannot_forge_an_offer_a_page_or_a_pull() {
         boot: trio.nodes[1].0.boot,
         ..offer.clone()
     };
-    trio.nodes[2].0.snapshot_offer(forged_offer);
+    trio.nodes[2]
+        .0
+        .snapshot_offer(forged_offer)
+        .expect("the forged offer is refused, not a fault");
     let forged_pull = SnapshotPull {
         partition: p,
         generation: offer.lineage.generation,
@@ -10742,6 +10745,329 @@ fn t61_r3_a_pull_from_a_copy_moved_out_of_the_plan_ends_the_transfer() {
     assert_eq!(dropped, vec!["not_a_member"], "{dropped:?}");
     let abandoned = copy3_field(&trio, METHOD, "snapshot_transfer_abandoned", "why");
     assert_eq!(abandoned, vec!["not_a_member"], "{abandoned:?}");
+}
+
+/// Issue #61 round 4 (blocker 1), a pull reaching a retired primary: as S2-R1, node 1 holds
+/// node 3's pull for page 2. Node 2 is then promoted for real, dropping node 3, so node 1's
+/// `Recovered` retires its primary, which keeps its old lineage and config. Node 3's held pull
+/// is then delivered to node 1. It is dropped `not_a_member` and the transfer ends: a retired
+/// primary leads nothing.
+/// Cut: no retired filter in `still_a_member`, red (the retired tracker still names copy 3 at
+/// node 3, so the pull is served and the transfer stands).
+/// Integration (~6 s): S2-R1's setup and a promote.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r4_a_pull_reaching_a_retired_primary_ends_the_transfer() {
+    const METHOD: &str = "t61_r4_a_pull_reaching_a_retired_primary_ends_the_transfer";
+    use super::snapshot::SnapshotPull;
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    // Bound to an instance, as round 3's promote row: `admin::promote` reads the record.
+    let bind = |host: &mut Host| {
+        host.engine
+            .bind_instance(super::note_tests::INSTANCE)
+            .expect("bind instance");
+        host.instance = Some(super::note_tests::INSTANCE);
+    };
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        bind(host);
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    bind(&mut trio.nodes[2].0);
+    trio.nodes[2].0.snapshot_pull_retry_millis = 600_000;
+    trio.until("node 1 held page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let install = trio.nodes[2].0.installs.get(&p).expect("node 3 installs");
+    let pull = SnapshotPull {
+        partition: p,
+        generation: install.offer.lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    let promote = super::seal_tests::spawn_promote_dropping(&trio, 2, Some(NodeId(3)));
+    trio.until(
+        "the promote finished and node 1's primary is retired",
+        |trio| {
+            (promote.is_finished()
+                && trio.nodes[0]
+                    .0
+                    .replication
+                    .primary(NodeId(1), p)
+                    .is_some_and(|primary| primary.tracker().retired()))
+            .then_some(())
+        },
+    );
+    trio.rt
+        .block_on(promote)
+        .expect("the promote's task")
+        .expect("the promote commits");
+    let one = &mut trio.nodes[0].0;
+    assert!(
+        one.transfers.contains_key(&(p, three)),
+        "the transfer outlived the promote"
+    );
+    one.snapshot_pages_held_from = None;
+    one.snapshot_pull(pull);
+    assert!(
+        !one.transfers.contains_key(&(p, three)),
+        "the transfer ended"
+    );
+    // Copy 3 is no longer in node 1's newest commit, so `copy3_field` cannot name it.
+    let whys = |msg: &str| -> Vec<String> {
+        logged!(METHOD, msg)
+            .iter()
+            .filter(|line| line["node"] == 1 && line["copy"] == three.0)
+            .map(|line| line["why"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let dropped = whys("snapshot_pull_dropped");
+    assert_eq!(dropped, vec!["not_a_member"], "{dropped:?}");
+    let abandoned = whys("snapshot_transfer_abandoned");
+    assert_eq!(abandoned, vec!["not_a_member"], "{abandoned:?}");
+}
+
+/// Issue #61 round 4 (blocker 2), an offer replacing a begun install: as S2-R1, node 1 serves
+/// page 1 and holds the rest, so node 3's install has begun (`install_begin` wiped the
+/// partition). Node 1's idle transfer is then abandoned and the same barrier offered afresh,
+/// and node 3 replaces its install with the new offer (`snapshot_install_replaced`). Node 1
+/// now answers no pull, so the replacement expires before it begins
+/// (`snapshot_install_expired{begun = false}`). The replaced install was aborted when it was
+/// replaced: node 3 holds no installing marker for the generation, and its receiver was
+/// re-rooted once (`snapshot_install_receiver_rooted`).
+/// Cut: no `abort_begun` in `snapshot_offer`, red (the begun install's marker is left behind
+/// with no install to abort it).
+/// Integration (~4 s): S2-R1's setup; the abandon and the re-offer are direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r4_an_offer_replacing_a_begun_install_aborts_it() {
+    const METHOD: &str = "t61_r4_an_offer_replacing_a_begun_install_aborts_it";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 600_000;
+    trio.until("node 3's install began", |trio| {
+        trio.nodes[2]
+            .0
+            .installs
+            .get(&p)
+            .is_some_and(|install| install.begun)
+            .then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let generation = trio.nodes[2].0.installs[&p].offer.lineage.generation;
+    let past = trio
+        .clock
+        .now()
+        .plus_millis(super::snapshot::SNAPSHOT_IDLE_MILLIS);
+    let owner = &mut trio.nodes[0].0;
+    let at = owner.transfers[&(p, three)].at;
+    owner.snapshot_pages_held_from = Some(0);
+    owner.transfer_duty(past);
+    assert!(!owner.transfers.contains_key(&(p, three)), "abandoned");
+    owner.snapshot_catchup(p, three, at);
+    assert!(owner.transfers.contains_key(&(p, three)), "offered afresh");
+    trio.until("node 3 replaced its install", |_| {
+        (!logged!(METHOD, "snapshot_install_replaced").is_empty()).then_some(())
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 100;
+    trio.until("node 3's replacement expired", |_| {
+        logged!(METHOD, "snapshot_install_expired")
+            .iter()
+            .any(|line| line["copy"] == three.0)
+            .then_some(())
+    });
+    let expired = logged!(METHOD, "snapshot_install_expired");
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["begun"], false, "{expired:?}");
+    assert_eq!(
+        trio.nodes[2].0.engine.installing(p, generation),
+        None,
+        "no installing marker is left"
+    );
+    let rooted = copy3_field(&trio, METHOD, "snapshot_install_receiver_rooted", "at");
+    assert_eq!(rooted, vec![at.0.to_string()], "{rooted:?}");
+}
+
+/// Issue #61 round 4 (item 3), a retry probe that sends nothing: as round 3's exhaustion row,
+/// node 3's first four page writes fail, so the 4th refusal keeps the barrier. Node 1's head
+/// record is then dropped from its history (`drop_history`), so `retry_duty`'s probe finds
+/// nothing to send (`send: nothing sent`). The count is re-armed before the probe, so after the
+/// next back-off the barrier is re-opened and probed again: two `snapshot_retry_reopened`, and
+/// the count is still held.
+/// Cut: the old clear-before-probe order (the count removed instead of re-armed), red (one
+/// re-open, then nothing ever probes copy 3 again).
+/// Integration (~5 s): S2-R1's setup and two 1 s back-offs.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r4_a_retry_probe_that_sends_nothing_is_tried_again() {
+    const METHOD: &str = "t61_r4_a_retry_probe_that_sends_nothing_is_tried_again";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_retry_backoff_millis = 1_000;
+        }
+    });
+    trio.nodes[2].0.snapshot_install_faults = 4;
+    let three = copy_of(&trio, 3);
+    trio.until("node 1 ran out of retries", |_| {
+        (!logged!(METHOD, "snapshot_retry_exhausted").is_empty()).then_some(())
+    });
+    assert!(logged!(METHOD, "snapshot_retry_reopened").is_empty());
+    let one = &mut trio.nodes[0].0;
+    let (generation, head) = {
+        let tracker = one
+            .replication
+            .primary(NodeId(1), p)
+            .expect("node 1 leads")
+            .tracker();
+        (tracker.lineage().generation, tracker.head())
+    };
+    let dropped = one
+        .engine
+        .drop_history(p, generation, head.0..head.0 + 1)
+        .expect("drop node 1's head record");
+    assert_eq!(dropped, 1);
+    trio.until("node 1 re-opened the barrier twice", |_| {
+        (logged!(METHOD, "snapshot_retry_reopened").len() >= 2).then_some(())
+    });
+    let reopened = logged!(METHOD, "snapshot_retry_reopened");
+    assert!(
+        reopened
+            .iter()
+            .all(|line| line["probe"] == format!("Some({})", head.0)),
+        "{reopened:?}"
+    );
+    assert!(
+        trio.nodes[0].0.snapshot_retries.contains_key(&(p, three)),
+        "the count stays armed"
+    );
+    let nothing: Vec<_> = logged!(METHOD, "send: nothing sent")
+        .into_iter()
+        .filter(|line| line["node"] == 1 && line["seq"] == head.0)
+        .collect();
+    assert!(!nothing.is_empty(), "the probe found no record to send");
+}
+
+/// Issue #61 round 4 (Q-feed), a feed read mid-install: as round 3's Q1 row, node 3 is a
+/// regular secondary above node 1's floor, and node 1 is asked for copy 3's snapshot. It serves
+/// page 1 and holds the rest, so node 3's install has begun: its lineage is wiped and its floor
+/// reads 1. A change-feed read sent to node 3 from `START` is refused `UNAVAILABLE`, naming the
+/// install, rather than answered from a history it does not hold.
+/// Cut: no `installs` guard in `Host::changes`, red (once its control read lands, the read is
+/// answered from the wiped copy).
+/// Integration (~4 s): S2-R1's trimmed trio without the wiped restart.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r4_a_feed_read_on_a_copy_mid_install_is_refused_unavailable() {
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed_trio(dir.path(), 4, 1, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 600_000;
+    let three = copy_of(&trio, 3);
+    // As round 3's Q1 row: put 31 lands on nodes 1 and 2 only, so copy 3's cursor waits.
+    trio.links.drop_direction(NodeId(1), NodeId(3));
+    match trio.ask(put(31)) {
+        Answer::Txn { .. } => {}
+        other => panic!("put 31 with node 3 cut off: {other:?}"),
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.links.heal(NodeId(1), NodeId(3));
+    let asked = trio.nodes[0]
+        .0
+        .replication
+        .ask_snapshot(NodeId(1), p, three);
+    assert!(asked.is_some(), "R1 asks, with copy 3's cursor waiting");
+    trio.nodes[0].0.snapshot_catchup(p, three, Seq(head));
+    trio.until("node 3's install began", |trio| {
+        trio.nodes[2]
+            .0
+            .installs
+            .get(&p)
+            .is_some_and(|install| install.begun)
+            .then_some(())
+    });
+    // Sent to node 3's mailbox as a client sends it, so the feed's control read lands first.
+    let (reply, answer) = std::sync::mpsc::channel();
+    trio.nodes[2]
+        .1
+        .send(Msg::Client(Client {
+            partition: p,
+            call: ClientCall::Changes {
+                identity: identity(1),
+                from: FeedCursor::START,
+                max: 10,
+            },
+            reply,
+        }))
+        .expect("node 3's mailbox");
+    match trio.answer(&answer) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(error.detail.contains("installing a snapshot"), "{error:?}");
+        }
+        other => panic!("answered mid-install: {other:?}"),
+    }
+    assert!(
+        trio.nodes[2].0.installs.contains_key(&p),
+        "still installing when it answered"
+    );
+}
+
+/// Issue #61 round 4 (Q-idle), a kept barrier and a peer restart: as round 3's exhaustion row,
+/// the 4th refusal keeps the barrier and arms the retry count (back-off 10 min here, so the
+/// duty never re-opens it). Node 3 then starts again, and node 1 hears it
+/// (`Host::transfers_peer_booted`). The kept barrier and the count are both forgotten: the new
+/// process is not the one that refused, so R1's next ask is served at once.
+/// Cut: `transfers_peer_booted` forgets only open transfers, red (the barrier and the count are
+/// kept, so the copy waits for the back-off).
+/// Integration (~4 s): S2-R1's setup; the boot is a direct call.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r4_a_peer_restart_forgets_a_kept_barrier_and_its_retry_count() {
+    const METHOD: &str = "t61_r4_a_peer_restart_forgets_a_kept_barrier_and_its_retry_count";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_retry_backoff_millis = 600_000;
+        }
+    });
+    trio.nodes[2].0.snapshot_install_faults = 4;
+    let three = copy_of(&trio, 3);
+    trio.until("node 1 ran out of retries", |_| {
+        (!logged!(METHOD, "snapshot_retry_exhausted").is_empty()).then_some(())
+    });
+    let one = &mut trio.nodes[0].0;
+    assert!(one.snapshots_served.contains_key(&(p, three)), "kept");
+    assert!(one.snapshot_retries.contains_key(&(p, three)), "armed");
+    assert!(!one.transfers.contains_key(&(p, three)), "no transfer open");
+    one.transfers_peer_booted(NodeId(3));
+    assert!(
+        !one.snapshots_served.contains_key(&(p, three)),
+        "{:?}",
+        one.snapshots_served
+    );
+    assert!(
+        !one.snapshot_retries.contains_key(&(p, three)),
+        "{:?}",
+        one.snapshot_retries
+    );
 }
 
 /// Issue #61, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so

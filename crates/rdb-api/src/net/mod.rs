@@ -135,8 +135,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
 /// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
 /// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
-/// until tenants are bound to certificates (#151; [`sender_refused`]). Split from #107's bump,
-/// it would take `11`.
+/// until tenants are bound to certificates (#151; [`sender_refused`]).
 ///
 /// `11` came with issue #61 (PR-A, design rev 5 M2): `WirePeerAsk::Probe`, F1's digest probe of
 /// a copy that another node holds, answered by `Host::probe` in the plan anchor's generation. A

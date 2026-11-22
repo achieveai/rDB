@@ -5858,7 +5858,7 @@ fn t61_s2_r5_an_offer_from_a_deposed_or_stale_primary_is_refused_untouched() {
         rdb_storage::dump(dir.path().join("3")).expect("dump")
     );
     for offer in offers {
-        host.snapshot_offer(offer);
+        host.snapshot_offer(offer).expect("the offer is taken");
         assert!(host.installs.is_empty(), "an install started");
         assert_eq!(host.fault, None);
     }

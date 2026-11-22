@@ -2311,8 +2311,9 @@ impl RocksEngine {
     /// The lowest `History` seq lineage `(partition, generation)` serves through its chain
     /// (#87, the change feed's `Trimmed`): the first record of the lowest level that holds one
     /// within that level's reach ([`Self::history_reach`]), or the lineage's applied head plus
-    /// one when none does (1 for an empty copy). It assumes no hole above that record: a history
-    /// trim (#61) must revisit it.
+    /// one when none does (1 for an empty copy). It assumes no hole above that record. #61's
+    /// trim deletes only below its floor, so it leaves none; only the debug tool
+    /// `drop_history` can.
     ///
     /// # Errors
     ///

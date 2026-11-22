@@ -664,12 +664,14 @@ impl Host {
 
     /// Round 3 (B1), every step: a barrier kept because its retries ran out
     /// ([`Self::refusal_kept`]) is re-opened once [`Host::snapshot_retry_backoff_millis`] has
-    /// passed: the count and the served barrier are forgotten (`snapshot_retry_reopened`), and
-    /// the copy is probed with the head (`Host::send_envelopes`, the `SendEnvelopes` R1's
-    /// keepalive and shadow timer send). An idle copy would otherwise never be heard again: on
-    /// a writable partition with no writes nothing else is sent to it. Its answer reaches its
-    /// cursor, which asks again, and that ask is served. A count whose barrier is no longer the
-    /// served one is only forgotten.
+    /// passed: the served barrier is forgotten (`snapshot_retry_reopened`), and the copy is
+    /// probed with the head (`Host::send_envelopes`, the `SendEnvelopes` R1's keepalive and
+    /// shadow timer send). An idle copy would otherwise never be heard again: on a writable
+    /// partition with no writes nothing else is sent to it. Its answer reaches its cursor,
+    /// which asks again, and that ask is served. Round 4 (item 3): the count is re-armed with
+    /// this tick before the probe, so a probe that sends nothing is tried again after the
+    /// back-off. It stops only when a transfer is open, when a new barrier was served, or when
+    /// this node no longer leads the generation (a retired primary leads nothing).
     pub(super) fn retry_duty(&mut self, now: rdb_core::contracts::time::Tick) {
         let due: Vec<_> = self
             .snapshot_retries
@@ -681,16 +683,27 @@ impl Host {
             })
             .map(|(&key, &(generation, barrier, ..))| (key, generation, barrier))
             .collect();
-        for ((partition, copy), generation, barrier) in due {
-            self.snapshot_retries.remove(&(partition, copy));
-            if self.snapshots_served.get(&(partition, copy)) != Some(&(generation, barrier)) {
+        for (key, generation, barrier) in due {
+            let (partition, copy) = key;
+            if self.transfers.contains_key(&key) {
                 continue;
             }
-            self.snapshots_served.remove(&(partition, copy));
+            if self
+                .snapshots_served
+                .get(&key)
+                .is_some_and(|&served| served != (generation, barrier))
+            {
+                self.snapshot_retries.remove(&key);
+                continue;
+            }
+            self.snapshots_served.remove(&key);
             let head = self
                 .replication
                 .primary(self.node, partition)
-                .filter(|primary| primary.tracker().lineage().generation == generation)
+                .filter(|primary| {
+                    !primary.tracker().retired()
+                        && primary.tracker().lineage().generation == generation
+                })
                 .map(|primary| primary.tracker().head());
             tracing::info!(
                 node = self.node.0,
@@ -701,8 +714,12 @@ impl Host {
                 "snapshot_retry_reopened"
             );
             let Some(head) = head else {
+                self.snapshot_retries.remove(&key);
                 continue;
             };
+            if let Some(retry) = self.snapshot_retries.get_mut(&key) {
+                retry.3 = Some(now);
+            }
             let site = Site {
                 partition,
                 correlation: rdb_core::contracts::ids::CorrelationId(0),
@@ -828,7 +845,8 @@ impl Host {
     }
 
     /// Peer `node` started again: its transfers are dropped at once (m-d), so R1's next ask
-    /// re-offers to the new process.
+    /// re-offers to the new process. Round 4 (Q-idle): a barrier kept for one of its copies, and
+    /// that copy's retry count, are forgotten too; the new process is not the one that refused.
     pub(super) fn transfers_peer_booted(&mut self, node: NodeId) {
         let gone: Vec<_> = self
             .transfers
@@ -844,16 +862,41 @@ impl Host {
                 "snapshot_transfer_abandoned",
             );
         }
+        let kept: Vec<_> = self
+            .snapshots_served
+            .keys()
+            .chain(self.snapshot_retries.keys())
+            .copied()
+            .filter(|key| !self.transfers.contains_key(key))
+            .filter(|&(partition, copy)| {
+                self.replication
+                    .primary(self.node, partition)
+                    .is_some_and(|primary| {
+                        primary
+                            .tracker()
+                            .config()
+                            .members
+                            .iter()
+                            .any(|member| member.copy == copy && member.node == node)
+                    })
+            })
+            .collect();
+        for key in kept {
+            self.snapshots_served.remove(&key);
+            self.snapshot_retries.remove(&key);
+        }
     }
 
     /// Round 3 (Q4): whether `transfer`'s receiver is still authorised. This node still leads
     /// the transfer's generation, and its committed config still names `copy` at the
     /// transfer's node. A pull from a copy removed from the plan, or after this node stopped
-    /// leading that generation, ends the transfer (`why = not_a_member`).
+    /// leading that generation, ends the transfer (`why = not_a_member`). A retired tracker
+    /// keeps its old lineage and config, so it is skipped first (round 4, blocker 1).
     fn still_a_member(&self, partition: PartitionId, copy: CopyId, transfer: &Transfer) -> bool {
         self.replication
             .primary(self.node, partition)
             .map(|primary| primary.tracker())
+            .filter(|tracker| !tracker.retired())
             .is_some_and(|tracker| {
                 tracker.lineage().generation == transfer.lineage.generation
                     && tracker
@@ -1123,8 +1166,9 @@ impl Host {
             .map(|(copy, hold)| needs_forget_tail(partition, *copy, hold.node, hold.head))
     }
 
-    /// An offer reached this target (module docs, "Target").
-    pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) {
+    /// An offer reached this target (module docs, "Target"). A held install it replaces is
+    /// aborted first (round 4, blocker 2); a failed abort faults the node.
+    pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) -> Result<(), super::Fault> {
         let partition = offer.lineage.partition;
         match self.offer_check(&offer) {
             Ok(()) => {}
@@ -1145,10 +1189,10 @@ impl Host {
                     self.copy_needs_forget_tail(&offer, hit);
                 }
                 self.refuse_offer(&offer, reason, held.map(|hit| hit.head));
-                return;
+                return Ok(());
             }
         }
-        if let Some(held) = self.installs.get(&partition) {
+        if let Some(held) = self.installs.remove(&partition) {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
@@ -1157,6 +1201,7 @@ impl Host {
                 deferred = held.deferred,
                 "snapshot_install_replaced"
             );
+            self.abort_begun(&held)?;
         }
         let barrier = ReplicationEnvelope::decode(&offer.barrier)
             .map(|envelope| envelope.record_digest)
@@ -1185,6 +1230,7 @@ impl Host {
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
+        Ok(())
     }
 
     /// Design section 2 step 2: the offer's authority and freshness, or why not.
