@@ -9726,7 +9726,7 @@ fn t61_r2_two_transient_install_refusals_then_success_at_the_same_barrier() {
 /// keeps it (`snapshot_retry_exhausted{refusals = 4}`, `refused`): the barrier is still served
 /// and no 5th transfer opens. After node 1's retry back-off (1 s here,
 /// `SNAPSHOT_RETRY_BACKOFF_MILLIS` in production) `retry_duty` re-opens the barrier and probes
-/// copy 3 with the head (`snapshot_retry_reopened{probe}`); the fault has cleared, so the next
+/// copy 3 with node 1's head (`snapshot_retry_reopened{probe = Some(head)}`); the fault has cleared, so the next
 /// ask opens a 5th transfer at the same `S` and node 3 is released `caught_up`.
 /// Cuts: `retry_duty` does nothing, red (the barrier stays kept and node 3 is never rebuilt);
 /// the limit counted `>=` instead of `>`, red (exhausted at refusal 3).
@@ -9758,7 +9758,20 @@ fn t61_r3_the_fourth_refusal_keeps_the_barrier_and_the_retry_duty_reopens_it() {
         "no 5th transfer while the barrier is kept"
     );
     assert!(logged!(METHOD, "snapshot_retry_reopened").is_empty());
+    // The head node 1's primary holds while the barrier is kept: nothing writes, so it is the
+    // head `retry_duty` probes with.
+    let primary_head = |trio: &Trio| {
+        trio.nodes[0]
+            .0
+            .replication
+            .primary(NodeId(1), p)
+            .expect("node 1 is the primary")
+            .tracker()
+            .head()
+    };
+    let head = primary_head(&trio);
     released_caught_up(&mut trio, METHOD);
+    assert_eq!(primary_head(&trio), head, "nothing wrote meanwhile");
     assert_eq!(
         copy3_field(&trio, METHOD, "snapshot_retry_allowed", "refusals"),
         vec!["1", "2", "3"]
@@ -9769,11 +9782,10 @@ fn t61_r3_the_fourth_refusal_keeps_the_barrier_and_the_retry_duty_reopens_it() {
     );
     let reopened = logged!(METHOD, "snapshot_retry_reopened");
     assert_eq!(reopened.len(), 1, "{reopened:?}");
-    assert!(
-        reopened[0]["probe"]
-            .as_str()
-            .is_some_and(|probe| probe.starts_with("Some(")),
-        "a head was probed: {reopened:?}"
+    assert_eq!(
+        reopened[0]["probe"],
+        format!("Some({})", head.0),
+        "{reopened:?}"
     );
     let whys = copy3_field(&trio, METHOD, "snapshot_transfer_released", "why");
     assert_eq!(
