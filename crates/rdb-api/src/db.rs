@@ -46,6 +46,7 @@ use tokio::runtime::Handle;
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
+use crate::feed::{FeedCursor, FeedPage};
 use crate::host::{
     self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
     PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
@@ -62,6 +63,15 @@ const OWNER: NodeId = admin::OWNER;
 /// The only tenant S0 writes as. Not settable by a caller (lead ruling, 2026-10-07: no raw
 /// identity on the REPL). The client is [`DbConfig::client`] (S2-8).
 pub const TENANT: TenantId = TenantId(1);
+
+/// Which copy [`Db::changes`] reads (#87).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The partition's owner, as this `Db` routes to it.
+    Owner,
+    /// Node `n`'s copy alone: the owner, or a regular secondary serving what it applied.
+    Node(NodeId),
+}
 
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads. A [`TxnPut`] names it
 /// as its `group` to write where `put` and `get` do.
@@ -113,6 +123,9 @@ pub const MAX_KEY: usize = 1_024;
 pub const MAX_PAGE: usize = 1_000;
 
 mod ack_floor;
+mod restart;
+
+pub use restart::RestartReason;
 pub(crate) mod error;
 #[cfg(test)]
 use error::wire_name;
@@ -140,15 +153,13 @@ pub struct Timeouts {
     /// up while writes go on, then promotes it to a regular copy. A copy dropped by an
     /// operator, a move or a promote still returns only when its node restarts. One attempt per
     /// drop: a re-add that fails leaves the copy out until its node restarts. Off by default
-    /// until the 512-partition acceptance run passes. Each node process reads its own, as an
-    /// owner and as a returning copy (which marks a refused landing only with it on).
+    /// until the 512-partition acceptance run passes. Each node process reads its own, for its
+    /// duty as an owner. A returning copy follows the setting of the owner that re-adds it,
+    /// which rides on the landing, not its own (ADR-rdb-0009 section 7, #107 slice 2b).
     ///
-    /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
-    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
-    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
-    /// setting off, a read-only return can leave the partition read-only until that copy
-    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
-    /// moves to 10, or a capability bit gates the re-add.
+    /// Every build that speaks protocol 10 has check B and the refused-receiver mark, and an
+    /// older build is refused at the handshake, so it is never re-added. Set it on every node
+    /// anyway, so whichever node owns a partition re-adds its copies the same way.
     pub live_readd: bool,
 }
 
@@ -563,6 +574,9 @@ pub struct Db {
     /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
     /// be restarted once writes have stopped (M9 S2b, D3).
     ready_seen: AtomicBool,
+    /// When [`Db::restart_wanted`] first saw `replace_stopped` in the run of polls that has
+    /// seen it every time since, for its 5 s hold. `None` while not stopped.
+    restart_hold: Mutex<Option<Instant>>,
     /// The `nodes/` this open claimed, while the open is unfinished. Dropping the `Db` then
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
@@ -582,6 +596,9 @@ struct Opened {
     heal: Arc<Mutex<HealState>>,
     /// The heal's task, aborted at shutdown.
     heal_task: Option<tokio::task::JoinHandle<()>>,
+    /// Why the running heal is waiting, as its latest `heal_retry` said (R5): `wait_ready`'s
+    /// time-out names it. `None` once the heal ends, or before it has waited.
+    heal_waiting: Arc<Mutex<Option<String>>>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
@@ -603,7 +620,42 @@ struct Opened {
     /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
     /// given it, so an owner re-seats the copies its partition was placed on.
     nodes: Arc<[NodeId]>,
+    /// What this open found of the OS boot for each node it runs (R5, [`crate::os_boot`]),
+    /// from that node's own `nodes/<n>/os_boot`: an owner's heal goes on without a down copy
+    /// only when its node's is `Same`. A node not here, as in an open that never looked, is
+    /// `Unknown`.
+    os_boot: BTreeMap<NodeId, crate::os_boot::OsBoot>,
+    /// The OS boot id to write to each such node's file once this open is ready
+    /// ([`Db::wait_ready`]) with its heal done, when it is not on file already; taken by the
+    /// first such ready answer.
+    os_boot_record: Mutex<Vec<(PathBuf, String)>>,
+    /// Woken when a node's restart ends ([`NodeHandle::restarting`] cleared), for the calls
+    /// that wait on it (#170 review r6).
+    restarted: std::sync::Condvar,
+    /// The last restart id handed out ([`NodeHandle::restarting`], review r7).
+    restarts: AtomicU64,
+    /// How many calls wait on a node's restart now (review r7: a row proves one waits).
+    restart_waiters: std::sync::atomic::AtomicUsize,
+    /// Holds a crate test armed at a restart's stages ([`Db::hold_restart`]).
+    #[cfg(test)]
+    restart_holds: Mutex<Vec<RestartHold>>,
 }
+
+/// Where a crate test may hold a restart ([`Db::hold_restart`], #170 review r7).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartStage {
+    /// The old thread has ended; the new one has not started, and the node is still marked.
+    Stopped,
+    /// The new handle is in place under the node lock, and the restart has not yet dropped
+    /// its mark.
+    Published,
+}
+
+/// One held restart stage: where it holds, the sender that says it got there, and the
+/// receiver it waits on until the test releases it ([`Db::hold_restart`]).
+#[cfg(test)]
+type RestartHold = (RestartStage, mpsc::Sender<()>, mpsc::Receiver<()>);
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
 #[derive(Debug)]
@@ -640,12 +692,20 @@ impl Default for Opened {
             base_boot: host::BOOT,
             heal: Arc::new(Mutex::new(HealState::NotNeeded)),
             heal_task: None,
+            heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
             stuck: Mutex::new(None),
             control: None,
             instance: None,
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
+            os_boot: BTreeMap::new(),
+            os_boot_record: Mutex::new(Vec::new()),
+            restarted: std::sync::Condvar::new(),
+            restarts: AtomicU64::new(0),
+            restart_waiters: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            restart_holds: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1224,6 +1284,37 @@ pub enum HealState {
     Failed(admin::HealError),
 }
 
+/// The reopen's heal over each owner in `ctxs`, one after another: every grant expires on its
+/// own clock, so the later heals find theirs already expired. Sets `state` to how it ended, and
+/// `waiting` to `None`; each owner's own heal clears `waiting` once its links are up (PR #181
+/// review), so a later owner's first window never names an earlier owner's wait.
+pub(crate) async fn heal_in_turn(
+    ctxs: Vec<admin::HealCtx>,
+    state: Arc<Mutex<HealState>>,
+    waiting: Arc<Mutex<Option<String>>>,
+) {
+    let mut first = None;
+    let mut ended = Ok(());
+    for ctx in ctxs {
+        match admin::heal_retrying(ctx).await {
+            Ok(healed) => {
+                first.get_or_insert(healed);
+            }
+            Err(error) => {
+                tracing::error!(%error, "heal_failed");
+                ended = Err(error);
+                break;
+            }
+        }
+    }
+    *lock(&state) = match (ended, first) {
+        (Ok(()), Some(healed)) => HealState::Handed(healed),
+        (Err(error), _) => HealState::Failed(error),
+        (Ok(()), None) => HealState::NotNeeded,
+    };
+    *lock(&waiting) = None;
+}
+
 /// Why [`Db::wait_ready`] returned without the owner admitting writes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReadyError {
@@ -1239,7 +1330,10 @@ pub enum ReadyError {
         /// after a promote (A-R256).
         owner: NodeId,
         /// The owner's last recovery phase, in words: `unknown` when it answered no status
-        /// look in the time, `none` when it runs no recovery.
+        /// look in the time, `unreachable` when no link to it was up, `none` when it runs no
+        /// recovery. With more than one partition it starts `partition <p>: `. While the
+        /// reopen's heal is waiting (R5), the phase is followed by [`HEAL_WAITING`] and the
+        /// heal's latest wait in words; split on [`HEAL_WAITING`] to get each part.
         phase: String,
     },
     /// Node 1 restarted, or its restart failed: the owner stays out until the folder is opened
@@ -1463,6 +1557,9 @@ fn log_open(limits: &Limits, budgets: &Budgets, unreachable_drop_after_ms: u64, 
         live_readd = live_readd.then_some(true),
         "db_open"
     );
+    // PR #181 (SBX): the setting's state, on or off, once per open. The reopen's heal leaves a
+    // down copy out only with it on (`admin::may_leave_out`).
+    tracing::info!(enabled = live_readd, "db_open_live_readd");
 }
 
 impl Db {
@@ -1687,6 +1784,7 @@ impl Db {
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened {
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
@@ -1778,6 +1876,16 @@ impl Db {
             engines,
             created: created.then(|| nodes_dir.clone()),
         };
+        // R5: read with the engines' `LOCK`s held, so an open refused `InUse` never touches it.
+        // One file per node, in its own copy's folder (PR #181 review): node processes share
+        // `config.dir`, and one that leads nothing must not stamp an owner's.
+        let mut os_boot = BTreeMap::new();
+        let mut os_boot_record = Vec::new();
+        for node in &config.local {
+            let seen = crate::os_boot::observe(&nodes_dir.join(node.0.to_string()))?;
+            os_boot.insert(*node, seen.verdict);
+            os_boot_record.extend(seen.to_record);
+        }
         let mut found = Self::check(
             &mut claim.engines,
             absent,
@@ -1914,12 +2022,15 @@ impl Db {
             ack_floor: ack_tracker(&config, budgets, request_floor(n) + 1),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind,
             opened: Opened {
                 base_boot: boot,
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 instance: Some(found.instance),
                 nodes: Arc::clone(&nodes),
+                os_boot,
+                os_boot_record: Mutex::new(os_boot_record),
                 ..Opened::default()
             },
             route: Route {
@@ -2000,7 +2111,15 @@ impl Db {
                 // The owner's process heals (arch-s2 B1): this one only runs its copy.
                 tracing::info!(owner = found.owner.0, "db_open_not_owner");
             } else {
-                db.start_heal(&store, &rt, budgets, boot, heals, &config.local)?;
+                db.start_heal(
+                    &store,
+                    &rt,
+                    budgets,
+                    boot,
+                    heals,
+                    &config.local,
+                    config.timeouts.live_readd,
+                )?;
             }
         }
         db.unwind = None;
@@ -2584,6 +2703,7 @@ impl Db {
     /// once every node has started on its open engine (A-R165): a copy queried before it is up
     /// answers `InventoryFailed`, and that sticks for the whole recovery. `db_heal_started`
     /// logs how many had started.
+    #[allow(clippy::too_many_arguments)]
     fn start_heal(
         &mut self,
         store: &Arc<dyn ConfigStore>,
@@ -2592,6 +2712,7 @@ impl Db {
         boot: BootId,
         heals: BTreeMap<NodeId, OwnerHeal>,
         local: &[NodeId],
+        live_readd: bool,
     ) -> Result<(), OpenError> {
         let (senders, started) = {
             let nodes = lock(&self.nodes);
@@ -2639,34 +2760,37 @@ impl Db {
                 partition_count: self.route.partitions(),
                 nodes: Arc::clone(&self.opened.nodes),
                 bootstrap,
+                os_boot: self
+                    .opened
+                    .os_boot
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or(crate::os_boot::OsBoot::Unknown),
+                links_since: Default::default(),
+                live_readd,
+                waiting: Arc::clone(&self.opened.heal_waiting),
             });
         }
         let state = Arc::clone(&self.opened.heal);
         *lock(&state) = HealState::Running;
-        self.opened.heal_task = Some(rt.spawn(async move {
-            // One after another: every grant expires on its own clock, so the later heals
-            // find theirs already expired.
-            let mut first = None;
-            let mut ended = Ok(());
-            for ctx in ctxs {
-                match admin::heal_retrying(ctx).await {
-                    Ok(healed) => {
-                        first.get_or_insert(healed);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "heal_failed");
-                        ended = Err(error);
-                        break;
-                    }
-                }
-            }
-            *lock(&state) = match (ended, first) {
-                (Ok(()), Some(healed)) => HealState::Handed(healed),
-                (Err(error), _) => HealState::Failed(error),
-                (Ok(()), None) => HealState::NotNeeded,
-            };
-        }));
+        let waiting = Arc::clone(&self.opened.heal_waiting);
+        // In the opener's span, as the planner's task is: the heal's lines (`heal_retry` among
+        // them) land in the opener's test file (issue #200, PR #171 review; R5).
+        self.opened.heal_task = Some(rt.spawn(tracing::Instrument::instrument(
+            heal_in_turn(ctxs, state, waiting),
+            tracing::Span::current(),
+        )));
         Ok(())
+    }
+
+    /// The reopen's heal state and the text of its latest wait ([`Opened::heal_waiting`]), for
+    /// a crate test that runs [`heal_in_turn`] against a `Db` built by hand.
+    #[cfg(test)]
+    pub(crate) fn heal_shared(&self) -> (Arc<Mutex<HealState>>, Arc<Mutex<Option<String>>>) {
+        (
+            Arc::clone(&self.opened.heal),
+            Arc::clone(&self.opened.heal_waiting),
+        )
     }
 
     /// Block until node 1 admits writes, the reopen's heal fails, or `within` passes. Looks at
@@ -2705,16 +2829,25 @@ impl Db {
             .into_iter();
         let Some(mut partition) = waiting.next() else {
             self.ready_seen.store(true, Ordering::Relaxed);
+            self.record_os_boot(deadline);
             return Ok(());
         };
-        let timed_out = |partition: PartitionId, phase: String| ReadyError::TimedOut {
-            within_ms: within.as_millis(),
-            owner: self.route.owner_of(partition),
-            phase: if self.route.partitions() > 1 {
+        let timed_out = |partition: PartitionId, phase: String| {
+            let phase = if self.route.partitions() > 1 {
                 format!("partition {}: {phase}", partition.0)
             } else {
                 phase
-            },
+            };
+            // R5: a heal still waiting is why there is no recovery to look at; say what for.
+            let phase = match lock(&self.opened.heal_waiting).as_deref() {
+                Some(reason) => format!("{phase}{HEAL_WAITING}{reason}"),
+                None => phase,
+            };
+            ReadyError::TimedOut {
+                within_ms: within.as_millis(),
+                owner: self.route.owner_of(partition),
+                phase,
+            }
         };
         loop {
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
@@ -2739,6 +2872,7 @@ impl Db {
                         continue;
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
+                    self.record_os_boot(deadline);
                     return Ok(());
                 }
                 // It answered without admitting: a resumed old owner stays this way after a
@@ -2800,6 +2934,39 @@ impl Db {
                 return Err(timed_out(partition, phase));
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
+    /// are whole again: write the OS boot id to each of its nodes' `os_boot` files, once, when
+    /// this open found it missing or stale. Not while its heal runs or after it failed (PR #181
+    /// review): until the heal is done, an owner's tail is not known whole, and the next open
+    /// must still wait for every copy (`os_boot_record_deferred`). A failed write is logged
+    /// `os_boot_record_failed` and leaves no file, so the next open waits for every copy, as
+    /// before R5.
+    ///
+    /// The heal task marks itself done just after its last plan is handed, so an owner can
+    /// admit a moment before that: a running heal is waited for until `deadline`.
+    fn record_os_boot(&self, deadline: std::time::Instant) {
+        if lock(&self.opened.os_boot_record).is_empty() {
+            return;
+        }
+        loop {
+            let state = match &*lock(&self.opened.heal) {
+                HealState::Running => "running",
+                HealState::Failed(_) => "failed",
+                HealState::NotNeeded | HealState::Handed(_) => break,
+            };
+            if state == "failed" || std::time::Instant::now() >= deadline {
+                tracing::info!(heal = state, "os_boot_record_deferred");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (dir, id) in std::mem::take(&mut *lock(&self.opened.os_boot_record)) {
+            if let Err(error) = crate::os_boot::record(&dir, &id) {
+                tracing::warn!(dir = %dir.display(), %error, "os_boot_record_failed");
+            }
         }
     }
 
@@ -2932,16 +3099,36 @@ impl Db {
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
-    /// an answer is awaited. A node this process does not run is reached over the peer links,
+    /// an answer is awaited. A node mid-restart is waited for; a send to another node is not
+    /// ([`Self::nodes_for`]). A node this process does not run is reached over the peer links,
     /// whatever their holds (ruling A-R226 h1): in a three-process database the owner is
     /// usually another process.
     fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
         {
-            let nodes = lock(&self.nodes);
+            let nodes = self.nodes_for(node);
             if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
                 return handle.send(msg);
             }
         }
+        self.post_to(node, msg)
+    }
+
+    /// [`Self::send_to`], waiting at most `bound` for a node of this process mid-restart
+    /// (#170 review r7): [`Unsent::Restarting`] then, with nothing sent to it.
+    fn send_to_within(&self, node: NodeId, msg: Msg, bound: Duration) -> Result<(), Unsent> {
+        {
+            let Some(nodes) = self.nodes_for_within(node, bound) else {
+                return Err(Unsent::Restarting);
+            };
+            if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
+                return handle.send(msg).map_err(|_| Unsent::Stopped);
+            }
+        }
+        self.post_to(node, msg).map_err(|_| Unsent::Stopped)
+    }
+
+    /// Post `msg` over the peer links to `node`, which this process does not run.
+    fn post_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
         self.links.post(node, msg).map_err(|fault| {
             tracing::warn!(node = node.0, ?fault, "db_send_unreachable");
             NodeStopped(node)
@@ -3030,16 +3217,50 @@ impl Db {
         partition: PartitionId,
         call: ClientCall,
     ) -> Result<mpsc::Receiver<Answer>, NodeStopped> {
-        let (reply, answer) = mpsc::channel();
-        let msg = Msg::Client(Client {
-            partition,
-            call,
-            reply,
-        });
+        let (msg, answer) = client_msg(partition, call);
         self.send_to(node, msg).map(|()| answer)
     }
 
+    /// [`Self::send_call`] through [`Self::send_to_within`].
+    fn send_call_within(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        call: ClientCall,
+        bound: Duration,
+    ) -> Result<mpsc::Receiver<Answer>, Unsent> {
+        let (msg, answer) = client_msg(partition, call);
+        self.send_to_within(node, msg, bound).map(|()| answer)
+    }
+
     fn call(&self, partition: PartitionId, call: ClientCall, wait: Duration) -> Option<Answer> {
+        self.call_by(partition, call, wait, None)
+    }
+
+    /// [`Self::call`], under one `deadline` when given (#170 review r8): the dispatch, a
+    /// refresh of the owner and its resend, and the answer all wait only the time left before
+    /// it, never a fresh `wait` each. The owner still mid-restart when it passes is refused
+    /// ([`feed_restarting`]), nothing sent; `wait` only names the timeout in that refusal.
+    /// Without one, the dispatch waits out a restart, a refresh waits its own read timeout and
+    /// the answer `wait`, as before.
+    fn call_by(
+        &self,
+        partition: PartitionId,
+        call: ClientCall,
+        wait: Duration,
+        deadline: Option<Instant>,
+    ) -> Option<Answer> {
+        let left = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
+        let send = |owner: NodeId, call: ClientCall| match deadline {
+            None => self
+                .send_call(owner, partition, call)
+                .map_err(|_| Unsent::Stopped),
+            Some(deadline) => self.send_call_within(owner, partition, call, left(deadline)),
+        };
+        let refresh = || match deadline {
+            None => self.refresh_owner(partition),
+            Some(deadline) => self.refresh_owners_by(&[partition], deadline),
+        };
         let mut owner = self.route.owner_of(partition);
         // A `Db` that can look again keeps a copy for one resend: when the owner cannot be
         // reached it may have been promoted away by another process, which told nobody here
@@ -3047,15 +3268,22 @@ impl Db {
         // send there.
         let spare = self.route.refresh.is_some().then(|| call.clone());
         let carried = carries(&call);
-        let mut sent = self.send_call(owner, partition, call);
-        if let (Err(_), Some(call)) = (&sent, spare) {
-            self.refresh_owner(partition);
+        let mut sent = send(owner, call);
+        if let (Err(Unsent::Stopped), Some(call)) = (&sent, spare) {
+            refresh();
             let now = self.route.owner_of(partition);
             if now != owner {
                 tracing::info!(was = owner.0, owner = now.0, "db_call_rerouted");
                 owner = now;
-                sent = self.send_call(owner, partition, call);
+                sent = send(owner, call);
             }
+        }
+        // Review r8: still mid-restart when the deadline passed; nothing was sent to it.
+        if let Err(Unsent::Restarting) = sent {
+            return Some(Answer::Error {
+                error: feed_restarting(owner, wait),
+                request: None,
+            });
         }
         let Ok(answer) = sent else {
             // An owner in another process with no link up is unavailable, not a host fault:
@@ -3070,10 +3298,10 @@ impl Db {
                 request: None,
             });
         };
-        match answer.recv_timeout(wait) {
+        match answer.recv_timeout(deadline.map_or(wait, left)) {
             Ok(answer) => {
                 if refusal_kind(&answer).is_some_and(rereads_owner) {
-                    self.refresh_owner(partition);
+                    refresh();
                 }
                 Some(answer)
             }
@@ -3104,6 +3332,11 @@ impl Db {
     /// call inside the gap goes on with the owner the last read named. A read that fails keeps
     /// the owner it had and logs why: the next such answer past the gap reads again.
     fn refresh_owners(&self, partitions: &[PartitionId]) {
+        self.refresh_owners_by(partitions, Instant::now() + self.timeouts.read);
+    }
+
+    /// [`Self::refresh_owners`], waiting only until `deadline` (#170 review r8).
+    fn refresh_owners_by(&self, partitions: &[PartitionId], deadline: Instant) {
         let Some((store, rt)) = &self.route.refresh else {
             return;
         };
@@ -3141,7 +3374,6 @@ impl Db {
                 }
             }
         });
-        let deadline = Instant::now() + self.timeouts.read;
         for _ in &due {
             let answer = read.recv_timeout(deadline.saturating_duration_since(Instant::now()));
             match answer {
@@ -3281,6 +3513,219 @@ impl Db {
             )),
         };
         answered.map_err(ApiError::for_barrier)
+    }
+
+    /// #87 (ADR-rdb-0020): `partition`'s committed transactions after `from`, read from
+    /// `source`'s copy, at most `max` of them (and at most [`crate::feed::FEED_PAGE_RECORDS`]).
+    /// Start at [`FeedCursor::START`]; store each page's `next` with the effect it had, and call
+    /// again at once while `more` is set. A page never passes what the copy may serve: the
+    /// owner's published position, or what a regular secondary applied. `Source::Owner` goes to
+    /// the owner this `Db` routes to, re-routed as any call is; `Source::Node(n)` goes to node
+    /// `n` alone, so the owner does no work. Either works from any host: a node in this process
+    /// or one over the links, from an app that holds no copy as well as from a node.
+    ///
+    /// The other answers say what to do: [`FeedPage::Behind`] keeps the cursor (wait, or ask
+    /// another copy); [`FeedPage::Trimmed`] means this copy lacks the record (ask another, or
+    /// rebuild from the app's own source): the cursor's record, or the record a cut leaves you
+    /// at, that this copy no longer holds answers `Trimmed` and does not fault the node (only a
+    /// record missing between the retained floor and what the copy may serve, met while paging,
+    /// does);
+    /// [`FeedPage::Rewound`] means records above `to` are not on this copy's history: a promote
+    /// cut them, or this copy cannot place the cursor's generation on its chain and `to` is
+    /// [`FeedCursor::START`] (a longer replay than needed, never a gap). That last holds only
+    /// while the copy's floor is 1: with a floor above 1 it answers `Trimmed { floor }` instead,
+    /// as a replay from the start would have a gap. Retract what was
+    /// applied above `to` and resume from `to`. See `docs/rdb/embed.md`, "Change feed".
+    ///
+    /// # Errors
+    ///
+    /// Every error claims `no_mutation`: a feed call writes nothing. Before anything is
+    /// sent, `INVALID_ARGUMENT` (`Definitive`) when the read timeout is too large to set a
+    /// deadline from now. `UNAVAILABLE` when the copy
+    /// cannot serve now: it holds no regular copy, is landing a newer generation, has published
+    /// nothing in its generation, or (a secondary) has not established freshness: no read of
+    /// `partitions/{p}` within the grant naming its generation with it pinned. A call to a
+    /// secondary without one starts that read, or joins the one in flight, and waits for it up
+    /// to 500 ms; it is refused when the read has not landed by then, and sooner when the read
+    /// fails or names another generation or membership. Follow the returned error: its retry
+    /// rule says whether to call again (`BoundedJitter`) or to switch source (`Definitive`, the
+    /// copy is left out). A call waiting on that read when the node stops cleanly is answered at
+    /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
+    /// `UNAVAILABLE` also when no answer came within the read timeout, which is one deadline
+    /// from the call's start, whichever the source: the wait for a node mid-restart, a refresh
+    /// of the owner and its resend, and the answer all come out of it. Also when
+    /// `Source::Node(n)` names a node in another process this one has no link up to
+    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped, or one that
+    /// dropped the call unanswered, as one that stops with the call still queued does, or one
+    /// still mid-restart when the deadline passes, the owner too for `Source::Owner`
+    /// (all `RetryAfterRecovery`: read another copy now, or that node once it has
+    /// restarted; after a failed restart, the refusal says so before that step). A node in
+    /// another process whose link closed before its answer came may have read: that refusal
+    /// names the link, says nothing was changed, and is `RetryAfterRecovery` too: another copy
+    /// now, or that node once its link is up again. Every such refusal has `no_mutation` set.
+    /// `INCOMPATIBLE_VERSION` when
+    /// this build refuses the node's records because their format is one it does not read.
+    /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
+    /// write's admission would, `LEASE_EXPIRED` (or `PROTECTION_PAUSED`, `GENERATION_CHANGED`),
+    /// with no redirect hint. On `LEASE_EXPIRED` (or `NOT_PRIMARY`), `Source::Owner` re-reads
+    /// the owner route for the next call only: this call answers the refusal, and calling again
+    /// reaches the new owner. A caller of `Source::Node` of the old owner switches to
+    /// `Source::Owner` or another member.
+    /// `CORRUPT_HISTORY`, in two ways, both with the feed's step (read another copy, or
+    /// rebuild from your own source):
+    /// - refused to this caller, the node unaffected: the copy holds the cursor's seq on that
+    ///   lineage with another digest (the cursor may come from another partition's history,
+    ///   the copies' histories may have diverged, or the record may be damaged), or a stored
+    ///   `User` key in any record the call scans does not parse: keys are parsed before the
+    ///   tenant filter, so another tenant's record counts too;
+    /// - the node faults: a storage read fails as corrupt, a record does not decode, does not
+    ///   match its digest or names another seq, a record is missing between the floor and the
+    ///   cap, or the first `History` key does not parse. Every feed call waiting on the node,
+    ///   and every later one, hears the same error; a put or a get hears the fault without the
+    ///   feed's step.
+    ///
+    /// A cursor from another partition's history is not sure to be `CORRUPT_HISTORY`: it is
+    /// judged against what this copy holds at its position, so it can read as `Behind`,
+    /// `Trimmed` or `Rewound` too. `INVALID_ARGUMENT` for `max` 0 or a partition this database
+    /// does not have, and over the links for an app not on the node's admin apps (#151).
+    pub fn changes(
+        &self,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        self.changes_under(self.identity(), partition, from, max, source)
+    }
+
+    /// [`Self::changes`] under another tenant's identity, as an app over the wire may claim
+    /// one (#170 review: the tenant rows).
+    #[cfg(test)]
+    pub(crate) fn changes_as(
+        &self,
+        tenant: TenantId,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        let identity = RequestIdentity {
+            tenant,
+            ..self.identity()
+        };
+        self.changes_under(identity, partition, from, max, source)
+    }
+
+    fn changes_under(
+        &self,
+        identity: RequestIdentity,
+        partition: PartitionId,
+        from: FeedCursor,
+        max: u32,
+        source: Source,
+    ) -> Result<FeedPage, ApiError> {
+        if partition.0 == 0 || partition.0 > self.route.partitions() {
+            return Err(ApiError::invalid(format!(
+                "partition {} is not one of this database's {}",
+                partition.0,
+                self.route.partitions()
+            )));
+        }
+        let call = ClientCall::Changes {
+            identity,
+            from,
+            max,
+        };
+        let wait = self.timeouts.read;
+        // Review r7/r8: one deadline, taken here, covers every wait of the call, whichever the
+        // source: the dispatch (a node mid-restart included), the owner's refresh and resend,
+        // and the answer.
+        // Review r9 (thread 4657822746): `Timeouts::read` has no upper bound, so a deadline it
+        // cannot name is refused here, before either source is sent anything.
+        let Some(deadline) = Instant::now().checked_add(wait) else {
+            return Err(feed_unrepresentable(wait));
+        };
+        let answer = match source {
+            Source::Owner => self.call_by(partition, call, wait, Some(deadline)),
+            Source::Node(node) => {
+                let left = || deadline.saturating_duration_since(Instant::now());
+                match self.send_call_within(node, partition, call, left()) {
+                    Ok(answer) => match answer.recv_timeout(left()) {
+                        Ok(answer) => Some(answer),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        // Review r6 (thread 4655953458): a local node took the call but dropped it
+                        // unread, as a thread that stops with it still queued does. The same rule
+                        // as a clean stop's drain and a stopped thread: a feed call writes nothing.
+                        // Review r7: a remote node's link can close after it read, so that reply
+                        // names the link, not a stop.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
+                            error: if self.runs(node) {
+                                feed_dropped(node)
+                            } else {
+                                feed_link_dropped(node)
+                            },
+                            request: None,
+                        }),
+                    },
+                    // Review r7 (thread 4657364897): still mid-restart when the wait ended. Nothing
+                    // was sent to it, the half-restarted handle least of all.
+                    Err(Unsent::Restarting) => Some(Answer::Error {
+                        error: feed_restarting(node, wait),
+                        request: None,
+                    }),
+                    // Review r3/r4/r5 (thread 4654680317): the cause kept, local or remote. A local
+                    // node whose thread has stopped serves the feed again once it has restarted,
+                    // and another copy can serve now, so a feed reader gets that step, not a host
+                    // fault's owner-takeover step; a node in another process with no link up can
+                    // come back.
+                    Err(_) => Some(Answer::Error {
+                        error: if lock(&self.nodes).iter().any(|handle| handle.node == node) {
+                            let mut error = ApiError::new(
+                                ErrorKind::Unavailable,
+                                format!(
+                                    "node {}'s node thread has stopped, in this process; nothing \
+                                 was read; next: {}",
+                                    node.0,
+                                    error::FEED_STOPPED_STEP
+                                ),
+                            );
+                            error.retry = RetryRule::RetryAfterRecovery;
+                            error.no_mutation = true;
+                            error
+                        } else {
+                            let mut error = ApiError::new(
+                                ErrorKind::Unavailable,
+                                format!(
+                                    "node {} is not reachable from this process: no link to it is \
+                                 up (its process may have stopped); nothing was read; a retry \
+                                 can succeed once node {} is back, or read from the owner or \
+                                 another member",
+                                    node.0, node.0
+                                ),
+                            );
+                            error.retry = RetryRule::RetryAfterRecovery;
+                            error
+                        },
+                        request: None,
+                    }),
+                }
+            }
+        };
+        let answered = match answer {
+            Some(Answer::Changes(page)) => Ok(page),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a feed call was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no feed answer in {wait:?}"),
+            )),
+        };
+        answered.map_err(|mut error| {
+            error.no_mutation = true;
+            self.explained(error)
+        })
     }
 
     /// [`Self::put`] under the app's request id `request`, which this client may have used
@@ -4125,7 +4570,8 @@ impl Db {
     #[must_use]
     pub fn ownership_events(&self) -> OwnershipEvents {
         let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
-        let nodes = lock(&self.nodes);
+        // Every node is sent the subscriber, so none may be mid-restart.
+        let nodes = self.nodes_settled();
         let mut missing = BTreeSet::new();
         for handle in nodes.iter() {
             if handle.start_failed {
@@ -4172,6 +4618,55 @@ impl Db {
             self.ready_seen.store(true, Ordering::Relaxed);
         }
         statuses
+    }
+
+    /// #81 V10: whether this process should restart its nodes, and why. One poll; call it about
+    /// once a second. Blocking, like [`Self::node_status`].
+    ///
+    /// `Some` when, at this poll, a node of this `Db` reports a host fault
+    /// ([`RestartReason::HostFaulted`]), or every poll for the last 5 s has seen
+    /// `replace_stopped` ([`RestartReason::ReplaceStopped`]: a promote froze the grant, and
+    /// nothing at this boot lifts it). And only when no `partitions/` record names one of this
+    /// `Db`'s nodes owner, in any lifecycle: a restart while it still owns a partition would cut
+    /// that partition's writes short of the planner's move. A poll whose status does not answer
+    /// starts the hold again. A control read that fails or does not answer within the read
+    /// timeout gives `None` (`db_restart_check_unread`).
+    ///
+    /// With several nodes in one `Db`, this is `None` while **any** of them owns a partition:
+    /// a frozen node beside an owning one stays frozen until the owner's partitions move. Run
+    /// one `Db` per node, as the gateway does, for each to restart on its own.
+    ///
+    /// On `Some`: [`Self::shutdown`], `Net::shutdown`, drop the `Db`, `Net` and `Links`, then
+    /// open again on the same folder with a fresh `Net` and `Links` on the same address.
+    /// `rdb_node` exits 75 instead, for its supervisor to do the same.
+    #[must_use]
+    pub fn restart_wanted(&self) -> Option<RestartReason> {
+        let statuses = self.node_status();
+        let now = Instant::now();
+        let stopped_since = {
+            let mut hold = lock(&self.restart_hold);
+            *hold = if statuses.is_empty() || !statuses.iter().any(|status| status.replace_stopped)
+            {
+                None
+            } else {
+                Some(hold.unwrap_or(now))
+            };
+            *hold
+        };
+        let faulted = statuses.iter().any(|status| status.fault.is_some());
+        restart::restart_due(stopped_since, faulted, now, || self.owns_no_partition())
+    }
+
+    /// [`Self::restart_wanted`]'s control read: whether no `partitions/` record names one of
+    /// this `Db`'s nodes owner ([`restart::owns_none_within`]). A failed or late read is
+    /// `false`, and a late one is aborted.
+    fn owns_no_partition(&self) -> bool {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            tracing::warn!(error = "no control store", "db_restart_check_unread");
+            return false;
+        };
+        let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        restart::owns_none_within(&rt, store, nodes, self.timeouts.read)
     }
 
     /// Each node's state for `partition`, as [`Self::node_status`] answers for partition 1: in
@@ -4223,7 +4718,9 @@ impl Db {
     /// # Errors
     ///
     /// The engine's refusal, as text (nothing was written); `node` not run by this process (a
-    /// copy is damaged from its own process); or `node` not answering within the read timeout.
+    /// copy is damaged from its own process); `node` not answering within the read timeout; or
+    /// `node` dropping the call unanswered (its thread stopped, or it faulted), said apart from
+    /// the timeout.
     #[cfg(debug_assertions)]
     pub fn damage_record(
         &self,
@@ -4231,6 +4728,30 @@ impl Db {
         generation: Generation,
         ns: rdb_core::contracts::storage::Namespace,
         key: &[u8],
+    ) -> Result<(), String> {
+        self.damage_record_as(
+            node,
+            generation,
+            ns,
+            key,
+            rdb_storage::RecordDamage::LastByte,
+        )
+    }
+
+    /// **Dev tool only**, debug builds: [`Self::damage_record`] with the damage `how` names
+    /// ([`rdb_storage::RocksEngine::damage_record_as`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`].
+    #[cfg(debug_assertions)]
+    pub fn damage_record_as(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        ns: rdb_core::contracts::storage::Namespace,
+        key: &[u8],
+        how: rdb_storage::RecordDamage,
     ) -> Result<(), String> {
         if let Some(error) = self.refuse_groupless("damage_record", "it runs on partition 1 only") {
             return Err(error.detail);
@@ -4241,9 +4762,11 @@ impl Db {
             generation,
             ns,
             key: key.to_vec(),
+            how,
             reply,
         };
-        let sent = lock(&self.nodes)
+        let sent = self
+            .nodes_for(node)
             .iter()
             .find(|handle| handle.node == node)
             .map(|handle| handle.send(msg));
@@ -4259,10 +4782,51 @@ impl Db {
         }
         match answer.recv_timeout(self.timeouts.read) {
             Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
-            Err(_) => Err(format!(
-                "node {} did not answer within {:?}",
-                node.0, self.timeouts.read
-            )),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
+        }
+    }
+
+    /// **Dev tool only**, debug builds (#170 review r1, lead ruling 2026-11-20): delete `node`'s
+    /// `History` records of partition 1 with a seq in `seqs`, through lineage `generation`'s
+    /// chain ([`Msg::DropHistory`]). From seq 1 up, as a history trim (#61) would on that one
+    /// copy, its change feed floor rises; higher up it leaves a hole. Returns how many it
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::damage_record`]: the host's refusal as text, `node` not run here, stopped, not
+    /// answering within the read timeout, or dropping the call. A faulted node answers its
+    /// fault: nothing was dropped.
+    #[cfg(debug_assertions)]
+    pub fn drop_history(
+        &self,
+        node: NodeId,
+        generation: Generation,
+        seqs: std::ops::Range<u64>,
+    ) -> Result<u64, String> {
+        if let Some(error) = self.refuse_groupless("drop_history", "it runs on partition 1 only") {
+            return Err(error.detail);
+        }
+        let (reply, answer) = mpsc::channel();
+        let msg = Msg::DropHistory {
+            partition: PARTITION,
+            generation,
+            seqs,
+            reply,
+        };
+        let sent = self
+            .nodes_for(node)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.send(msg));
+        match sent {
+            None => return Err(format!("node {} is not run by this process", node.0)),
+            Some(Err(NodeStopped(_))) => return Err(format!("node {} is stopped", node.0)),
+            Some(Ok(())) => {}
+        }
+        match answer.recv_timeout(self.timeouts.read) {
+            Ok(done) => done.map_err(|refused| format!("node {}: {refused}", node.0)),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
         }
     }
 
@@ -4287,7 +4851,8 @@ impl Db {
             generation,
             reply,
         };
-        let sent = lock(&self.nodes)
+        let sent = self
+            .nodes_for(node)
             .iter()
             .find(|handle| handle.node == node)
             .map(|handle| handle.send(msg));
@@ -4305,10 +4870,7 @@ impl Db {
             Ok(done) => done
                 .map(|seq| seq.0)
                 .map_err(|refused| format!("node {}: {refused}", node.0)),
-            Err(_) => Err(format!(
-                "node {} did not answer within {:?}",
-                node.0, self.timeouts.read
-            )),
+            Err(unanswered) => Err(seam_unanswered(node, unanswered, self.timeouts.read)),
         }
     }
 
@@ -4411,7 +4973,28 @@ impl Db {
     /// `Quarantined`, also names that state and the one step that helps, as the latest look at
     /// the owner found it ([`Self::stuck_step`], A-R200). A retry is still safe, so its rule and
     /// proof stay; it only cannot succeed in this open.
+    ///
+    /// A feed refusal whose detail already ends with the feed's own step (read another copy, or
+    /// rebuild) is left as it is (review r1): a note after it would hide that step and add the
+    /// kind's generic "call again", which contradicts it.
     fn explained(&self, mut error: ApiError) -> ApiError {
+        // Review r7 (thread 4657364923): a stopped node's feed refusal after a failed restart
+        // names that restart, before its own step, which stays last.
+        if error.detail.ends_with(error::FEED_STOPPED_STEP) {
+            let failed = lock(&self.nodes).iter().any(|handle| handle.start_failed);
+            if let (true, Some(note), Some(at)) =
+                (failed, self.restart_note(), error.detail.rfind("next: "))
+            {
+                error.detail.insert_str(at, &format!("{note}; "));
+            }
+            return error;
+        }
+        if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
+            || error.detail.ends_with(error::FEED_LINK_STEP)
+            || error.detail.ends_with(error::FEED_HISTORY_STEP)
+        {
+            return error;
+        }
         // A quarantine also refuses a write `LEASE_EXPIRED` or `PROTECTION_PAUSED`, whose own
         // step ("call `Db::wait_ready`") cannot end it; the quarantined text names the rebuild
         // that does. That text ends with its step, so it goes last, after any restart note,
@@ -4476,6 +5059,94 @@ impl Db {
             )),
             stuck => Some(stuck.to_string()),
         }
+    }
+
+    /// The node lock, taken once `node` is not mid-restart (#170 review r6): a restart stops
+    /// and starts a node outside the lock, so a call that sends to that node waits here, and a
+    /// call to another node does not. Reads that only look at the handles take the lock as it
+    /// is: they see a node mid-restart at its old boot, with no ownership.
+    fn nodes_for(&self, node: NodeId) -> MutexGuard<'_, Vec<NodeHandle>> {
+        let nodes = lock(&self.nodes);
+        if !mid_restart(&nodes, Some(node)) {
+            return nodes;
+        }
+        let _waiting = self.restart_wait(node);
+        self.opened
+            .restarted
+            .wait_while(nodes, |nodes| mid_restart(nodes, Some(node)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Self::nodes_for`], waiting at most `bound` (#170 review r7): `None` once `bound` has
+    /// passed with `node` still mid-restart. Nothing has been sent to it then.
+    fn nodes_for_within(
+        &self,
+        node: NodeId,
+        bound: Duration,
+    ) -> Option<MutexGuard<'_, Vec<NodeHandle>>> {
+        let nodes = lock(&self.nodes);
+        if !mid_restart(&nodes, Some(node)) {
+            return Some(nodes);
+        }
+        let _waiting = self.restart_wait(node);
+        let (nodes, waited) = self
+            .opened
+            .restarted
+            .wait_timeout_while(nodes, bound, |nodes| mid_restart(nodes, Some(node)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!waited.timed_out()).then_some(nodes)
+    }
+
+    /// Count a call waiting on `node`'s restart until the returned guard drops.
+    fn restart_wait(&self, node: NodeId) -> RestartWait<'_> {
+        tracing::info!(node = node.0, "call_waits_on_restart");
+        self.opened.restart_waiters.fetch_add(1, Ordering::SeqCst);
+        RestartWait(&self.opened.restart_waiters)
+    }
+
+    /// How many calls wait on a restart now.
+    #[cfg(test)]
+    pub(crate) fn restart_waiters(&self) -> usize {
+        self.opened.restart_waiters.load(Ordering::SeqCst)
+    }
+
+    /// Hold the next restart that reaches `stage` there (#170 review r7). The receiver hears
+    /// when it is held; it goes on once the sender sends or drops.
+    #[cfg(test)]
+    pub(crate) fn hold_restart(
+        &self,
+        stage: RestartStage,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        lock(&self.opened.restart_holds).push((stage, entered, released));
+        (held, release)
+    }
+
+    /// Wait at `stage` if a crate test armed a hold there.
+    #[cfg(test)]
+    fn restart_held(&self, node: NodeId, stage: RestartStage) {
+        let armed = {
+            let mut holds = lock(&self.opened.restart_holds);
+            holds
+                .iter()
+                .position(|(at, _, _)| *at == stage)
+                .map(|at| holds.remove(at))
+        };
+        if let Some((_, entered, released)) = armed {
+            tracing::info!(node = node.0, ?stage, "test_restart_held");
+            let _ = entered.send(());
+            let _ = released.recv();
+        }
+    }
+
+    /// The node lock, taken once no node is mid-restart ([`Self::nodes_for`]), for a call that
+    /// sends to every node or keeps their mailboxes.
+    fn nodes_settled(&self) -> MutexGuard<'_, Vec<NodeHandle>> {
+        self.opened
+            .restarted
+            .wait_while(lock(&self.nodes), |nodes| mid_restart(nodes, None))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether this `Db` runs `node`'s process, rather than reaching it over the links.
@@ -4618,6 +5289,7 @@ impl Db {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -4658,6 +5330,7 @@ impl Db {
             ack_floor: hand_tracker(),
             client: config.client,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -4777,7 +5450,8 @@ impl Db {
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
         ) = {
-            let nodes = lock(&self.nodes);
+            // Senders kept past the lock, so none of a node mid-restart.
+            let nodes = self.nodes_settled();
             (
                 nodes
                     .iter()
@@ -4915,8 +5589,10 @@ impl Db {
                 retry_after: None,
             });
         }
-        // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
-        let mut nodes = lock(&self.nodes);
+        // #170 review r6: marked `restarting` under the node lock, then stopped and started
+        // outside it. No call reaches a half-restarted node: a call to it waits in
+        // `Self::nodes_for`, while calls to the other nodes go on. One restart at a time.
+        let mut nodes = self.nodes_settled();
         let Some(at) = nodes.iter().position(|handle| handle.node == node) else {
             let runs: Vec<NodeId> = nodes.iter().map(|handle| handle.node).collect();
             return Err(no_such_node(node, &runs));
@@ -4962,7 +5638,16 @@ impl Db {
                 BootId(old_boot.0 + 1)
             }
         };
-        handle.stop();
+        let id = self.opened.restarts.fetch_add(1, Ordering::SeqCst) + 1;
+        handle.restarting = Some(id);
+        let _mark = RestartMark { db: self, node, id };
+        let join = handle.ask_stop();
+        let owner_views = Arc::clone(&handle.owner_views);
+        drop(nodes);
+        tracing::info!(node = node.0, boot = old_boot.0, "node_restart_stopping");
+        NodeHandle::await_stop(node, join, &owner_views);
+        #[cfg(test)]
+        self.restart_held(node, RestartStage::Stopped);
         self.control.forget_node(node, old_boot);
         let folder = respawn.nodes_dir.join(node.0.to_string());
         // M5: the record is read after the stop, so nothing can take the node back between the
@@ -4993,7 +5678,10 @@ impl Db {
                 Arc::clone(&self.opened.nodes),
             )
         };
-        match started {
+        // The handles are never added or removed after the open, so `at` is still this node.
+        let mut nodes = lock(&self.nodes);
+        let handle = &mut nodes[at];
+        let result = match started {
             Ok(started) => {
                 *handle = started;
                 tracing::info!(
@@ -5038,7 +5726,11 @@ impl Db {
                 handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
-        }
+        };
+        drop(nodes);
+        #[cfg(test)]
+        self.restart_held(node, RestartStage::Published);
+        result
     }
 
     /// Hand the node `handle` now runs every ownership subscriber still open that left it out
@@ -5656,6 +6348,9 @@ impl Db {
     }
 
     /// Stop every node and every control call. The control store stays the caller's.
+    ///
+    /// This does not stop the process links: call [`crate::net::Net::shutdown`] (or drop every
+    /// `Arc<Net>`, which the `Links` holds too) as well, or peers keep a route to this node.
     pub fn shutdown(&mut self) {
         if let Some(task) = self.opened.planner_task.take() {
             task.abort();
@@ -5779,7 +6474,8 @@ fn carries(call: &ClientCall) -> Carries {
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
         | ClientCall::GetPrevious { .. }
-        | ClientCall::WaitDurable { .. } => Carries::Nothing,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => Carries::Nothing,
     }
 }
 
@@ -6235,6 +6931,129 @@ async fn declared_open_refusal(
     Ok(())
 }
 
+/// A client call's message to a node and the receiver its answer comes back on.
+fn client_msg(partition: PartitionId, call: ClientCall) -> (Msg, mpsc::Receiver<Answer>) {
+    let (reply, answer) = mpsc::channel();
+    (
+        Msg::Client(Client {
+            partition,
+            call,
+            reply,
+        }),
+        answer,
+    )
+}
+
+/// Why [`Db::send_to_within`] sent nothing.
+enum Unsent {
+    /// The node's thread has stopped, or no link to it is up.
+    Stopped,
+    /// A node of this process was still mid-restart when the wait ended (#170 review r7).
+    Restarting,
+}
+
+/// The refusal of a feed call to `node` while it stayed mid-restart for all of `wait` (#170
+/// review r7): nothing was sent to it. Retryable after recovery with the stopped-node step.
+fn feed_restarting(node: NodeId, wait: Duration) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "node {} is restarting in this process and was not running again within {wait:?}; \
+             nothing was read; next: {}",
+            node.0,
+            error::FEED_STOPPED_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
+}
+
+/// The refusal of a feed call whose read timeout `wait` is too large to set a deadline from
+/// now (#170 review r9): nothing was sent. `INVALID_ARGUMENT`, `Definitive`: the same open
+/// refuses every such call until it is opened with a smaller `Timeouts::read`.
+fn feed_unrepresentable(wait: Duration) -> ApiError {
+    let mut error = ApiError::invalid(format!(
+        "the read timeout {wait:?} is too large to set a deadline from now; nothing was sent: \
+         open the database with a smaller `Timeouts::read`"
+    ));
+    error.retry = RetryRule::Definitive;
+    error.no_mutation = true;
+    error
+}
+
+/// The refusal of a feed call whose link to `node`, in another process, closed before its
+/// answer came (#170 review r7). The node may have read; a feed call changes nothing.
+fn feed_link_dropped(node: NodeId) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "the link to node {} closed before its answer to the feed call came; nothing was \
+             changed; next: {}",
+            node.0,
+            error::FEED_LINK_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
+}
+
+/// The refusal of a feed call `node` dropped unanswered (#170 review r6): taken, then dropped
+/// unread, as by a thread that stops with the call still queued. Retryable after recovery with
+/// the stopped-node step, as a clean stop's drain answers; a feed call writes nothing.
+fn feed_dropped(node: NodeId) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "node {} dropped the feed call unanswered (it stopped before reading it); nothing \
+             was read; next: {}",
+            node.0,
+            error::FEED_STOPPED_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
+}
+
+/// Whether `node` (any node, for `None`) is mid-restart.
+fn mid_restart(nodes: &[NodeHandle], node: Option<NodeId>) -> bool {
+    nodes
+        .iter()
+        .any(|handle| handle.restarting.is_some() && node.is_none_or(|node| handle.node == node))
+}
+
+/// A call counted in [`Opened::restart_waiters`] while it waits on a restart.
+struct RestartWait<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for RestartWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A restart's `restarting` mark on its node ([`NodeHandle::restarting`]): cleared, and the
+/// calls waiting on it woken, however the restart ends, a panic too (#170 review r6).
+struct RestartMark<'a> {
+    db: &'a Db,
+    node: NodeId,
+    /// The restart's id: only a mark still holding it is cleared (review r7).
+    id: u64,
+}
+
+impl Drop for RestartMark<'_> {
+    fn drop(&mut self) {
+        for handle in lock(&self.db.nodes)
+            .iter_mut()
+            .filter(|handle| handle.node == self.node && handle.restarting == Some(self.id))
+        {
+            handle.restarting = None;
+        }
+        self.db.opened.restarted.notify_all();
+    }
+}
+
 /// The refusal of a call naming `node`, which this `Db` does not run: `runs` are the nodes it
 /// does, which since #80 S1b need not be 1, 2 and 3 (one declared node, say).
 pub(crate) fn no_such_node(node: NodeId, runs: &[NodeId]) -> ApiError {
@@ -6332,6 +7151,26 @@ const NO_ANSWER: &str = "unknown";
 const NO_LINK: &str = "unreachable";
 /// [`ReadyError::TimedOut`]'s phase when the owner runs no recovery.
 const NO_RECOVERY: &str = "none";
+/// What joins [`ReadyError::TimedOut`]'s phase to the reopen's heal wait, when one is waiting
+/// (R5): `wait_ready` writes it, and the error's text splits on it. Public so an app can split
+/// the phase the same way:
+///
+/// ```
+/// use rdb_api::db::{ReadyError, HEAL_WAITING};
+/// use rdb_api::NodeId;
+///
+/// let timed_out = ReadyError::TimedOut {
+///     within_ms: 300,
+///     owner: NodeId(1),
+///     phase: format!("unreachable{HEAL_WAITING}no link to node 3 came up"),
+/// };
+/// let ReadyError::TimedOut { phase, .. } = &timed_out else { unreachable!() };
+/// let (seen, heal) = phase
+///     .split_once(HEAL_WAITING)
+///     .map_or((phase.as_str(), None), |(seen, heal)| (seen, Some(heal)));
+/// assert_eq!((seen, heal), ("unreachable", Some("no link to node 3 came up")));
+/// ```
+pub const HEAL_WAITING: &str = "; the reopen's heal is waiting: ";
 
 /// Why [`Db::look`] has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6344,14 +7183,25 @@ enum Unlooked {
 
 /// [`ReadyError::TimedOut`]'s text (A-R230 Q3, #59): it never says "unknown", which read as a
 /// fault while node 1 was busy syncing, it names the owner, and it ends with the step.
+///
+/// A phase that carries the reopen's heal wait ([`HEAL_WAITING`]) is classified by what comes
+/// before it, so a sentinel keeps its words, and the wait is said before the step (PR #181
+/// review).
 fn timed_out_text(within_ms: u128, owner: NodeId, phase: &str) -> String {
+    let (phase, heal) = phase
+        .split_once(HEAL_WAITING)
+        .map_or((phase, None), |(phase, heal)| (phase, Some(heal)));
     let seen = match phase {
         NO_ANSWER => error::ReadySeen::NoAnswer,
         NO_LINK => error::ReadySeen::NoLink,
         NO_RECOVERY => error::ReadySeen::NoRecovery,
         phase => error::ReadySeen::Phase(phase),
     };
-    error::ready_timed_out_text(within_ms, owner.0, seen)
+    let text = error::ready_timed_out_text(within_ms, owner.0, seen);
+    match heal {
+        Some(heal) => text.replacen("; next: ", &format!("{HEAL_WAITING}{heal}; next: "), 1),
+        None => text,
+    }
 }
 
 /// The step after a control store that was not reached or had no leader (M10 D14, A-R210).
@@ -6499,6 +7349,24 @@ fn move_aside(node: NodeId, folder: &Path, to: &Path) -> Result<(), String> {
                 to.display()
             ))
         }
+    }
+}
+
+/// **Dev tool only**: why a debug seam on `node` got no answer (review r3/r4, threads
+/// 4654331877 and 4654675984). A timeout says how long it waited; a dropped reply says the node
+/// let the call go unanswered (its thread stopped, or it faulted on a seam that has no answer
+/// for a fault), which waiting longer would not change.
+#[cfg(debug_assertions)]
+fn seam_unanswered(node: NodeId, error: mpsc::RecvTimeoutError, waited: Duration) -> String {
+    match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            format!("node {} did not answer within {waited:?}", node.0)
+        }
+        mpsc::RecvTimeoutError::Disconnected => format!(
+            "node {} dropped the call unanswered: its thread has stopped or it has faulted \
+             (`Db::node_status` says which)",
+            node.0
+        ),
     }
 }
 
@@ -6838,7 +7706,8 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Move { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
-        | ClientCall::WaitDurable { .. } => return None,
+        | ClientCall::WaitDurable { .. }
+        | ClientCall::Changes { .. } => return None,
     };
     let request = identity.request;
     if object.len() > MAX_OBJECT_ID {
@@ -6988,6 +7857,9 @@ mod barrier_tests;
 
 #[cfg(test)]
 mod partition_tests;
+
+#[cfg(test)]
+mod feed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7336,6 +8208,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7550,6 +8423,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7604,6 +8478,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7670,6 +8545,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7753,6 +8629,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -7827,6 +8704,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route {
@@ -7908,6 +8786,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -8483,6 +9362,54 @@ mod tests {
         on.insert("live_readd".to_owned());
         assert_eq!(fields(&lines[1]), on, "{lines:?}");
         assert_eq!(lines[1]["live_readd"], true, "{lines:?}");
+    }
+
+    /// PR #181 (SBX): every open logs `db_open_live_readd{enabled}` once, off as well as on, so
+    /// a log shows whether the reopen's heal may leave a copy out. Unit (~1 ms).
+    /// Cut: the line logged only when on, red at the off open.
+    #[config_log::retcd_test]
+    fn db_open_logs_the_live_readd_state_once_either_way() {
+        const METHOD: &str = "db_open_logs_the_live_readd_state_once_either_way";
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, false);
+        log_open(&Limits::default(), &Budgets::SPEC_DEFAULTS, 10_000, true);
+        let states: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_live_readd")
+            .map(|line| (line["@l"].clone(), line["enabled"].clone()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (serde_json::json!("Information"), serde_json::json!(false)),
+                (serde_json::json!("Information"), serde_json::json!(true)),
+            ],
+        );
+    }
+
+    /// PR #181 review: while the reopen's heal waits, a `wait_ready` time-out keeps each of
+    /// its three sentinels' words (no answer, no link, no recovery) and adds the heal's wait
+    /// before the step; it never renders "recovery phase unknown". Unit (~1 ms).
+    /// Cut: `timed_out_text` classifies the phase with the heal's wait still on it: red.
+    #[test]
+    fn a_timed_out_ready_keeps_its_sentinel_words_while_the_heal_waits() {
+        for (sentinel, words) in [
+            (NO_ANSWER, "answered no status look"),
+            (NO_LINK, "is not reachable from this process"),
+            (NO_RECOVERY, "runs no recovery"),
+        ] {
+            let text = ReadyError::TimedOut {
+                within_ms: 300,
+                owner: NodeId(2),
+                phase: format!("{sentinel}{HEAL_WAITING}live_readd_off"),
+            }
+            .to_string();
+            assert!(text.contains(words), "{sentinel}: {text}");
+            assert!(!text.contains("recovery phase is"), "{sentinel}: {text}");
+            assert!(
+                text.contains("the reopen's heal is waiting: live_readd_off; next: "),
+                "{sentinel}: {text}"
+            );
+        }
     }
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
@@ -9421,6 +10348,7 @@ mod tests {
             ack_floor: hand_tracker(),
             client: DEFAULT_CLIENT,
             ready_seen: AtomicBool::new(false),
+            restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened::default(),
             route: Route::default(),
@@ -15500,5 +16428,157 @@ mod tests {
         }
         assert!(with(2, false).is_ok(), "the floor off takes cap 2");
         assert!(with(3, true).is_ok(), "cap 3 is the least the floor takes");
+    }
+
+    /// A `Db` built by hand whose heal stands at `heal`, with one OS boot id queued for a node
+    /// folder in `dir`; and that folder's `os_boot` file.
+    fn r5_queued(
+        rt: &tokio::runtime::Runtime,
+        dir: &std::path::Path,
+        heal: HealState,
+    ) -> (Db, PathBuf) {
+        let db = Db::by_hand(
+            Vec::new(),
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            Timeouts::default(),
+            None,
+        );
+        *lock(&db.opened.heal) = heal;
+        *lock(&db.opened.os_boot_record) = vec![(dir.to_path_buf(), "boot-a".to_owned())];
+        (db, dir.join(crate::os_boot::OS_BOOT_FILE))
+    }
+
+    /// The heal states this test's `os_boot_record_deferred` lines name, in order.
+    fn r5_deferred(method: &str) -> Vec<String> {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "os_boot_record_deferred")
+            .map(|line| line["heal"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// The heal a [`r5_queued`] `Db` is handed once its owner is ready.
+    const R5_HANDED: admin::Healed = admin::Healed {
+        cleared: admin::GrantCleared::Absent(rdb_core::contracts::ids::Revision(1)),
+        read_revision: rdb_core::contracts::ids::Revision(1),
+        control_revision: rdb_core::contracts::ids::Revision(1),
+    };
+
+    /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal still `Running` past
+    /// its deadline writes no marker, logs `os_boot_record_deferred{heal=running}` and keeps
+    /// the queued id; once the heal is `Handed`, the next call writes it, and a call after that
+    /// does not write it again. Unit (~10 ms). Cut: the queue emptied when the write is
+    /// deferred: the id is not kept, red (in `r5_z` too).
+    #[config_log::retcd_test]
+    fn r5_y_a_running_heal_past_its_deadline_defers_the_marker_and_keeps_its_id() {
+        const METHOD: &str =
+            "r5_y_a_running_heal_past_its_deadline_defers_the_marker_and_keeps_its_id";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let (db, marker) = r5_queued(&rt, dir.path(), HealState::Running);
+        db.record_os_boot(std::time::Instant::now());
+        assert!(!marker.exists(), "no marker while the heal runs");
+        assert_eq!(lock(&db.opened.os_boot_record).len(), 1, "the id is kept");
+        assert_eq!(r5_deferred(METHOD), ["running"]);
+
+        *lock(&db.opened.heal) = HealState::Handed(R5_HANDED);
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker").trim(),
+            "boot-a"
+        );
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
+        // A later ready answer writes nothing: the file is left as it is.
+        std::fs::write(&marker, "left alone").expect("overwrite");
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker"),
+            "left alone",
+            "written once"
+        );
+    }
+
+    /// PR #181 review round 6: a marker write that fails logs `os_boot_record_failed` once,
+    /// at Warning, with the folder, and leaves no file; the id is taken all the same, so a later
+    /// ready answer does not write it either, and the next open waits for every copy. Here the
+    /// node folder does not exist. Unit (~10 ms). Cut: the warn removed, red.
+    #[config_log::retcd_test]
+    fn r5_record_failed_a_marker_that_cannot_be_written_is_warned_once() {
+        const METHOD: &str = "r5_record_failed_a_marker_that_cannot_be_written_is_warned_once";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let gone = dir.path().join("no-such-node");
+        let (db, marker) = r5_queued(&rt, &gone, HealState::Handed(R5_HANDED));
+        db.record_os_boot(std::time::Instant::now());
+        db.record_os_boot(std::time::Instant::now());
+        assert!(!marker.exists(), "no marker");
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
+        let failed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "os_boot_record_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["@l"], "Warning", "{failed:?}");
+        assert_eq!(
+            failed[0]["dir"].as_str(),
+            Some(gone.display().to_string().as_str()),
+            "{failed:?}"
+        );
+    }
+
+    /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal `Failed` writes no
+    /// marker, at once (a failed heal is not waited for), logs
+    /// `os_boot_record_deferred{heal=failed}` and keeps the queued id; a later call with the
+    /// heal `Handed` writes the queued id once: the file, overwritten after that write, is
+    /// left alone by the next call. Unit (~10 ms). Cuts: `Failed` taken as done: the marker is
+    /// written, red; the id kept after the write: the next call writes `boot-a` again, red.
+    #[config_log::retcd_test]
+    fn r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id() {
+        const METHOD: &str = "r5_z_a_failed_heal_defers_the_marker_and_keeps_its_id";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let failed = HealState::Failed(admin::HealError::PeersUnknown {
+            nodes: vec![3],
+            within_ms: 1,
+            reason: "copy_not_proven_down",
+        });
+        let (db, marker) = r5_queued(&rt, dir.path(), failed);
+        let started = std::time::Instant::now();
+        db.record_os_boot(started + Duration::from_secs(60));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a failed heal is not waited for: {:?}",
+            started.elapsed()
+        );
+        assert!(!marker.exists(), "no marker after a failed heal");
+        assert_eq!(lock(&db.opened.os_boot_record).len(), 1, "the id is kept");
+        assert_eq!(r5_deferred(METHOD), ["failed"]);
+
+        *lock(&db.opened.heal) = HealState::Handed(R5_HANDED);
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker").trim(),
+            "boot-a"
+        );
+        // Review round 3: a rewrite of the same bytes is caught too. A later ready answer
+        // writes nothing: the file is left as it is.
+        std::fs::write(&marker, "left alone").expect("overwrite");
+        db.record_os_boot(std::time::Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker"),
+            "left alone",
+            "written once"
+        );
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
     }
 }

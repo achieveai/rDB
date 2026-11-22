@@ -120,11 +120,24 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
 /// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
-/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
-/// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a bump to 10, or a capability bit that gates the re-add. Any change that
+/// ADR-rdb-0009 section 7 sets the prerequisites. `10` settles that (below). Any change that
 /// weakens check A takes a bump.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// `10` came with issue #107 slice 2b: `WireMsg::Landed::owner_live_readd`, the committing
+/// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
+/// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
+/// refused at the handshake. That includes an app process with no copy (`--nodes`): an app at
+/// 9 is refused by nodes at 10. Upgrade: stop every node and every app process that links to
+/// them, upgrade them all, start the nodes, then the apps.
+///
+/// `10` also carries issue #87's change feed, in the same bump: `WireCall::Changes`,
+/// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,
+/// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
+/// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
+/// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
+/// until tenants are bound to certificates (#151; [`sender_refused`]). Split from #107's bump,
+/// it would take `11`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -309,6 +322,23 @@ struct Shared {
     span: tracing::Span,
     #[allow(clippy::type_complexity)]
     on_boot: Mutex<Option<Box<dyn Fn(NodeId, BootId) + Send + Sync>>>,
+    /// The inbound link tasks [`Service::link`] spawns, which are not [`Net`]'s own `tasks`.
+    /// `None` once [`Net::shutdown`] ran: a link accepted after that is aborted at once.
+    link_tasks: Mutex<Option<Vec<tokio::task::AbortHandle>>>,
+    /// Set by [`Net::shutdown`]: the listener's serve loop stops, and every connection it
+    /// accepted is shut down with it (`serve_with_incoming_shutdown`). A link registering at
+    /// the same time reads it too ([`stopped`]): under the conns lock before it records its
+    /// connection, and under the routes lock before it publishes its route (PR #171 review).
+    stop: tokio::sync::watch::Sender<bool>,
+    /// Run once by [`register`] between recording a connection and publishing its route: a row
+    /// holds a registration there while it runs [`Net::shutdown`].
+    #[cfg(test)]
+    between_conn_and_route: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Whether [`Net::shutdown`] has run.
+fn stopped(shared: &Shared) -> bool {
+    *shared.stop.borrow()
 }
 
 /// The remote backend of one process's [`Links`].
@@ -371,6 +401,10 @@ impl Net {
             rt: tokio::runtime::Handle::current(),
             span: tracing::Span::current(),
             on_boot: Mutex::new(None),
+            link_tasks: Mutex::new(Some(Vec::new())),
+            stop: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            between_conn_and_route: Mutex::new(None),
         });
         // Only a process with peers has a bound to prove: an app with none, or a node alone,
         // stays "no `Net` attached", always established, as before this guard.
@@ -396,13 +430,22 @@ impl Net {
             let tls = config.tls.server_tls_config();
             let incoming = accepted_streams(listener);
             let label = config.label.clone();
+            let mut stop = shared.stop.subscribe();
             tasks.push(tokio::spawn(
                 async move {
                     let served = tonic::transport::Server::builder()
                         .tls_config(tls)
                         .map(|mut builder| builder.add_service(service));
+                    // The shutdown variant, not `serve_with_incoming`: only it gives each
+                    // accepted connection a watch on the stop signal. tonic spawns every
+                    // connection as its own task, so without one an aborted serve leaves them
+                    // all serving. With one, a stop or this task's abort (which drops the
+                    // signal's sender) shuts each connection down (tonic 0.12 `serve_connection`).
+                    let stopped = async move {
+                        let _ = stop.wait_for(|stopped| *stopped).await;
+                    };
                     let result = match served {
-                        Ok(router) => router.serve_with_incoming(incoming).await,
+                        Ok(router) => router.serve_with_incoming_shutdown(incoming, stopped).await,
                         Err(error) => Err(error),
                     };
                     if let Err(error) = result {
@@ -641,6 +684,16 @@ impl Net {
         }
     }
 
+    /// An abort handle of each of this `Net`'s own tasks (serve, dials, release loop), so a row
+    /// can see each one end after [`Net::shutdown`]. Empty once `shutdown` has drained them.
+    #[cfg(test)]
+    fn own_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        lock(&self.tasks)
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect()
+    }
+
     /// Send an already-encoded client call, as [`Net::send`] does after `outbound`. Rows use it
     /// to send a call the far side cannot decode, which `outbound` never produces.
     #[cfg(test)]
@@ -726,6 +779,10 @@ impl Net {
             rt,
             span: tracing::Span::current(),
             on_boot: Mutex::new(None),
+            link_tasks: Mutex::new(Some(Vec::new())),
+            stop: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            between_conn_and_route: Mutex::new(None),
         });
         Arc::new(Self {
             shared,
@@ -734,43 +791,89 @@ impl Net {
         })
     }
 
-    /// Bring a new link to `node` up at `boot` through `install`, replacing (and closing) any
-    /// live one. Returns its id and the frames it sends.
+    /// Bring a new link to `node` up at `boot` through [`register`], as a handshake does,
+    /// replacing (and closing) any live one. Returns its id (0 when refused after a shutdown)
+    /// and the frames it sends.
     pub(crate) fn link_up_unsocketed(
         &self,
         node: NodeId,
         boot: BootId,
     ) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Envelope>) {
         let (tx, out) = unbounded_channel();
-        let conn = new_conn(&self.shared, Label::Node(node), tx);
-        install(&self.shared, node, &conn, boot);
-        (conn.id, out)
+        let conn = register(&self.shared, node, tx, boot);
+        (conn.map_or(0, |conn| conn.id), out)
+    }
+
+    /// Run `hook` once, inside the next registration, after its connection is recorded and
+    /// before its route is published.
+    pub(crate) fn hold_next_registration(&self, hook: impl FnOnce() + Send + 'static) {
+        *lock(&self.shared.between_conn_and_route) = Some(Box::new(hook));
+    }
+
+    /// How many connections this process holds.
+    pub(crate) fn conn_count(&self) -> usize {
+        lock(&self.shared.conns).len()
+    }
+}
+
+impl Net {
+    /// Take this process's links down for good: stop serving, stop dialling, end every link
+    /// (dialled or accepted), and refuse any link accepted later. Peers see each link end and
+    /// find nothing listening when they redial, so they stop hearing this process and drop
+    /// their route to it. Idempotent; [`Drop`] calls it.
+    ///
+    /// Without it, an embedder that drops its `Db` but keeps this `Net` (or a `Links` that
+    /// holds it) still answers peers' probes at the old boot, and a restart on the same
+    /// address is never met as a new boot (#81).
+    pub fn shutdown(&self) {
+        let Some(links) = lock(&self.shared.link_tasks).take() else {
+            return;
+        };
+        self.shared.stop.send_replace(true);
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
+        }
+        for task in links {
+            task.abort();
+        }
+        let conns: Vec<Arc<Conn>> = lock(&self.shared.conns).values().cloned().collect();
+        let ended = conns.len();
+        for conn in conns {
+            close(&self.shared, &conn, "this process's links shut down");
+        }
+        tracing::info!(label = %self.shared.label, ended, "net_shutdown");
     }
 }
 
 impl Drop for Net {
     fn drop(&mut self) {
-        for task in lock(&self.tasks).drain(..) {
-            task.abort();
-        }
-        let conns: Vec<Arc<Conn>> = std::mem::take(&mut *lock(&self.shared.conns))
-            .into_values()
-            .collect();
-        for conn in conns {
-            lock(&conn.pending).clear();
-        }
+        self.shutdown();
     }
 }
 
 /// Bring `conn` up as node `node`'s route, at `boot`; send what waited for it. A known peer
 /// back at another boot restarted: every node this process runs hears it as
 /// [`Msg::PeerBooted`] (#42, ruling A-R251), so the record owner can re-plan around it.
-fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
+///
+/// `false` when [`Net::shutdown`] has run: read under the routes lock, so a shutdown either
+/// finds this route published and frees it when it closes `conn`, or this finds it stopped.
+/// The route is then left as it is and `conn` closed; the caller ends the link.
+fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) -> bool {
     let (new_boot, previous, replaced) = {
         let mut routes = lock(&shared.routes);
+        if stopped(shared) {
+            drop(routes);
+            tracing::info!(
+                node = node.0,
+                conn = conn.id,
+                "net_link_refused_after_shutdown"
+            );
+            close(shared, conn, "this process's links shut down");
+            return false;
+        }
         let Some(route) = routes.get_mut(&node) else {
             tracing::warn!(peer = %conn.peer, "net_link_from_unknown_node");
-            return;
+            return true;
         };
         let previous = route.boot.replace(boot);
         route.refused = None;
@@ -811,6 +914,27 @@ fn install(shared: &Arc<Shared>, node: NodeId, conn: &Arc<Conn>, boot: BootId) {
             observer(node, boot);
         }
     }
+    true
+}
+
+/// A link to node `node` that said hello at `boot`: record its connection ([`new_conn`]), then
+/// publish it as the route ([`install`]). `None` when [`Net::shutdown`] ran first or in
+/// between: nothing is left recorded or routed, and dropping `tx` ends the stream.
+fn register(
+    shared: &Arc<Shared>,
+    node: NodeId,
+    tx: UnboundedSender<Envelope>,
+    boot: BootId,
+) -> Option<Arc<Conn>> {
+    let conn = new_conn(shared, Label::Node(node), tx)?;
+    #[cfg(test)]
+    {
+        let hook = lock(&shared.between_conn_and_route).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    install(shared, node, &conn, boot).then_some(conn)
 }
 
 /// Peer `node`, last seen at `old`, is back at `boot`: post [`Msg::PeerBooted`] to each node
@@ -893,7 +1017,15 @@ fn accepted_streams(
     })
 }
 
-fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<Conn> {
+/// Record a new connection to `peer`. `None` once [`Net::shutdown`] has run, read under the
+/// conns lock: a shutdown either finds the connection recorded and closes it, or this finds it
+/// stopped and records nothing (`tx` is dropped, which ends the stream).
+fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Option<Arc<Conn>> {
+    let mut conns = lock(&shared.conns);
+    if stopped(shared) {
+        tracing::info!(%peer, "net_link_refused_after_shutdown");
+        return None;
+    }
     let conn = Arc::new(Conn {
         id: shared.next_conn.fetch_add(1, Ordering::Relaxed) + 1,
         peer,
@@ -908,8 +1040,8 @@ fn new_conn(shared: &Shared, peer: Label, tx: UnboundedSender<Envelope>) -> Arc<
         probe_echoed: AtomicU64::new(0),
         answered_at: Mutex::new(Instant::now()),
     });
-    lock(&shared.conns).insert(conn.id, Arc::clone(&conn));
-    conn
+    conns.insert(conn.id, Arc::clone(&conn));
+    Some(conn)
 }
 
 /// Read `inbound` until it ends, handling each frame in order. A hold keeps frames back here
@@ -1079,6 +1211,8 @@ const DEFAULT_LR_ADMIN: &str = "admin";
 /// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
 ///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
 ///   reason is the whole refusal, which [`receive`] answers the call with;
+/// - a change feed call (`Changes`) names a tenant no certificate binds yet (#151), so only an
+///   app on `admin_apps` may send one (owner ruling 2026-11-20, fail closed);
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
 fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
@@ -1113,6 +1247,25 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                  rebuild a copy or forget a tail, and the node's operator names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",
+                to.0
+            ));
+        }
+        // #170 review (owner ruling 2026-11-20, fail closed): a feed call names its tenant but
+        // no certificate binds an app to one yet (#151), so only an app on `admin_apps`, whom
+        // the operator trusts with every tenant, may read the feed. Nodes are trusted (below).
+        (
+            Label::App(app),
+            WireMsg::Client {
+                call: wire::WireCall::Changes { .. },
+                to,
+                ..
+            },
+        ) if !admin_apps.contains(app) => {
+            return Some(format!(
+                "app {app} may not read the change feed on node {}: the change feed needs the \
+                 admin certificate until tenants are bound to certificates (#151); add {app} to \
+                 the node's admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) only if \
+                 it may read every tenant",
                 to.0
             ));
         }
@@ -1371,6 +1524,7 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        unmuted(&shared, node).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);
@@ -1392,6 +1546,18 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Wait while this node is muted: a stopped process dials nobody, so its links stay down for
+/// as long as the fault lasts (#107 slice 2b manual walk).
+async fn unmuted(shared: &Shared, node: NodeId) {
+    if !shared.faults.muted() {
+        return;
+    }
+    tracing::info!(peer = node.0, "net_dial_muted");
+    while shared.faults.muted() {
+        tokio::time::sleep(faults::POLL).await;
     }
 }
 
@@ -1418,6 +1584,10 @@ async fn dial_once(
             source = cause.source();
         }
         false
+    }
+    // Fault `refuse-links`: no dial, so no `Hello` names this node's boot to the peer.
+    if shared.faults.refuses_links() {
+        return Err("fault refuse-links: this node dials no link".to_owned());
     }
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| format!("bad address {address}: {error}"))?
@@ -1532,8 +1702,8 @@ async fn dial_once(
             node.0, welcome.label
         ));
     }
-    let conn = new_conn(shared, Label::Node(node), tx);
-    install(shared, node, &conn, welcome.boot);
+    let conn = register(shared, node, tx, welcome.boot)
+        .ok_or_else(|| "this process's links shut down".to_owned())?;
     let reason = read(Arc::clone(shared), Arc::clone(&conn), inbound).await;
     close(shared, &conn, &reason);
     Ok(reason)
@@ -1610,7 +1780,7 @@ impl RdbNet for Service {
         let (tx, rx) = unbounded_channel::<Envelope>();
         let shared = Arc::clone(&self.shared);
         let span = shared.span.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let first = tokio::time::timeout(HANDSHAKE, inbound.next()).await;
             let hello = match first {
                 Ok(Some(Ok(envelope))) => match wire::decode(&envelope.body) {
@@ -1629,6 +1799,17 @@ impl RdbNet for Service {
                     return;
                 }
             };
+            // Fault `refuse-links`: no `Welcome`; the stream ends and the dial fails.
+            if shared.faults.refuses_links() {
+                tracing::info!(peer = %label, "net_handshake_refused_by_fault");
+                return;
+            }
+            // Mute: a stopped process answers no handshake, so the dialler's link stays down.
+            if shared.faults.muted() {
+                // Debug: the dialler retries about once a second for as long as the mute lasts.
+                tracing::debug!(peer = %label, "net_handshake_muted");
+                return;
+            }
             if let Some(reason) = refusal(&shared, &label, &hello) {
                 tracing::warn!(peer = %label, %reason, "net_handshake_refused");
                 let _ = tx.send(envelope(&Frame::Refused { reason }));
@@ -1636,16 +1817,29 @@ impl RdbNet for Service {
             }
             serving(&shared).await;
             let _ = tx.send(envelope(&Frame::Welcome(own_hello(&shared))));
-            let conn = new_conn(&shared, label.clone(), tx);
-            if let Label::Node(node) = &label {
-                install(&shared, *node, &conn, hello.boot);
+            let conn = if let Label::Node(node) = &label {
+                register(&shared, *node, tx, hello.boot)
             } else {
-                tracing::info!(peer = %label, conn = conn.id, "net_app_link_up");
-            }
+                let conn = new_conn(&shared, label.clone(), tx);
+                if let Some(conn) = &conn {
+                    tracing::info!(peer = %label, conn = conn.id, "net_app_link_up");
+                }
+                conn
+            };
+            // Refused: this process's links shut down while the link registered.
+            let Some(conn) = conn else { return };
             let reason = read(Arc::clone(&shared), Arc::clone(&conn), inbound).await;
             close(&shared, &conn, &reason);
         }
         .instrument(span));
+        // Tracked, so `Net::shutdown` ends it; past a shutdown it ends now.
+        match &mut *lock(&self.shared.link_tasks) {
+            Some(tasks) => {
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task.abort_handle());
+            }
+            None => task.abort(),
+        }
         let outgoing = UnboundedReceiverStream::new(rx).map(Ok::<_, Status>);
         Ok(Response::new(Box::pin(outgoing)))
     }
