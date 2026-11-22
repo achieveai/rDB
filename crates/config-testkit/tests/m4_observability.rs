@@ -373,8 +373,13 @@ fn open_plain(dir: &Path) -> config_storage::RocksStore {
 /// Turn a current v2 directory into the directory an M2/M3 build would have written. Rebuilt
 /// privately from `config-storage/tests/m4_journal.rs`'s `downgrade_to_v1` (a different
 /// crate's test file, read-only reference; not shared code, not edited here).
+///
+/// Since format 4 (#186) the demotion moves the marker only and keeps every family: a real v1
+/// directory keeps its log in the root and is refused as `PreSplitLayout`, so the one marker-1
+/// directory a current build still migrates is the split one a `--compat-schema 1` node writes
+/// (ADR-0008, owner ruling 2026-11-21). The directory is empty, so its journal is too.
 fn downgrade_to_v1(dir: &Path) {
-    let mut db = rocksdb::DB::open_cf(
+    let db = rocksdb::DB::open_cf(
         &rocksdb::Options::default(),
         dir,
         config_storage::COLUMN_FAMILIES,
@@ -390,10 +395,6 @@ fn downgrade_to_v1(dir: &Path) {
         let _ = db.delete_cf(cf, b"journal_stats");
         let _ = db.delete_cf(cf, b"retired_nodes");
     }
-    db.drop_cf(config_storage::CF_EVENTS)
-        .expect("drop the journal family");
-    db.drop_cf(config_storage::CF_DEDUP)
-        .expect("drop the dedup family");
 }
 
 /// M4-121: exactly one `format_migrated{from:1,to:2}` is ever logged for one directory — once

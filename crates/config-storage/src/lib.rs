@@ -35,9 +35,11 @@ pub use journal::{
     event_bytes, journal_hash, AppliedBatch, AppliedBatchSink, JournalStats, NoopSink,
 };
 pub use reader::{DedupStats, PinnedRead, PinnedView, StateReader, StorageReadError};
+pub use rocks::log_dir;
 pub use rocks::{
     RocksLog, RocksOptions, RocksSm, RocksStore, StorageOpenError, CF_DEDUP, CF_EVENTS, CF_KV,
-    CF_RAFT_LOG, CF_RAFT_META, CF_STATE_META, COLUMN_FAMILIES, FORMAT_VERSION,
+    CF_RAFT_LOG, CF_RAFT_META, CF_STATE_META, COLUMN_FAMILIES, FORMAT_VERSION, LOG_COLUMN_FAMILIES,
+    LOG_DIR,
 };
 pub use snapshot::{
     export_snapshot, is_snapshot_data_cf, restore_into_fresh_store, RestoreReport, SnapshotConfig,

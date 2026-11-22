@@ -26,12 +26,15 @@ use config_log::retcd_test;
 use config_storage::{
     AppliedBatch, AppliedBatchSink, Boundary, EphemeralStore, FaultAction, FaultInjector,
     JournalStats, NoFaults, NoopSink, RaftNodeId, RocksOptions, RocksStore, StateReader,
-    StorageOpenError, StorageReadError, TypeConfig, CF_DEDUP, CF_EVENTS, CF_STATE_META,
+    StorageOpenError, StorageReadError, TypeConfig, CF_DEDUP, CF_EVENTS, CF_KV, CF_STATE_META,
     COLUMN_FAMILIES, FORMAT_VERSION,
 };
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
 use tracing::Span;
+
+#[path = "support/pre_split.rs"]
+mod pre_split;
 
 // --- fixtures -----------------------------------------------------------------------------
 
@@ -207,19 +210,31 @@ fn with_raw(dir: &Path, cfs: &[&str], f: impl FnOnce(&rocksdb::DB)) {
 }
 
 /// Turn a current directory into the directory an M2/M3 build would have written.
+/// Demote a closed current directory to marker 1 **in the split layout**, with an empty journal.
+///
+/// Since format 4 the only directory a current build migrates is one a `--compat-schema 1` node
+/// wrote (M6-R22): today's families and `raft-log/`, marker 1. A real v1 directory keeps its
+/// log in the root and is refused as `PreSplitLayout` (M4-13, owner ruling 2026-11-21). This
+/// fixture is the compat shape with nothing journalled, which is the case where the v1
+/// watermark is stamped; the families stay, the marker moves, and the v2/v3 keys and the
+/// journal's entries are removed.
 fn downgrade_to_v1(dir: &Path) {
-    let mut db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir, COLUMN_FAMILIES)
+    let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir, COLUMN_FAMILIES)
         .expect("reopen raw to demote");
-    {
-        let cf = db.cf_handle(CF_STATE_META).expect("state_meta cf");
-        db.put_cf(cf, b"format_version", 1u32.to_le_bytes())
-            .expect("restamp v1");
-        db.delete_cf(cf, b"compact_revision").expect("drop v2 key");
-        db.delete_cf(cf, b"journal_stats").expect("drop v2 key");
-        db.delete_cf(cf, b"retired_nodes").expect("drop v3 key");
+    let cf = db.cf_handle(CF_STATE_META).expect("state_meta cf");
+    db.put_cf(cf, b"format_version", 1u32.to_le_bytes())
+        .expect("restamp v1");
+    db.delete_cf(cf, b"compact_revision").expect("drop v2 key");
+    db.delete_cf(cf, b"journal_stats").expect("drop v2 key");
+    db.delete_cf(cf, b"retired_nodes").expect("drop v3 key");
+    let events = db.cf_handle(CF_EVENTS).expect("events cf");
+    let keys: Vec<Box<[u8]>> = db
+        .iterator_cf(events, rocksdb::IteratorMode::Start)
+        .map(|item| item.expect("scan events").0)
+        .collect();
+    for key in keys {
+        db.delete_cf(events, key).expect("clear the journal");
     }
-    db.drop_cf(CF_EVENTS).expect("drop the journal family");
-    db.drop_cf(CF_DEDUP).expect("drop the dedup family");
 }
 
 fn raw_format_version(dir: &Path, cfs: &[&str]) -> Option<u32> {
@@ -640,42 +655,44 @@ async fn m4_12_ephemeral_journal_lost_on_restart_documented() {
 
 // --- §3.2 the v1 -> v2 migration ----------------------------------------------------------
 
-/// M4-13: a v1 directory opens, is stamped v2, gains the journal family, and keeps its data.
+/// M4-13: a v1 directory is refused as `PreSplitLayout`, and left exactly as it was found.
+///
+/// Until format 4 this row migrated a v1 directory in place. Format 4 moved the Raft log out of
+/// the root into `raft-log/`, and the owner ruled on 2026-11-21 that, until the first real
+/// deploy, a format change refuses old folders with a typed error and no migration (ADR-0008).
+/// The marker migration the rows below exercise is still live, for the split directory a
+/// `--compat-schema 1` node writes.
 #[retcd_test]
-async fn m4_13_v1_dir_migrates_to_v2() {
+async fn m4_13_v1_dir_is_refused_as_pre_split() {
     let tmp = tempfile::tempdir().unwrap();
     seed_three(tmp.path()).await;
-    downgrade_to_v1(tmp.path());
-
-    assert_eq!(raw_format_version(tmp.path(), &COLUMN_FAMILIES_V1), Some(1));
+    pre_split::fold_to_pre_split(tmp.path(), 1);
     assert!(!list_cfs(tmp.path()).iter().any(|c| c == CF_EVENTS));
+    let before = pre_split::snapshot_files(tmp.path());
 
-    let s = open_plain(tmp.path());
-    let reader = s.reader();
-    let mut revision = 0;
-    let mut records = 0;
-    reader.with_state(&mut |kv: &KvState| {
-        revision = kv.cluster_revision();
-        records = kv.len();
-    });
-    assert_eq!(revision, 3, "the revision survives the migration");
-    assert_eq!(records, 3, "so do the records");
+    let err = RocksStore::open(
+        tmp.path(),
+        identity(),
+        Limits::DEFAULT,
+        Arc::new(NoFaults),
+        Span::none(),
+    )
+    .expect_err("a v1 directory must be refused");
+    match &err {
+        StorageOpenError::PreSplitLayout { found, path } => {
+            assert_eq!(*found, 1, "the refusal names the marker it found");
+            assert_eq!(path.as_path(), tmp.path());
+        }
+        other => panic!("expected PreSplitLayout, got {other:?}"),
+    }
     assert_eq!(
-        reader.compact_revision().unwrap(),
-        3,
-        "ruling R1: the watermark is stamped from this node's own cluster_revision"
+        pre_split::snapshot_files(tmp.path()),
+        before,
+        "the refused directory is left byte for byte as it was found"
     );
-    drop(reader);
-    drop(s);
-
-    assert_eq!(
-        raw_format_version(tmp.path(), &COLUMN_FAMILIES),
-        Some(FORMAT_VERSION)
-    );
-    assert!(list_cfs(tmp.path()).iter().any(|c| c == CF_EVENTS));
     assert!(
-        list_cfs(tmp.path()).iter().any(|c| c == CF_DEDUP),
-        "the same migration creates every family this build knows, not just the v2 one"
+        !config_storage::log_dir(tmp.path()).exists(),
+        "and no log database was created beside it"
     );
 }
 
@@ -1228,7 +1245,7 @@ async fn m4_95_missing_events_cf_on_v2_dir_refused() {
         db.drop_cf(CF_DEDUP).expect("drop the dedup family");
     }
     assert_eq!(
-        raw_format_version(tmp.path(), &COLUMN_FAMILIES_V1),
+        raw_format_version(tmp.path(), &[CF_KV, CF_STATE_META]),
         Some(FORMAT_VERSION),
         "the marker still says the current version"
     );

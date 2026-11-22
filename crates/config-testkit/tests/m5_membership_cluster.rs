@@ -683,23 +683,21 @@ async fn m5_70_new_identity_over_an_old_dir_is_refused_at_store_open() {
 ///
 /// # Which refusal is the oracle
 ///
-/// The plan text predates ruling M5-R19 and says only "a typed format error naming
-/// `format_version`". R19 is the more specific statement and is what the product implements: a
-/// legacy directory whose log is **drained** migrates in place, and one whose log is
-/// **undrained** is refused, because a log entry is a positional `postcard` encoding of a
-/// `Command` that a narrower build may decode into a *different* command. So the store this row
-/// seeds carries exactly one log entry — the difference between the migration path and the
-/// refusal path — and the assertion is `UpgradeRequiresDrainedLog`, naming both the format and
-/// the entry count.
+/// The plan text predates two rulings and says only "a typed format error naming
+/// `format_version`". Ruling M5-R19 made it `UpgradeRequiresDrainedLog` for an undrained legacy
+/// log. Format 4 (#186) then moved the Raft log out of the root database into `raft-log/`, and
+/// the owner ruled on 2026-11-21 that, until the first real deploy, a format change refuses old
+/// folders with a typed error and no migration (ADR-0008). So any directory with the log still
+/// in the root, drained or not, is refused as `PreSplitLayout`, naming the marker it found,
+/// before its log is read. That is the oracle now.
 ///
 /// # Why the directory is hand-built
 ///
 /// This build cannot write a v1 directory; that format predates it. The seed below therefore
 /// creates one directly through a raw `rocksdb` handle, in the only window where that is
 /// possible — `Cluster::provision_seeded_dir` hands the caller the directory before the node's
-/// first open. The shape it writes is the one `verify_column_families` classifies as
-/// `CfLayout::LegacyV1`: the four v1 families, no `events`, no `dedup`, and a `format_version`
-/// marker of 1.
+/// first open: the four v1 families in the root, no `events`, no `dedup`, no `raft-log/`, and a
+/// `format_version` marker of 1.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
     let (cluster, _scripts) = three_voters_and_a_spare().await;
@@ -714,13 +712,8 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
         .await
         .expect_err("a legacy directory that still holds history must not open");
     match refusal {
-        NodeStartError::Storage(StorageOpenError::UpgradeRequiresDrainedLog {
-            format,
-            log_entries,
-            path,
-        }) => {
-            assert_eq!(format, 1, "the refusal must name the format it found");
-            assert_eq!(log_entries, 1, "...and how much history blocks the upgrade");
+        NodeStartError::Storage(StorageOpenError::PreSplitLayout { found, path }) => {
+            assert_eq!(found, 1, "the refusal must name the format it found");
             assert_eq!(path, cluster.data_dir(legacy));
         }
         other => panic!("expected a typed legacy-format refusal, got {other:?}"),
@@ -737,6 +730,10 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
             "a refused open must not have created the {manufactured:?} family: {families:?}"
         );
     }
+    assert!(
+        !config_storage::log_dir(&cluster.data_dir(legacy)).exists(),
+        "nor the split log database"
+    );
 
     // And it never joins: committed membership is untouched by the attempt.
     let members_after = cluster

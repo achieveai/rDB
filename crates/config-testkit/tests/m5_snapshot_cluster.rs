@@ -1231,14 +1231,24 @@ async fn drop_the_published_snapshot(cluster: &Cluster, id: NodeId) {
                 .is_some(),
             "the row's premise is a store that *had* published a snapshot"
         );
+        // Since format 4 the purge pointer lives in the log database under `raft-log/`. Its
+        // `LOCK` was released with the root's, so a single read-only open suffices here.
+        let log = rocksdb::DB::open_cf_for_read_only(
+            &rocksdb::Options::default(),
+            config_storage::log_dir(&dir),
+            config_storage::LOG_COLUMN_FAMILIES,
+            false,
+        )
+        .expect("open the log database read-only");
         assert!(
-            db.cf_handle("raft_meta")
-                .and_then(|cf| db
+            log.cf_handle("raft_meta")
+                .and_then(|cf| log
                     .get_cf(cf, b"last_purged")
                     .expect("read the purge pointer"))
                 .is_some(),
             "the row's premise is a store that had also purged behind that snapshot"
         );
+        drop(log);
         db.delete_cf(state_meta, b"current_snapshot")
             .expect("drop the publication pointer");
     }
