@@ -9133,3 +9133,162 @@ fn s80s4_a_refill_whose_shadow_is_unreachable_is_given_up_and_another_node_refil
     assert_eq!(given_up.len(), 1, "{given_up:?}");
     refill_five_after_four(&mut trio, METHOD, &mut request);
 }
+
+/// #80 S4 row 4 (A-R456 narrowed by the lead, 2026-11-21): writes keep landing during a refill.
+/// Five nodes, node 3 dropped, 2,000 records preloaded, then a refill of node 4 with one put in
+/// flight at every step. Until the refill answers done and 50 more puts land: the longest wall
+/// gap between two landed puts is under `test_patience(2 s)`, and the refill is done within
+/// `test_patience(30 s)`. Node 1 re-plans at most 4 times between `refill_started` and the
+/// `refilled` commit (2 when measured; a CAS retry is legitimate). Every refused put is
+/// `no_mutation` but `UNKNOWN_OUTCOME`: each re-plan revokes the epoch once, so at most one put
+/// in flight per re-plan can be applied and answered so, and their count is at most the
+/// re-plans; each is settled by reading its key after done, logged on `s80s4_refill_writes`.
+/// At the end node 4 is regular (members 1, 2, 4) and exactly the 2,000 preloaded keys read
+/// back present from node 1.
+/// Measured 2026-11-21 at load 12-20 before the bound was set: as built, the longest gap was
+/// 383-624 ms over 3 runs; under the cut below, 12.8-13.5 s over 2 runs.
+/// Cut: `promote: true` in `Host::refill_step`'s `Replan`. It does not pin node 4 regular and
+/// wait: it loops re-planning (633 and 665 re-plans in 120 s), every `refill_committed` at
+/// phase "other"; the cause was not read. Writes stall between the re-plans. Red, observed
+/// 2026-11-21 at load 14, on the done-within assert first: "the refill of node 4 was not done
+/// within 90s: 3884 puts landed, the longest gap 6.855533702s".
+/// Integration (~40 s): the drop, 2,000 puts, the refill, 2,000 reads.
+#[config_log::retcd_test]
+fn s80s4_a_refill_keeps_writes_landing_with_2000_records() {
+    const METHOD: &str = "s80s4_a_refill_keeps_writes_landing_with_2000_records";
+    const N: u64 = 2_000;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, mut request) = five_with_three_dropped(dir.path(), |_| {});
+    let preload = request + 1;
+    land_retrying(&mut trio, &mut request, N);
+    let preloaded = preload..=request;
+    request += 1;
+    let asked_at = Instant::now();
+    match trio.ask(refill_call(request, 4)) {
+        Answer::Moved(answer) => assert!(!answer.done, "{answer:?}"),
+        other => panic!("refill 4: {other:?}"),
+    }
+    let within = test_patience(Duration::from_secs(30));
+    let deadline = asked_at + within;
+    let mut writer = 1_000_000_u64;
+    let mut in_flight: Option<(u64, mpsc::Receiver<Answer>)> = None;
+    let mut landed = 0_u64;
+    let mut unknown: Vec<u64> = Vec::new();
+    let mut last_landed = asked_at;
+    let mut max_gap = Duration::ZERO;
+    let mut done_at: Option<Instant> = None;
+    let mut after_done = 0_u64;
+    let mut next_ask = trio.clock.now().plus_millis(200);
+    while after_done < 50 {
+        trio.step();
+        let answer = in_flight
+            .as_ref()
+            .and_then(|(sent, rx)| rx.try_recv().ok().map(|answer| (*sent, answer)));
+        let free = in_flight.is_none() || answer.is_some();
+        match answer {
+            Some((_, Answer::Txn { .. })) => {
+                landed += 1;
+                let now = Instant::now();
+                max_gap = max_gap.max(now - last_landed);
+                last_landed = now;
+                if done_at.is_some() {
+                    after_done += 1;
+                }
+            }
+            Some((sent, Answer::Error { error, .. })) if error.name() == "UNKNOWN_OUTCOME" => {
+                unknown.push(sent);
+            }
+            Some((sent, Answer::Error { error, .. })) => {
+                assert!(
+                    error.no_mutation,
+                    "put {sent} refused with a mutation: {error:?}"
+                );
+            }
+            Some((sent, other)) => panic!("put {sent}: {other:?}"),
+            None => {}
+        }
+        if free {
+            writer += 1;
+            in_flight = Some((writer, trio.call(put(writer))));
+        }
+        if done_at.is_none() && trio.clock.now() >= next_ask {
+            next_ask = trio.clock.now().plus_millis(200);
+            request += 1;
+            match trio.ask(refill_call(request, 4)) {
+                Answer::Moved(answer) if answer.done => done_at = Some(Instant::now()),
+                Answer::Moved(_) => {}
+                other => panic!("refill 4: {other:?}"),
+            }
+        }
+        assert!(
+            done_at.is_some() || Instant::now() < deadline,
+            "the refill of node 4 was not done within {within:?}: {landed} puts landed, the \
+             longest gap {max_gap:?}"
+        );
+        assert!(
+            Instant::now() < deadline + within,
+            "50 puts did not land after the refill was done: {landed} landed"
+        );
+    }
+    let bound = test_patience(Duration::from_secs(2));
+    assert!(
+        max_gap < bound,
+        "writes paused {max_gap:?} during the refill, over {bound:?}"
+    );
+    let started = logged!(METHOD, "refill_started");
+    assert_eq!(started.len(), 1, "{started:?}");
+    let started = wall_millis(&started[0]);
+    let refilled: Vec<_> = logged!(METHOD, "refill_committed")
+        .into_iter()
+        .filter(|line| line["phase"] == "refilled")
+        .collect();
+    assert_eq!(refilled.len(), 1, "{refilled:?}");
+    let refilled = wall_millis(&refilled[0]);
+    let replans = logged!(METHOD, "rejoin_plan")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .filter(|line| (started..=refilled).contains(&wall_millis(line)))
+        .count();
+    assert!(
+        replans <= 4,
+        "node 1 re-planned {replans} times during the refill"
+    );
+    assert!(
+        unknown.len() <= replans,
+        "{} puts answered UNKNOWN_OUTCOME over {replans} re-plans: {unknown:?}",
+        unknown.len()
+    );
+    let (_, _, members) = commit_of(&trio).expect("a commit");
+    assert_eq!(members, vec![1, 2, 4], "node 4 filled the free slot");
+    assert_eq!(pinned_role(&trio, 4), Some(ReplicaRole::RegularSecondary));
+    let mut asked_as = 2_000_000_u64;
+    let settled: Vec<(u64, bool)> = unknown
+        .iter()
+        .map(|sent| {
+            asked_as += 1;
+            (*sent, present(&mut trio, *sent, asked_as))
+        })
+        .collect();
+    let present_count = preloaded
+        .clone()
+        .filter(|k| {
+            asked_as += 1;
+            present(&mut trio, *k, asked_as)
+        })
+        .count();
+    assert_eq!(
+        present_count,
+        usize::try_from(N).expect("N"),
+        "the preloaded keys k{}..=k{} read back",
+        preloaded.start(),
+        preloaded.end()
+    );
+    tracing::info!(
+        max_gap_ms = u64::try_from(max_gap.as_millis()).unwrap_or(u64::MAX),
+        refill_ms = done_at.map(|at| u64::try_from((at - asked_at).as_millis()).unwrap_or(0)),
+        landed,
+        replans,
+        unknown = ?settled,
+        "s80s4_refill_writes"
+    );
+}
