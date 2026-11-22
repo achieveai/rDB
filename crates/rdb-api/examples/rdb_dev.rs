@@ -1140,7 +1140,7 @@ where
             args,
             &db,
             &rt,
-            &*store,
+            &store,
             control.as_ref(),
             &progress,
             &bg_failed,
@@ -1872,11 +1872,13 @@ fn repl<'scope, 'env>(
     args: &Args,
     db: &'env Db,
     rt: &tokio::runtime::Runtime,
-    store: &dyn ConfigStore,
+    shared: &Arc<dyn ConfigStore>,
     control: Option<&Control<'_>>,
     progress: &Progress,
     bg_failed: &'env AtomicBool,
 ) -> ExitCode {
+    // `admin add-node` and `remove-node` take the `Arc`; every other verb the store itself.
+    let store: &dyn ConfigStore = &**shared;
     let input: Box<dyn BufRead> = match &args.script {
         Some(path) => match std::fs::File::open(path) {
             Ok(file) => Box::new(std::io::BufReader::new(file)),
@@ -2318,8 +2320,126 @@ fn repl<'scope, 'env>(
             ["admin", "move", from, to] => parse_any_node(from).and_then(|from| {
                 parse_any_node(to).map(|to| bad |= !move_lines(db, from, to, &say))
             }),
+            ["admin", "add-node", rest @ ..] => parse_add_node(rest).map(|ask| {
+                let added = admin::add_member(
+                    db,
+                    rt.handle(),
+                    shared,
+                    &ask.addr,
+                    ask.machine.as_deref(),
+                    &ask.unreachable_ok,
+                    MEMBERSHIP_LOOK,
+                );
+                match added {
+                    Ok(record) => {
+                        tracing::info!(
+                            node = record.node.0,
+                            addr = %record.addr,
+                            machine = %record.machine,
+                            "repl_add_node"
+                        );
+                        say(&added_line(&record));
+                    }
+                    Err(error) => {
+                        tracing::warn!(addr = %ask.addr, error = %error, "repl_add_node_refused");
+                        say(&format!("err admin add-node: {error}"));
+                        bad = true;
+                    }
+                }
+            }),
+            ["admin", "remove-node", rest @ ..] => {
+                parse_remove_node(rest).map(|(node, unreachable_ok)| {
+                    let removed = admin::remove_member(
+                        db,
+                        rt.handle(),
+                        shared,
+                        node,
+                        &unreachable_ok,
+                        MEMBERSHIP_LOOK,
+                    );
+                    match removed {
+                        Ok(record) => {
+                            tracing::info!(node = node.0, "repl_remove_node");
+                            say(&removed_line(&record));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                node = node.0,
+                                error = %error,
+                                "repl_remove_node_refused"
+                            );
+                            say(&format!("err admin remove-node {}: {error}", node.0));
+                            bad = true;
+                        }
+                    }
+                })
+            }
+            ["admin", "rebalance", rest @ ..] => parse_rebalance(rest).map(|max_moves| {
+                say(&rebalance_head(max_moves));
+                let opts = admin::RebalanceOpts {
+                    max_moves: max_moves.unwrap_or(usize::MAX),
+                    draining: std::collections::BTreeSet::new(),
+                };
+                match admin::rebalance(db, rt.handle(), store, &opts) {
+                    Ok(report) => {
+                        tracing::info!(
+                            moves = report.moved.len(),
+                            refills = report.refilled.len(),
+                            residuals = report.residuals.len(),
+                            copy_skew = report.copy_skew,
+                            primary_skew = report.primary_skew,
+                            "repl_rebalance"
+                        );
+                        rebalance_lines(&report).iter().for_each(|line| say(line));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "repl_rebalance_refused");
+                        say(&format!("err admin rebalance: {error}"));
+                        bad = true;
+                    }
+                }
+            }),
+            ["admin", "drain", rest @ ..] => parse_drain(rest).map(|node| {
+                say(&drain_head(node));
+                match admin::drain(db, rt.handle(), store, node) {
+                    Ok(report) => {
+                        tracing::info!(
+                            node = node.0,
+                            promoted_by_drain = ?report.promoted_by_drain,
+                            promoted_elsewhere = ?report.promoted_elsewhere,
+                            residuals = report.rebalance.residuals.len(),
+                            "repl_drain"
+                        );
+                        drained_lines(node, &report).iter().for_each(|line| say(line));
+                    }
+                    Err(error) => {
+                        tracing::warn!(node = node.0, error = %error, "repl_drain_refused");
+                        say(&format!("err admin drain {}: {error}", node.0));
+                        bad = true;
+                    }
+                }
+            }),
+            ["admin", "placement"] => {
+                match rt.block_on(admin::inventory(store, &std::collections::BTreeSet::new())) {
+                    Ok(inventory) => {
+                        tracing::info!(
+                            nodes = inventory.nodes.len(),
+                            partitions = inventory.partitions.len(),
+                            "repl_placement"
+                        );
+                        placement_lines(&inventory).iter().for_each(|line| say(line));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "repl_placement_refused");
+                        say(&format!("err admin placement: {error}"));
+                        bad = true;
+                    }
+                }
+                Ok(())
+            }
+            ["admin", "placement", ..] => Err(PLACEMENT_USAGE.to_owned()),
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | {FORGET_TAIL_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | {FORGET_TAIL_USAGE} | {ADD_NODE_USAGE} | {REMOVE_NODE_USAGE} | {REBALANCE_USAGE} | {DRAIN_USAGE} | {PLACEMENT_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -2567,6 +2687,246 @@ fn move_lines(db: &Db, from: NodeId, to: NodeId, say: &dyn Fn(&str)) -> bool {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// How long a membership verb waits for each live member's fresh status (#80 S4 T12, S-3): the
+/// admin rows' `test_patience(5 s)`. `Db::timeouts` is crate-private, so this is the example's.
+const MEMBERSHIP_LOOK: Duration = Duration::from_secs(5);
+
+/// `admin add-node`'s usage (#80 S4 T12).
+const ADD_NODE_USAGE: &str = "admin add-node --addr <host:port> [--machine <label>] \
+                              [--unreachable-ok <n>]..: name each live member that is down";
+
+/// `admin remove-node`'s usage (#80 S4 T12): the dead-host path is named here.
+const REMOVE_NODE_USAGE: &str = "admin remove-node <n> [--unreachable-ok <m>]..: run admin drain \
+                                 <n> first; if n's host is down, name it as well: admin \
+                                 remove-node <n> --unreachable-ok <n>";
+
+/// `admin rebalance`'s usage (#80 S4 T12).
+const REBALANCE_USAGE: &str = "admin rebalance [--max-moves <k>]";
+
+/// `admin drain`'s usage (#80 S4 T12).
+const DRAIN_USAGE: &str = "admin drain <n>: n is a node 1 to 8";
+
+/// `admin placement`'s usage (#80 S4 T12).
+const PLACEMENT_USAGE: &str = "admin placement";
+
+/// `admin add-node`'s words, read.
+#[derive(Debug, PartialEq, Eq)]
+struct AddNodeAsk {
+    addr: String,
+    machine: Option<String>,
+    unreachable_ok: Vec<NodeId>,
+}
+
+/// The value after a flag: present and not itself a flag.
+fn flag_value<'a>(
+    words: &mut std::slice::Iter<'_, &'a str>,
+    flag: &str,
+    usage: &str,
+) -> Result<&'a str, String> {
+    match words.next() {
+        Some(value) if !value.starts_with("--") => Ok(value),
+        _ => Err(format!("{flag} takes a value; {usage}")),
+    }
+}
+
+/// `admin add-node --addr H:P [--machine L] [--unreachable-ok N]..`'s words after `add-node`.
+fn parse_add_node(rest: &[&str]) -> Result<AddNodeAsk, String> {
+    let usage = |why: String| format!("{why}; {ADD_NODE_USAGE}");
+    let (mut addr, mut machine, mut unreachable_ok) = (None, None, Vec::new());
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "--addr" if addr.is_none() => {
+                addr = Some(flag_value(&mut words, "--addr", ADD_NODE_USAGE)?.to_owned());
+            }
+            "--machine" if machine.is_none() => {
+                machine = Some(flag_value(&mut words, "--machine", ADD_NODE_USAGE)?.to_owned());
+            }
+            "--unreachable-ok" => {
+                let node = flag_value(&mut words, "--unreachable-ok", ADD_NODE_USAGE)?;
+                unreachable_ok.push(parse_any_node(node).map_err(usage)?);
+            }
+            other => return Err(usage(format!("unexpected {other:?}"))),
+        }
+    }
+    let addr = addr.ok_or_else(|| usage("--addr is required".to_owned()))?;
+    Ok(AddNodeAsk {
+        addr,
+        machine,
+        unreachable_ok,
+    })
+}
+
+/// `admin remove-node N [--unreachable-ok M]..`'s words after `remove-node`.
+fn parse_remove_node(rest: &[&str]) -> Result<(NodeId, Vec<NodeId>), String> {
+    let usage = |why: String| format!("{why}; {REMOVE_NODE_USAGE}");
+    let Some((node, flags)) = rest.split_first() else {
+        return Err(usage("name the node".to_owned()));
+    };
+    let node = parse_any_node(node).map_err(usage)?;
+    let mut unreachable_ok = Vec::new();
+    let mut words = flags.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "--unreachable-ok" => {
+                let other = flag_value(&mut words, "--unreachable-ok", REMOVE_NODE_USAGE)?;
+                unreachable_ok.push(parse_any_node(other).map_err(usage)?);
+            }
+            other => return Err(usage(format!("unexpected {other:?}"))),
+        }
+    }
+    Ok((node, unreachable_ok))
+}
+
+/// `admin rebalance [--max-moves K]`'s words after `rebalance`: `None` for no limit.
+fn parse_rebalance(rest: &[&str]) -> Result<Option<usize>, String> {
+    match rest {
+        [] => Ok(None),
+        ["--max-moves", k] => k
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("--max-moves takes a whole number; {REBALANCE_USAGE}")),
+        _ => Err(REBALANCE_USAGE.to_owned()),
+    }
+}
+
+/// `admin drain N`'s words after `drain`.
+fn parse_drain(rest: &[&str]) -> Result<NodeId, String> {
+    match rest {
+        [n] => parse_any_node(n).map_err(|e| format!("{e}; {DRAIN_USAGE}")),
+        _ => Err(DRAIN_USAGE.to_owned()),
+    }
+}
+
+/// `admin add-node`'s line on success.
+fn added_line(record: &rdb_core::authority::node::NodeRecord) -> String {
+    format!(
+        "added node={} addr={} machine={}",
+        record.node.0, record.addr, record.machine
+    )
+}
+
+/// `admin remove-node`'s line on success: the record as it was before the remove.
+fn removed_line(record: &rdb_core::authority::node::NodeRecord) -> String {
+    format!(
+        "removed node={} addr={} machine={}",
+        record.node.0, record.addr, record.machine
+    )
+}
+
+/// `admin rebalance`'s first line, said before it runs.
+fn rebalance_head(max_moves: Option<usize>) -> String {
+    format!(
+        "rebalance: max moves {}, draining -",
+        max_moves.map_or_else(|| "none".to_owned(), |k| k.to_string())
+    )
+}
+
+/// A [`admin::RebalanceReport`] as `admin rebalance` and `admin drain` print it: one `moved`
+/// line per committed copy move, one `refilled` line per refill, one `residual:` line per claim
+/// left unmet (or `residual: none`), then the summary line, which counts all three.
+fn rebalance_lines(report: &admin::RebalanceReport) -> Vec<String> {
+    let mut lines: Vec<String> = report
+        .moved
+        .iter()
+        .map(|step| {
+            format!(
+                "moved partition={} from={} to={} # {}",
+                step.partition,
+                step.from,
+                step.to,
+                step.why.describe()
+            )
+        })
+        .chain(
+            report
+                .refilled
+                .iter()
+                .map(|(partition, to)| format!("refilled partition={partition} to={to}")),
+        )
+        .chain(report.residuals.iter().map(|r| format!("residual: {r}")))
+        .collect();
+    if report.residuals.is_empty() {
+        lines.push("residual: none".to_owned());
+    }
+    lines.push(format!(
+        "rebalance: moves={} refills={} residuals={} copy_skew={} primary_skew={}",
+        report.moved.len(),
+        report.refilled.len(),
+        report.residuals.len(),
+        report.copy_skew,
+        report.primary_skew
+    ));
+    lines
+}
+
+/// `admin drain`'s first line, said before it runs.
+fn drain_head(node: NodeId) -> String {
+    format!(
+        "drain: node {}; moving its copies off, then promoting what it owns, then refilling",
+        node.0
+    )
+}
+
+/// `admin drain`'s lines after its first: the report's last rebalance as [`rebalance_lines`]
+/// prints it, then `drained`. The first pass (the moves before the freeze) is not listed:
+/// [`admin::DrainReport`] keeps only the last rebalance, after the promotes.
+fn drained_lines(node: NodeId, report: &admin::DrainReport) -> Vec<String> {
+    let list = |partitions: &[u32]| {
+        partitions
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut lines = rebalance_lines(&report.rebalance);
+    lines.push(format!(
+        "drained node={} promoted_by_drain=[{}] promoted_elsewhere=[{}]",
+        node.0,
+        list(&report.promoted_by_drain),
+        list(&report.promoted_elsewhere)
+    ));
+    lines
+}
+
+/// `admin placement`'s lines (#80 S4 T12): the inventory the records give, read only.
+/// `placement: nodes=N partitions=P`, then one line per node,
+/// `placement node=N machine=L state=S copies=C primaries=R`, where `S` is the inventory's
+/// state word, one of `ok`, `draining`, `full` or `unhealthy` (`NodeState::name`), then
+/// `placement: copy_skew=C primary_skew=S`. `copies` and `primaries` count every partition that
+/// names the node, whatever its state, so a node that must empty still shows what it holds;
+/// the skews are `placement`'s, over the nodes in service.
+fn placement_lines(inventory: &rdb_core::placement::Inventory) -> Vec<String> {
+    use rdb_core::placement;
+    let holding = |id: u32| {
+        let partitions = &inventory.partitions;
+        (
+            partitions.iter().filter(|p| p.copies.contains(&id)).count(),
+            partitions.iter().filter(|p| p.primary == id).count(),
+        )
+    };
+    std::iter::once(format!(
+        "placement: nodes={} partitions={}",
+        inventory.nodes.len(),
+        inventory.partitions.len()
+    ))
+    .chain(inventory.nodes.iter().map(|node| {
+        let (copies, primaries) = holding(node.id);
+        format!(
+            "placement node={} machine={} state={} copies={copies} primaries={primaries}",
+            node.id,
+            node.machine,
+            node.state.name(),
+        )
+    }))
+    .chain(std::iter::once(format!(
+        "placement: copy_skew={} primary_skew={}",
+        placement::copy_skew(inventory),
+        placement::primary_skew(inventory)
+    )))
+    .collect()
 }
 
 /// `admin status`'s members line (M11): each node the owner's commit pins, with its role, then
@@ -3017,7 +3377,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "barrier",
         "probe-all",
     ];
-    const SUBVERBS: [&str; 28] = [
+    const SUBVERBS: [&str; 33] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -3046,6 +3406,11 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "client drop-reply",
         "admin repair-element",
         "admin fork-copy",
+        "admin add-node",
+        "admin remove-node",
+        "admin rebalance",
+        "admin drain",
+        "admin placement",
     ];
     let mut first = line.split_whitespace();
     let Some(verb) = first
@@ -9703,6 +10068,288 @@ mod tests {
         for bad in ["", "0", "9", "3 --fence", "3 --fence --wipe", "3 --wipe x"] {
             assert!(parse_rebuild(&words(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// #80 S4 T12 R1: the membership verbs read their words, in any flag order, and refuse a
+    /// missing or repeated `--addr`, a flag with no value, a node outside 1 to 8 and an extra
+    /// word, each ending with its verb's usage. remove-node's usage names `--unreachable-ok`
+    /// for a node whose host is down. Cut: drop add-node's `addr.is_none()` guard and the
+    /// repeated `--addr` line is accepted: red, observed 2026-11-21 at load 15.07. Unit.
+    #[test]
+    fn s80s4_membership_verbs_read_their_words_and_refuse_the_rest() {
+        fn words(line: &str) -> Vec<&str> {
+            line.split_whitespace().collect()
+        }
+        assert_eq!(
+            parse_add_node(&words("--addr 10.0.0.16:7100")),
+            Ok(AddNodeAsk {
+                addr: "10.0.0.16:7100".to_owned(),
+                machine: None,
+                unreachable_ok: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_add_node(&words(
+                "--unreachable-ok 2 --machine d6 --addr 10.0.0.16:7100 --unreachable-ok 3"
+            )),
+            Ok(AddNodeAsk {
+                addr: "10.0.0.16:7100".to_owned(),
+                machine: Some("d6".to_owned()),
+                unreachable_ok: vec![NodeId(2), NodeId(3)],
+            })
+        );
+        for bad in [
+            "",
+            "--machine d6",
+            "--addr",
+            "--addr --machine d6",
+            "--addr a:1 --addr b:1",
+            "--addr a:1 --machine d6 --machine d7",
+            "--addr a:1 --unreachable-ok",
+            "--addr a:1 --unreachable-ok 9",
+            "--addr a:1 x",
+        ] {
+            let why = parse_add_node(&words(bad)).expect_err(bad);
+            assert!(why.ends_with(ADD_NODE_USAGE), "{bad:?}: {why}");
+        }
+        assert_eq!(parse_remove_node(&words("2")), Ok((NodeId(2), Vec::new())));
+        assert_eq!(
+            parse_remove_node(&words("2 --unreachable-ok 2 --unreachable-ok 5")),
+            Ok((NodeId(2), vec![NodeId(2), NodeId(5)]))
+        );
+        for bad in [
+            "",
+            "9",
+            "2 3",
+            "2 --unreachable-ok",
+            "2 --unreachable-ok 0",
+            "--unreachable-ok 2",
+        ] {
+            let why = parse_remove_node(&words(bad)).expect_err(bad);
+            assert!(why.ends_with(REMOVE_NODE_USAGE), "{bad:?}: {why}");
+        }
+        assert!(
+            REMOVE_NODE_USAGE.contains("if n's host is down")
+                && REMOVE_NODE_USAGE.contains("admin remove-node <n> --unreachable-ok <n>"),
+            "{REMOVE_NODE_USAGE}"
+        );
+        assert_eq!(parse_rebalance(&words("")), Ok(None));
+        assert_eq!(parse_rebalance(&words("--max-moves 0")), Ok(Some(0)));
+        assert_eq!(parse_rebalance(&words("--max-moves 12")), Ok(Some(12)));
+        for bad in [
+            "--max-moves",
+            "--max-moves x",
+            "--max-moves -1",
+            "x",
+            "--max-moves 1 2",
+        ] {
+            let why = parse_rebalance(&words(bad)).expect_err(bad);
+            assert!(why.ends_with(REBALANCE_USAGE), "{bad:?}: {why}");
+        }
+        assert_eq!(parse_drain(&words("2")), Ok(NodeId(2)));
+        assert_eq!(parse_drain(&words("8")), Ok(NodeId(8)));
+        for bad in ["", "0", "9", "2 3"] {
+            let why = parse_drain(&words(bad)).expect_err(bad);
+            assert!(why.ends_with(DRAIN_USAGE), "{bad:?}: {why}");
+        }
+    }
+
+    /// #80 S4 T12 R2: the lines the S3 script reads, pinned exactly. `added` and `removed` say
+    /// the record; `rebalance` says a head line, then `moved`, `refilled` and `residual:`
+    /// lines (`residual: none` when there are none), then one summary line that counts all
+    /// three; `drain` adds `drained` with both promote lists; `placement` says one line per
+    /// node, counting what each partition names even on a draining node, with the state words
+    /// `ok`, `draining`, `full` and `unhealthy`. Cut: drop the `residual: none` line and the
+    /// empty-report assert goes red, observed 2026-11-21 at load 15.07. Unit.
+    #[test]
+    fn s80s4_rebalance_drain_and_placement_say_their_pinned_lines() {
+        use rdb_core::placement::{Inventory, Node, NodeState, Partition, Step, Why};
+        let record = rdb_core::authority::node::NodeRecord {
+            node: NodeId(6),
+            addr: "10.0.0.16:7100".to_owned(),
+            machine: "d6".to_owned(),
+        };
+        assert_eq!(
+            added_line(&record),
+            "added node=6 addr=10.0.0.16:7100 machine=d6"
+        );
+        assert_eq!(
+            removed_line(&record),
+            "removed node=6 addr=10.0.0.16:7100 machine=d6"
+        );
+        assert_eq!(
+            rebalance_head(None),
+            "rebalance: max moves none, draining -"
+        );
+        assert_eq!(
+            rebalance_head(Some(0)),
+            "rebalance: max moves 0, draining -"
+        );
+        let report = admin::RebalanceReport {
+            moved: vec![Step {
+                partition: 3,
+                from: 2,
+                to: 6,
+                primary: false,
+                why: Why::CopySkew,
+            }],
+            refilled: vec![(5, 4)],
+            residuals: vec!["no_live_handoff: x".to_owned()],
+            copy_skew: 1,
+            primary_skew: 2,
+        };
+        assert_eq!(
+            rebalance_lines(&report),
+            [
+                "moved partition=3 from=2 to=6 # balance copy counts",
+                "refilled partition=5 to=4",
+                "residual: no_live_handoff: x",
+                "rebalance: moves=1 refills=1 residuals=1 copy_skew=1 primary_skew=2",
+            ]
+        );
+        let empty = admin::RebalanceReport {
+            moved: Vec::new(),
+            refilled: Vec::new(),
+            residuals: Vec::new(),
+            copy_skew: 0,
+            primary_skew: 0,
+        };
+        assert_eq!(
+            rebalance_lines(&empty),
+            [
+                "residual: none",
+                "rebalance: moves=0 refills=0 residuals=0 copy_skew=0 primary_skew=0",
+            ]
+        );
+        assert_eq!(
+            drain_head(NodeId(2)),
+            "drain: node 2; moving its copies off, then promoting what it owns, then refilling"
+        );
+        let drained = admin::DrainReport {
+            rebalance: empty,
+            promoted_by_drain: vec![2, 7],
+            promoted_elsewhere: Vec::new(),
+        };
+        assert_eq!(
+            drained_lines(NodeId(2), &drained),
+            [
+                "residual: none",
+                "rebalance: moves=0 refills=0 residuals=0 copy_skew=0 primary_skew=0",
+                "drained node=2 promoted_by_drain=[2,7] promoted_elsewhere=[]",
+            ]
+        );
+        let node = |id: u32, state: NodeState| Node {
+            id,
+            machine: format!("m{id}"),
+            domain: format!("m{id}"),
+            state,
+            primary_eligible: true,
+        };
+        let inventory = Inventory {
+            nodes: vec![
+                node(1, NodeState::Ok),
+                node(2, NodeState::Draining),
+                node(6, NodeState::Ok),
+            ],
+            partitions: vec![
+                Partition {
+                    id: 1,
+                    copies: vec![1, 2, 6],
+                    primary: 1,
+                },
+                Partition {
+                    id: 2,
+                    copies: vec![1, 2, 6],
+                    primary: 6,
+                },
+            ],
+        };
+        assert_eq!(
+            placement_lines(&inventory),
+            [
+                "placement: nodes=3 partitions=2",
+                "placement node=1 machine=m1 state=ok copies=2 primaries=1",
+                "placement node=2 machine=m2 state=draining copies=2 primaries=0",
+                "placement node=6 machine=m6 state=ok copies=2 primaries=1",
+                "placement: copy_skew=0 primary_skew=0",
+            ]
+        );
+        let words: Vec<&str> = [
+            NodeState::Ok,
+            NodeState::Draining,
+            NodeState::Full,
+            NodeState::Unhealthy,
+        ]
+        .iter()
+        .map(|state| state.name())
+        .collect();
+        assert_eq!(words, ["ok", "draining", "full", "unhealthy"]);
+    }
+
+    /// #80 S4 T12 R3: in a session on rdb_dev's own voters, which declare no database, so hold
+    /// no `nodes/` record, `admin placement` and `admin rebalance` refuse "the inventory has no
+    /// nodes" (never `nodes=0`, whose `copy_skew=0` would pass a skew check on no database) and
+    /// `admin remove-node 2` refuses "no database is declared", writing nothing; each refusal is
+    /// one `repl_*_refused` event, and the run exits 1. The voters stop when `run` returns, so
+    /// no store is left to list: "nothing written" rests on the refusal's text and on no
+    /// `remove_node_written` event. The lines say `err admin <verb>: ` and the event's `error`.
+    /// Cut: `admin placement` answers an inventory read that fails with an empty inventory
+    /// (`nodes=0`) instead of refusing, and the placement assert goes red, observed 2026-11-21
+    /// at load 14.22. Integration (~10 s): three real rEtcd voters and an open.
+    #[config_log::retcd_test]
+    fn s80s4_membership_verbs_in_a_session_refuse_on_an_undeclared_store_and_exit_one() {
+        const METHOD: &str =
+            "s80s4_membership_verbs_in_a_session_refuse_on_an_undeclared_store_and_exit_one";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let path = root.path().join("script.txt");
+        std::fs::write(
+            &path,
+            "wait ready 60\nadmin placement\nadmin rebalance --max-moves 0\nadmin remove-node 2\n",
+        )
+        .expect("write the script");
+        let args = Args {
+            dir: root.path().join("run"),
+            log_dir: root.path().join("logs"),
+            script: Some(path),
+            partitions: Some(4),
+            ..parse(std::iter::empty()).expect("defaults")
+        };
+        let code = run(&args, Db::open);
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let refused = |event: &str| -> Vec<String> {
+            lines
+                .iter()
+                .filter(|line| line["@m"] == event)
+                .map(|line| line["error"].as_str().expect("error").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            refused("repl_placement_refused"),
+            ["inventory: the inventory has no nodes"]
+        );
+        assert_eq!(
+            refused("repl_rebalance_refused"),
+            ["inventory: the inventory has no nodes"]
+        );
+        assert_eq!(
+            refused("repl_remove_node_refused"),
+            ["no database is declared on this control store; nothing was written"]
+        );
+        for written in [
+            "remove_node_written",
+            "repl_placement",
+            "repl_rebalance",
+            "repl_remove_node",
+        ] {
+            assert!(
+                !lines.iter().any(|line| line["@m"] == written),
+                "{written} was logged"
+            );
+        }
+        assert_eq!(code, ExitCode::from(1));
     }
 
     /// A-R245: `admin status` lists both prefixes through the store it is given, the Db's own,
