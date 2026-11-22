@@ -4517,8 +4517,10 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 /// versions (`plan version 2, this build reads 1`).
 pub(crate) const PROMOTE_PLAN_VERSION: u8 = 5;
 
-/// The last layout that stored the plan alone, with no possible-loss reason after it.
-const PROMOTE_PLAN_VERSION_PLAN_ONLY: u8 = 4;
+/// The layout that stores the plan alone, with no possible-loss reason after it. A promote with
+/// no possible loss still writes it (t4's ask on #177): the plan sits in the control store, so
+/// a build that reads only up to `4` can read every plan but one that carries a reason.
+pub(crate) const PROMOTE_PLAN_VERSION_PLAN_ONLY: u8 = 4;
 
 /// The stored plan before `must_hold` (version `1`): every field of [`RecoveryPlan`] before it,
 /// in order.
@@ -4615,15 +4617,24 @@ pub(crate) fn encode_promote_plan(plan: &RecoveryPlan) -> Bytes {
     encode_promote_plan_with(plan, None)
 }
 
-/// A promote plan as stored: [`PROMOTE_PLAN_VERSION`], then the plan and `possible_loss` in
-/// postcard, the codec the links already use.
+/// A promote plan as stored, in postcard, the codec the links already use: with no
+/// `possible_loss`, [`PROMOTE_PLAN_VERSION_PLAN_ONLY`] and the plan alone, as before #177;
+/// with one, [`PROMOTE_PLAN_VERSION`], the plan, then the reason. So only a plan that needs
+/// the new layout is one an older build refuses.
 pub(crate) fn encode_promote_plan_with(
     plan: &RecoveryPlan,
     possible_loss: Option<crate::host::PossibleLossReason>,
 ) -> Bytes {
-    let mut bytes = vec![PROMOTE_PLAN_VERSION];
+    let version = if possible_loss.is_some() {
+        PROMOTE_PLAN_VERSION
+    } else {
+        PROMOTE_PLAN_VERSION_PLAN_ONLY
+    };
+    let mut bytes = vec![version];
     bytes.extend(postcard::to_stdvec(plan).expect("a recovery plan serialises"));
-    bytes.extend(postcard::to_stdvec(&possible_loss).expect("a reason serialises"));
+    if possible_loss.is_some() {
+        bytes.extend(postcard::to_stdvec(&possible_loss).expect("a reason serialises"));
+    }
     Bytes::from(bytes)
 }
 

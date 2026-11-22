@@ -1632,13 +1632,40 @@ async fn i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused(
         },
     )
     .await;
-    assert_not_admin(
-        "i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused",
-        &got,
-        &answer,
-        "pilot",
-        "ack-possible-loss",
+    // `assert_not_admin`'s checks but its last: a refused ack says nothing was cleared, as a
+    // refused forget-tail says nothing was given up, not that it did nothing.
+    assert!(
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
+        "an app not on the admin list never reaches node 1's node with an ack: {got:?}"
     );
+    assert_eq!(
+        client_requests("i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused"),
+        [(1, "status".to_owned())]
+    );
+    let Answer::Error { error, request } = &answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, &None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    assert!(
+        text.contains("app pilot is not an admin app")
+            && text.contains("--admin-apps")
+            && text.contains("ack a possible loss")
+            && text.contains("nothing was cleared"),
+        "{text}"
+    );
+    assert!(!text.contains("  "), "one space between words: {text:?}");
 }
 
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with

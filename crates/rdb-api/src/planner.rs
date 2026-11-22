@@ -205,6 +205,10 @@ type Entry = (PartitionRecord, Option<Vec<RecordMember>>);
 /// that answered counts, whether or not the choice counted it, a faulted or frozen one too:
 /// its store may have held the only copy of a write. Of mixed reasons, unknown wins
 /// ([`PossibleLossReason::worst`]); otherwise changed. `None` when no member reports one.
+///
+/// A faulted member still reports: its host answers a look with its status, holds included
+/// (`Host::answer_faulted`). A member whose look does not answer reports nothing, so its
+/// store's state is not counted here; that is out of scope for #177.
 fn possible_loss(looks: &[(NodeId, Option<NodeStatus>)]) -> Option<PossibleLossReason> {
     looks
         .iter()
@@ -250,7 +254,7 @@ pub(crate) fn choose_target(
                 return None;
             }
             let holds = status.holds?;
-            if holds.owner_epoch.is_none() && holds.generation != current {
+            if holds.is_restored() && holds.generation != current {
                 return None;
             }
             Some((holds.generation, holds.applied, member.node))

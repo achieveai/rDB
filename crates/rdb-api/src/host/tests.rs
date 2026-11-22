@@ -6955,26 +6955,33 @@ mod routed_fence {
         };
         plan.release.through = Some(Seq(11));
         let bytes = crate::admin::encode_promote_plan(&plan);
-        assert_eq!(bytes[0], crate::admin::PROMOTE_PLAN_VERSION);
+        assert_eq!(bytes[0], crate::admin::PROMOTE_PLAN_VERSION_PLAN_ONLY);
         assert_eq!(crate::admin::decode_promote_plan(&bytes), Ok(plan));
     }
 
-    /// #177: a promote's possible-loss reason is stored after the plan, at the current version
-    /// (5), and reads back with it; none reads back as none. A plan stored at version 4, before
-    /// the reason, reads with none and still binds a routed fence, by the rule older versions
-    /// follow. Cuts: version 4 read as version 5, red (the decode fails); the reason not
-    /// written, red (it reads back none). Unit (<1 ms).
+    /// #177: a promote's possible-loss reason is stored after the plan, at version 5, and reads
+    /// back with it. A promote with none writes version 4, the plan alone, as before #177, so
+    /// a build that reads up to 4 reads it (t4's ask). A version 4 plan reads with none and
+    /// still binds a routed fence. A version 6 plan is refused by name and does not bind.
+    /// Cuts: always write version 5, the none case's byte is 5, red; version 4 read as version
+    /// 5, red (the decode fails); the reason not written, red (it reads back none). Unit (<1 ms).
     #[test]
     fn i177_a_stored_plan_carries_its_possible_loss_and_a_version_4_one_has_none() {
         use crate::host::PossibleLossReason;
         let plan = stored_plan();
-        for reason in [
-            None,
-            Some(PossibleLossReason::OsBootChanged),
-            Some(PossibleLossReason::OsBootUnknown),
+        for (reason, version) in [
+            (None, crate::admin::PROMOTE_PLAN_VERSION_PLAN_ONLY),
+            (
+                Some(PossibleLossReason::OsBootChanged),
+                crate::admin::PROMOTE_PLAN_VERSION,
+            ),
+            (
+                Some(PossibleLossReason::OsBootUnknown),
+                crate::admin::PROMOTE_PLAN_VERSION,
+            ),
         ] {
             let bytes = crate::admin::encode_promote_plan_with(&plan, reason);
-            assert_eq!(bytes[0], crate::admin::PROMOTE_PLAN_VERSION);
+            assert_eq!(bytes[0], version, "{reason:?}");
             assert_eq!(
                 crate::admin::decode_promote_plan_with(&bytes),
                 Ok((plan.clone(), reason)),
@@ -6982,16 +6989,30 @@ mod routed_fence {
             );
         }
         // Version 4's layout: the byte, then the plan alone.
-        let mut v4 = vec![4];
+        let mut v4 = vec![crate::admin::PROMOTE_PLAN_VERSION_PLAN_ONLY];
         v4.extend(postcard::to_stdvec(&plan).expect("a plan serialises"));
         assert_eq!(
             crate::admin::decode_promote_plan_with(&v4),
-            Ok((plan, None)),
+            Ok((plan.clone(), None)),
             "a version 4 plan has no reason"
         );
         let (proof, mut facts) = true_fence();
         facts.plan = Some(bytes::Bytes::from(v4));
         assert_eq!(bind(&proof, facts), Ok(()));
+        // A newer build's plan: refused by its byte, naming both versions.
+        let newer = crate::admin::PROMOTE_PLAN_VERSION + 1;
+        let mut v6 = vec![newer];
+        v6.extend(postcard::to_stdvec(&plan).expect("a plan serialises"));
+        assert_eq!(
+            crate::admin::decode_promote_plan_with(&v6),
+            Err(format!(
+                "plan version {newer}, this build reads 1 to {}",
+                crate::admin::PROMOTE_PLAN_VERSION
+            ))
+        );
+        let (proof, mut facts) = true_fence();
+        facts.plan = Some(bytes::Bytes::from(v6));
+        assert_eq!(bind(&proof, facts), Err("plan_unreadable"));
     }
 
     /// `stored_plan()` with `must_hold` {3} and a prior naming three members and no note, as #80

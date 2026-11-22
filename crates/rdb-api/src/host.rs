@@ -1642,9 +1642,11 @@ pub struct Holding {
     /// from a restored store, which keeps no owner epoch (#177), and epoch 0 is a real epoch,
     /// so `None` is not 0.
     pub owner_epoch: Option<OwnerEpoch>,
-    /// Highest contiguous sequence applied. A live copy's is its buffered applied; a restored
-    /// copy's is what its store kept, which is never more than it holds, so comparing the two
-    /// is conservative: a restored copy can only look shorter than it is.
+    /// Highest contiguous sequence applied. A live copy's is its buffered applied. A restored
+    /// copy's is `RocksEngine::buffered_applied` read after the reopen, which is what the WAL
+    /// and the store recovered, nothing a live buffer still held (t4's ask on #177): keep it
+    /// that read. It is never more than the copy holds, so comparing the two is conservative:
+    /// a restored copy can only look shorter than it is.
     pub applied: u64,
     /// Highest contiguous sequence proved durable.
     pub durable: u64,
@@ -1653,6 +1655,17 @@ pub struct Holding {
     /// not tell. `None` for every other holding, and for a restored one whose open found the
     /// same boot. A failover that sees it on any member logs `failover_possible_loss`.
     pub restored: Option<PossibleLossReason>,
+}
+
+impl Holding {
+    /// #177: whether this holding was reported from a restored store (a copy restarted while
+    /// its owner is dead, not yet rejoined), as `Host::restored_holding` reports one, rather
+    /// than by a live owner or receiver. Decisions ask this, never `owner_epoch` directly. Not
+    /// [`Self::restored`]: that is `None` for a restored copy on the same OS boot too.
+    #[must_use]
+    pub const fn is_restored(&self) -> bool {
+        self.owner_epoch.is_none()
+    }
 }
 
 /// A node's thread has stopped: nothing sent to it is read.

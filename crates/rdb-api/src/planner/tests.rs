@@ -194,6 +194,7 @@ fn i177_a_restored_member_on_a_changed_boot_marks_the_promote_whichever_copy_win
         (2, 50),
         changed,
     );
+    assert_eq!(choose(1, &rf4(), &behind), Ok(NodeId(4)));
     assert_eq!(
         possible_loss(&behind),
         changed,
@@ -244,6 +245,86 @@ fn i177_a_restored_member_on_a_changed_boot_marks_the_promote_whichever_copy_win
         possible_loss(&mixed),
         Some(OsBootUnknown),
         "unknown then changed"
+    );
+}
+
+/// Node 1 the dead primary, nodes 2, 3 and 4 regular secondaries: room for a promote with a
+/// member that is no candidate.
+fn rf4() -> Vec<RecordMember> {
+    let mut members = rf3();
+    members.push(member(3, 4, ReplicaRole::RegularSecondary));
+    members
+}
+
+/// #177 (t4): a member that is no candidate still marks the promote. Node 4's copy restored
+/// on a changed boot; nodes 2 and 3 are live candidates. With node 4 faulted (its look still
+/// answers: a faulted host answers `Inspect` with its status, holds included,
+/// `Host::answer_faulted`), or with its grant frozen, a live copy is promoted and the promote
+/// carries `OsBootChanged`. A member whose look does not answer reports nothing; that is out
+/// of scope here.
+/// Cut: `possible_loss` skips a faulted look (`status.fault.is_some()`), the faulted case is
+/// `None`, red.
+#[test]
+fn i177_a_faulted_or_frozen_restored_member_still_marks_the_promote() {
+    let changed = Some(PossibleLossReason::OsBootChanged);
+    let base = || {
+        restored_with(
+            looks(&[(2, Some((3, 10))), (3, Some((3, 11))), (4, Some((3, 0)))]),
+            4,
+            (3, 12),
+            changed,
+        )
+    };
+    let mut faulted = base();
+    for (node, status) in &mut faulted {
+        if *node == NodeId(4) {
+            status.as_mut().expect("node 4 answers").fault = Some("storage fault".to_owned());
+        }
+    }
+    assert_eq!(choose(1, &rf4(), &faulted), Ok(NodeId(3)));
+    assert_eq!(
+        possible_loss(&faulted),
+        changed,
+        "a faulted restored member"
+    );
+
+    let frozen = base();
+    assert_eq!(
+        choose_target(
+            PartitionId(1),
+            &rf4(),
+            DEAD,
+            CURRENT,
+            &frozen,
+            &[NodeId(4)].into_iter().collect(),
+        ),
+        Ok(NodeId(3))
+    );
+    assert_eq!(possible_loss(&frozen), changed, "a frozen restored member");
+}
+
+/// #177 near miss (t4): a live copy, with an owner epoch, one generation behind
+/// `partitions/` still counts exactly as before #177; only a restored one behind is dropped.
+/// Here the behind live copy is the second answering copy, so the partition is promoted to
+/// the current one, and the same look with that copy restored is a lone survivor.
+/// Cut: drop `is_restored()` from `choose_target`'s filter, the live copy is dropped too and the
+/// first choice is `LoneSurvivor`, red.
+#[test]
+fn i177_a_live_copy_one_generation_behind_still_counts() {
+    let live_behind = looks(&[(2, Some((2, 50))), (3, Some((3, 5)))]);
+    assert!(
+        live_behind[0]
+            .1
+            .as_ref()
+            .and_then(|status| status.holds)
+            .is_some_and(|holds| !holds.is_restored() && holds.owner_epoch.is_some()),
+        "node 2's copy is live"
+    );
+    assert_eq!(choose(1, &rf3(), &live_behind), Ok(NodeId(3)));
+    let restored_behind = restored(looks(&[(2, Some((2, 50))), (3, Some((3, 5)))]), 2, 2, 50);
+    assert_eq!(
+        choose(1, &rf3(), &restored_behind),
+        Err(NoEligible::LoneSurvivor { answering: 1 })
     );
 }
 

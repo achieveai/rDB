@@ -15698,7 +15698,20 @@ mod tests {
         assert!(loss.applied >= 1, "a=1 was applied: {loss:?}");
         assert_eq!(logged(METHOD, "failover_possible_loss_recorded").len(), 1);
         assert!(logged(METHOD, "failover_possible_loss").is_empty());
-        db.put(b"c", b"3", None).expect("writes are not blocked");
+        // Node 2 adopts the promoted generation a moment after the promote answers; a put
+        // refused before that sent nothing (`no_mutation`), so it is sent again until then.
+        let deadline =
+            std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        loop {
+            match db.put(b"c", b"3", None) {
+                Ok(_) => break,
+                Err(error) if error.error.no_mutation && std::time::Instant::now() < deadline => {
+                    tracing::debug!(?error, "i177_put_before_adoption_retry");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("writes are not blocked: {error:?}"),
+            }
+        }
 
         let stale = db
             .ack_possible_loss(generation.next())
@@ -15778,7 +15791,9 @@ mod tests {
             .expect("the fresh open is ready");
         db.put(b"a", b"1", None).expect("put a=1");
         let before = stored_generation(&rt, &store).expect("partitions/1");
-        crate::host::set_after_commit(dir.path(), Some(crate::host::AfterCommit::Fault));
+        // Node 2 is running already, so the hook for a running host, not `set_after_commit`'s
+        // for hosts started later.
+        crate::host::fault_next_commit(&dir.path().join("nodes").join("2"));
         let answer = db.promote_with(
             PARTITION,
             NodeId(2),
@@ -15789,7 +15804,8 @@ mod tests {
         until_stored(&rt, &store, before + 1);
         db.shutdown();
         drop(db);
-        crate::host::set_after_commit(dir.path(), None);
+        let hooked = logged(METHOD, "after_commit_hook");
+        assert_eq!(hooked.len(), 1, "node 2 faulted at its commit: {hooked:?}");
         assert!(
             logged(METHOD, "failover_possible_loss_recorded").is_empty(),
             "the faulted node landed nothing"
