@@ -12233,14 +12233,10 @@ impl Host {
         Ok((floor, self.digest_at(partition, generation, floor)?))
     }
 
-    /// The newest generation of `partition` this engine holds.
+    /// The newest generation of `partition` this engine holds: a bounded lookup, never a copy
+    /// of every lineage key (PR #204 review; explicit status requests call it).
     fn newest_held(&self, partition: PartitionId) -> Option<Generation> {
-        self.engine
-            .lineages()
-            .into_iter()
-            .filter(|(p, _)| *p == partition)
-            .map(|(_, g)| g)
-            .max()
+        self.engine.newest_generation(partition)
     }
 
     /// Issue #61 (design section 3.4): R1's sides of `partition` hold no rung below this
