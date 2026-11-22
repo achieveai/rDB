@@ -7716,3 +7716,102 @@ fn i79_the_protection_floor_is_the_primary_and_the_best_secondary() {
         vec![(CONFIG, DurableSeq(5))]
     );
 }
+
+/// Issue #79 (option A): the sim's `m9_f1_00` path, here at R1, where P > C is decided. B and C
+/// were pinned with A; F1 commits `DegradedRf2` at the cutoff with B behind. Under the quorum
+/// floor the primary and C make the quorum, so two writes publish and are durable on it
+/// before B has caught up: new behaviour, which the all-copies floor held back. F1's activation
+/// re-emit then proves every copy at `HEAD + 2`, above the selected cutoff `HEAD` (P > C).
+/// Claims:
+/// 1. Before B catches up, `HEAD + 2` qualifies and is the quorum floor; B is not durable there.
+/// 2. The re-emit keeps the published head and history, floors B's proof at the selected cutoff
+///    (`m9_f1_a`), credits B nothing above it, and keeps C's progress and the quorum floor.
+/// 3. B's catch-up ACK at `HEAD + 2` is admitted on the same history: no divergence, and every
+///    copy is durable through it.
+///
+/// Cuts, each red: the floor at the barrier's cutoff (the pre-fix `m9_f1_a` bug), at claim 2's
+/// `known(B)`; the re-emit cut at the cutoff instead of its own head (the pre-D3 rebuild), at
+/// claim 2's head; the re-emit not keeping the peers' progress (pre-A-R197), at claim 2's floor.
+/// Unit (< 10 ms).
+#[retcd_test]
+fn i79_a_re_emit_proving_a_slow_copy_above_the_cutoff_floors_it_at_the_cutoff() {
+    let mut tracker = tracker();
+    tracker.on_recovered(&activating(), T);
+    deliver(&mut tracker, &in_new_root(c(HEAD, HEAD, HEAD)));
+    for seq in [HEAD + 1, HEAD + 2] {
+        local_applied(&mut tracker, seq);
+    }
+    tracker.on_flushed(&flushed_through(HEAD + 2));
+    deliver(&mut tracker, &in_new_root(c(HEAD + 2, HEAD + 2, HEAD + 2)));
+
+    // 1.
+    let above = Seq(HEAD + 2);
+    assert!(tracker.qualifies_now(above), "C qualifies HEAD + 2");
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(NEW_CONFIG, DurableSeq(above.0))],
+        "the primary and C are the quorum"
+    );
+    assert!(!tracker.all_durable_through(above), "B is still behind");
+
+    // 2.
+    let mut result = activated();
+    let required = [COPY_A, COPY_B, COPY_C];
+    let proofs: Vec<DurableProof> = required
+        .iter()
+        .map(|&copy| DurableProof {
+            copy,
+            partition: P,
+            seq: DurableSeq(above.0),
+            digest: d(above.0),
+            boot: named_boot(&result, copy),
+        })
+        .collect();
+    result.barrier =
+        RecoveryBarrier::try_new(&proofs, &required.into_iter().collect(), above, d(above.0))
+            .expect("every copy proved above the selected cutoff");
+    assert_eq!(
+        (result.selected.cutoff_seq, result.barrier.cutoff()),
+        (Seq(HEAD), above),
+        "P > C"
+    );
+    tracker.on_recovered(&result, T);
+    assert_eq!(
+        (tracker.head(), tracker.history().highest()),
+        (above, Some(above)),
+        "no published seq is cut"
+    );
+    assert_eq!(
+        tracker.known(COPY_B),
+        Some(progress(HEAD, HEAD, HEAD)),
+        "B's proof is floored at the selected cutoff"
+    );
+    let b_durable = tracker.peer(COPY_B).expect("B").progress.durable;
+    assert!(
+        b_durable.0 <= HEAD,
+        "B is credited nothing above the cutoff: {b_durable:?}"
+    );
+    assert_eq!(
+        tracker.peer(COPY_C).expect("C").progress,
+        progress(HEAD + 2, HEAD + 2, HEAD + 2),
+        "C keeps its progress"
+    );
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(NEW_CONFIG, DurableSeq(above.0))],
+        "the quorum floor stays"
+    );
+
+    // 3.
+    deliver(&mut tracker, &in_new_root(b(HEAD + 2, HEAD + 2, HEAD + 2)));
+    assert_eq!(
+        tracker.peer(COPY_B).expect("B").progress,
+        progress(HEAD + 2, HEAD + 2, HEAD + 2),
+        "B's catch-up ACK is admitted"
+    );
+    assert!(tracker.diverged().is_empty(), "B is on the same history");
+    assert!(
+        tracker.all_durable_through(above),
+        "every copy durable through HEAD + 2"
+    );
+}
