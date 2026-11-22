@@ -2893,6 +2893,11 @@ struct Host {
     /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it. With
     /// the generation it was served under (lead ruling R18), so a new commit serves it again.
     snapshots_served: BTreeMap<(PartitionId, CopyId), (Generation, Seq)>,
+    /// Issue #61 round 2 (B3): per `(partition, copy)`, the `install_retryable` refusals heard
+    /// at one `(generation, barrier)` of [`Self::snapshots_served`]. Under
+    /// [`snapshot::SNAPSHOT_RETRY_LIMIT`] such a refusal forgets the barrier, so R1's next ask
+    /// re-offers it; at the limit the barrier is kept. Cleared on the copy's caught-up release.
+    snapshot_retries: BTreeMap<(PartitionId, CopyId), (Generation, Seq, u32)>,
     /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
     transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
     /// Issue #61 S2: the install this target runs, per partition.
@@ -2925,6 +2930,12 @@ struct Host {
     /// index (0 is the first), so a row can stop a target mid-install. Rows only.
     #[cfg(debug_assertions)]
     snapshot_pages_held_from: Option<u64>,
+    /// Issue #61 round 2 (B4): while above 0, this target's next page write fails as a storage
+    /// fault would (`InstallError::Storage`), once per page, counting down. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_install_faults: u32,
+    /// [`snapshot::SNAPSHOT_PULL_RETRY_MILLIS`]; crate tests set it directly.
+    snapshot_pull_retry_millis: u64,
     /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root.
     committed_correlation: BTreeMap<PartitionId, CorrelationId>,
     /// (partition, generation) this copy linked at its landing, outside the barrier (A-R185).
@@ -3236,6 +3247,7 @@ impl Host {
             inventory_ladders: BTreeMap::new(),
             ladder_passes: 0,
             snapshots_served: BTreeMap::new(),
+            snapshot_retries: BTreeMap::new(),
             transfers: BTreeMap::new(),
             installs: BTreeMap::new(),
             snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
@@ -3248,6 +3260,9 @@ impl Host {
             snapshot_export_fault: false,
             #[cfg(debug_assertions)]
             snapshot_pages_held_from: None,
+            #[cfg(debug_assertions)]
+            snapshot_install_faults: 0,
+            snapshot_pull_retry_millis: snapshot::SNAPSHOT_PULL_RETRY_MILLIS,
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             caught_up_resends: BTreeMap::new(),
@@ -4265,6 +4280,7 @@ impl Host {
         }
         self.rebuild_duty(now);
         self.transfer_duty(now);
+        self.install_duty(now);
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);

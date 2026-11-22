@@ -9563,6 +9563,163 @@ fn t61_pr204_a_non_primary_cannot_forge_an_offer_a_page_or_a_pull() {
     }
 }
 
+/// Round 2 (B2b and B3): `whys` of every `event` line of `method` for copy 3, in order.
+#[cfg(debug_assertions)]
+fn copy3_field(trio: &Trio, method: &str, event: &str, field: &str) -> Vec<String> {
+    let three = copy_of(trio, 3);
+    logged!(method, event)
+        .iter()
+        .filter(|line| line["copy"] == three.0)
+        .map(|line| match &line[field] {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// Round 2 (B2b and B3): wait for copy 3's transfer to be released `caught_up`.
+#[cfg(debug_assertions)]
+fn released_caught_up(trio: &mut Trio, method: &str) {
+    let three = copy_of(trio, 3);
+    trio.until("node 3 was rebuilt and released the transfer", |_| {
+        logged!(method, "snapshot_transfer_released")
+            .iter()
+            .any(|line| line["copy"] == three.0 && line["why"] == "caught_up")
+            .then_some(())
+    });
+}
+
+/// Issue #61 round 2 (B2b), a lost pull: as S2-R1, node 1 drops node 3's pull for page 2
+/// (`snapshot_pull_held`), as a lost message would, then answers again. Node 3, with no page
+/// for its retry wait (300 ms here, `SNAPSHOT_PULL_RETRY_MILLIS` in production), re-sends the
+/// same pull (`snapshot_pull_retried{retry = 1}`), which is served, and the rebuild completes
+/// with one install and no expiry.
+/// Cut: `install_duty` does nothing, red (the lost pull is never asked again and node 3 is not
+/// rebuilt).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r2_a_lost_pull_is_sent_again_and_the_install_completes() {
+    const METHOD: &str = "t61_r2_a_lost_pull_is_sent_again_and_the_install_completes";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 300;
+    trio.until("node 1 dropped the pull for page 2", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    let installed = rebuilt(&mut trio, METHOD, floor);
+    assert!(installed >= floor);
+    let retried = copy3_field(&trio, METHOD, "snapshot_pull_retried", "retry");
+    assert_eq!(
+        retried.first().map(String::as_str),
+        Some("1"),
+        "{retried:?}"
+    );
+    let expired = logged!(METHOD, "snapshot_install_expired");
+    assert!(expired.is_empty(), "{expired:?}");
+}
+
+/// Issue #61 round 2 (B2b and B3), an install that expires: as S2-R1, node 1 drops every pull
+/// for page 2. Node 3 re-sends it `SNAPSHOT_PULL_RETRIES` (3) times, 100 ms apart here, then
+/// its install expires (`snapshot_install_expired{retries = 3}`) and it refuses the offer
+/// `install_retryable`. Node 1 ends the transfer `refused_retryable` and forgets the barrier
+/// (`snapshot_retry_allowed{refusals = 1}`); once it answers again, R1's next ask opens a new
+/// transfer and node 3 is released `caught_up`.
+/// Cuts: no expiry in `install_duty`, red (no `snapshot_install_expired`, the install stands);
+/// a retryable refusal keeps the barrier (`refusal_kept` answers `refused`), red (no transfer
+/// opens again).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r2_an_install_with_no_pages_expires_and_the_barrier_is_offered_again() {
+    const METHOD: &str = "t61_r2_an_install_with_no_pages_expires_and_the_barrier_is_offered_again";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(2);
+        }
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 100;
+    let three = copy_of(&trio, 3);
+    trio.until("node 3's install expired", |_| {
+        logged!(METHOD, "snapshot_install_expired")
+            .iter()
+            .any(|line| line["copy"] == three.0)
+            .then_some(())
+    });
+    assert!(
+        trio.nodes[2].0.installs.is_empty(),
+        "the expired install is dropped"
+    );
+    trio.until("node 1 forgot the barrier", |_| {
+        (!logged!(METHOD, "snapshot_retry_allowed").is_empty()).then_some(())
+    });
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    released_caught_up(&mut trio, METHOD);
+    assert_eq!(
+        copy3_field(&trio, METHOD, "snapshot_install_expired", "retries"),
+        vec!["3"]
+    );
+    assert_eq!(
+        copy3_field(&trio, METHOD, "snapshot_pull_retried", "retry")[..3],
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        copy3_field(&trio, METHOD, "snapshot_retry_allowed", "refusals"),
+        vec!["1"]
+    );
+    let whys = copy3_field(&trio, METHOD, "snapshot_transfer_released", "why");
+    assert_eq!(whys, vec!["refused_retryable", "caught_up"], "{whys:?}");
+    let opened = copy3_field(&trio, METHOD, "snapshot_transfer_opened", "at");
+    assert_eq!(opened.len(), 2, "{opened:?}");
+}
+
+/// Issue #61 round 2 (B4), two transient refusals: as S2-R1, node 3's first two page writes
+/// fail as storage faults (`snapshot_install_faults = 2`). Each install is refused
+/// `install_retryable`, node 1 forgets the barrier each time (`snapshot_retry_allowed`,
+/// refusals 1 then 2, never `snapshot_retry_exhausted`), and R1's next ask re-offers the same
+/// barrier. The third install succeeds and node 3 is released `caught_up`, with every
+/// transfer at the same `S`.
+/// Cut: a retryable refusal keeps the barrier (`refusal_kept` answers `refused`), red (the
+/// second offer never opens).
+/// Integration (~4 s): S2-R1's setup.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r2_two_transient_install_refusals_then_success_at_the_same_barrier() {
+    const METHOD: &str = "t61_r2_two_transient_install_refusals_then_success_at_the_same_barrier";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _floor) = trimmed(dir.path(), 4, |_| {});
+    trio.nodes[2].0.snapshot_install_faults = 2;
+    released_caught_up(&mut trio, METHOD);
+    let refused = logged!(METHOD, "snapshot_install_refused");
+    let reasons: Vec<&str> = refused
+        .iter()
+        .filter(|line| line["node"] == 3)
+        .map(|line| line["reason"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(reasons, vec!["install_retryable"; 2], "{refused:?}");
+    assert_eq!(
+        copy3_field(&trio, METHOD, "snapshot_retry_allowed", "refusals"),
+        vec!["1", "2"]
+    );
+    let exhausted = logged!(METHOD, "snapshot_retry_exhausted");
+    assert!(exhausted.is_empty(), "{exhausted:?}");
+    let whys = copy3_field(&trio, METHOD, "snapshot_transfer_released", "why");
+    assert_eq!(
+        whys,
+        vec!["refused_retryable", "refused_retryable", "caught_up"],
+        "{whys:?}"
+    );
+    let at = copy3_field(&trio, METHOD, "snapshot_transfer_opened", "at");
+    assert_eq!(at.len(), 3, "{at:?}");
+    assert!(at.iter().all(|seq| *seq == at[0]), "one barrier: {at:?}");
+}
+
 /// Issue #61, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
 /// node 3's next pull is never answered. A transfer duty past `SNAPSHOT_IDLE_MILLIS` abandons
 /// the transfer (`snapshot_transfer_abandoned{why = idle}`) and forgets the barrier it served,

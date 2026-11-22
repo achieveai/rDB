@@ -3256,6 +3256,7 @@ fn t61_snapshot_wire_round_trip() {
         SnapshotRefusal::TailHeld,
         SnapshotRefusal::Chain,
         SnapshotRefusal::Install,
+        SnapshotRefusal::InstallRetryable,
     ];
     let mut kinds = BTreeSet::new();
     for reason in reasons {
