@@ -1014,9 +1014,10 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
   embedder's network policy.
   For SBX (checked 2026-11-22): no network control covers an rDB node listener yet. SBX's
   nftables rules block only sandboxes, whose outbound traffic is dropped except to the egress
-  proxy (SBX ADR 0027); nothing stops another holder of an app certificate on the network. So
-  the real control is #154's node-side check, and until it lands, the refusal above of Delete
-  and List from a non-admin app.
+  proxy. Those rules and SBX's ADR 0027 are SBX's internal documents, not public, so this page
+  cannot link them. Nothing stops another holder of an app certificate on the network. The
+  real control is #154 (open), the node-side check; until it lands, the refusal above of
+  Delete and List from a non-admin app.
 - `route`, `ownership` and ownership events return partition and node facts only, never a
   record.
 
