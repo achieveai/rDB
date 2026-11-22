@@ -16415,6 +16415,18 @@ impl Host {
                     ),
                 );
             }
+            // A copy anchored at the root with no lineage of the newest generation (an aborted
+            // install removed it, and the rebuild has not landed) holds none of its history: its
+            // floor reads 1, so an older cursor would be rewound to START over records this copy
+            // only lacks.
+            if receiver.applied_head().seq == Seq::ZERO
+                && self.engine.newest_generation(partition) != Some(newest)
+            {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!("node {node} holds none of partition {p} yet: it is being rebuilt"),
+                );
+            }
             match self.feed_fresh(partition, newest, wait) {
                 Freshness::Fresh => {}
                 Freshness::Reading => return Ok(FeedCall::WaitForRead),

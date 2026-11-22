@@ -5309,7 +5309,7 @@ fn m11_r463_b_the_catch_up_clock_starts_again_only_on_progress() {
     );
 }
 
-/// Issue #61 S2-R6 (design M5): a move's shadow being rebuilt from this owner's snapshot makes
+/// S2-R6 (design M5): a move's shadow being rebuilt from this owner's snapshot makes
 /// progress while the transfer serves entries, though its lag and acknowledgement stand still
 /// past the cutoff. More entries pulled starts the catch-up clock again; the same count does
 /// not, and past the deadline the move is given up. The pull count comes from the owner's
@@ -5352,7 +5352,7 @@ fn t61_s2_r6_a_snapshot_transfer_serving_entries_is_move_progress() {
     );
 }
 
-/// Issue #61 S2-R6 (design M5), the count `shadow_duty` gives `move_lag_duty`: the entries the
+/// S2-R6 (design M5), the count `shadow_duty` gives `move_lag_duty`: the entries the
 /// owner's transfer to the shadow's copy has served when that transfer is to the shadow's
 /// node, else 0 (a transfer to another node, or none).
 /// Cut: `transfer_pulled` returns 0, red (the matching transfer reads 0).
@@ -9386,7 +9386,7 @@ fn issue107_r2_the_gate_refuses_each_reason_before_the_probe_and_logs_it_once() 
     assert!(refused.is_empty(), "{refused:?}");
 }
 
-/// Issue #61 S2-R1 (design section 2, PR-A A8a), `S` at the head: every copy is trimmed, then
+/// S2-R1 (design section 2, PR-A A8a), `S` at the head: every copy is trimmed, then
 /// node 3 restarts on an empty disk and no write lands until it is rebuilt. No copy holds a
 /// record below the floor F, so R1 cannot walk node 3 from the root: node 1 opens a transfer at
 /// its applied seq `S`, which is its head. In order: `snapshot_offer_sent`,
@@ -9414,7 +9414,7 @@ fn t61_s2_r1_a_wiped_copy_below_every_floor_is_rebuilt_from_a_snapshot() {
     promoted_and_durable(&mut trio, 31);
 }
 
-/// Issue #61 S2-R1b (A8a, lead ruling 2), `S` below the head, writes during the transfer: as
+/// S2-R1b (A8a, lead ruling 2), `S` below the head, writes during the transfer: as
 /// S2-R1, but node 1 holds its offer (`snapshot_offer_held`) while two puts land at the new
 /// generation on nodes 1 and 2. Each put makes node 3, at the root, ask again with the new head
 /// as its barrier; the open transfer is not replaced (`snapshot_catchup_in_flight`), so the
@@ -9507,7 +9507,7 @@ fn rebuilt(trio: &mut Trio, method: &str, floor: u64) -> u64 {
     at
 }
 
-/// Issue #61, the dedup marker: as S2-R1, but node 1's first export fails at its
+/// The dedup marker: as S2-R1, but node 1's first export fails at its
 /// view read (`snapshot_export_fault`, once), after the barrier check. No write lands, so R1
 /// asks again at the same barrier, and that ask is served: one
 /// `snapshot_catchup_unserved{reason = view_failed}`, then a transfer opened at that same
@@ -9541,7 +9541,7 @@ fn t61_pr204_an_export_read_fault_does_not_drop_the_retry_at_the_same_barrier() 
     assert_eq!(logged!(METHOD, "snapshot_transfer_installed").len(), 1);
 }
 
-/// Issue #61, a head probe during an install: as the deferral row, node 1 holds
+/// A head probe during an install: as the deferral row, node 1 holds
 /// the pull for page 1 and node 3's install owns the partition. An ordinary append of the
 /// install's lineage then reaches node 3 two past its receiver's head, as a head probe past a
 /// gap does. It is not deferred: it reaches the receiver, which answers it without staging.
@@ -9649,7 +9649,7 @@ fn t61_pr204_a_head_probe_past_the_gap_reaches_the_receiver_during_an_install() 
     assert_eq!(done[0]["deferred"], 0, "{done:?}");
 }
 
-/// Issue #61, an append during an install: as S2-R1, node 1 holds the pull for
+/// An append during an install: as S2-R1, node 1 holds the pull for
 /// page 1, so node 3's install has begun and owns the partition. An ordinary append of the
 /// install's lineage then reaches node 3, contiguous with its receiver's head (seq 1 on the
 /// root, built as `trio::write_chain_in` builds a record, since the trimmed history holds no
@@ -9772,7 +9772,7 @@ fn t61_pr204_an_append_during_an_install_is_deferred_and_nothing_fences() {
     );
 }
 
-/// Issue #61, S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
+/// S2-R6 through `shadow_duty`: as S2-R1, node 3 is node 1's shadow,
 /// rebuilt from a snapshot, its ACK stalled at the root below the cutoff. Node 1 holds the pull
 /// for page 1 and is given a move onto node 3 (catch-up deadline 1 s). A duty at `t` starts the
 /// move clock; one more page served, a duty at `t + 2 s` finds the transfer served more and
@@ -9851,7 +9851,7 @@ fn t61_pr204_a_move_shadow_fed_by_snapshot_pages_resets_its_move_clock() {
     assert_eq!(logged!(METHOD, "move_catch_up_given_up").len(), 1);
 }
 
-/// Issue #61, a replayed page: as S2-R1, node 1 holds the pull for page 2, so
+/// A replayed page: as S2-R1, node 1 holds the pull for page 2, so
 /// node 3 has written pages 0 and 1 and its cursor is past page 1. Page 0 then reaches node 3
 /// again, as node 1 built it (from the barrier, after no key). It is dropped
 /// (`snapshot_chunk_dropped{why = mismatch}`): the install's cursor, chain, entries and pages are
@@ -9937,7 +9937,7 @@ fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
     rebuilt(&mut trio, METHOD, floor);
 }
 
-/// Issue #61 (#214 folded in), snapshot senders: as S2-R1, node 1 holds the pull for page 2,
+/// Snapshot senders (#214 folded in): as S2-R1, node 1 holds the pull for page 2,
 /// so node 3's install stands at two pages. Node 2, a certified member that is not the
 /// primary, then tries three forgeries, each well formed but its own:
 ///
@@ -10109,7 +10109,7 @@ fn released_caught_up(trio: &mut Trio, method: &str) {
     });
 }
 
-/// Issue #61, a lost pull: as S2-R1, node 1 drops node 3's pull for page 2
+/// A lost pull: as S2-R1, node 1 drops node 3's pull for page 2
 /// (`snapshot_pull_held`), as a lost message would, then answers again. Node 3, with no page
 /// for its retry wait (300 ms here, `SNAPSHOT_PULL_RETRY_MILLIS` in production), re-sends the
 /// same pull (`snapshot_pull_retried{retry = 1}`), which is served, and the rebuild completes
@@ -10144,7 +10144,7 @@ fn t61_r2_a_lost_pull_is_sent_again_and_the_install_completes() {
     assert!(expired.is_empty(), "{expired:?}");
 }
 
-/// Issue #61, an install that expires: as S2-R1, node 1 drops every pull
+/// An install that expires: as S2-R1, node 1 drops every pull
 /// for page 2. Node 3 re-sends it `SNAPSHOT_PULL_RETRIES` (3) times, 100 ms apart here, then
 /// its install expires (`snapshot_install_expired{retries = 3}`) and it refuses the offer
 /// `install_retryable`. Node 1 ends the transfer `refused_retryable` and forgets the barrier
@@ -10199,7 +10199,7 @@ fn t61_r2_an_install_with_no_pages_expires_and_the_barrier_is_offered_again() {
     assert_eq!(opened.len(), 2, "{opened:?}");
 }
 
-/// Issue #61, two transient refusals: as S2-R1, node 3's first two page writes
+/// Two transient refusals: as S2-R1, node 3's first two page writes
 /// fail as storage faults (`snapshot_install_faults = 2`). Each install is refused
 /// `install_retryable`, node 1 forgets the barrier each time (`snapshot_retry_allowed`,
 /// refusals 1 then 2, never `snapshot_retry_exhausted`), and R1's next ask re-offers the same
@@ -10240,7 +10240,7 @@ fn t61_r2_two_transient_install_refusals_then_success_at_the_same_barrier() {
     assert!(at.iter().all(|seq| *seq == at[0]), "one barrier: {at:?}");
 }
 
-/// Issue #61, the exhaustion boundary: as S2-R1, node 3's first four page
+/// The exhaustion boundary: as S2-R1, node 3's first four page
 /// writes fail as storage faults (`snapshot_install_faults = 4`). Refusals 1 to 3 each forget
 /// the barrier (`snapshot_retry_allowed`, 1 then 2 then 3), so 3 retries are allowed. The 4th
 /// keeps it (`snapshot_retry_exhausted{refusals = 4}`, `refused`): the barrier is still served
@@ -10324,7 +10324,7 @@ fn t61_r3_the_fourth_refusal_keeps_the_barrier_and_the_retry_duty_reopens_it() {
     assert!(at.iter().all(|seq| *seq == at[0]), "one barrier: {at:?}");
 }
 
-/// Issue #61, an install that expires with no first page: as S2-R1, node 1
+/// An install that expires with no first page: as S2-R1, node 1
 /// answers no pull at all (`snapshot_pages_held_from = Some(0)`). Node 3 re-sends its first
 /// pull 3 times, 100 ms apart, then its install expires before it began
 /// (`snapshot_install_expired{begun = false, chunks = 0}`): nothing was wiped, so nothing is
@@ -10370,7 +10370,7 @@ fn t61_r3_an_install_that_expires_before_its_first_page_aborts_nothing() {
     assert_eq!(whys, vec!["refused_retryable", "caught_up"], "{whys:?}");
 }
 
-/// Issue #61, inventory after an expiry: as item 14's row, node 1 holds page 1, so
+/// Inventory after an expiry: as item 14's row, node 1 holds page 1, so
 /// node 3's install has begun (and wiped the partition) when it expires. The expiry aborts the
 /// install (`install_abort`), so the lineage is gone, not left unlinked. Node 3 is then asked
 /// for its inventory before any new offer reaches it. It answers `InventoryFailed` with
@@ -10430,7 +10430,7 @@ fn t61_r3_an_inventory_asked_after_a_begun_install_expired_fails_at_info_not_err
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-/// Issue #61, the re-seed keeps what control installed: as S2-R1, node 1 holds its
+/// The re-seed keeps what control installed: as S2-R1, node 1 holds its
 /// offer until node 3, wiped and re-planned, holds a receiver with an A1 view and a control
 /// revision. After the install, node 3's re-seeded receiver at `S` carries both over: its
 /// `authority_seq` and `last_partition_revision` are at least the held ones, never 0. With them
@@ -10477,7 +10477,7 @@ fn t61_r3_a_reseeded_receiver_keeps_its_authority_view_and_control_revision() {
     );
 }
 
-/// Issue #61, a delayed refusal crossing a replacement: as S2-R1, node 1 holds page
+/// A delayed refusal crossing a replacement: as S2-R1, node 1 holds page
 /// 1. Its idle transfer is abandoned (`transfer_duty` past `SNAPSHOT_IDLE_MILLIS`) and the
 /// same barrier is offered afresh, a second transfer instance at the same `S`. The first
 /// instance's `install_retryable` refusal then arrives late. It names the first instance, so
@@ -10545,7 +10545,7 @@ fn t61_r3_a_delayed_refusal_of_an_earlier_transfer_ends_nothing() {
     assert!(released.is_empty(), "{released:?}");
 }
 
-/// Issue #61, a regression guard for promote after a rebuild: as S2-R1, bound to an
+/// A regression guard for promote after a rebuild: as S2-R1, bound to an
 /// instance, node 3 is rebuilt by node 1's snapshot, so its engine floor is the install's `S`,
 /// and pinned regular. Node 1 is then cut off and node 3 promoted: its `Recovered` installs `fresh_primary`'s
 /// ladder, whose lowest rung is the genesis 0, below that floor. Node 2 then restarts on an
@@ -10606,7 +10606,7 @@ fn t61_r3_a_copy_below_the_floor_of_a_promoted_rebuilt_copy_is_rebuilt_by_it() {
     assert_eq!(opened[0]["copy"], two.0, "{opened:?}");
 }
 
-/// Issue #61, a begun install that expires is aborted. No production route is
+/// A begun install that expires is aborted. No production route is
 /// known to a snapshot ask from a copy that R1 can still reach with a contiguous record, so
 /// the ask is forced: copy 3 is above node 1's floor here. Every copy holds the 30 puts, trimmed to
 /// `head - 4`. With node 1's frames to node 3 lost, put 31 lands on nodes 1 and 2 only: node 3's
@@ -10671,7 +10671,7 @@ fn t61_r3_a_begun_install_that_expires_is_aborted_and_a_contiguous_append_fences
     assert_eq!(whys, vec!["refused_retryable", "caught_up"], "{whys:?}");
 }
 
-/// Issue #61, a pull from a copy no longer in the plan: as S2-R1, node 1 holds
+/// A pull from a copy no longer in the plan: as S2-R1, node 1 holds
 /// node 3's pull for page 2. Node 1's primary is then re-pinned with copy 3 at node 4, as a
 /// plan that moved it would pin it, and node 3's held pull is delivered again. The pull is
 /// dropped `not_a_member` and the transfer ends (`snapshot_transfer_abandoned{why =
@@ -10747,7 +10747,7 @@ fn t61_r3_a_pull_from_a_copy_moved_out_of_the_plan_ends_the_transfer() {
     assert_eq!(abandoned, vec!["not_a_member"], "{abandoned:?}");
 }
 
-/// Issue #61, a pull reaching a retired primary: as S2-R1, node 1 holds
+/// A pull reaching a retired primary: as S2-R1, node 1 holds
 /// node 3's pull for page 2. Node 2 is then promoted for real, dropping node 3, so node 1's
 /// `Recovered` retires its primary, which keeps its old lineage and config. Node 3's held pull
 /// is then delivered to node 1. It is dropped `not_a_member` and the transfer ends: a retired
@@ -10833,7 +10833,7 @@ fn t61_r4_a_pull_reaching_a_retired_primary_ends_the_transfer() {
     assert_eq!(abandoned, vec!["not_a_member"], "{abandoned:?}");
 }
 
-/// Issue #61, an offer replacing a begun install: as S2-R1, node 1 serves
+/// An offer replacing a begun install: as S2-R1, node 1 serves
 /// page 1 and holds the rest, so node 3's install has begun (`install_begin` wiped the
 /// partition). Node 1's idle transfer is then abandoned and the same barrier offered afresh,
 /// and node 3 replaces its install with the new offer (`snapshot_install_replaced`). Node 1
@@ -10899,7 +10899,7 @@ fn t61_r4_an_offer_replacing_a_begun_install_aborts_it() {
     assert_eq!(rooted, vec![at.0.to_string()], "{rooted:?}");
 }
 
-/// Issue #61, a retry probe that sends nothing: as the exhaustion row,
+/// A retry probe that sends nothing: as the exhaustion row,
 /// node 3's first four page writes fail, so the 4th refusal keeps the barrier. Node 1's head
 /// record is then dropped from its history (`drop_history`), so `retry_duty`'s probe finds
 /// nothing to send (`send: nothing sent`). The count is re-armed before the probe, so after the
@@ -10971,7 +10971,7 @@ fn t61_r4_a_retry_probe_that_sends_nothing_is_tried_again() {
     assert!(!nothing.is_empty(), "the probe found no record to send");
 }
 
-/// Issue #61, a feed read mid-install: as the begun-install expiry row, node 3 is a
+/// A feed read mid-install: as the begun-install expiry row, node 3 is a
 /// regular secondary above node 1's floor, and node 1 is asked for copy 3's snapshot. It serves
 /// page 1 and holds the rest, so node 3's install has begun: its lineage is wiped and its floor
 /// reads 1. A change-feed read sent to node 3 from `START` is refused `UNAVAILABLE`, naming the
@@ -11040,7 +11040,7 @@ fn t61_r4_a_feed_read_on_a_copy_mid_install_is_refused_unavailable() {
     );
 }
 
-/// Issue #61, a kept barrier and a peer restart: as the exhaustion row,
+/// A kept barrier and a peer restart: as the exhaustion row,
 /// the 4th refusal keeps the barrier and arms the retry count (back-off 10 min here, so the
 /// duty never re-opens it). Node 3 then starts again, and node 1 hears it
 /// (`Host::transfers_peer_booted`). The kept barrier and the count are both forgotten: the new
@@ -11081,7 +11081,7 @@ fn t61_r4_a_peer_restart_forgets_a_kept_barrier_and_its_retry_count() {
     );
 }
 
-/// Issue #61, a dropped install is aborted: as S2-R1, node 1 serves page 1 and holds the rest,
+/// A dropped install is aborted: as S2-R1, node 1 serves page 1 and holds the rest,
 /// so node 3's install has begun (`install_begin` wiped the partition). Node 2 is then promoted
 /// for real, keeping node 3, which lands the new generation's receiver while its install is still
 /// held. An old page of the first install then reaches node 3. Its lineage is no longer the
@@ -11184,7 +11184,154 @@ fn t61_r5_a_dropped_install_is_aborted_and_the_adopted_receiver_stands() {
     assert_eq!(dropped.len(), 1, "{dropped:?}");
 }
 
-/// Issue #61, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
+/// A regular copy 3 whose snapshot install has begun: as the begun-install expiry row, put 31
+/// lands on nodes 1 and 2 only and node 1 is asked for copy 3's snapshot, serving page 1 and
+/// holding the rest. Node 3 does not re-send its pulls until a row lowers its retry wait.
+#[cfg(debug_assertions)]
+fn regular_copy_installing(dir: &std::path::Path) -> Trio {
+    let p = PartitionId(1);
+    let (mut trio, _floor) = trimmed_trio(dir, 4, 1, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.nodes[2].0.snapshot_pull_retry_millis = 600_000;
+    let three = copy_of(&trio, 3);
+    trio.links.drop_direction(NodeId(1), NodeId(3));
+    match trio.ask(put(31)) {
+        Answer::Txn { .. } => {}
+        other => panic!("put 31 with node 3 cut off: {other:?}"),
+    }
+    let head = trio.head().expect("node 1 holds a head");
+    trio.links.heal(NodeId(1), NodeId(3));
+    let asked = trio.nodes[0]
+        .0
+        .replication
+        .ask_snapshot(NodeId(1), p, three);
+    assert!(asked.is_some(), "R1 asks, with copy 3's cursor waiting");
+    trio.nodes[0].0.snapshot_catchup(p, three, Seq(head));
+    trio.until("node 3's install began", |trio| {
+        trio.nodes[2]
+            .0
+            .installs
+            .get(&p)
+            .is_some_and(|install| install.begun)
+            .then_some(())
+    });
+    trio
+}
+
+/// Node 3's install expires (node 1 holds its offers from here, so no new one is accepted),
+/// then a change-feed read from a cursor stamped with the generation below node 3's newest
+/// reaches it. Node 3 holds nothing at the root, so the read is refused `UNAVAILABLE`: never
+/// `Rewound` to `START`, and never an empty page marked complete.
+#[cfg(debug_assertions)]
+fn older_cursor_after_expiry(trio: &mut Trio, method: &str) {
+    let p = PartitionId(1);
+    trio.nodes[0].0.snapshot_offer_held = true;
+    trio.nodes[2].0.snapshot_pull_retry_millis = 100;
+    let three = copy_of(trio, 3);
+    trio.until("node 3's install expired", |_| {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .iter()
+            .any(|line| line["@m"] == "snapshot_install_expired" && line["copy"] == three.0)
+            .then_some(())
+    });
+    let three = &trio.nodes[2].0;
+    assert!(three.installs.is_empty(), "no install holds the partition");
+    let receiver = three
+        .replication
+        .receiver(NodeId(3), p)
+        .expect("a receiver");
+    assert_eq!(receiver.applied_head().seq, Seq::ZERO, "re-rooted");
+    let newest = three.committed[&p].new_generation;
+    let older = Generation(
+        newest
+            .0
+            .checked_sub(1)
+            .expect("a generation below the newest"),
+    );
+    let (reply, answer) = std::sync::mpsc::channel();
+    trio.nodes[2]
+        .1
+        .send(Msg::Client(Client {
+            partition: p,
+            call: ClientCall::Changes {
+                identity: identity(1),
+                from: FeedCursor {
+                    generation: older,
+                    seq: Seq(5),
+                    digest: Digest::ROOT,
+                },
+                max: 10,
+            },
+            reply,
+        }))
+        .expect("node 3's mailbox");
+    match trio.answer(&answer) {
+        Answer::Error { error, .. } => {
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+            assert!(error.detail.contains("being rebuilt"), "{error:?}");
+        }
+        other => panic!("answered from a copy that holds nothing: {other:?}"),
+    }
+}
+
+/// A begun install that expires, then an older-cursor feed read: as
+/// [`older_cursor_after_expiry`], refused `UNAVAILABLE` (`snapshot_install_expired{begun =
+/// true}`, the receiver re-rooted).
+/// Cut: no root-anchored guard in `Host::changes`, red (`Rewound { to: START }`).
+/// Integration (~4 s): the trimmed trio without the wiped restart.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r6_an_older_cursor_after_a_begun_install_expired_is_refused_not_rewound() {
+    const METHOD: &str =
+        "t61_r6_an_older_cursor_after_a_begun_install_expired_is_refused_not_rewound";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = regular_copy_installing(dir.path());
+    older_cursor_after_expiry(&mut trio, METHOD);
+    let expired = logged!(METHOD, "snapshot_install_expired");
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["begun"], true, "{expired:?}");
+}
+
+/// A replacement that expires before its first page, then an older-cursor feed read: node 3's
+/// begun install is abandoned on node 1 and the same barrier offered afresh; node 3 replaces it
+/// (aborting the begun one), and with node 1 answering no pull the replacement expires
+/// (`snapshot_install_expired{begun = false}`). As [`older_cursor_after_expiry`], refused
+/// `UNAVAILABLE`.
+/// Cut: no root-anchored guard in `Host::changes`, red (`Rewound { to: START }`).
+/// Integration (~4 s): the trimmed trio without the wiped restart; the abandon and re-offer are
+/// direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_r6_an_older_cursor_after_a_replacement_expired_before_its_first_page_is_refused() {
+    const METHOD: &str =
+        "t61_r6_an_older_cursor_after_a_replacement_expired_before_its_first_page_is_refused";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = regular_copy_installing(dir.path());
+    let three = copy_of(&trio, 3);
+    let past = trio
+        .clock
+        .now()
+        .plus_millis(super::snapshot::SNAPSHOT_IDLE_MILLIS);
+    let owner = &mut trio.nodes[0].0;
+    let at = owner.transfers[&(p, three)].at;
+    owner.snapshot_pages_held_from = Some(0);
+    owner.transfer_duty(past);
+    owner.snapshot_catchup(p, three, at);
+    assert!(owner.transfers.contains_key(&(p, three)), "offered afresh");
+    trio.until("node 3 replaced its install", |_| {
+        (!logged!(METHOD, "snapshot_install_replaced").is_empty()).then_some(())
+    });
+    older_cursor_after_expiry(&mut trio, METHOD);
+    let expired = logged!(METHOD, "snapshot_install_expired");
+    assert_eq!(expired.len(), 1, "{expired:?}");
+    assert_eq!(expired[0]["begun"], false, "{expired:?}");
+}
+
+/// Idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
 /// node 3's next pull is never answered. A transfer duty past `SNAPSHOT_IDLE_MILLIS` abandons
 /// the transfer (`snapshot_transfer_abandoned{why = idle}`) and forgets the barrier it served,
 /// so R1's ask at that same barrier opens a fresh transfer; node 3 replaces its install with
@@ -11240,7 +11387,7 @@ fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afres
     rebuilt(&mut trio, METHOD, floor);
 }
 
-/// Issue #61, item 13: a rebuild watch whose required copy is still being sent a
+/// Item 13: a rebuild watch whose required copy is still being sent a
 /// snapshot does not name a stall. As S2-R1, with node 1 holding page 1 so node 3's transfer
 /// runs longer than the watch, node 1 holds a `ReadOnly` watch that requires node 3's copy,
 /// and its check runs while the transfer is live: no `recovery_rebuild_stalled`, nothing in
@@ -11327,7 +11474,7 @@ fn t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live
     assert!(owner.stalled.contains_key(&p));
 }
 
-/// Issue #61, item 14: a copy asked for its inventory while it installs a
+/// Item 14: a copy asked for its inventory while it installs a
 /// snapshot of the partition answers `InventoryFailed` with `anchor_generation_unlinked`, its
 /// normal state until the install links the lineage, and logs it at info with `installing`,
 /// not at error. As S2-R1, with node 1 holding page 1 so node 3's install stays open.
@@ -11373,7 +11520,7 @@ fn t61_pr204_an_inventory_asked_during_an_install_fails_at_info_not_error() {
     assert_eq!(failed[0]["installing"], true, "{failed:?}");
 }
 
-/// Issue #61, item 12: a barrier member whose landing needs a copied inherit
+/// Item 12: a barrier member whose landing needs a copied inherit
 /// that its trim floor refuses must not anchor at the cutoff. As S2-R1 before the wipe: every
 /// copy holds puts 1..=30, trimmed to 26. Node 3 lands the next generation at cutoff 28, so
 /// the inherit copies as of 28, and puts 29 and 30 created keys whose absence at 28 the
@@ -11467,7 +11614,7 @@ fn t61_pr204_a_landing_refused_below_the_floor_while_holding_the_cutoff_faults()
     }
 }
 
-/// Issue #61, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
+/// The page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
 /// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
 /// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes
 /// is at most the cap (`snapshot_transfer_installed{largest_page_bytes}`), it takes several
@@ -11527,7 +11674,7 @@ fn promoted_and_durable(trio: &mut Trio, request: u64) {
     });
 }
 
-/// Issue #61 S2 rows: D9's trio, 30 puts applied on every copy, every copy trimmed to
+/// S2 rows: D9's trio, 30 puts applied on every copy, every copy trimmed to
 /// `head - keep`, then node 3 restarted on an empty disk. Every node serves snapshot pages of
 /// 4 entries and is then set up by `each` (a row's hooks, by node). Answers the trio and the
 /// floor.
@@ -11614,7 +11761,7 @@ fn trimmed_trio(
     (trio, floor)
 }
 
-/// Issue #61 S2-R3 (design section 2): one byte of the second page is flipped at the source
+/// S2-R3 (design section 2): one byte of the second page is flipped at the source
 /// after its chain is computed. Node 3 checks the chain before it writes the page, so it logs
 /// `snapshot_install_refused{reason = chain}` after one page was written, never finishes
 /// (no `snapshot_transfer_installed`), keeps its receiver below the floor, and tells node 1,
@@ -11670,7 +11817,7 @@ fn t61_s2_r3_a_corrupt_page_is_refused_and_nothing_is_switched() {
     );
 }
 
-/// Issue #61 S2-R2 (design section 2, A8): node 1, the source, dies after two pages of node
+/// S2-R2 (design section 2, A8): node 1, the source, dies after two pages of node
 /// 3's install (it holds the pull for page 2, then every link to it is cut) and node 2 is
 /// promoted. Node 3, still holding the install of the deposed lineage, asks node 2 and is rebuilt
 /// by node 2's transfer at its own `S`: node 2 first refills its `fresh_primary` ladder (ruling
@@ -11757,7 +11904,7 @@ fn t61_s2_r2_a_source_lost_mid_transfer_is_replaced_by_the_new_primary() {
     }
 }
 
-/// Issue #61 S2-R2b (design section 2, A7 + A8): node 3 is stopped after two pages of its
+/// S2-R2b (design section 2, A7 + A8): node 3 is stopped after two pages of its
 /// install (node 1 holds the pull for page 2, `snapshot_pages_held_from`) and restarts on
 /// the same disk. Its open finds the `installing` marker and clears the half-installed lineage
 /// (`snapshot_install_cleared_at_open`); node 1 abandons the transfer on the restart
@@ -11807,7 +11954,7 @@ fn t61_s2_r2b_a_target_restarted_mid_install_is_cleared_and_rebuilt() {
     promoted_and_durable(&mut trio, 31);
 }
 
-/// Issue #61 S1-R10 cut (iii) (design B1, rev 4 N4): an idle partition trimmed at its head on
+/// S1-R10 cut (iii) (design B1, rev 4 N4): an idle partition trimmed at its head on
 /// every copy (F = head), node 3 rebuilt from a snapshot at `S = F`, and restarted on the same
 /// disk the moment its install finished. The installed lineage reopens from its barrier record
 /// at `F`, so node 3 rejoins without a second transfer, is promoted, and a put is durable on
@@ -11843,7 +11990,7 @@ fn s1_r10_iii_a_target_restarted_right_after_its_install_serves() {
     });
 }
 
-/// Issue #61 A8b (lead ruling R15): node 3 is dropped (a writable `DegradedRf2` commit without
+/// A8b (lead ruling R15): node 3 is dropped (a writable `DegradedRf2` commit without
 /// it), the survivors write on and trim to their head, and node 3's disk gets an older tail
 /// planted on its last lineage, past every base and creating keys no other copy holds. On
 /// restart it is re-added as a shadow. That commit is writable, so its ledger's L is its own
@@ -11953,7 +12100,7 @@ fn t61_a_dropped_copys_older_tail_under_a_writable_commit_is_discarded_by_the_in
     assert_eq!(trio.status(2).needs_operator, None);
 }
 
-/// Issue #61 A8b (lead rulings R15 and R18; replaces S2-R7): the operator's way out of an
+/// A8b (lead rulings R15 and R18; replaces S2-R7): the operator's way out of an
 /// offer refused for a held tail, end to end, on a copy whose landed commit does not know L
 /// (`TailLedger::last_writable` `None`). That is the state of every partition on a node
 /// upgraded from a build before the ledger (a layout-5 record reads as `TailLedger::unknown`),
@@ -12154,7 +12301,7 @@ fn t61_a_held_tail_under_an_unknown_l_is_given_up_and_the_next_offer_rebuilds_th
     assert_eq!(trio.status(2).needs_operator, None);
 }
 
-/// Issue #61 S1-R9a (design N3 and B3, A8c): the read-only window, named. Every copy is trimmed
+/// S1-R9a (design N3 and B3, A8c): the read-only window, named. Every copy is trimmed
 /// and node 3 comes back on an empty disk; node 1 opens node 3's transfer but holds its offer,
 /// and dies. Node 2 is promoted: F1 commits `ReadOnly` (node 3 a shadow below the floor) and
 /// node 2 opens its own transfer to node 3, its offer held so the window stays open. A put to
@@ -12340,7 +12487,7 @@ fn t61_s1_r9a_a_write_in_the_rebuild_window_is_refused_read_only_with_a_poll_hin
     );
 }
 
-/// Issue #61 lead ruling R26 item 0: the real failover with `--drop`. S1-R9a's world, but node
+/// Lead ruling R26 item 0: the real failover with `--drop`. S1-R9a's world, but node
 /// 1 is dead and node 2 is promoted dropping it: the plan keeps copies 2 and 3 only, so F1
 /// commits `ReadOnly` (node 3 a shadow below the floor) and arms no rebuild (arch-s2 R2-M2: a
 /// two-copy plan never activates). Node 3 is then rebuilt by R1's snapshot, which F1 never
@@ -12438,7 +12585,7 @@ fn t61_r26_a_dead_owner_dropped_by_promote_still_goes_writable_after_the_rebuild
     );
 }
 
-/// Issue #61 lead ruling R26, the SBX failover world: node 3 keeps its disk but falls behind
+/// Lead ruling R26, the SBX failover world: node 3 keeps its disk but falls behind
 /// the trim. Every copy applies 5 puts; node 3's links are dropped both ways (it hears nothing,
 /// and nothing is buffered for it); 25 more puts land on nodes 1 and 2, which trim to the head
 /// less 4, past node 3. Node 1 then dies when `owner_dead` (else it stays up, linked to node 2
@@ -12556,7 +12703,7 @@ fn stepped(owner_dead: bool) -> &'static [usize] {
     }
 }
 
-/// Issue #61 lead ruling R26 (b), the SBX failover world
+/// Lead ruling R26 (b), the SBX failover world
 /// ([`behind_the_trim_after_a_dropping_promote`]). Node 2's repair waits the spec's
 /// `resume_hold_millis` for a member's link, scaled as the bound is, so the trigger's absence
 /// cannot hide inside the bound. Once R1's snapshot has caught node 3 up, writes go to node 2
@@ -12695,7 +12842,7 @@ fn caught_up_copy_ends_the_read_only_window(method: &str, owner_dead: bool) {
     );
 }
 
-/// Issue #61 R26 (b): the refusal detail once a copy the `ReadOnly` commit left outside has
+/// R26 (b): the refusal detail once a copy the `ReadOnly` commit left outside has
 /// caught up, set up directly on node 1's host over its bootstrap commit. With
 /// `caught_up_outside` naming copy 3 on node 3 in the current generation, a
 /// `RECOVERY_READ_ONLY` refusal names it and the owner's re-plan, with `retry_after` 5 s and
@@ -12749,7 +12896,7 @@ fn t61_r26_b_a_caught_up_copy_names_the_owners_re_plan_in_the_refusal() {
     assert_eq!(older.retry_after, None, "{older:?}");
 }
 
-/// Issue #61 R26 (b), the real failover: [`caught_up_copy_ends_the_read_only_window`] with
+/// R26 (b), the real failover: [`caught_up_copy_ends_the_read_only_window`] with
 /// node 1 dead, so no re-add can end the window.
 /// Cuts: no `repair_on_caught_up` at `CopyCaughtUp`, red on the bound (first write 17.2 s after
 /// `caught_up`, the scaled hold and a probe); no `caught_up_read_only`, red (the generic
@@ -12764,7 +12911,7 @@ fn t61_r26_b_a_dead_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught
     );
 }
 
-/// Issue #61 R26 (b), the manual run's world (D1): [`caught_up_copy_ends_the_read_only_window`]
+/// R26 (b), the manual run's world (D1): [`caught_up_copy_ends_the_read_only_window`]
 /// with node 1 alive and dropped by the promote.
 /// Cuts: as the dead-owner row (17.2 s; the generic detail).
 /// Integration (~10 s): as the dead-owner row.
