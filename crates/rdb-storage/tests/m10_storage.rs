@@ -552,7 +552,11 @@ fn m10_s2_epoch_revocations_survive_a_reopen_and_move_a_format_1_copy_to_2() {
         let mut engine = RocksEngine::open(&db).expect("open");
         write(&mut engine, 2);
     }
-    assert_eq!(marker(&db), FORMAT_VERSION, "a new copy is format 2");
+    assert_eq!(
+        marker(&db),
+        FORMAT_VERSION,
+        "a new copy is the current format"
+    );
     put_raw(&db, b"format", &OLDEST_FORMAT_VERSION.to_be_bytes());
     {
         let mut engine = RocksEngine::open(&db).expect("an S1 copy opens");
@@ -1185,4 +1189,121 @@ fn a_r315_block_cache_memory_stays_within_the_store_capacity() {
         DEFAULT_BLOCK_CACHE_BYTES as u64,
         "the default is one 64 MiB cache"
     );
+}
+
+/// #177: a partition's possible-loss marker. A format-2 copy (this build's previous format)
+/// opens unchanged and stays format 2 through a revocation and a plain inherit, so the build
+/// before this one still opens it. The inherit that carries a marker writes it in the switch's
+/// batch and moves the format to [`POSSIBLE_LOSS_FORMAT_VERSION`] there, so that build refuses
+/// the copy instead of opening it blind to the marker (it accepts only up to format 2). The
+/// marker survives a reopen, read-only included, and `dump` names it; a clear deletes it and
+/// leaves the format where it is; a marker this build cannot decode refuses the open. A
+/// format newer than this build's is refused by `s0_open_refuses_a_foreign_layout`. Cuts: put
+/// no marker in the switch (the reopen reads `None`); move no format (it reads 2); move the
+/// format on a plain inherit (the plain copy reads 3); drop `possible` from the keys an open
+/// accepts (the reopen is refused); move the format back on a clear (it reads 2). Unit, under
+/// a second.
+#[retcd_test]
+fn i177_a_possible_loss_marker_lands_with_its_switch_and_moves_a_format_2_copy() {
+    use rdb_storage::keys::{FLOOR_FORMAT_VERSION, FORMAT_VERSION, POSSIBLE_LOSS_FORMAT_VERSION};
+    use rdb_storage::{Inherited, PossibleLossCause, PossibleLossMark};
+    let dir = data_dir("possible-loss");
+    let (p1, g1, g2) = (PartitionId(1), Generation(1), Generation(2));
+    let mark = PossibleLossMark {
+        generation: g2,
+        applied: 2,
+        cause: PossibleLossCause::OsBootChanged,
+    };
+    let format_2 = |name: &str| {
+        let db = dir.join(name);
+        {
+            let mut engine = RocksEngine::open(&db).expect("open");
+            write(&mut engine, 2);
+        }
+        put_raw(&db, b"format", &FLOOR_FORMAT_VERSION.to_be_bytes());
+        db
+    };
+    const {
+        assert!(
+            FORMAT_VERSION > FLOOR_FORMAT_VERSION,
+            "the marker is a format bump"
+        )
+    };
+
+    // A plain inherit, and a revocation, leave a format-2 copy format 2.
+    let db = format_2("plain");
+    {
+        let mut engine = RocksEngine::open(&db).expect("a format-2 copy opens");
+        assert_eq!(engine.format(), FLOOR_FORMAT_VERSION, "opened unchanged");
+        assert_eq!(engine.possible_loss(p1), Ok(None), "none stands");
+        engine
+            .persist_epoch_revocation(p1, OwnerEpoch(1))
+            .expect("revoke");
+        assert_eq!(engine.inherit(p1, g1, g2, Seq(2)), Ok(Inherited::Linked));
+        assert_eq!(engine.possible_loss(p1), Ok(None));
+    }
+    assert_eq!(marker(&db), FLOOR_FORMAT_VERSION, "no marker, no move");
+
+    // A marked inherit writes the marker and moves the format, in one batch.
+    let db = format_2("marked");
+    {
+        let mut engine = RocksEngine::open(&db).expect("a format-2 copy opens");
+        assert_eq!(
+            engine.inherit_marked(p1, g1, g2, Seq(2), Some(mark)),
+            Ok(Inherited::Linked)
+        );
+        assert_eq!(engine.format(), POSSIBLE_LOSS_FORMAT_VERSION);
+        assert_eq!(engine.possible_loss(p1), Ok(Some(mark)));
+        assert_eq!(
+            engine.possible_loss(PartitionId(2)),
+            Ok(None),
+            "per partition"
+        );
+    }
+    assert_eq!(
+        marker(&db),
+        POSSIBLE_LOSS_FORMAT_VERSION,
+        "the marker moved the format"
+    );
+    {
+        let engine = RocksEngine::open(&db).expect("a reopen");
+        assert_eq!(engine.possible_loss(p1), Ok(Some(mark)), "durable");
+    }
+    let reader = RocksEngine::open_read_only(&db).expect("read-only open");
+    assert_eq!(reader.possible_loss(p1), Ok(Some(mark)));
+    drop(reader);
+    assert!(
+        dump(&db).expect("dump").iter().any(|r| r.to_string()
+            == "metadata possible_loss p=1 generation=2 applied=2 cause=OsBootChanged"),
+        "dump names it"
+    );
+
+    // A clear deletes it; the format stays.
+    {
+        let mut engine = RocksEngine::open(&db).expect("open");
+        engine.clear_possible_loss(p1).expect("clear");
+        engine
+            .clear_possible_loss(p1)
+            .expect("a second clear is a no-op");
+        assert_eq!(engine.possible_loss(p1), Ok(None));
+    }
+    assert_eq!(
+        marker(&db),
+        POSSIBLE_LOSS_FORMAT_VERSION,
+        "a clear never moves it back"
+    );
+    {
+        let engine = RocksEngine::open(&db).expect("a reopen");
+        assert_eq!(engine.possible_loss(p1), Ok(None), "the clear is durable");
+    }
+
+    // An undecodable marker refuses the open.
+    let mut key = b"possible".to_vec();
+    key.extend_from_slice(&1_u32.to_be_bytes());
+    put_raw(&db, &key, &[0; 16]);
+    assert!(
+        matches!(RocksEngine::open(&db), Err(OpenError::CorruptRecord { .. })),
+        "a marker of 16 bytes is refused"
+    );
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }

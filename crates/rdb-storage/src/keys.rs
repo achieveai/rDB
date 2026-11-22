@@ -1,7 +1,8 @@
 //! Physical layout: column families, key prefix, value framing and the format marker.
 //!
-//! [`FORMAT_VERSION`] `2` (M10 S2): format `1`, settled by ADR-rdb-0010 decision 11, plus the
-//! epoch revocations and the ack floor's dedup rows. A format-1 directory still opens; see
+//! [`FORMAT_VERSION`] `3` (#177): format `2` plus the possible-loss marker. Format `2` (M10 S2)
+//! is format `1`, settled by ADR-rdb-0010 decision 11, plus the epoch revocations and the ack
+//! floor's dedup rows. A format-1 directory still opens; see
 //! [`OLDEST_FORMAT_VERSION`]. S0's provisional `0` is refused at open, so no S0 data
 //! directory is read.
 //!
@@ -28,7 +29,8 @@
 //!   That no longer holds for the next key: this build refuses a short `metadata` key it does
 //!   not define (A-R184), so a key added after these needs a [`FORMAT_VERSION`] bump
 //!   (review-s1 F-010). The first was the epoch revocations, key `revoked` then the partition
-//!   id (u32 BE), 11 bytes: format 2.
+//!   id (u32 BE), 11 bytes: format 2. The second is a partition's possible-loss marker (#177),
+//!   key `possible` then the partition id (u32 BE), 12 bytes: [`POSSIBLE_LOSS_FORMAT_VERSION`].
 
 use std::collections::BTreeSet;
 
@@ -40,8 +42,24 @@ use rdb_core::contracts::trace::Version;
 /// The on-disk format this build writes (ADR-rdb-0010 decision 11). `0` was S0's provisional
 /// layout and is refused. Format 2 (M10 S2) adds one record, the epoch revocations
 /// ([`REVOKED_PREFIX`]), and gives `dedup` rows a meaning format 1 lacks: an ack floor's record
-/// and the deletes it licenses (A-R252). A key added after it needs another bump.
-pub const FORMAT_VERSION: u32 = 2;
+/// and the deletes it licenses (A-R252). Format 3 (#177) adds one record, a partition's
+/// possible-loss marker ([`POSSIBLE_LOSS_PREFIX`]). A key added after it needs another bump.
+///
+/// A new directory is stamped with this. An older one keeps its marker until the first write
+/// an older build would misread, and that write moves the marker only as far as its own
+/// record needs: [`FLOOR_FORMAT_VERSION`] for a revocation or an ack floor,
+/// [`POSSIBLE_LOSS_FORMAT_VERSION`] for a possible-loss marker. Clearing a marker never moves
+/// it back.
+pub const FORMAT_VERSION: u32 = 3;
+
+/// The format an epoch revocation or an ack floor's record moves an older copy to: the format
+/// that added them (M10 S2). A format-1 build refuses it.
+pub const FLOOR_FORMAT_VERSION: u32 = 2;
+
+/// The format a possible-loss marker moves an older copy to: the format that added it (#177),
+/// so a build that does not know the marker refuses the copy instead of opening it blind to
+/// it. Named apart from [`FORMAT_VERSION`] so a renumber, or a later bump, is one line.
+pub const POSSIBLE_LOSS_FORMAT_VERSION: u32 = FORMAT_VERSION;
 
 /// The oldest format this build opens. A format-1 directory is a format-2 one that holds no
 /// revocation and no ack floor. Its marker stays `1`, and a format-1 build can still open it,
@@ -178,6 +196,82 @@ pub(crate) fn decode_publish_marks(raw: &[u8]) -> Option<Vec<PublishMark>> {
             })
         })
         .collect()
+}
+
+/// The possible-loss key in `metadata` starts with these bytes; the partition id (u32 BE)
+/// follows, 12 bytes in all, shorter than [`PREFIX_LEN`] like the revocations. Format 3 (#177):
+/// its value is [`PossibleLossMark`], [`POSSIBLE_LOSS_MARK_LEN`] bytes.
+pub(crate) const POSSIBLE_LOSS_PREFIX: &[u8] = b"possible";
+/// Length of a stored [`PossibleLossMark`]: generation and applied, each u64 BE, then the
+/// cause, one byte.
+pub(crate) const POSSIBLE_LOSS_MARK_LEN: usize = 17;
+
+/// The possible-loss key of `partition`.
+pub(crate) fn possible_loss_key(partition: PartitionId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(POSSIBLE_LOSS_PREFIX.len() + 4);
+    out.extend_from_slice(POSSIBLE_LOSS_PREFIX);
+    out.extend_from_slice(&partition.0.to_be_bytes());
+    out
+}
+
+/// The partition a possible-loss key names, or `None` when `raw` is not one.
+pub(crate) fn decode_possible_loss_key(raw: &[u8]) -> Option<PartitionId> {
+    let id = raw.strip_prefix(POSSIBLE_LOSS_PREFIX)?;
+    Some(PartitionId(u32::from_be_bytes(id.try_into().ok()?)))
+}
+
+/// Why a promote onto this copy may have lost acknowledged writes (#177): what the copy's own
+/// open said of its host's boot when the planner chose it, or chose a copy beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PossibleLossCause {
+    /// The host's OS boot changed since the copy last ran: its page cache may have lost writes
+    /// that were acknowledged but not yet on disk.
+    OsBootChanged,
+    /// The open could not tell whether the OS boot changed.
+    OsBootUnknown,
+}
+
+/// A partition's possible-loss marker (#177), as stored on the copy a promote landed on.
+/// Written in the same batch as that landing's switch ([`crate::RocksEngine::inherit_marked`]),
+/// cleared by [`crate::RocksEngine::clear_possible_loss`]. What it means is the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PossibleLossMark {
+    /// The generation the promote committed.
+    pub generation: Generation,
+    /// The seq the promote's lineage starts at on this copy: the copy's applied at landing.
+    pub applied: u64,
+    /// Why.
+    pub cause: PossibleLossCause,
+}
+
+/// Encode a [`PossibleLossMark`].
+pub(crate) fn encode_possible_loss(mark: PossibleLossMark) -> [u8; POSSIBLE_LOSS_MARK_LEN] {
+    let mut out = [0; POSSIBLE_LOSS_MARK_LEN];
+    out[0..8].copy_from_slice(&mark.generation.0.to_be_bytes());
+    out[8..16].copy_from_slice(&mark.applied.to_be_bytes());
+    out[16] = match mark.cause {
+        PossibleLossCause::OsBootChanged => 1,
+        PossibleLossCause::OsBootUnknown => 2,
+    };
+    out
+}
+
+/// Decode a [`PossibleLossMark`]; `None` when it is not [`POSSIBLE_LOSS_MARK_LEN`] bytes or
+/// names no cause this build defines.
+pub(crate) fn decode_possible_loss(raw: &[u8]) -> Option<PossibleLossMark> {
+    if raw.len() != POSSIBLE_LOSS_MARK_LEN {
+        return None;
+    }
+    let cause = match raw[16] {
+        1 => PossibleLossCause::OsBootChanged,
+        2 => PossibleLossCause::OsBootUnknown,
+        _ => return None,
+    };
+    Some(PossibleLossMark {
+        generation: Generation(decode_mark(&raw[0..8])?),
+        applied: decode_mark(&raw[8..16])?,
+        cause,
+    })
 }
 
 /// The epoch-revocation key in `metadata` starts with these bytes; the partition id (u32 BE)

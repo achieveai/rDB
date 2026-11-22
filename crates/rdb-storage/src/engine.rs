@@ -43,12 +43,13 @@ use rocksdb::{
 use rdb_core::contracts::trace::Version;
 
 use crate::keys::{
-    self, decode_copying, decode_key, decode_mark, decode_publish_marks, decode_publish_marks_key,
-    decode_revoked, decode_revoked_key, encode_key, encode_publish_marks, encode_revoked, frame,
-    ns_byte, ns_from_byte, private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame,
-    Link, PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
-    FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN, OLDEST_FORMAT_VERSION, PARENT_KEY,
-    PRIVATE_NS, SEALED_KEY,
+    self, decode_copying, decode_key, decode_mark, decode_possible_loss, decode_possible_loss_key,
+    decode_publish_marks, decode_publish_marks_key, decode_revoked, decode_revoked_key, encode_key,
+    encode_publish_marks, encode_revoked, frame, ns_byte, ns_from_byte, possible_loss_key,
+    private_key, publish_marks_key, revoked_key, tombstone, unframe, Frame, Link, PossibleLossMark,
+    PublishMark, APPLIED_KEY, CF_METADATA, COLUMN_FAMILIES, COPYING_KEY, DURABLE_KEY,
+    FLOOR_FORMAT_VERSION, FORMAT_KEY, FORMAT_VERSION, INSTANCE_KEY, INSTANCE_LEN,
+    OLDEST_FORMAT_VERSION, PARENT_KEY, PRIVATE_NS, SEALED_KEY,
 };
 
 /// The `tracing` target of every event this crate emits.
@@ -327,7 +328,7 @@ pub struct RocksEngine {
     instance: Option<[u8; INSTANCE_LEN]>,
     /// The format marker on disk: [`FORMAT_VERSION`], or [`OLDEST_FORMAT_VERSION`] until the
     /// first epoch revocation moves it.
-    format: u32,
+    pub(crate) format: u32,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
     /// The lock on the directory's [`CLAIM_FILE`] (lead ruling A-R168); `None` on a read-only
@@ -1129,9 +1130,10 @@ impl RocksEngine {
         epochs.insert(epoch);
         let key = revoked_key(partition);
         let value = encode_revoked(&epochs);
-        let marker = FORMAT_VERSION.to_be_bytes();
+        let marker = FLOOR_FORMAT_VERSION.to_be_bytes();
         let mut puts: Vec<(&[u8], &[u8])> = vec![(&key, &value)];
-        if self.format < FORMAT_VERSION {
+        let moved = self.format < FLOOR_FORMAT_VERSION;
+        if moved {
             puts.push((FORMAT_KEY, &marker));
         }
         if let Err(e) = self.put_metadata_all(&puts, sync) {
@@ -1145,7 +1147,9 @@ impl RocksEngine {
             return Err(StorageFault::WriteFailed);
         }
         let from_format = self.format;
-        self.format = FORMAT_VERSION;
+        if moved {
+            self.format = FLOOR_FORMAT_VERSION;
+        }
         // A staged write is not persisted until a sync returns, so it logs its own name: the
         // host logs `epoch_revocation_persisted` only then (critic-f4 A3).
         if sync {
@@ -1170,6 +1174,71 @@ impl RocksEngine {
             );
         }
         Ok(())
+    }
+
+    /// #177: `partition`'s possible-loss marker, or `None` when none stands. Open refused a
+    /// marker it could not read, so a `Corrupt` here is a read that failed since.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::Corrupt`] when the read fails or the value is not a marker.
+    pub fn possible_loss(
+        &self,
+        partition: PartitionId,
+    ) -> Result<Option<PossibleLossMark>, StorageFault> {
+        let raw = self
+            .db
+            .get_cf(self.cf(CF_METADATA), possible_loss_key(partition))
+            .map_err(|e| {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    partition = partition.0,
+                    error = %e,
+                    "possible_loss_read_failed"
+                );
+                StorageFault::Corrupt
+            })?;
+        raw.map(|raw| decode_possible_loss(&raw).ok_or(StorageFault::Corrupt))
+            .transpose()
+    }
+
+    /// #177: delete `partition`'s possible-loss marker, synced, so an ack that returned is not
+    /// undone by a crash. The format marker stays where the marker moved it: a copy that held
+    /// one is never handed back to a build that would not have seen it. A no-op write when
+    /// none stands.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageFault::WriteFailed`] when RocksDB refuses the delete; the marker then stands.
+    pub fn clear_possible_loss(&mut self, partition: PartitionId) -> Result<(), StorageFault> {
+        let fired = self.fire(InjectedFault::SyncedPut);
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        let mut write = WriteBatch::default();
+        write.delete_cf(self.cf(CF_METADATA), possible_loss_key(partition));
+        let written = fired.and_then(|()| {
+            self.note_synced_write("possible_loss_clear");
+            self.db.write_opt(write, &opts).map_err(|e| e.to_string())
+        });
+        if let Err(e) = written {
+            tracing::error!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                error = %e,
+                "possible_loss_clear_failed"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
+        self.synced_seq = Some(self.db.latest_sequence_number());
+        tracing::info!(target: LOG_TARGET, partition = partition.0, "possible_loss_cleared");
+        Ok(())
+    }
+
+    /// The format marker on disk (#177 rows): [`FORMAT_VERSION`] on a new copy, or an older
+    /// one until a write an older build would misread moves it.
+    #[must_use]
+    pub const fn format(&self) -> u32 {
+        self.format
     }
 
     /// Every epoch revocation this copy holds, by partition then epoch, for the host to replay
@@ -1482,12 +1551,12 @@ impl RocksEngine {
         // An ack floor's record and deletes mean nothing to a format-1 build, which would
         // re-execute a resend the floor dropped (review-s2 F-006, A-R411). The same batch moves
         // the marker, as an epoch revocation does, so a format-1 build refuses this copy.
-        let upgrade = self.format < FORMAT_VERSION && carries_ack_floor(&batch);
+        let upgrade = self.format < FLOOR_FORMAT_VERSION && carries_ack_floor(&batch);
         if upgrade {
             write.put_cf(
                 self.cf(CF_METADATA),
                 FORMAT_KEY,
-                FORMAT_VERSION.to_be_bytes(),
+                FLOOR_FORMAT_VERSION.to_be_bytes(),
             );
         }
         let mut opts = WriteOptions::default();
@@ -1515,10 +1584,10 @@ impl RocksEngine {
                 generation = batch.generation.0,
                 seq = batch.seq.0,
                 from_format = self.format,
-                format = FORMAT_VERSION,
+                format = FLOOR_FORMAT_VERSION,
                 "format_marker_moved_for_ack_floor"
             );
-            self.format = FORMAT_VERSION;
+            self.format = FLOOR_FORMAT_VERSION;
         }
         tracing::info!(
             target: LOG_TARGET,
@@ -2200,6 +2269,18 @@ impl std::fmt::Display for RawRecord {
                 );
                 return write!(f, "publish_marks p={} {marks}", partition.0);
             }
+            if let Some(partition) = decode_possible_loss_key(&self.key) {
+                let mark = decode_possible_loss(&self.value).map_or_else(
+                    || format!("<undecodable {}>", hex(&self.value)),
+                    |mark| {
+                        format!(
+                            "generation={} applied={} cause={:?}",
+                            mark.generation.0, mark.applied, mark.cause
+                        )
+                    },
+                );
+                return write!(f, "possible_loss p={} {mark}", partition.0);
+            }
             if let Some(partition) = decode_revoked_key(&self.key) {
                 let epochs = decode_revoked(&self.value).map_or_else(
                     || format!("<undecodable {}>", hex(&self.value)),
@@ -2580,6 +2661,14 @@ fn restore_lineages(
                 || decode_publish_marks_key(&key).is_some()
                 || decode_revoked_key(&key).is_some()
             {
+                continue;
+            }
+            // #177: a possible-loss marker, read whole here so a bad one refuses the open by
+            // name instead of reading as "no marker" later.
+            if decode_possible_loss_key(&key).is_some() {
+                if decode_possible_loss(&value).is_none() {
+                    return Err(corrupt("a possible-loss marker this build cannot read"));
+                }
                 continue;
             }
             return Err(corrupt(
