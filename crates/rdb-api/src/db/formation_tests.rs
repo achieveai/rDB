@@ -24,6 +24,9 @@ struct Proc {
     db: Option<Db>,
     /// `None` once [`Rig::stop`] took the node down: its listener and links are gone.
     _net: Option<Arc<Net>>,
+    /// The faults its net applies, for [`Rig::mute`] and [`Rig::unmute`]; `None` for a
+    /// process a row opened by hand.
+    faults: Option<Arc<Faults>>,
     dir: PathBuf,
     /// The `TempDir` that removes `dir` when dropped.
     _dir: Box<dyn std::any::Any>,
@@ -146,6 +149,33 @@ fn open_node_with(
     addrs: &BTreeMap<NodeId, String>,
     timeouts: Timeouts,
 ) -> Result<(Db, Arc<Net>), OpenError> {
+    open_node_faulted(
+        rt,
+        store,
+        cert_dir,
+        node,
+        dir,
+        listener,
+        addrs,
+        timeouts,
+        Faults::new(),
+    )
+}
+
+/// [`open_node_with`] whose net applies `faults` (PR #181 review round 4: a running node's
+/// links muted and back, as `db::failover_tests` does).
+#[allow(clippy::too_many_arguments)]
+fn open_node_faulted(
+    rt: &tokio::runtime::Runtime,
+    store: &Arc<dyn ConfigStore>,
+    cert_dir: &Path,
+    node: NodeId,
+    dir: &Path,
+    listener: tokio::net::TcpListener,
+    addrs: &BTreeMap<NodeId, String>,
+    timeouts: Timeouts,
+    faults: Arc<Faults>,
+) -> Result<(Db, Arc<Net>), OpenError> {
     let _entered = rt.enter();
     let boot = next_boot(dir).expect("a boot");
     let label = Label::Node(node);
@@ -159,7 +189,7 @@ fn open_node_with(
             dial: NetConfig::dial_lower(node, addrs),
             protocol_version: PROTOCOL_VERSION,
             admin_apps: BTreeSet::new(),
-            faults: Faults::new(),
+            faults,
         },
         &links,
         Some(listener),
@@ -370,7 +400,8 @@ impl Rig {
         for (node, (dir, keep)) in nodes.iter().zip(dirs) {
             let listener = self.listen(&self.rt, *node);
             let own_rt = self.own_runtimes.then(runtime);
-            let (db, net) = open_node_with(
+            let faults = Faults::new();
+            let (db, net) = open_node_faulted(
                 own_rt.as_ref().unwrap_or(&self.rt),
                 &self.store,
                 &self.cert_dir,
@@ -379,12 +410,14 @@ impl Rig {
                 listener,
                 &addrs,
                 self.timeouts,
+                Arc::clone(&faults),
             )
             .unwrap_or_else(|e| panic!("node {}'s process opens its own folder: {e}", node.0));
             self.procs.push(Proc {
                 node: *node,
                 db: Some(db),
                 _net: Some(net),
+                faults: Some(faults),
                 dir,
                 _dir: keep,
                 own_rt,
@@ -1419,6 +1452,7 @@ fn s1a_a_delayed_declared_opener_does_not_write_another_owners_partition() {
             node,
             db: Some(db),
             _net: Some(net),
+            faults: None,
             dir,
             _dir: keep,
             own_rt: None,
@@ -2669,6 +2703,7 @@ impl Rig {
             dir,
             _dir,
             own_rt,
+            ..
         } = self.procs.remove(at);
         if let Some(mut db) = db {
             db.shutdown();
@@ -2682,7 +2717,8 @@ impl Rig {
         let own_rt = self.own_runtimes.then(runtime);
         let rt = own_rt.as_ref().unwrap_or(&self.rt);
         let listener = rebind(rt, &self.addrs[&node]);
-        let (db, net) = open_node_with(
+        let faults = Faults::new();
+        let (db, net) = open_node_faulted(
             rt,
             &self.store,
             &self.cert_dir,
@@ -2691,6 +2727,7 @@ impl Rig {
             listener,
             &self.addrs,
             timeouts,
+            Arc::clone(&faults),
         )
         .unwrap_or_else(|e| panic!("node {} reopens its own folder: {e}", node.0));
         self.procs.insert(
@@ -2699,11 +2736,35 @@ impl Rig {
                 node,
                 db: Some(db),
                 _net: Some(net),
+                faults: Some(faults),
                 dir,
                 _dir,
                 own_rt,
             },
         );
+    }
+}
+
+impl Rig {
+    /// Cut `node`'s running process off from outside. `mute`: its links read nothing, answer
+    /// no probe and write nothing, so its peers' silence timers close the links already up.
+    /// `refuse-links`: it dials none and answers no `Hello`, so no new link comes up and no
+    /// peer learns its boot (`mute` alone still completes every handshake). The process keeps
+    /// running; [`Rig::unmute`] lets its links come back.
+    fn mute(&self, node: NodeId) {
+        self.faults_of(node).apply("mute\nrefuse-links\n");
+    }
+
+    /// Lift [`Rig::mute`]: `node`'s links come back with no restart.
+    fn unmute(&self, node: NodeId) {
+        self.faults_of(node).apply("");
+    }
+
+    fn faults_of(&self, node: NodeId) -> &Faults {
+        self.procs[node.0 as usize - 1]
+            .faults
+            .as_deref()
+            .unwrap_or_else(|| panic!("node {} was opened by the rig", node.0))
     }
 }
 
@@ -3384,6 +3445,125 @@ fn owner_pins_at(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId, boot: Bo
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Whether node 2's process has a link up to `node` now.
+fn owner_linked(rig: &Rig, node: NodeId) -> bool {
+    rig.of(R5_OWNER)
+        .links()
+        .net()
+        .and_then(|net| net.connection(node))
+        .is_some()
+}
+
+/// PR #181 review round 4: blocker 4 with C already running and only its link coming back.
+/// As in `r5_b2_`, C's heal is blocked (node D, in C's partitions and none of node 2's, is
+/// down), so `grants/C` keeps naming the old boot `b1`. C restarts at `b2`, and its links are
+/// then cut ([`Rig::mute`]: `mute` closes the links up, `refuse-links` keeps new ones down);
+/// its process keeps running. Node 2 reopens with live re-add off, has no link to C and no
+/// boot for it, and waits past b1's expiry, not ready. C is unmuted: its link comes back with
+/// no restart.
+/// Node 2 is ready, pins C at `b2` in every shared partition, reads back and takes a put;
+/// nothing is left out, C's boot is still `b2`, `grants/C` still names b1 and C's heal is
+/// still `Running`. This restores a link by unmuting a running node, not by a network cut.
+/// Integration (~60 s).
+/// Cut: `may_leave_out` ignores `live_readd`: node 2 leaves C out on its expired grant and is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_link_a_running_b2_whose_link_comes_back_is_pinned_at_b2() {
+    const METHOD: &str = "r5_link_a_running_b2_whose_link_comes_back_is_pinned_at_b2";
+    let (mut rig, owned, copy) = r5_scene();
+    let copy_owns: Vec<u32> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == copy.0)
+        .collect();
+    assert!(!copy_owns.is_empty(), "node {} owns a partition", copy.0);
+    let blocker = (1..=S1B_K)
+        .map(NodeId)
+        .find(|node| {
+            *node != R5_OWNER
+                && *node != copy
+                && copy_owns
+                    .iter()
+                    .any(|p| ring(S1B_K, *p).copies.contains(&node.0))
+                && owned
+                    .iter()
+                    .all(|(p, _)| !ring(S1B_K, *p).copies.contains(&node.0))
+        })
+        .expect("a node in C's partitions and in none of node 2's");
+    let b1 = grant_of(&rig, copy)
+        .expect("C holds a grant: it owns a partition")
+        .boot;
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(blocker);
+    rig.restart(copy, Timeouts::default());
+    let b2 = rig.of(copy).boot_of(copy).expect("C runs");
+    assert_ne!(b2, b1, "C runs at a new boot");
+    rig.mute(copy);
+    let unlinked = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
+    while owner_linked(&rig, copy) {
+        assert!(
+            Instant::now() < unlinked,
+            "node 2's link to C goes down once C is muted"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let from = log_mark(METHOD);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    // Until b1's grant has expired: its expiry, the clock margins and a second more.
+    let budgets = fast();
+    let expiry = grant_of(&rig, copy)
+        .expect("grants/C is kept")
+        .expiry_utc_ms;
+    let past = expiry
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("margins fit")
+        + 1_000;
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("now fits")
+    };
+    let expired = Duration::from_millis(u64::try_from((past - now_ms()).max(1_000)).expect("ms"));
+    let waited = rig.of(R5_OWNER).wait_ready(expired);
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} once b1's grant has expired: {waited:?}",
+        copy.0
+    );
+    assert!(now_ms() > past, "b1's grant has expired");
+    assert!(
+        !owner_linked(&rig, copy),
+        "node 2 has no link to C while C is muted"
+    );
+    // Review round 4: node 2 has not learnt b2 before the unmute: no handshake with C since
+    // its restart, so its net holds no boot for C.
+    let seen = rig
+        .of(R5_OWNER)
+        .links()
+        .net()
+        .and_then(|net| net.boot_of(copy));
+    assert_eq!(seen, None, "node 2 knows no boot for C before the unmute");
+    rig.unmute(copy);
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once C's link is back: {e}"));
+    let shared = shared_with(&owned, copy);
+    fully_pinned_and_writable(&rig, &shared, copy);
+    owner_pins_at(&rig, &shared, copy, b2);
+    left_nothing_out(METHOD, from);
+    assert_eq!(rig.of(copy).boot_of(copy), Some(b2), "C was not restarted");
+    let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
+    assert_eq!(kept.boot, b1, "grants/C still names b1");
+    assert!(
+        matches!(rig.of(copy).heal_state(), HealState::Running),
+        "C's own heal is still blocked: {:?}",
+        rig.of(copy).heal_state()
+    );
 }
 
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
