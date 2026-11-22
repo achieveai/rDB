@@ -1747,3 +1747,49 @@ fn t61_need_prefix_zero_after_trim_asks_snapshot() {
         "the floor itself walks {effects:?}"
     );
 }
+
+/// Issue #61 PR-B (lead ruling 2026-11-22): an ACK the ladder no longer holds asks for a
+/// snapshot with no cursor behind it (`ProgressTracker::ack_ladder`, `NotRetained`). R1 now
+/// starts a catching-up cursor there, so the copy's ACK at the head after the install ends the
+/// catch-up with `CopyCaughtUp`, which is what releases the host's transfer. An ACK below the
+/// head instead walks the rest, and the ACK at the head then reports it once.
+/// Cut: `Primary::await_snapshot` starts no cursor, red at "the request has a cursor behind
+/// it".
+/// Unit (<10 ms).
+#[retcd_test]
+fn t61_pr_b_an_ack_below_the_floor_starts_a_cursor_that_reports_caught_up() {
+    use routed::{b_ack, cursor, from_b, primary, sends, step};
+
+    // The ladder holds 5..=12: an ACK at 4 cannot be verified.
+    let mut module = primary();
+    assert!(cursor(&module).is_none(), "no catch-up runs");
+    let asked = step(&mut module, 0, from_b(&b_ack(4, 4))).expect("routed");
+    assert!(asked.contains(&snapshot()), "{asked:?}");
+    assert!(
+        cursor(&module).is_some(),
+        "the request has a cursor behind it"
+    );
+    let installed = step(&mut module, 1, from_b(&b_ack(HEAD, HEAD))).expect("routed");
+    assert_eq!(
+        caught_progress_durable(&installed).0,
+        1,
+        "the ACK at the head reports caught up {installed:?}"
+    );
+    assert!(
+        cursor(&module).is_none(),
+        "the cursor ends with the catch-up"
+    );
+
+    // Re-seeded at 9 with the head at 12: the cursor walks 10, 11 and 12, then reports.
+    let mut walked = primary();
+    let _ = step(&mut walked, 0, from_b(&b_ack(4, 4))).expect("routed");
+    let mut sent = Vec::new();
+    for (now, at) in [(1, 9), (2, 10), (3, 11)] {
+        let effects = step(&mut walked, now, from_b(&b_ack(at, at))).expect("routed");
+        assert_eq!(caught_progress_durable(&effects).0, 0, "{at}: {effects:?}");
+        sent.extend(sends(&effects));
+    }
+    assert_eq!(sent, vec![10, 11, 12], "the walk past S");
+    let last = step(&mut walked, 4, from_b(&b_ack(HEAD, HEAD))).expect("routed");
+    assert_eq!(caught_progress_durable(&last).0, 1, "{last:?}");
+}

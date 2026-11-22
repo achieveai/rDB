@@ -2369,6 +2369,13 @@ fn a_cursor_is_dropped_when_it_stops() {
 /// B-R48 ruling 6 and c11's case: `Recovered` drops every cursor. B's cursor was chasing head
 /// 12 when recovery cut the head to 10. Kept alive, it would call B caught up at 10 on the
 /// first ACK B sends under the new root. A copy past the cut gets the snapshot request.
+///
+/// Issue #61 PR-B (lead ruling 2026-11-22): that request now starts a catching-up cursor
+/// (`Primary::await_snapshot`). Ruling 6 still holds: the cursor is born after `Recovered`,
+/// fresh (no mark, nothing in flight), and B's ACKs at the old head 12 report nothing. Only an
+/// ACK the new root's ladder verifies, at 10, reports `CopyCaughtUp`, once. The last assertion
+/// was `cursor(COPY_B).is_none()` after the request; it changed with the 2026-11-22 ruling.
+/// Cut: no cursor in `Primary::await_snapshot`, red at "a fresh cursor waits for the snapshot".
 #[retcd_test]
 fn recovered_drops_every_cursor_and_a_head_cut_reports_no_copy_caught_up() {
     let result = recovery(10, d(10), pin_with_b());
@@ -2391,17 +2398,46 @@ fn recovered_drops_every_cursor_and_a_head_cut_reports_no_copy_caught_up() {
     let want = deliver(&mut reference, &at_cut);
     assert_eq!(want[0], peer_progress(B, 10), "the tracker admits it");
     assert_eq!(route(&mut module, accepted(&at_cut)), want);
+    let past_cut = vec![
+        rejected(AckRejectReason::Unverifiable),
+        kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(10),
+        }),
+    ];
     assert_eq!(
         route(&mut module, accepted(&new_root(b(HEAD, HEAD, 10)))),
-        vec![
-            rejected(AckRejectReason::Unverifiable),
-            kernel(KernelEffect::SnapshotCatchupRequired {
-                copy: COPY_B,
-                barrier: Seq(10),
-            }),
-        ]
+        past_cut
     );
+    let fresh = primary_side(&module)
+        .cursor(COPY_B)
+        .expect("a fresh cursor waits for the snapshot");
+    assert_eq!(
+        (fresh.mark(), fresh.outstanding(), fresh.unacked()),
+        (None, None, None),
+        "fresh: no mark, nothing in flight"
+    );
+    assert_eq!(
+        route(&mut module, accepted(&new_root(b(HEAD, HEAD, 10)))),
+        past_cut,
+        "the old head still reports no caught-up"
+    );
+    let caught = |effects: &[EffectKind]| {
+        effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    EffectKind::Kernel(KernelEffect::CopyCaughtUp { .. })
+                )
+            })
+            .count()
+    };
+    let rebuilt = route(&mut module, accepted(&at_cut));
+    assert_eq!(caught(&rebuilt), 1, "caught up at 10, once: {rebuilt:?}");
     assert!(primary_side(&module).cursor(COPY_B).is_none());
+    let again = route(&mut module, accepted(&at_cut));
+    assert_eq!(caught(&again), 0, "once: {again:?}");
 }
 
 /// `Recovered` on a node that holds both halves of the partition answers the receiver's effects

@@ -704,21 +704,27 @@ fn t61_s3_a_grace_on_a_node_with_no_primary_ends_no_primary() {
 }
 
 /// Ask node 1 to serve copy `three` a snapshot at node 1's head, as R1 does for a copy past the
-/// trim. Answers whether a transfer is open for it afterwards.
+/// trim: through R1 (`Replication::ask_snapshot`, a debug-only seam), so `three`'s cursor is
+/// catching up as after a real request, then the host takes R1's `SnapshotCatchupRequired`.
+/// Answers whether a transfer is open for it afterwards. Debug builds only, like the seam.
+#[cfg(debug_assertions)]
 fn offer_snapshot(trio: &mut Trio, three: CopyId) -> bool {
-    let head = trio.head().expect("node 1 holds a head");
     let site = Site {
         partition: P,
         correlation: CorrelationId(u64::MAX),
     };
     let host = &mut trio.nodes[0].0;
+    let ask = host
+        .replication
+        .ask_snapshot(NodeId(1), P, three)
+        .expect("node 1 holds the primary side");
+    let EffectKind::Kernel(effect) = ask else {
+        panic!("R1's ask is a kernel effect: {ask:?}");
+    };
     assert_eq!(
         host.kernel(
             ModuleName::Replication,
-            &KernelEffect::SnapshotCatchupRequired {
-                copy: three,
-                barrier: Seq(head),
-            },
+            &effect,
             site,
             &[],
             &StepFences::default(),
@@ -758,7 +764,8 @@ fn put_durable(trio: &mut Trio, request: u64) {
     });
 }
 
-/// Node 1's overruns in a row for `copy`.
+/// Node 1's overruns in a row for `copy`. Debug builds only, like its one row (r4b).
+#[cfg(debug_assertions)]
 fn overruns_of(trio: &Trio, copy: CopyId) -> u32 {
     trio.nodes[0]
         .0
@@ -792,6 +799,12 @@ fn overruns_of(trio: &Trio, copy: CopyId) -> u32 {
 /// (step 2 gives up at the held round); a held round resets, red (step 2 never gives up); no
 /// give-up gate on the offer, red (step 2's ask opens a transfer); no `budget_raised` clear, red
 /// (step 3 is still given up). Integration (~5 s): bootstrap, nine puts and a heal.
+///
+/// Each ask goes through R1 (`offer_snapshot`), so copy 3's cursor is catching up and the
+/// re-seed's ACK after the heal releases the transfer `caught_up` (PR #204 round 1's install
+/// drops the appends that used to start that cursor by chance). Cut: no cursor in
+/// `Primary::await_snapshot`, red (the transfer is never released caught up).
+#[cfg(debug_assertions)]
 #[config_log::retcd_test]
 fn t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises() {
     const METHOD: &str =
