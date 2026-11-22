@@ -1532,14 +1532,20 @@ pub struct IndexLengths {
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
-/// and its store; a secondary reports what its receiver took, since it adopts none (OB2).
+/// and its store; a secondary reports what its receiver took, since it adopts none (OB2). A
+/// copy with neither, as a restarted copy is until it rejoins, reports the lineage its store
+/// restored (#177): the newest one neither staged nor sealed, with its store's marks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Holding {
     /// The generation held.
     pub generation: Generation,
-    /// The owner epoch it was held under.
-    pub owner_epoch: OwnerEpoch,
-    /// Highest contiguous sequence applied.
+    /// The owner epoch it was held under. Never compare it: `None` means a holding reported
+    /// from a restored store, which keeps no owner epoch (#177), and epoch 0 is a real epoch,
+    /// so `None` is not 0.
+    pub owner_epoch: Option<OwnerEpoch>,
+    /// Highest contiguous sequence applied. A live copy's is its buffered applied; a restored
+    /// copy's is what its store kept, which is never more than it holds, so comparing the two
+    /// is conservative: a restored copy can only look shorter than it is.
     pub applied: u64,
     /// Highest contiguous sequence proved durable.
     pub durable: u64,
@@ -16331,6 +16337,34 @@ impl Host {
         self.tail_refused.get(&partition).copied()
     }
 
+    /// #177 (option B, the lead's ruling): what a copy with no receiver and no adoption, such
+    /// as one restarted while its owner is dead, holds of `partition`: the newest lineage its
+    /// store keeps that is neither staged (a copy in progress, whose keys are partial) nor
+    /// sealed (a newer lineage took over from it), with that lineage's applied and durable
+    /// marks as the store holds them, so it never says more than the store has. No owner
+    /// epoch: the store keeps none. `None` when the store keeps no such lineage.
+    ///
+    /// The planner counts it ([`crate::planner`]'s `choose_target`) only at the generation
+    /// `partitions/` names, so a copy restored one generation behind is never promoted.
+    fn restored_holding(&self, partition: PartitionId) -> Option<Holding> {
+        let generation = self
+            .engine
+            .generations(partition)
+            .into_iter()
+            .rev()
+            .filter(|generation| generation.0 != 0)
+            .find(|generation| {
+                self.engine.staging(partition, *generation).is_none()
+                    && self.engine.sealed_by(partition, *generation).is_none()
+            })?;
+        Some(Holding {
+            generation,
+            owner_epoch: None,
+            applied: self.engine.buffered_applied(partition, generation).0,
+            durable: self.engine.durable(partition, generation).0,
+        })
+    }
+
     fn status(&self, partition: PartitionId) -> NodeStatus {
         let adopted = self.adopted(partition);
         let now = self.clock.now();
@@ -16363,14 +16397,17 @@ impl Host {
                 let lineage = receiver.lineage();
                 Some(Holding {
                     generation: lineage.generation,
-                    owner_epoch: lineage.owner_epoch,
+                    owner_epoch: Some(lineage.owner_epoch),
                     applied: receiver.buffered_applied_seq().0,
                     durable: receiver.durable_seq().0,
                 })
             }
+            None if adopted.generation.0 == 0 && receiver.is_none() => {
+                self.restored_holding(partition)
+            }
             None => (adopted.generation.0 != 0).then(|| Holding {
                 generation: adopted.generation,
-                owner_epoch: adopted.owner_epoch,
+                owner_epoch: Some(adopted.owner_epoch),
                 applied: self
                     .engine
                     .buffered_applied(partition, adopted.generation)

@@ -516,7 +516,7 @@ fn status() -> NodeStatus {
         fault: Some("f".to_owned()),
         holds: Some(Holding {
             generation: zero(),
-            owner_epoch: zero(),
+            owner_epoch: Some(zero()),
             applied: 5,
             durable: 4,
         }),

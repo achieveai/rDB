@@ -6824,6 +6824,53 @@ fn s4d_a_staged_copy_on_the_newest_lineage_is_reported_and_a_remnant_is_not() {
     );
 }
 
+/// #177 (option B): a copy with no receiver and no adoption, as a restarted copy is until it
+/// rejoins, reports the lineage its store restored, with no owner epoch and the store's own
+/// marks, so a planner can count it. A staged child (a copy stopped part way, whose keys are
+/// partial) is never reported: the status names its parent. Once the child is switched in,
+/// the parent is sealed and the child is reported.
+/// Cut: `Host::restored_holding` stops checking `staging`, red (g2 reported while staged).
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn i177_a_restored_copy_reports_its_newest_whole_lineage_never_a_staged_one() {
+    use rdb_storage::InjectedFault;
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(dir.path(), &rt);
+    let (p, g1, g2) = (PartitionId(1), Generation(1), Generation(2));
+    assert_eq!(host.status(p).holds, None, "an empty store holds nothing");
+    super::trio::write_chain(&mut host.engine, g1, 3);
+    let restored = |host: &Host, generation| Holding {
+        generation,
+        owner_epoch: None,
+        applied: host.engine.buffered_applied(p, generation).0,
+        durable: host.engine.durable(p, generation).0,
+    };
+    let status = host.status(p);
+    assert_eq!(status.role, "none");
+    assert_eq!(status.holds, Some(restored(&host, g1)));
+    assert_eq!(status.holds.map(|held| held.applied), Some(3));
+
+    host.engine.inject_fault(InjectedFault::Switch);
+    assert!(host.engine.inherit(p, g1, g2, Seq(2)).is_err());
+    assert_eq!(host.engine.staging(p, g2), Some((g1, Seq(2))));
+    assert_eq!(
+        host.status(p).holds,
+        Some(restored(&host, g1)),
+        "the staged g2 is never reported"
+    );
+
+    host.engine
+        .inherit(p, g1, g2, Seq(2))
+        .expect("the copy finishes");
+    assert_eq!(host.engine.sealed_by(p, g1), Some(g2));
+    assert_eq!(
+        host.status(p).holds,
+        Some(restored(&host, g2)),
+        "g1 is sealed by g2"
+    );
+}
+
 // Issue #105 unit 2 (`ws-79-tail-architect.md` section 14 (d) and section 15.4): the owner
 // stands down for an adopted tail, on stepped hosts. b19's read-only commit on {1, 2} with a tail
 // of [`ADOPTED_TAIL`] records on node 2, stamped by the last writable generation, so node 2 adopts

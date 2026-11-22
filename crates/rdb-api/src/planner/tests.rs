@@ -33,7 +33,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         fault: None,
         holds: holds.map(|(generation, applied)| Holding {
             generation: Generation(generation),
-            owner_epoch: OwnerEpoch(0),
+            owner_epoch: Some(OwnerEpoch(0)),
             applied,
             durable: applied,
         }),
@@ -77,9 +77,62 @@ fn choose(
         PartitionId(partition),
         members,
         DEAD,
+        CURRENT,
         looks,
         &BTreeSet::new(),
     )
+}
+
+/// The generation `partitions/` names in these rows.
+const CURRENT: Generation = Generation(3);
+
+/// [`looks`], with node `node`'s holding read from a restored store at `generation` (#177):
+/// no receiver, no adoption, so no owner epoch.
+fn restored(
+    mut looks: Vec<(NodeId, Option<NodeStatus>)>,
+    node: u32,
+    generation: u64,
+    applied: u64,
+) -> Vec<(NodeId, Option<NodeStatus>)> {
+    let status = looks
+        .iter_mut()
+        .find(|(n, _)| *n == NodeId(node))
+        .and_then(|(_, status)| status.as_mut())
+        .expect("a look at the node");
+    status.role = "none";
+    status.holds = Some(Holding {
+        generation: Generation(generation),
+        owner_epoch: None,
+        applied,
+        durable: applied,
+    });
+    looks
+}
+
+/// #177: a copy restarted while its owner is dead, restored at the generation `partitions/`
+/// names, counts as the second answering copy, so the partition is promoted instead of
+/// staying `lone_survivor`. It wins on `applied` like any copy.
+#[test]
+fn i177_a_restored_copy_at_the_current_generation_counts() {
+    let restored_longer = restored(looks(&[(2, Some((3, 0))), (3, Some((3, 9)))]), 2, 3, 10);
+    assert_eq!(choose(1, &rf3(), &restored_longer), Ok(NodeId(2)));
+    let live_longer = restored(looks(&[(2, Some((3, 0))), (3, Some((3, 11)))]), 2, 3, 10);
+    assert_eq!(choose(1, &rf3(), &live_longer), Ok(NodeId(3)));
+}
+
+/// #177, t4's point 1: a copy restored one generation behind `partitions/` missed a promote,
+/// so it is no candidate, and the one live copy stays a lone survivor. A live copy one
+/// generation behind still counts, as before: its receiver is at the owner's lineage.
+/// Cut: drop the generation filter in `choose_target`; node 2 counts and node 3 is chosen, red.
+#[test]
+fn i177_a_restored_copy_one_generation_behind_is_not_counted() {
+    let behind = restored(looks(&[(2, Some((3, 10))), (3, Some((3, 5)))]), 2, 2, 50);
+    assert_eq!(
+        choose(1, &rf3(), &behind),
+        Err(NoEligible::LoneSurvivor { answering: 1 })
+    );
+    let live_behind = looks(&[(2, Some((2, 50))), (3, Some((3, 5)))]);
+    assert_eq!(choose(1, &rf3(), &live_behind), Ok(NodeId(3)));
 }
 
 /// V1: unequal prefixes in one generation. The copy holding the acknowledged write wins
@@ -158,6 +211,7 @@ fn own81_v3_a_frozen_copy_is_no_candidate() {
             PartitionId(1),
             &rf3(),
             DEAD,
+            CURRENT,
             &looks(&[(2, Some((3, 10))), (3, Some((3, 11)))]),
             &frozen,
         ),

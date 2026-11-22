@@ -1847,9 +1847,13 @@ fn holds_part(node: &NodeStatus) -> String {
     node.holds.map_or_else(
         || "holds=nothing".to_owned(),
         |h| {
+            // #177: a holding read from a restored store keeps no owner epoch; say so, never 0.
+            let epoch = h
+                .owner_epoch
+                .map_or_else(|| "restored".to_owned(), |epoch| epoch.0.to_string());
             format!(
-                "gen={} epoch={} applied={} durable={}",
-                h.generation.0, h.owner_epoch.0, h.applied, h.durable
+                "gen={} epoch={epoch} applied={} durable={}",
+                h.generation.0, h.applied, h.durable
             )
         },
     )
@@ -6063,7 +6067,7 @@ mod tests {
         let holds = |generation| {
             Some(rdb_api::host::Holding {
                 generation: Generation(generation),
-                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                owner_epoch: Some(rdb_core::contracts::ids::OwnerEpoch(generation)),
                 applied: 1,
                 durable: 1,
             })
@@ -6104,7 +6108,7 @@ mod tests {
         let holds = |generation| {
             Some(rdb_api::host::Holding {
                 generation: Generation(generation),
-                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                owner_epoch: Some(rdb_core::contracts::ids::OwnerEpoch(generation)),
                 applied: 1,
                 durable: 1,
             })

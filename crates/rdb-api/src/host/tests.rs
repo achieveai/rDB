@@ -1074,7 +1074,7 @@ fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
     );
     assert_eq!(
         (held.generation, held.owner_epoch),
-        (Generation(1), OwnerEpoch(1))
+        (Generation(1), Some(OwnerEpoch(1)))
     );
     assert_eq!(
         held.applied,

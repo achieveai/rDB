@@ -209,6 +209,11 @@ type Entry = (PartitionRecord, Option<Vec<RecordMember>>);
 /// The highest `(generation, applied)` wins. Ties are spread by partition: index
 /// `partition mod count` of the tied nodes in node order (ruling C-6).
 ///
+/// #177 (t4's point 1): a copy restarted while its owner is dead reports the lineage its store
+/// restored, with no owner epoch ([`crate::host::Holding`]). It counts only at `current`, the
+/// generation `partitions/` names: a copy restored at an older generation missed a promote, so
+/// it may lack writes that promote's members acknowledged, and is no candidate.
+///
 /// # Errors
 ///
 /// [`NoEligible`].
@@ -216,6 +221,7 @@ pub(crate) fn choose_target(
     partition: PartitionId,
     members: &[RecordMember],
     dead: NodeId,
+    current: Generation,
     looks: &[(NodeId, Option<NodeStatus>)],
     frozen: &BTreeSet<NodeId>,
 ) -> Result<NodeId, NoEligible> {
@@ -232,6 +238,9 @@ pub(crate) fn choose_target(
                 return None;
             }
             let holds = status.holds?;
+            if holds.owner_epoch.is_none() && holds.generation != current {
+                return None;
+            }
             Some((holds.generation, holds.applied, member.node))
         })
         .collect();
@@ -750,13 +759,22 @@ impl Planner {
                 let planner = self.clone();
                 let frozen = frozen.clone();
                 let partition = record.partition;
+                let current = record.generation;
                 let quiet = memory
                     .promote_failed
                     .get(&partition)
                     .is_some_and(|repeats| repeats.quiet(now));
                 async move {
                     let answer = planner
-                        .fail_over(partition, dead, members.as_deref(), &frozen, quiet, held)
+                        .fail_over(
+                            partition,
+                            dead,
+                            current,
+                            members.as_deref(),
+                            &frozen,
+                            quiet,
+                            held,
+                        )
                         .await;
                     (partition, answer)
                 }
@@ -899,10 +917,12 @@ impl Planner {
     /// answers `Ok`: a grant that ran out in between is logged `planner_promote_observed`, not
     /// `planner_promoted`, and the answer is kept. The checks narrow the window and cannot close
     /// it; the store's fence and the `Fencing` CAS keep a late promote safe (#81).
+    #[allow(clippy::too_many_arguments)]
     async fn fail_over(
         &self,
         partition: PartitionId,
         dead: NodeId,
+        current: Generation,
         members: Option<&[RecordMember]>,
         frozen: &BTreeSet<NodeId>,
         quiet: bool,
@@ -921,7 +941,7 @@ impl Planner {
                 .map(|node| async move { (*node, self.look(partition, *node).await) }),
         )
         .await;
-        let to = choose_target(partition, members, dead, &looks, frozen)?;
+        let to = choose_target(partition, members, dead, current, &looks, frozen)?;
         let looked = looks
             .iter()
             .find(|(node, _)| *node == to)

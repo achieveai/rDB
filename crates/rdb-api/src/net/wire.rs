@@ -2058,7 +2058,10 @@ impl WireAnswer {
 #[allow(missing_docs)]
 pub struct WireHolding {
     pub generation: Generation,
-    pub owner_epoch: OwnerEpoch,
+    /// `None` for a holding reported from a restored store (#177). Changed from a bare
+    /// `OwnerEpoch` with #177's protocol version; postcard is positional, so the handshake's
+    /// version check is what keeps an older peer from reading it.
+    pub owner_epoch: Option<OwnerEpoch>,
     pub applied: u64,
     pub durable: u64,
 }
