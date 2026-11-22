@@ -398,6 +398,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
 - **A faulted owner is not live.** An owner whose look answers with a host fault serves nothing
   for the rest of its boot, so it counts as not answering: the promote waits out its grant, as
   for a dead one, and logs `promote_owner_faulted`. No freeze is needed first (issue #122).
+  With `DbConfig::failover` set, the planner does the same by itself: once a faulted owner's
+  grant has run out it moves every partition of that owner, logging `planner_node_silent` with
+  reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
+  owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -411,12 +415,85 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   node died and resumes. That is not caused by a promote and a promote does not shorten it.
 - **While a node is down, a surviving node that restarts cannot finish opening until the dead
   node returns or the partitions it co-owns are promoted with `--drop`, which costs that
-  surviving node its leadership.** Its open keeps logging `heal_retry` for the dead node. The
+  surviving node its leadership** — after a host crash or reboot. A process restart on the same
+  OS boot can heal without the dead node: see the amendment below. Its open keeps logging `heal_retry` for the dead node. The
   way out: stop the surviving node, then `lr promote 3 --partition 1 --drop 2` for each partition
   it owns that has a copy on the dead node (here node 1 owns partition 1, node 2 is dead, and
   node 3 takes over). The cost: the promote freezes the surviving node's grant, so it holds
   copies from then on and cannot lead again in this release, and the moved partition stays
   paused until its other copy is back, because that copy was on the stopped node.
+- **Amended 2026-11-20 (R5, reopen heal, arch-s2 B1 / A-R271; PR #181 ruling A,
+  ADR-rdb-0028): after a process restart, an owner with `Timeouts::live_readd` on heals with
+  a majority of its copies.** The bullet above still holds after a host crash, and it holds
+  whenever `live_readd` is off.
+  - **Issue #169 (a restarted owner waits for a down copy) is fixed only with
+    `Timeouts::live_readd` on** (`rdb_node --live-readd`). With it off, the default, the reopen
+    waits for every copy, as before R5, and logs `heal_wait_all` with reason `live_readd_off`.
+    Each open logs the setting as `db_open_live_readd{enabled}`.
+  - **Process restart, same OS boot (Linux), `live_readd` on:** the owner's open does not wait
+    for a copy that is down, when a majority of the partition's pinned non-shadow members, the
+    owner included, is up and the down copy's grant (`grants/{node}`) is frozen or proven
+    expired on the owner's clock. It logs `heal_proceed_without` and leaves that copy out. A
+    copy with a live grant is waited for: it may be alive with a slow link. A copy that has
+    stopped no longer renews its grant. Its expiry can be proven only while the owner's clock
+    has an admissible bound (otherwise the heal waits, `no_clock_bound`); with one, it is
+    proven at most one grant lifetime plus the clock margins after the copy stopped, and the
+    heal's next look after that leaves it out. A copy that is alive keeps renewing its grant,
+    so while it renews and its link to the owner is missing there is no fixed wait. The wait
+    ends when the link comes up, or when the copy stops renewing and the owner proves its grant
+    expired. A copy with no grant record
+    is waited for one heal window (`no_grant_record`), then
+    left out too (`evidence=no_grant_after_window`). That costs availability only, never an
+    acknowledged write.
+  - **How a left-out copy comes back:** by #107's live re-add, once its link has been up for
+    5 s, whether it never stopped or started again. No record proves which boot a left-out
+    copy runs: a frozen or expired grant can name an older process of a node that already runs
+    again. Memory only: if the owner restarts again before the copy is back, the copy returns
+    only when its own node restarts, as after any drop.
+  - **Set `live_readd` the same on every node.** Each step is the owner's: its setting decides
+    whether the heal leaves a copy out and whether it re-adds it. On this build the returning
+    copy marks a refused landing only with its own setting on, so a copy with it off can leave a
+    re-added partition read-only until that copy restarts. It never loses a write.
+  - **Host crash or reboot:** the owner waits for every copy, as above, or for
+    `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
+    steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
+  - Every wait logs `heal_wait_all` with its reason: `os_boot_changed`, `os_boot_unknown`,
+    `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
+    `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
+    `no_clock_bound`. One more reason is not a wait: `decided_past_deadline`. Only a late
+    **decision** gets it: the heal decided it may leave a copy out, but only after its
+    attempt's deadline. That attempt acts on nothing and logs `heal_leave_out_expired`. A late
+    **wait** keeps its own reason and logs `heal_wait_all`. Both end the attempt, and the heal
+    tries again by itself, with a new window: there is nothing to do. A `wait_ready` that times out names the latest reason.
+  - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
+    (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
+    done. Node processes that share one folder each keep their own. A first open, a missing,
+    empty or unreadable id, and macOS or Windows all count as a host crash.
+  - **Containers:** the boot id is the host kernel's, so restarting a container is the same boot.
+    That is correct: the host kept the unsynced data.
+  - **Known limits:** restoring a VM or disk snapshot, or network storage that drops its write
+    cache without a reboot, keeps the boot id but loses data. Before starting a node on a
+    restored snapshot, delete `nodes/<n>/os_boot` from its folder; it then waits for every copy.
+  - **What is still open before `live_readd` is on by default** (#107's table). If one is hit
+    with it on, this is what you see:
+    - **Protocol 10, the owner's setting on the wire** (#170, not on this build): a peer on an
+      older build, or with the setting off, can leave a re-added partition read-only until that
+      copy restarts.
+    - **A re-add shadow that is never promoted** (M3 exit): while the owner still has a link to
+      it, nothing gives up on a shadow that stalls and nothing is logged; the partition keeps
+      writing with its other copies, and the copy stays a shadow. A shadow the owner has no
+      link to is different: the owner logs `move_shadow_unreachable`, and after its drop clock
+      (10 s) gives the shadow up, re-plans without it and logs `move_given_up`.
+    - **Flatten off the owner's thread** (storage): adoption's flatten runs on the owner's
+      thread, so a re-add after a long drop can pause the owner's other partitions while it
+      flattens.
+    - **The WAL watchdog against a frozen process** (storage): how the watchdog treats a
+      process that was frozen and resumed is not yet checked; treat a watchdog fault after a
+      freeze as this case.
+    - **Check B at adoption** (#121) and **the #81 failover row**: with automatic
+      failover on, those paths are not yet proven together with live re-add.
+    - **R4, the 512-partition walk**: the cost of many re-adds at once is not measured; expect
+      pauses on a node with many partitions blipped together.
 
 **Supervising a node process: exit 75 means "restart me"** (#81 V10). A node process whose
 partitions were all promoted away while it was stopped comes back with a frozen grant, and
@@ -1570,8 +1647,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   report misses the first discovery window, for example when the host stalls during `lr up`.
   The partition then runs on 2 copies until a fix lands. Reads and writes keep working. Lose
   one more copy and the partition becomes read-only. For a declared database, an owner whose
-  folder is lost after its first root and before any admitted write is still refused as
-  unfinished forming; repeating --declare does not recover it (#137).
+  folder is lost after its first root and before any admitted write takes that root back on
+  restart, with nothing lost (#137). One that may have admitted writes is refused and told to
+  move the partition with `admin promote`.
 - **With 2 of 3 copies down, an app can read but not write.** Node 1 then finishes its
   recovery with only its own copy. That is what `wait_ready`'s "node 1's recovery phase is
   Committed" (or `Rebuilding`) means here: the recovery is done, but with too few copies to take
@@ -1611,12 +1689,14 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
-- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** The owner re-plans a
-  partition when a copy rejoins, and during a move or a refill. Each re-plan can answer one
-  put in flight `UNKNOWN_OUTCOME`, and that put may or may not have landed. Treat
-  `UNKNOWN_OUTCOME` as "may have applied": ask `db.status`, send it again with
-  `db.resend`, or read the key back. Never send it again as a new write. A fix is tracked in a
-  separate issue.
+- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
+  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
+  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
+  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
+  last check, the answer is still `UNKNOWN_OUTCOME`. A move or a refill re-plans the
+  partition too, and each such re-plan can answer one put in flight `UNKNOWN_OUTCOME`. Treat
+  that as "may have applied": ask `db.status`, send it again with `db.resend`, or read the key
+  back. Never send it again as a new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or

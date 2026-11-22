@@ -41,6 +41,7 @@ pub mod control;
 pub mod db;
 pub mod host;
 pub mod net;
+mod os_boot;
 pub mod ownership;
 pub mod planner;
 pub mod transport;

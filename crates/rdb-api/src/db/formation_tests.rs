@@ -1657,71 +1657,218 @@ fn s1a_an_unreachable_store_at_the_formation_read_says_what_to_do() {
     );
 }
 
-/// PR #138 review, and #137: node 1 roots its first partition and stops before any write is
-/// admitted (the commit hook faults it before activation), then loses its whole folder. With
-/// the formation record present, its reopen is refused "has not finished forming", and running
-/// the same declaration again (`Already`) does not change that: today's limit, which #137
-/// owns. The refusal says so and does not tell the operator to run the formation again. The
-/// refused opens bind nothing, start nothing and write nothing. Integration (~4 s).
-/// Cut: `empty_owner_refusal` answers the shared `RERUN_FORM` step for a declared database
-/// too; red at the text.
-#[config_log::retcd_test]
-fn s1a_a_declared_owner_wiped_before_any_write_stays_refused() {
-    let mut rig = bare_rig(Arc::new(config_testkit::MemStore::new()));
-    rig.declare_created();
+/// The partitions of `partitions` that `wiped` owns and that are rooted in the store: each with
+/// its record's owner and generation.
+fn rooted_of_wiped(
+    rig: &Rig,
+    partitions: u32,
+    wiped: NodeId,
+) -> Vec<(PartitionId, NodeId, Generation)> {
+    rig.rt
+        .block_on(partition_states(&rig.store, partitions))
+        .expect("the store answers")
+        .into_iter()
+        .filter_map(|(partition, state)| match state {
+            PartitionState::Rooted(record, _)
+                if admin::owner_in(&ALL_NODES, partition) == wiped =>
+            {
+                Some((partition, record.owner, record.generation))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// #137's state: declare `partitions` over nodes 1 to 3 in `store` and open them, `wiped`'s
+/// commit hook faulting it right after its first root commits, before that generation is linked
+/// or activated, so no write is ever admitted; wait until one of its partitions is rooted, then
+/// end every process and lose `wiped`'s whole folder. Answers the rig, every process ended, and
+/// the partitions of `wiped` that were rooted.
+fn wiped_before_any_write(
+    store: Arc<dyn ConfigStore>,
+    partitions: u32,
+    wiped: NodeId,
+) -> (Rig, Vec<(PartitionId, NodeId, Generation)>) {
+    let mut rig = bare_rig(store);
+    match rig
+        .rt
+        .block_on(admin::declare(&rig.store, &rig.declaration_of(partitions)))
+    {
+        Ok(admin::Declared::Created(_)) => {}
+        other => panic!("the declaration is written: {other:?}"),
+    }
     let dirs = fresh_dirs();
-    crate::host::set_after_commit(&dirs[0].0, Some(crate::host::AfterCommit::Fault));
+    crate::host::set_after_commit(
+        &dirs[wiped.0 as usize - 1].0,
+        Some(crate::host::AfterCommit::Fault),
+    );
     rig.open_all(dirs);
-    let owned: Vec<PartitionId> = (1..=PARTITIONS)
-        .map(PartitionId)
-        .filter(|partition| admin::initial_owner(*partition) == NodeId(1))
-        .collect();
     let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(20));
-    while !rig.rt.block_on(async {
-        partition_states(&rig.store, PARTITIONS)
-            .await
-            .expect("the store answers")
-            .iter()
-            .any(|(partition, state)| {
-                owned.contains(partition) && matches!(state, PartitionState::Rooted(..))
-            })
-    }) {
-        assert!(Instant::now() < deadline, "node 1 never rooted a partition");
+    while rooted_of_wiped(&rig, partitions, wiped).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "node {} never rooted a partition",
+            wiped.0
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     rig.shutdown_all();
-    crate::host::set_after_commit(&rig.procs[0].dir, None);
-    let before = snapshot(&rig.rt, &*rig.store);
-    rig.wipe(NodeId(1));
-    for attempt in ["first", "after declaring again"] {
-        let refused = rig
-            .reopen(NodeId(1))
-            .map(|_| ())
-            .expect_err("the wiped owner is refused");
+    crate::host::set_after_commit(&rig.procs[wiped.0 as usize - 1].dir, None);
+    let rooted = rooted_of_wiped(&rig, partitions, wiped);
+    rig.wipe(wiped);
+    (rig, rooted)
+}
+
+/// #137: [`wiped_before_any_write`], then every process reopens: the wiped owner's open rolls
+/// each rooted partition it owns forward onto its own empty copy (no promote, no re-form),
+/// every partition takes a write, and after a restart of all three every write reads back.
+/// Returns the partitions that were rolled forward.
+fn wiped_owner_before_any_write_rolls_forward(
+    method: &str,
+    partitions: u32,
+    wiped: NodeId,
+) -> Vec<PartitionId> {
+    let owner_of = |partition: u32| admin::owner_in(&ALL_NODES, PartitionId(partition));
+    let (mut rig, rooted) =
+        wiped_before_any_write(Arc::new(config_testkit::MemStore::new()), partitions, wiped);
+    rig.restart_all();
+    rig.wait_ready();
+    // The roll-forward names the root's generation (below); the reopen's heal may commit a
+    // later one, but the owner stays: nothing promoted the partition away.
+    let after = rooted_of_wiped(&rig, partitions, wiped);
+    for (partition, owner, generation) in &rooted {
         assert!(
-            refused.to_string().contains("has not finished forming")
-                && refused
-                    .to_string()
-                    .contains("does not finish it (issue #137)")
-                && !refused
-                    .to_string()
-                    .contains("run the command that formed it again"),
-            "{attempt}: {refused}"
-        );
-        assert!(!has_copies(&rig.procs[0].dir), "{attempt}: nothing bound");
-        assert_eq!(
-            snapshot(&rig.rt, &*rig.store),
-            before,
-            "{attempt}: nothing written"
-        );
-        let again = rig
-            .rt
-            .block_on(admin::declare(&rig.store, &rig.declaration()));
-        assert!(
-            matches!(again, Ok(admin::Declared::Already(_))),
-            "{again:?}"
+            after
+                .iter()
+                .any(|(p, o, g)| p == partition && o == owner && g >= generation),
+            "partition {} keeps owner {}: {after:?}",
+            partition.0,
+            owner.0
         );
     }
+    let rolled: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open_rolled_forward")
+            .collect();
+    for (partition, _, generation) in &rooted {
+        // Partition 1's line names no partition; a later partition's names it. `copies` is
+        // logged as its debug text.
+        let names = |line: &serde_json::Value| {
+            line["generation"] == generation.0
+                && line["copies"] == format!("[{}]", wiped.0)
+                && match partition.0 {
+                    1 => line["partition"].is_null(),
+                    n => line["partition"] == n,
+                }
+        };
+        assert!(
+            rolled.iter().any(names),
+            "partition {} rolled forward onto node {}'s copy: {rolled:?}",
+            partition.0,
+            wiped.0
+        );
+    }
+    let groups: Vec<(u32, AffinityId)> = (1..=partitions)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    for (partition, group) in &groups {
+        let put = put_lands(rig.of(owner_of(*partition)), *group, b"k", b"v");
+        assert_eq!(put.partition, PartitionId(*partition), "{put:?}");
+    }
+    rig.restart_all();
+    rig.wait_ready();
+    for (partition, group) in &groups {
+        let got = rig
+            .of(owner_of(*partition))
+            .get_in(*group, b"k")
+            .expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"v"[..]),
+            "partition {partition} keeps its write"
+        );
+    }
+    rooted
+        .into_iter()
+        .map(|(partition, ..)| partition)
+        .collect()
+}
+
+/// #137, a later partition: node 2 owns no partition 1, so its reopen reaches the owner's empty
+/// copy in `Db::decide_partition` (from `Db::check_others`). Integration (~8 s).
+/// Cut: `Db::decide_partition` refuses the owner's empty copy unconditionally (its
+/// `empty_owner` call answers the old refusal); `restart_all` panics "has not finished forming".
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_before_any_write_rolls_forward_a_later_partition() {
+    const METHOD: &str =
+        "s1a_a_declared_owner_wiped_before_any_write_rolls_forward_a_later_partition";
+    assert_ne!(admin::owner_in(&ALL_NODES, PARTITION), NodeId(2));
+    let rolled = wiped_owner_before_any_write_rolls_forward(METHOD, PARTITIONS, NodeId(2));
+    assert!(
+        !rolled.is_empty() && !rolled.contains(&PARTITION),
+        "{rolled:?}"
+    );
+}
+
+/// #137, partition 1: one partition, owned by node 1, so the reopen reaches the owner's empty
+/// copy in `Db::check`. Integration (~6 s).
+/// Cut: `Db::check`'s owner-local branch refuses unconditionally (its `empty_owner` call
+/// answers the old refusal); `restart_all` panics "has not finished forming".
+#[config_log::retcd_test]
+fn s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1() {
+    const METHOD: &str = "s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1";
+    assert_eq!(admin::owner_in(&ALL_NODES, PARTITION), NodeId(1));
+    let rolled = wiped_owner_before_any_write_rolls_forward(METHOD, 1, NodeId(1));
+    assert_eq!(rolled, [PARTITION]);
+}
+
+/// PR #156 review (question): `partitions/1` is read twice by a reopen of the owner's empty
+/// copy, `formed_member`'s `get` (the instance) and `partition_states`' `list` (the record and
+/// root the roll uses). Replacing the control-store namespace while an open runs is not
+/// supported, but a root of another instance on the second read must not be rolled forward
+/// under the first read's instance. #137's state, then the store's `list` answers
+/// `partitions/1` naming another instance: node 1's reopen is refused naming both instances,
+/// binds nothing and writes nothing. Integration (~4 s).
+/// Cut: drop the instance comparison in `Db::check`'s owner-local branch; the reopen rolls the
+/// other instance's root forward and opens, red.
+#[config_log::retcd_test]
+fn pr156_partition_1_read_again_under_another_instance_is_refused() {
+    let swapping =
+        crate::test_store::SwapPartitionOneInstance::new(Arc::new(config_testkit::MemStore::new()));
+    let (rig, rooted) =
+        wiped_before_any_write(Arc::clone(&swapping) as Arc<dyn ConfigStore>, 1, NodeId(1));
+    assert_eq!(rooted.len(), 1, "partition 1 is rooted: {rooted:?}");
+    let Some((_, PartitionState::Rooted(_, root))) = rig
+        .rt
+        .block_on(partition_states(&rig.store, 1))
+        .expect("the store answers")
+        .pop()
+    else {
+        panic!("partition 1 has a root");
+    };
+    let mut other = root.instance;
+    for byte in &mut other {
+        *byte = !*byte;
+    }
+    swapping.arm(&root.instance, &other);
+    let before = snapshot(&rig.rt, &*rig.store);
+    let refused = rig
+        .reopen(NodeId(1))
+        .map(|_| ())
+        .expect_err("a root of another instance is not rolled forward");
+    let text = refused.to_string();
+    assert!(
+        matches!(refused, OpenError::Mismatch(_))
+            && text.contains(&format!(
+                "partitions/1 named instance {} and then {} while this open read it",
+                admin::instance_hex(&root.instance),
+                admin::instance_hex(&other)
+            )),
+        "{text}"
+    );
+    assert!(!has_copies(&rig.procs[0].dir), "nothing bound");
+    assert_eq!(snapshot(&rig.rt, &*rig.store), before, "nothing written");
 }
 
 /// PR #138 review: after acknowledged writes, node 1 loses its whole folder. With the
@@ -2758,6 +2905,519 @@ fn s1b_restart_of_each_of_five_nodes_reopens_its_own_folder() {
     for proc in &rig.procs {
         assert_eq!(copies_in(&proc.dir), [proc.node.0.to_string()]);
     }
+}
+
+// ---- R5: a restarted owner heals with a majority when the OS did not reboot ----
+
+/// The owner of the R5 rows: node 2, which the ring makes primary of some of the 16 partitions.
+const R5_OWNER: NodeId = NodeId(2);
+
+/// R5's scene: five nodes, each process on its own runtime, every partition written once.
+/// Returns the rig, `R5_OWNER`'s partitions with a group in each, and the copy `C` of the first
+/// of them that is not the owner, chosen as the one to take down with it.
+fn r5_scene() -> (Rig, Vec<(u32, AffinityId)>, NodeId) {
+    let rig = declared_rig_with(S1B_K, S1B_P, true);
+    rig.wait_ready();
+    let owned: Vec<(u32, AffinityId)> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == R5_OWNER.0)
+        .map(|partition| (partition, group_of(rig.of(NodeId(1)), partition)))
+        .collect();
+    assert!(!owned.is_empty(), "node 2 owns a partition");
+    for (_, group) in &owned {
+        put_lands(rig.of(R5_OWNER), *group, b"before", b"1");
+    }
+    let copy = ring(S1B_K, owned[0].0)
+        .copies
+        .iter()
+        .copied()
+        .find(|node| *node != R5_OWNER.0)
+        .map(NodeId)
+        .expect("a partition has a copy besides its owner");
+    (rig, owned, copy)
+}
+
+/// `node`'s copy folder, where its `os_boot` file lives.
+fn copy_dir(rig: &Rig, node: NodeId) -> PathBuf {
+    rig.procs[node.0 as usize - 1]
+        .dir
+        .join("nodes")
+        .join(node.0.to_string())
+}
+
+/// Give `node`'s copy the OS boot id `id`, on file as a ready open leaves it, and the same id
+/// as the OS's now: the next open of it runs under the same OS boot.
+fn same_os_boot(rig: &Rig, node: NodeId, id: &str) {
+    let dir = copy_dir(rig, node);
+    crate::os_boot::record(&dir, id).expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok(id));
+}
+
+/// R5 (PR #181 ruling A): the heal leaves a copy out only with `Timeouts::live_readd` on.
+fn live_readd_on() -> Timeouts {
+    Timeouts {
+        live_readd: true,
+        ..Timeouts::default()
+    }
+}
+
+/// The heal-decision lines of this row's own log: `heal_proceed_without`, `heal_wait_all` and
+/// `heal_peers_unknown`.
+fn heal_decisions(method: &str) -> Vec<serde_json::Value> {
+    config_testkit::logs::lines_for_current_test(module_path!(), method)
+        .into_iter()
+        .filter(|line| {
+            matches!(
+                line["@m"].as_str(),
+                Some("heal_proceed_without" | "heal_wait_all" | "heal_peers_unknown")
+            )
+        })
+        .collect()
+}
+
+/// R5 row 1 (t1's s80s3 fault): owner node 2 and a copy `C` of one of its partitions both stop;
+/// node 2 restarts under the same OS boot, `C` still down. Node 2's heal proceeds with the
+/// majority it has, logs `heal_proceed_without` naming `C`, never `heal_peers_unknown`, and its
+/// partitions read back the values written before and take new puts. Red on main: the heal waits
+/// for `C`'s link and `wait_ready` times out. Integration (~30 s): a formation of five, two
+/// stops, a restart that waits out `C`'s grant.
+/// Cut: `member_boots` never asks `leave_out` (waits for every copy, as before): red at ready.
+#[config_log::retcd_test]
+fn r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot() {
+    const METHOD: &str = "r5_a_restarted_owner_heals_with_a_majority_when_the_os_did_not_reboot";
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
+    for (partition, group) in &owned {
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+    let decisions = heal_decisions(METHOD);
+    assert!(
+        !decisions
+            .iter()
+            .any(|line| line["@m"] == "heal_peers_unknown"),
+        "{decisions:?}"
+    );
+    let without: Vec<&serde_json::Value> = decisions
+        .iter()
+        .filter(|line| line["@m"] == "heal_proceed_without")
+        .collect();
+    assert!(!without.is_empty(), "{decisions:?}");
+    for line in &without {
+        assert_eq!(line["reason"], "same_os_boot", "{line}");
+        assert!(
+            matches!(
+                line["evidence"].as_str(),
+                Some("grant_expired" | "grant_frozen")
+            ),
+            "{line}"
+        );
+        assert!(
+            line["missing"]
+                .as_str()
+                .is_some_and(|m| m.contains(&copy.0.to_string())),
+            "{line}"
+        );
+    }
+}
+
+/// R5 row 4 (b): after row 1's heal went on without copy `C`, `C` starts again at a newer
+/// boot. Owner node 2 re-adds it: `partitions/{p}` pins `C` again, the record still names
+/// node 2 as owner, `C`'s process leads none of them, and the values read back. Integration
+/// (~45 s). The heal noted `C` at `UNLINKED_BOOT` (PR #181 ruling A), so its first link is a
+/// #107 live return, taken back by `live_readd_duty`. Cut: the host ignores
+/// `Msg::HealLeftOut`: no clocked return, and `restore_left_out` records `C` at its new live
+/// boot, so it waits for yet another restart (`copy_left_out_until_restart`), red at the pins.
+/// The read back waits first for the owner to serve each partition at its final generation
+/// ([`owner_serves`]): the re-add pins `C` as a shadow, and its promote is one more re-plan,
+/// whose epoch fence refuses a read on purpose (#191). The read itself is plain.
+#[config_log::retcd_test]
+fn r5_b_a_copy_left_out_by_the_heal_rejoins_when_it_starts_again() {
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 heals without node {}: {e}", copy.0));
+    let shared: Vec<&(u32, AffinityId)> = owned
+        .iter()
+        .filter(|(partition, _)| ring(S1B_K, *partition).copies.contains(&copy.0))
+        .collect();
+    for (partition, _) in &shared {
+        assert!(
+            !pinned_nodes(&rig, *partition).contains(&copy.0),
+            "partition {partition}: the heal left node {} out",
+            copy.0
+        );
+    }
+    rig.restart(copy, live_readd_on());
+    for (partition, group) in &shared {
+        pins_until(
+            &rig,
+            *partition,
+            Duration::from_secs(60),
+            "the left-out copy is pinned again",
+            |pins| pins.contains(&copy.0),
+        );
+        let record = rig
+            .rt
+            .block_on(rig.store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(PartitionId(*partition)).encode()),
+            }))
+            .expect("the store answers")
+            .record
+            .and_then(|found| PartitionRecord::decode(&found.value))
+            .expect("partitions/{p} decodes");
+        assert_eq!(record.owner, R5_OWNER, "partition {partition}: one owner");
+        assert!(
+            rig.of(copy).ownership(PartitionId(*partition)).is_none(),
+            "partition {partition}: node {} leads nothing",
+            copy.0
+        );
+        owner_serves(&rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// Wait until `owner` serves `partition` at its final generation: the record pins `copy` as a
+/// regular copy (a re-add pins it as a shadow first, and its promote is one more re-plan), and
+/// the owner has adopted that record's generation and epoch and still leads under it. Until
+/// then a re-plan's epoch fence refuses reads `RetryAfterRecovery` by design (#191), so a row
+/// that reads before this races the fence. Panics after `within`, with the last state seen.
+fn owner_serves(rig: &Rig, partition: u32, owner: NodeId, copy: NodeId, within: Duration) {
+    let deadline = Instant::now() + crate::host::test_patience(within);
+    let id = PartitionId(partition);
+    loop {
+        let value = rig
+            .rt
+            .block_on(rig.store.get(config_core::GetRequest {
+                key: Bytes::from(ControlKey::Partition(id).encode()),
+            }))
+            .expect("the store answers")
+            .record
+            .map(|found| found.value);
+        let record = value
+            .as_ref()
+            .and_then(|value| PartitionRecord::decode(value));
+        let regular = value
+            .as_ref()
+            .and_then(|value| RecordMember::decode_all(value))
+            .is_some_and(|members| {
+                members.iter().any(|member| {
+                    member.node == copy
+                        && member.role == rdb_core::contracts::ids::ReplicaRole::RegularSecondary
+                })
+            });
+        let adopted = rig.of(owner).ownership(id);
+        let serves = record
+            .as_ref()
+            .zip(adopted.as_ref())
+            .is_some_and(|(record, adopted)| {
+                record.owner == owner
+                    && adopted.token.generation == record.generation
+                    && adopted.token.owner_epoch == record.owner_epoch
+                    && rig.of(owner).still_owner(id, adopted.token)
+            });
+        if regular && serves {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partition {partition}: node {} never served it with node {} regular: \
+             regular {regular}, record {record:?}, adopted {adopted:?}",
+            owner.0,
+            copy.0
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// PR #181 review (Db forwarding and the deferred marker): node 2's copy holds OS boot `A` and
+/// the OS now says `B`, a reboot. With `C` down and `live_readd` on, node 2's open must keep
+/// waiting past `C`'s grant expiry, `os_boot_changed`, and write no `os_boot` file. Opened
+/// again on `B`, `C` still down, it waits again, now `os_boot_unknown`, and still writes none.
+/// Once `C` is back, it is ready and the file holds `B`. Integration (~45 s): a formation of
+/// five, two stops, three owner opens.
+/// Cuts: the open forwards `Same` to the heal whatever it found: node 2 goes on without `C`,
+/// red; the file written at open rather than once ready: red at its absence.
+#[config_log::retcd_test]
+fn r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready() {
+    const METHOD: &str =
+        "r5_c_after_a_reboot_the_heal_waits_and_the_boot_is_recorded_only_once_ready";
+    let (mut rig, _, copy) = r5_scene();
+    let dir = copy_dir(&rig, R5_OWNER);
+    let marker = dir.join(crate::os_boot::OS_BOOT_FILE);
+    crate::os_boot::record(&dir, "os-boot-a").expect("the os_boot file is written");
+    crate::os_boot::inject(&dir, Ok("os-boot-b"));
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    // Past C's grant (6 s plus margins), when a same-boot heal would have gone on.
+    for want in ["os_boot_changed", "os_boot_unknown"] {
+        rig.restart(R5_OWNER, live_readd_on());
+        let waited = rig.of(R5_OWNER).wait_ready(Duration::from_secs(9));
+        assert!(
+            matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+            "{want}: node 2 waits for node {}: {waited:?}",
+            copy.0
+        );
+        assert!(!marker.exists(), "{want}: no os_boot file before ready");
+        let reasons: Vec<String> = heal_decisions(METHOD)
+            .iter()
+            .filter(|line| line["@m"] == "heal_wait_all")
+            .map(|line| line["reason"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            reasons.last().map(String::as_str),
+            Some(want),
+            "{reasons:?}"
+        );
+    }
+    rig.restart(copy, live_readd_on());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("the os_boot file is written once ready")
+            .trim(),
+        "os-boot-b"
+    );
+    let decisions = heal_decisions(METHOD);
+    assert!(
+        !decisions
+            .iter()
+            .any(|line| line["@m"] == "heal_proceed_without"),
+        "{decisions:?}"
+    );
+}
+
+/// `node`'s grant record in the control store, if it has one.
+fn grant_of(rig: &Rig, node: NodeId) -> Option<rdb_core::authority::grant::GrantRecord> {
+    rig.rt
+        .block_on(rig.store.get(config_core::GetRequest {
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+        }))
+        .expect("the store answers")
+        .record
+        .map(|found| {
+            rdb_core::authority::grant::GrantRecord::decode(&found.value)
+                .expect("grants/{node} decodes")
+        })
+}
+
+/// The partitions of `owned` whose ring also places `copy`.
+fn shared_with(owned: &[(u32, AffinityId)], copy: NodeId) -> Vec<(u32, AffinityId)> {
+    owned
+        .iter()
+        .copied()
+        .filter(|(partition, _)| ring(S1B_K, *partition).copies.contains(&copy.0))
+        .collect()
+}
+
+/// Asserts that each of `shared` pins every copy its ring places, `copy` among them, that
+/// `R5_OWNER` serves it with `copy` regular, and that it reads back the value written before
+/// and takes a put.
+fn fully_pinned_and_writable(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId) {
+    for (partition, group) in shared {
+        let placed: BTreeSet<u32> = ring(S1B_K, *partition).copies.iter().copied().collect();
+        pins_until(
+            rig,
+            *partition,
+            Duration::from_secs(60),
+            "every placed copy is pinned",
+            |pins| *pins == placed,
+        );
+        owner_serves(rig, *partition, R5_OWNER, copy, Duration::from_secs(60));
+        let got = rig.of(R5_OWNER).get_in(*group, b"before").expect("a get");
+        assert_eq!(
+            got.value.as_ref().map(|(_, value)| &value[..]),
+            Some(&b"1"[..]),
+            "partition {partition}"
+        );
+        put_lands(rig.of(R5_OWNER), *group, b"after", b"2");
+    }
+}
+
+/// How many lines this row has logged so far: [`left_nothing_out`] reads only those after.
+fn log_mark(method: &str) -> usize {
+    config_testkit::logs::lines_for_current_test(module_path!(), method).len()
+}
+
+/// Asserts this row's log, from line `from` (a [`log_mark`], after the formation), holds no
+/// leave-out: no `heal_proceed_without` and no `heal_left_out_noted`, and that every
+/// `heal_wait_all` of node 2's heal said `live_readd_off`.
+fn left_nothing_out(method: &str, from: usize) {
+    let lines: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .into_iter()
+            .skip(from)
+            .collect();
+    let named = |message: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|line| line["@m"] == message).collect()
+    };
+    assert!(
+        named("heal_proceed_without").is_empty(),
+        "no leave-out decision"
+    );
+    assert!(
+        named("heal_left_out_noted").is_empty(),
+        "no copy noted left out"
+    );
+    let waits: Vec<&serde_json::Value> = named("heal_wait_all")
+        .into_iter()
+        .filter(|line| line["owner"].as_u64() == Some(u64::from(R5_OWNER.0)))
+        .collect();
+    assert!(
+        !waits.is_empty() && waits.iter().all(|line| line["reason"] == "live_readd_off"),
+        "{waits:?}"
+    );
+}
+
+/// PR #181 review round 3, blocker 3: `Timeouts::live_readd` off, the default, through
+/// `Db::open`. Node 2 reopens under the same OS boot while copy `C` is down and has no grant
+/// record (deleted, as a copy that never owned a partition has none). Node 2's heal waits past
+/// one full heal window, when a no-grant copy could first be left out, `live_readd_off` each
+/// time, and is not ready. `C` then starts again: node 2 is ready, each shared partition pins
+/// every placed copy with `C` regular, reads back and takes a put, and nothing was ever left
+/// out. Integration (~60 s): a formation of five, two stops, a wait of one window.
+/// Cut: `may_leave_out` ignores `live_readd`: after the window `C` is left out, node 2 is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written() {
+    const METHOD: &str =
+        "r5_off_with_live_readd_off_a_no_grant_copy_back_after_a_window_is_pinned_and_written";
+    let (mut rig, owned, copy) = r5_scene();
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    rig.stop(copy);
+    rig.rt
+        .block_on(rig.store.delete(config_core::DeleteRequest {
+            key: Bytes::from(ControlKey::Grant(copy).encode()),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("grants/C is deleted");
+    assert!(
+        grant_of(&rig, copy).is_none(),
+        "no grant record for node {}",
+        copy.0
+    );
+    let from = log_mark(METHOD);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    let window = heal_within(&fast());
+    let waited = rig.of(R5_OWNER).wait_ready(window + Duration::from_secs(2));
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} after one window: {waited:?}",
+        copy.0
+    );
+    rig.restart(copy, Timeouts::default());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} is back: {e}", copy.0));
+    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    left_nothing_out(METHOD, from);
+}
+
+/// PR #181 review round 3, blocker 4: copy `C`'s grant has expired and names its old boot
+/// `b1`, while `C` already runs again at a new boot `b2` and its own heal is blocked, so that
+/// grant is never cleared. `C`'s heal waits for node `D`, which `C`'s partitions pin and node
+/// 2's do not, kept down (live re-add off, the default, on every node). Node 2 reopens under
+/// the same OS boot with live re-add off while `C` is down, waits past the grant's expiry, and
+/// is not ready; `C` then starts at `b2`. Node 2's heal pins it: node 2 is ready, each shared
+/// partition pins every placed copy with `C` regular, reads back and takes a put, nothing is
+/// left out and `C` is never restarted. At the end `grants/C` still names `b1` and `C`'s heal
+/// still runs. Integration (~60 s).
+/// Cut: `may_leave_out` ignores `live_readd`: node 2 leaves `C` out on its expired grant and is
+/// ready without it, red at the wait.
+#[config_log::retcd_test]
+fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned() {
+    const METHOD: &str =
+        "r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinned";
+    let (mut rig, owned, copy) = r5_scene();
+    let copy_owns: Vec<u32> = (1..=S1B_P)
+        .filter(|partition| ring(S1B_K, *partition).primary == copy.0)
+        .collect();
+    assert!(!copy_owns.is_empty(), "node {} owns a partition", copy.0);
+    let blocker = (1..=S1B_K)
+        .map(NodeId)
+        .find(|node| {
+            *node != R5_OWNER
+                && *node != copy
+                && copy_owns
+                    .iter()
+                    .any(|p| ring(S1B_K, *p).copies.contains(&node.0))
+                && owned
+                    .iter()
+                    .all(|(p, _)| !ring(S1B_K, *p).copies.contains(&node.0))
+        })
+        .expect("a node in C's partitions and in none of node 2's");
+    let b1 = grant_of(&rig, copy)
+        .expect("node {copy} holds a grant: it owns a partition")
+        .boot;
+    same_os_boot(&rig, R5_OWNER, "os-boot-a");
+    let from = log_mark(METHOD);
+    rig.stop(blocker);
+    rig.stop(copy);
+    rig.stop(R5_OWNER);
+    rig.restart(R5_OWNER, Timeouts::default());
+    // Past C's grant: its expiry, the clock margins and a second more.
+    let budgets = fast();
+    let expiry = grant_of(&rig, copy)
+        .expect("grants/C is kept")
+        .expiry_utc_ms;
+    let past = expiry
+        + i64::try_from(budgets.clock_error_millis + budgets.dispatch_margin_millis)
+            .expect("margins fit")
+        + 1_000;
+    let now_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_millis(),
+        )
+        .expect("now fits")
+    };
+    let wait = Duration::from_millis(u64::try_from((past - now_ms()).max(1_000)).expect("ms"));
+    let waited = rig.of(R5_OWNER).wait_ready(wait);
+    assert!(
+        matches!(waited, Err(crate::db::ReadyError::TimedOut { .. })),
+        "node 2 still waits for node {} past its grant: {waited:?}",
+        copy.0
+    );
+    assert!(now_ms() > past, "C's grant has expired");
+    rig.restart(copy, Timeouts::default());
+    rig.of(R5_OWNER)
+        .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
+        .unwrap_or_else(|e| panic!("node 2 is ready once node {} links: {e}", copy.0));
+    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    left_nothing_out(METHOD, from);
+    let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
+    assert_eq!(kept.boot, b1, "grants/C still names the old boot");
+    assert!(
+        matches!(rig.of(copy).heal_state(), HealState::Running),
+        "C's own heal is still blocked: {:?}",
+        rig.of(copy).heal_state()
+    );
 }
 
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.

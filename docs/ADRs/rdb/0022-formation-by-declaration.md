@@ -5,7 +5,10 @@
 **Spec:** `docs/rdb/design-specification.md` §7.1 (authoritative records)
 **Extends:** [ADR-rdb-0008](0008-control-records-in-retcd.md) (two new `operations/` records).
 **Amended by:** [ADR-rdb-0023](0023-node-records-ring-placement-one-node-per-machine.md) (#80 S1b:
-nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decision 6 below).
+nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decision 6 below);
+[ADR-rdb-0028](0028-reopen-heal-on-a-majority-within-one-os-boot.md) (R5, PR #181: with
+`Timeouts::live_readd` on, after a process restart within one OS boot, a reopen's heal goes on
+with a majority; Decision 5 below).
 **Issue:** #80 slice S1a.
 
 ## Context
@@ -65,6 +68,12 @@ nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decisi
    The bootstrap plan pins each member at the boot its handshake reported. In one process all
    members share one boot, so nothing changes there. The heal waits for every member's boot, so a
    declared node that never starts blocks the partitions it shares, and `heal_retry` names it.
+   *Amended by ADR-rdb-0028 (R5, PR #181):* with `Timeouts::live_readd` on and the same OS boot
+   since the owner's last ready open, the reopen's heal of a partition already rooted goes on
+   without a down regular copy once a majority is up: one whose grant is frozen or proven
+   expired, or that has no grant record after one heal window. A partition still to form
+   keeps this rule and waits for every member (`partition_forming`), and so does every heal with
+   `live_readd` off or after a host crash.
 6. **The node set is the initial declaration only.** This build declares nodes 1, 2 and 3 and keeps
    today's placement (`initial_owner`). More nodes, `nodes/{id}` records and add or remove are
    later slices.
@@ -110,10 +119,17 @@ nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decisi
   `count_open` has read the counter present, or lost its create to another open's, it never
   creates it, so a counter deleted between its retries is refused too
   (`s1a_a_counter_deleted_after_a_lost_cas_is_never_recreated`).
-- Not covered: an owner whose copy is empty after its partition got its first root, before any
-  write was admitted. It is refused as before ("has not finished forming"), and running the
-  declaration again does not recover it (#137). The refusal says so; it does not give the
-  `--form` step.
+- An owner whose copy is empty after its partition got its first root, before any write was
+  admitted, rolls that root forward onto its empty copy when it restarts (#137). The proof is
+  the one an undeclared `--form` re-run and ruling A-R184 use: the root sits on the empty base
+  (predecessor generation 0, cutoff 0) and the partition's activation mark (partition 1's open
+  counter, a later partition's own mark) shows no host activated its generation, so no write
+  was admitted. The open claims the mark at the revision it read, so a host that activated the
+  generation since makes the open Stale. The roll keeps the root's generation and the
+  partition keeps its owner: nothing is formed again and nothing is promoted. `empty_owner` in `crates/rdb-api/src/db.rs`
+  decides it, for partition 1 in `Db::check` and for the others in `Db::decide_partition`. An
+  owner whose copy is empty and that may have admitted writes is still refused, and told to
+  move the partition with `admin promote`.
 
 ## Verification
 
@@ -163,8 +179,13 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
 - `s1a_a_declared_node_process_missing_routes_or_a_partition_record_is_refused`: `routes/0`, then
   `partitions/2`, deleted; node 1's open is refused and writes nothing. Red with the count
   comparison in `Db::open_spawning`, or the `Absent` guard in `check_others`, cut.
-- `s1a_a_declared_owner_wiped_before_any_write_stays_refused` (today's limit, #137) and
-  `s1a_a_declared_owner_wiped_after_acknowledged_writes_is_told_to_promote`.
+- `s1a_a_declared_owner_wiped_before_any_write_rolls_forward_a_later_partition` and
+  `s1a_a_declared_owner_wiped_before_any_write_rolls_forward_partition_1` (#137): the owner
+  roots, faults before activation, loses its folder and restarts; the partition keeps its owner,
+  every partition takes a write, and each write reads back after a restart. Each red with its
+  call site (`Db::decide_partition`, `Db::check`) refusing the owner's empty copy
+  unconditionally. `s1a_a_declared_owner_wiped_after_acknowledged_writes_is_told_to_promote`
+  keeps the refusal for an owner that may have admitted writes.
 - `s1a_restart_of_each_node_reopens_its_own_folder`,
   `s1a_declare_is_idempotent_and_refuses_a_changed_count`,
   `s1a_undeclared_partial_open_is_refused_as_before`,
@@ -184,5 +205,5 @@ All rows are in `crates/rdb-api/src/db/formation_tests.rs` unless named otherwis
 - [ADR-rdb-0008](0008-control-records-in-retcd.md): control records in rEtcd, which this extends.
 - `docs/rdb/design-specification.md` §7.1, authoritative records.
 - Issue #80 (multi-host formation), slice S1a; PR #138.
-- Issue #137: an owner that lost its folder right after forming stays refused.
+- Issue #137: an owner that lost its folder right after forming, before any write, rolls its root forward.
 - Rulings A-R231(a) and A-R328: what a node process may open on an empty folder.
