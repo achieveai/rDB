@@ -411,7 +411,9 @@ impl ProgressTracker {
 
     /// [`Self::on_ack`], also naming the copy the ACK advanced when all nine rules passed, and
     /// `None` when it was dropped. Routing hands a catch-up cursor only an ACK named here (lead
-    /// ruling B-R48; the cursor trusts what it is given).
+    /// ruling B-R48; the cursor trusts what it is given). A `SnapshotCatchupRequired` this
+    /// returns (rule 9, `NotRetained`) starts or re-arms a catching-up cursor in routing
+    /// (`Primary::await_snapshot`, issue #61 lead ruling 2026-11-22).
     pub fn ack_ladder(
         &mut self,
         from: &PeerLabel,
