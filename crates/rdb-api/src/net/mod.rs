@@ -155,6 +155,11 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// answers it today; the type changed all the same. The number is main's version + 1, set by the
 /// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
 /// as for `10`: every node and every linked app process together.
+///
+/// `13` came with #177: `WireCall::AckPossibleLoss` is new, `WireNodeStatus` gains
+/// `possible_loss`, and `WireHolding` gains `restored` and makes `owner_epoch` optional (`None`
+/// for a holding reported from a restored store). The number is main's version + 1, set at the
+/// pre-gate main merge. The upgrade is the same as for `10`.
 pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.

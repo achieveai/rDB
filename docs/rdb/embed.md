@@ -1678,8 +1678,9 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (12 at this commit:
-  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list), whether or not this setting is on. A
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (13 at this commit:
+  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13 #177's
+  possible-loss ack, status and restored holdings), whether or not this setting is on. A
   build before these guards speaks 9, even one that has this setting, and a build at 10 or 11 lacks
   the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
@@ -2000,8 +2001,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (12 at this commit: 10 for
-  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148), and the handshake
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (13 at this commit: 10 for
+  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148, 13 for #177), and the handshake
   refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.
