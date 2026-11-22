@@ -2696,11 +2696,7 @@ async fn replan(
             Ok(Ok(_)) => return Ok(()),
             Ok(Err(failed)) => failed,
             Err(_elapsed) => HealFailed {
-                error: HealError::Control(format!(
-                    "the re-plan of partition {} had no answer before the heal's deadline; \
-                     {STORE_STEP}",
-                    names_in_words(&contended.iter().map(|p| p.0).collect::<Vec<_>>())
-                )),
+                error: HealError::Control(replan_unfinished(&contended)),
                 transient: false,
             },
         };
@@ -2717,6 +2713,24 @@ async fn replan(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(REPLAN_RETRY_MAX);
     }
+}
+
+/// Why a re-plan of `contended` ended at the heal's deadline, with the next step. It names no
+/// one cause: the re-plan waits on the control store and also on every pinned member's
+/// handshake ([`member_boots`]), and the deadline can cut either wait (PR #218 review, round 3,
+/// thread kmMx).
+fn replan_unfinished(contended: &[PartitionId]) -> String {
+    let names: Vec<u32> = contended.iter().map(|partition| partition.0).collect();
+    let noun = if names.len() > 1 {
+        "partitions"
+    } else {
+        "partition"
+    };
+    format!(
+        "the re-plan of {noun} {} did not finish before the heal's deadline; open again once \
+         every member's node is up and the control store answers",
+        names_in_words(&names)
+    )
 }
 
 /// The owner's status for `partition`, or `None` when it does not answer by `until`.
@@ -8410,88 +8424,120 @@ mod tests {
         );
     }
 
-    /// PR #218 review, round 2 (thread jkxj): an established frozen wait (failover on, the
-    /// node's partition `Serving` at the first look) that then finds the partition `Fencing`,
-    /// and finds it so until the deadline, ends [`HealError::Frozen`] with the promote advice,
-    /// not the planner's, and writes and sends nothing.
+    /// PR #218 review, rounds 2 and 3 (threads jkxj, kmMu): an established frozen wait
+    /// (failover on, the node's partition `Serving` at the first look) that then finds the
+    /// partition `Fencing`, or `FencingDrained`, and finds it so until the deadline, ends
+    /// [`HealError::Frozen`] with the promote advice, not the planner's, and writes and sends
+    /// nothing.
+    /// The order is driven, not slept into (round 3): on paused tokio time the fence is written
+    /// once this round's `heal_grant_frozen_waiting` line is in the log, and the deadline comes
+    /// after it on the virtual clock, however late a loaded runner resumes the writer. The heal
+    /// is still bounded by `heal_failover`'s watchdog (3 × within + 2 s × scale).
     /// Cut, 2026-11-22, reverted and checked with `cmp`: the planner's step where a later look
     /// finds the fence. Red: the step was the planner's, "node 1 still owns partition 1, ...".
-    /// Unit (~1.5 s): `MemStore`.
+    /// Unit (well under 1 s per case): `MemStore`, paused time.
     #[config_log::retcd_test]
     fn i172_a_failover_heal_whose_wait_meets_a_lasting_fence_says_to_promote() {
         const METHOD: &str =
             "i172_a_failover_heal_whose_wait_meets_a_lasting_fence_says_to_promote";
-        let rt = runtime();
-        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let written = rooted(&*store, &rt, BootId(5));
-        frozen_grant(&*store, &rt);
-        let partitions = ControlKey::Partition(PARTITION).encode();
-        let grants = ControlKey::Grant(OWNER).encode();
-        let grant_before = revision_of(&*store, &rt, grants.clone());
-        let found = rt
-            .block_on(store.get(GetRequest {
-                key: Bytes::from(partitions.clone()),
-            }))
-            .expect("get")
-            .record
-            .expect("partitions/1");
-        let root = PartitionRoot::decode(&found.value).expect("root");
-        let fencing = PartitionRecord {
-            lifecycle: PartitionLifecycle::Fencing,
-            ..PartitionRecord::decode(&found.value).expect("record")
+        const WITHIN: Duration = Duration::from_millis(1500);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        for (round, lifecycle) in [
+            PartitionLifecycle::Fencing,
+            PartitionLifecycle::FencingDrained,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let written = rooted(&*store, &rt, BootId(5));
+            frozen_grant(&*store, &rt);
+            let partitions = ControlKey::Partition(PARTITION).encode();
+            let grants = ControlKey::Grant(OWNER).encode();
+            let grant_before = revision_of(&*store, &rt, grants.clone());
+            let found = rt
+                .block_on(store.get(GetRequest {
+                    key: Bytes::from(partitions.clone()),
+                }))
+                .expect("get")
+                .record
+                .expect("partitions/1");
+            let root = PartitionRoot::decode(&found.value).expect("root");
+            let fencing = PartitionRecord {
+                lifecycle,
+                ..PartitionRecord::decode(&found.value).expect("record")
+            }
+            .encode_with(&root);
+            let writer = Arc::clone(&store);
+            let fenced = std::sync::Mutex::new(None);
+            let fence = async {
+                let started = tokio::time::Instant::now();
+                // The wait has started: this round's line is in the log.
+                while undo_lines(METHOD, "heal_grant_frozen_waiting").len() <= round {
+                    assert!(
+                        started.elapsed() < WITHIN,
+                        "{lifecycle:?}: the frozen wait never started"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let revision = writer
+                    .put(PutRequest {
+                        key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+                        value: fencing,
+                        expected_mod_revision: Some(written),
+                        dedup: None,
+                    })
+                    .await
+                    .expect("a promote writes the fence")
+                    .revision;
+                *fenced.lock().expect("fenced") = Some((revision, started.elapsed()));
+            };
+            let (healed, sent) =
+                heal_failover(Arc::clone(&store), &rt, WITHIN, vec![PARTITION], 1, fence);
+            let (fenced, at) = fenced
+                .into_inner()
+                .expect("fenced")
+                .unwrap_or_else(|| panic!("{lifecycle:?}: the fence landed"));
+            assert!(
+                at < WITHIN,
+                "{lifecycle:?}: the fence was written before the deadline, {at:?} in"
+            );
+            assert_eq!(
+                (
+                    undo_lines(METHOD, "heal_grant_frozen_waiting").len(),
+                    undo_lines(METHOD, "heal_grant_frozen_fence_seen").len()
+                ),
+                (round + 1, round + 1),
+                "{lifecycle:?}: the wait had started and then saw the fence"
+            );
+            let refused = healed.expect_err("the grant stays frozen");
+            let HealError::Frozen { node: 1, step } = &refused else {
+                panic!("{lifecycle:?}: {refused:?}");
+            };
+            assert_eq!(
+                step,
+                "a takeover from node 1 is unfinished; run `admin promote <the node you chose>` \
+                 again",
+                "{lifecycle:?}"
+            );
+            assert!(!step.contains("planner"), "{lifecycle:?}: {step}");
+            assert!(
+                sent.is_empty(),
+                "{lifecycle:?}: the heal sent nothing: {sent:?}"
+            );
+            assert_eq!(
+                (
+                    revision_of(&*store, &rt, partitions),
+                    revision_of(&*store, &rt, grants)
+                ),
+                (fenced, grant_before),
+                "{lifecycle:?}: the heal wrote nothing"
+            );
         }
-        .encode_with(&root);
-        let writer = Arc::clone(&store);
-        let fenced = std::sync::Mutex::new(None);
-        let fence = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let revision = writer
-                .put(PutRequest {
-                    key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
-                    value: fencing,
-                    expected_mod_revision: Some(written),
-                    dedup: None,
-                })
-                .await
-                .expect("a promote writes Fencing")
-                .revision;
-            *fenced.lock().expect("fenced") = Some(revision);
-        };
-        let (healed, sent) = heal_failover(
-            Arc::clone(&store),
-            &rt,
-            Duration::from_millis(1500),
-            vec![PARTITION],
-            1,
-            fence,
-        );
-        let fenced = fenced
-            .into_inner()
-            .expect("fenced")
-            .expect("the fence landed");
-        assert!(
-            logged_here(METHOD, "heal_grant_frozen_waiting")
-                && logged_here(METHOD, "heal_grant_frozen_fence_seen"),
-            "the wait had started and then saw the fence"
-        );
-        let refused = healed.expect_err("the grant stays frozen");
-        let HealError::Frozen { node: 1, step } = &refused else {
-            panic!("{refused:?}");
-        };
-        assert_eq!(
-            step,
-            "a takeover from node 1 is unfinished; run `admin promote <the node you chose>` again"
-        );
-        assert!(!step.contains("planner"), "{step}");
-        assert!(sent.is_empty(), "the heal sent nothing: {sent:?}");
-        assert_eq!(
-            (
-                revision_of(&*store, &rt, partitions),
-                revision_of(&*store, &rt, grants)
-            ),
-            (fenced, grant_before),
-            "the heal wrote nothing"
-        );
     }
 
     /// Whether the log of this module's test `method` holds a line with message `message`.
@@ -8679,6 +8725,171 @@ mod tests {
         );
     }
 
+    /// PR #218 review, round 3 (thread kmMl): a re-plan whose first two tries each fail their
+    /// first `partitions/` read `Unavailable` is tried a third time within the deadline, and
+    /// sends each partition one plan and one fence; the watch then ends `Ok`.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: the retry loop stops after one retry.
+    /// Unit (~0.5 s): a [`Scripted`] store failing two lists.
+    #[config_log::retcd_test]
+    fn i172_a_heal_replan_after_two_transient_store_errors_tries_again() {
+        const METHOD: &str = "i172_a_heal_replan_after_two_transient_store_errors_tries_again";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script {
+            fail_lists: 2,
+            ..Script::default()
+        }));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, PartitionId(2), OWNER);
+        let (settled, sent) = settle(
+            Arc::clone(&store),
+            &rt,
+            Duration::from_secs(5),
+            vec![PARTITION, PartitionId(2)],
+            "Blocked(CasContention)",
+        );
+        assert_eq!(settled, Ok(()));
+        assert_eq!(
+            plans_and_fences(&sent),
+            [(1, "plan"), (1, "fence"), (2, "plan"), (2, "fence")]
+        );
+        assert_eq!(
+            undo_lines(METHOD, "heal_replan_retry").len(),
+            2,
+            "two retries were logged"
+        );
+        assert_eq!(
+            scripted.list_arrivals().len(),
+            4,
+            "two failed lists, then the third try's two reads"
+        );
+    }
+
+    /// PR #218 review, round 3 (thread kmMn): a re-plan whose first `partitions/` read fails
+    /// with an error no retry gets past (`PermissionDenied`) ends the watch with that error,
+    /// after that one read, and sends nothing, though every later read would answer.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: every failed read is marked transient.
+    /// Unit (~0.1 s): a [`Scripted`] store refusing one list.
+    #[config_log::retcd_test]
+    fn i172_a_heal_replan_with_a_definite_store_error_stops_before_sending() {
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script {
+            fail_list_with: Some(ConfigError::PermissionDenied {
+                detail: "scripted: the list was refused".to_owned(),
+            }),
+            ..Script::default()
+        }));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, PartitionId(2), OWNER);
+        let (settled, sent) = settle(
+            Arc::clone(&store),
+            &rt,
+            Duration::from_secs(5),
+            vec![PARTITION, PartitionId(2)],
+            "Blocked(CasContention)",
+        );
+        assert_eq!(
+            settled,
+            Err(HealError::Control(
+                "list partitions/: permission denied: scripted: the list was refused".to_owned()
+            ))
+        );
+        assert!(sent.is_empty(), "nothing sent: {sent:?}");
+        assert_eq!(scripted.list_arrivals().len(), 1, "one read, not retried");
+    }
+
+    /// PR #218 review, round 3 (thread kmMp): a re-plan whose fresh-record read (the second
+    /// `partitions/` read, after the members' boots) fails `Unavailable` is tried again within
+    /// the deadline and sends each partition one plan and one fence; the watch then ends `Ok`.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: that read's transient flag dropped.
+    /// Unit (~0.2 s): a [`Scripted`] store passing one list, then failing one.
+    #[config_log::retcd_test]
+    fn i172_a_heal_replan_after_its_fresh_record_read_fails_tries_again() {
+        const METHOD: &str = "i172_a_heal_replan_after_its_fresh_record_read_fails_tries_again";
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::new(Script {
+            pass_lists: 1,
+            fail_lists: 1,
+            ..Script::default()
+        }));
+        let store: Arc<dyn ConfigStore> = scripted.clone();
+        rooted(&*store, &rt, BootId(5));
+        rooted_copy(&*store, &rt, PartitionId(2), OWNER);
+        let (settled, sent) = settle(
+            Arc::clone(&store),
+            &rt,
+            Duration::from_secs(5),
+            vec![PARTITION, PartitionId(2)],
+            "Blocked(CasContention)",
+        );
+        assert_eq!(settled, Ok(()));
+        assert_eq!(
+            plans_and_fences(&sent),
+            [(1, "plan"), (1, "fence"), (2, "plan"), (2, "fence")]
+        );
+        let retries = undo_lines(METHOD, "heal_replan_retry");
+        assert_eq!(retries.len(), 1, "one retry was logged");
+        assert_eq!(
+            retries[0]["error"],
+            "control store: list partitions/: unavailable: scripted: the list failed"
+        );
+        assert_eq!(
+            scripted.list_arrivals().len(),
+            4,
+            "the members' read, the failed fresh read, then the retry's two"
+        );
+    }
+
+    /// PR #218 review, round 3 (thread kmMx): a re-plan that the deadline cuts while it waits for
+    /// a peer's handshake, with the store answering, gets advice that names both waits, never
+    /// the store's alone, and sends nothing. Paused tokio time, the deadline at 610 ms: off the
+    /// 20 ms polls of [`member_boots`], so the deadline ends it and not that wait's own check.
+    /// Cut, 2026-11-22, reverted and checked with `cmp`: the round-2 store-only advice.
+    /// Unit (well under 1 s): `MemStore`, paused time.
+    #[config_log::retcd_test]
+    fn i172_a_heal_replan_cut_while_a_peer_boot_is_unknown_does_not_blame_the_store() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        rooted(&*store, &rt, BootId(5));
+        let (owner, mailbox) = std::sync::mpsc::channel();
+        let ctx = HealCtx {
+            partition_count: 1,
+            nodes: crate::db::ALL_NODES.into(),
+            store,
+            boot: OPEN_2,
+            budgets: Budgets::SPEC_DEFAULTS,
+            clock: HostClock::start(),
+            owner,
+            within: Duration::from_secs(5),
+            // Only the owner's own boot is known: nodes 2 and 3 never shake hands.
+            member_boot: Arc::new(|node| (node == OWNER).then_some(OPEN_2)),
+            failover: false,
+            owner_node: OWNER,
+            partitions: vec![PARTITION],
+            bootstrap: Vec::new(),
+        };
+        let proved = HealProof(Gone::Absent(Revision(1)));
+        let ended = rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(610);
+            replan(&ctx, vec![PARTITION], proved, deadline).await
+        });
+        assert_eq!(
+            ended,
+            Err(HealError::Control(
+                "the re-plan of partition 1 did not finish before the heal's deadline; open \
+                 again once every member's node is up and the control store answers"
+                    .to_owned()
+            ))
+        );
+        let sent: Vec<Msg> = mailbox.try_iter().collect();
+        assert!(sent.is_empty(), "nothing sent: {sent:?}");
+    }
+
     /// PR #218 review, round 2 (thread jkxY): a re-plan whose store reads never answer is
     /// bounded by the watch's deadline: the watch ends at about that deadline with the cause,
     /// so `Db::wait_ready` stops waiting on the block, and nothing is sent.
@@ -8706,10 +8917,11 @@ mod tests {
         assert_eq!(gate.parked(), 1, "the re-plan's read parked");
         assert_eq!(
             settled,
-            Err(HealError::Control(format!(
-                "the re-plan of partition 1 and 2 had no answer before the heal's deadline; \
-                 {STORE_STEP}"
-            )))
+            Err(HealError::Control(
+                "the re-plan of partitions 1 and 2 did not finish before the heal's deadline; \
+                 open again once every member's node is up and the control store answers"
+                    .to_owned()
+            ))
         );
         assert!(sent.is_empty(), "nothing sent: {sent:?}");
         let late = Duration::from_millis(600)

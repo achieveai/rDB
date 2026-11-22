@@ -60,6 +60,12 @@ pub(crate) struct Script {
     pub(crate) fail_gets: u32,
     /// Lists still to fail with `Unavailable`, without reading (M9 S2a, scenario 2f).
     pub(crate) fail_lists: u32,
+    /// Lists still to let through before `fail_lists` applies (PR #218 review, round 3: a
+    /// heal's second `partitions/` read).
+    pub(crate) pass_lists: u32,
+    /// The next list fails with this, without reading (PR #218 review, round 3: an error no
+    /// retry gets past).
+    pub(crate) fail_list_with: Option<ConfigError>,
     /// Lists still to read and then hold their answer until [`Scripted::release_lists`]: a
     /// list in flight, whose snapshot is older than anything written after it read.
     pub(crate) hold_lists: u32,
@@ -249,10 +255,14 @@ impl ConfigStore for Scripted {
             .lock()
             .expect("lists")
             .push(tokio::time::Instant::now());
-        if self.take(|script| &mut script.fail_lists) {
+        if !self.take(|script| &mut script.pass_lists) && self.take(|script| &mut script.fail_lists)
+        {
             return Box::pin(std::future::ready(Err(ConfigError::Unavailable {
                 reason: "scripted: the list failed".to_owned(),
             })));
+        }
+        if let Some(error) = self.script.lock().expect("script").fail_list_with.take() {
+            return Box::pin(std::future::ready(Err(error)));
         }
         if self.take(|script| &mut script.block_lists) {
             return Box::pin(async move {

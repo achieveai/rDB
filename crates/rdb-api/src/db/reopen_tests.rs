@@ -471,6 +471,199 @@ impl ConfigStore for CasFault {
     }
 }
 
+// ---- #172 (PR #218 review, round 3): a failed re-plan's cause reaches `wait_ready` ----
+
+/// Where a [`ReplanReadFault`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplanStage {
+    /// Every call passes.
+    Off,
+    /// The next recovery CAS on `partitions/1` meets a conflict.
+    Armed,
+    /// The CAS met it; the next read of `partitions/1` (F1's, after the conflict) passes.
+    Conflicted,
+    /// Every read of `partitions/1` is refused from now on.
+    Refusing,
+}
+
+/// A `MemStore` that, once armed, makes the reopen's recovery CAS on `partitions/1` meet a
+/// conflict: it writes the record again unchanged first, so its revision moves past the fence's
+/// and nobody else owns it (`Blocked(CasContention)`). It lets F1's one read after that conflict
+/// through, then refuses every later read of `partitions/1` with `PermissionDenied`, an error
+/// no retry gets past: the first of them is the heal's re-plan's.
+struct ReplanReadFault {
+    inner: config_testkit::MemStore,
+    stage: Mutex<ReplanStage>,
+    /// Reads of `partitions/1` refused so far.
+    refused: AtomicU64,
+}
+
+impl ReplanReadFault {
+    fn new() -> Self {
+        Self {
+            inner: config_testkit::MemStore::new(),
+            stage: Mutex::new(ReplanStage::Off),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    fn stage(&self) -> ReplanStage {
+        *lock(&self.stage)
+    }
+}
+
+impl ConfigStore for ReplanReadFault {
+    fn get<'a, 'b>(
+        &'a self,
+        request: config_core::GetRequest,
+    ) -> Reply<'b, config_core::GetResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        if request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes() {
+            let mut stage = lock(&self.stage);
+            match *stage {
+                ReplanStage::Conflicted => *stage = ReplanStage::Refusing,
+                ReplanStage::Refusing => {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                    return Box::pin(std::future::ready(Err(
+                        config_core::ConfigError::PermissionDenied {
+                            detail: "scripted: the read was refused".to_owned(),
+                        },
+                    )));
+                }
+                ReplanStage::Off | ReplanStage::Armed => {}
+            }
+        }
+        self.inner.get(request)
+    }
+
+    fn list<'a, 'b>(
+        &'a self,
+        request: config_core::ListRequest,
+    ) -> Reply<'b, config_core::ListResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.list(request)
+    }
+
+    fn put<'a, 'b>(
+        &'a self,
+        request: config_core::PutRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let cas = request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes()
+                && request.expected_mod_revision != Some(0);
+            if cas && self.stage() == ReplanStage::Armed {
+                let found = self
+                    .inner
+                    .get(config_core::GetRequest {
+                        key: request.key.clone(),
+                    })
+                    .await?
+                    .record
+                    .expect("the reopen's CAS is over a record");
+                self.inner
+                    .put(config_core::PutRequest {
+                        key: request.key.clone(),
+                        value: found.value,
+                        expected_mod_revision: Some(found.mod_revision),
+                        dedup: None,
+                    })
+                    .await?;
+                *lock(&self.stage) = ReplanStage::Conflicted;
+            }
+            self.inner.put(request).await
+        })
+    }
+
+    fn delete<'a, 'b>(
+        &'a self,
+        request: config_core::DeleteRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.delete(request)
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn watch<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.watch(request)
+    }
+}
+
+/// PR #218 review, round 3 (thread kmMs): the reopen's heal hands node 1 its plan; the
+/// recovery CAS then meets a conflict on a record nobody else owns, so F1 blocks
+/// `CasContention` and the heal's watch plans it again. That re-plan's first read is refused
+/// with an error no retry gets past. Public `wait_ready` then answers `ReadyError::Heal` with
+/// that read's own words, not the block it left. `wait_ready` is called once the watch has
+/// logged `heal_replan_failed`, so its own owner reads cannot take F1's read.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: the watch's `HealState::Failed` update
+/// removed. Red: `Err(Blocked { owner: NodeId(1), reason: "CasContention" })`.
+/// Integration (~4 s): one fresh open until ready, one reopen.
+#[config_log::retcd_test]
+fn i172_a_wait_ready_reports_the_failed_replan_cause() {
+    const METHOD: &str = "i172_a_wait_ready_reports_the_failed_replan_cause";
+    let rt = runtime();
+    let faulty = Arc::new(ReplanReadFault::new());
+    let store: Arc<dyn ConfigStore> = faulty.clone();
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    *lock(&faulty.stage) = ReplanStage::Armed;
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + patience;
+    let logged = |message: &str| {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .count()
+    };
+    while logged("heal_replan_failed") == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-plan did not fail within {patience:?}: stage {:?}, heal {:?}, node 1 {:?}",
+            faulty.stage(),
+            db.heal_state(),
+            db.node_status().into_iter().next().map(|n| n.recovery)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(logged("heal_replan_after_conflict"), 1, "one re-plan");
+    assert_eq!(
+        faulty.refused.load(Ordering::Relaxed),
+        1,
+        "the re-plan's first read alone was refused, and not retried"
+    );
+    assert_eq!(
+        db.wait_ready(patience),
+        Err(ReadyError::Heal(admin::HealError::Control(
+            "get partitions/1: permission denied: scripted: the read was refused".to_owned()
+        )))
+    );
+    db.shutdown();
+}
+
 /// a=1 reads back, and a new write lands and reads back.
 fn reads_back_and_writes(db: &Db, case: &str) {
     let got = db
