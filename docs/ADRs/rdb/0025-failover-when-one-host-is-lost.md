@@ -487,8 +487,20 @@ The #207 count: on a plain 4-node ring, after the first loss, 0 partitions were 
 12 refilled). A stuck refill needs an earlier move or refill that emptied a first-placement
 seat.
 
-<!-- TODO (S4): row 4 (normal vs `promote: true`) and the Docker add d6 / remove d2 run
-(D2). -->
+In `crates/rdb-api/src/host/drop_tests.rs`, writes during a refill:
+
+- `s80s4_a_refill_keeps_writes_landing_with_2000_records` (row 4). Five nodes, node 3
+  dropped, 2,000 records preloaded, then a refill of node 4 with one put in flight at every
+  step. Until the refill is done and 50 more puts land, the longest gap between landed puts is
+  under 2 s, and the refill is done within 30 s (both scaled by `test_patience`). Node 1
+  re-plans at most 4 times. Every refused put is `no_mutation`, except `UNKNOWN_OUTCOME`,
+  whose count is at most the re-plans; each is settled by a read. Green: longest gap 332-493
+  ms, refill 7.6-9.4 s, 2 re-plans, `UNKNOWN_OUTCOME` 0 or 1 (the one had not landed). Cut:
+  `promote: true` in `refill_step`; red on the done-within check first, "not done within 90 s:
+  3884 puts landed, the longest gap 6.86 s". Not investigated: the cut's re-plan loop with
+  phase "other".
+
+<!-- TODO (S4): the Docker add d6 / remove d2 run (D2). -->
 
 ## References
 
