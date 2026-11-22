@@ -661,14 +661,14 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
     }))
 }
 
-/// The one fixture M7B-78 and its positive control share; `fault` is the only thing that differs
+/// The one fixture M7B-78 and its positive control share; `faults` is the only thing that differs
 /// (plan BA-6; review-l1 R3, tester-l1 D4). Node 1 holds `1..=40` of generation 7, synced; nodes
 /// 2 and 3 hold nothing. `Recovered` lands on all three at tick 0 (no F1 runs, so the members
 /// hear it from the seed, not a control watch). R1 catches both secondaries up from the root
 /// through `SendEnvelopes`, one host flush per secondary at tick 50 makes each durable, and R1's
 /// tracker reports the predicate durable through 40 to L1 as `DurableAdvanced`: nothing about
 /// durability or progress is seeded.
-fn resume_plan(fault: Option<StorageOp>) -> RunPlan {
+fn resume_plan(faults: &[StorageOp]) -> RunPlan {
     let history = canonical_history(resume_lineage(), C1, BARRIER).expect("a canonical history");
     let mut plan = RunPlan::new(rdb_sim::sim::cluster::ClusterConfig {
         partitions: vec![rdb_sim::sim::cluster::PartitionSpec {
@@ -695,7 +695,7 @@ fn resume_plan(fault: Option<StorageOp>) -> RunPlan {
         })
         .collect();
     plan.flushes = vec![(Tick(RESUME_FLUSH), B), (Tick(RESUME_FLUSH), C)];
-    plan.storage_ops = fault.into_iter().collect();
+    plan.storage_ops = faults.to_vec();
     plan.limits = RunLimits {
         max_events: 50_000,
         deadline: Tick(RESUME_DEADLINE),
@@ -713,8 +713,8 @@ struct ResumeRun {
     mode: Option<rdb_core::protection::Mode>,
 }
 
-fn resume_run(fault: Option<StorageOp>) -> ResumeRun {
-    let plan = resume_plan(fault);
+fn resume_run(faults: &[StorageOp]) -> ResumeRun {
+    let plan = resume_plan(faults);
     let mut runner = Runner::new(&plan).expect("a runner");
     let report = runner.run(plan.limits).expect("a run");
     assert!(
@@ -787,7 +787,7 @@ fn admissions(lines: &[TraceEvent]) -> Vec<(u64, bool)> {
 fn m7b_147_the_storage_backed_fixture_without_the_flush_fault_resumes() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
-    let run = resume_run(None);
+    let run = resume_run(&[]);
     assert_eq!(
         run.durable,
         (BARRIER, BARRIER, BARRIER),
@@ -820,10 +820,12 @@ fn m7b_147_the_storage_backed_fixture_without_the_flush_fault_resumes() {
 }
 
 /// M7B-78 (D §4.4 via R1 §3.3 `FlushFailed`; 0006 §4; gate V1; T-B-01). L1 is `Paused` at barrier
-/// 40, and C's one flush at 40 fails: `StorageOp::Fail{node C, fault: FlushFailed}` — the plan's
-/// `StorageOp::FailFlush` is spelled this way in the landed crate. C's durable watermark never
-/// reaches 40 in R1's tracker, so the predicate's floor stays below the barrier and nothing R1
-/// reports can satisfy it. L1 stays `Paused` for the run: every `protection_state` line on node 1
+/// 40, and B's and C's one flush at 40 each fail: `StorageOp::Fail{node, fault: FlushFailed}` —
+/// the plan's `StorageOp::FailFlush` is spelled this way in the landed crate. Neither durable
+/// watermark reaches 40 in R1's tracker, so the predicate's floor stays below the barrier and
+/// nothing R1 reports can satisfy it. Both fail since issue #79 (option A): the floor is the
+/// durable quorum, the primary and the better secondary, so B's success alone would carry it.
+/// L1 stays `Paused` for the run: every `protection_state` line on node 1
 /// has `phase != Resuming` and `phase != Healthy`, the last is `Paused`, admission is never
 /// allowed, and the live instance ends `Paused`.
 ///
@@ -837,7 +839,7 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
 
-    let control = resume_run(None);
+    let control = resume_run(&[]);
     assert!(
         phases(&control.lines)
             .iter()
@@ -845,12 +847,12 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
         "control: without the fault the same fixture resumes"
     );
 
-    let run = resume_run(Some(StorageOp::Fail {
-        node: C,
+    let run = resume_run(&[B, C].map(|node| StorageOp::Fail {
+        node,
         fault: StorageFault::FlushFailed,
     }));
     let (b, c, floor) = run.durable;
-    assert_eq!(b, BARRIER, "B's flush succeeded");
+    assert!(b < BARRIER, "B's failed flush proved nothing: {b}");
     assert!(c < BARRIER, "C's failed flush proved nothing: {c}");
     assert!(
         floor < BARRIER,

@@ -923,6 +923,7 @@ fn f1_slow_catch_up() -> RunPlan {
 /// landing and never catches up (`m10_land_link`), and under arm 3 one holding 19 catches up a
 /// single record, so either would no longer test the pin. Do not restore 20 or 19.
 #[retcd_test]
+#[ignore = "#79 option A: B and C are the durable quorum, so L1 no longer holds writes for A and P > C is reachable; rewritten for P > C in the #79 follow-up"]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());
     let caught_up = applied_on(&trace, A_NODE)
@@ -1376,6 +1377,10 @@ const F1Z_CORRUPT_AT: u64 = cases::M9_D3_A_BACK_AT + 20;
 
 fn f1_at_cutoff_zero() -> RunPlan {
     let mut plan = f1_at_cutoff_zero_unfaulted();
+    // Issue #79 (option A): B and C are the durable quorum, so L1 never pauses and sends A no
+    // keepalive. A write submitted while the CAS is held gives B the append to A to corrupt.
+    plan.seed
+        .push(submit_at(F1Z_CORRUPT_AT, 9_300, RequestId(300)));
     plan.steps.push(plan_next(
         F1Z_CORRUPT_AT,
         B_NODE,
@@ -1389,7 +1394,7 @@ fn f1_at_cutoff_zero() -> RunPlan {
 #[retcd_test]
 fn m9_f1_01_at_cutoff_zero_a_copy_quarantined_during_the_activation_cas_stays_out_and_the_others_take_every_write(
 ) {
-    f2_stays_out(&f1_at_cutoff_zero(), cases::M9_D3_A_BACK_AT + 103, 2);
+    f2_stays_out(&f1_at_cutoff_zero(), F1Z_CORRUPT_AT, 3);
 }
 
 /// K1's timeline (host walk A12 at 5c798ca, "early heal"): B and C survive an empty partition

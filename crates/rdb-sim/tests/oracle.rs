@@ -2677,7 +2677,8 @@ fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
 /// self minus lost). Clause (a) quantifies over the pinned set less the copies the resume line
 /// names lost: n3 lost and short of the barrier, the other two at it, is a legal resume. Near-
 /// misses: the lost set excuses only its own nodes, so n1 short beside a lost n3 still reports n1
-/// alone; and the same run with nothing lost reports n3, as before the field existed.
+/// alone. Since issue #79 (option A) the same run with nothing lost is legal too: n1 and n2 are
+/// the durable quorum. It reported n3 before.
 #[retcd_test]
 fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     support::preamble();
@@ -2696,16 +2697,9 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
         signature.detail
     );
 
-    let signature = violated(
-        &judge(&n3_short()),
-        Invariant::Lag,
-        "resume_without_every_pinned_copy",
-    );
-    assert!(
-        signature.detail.contains("node(s) 3 short"),
-        "{}",
-        signature.detail
-    );
+    // Issue #79 (option A): the same run with nothing lost is legal too now. n3 short beside
+    // the primary and n2 at the barrier is the durable quorum (it reported n3 before #79).
+    proven(&judge(&n3_short()), Invariant::Lag);
 }
 
 #[retcd_test]
