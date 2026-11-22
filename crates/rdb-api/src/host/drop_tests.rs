@@ -9366,6 +9366,93 @@ fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afres
     rebuilt(&mut trio, METHOD, floor);
 }
 
+/// Issue #61 PR #204 review, item 13: a rebuild watch whose required copy is still being sent a
+/// snapshot does not name a stall. As S2-R1, with node 1 holding page 1 so node 3's transfer
+/// runs longer than the watch, node 1 holds a `ReadOnly` watch that requires node 3's copy,
+/// and its check runs while the transfer is live: no `recovery_rebuild_stalled`, nothing in
+/// `Host.stalled`, the check re-armed (`rebuild_check_transfer_live`). The pages are released
+/// and the rebuild completes with no stall line before `snapshot_transfer_installed`. Control:
+/// the same check after the transfer has ended does name the stall, so the row would see one.
+/// Cut: the check ignores live transfers, red (the stall line before the install).
+/// Integration (~3 s): S2-R1's setup and a watch set on node 1.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live() {
+    const METHOD: &str =
+        "t61_pr204_a_rebuild_watch_names_no_stall_while_a_snapshot_to_its_copy_is_live";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let owner = &mut trio.nodes[0].0;
+    let generation = owner.transfers[&(p, three)].lineage.generation;
+    let now = owner.clock.now();
+    owner.rebuild_pin_wait_millis = 50;
+    owner.rebuilds.insert(
+        p,
+        RebuildWatch {
+            generation,
+            mode: PartitionMode::ReadOnly,
+            cutoff: Seq::ZERO,
+            required: vec![three],
+            since: now,
+            pinned: false,
+            unproven: BTreeSet::new(),
+            unreported: false,
+        },
+    );
+    owner.rebuild_check(p, generation);
+    assert!(
+        logged!(METHOD, "recovery_rebuild_stalled").is_empty(),
+        "no stall while live"
+    );
+    assert!(!owner.stalled.contains_key(&p), "nothing in the status");
+    let live = logged!(METHOD, "rebuild_check_transfer_live");
+    assert_eq!(live.len(), 1, "{live:?}");
+    // The held pull is not sent again by itself: answer node 3's cursor.
+    let install = trio.nodes[2].0.installs[&p].clone();
+    let pull = SnapshotPull {
+        partition: p,
+        generation: install.offer.lineage.generation,
+        at: install.offer.at,
+        copy: install.offer.copy,
+        node: NodeId(3),
+        after: install.after.clone(),
+        prev: install.chain,
+    };
+    trio.nodes[0].0.snapshot_pages_held_from = None;
+    trio.nodes[0].0.snapshot_pull(pull);
+    rebuilt(&mut trio, METHOD, floor);
+    let installed = logged!(METHOD, "snapshot_transfer_installed");
+    let stalled = logged!(METHOD, "recovery_rebuild_stalled");
+    assert!(
+        stalled
+            .iter()
+            .all(|line| line["@t"].as_str() > installed[0]["@t"].as_str()),
+        "no stall before the install: {stalled:?}"
+    );
+    // Control: with the transfer ended, the same check names the stall.
+    trio.until("node 1 ended the transfer", |trio| {
+        (!trio.nodes[0].0.transfers.contains_key(&(p, three))).then_some(())
+    });
+    let before = logged!(METHOD, "recovery_rebuild_stalled").len();
+    let owner = &mut trio.nodes[0].0;
+    owner.rebuild_check(p, generation);
+    assert_eq!(
+        logged!(METHOD, "recovery_rebuild_stalled").len(),
+        before + 1,
+        "the check reaches the stall line once no transfer is live"
+    );
+    assert!(owner.stalled.contains_key(&p));
+}
+
 /// Issue #61 PR #204 review, the page byte cap: as S2-R1, with 30 values of 100 KiB, pages of
 /// up to 1,024 keys (the default) and a 1 MiB byte cap. A page by key count alone would carry
 /// all 3 MB at once, the way 1,024 such values pass the 64 MiB frame. Every page node 3 writes

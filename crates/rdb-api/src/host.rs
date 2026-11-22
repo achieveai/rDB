@@ -11158,7 +11158,42 @@ impl Host {
             );
             return;
         }
-        let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
+        // PR #204 review (item 13): a required copy this node is sending a snapshot to, with a
+        // page pulled within `SNAPSHOT_IDLE_MILLIS`, is being rebuilt, not stalled: the check
+        // waits another pin wait instead of naming a stall. A transfer left idle that long is
+        // abandoned (`transfer_duty`), so a dead one still reaches the line.
+        let now = self.clock.now();
+        let live: Vec<(u8, u64)> = watch
+            .required
+            .iter()
+            .filter_map(|copy| {
+                self.transfers
+                    .get(&(partition, *copy))
+                    .filter(|transfer| {
+                        HostClock::millis_until(transfer.touched, now)
+                            < snapshot::SNAPSHOT_IDLE_MILLIS
+                    })
+                    .map(|transfer| (copy.0, transfer.pages))
+            })
+            .collect();
+        if !live.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                transfers = ?live,
+                "rebuild_check_transfer_live"
+            );
+            self.delay(
+                now.plus_millis(self.rebuild_pin_wait_millis),
+                Delayed::RebuildCheck {
+                    partition,
+                    generation,
+                },
+            );
+            return;
+        }
+        let waited_ms = now.0.saturating_sub(watch.since.0);
         let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
         let phase = f1_phase
             .as_ref()
