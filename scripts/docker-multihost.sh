@@ -1072,22 +1072,43 @@ elif mode == "members":
     members(args[0], args[1], int(args[2]), ids(args[3]),
             [a for a in args[4].split(",") if a and a != "-"])
 elif mode == "a10pick":
-    # The owner, other than the new node, of the most partitions that hold the new node as a
-    # regular copy: `O P,P,..`; exit 1 when the new node is a regular copy nowhere.
-    new, held = int(args[0]), {}
+    # planner.rs `choose_target`: of the regular copies left, the highest (generation, applied)
+    # wins, and a tie goes to index `partition mod count` of the tied nodes in node order. An
+    # app session sees no copy's applied position, but on a quiet rig the copies left tie, so
+    # the tie rule decides. Picks the owner, other than the new node, of the most partitions
+    # the new node wins that way: `O P,P,..`. With none, the owner of the most partitions that
+    # hold the new node as a regular copy, which may then not exercise A10. Exit 1 when the new
+    # node is a regular copy nowhere.
+    new, wins, held = int(args[0]), {}, {}
     for p, (owner, _, listed) in sorted(status(args[1]).items()):
-        if owner != new and (new, "regular") in listed:
-            held.setdefault(owner, []).append(p)
-    if not held:
+        if owner == new or (new, "regular") not in listed:
+            continue
+        held.setdefault(owner, []).append(p)
+        left = sorted(node for node, role in listed if node != owner and role != "shadow")
+        if left[p % len(left)] == new:
+            wins.setdefault(owner, []).append(p)
+    pool = wins or held
+    if not pool:
         print(f"node {new} is a regular copy of no partition")
         sys.exit(1)
-    owner = max(sorted(held), key=lambda o: len(held[o]))
-    print(owner, ",".join(str(p) for p in held[owner]))
+    owner = max(sorted(pool), key=lambda o: len(pool[o]))
+    print(owner, ",".join(str(p) for p in pool[owner]))
 elif mode == "a10won":
-    # Of the partitions P,.. the killed owner held with the new node a copy, those it now owns.
-    won = [p for p in owners_of(int(args[0]), args[2]) if p in ids(args[1])]
-    print(",".join(str(p) for p in won) or "-")
-    sys.exit(0 if won else 1)
+    # Of the partitions P,.. the killed owner held with the new node a copy, those the new node
+    # now owns (exit 0). When it owns none of them and none is still the killed owner's (args:
+    # NEW PARTS STATUS KILLED), failover chose other copies: exit 3, naming them, which A10
+    # reports NOT EXERCISED. Exit 1 when one is unread or still the killed owner's.
+    new, parts, now, killed = int(args[0]), ids(args[1]), status(args[2]), int(args[3])
+    won = [p for p in parts if p in now and now[p][0] == new]
+    if won:
+        print(",".join(str(p) for p in won))
+        sys.exit(0)
+    stuck = [p for p in parts if p not in now or now[p][0] == killed]
+    if stuck:
+        print(f"partitions {stuck} are unread or still owned by node {killed}")
+        sys.exit(1)
+    print("failover chose " + ", ".join(f"node {now[p][0]} for partition {p}" for p in parts))
+    sys.exit(3)
 else:
     die(f"unknown mode {mode}")
 PY
@@ -1789,18 +1810,32 @@ PY
     # A9: another CA's node, a second node on one machine, and the 9th id are all refused.
     a9 "$tmp"
 
-    if [ "$FAILS" = 0 ]; then say "check-members: all passed"; else say "check-members: $FAILS failed"; fi
+    if [ "$FAILS" = 0 ]; then say "check-members: all passed, $NOTEX not exercised"; else say "check-members: $FAILS failed, $NOTEX not exercised"; fi
     [ "$FAILS" = 0 ]
 }
 
+# a10won's answer to a verdict: 0 sets A10_WRITE (write there), 3 is NOT EXERCISED (failover
+# chose another copy, a choice the rig made, not a defect), anything else FAILs.
+NOTEX=0
+unexercised() { echo "NOT EXERCISED $1"; NOTEX=$((NOTEX + 1)); }
+a10_verdict() { # rc, line
+    A10_WRITE=0
+    case "$1" in
+        0) A10_WRITE=1 ;;
+        3) unexercised "A10: $2" ;;
+        *) verdict "A10 the new node's partitions after the kill could be read: $2" 1 ;;
+    esac
+}
+
 a10() { # new node, scratch
-    local n="$1" tmp="$2" pick o parts left=x won since deadline
+    local n="$1" tmp="$2" pick o parts left=x won since deadline m
+    A10_WRITE=0
     session_run "$tmp/a10-pre.out" "admin status"
     pick="$(analyze a10pick "$n" "$tmp/a10-pre.out")" || { verdict "A10 $pick" 1; return; }
     o="${pick%% *}"; parts="${pick#* }"
     docker kill "$NAME-d$o" > /dev/null || { verdict "A10 docker kill $NAME-d$o" 1; return; }
     KILLED="$KILLED $NAME-d$o"
-    say "A10: killed $NAME-d$o, owner of partitions $parts where node $n is a regular copy"
+    say "A10: killed $NAME-d$o, owner of partitions $parts, where node $n wins choose_target's tie rule"
     deadline=$((SECONDS + 60))
     while [ "$SECONDS" -lt "$deadline" ]; do
         left="$(owned_now "$o" "$tmp/a10-post.out")" && [ "$left" = 0 ] && break
@@ -1808,9 +1843,10 @@ a10() { # new node, scratch
     done
     if [ "$left" != 0 ]; then
         verdict "A10 within 60 s node $o owns nothing (still ${left:-unread})" 1
-    elif ! won="$(analyze a10won "$n" "$parts" "$tmp/a10-post.out")"; then
-        verdict "A10 node $n was chosen owner of one of $parts (it was not; nothing to write there)" 1
     else
+        won="$(analyze a10won "$n" "$parts" "$tmp/a10-post.out" "$o")"; a10_verdict "$?" "$won"
+    fi
+    if [ "${A10_WRITE:-0}" = 1 ]; then
         awk -v won=",$won," 'index(won, "," $1 ",")' "$tmp/groups" > "$tmp/a10.groups"
         local nonce; nonce="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
         {
@@ -1824,6 +1860,21 @@ a10() { # new node, scratch
         local ok; ok="$(read_check "$tmp/a10.out" "$tmp/a10.groups" "$nonce")"
         verdict "A10 a new app session wrote and read back partitions $won, now owned by node $n ($ok)" $?
     fi
+    # The planner's own reasons: its promote decisions for those partitions.
+    for m in $(live_ids); do
+        [ "$m" = "$o" ] && continue
+        docker exec "$NAME-d$m" sh -c 'grep -rh planner_promote_decision /data/logs' 2>/dev/null
+    done | python3 -I -c '
+import json, sys
+parts = {int(p) for p in sys.argv[1].split(",")}
+for line in sys.stdin:
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if e.get("partition") in parts and e.get("dead") == int(sys.argv[2]):
+        print(f"  decision partition={e[\"partition\"]} to={e.get(\"to\")} generation={e.get(\"generation\")} applied={e.get(\"applied\")}")
+' "$parts" "$o"
     since="$(date +%s)"
     docker start "$NAME-d$o" > /dev/null && KILLED="${KILLED/ $NAME-d$o/}"
     node_ready_since "$o" "$since" 60; verdict "A10 node $o ready again within 60 s" $?
@@ -2612,11 +2663,39 @@ selftest_s4() {
     # a10pick and a10won.
     { s4_status "[4:owner,5:regular,6:regular]"
       echo "partitions/3 rev=7 PartitionRecord { owner: NodeId(4), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=[4:owner,1:regular,6:regular]"; } > "$t/a10.pre"
-    [ "$(analyze a10pick 6 "$t/a10.pre")" = "4 2,3" ]; st "a10pick names the owner most often beside the new node" $?
+    # Node 6 wins partition 1 (owner 1) and 3 (owner 4) on the tie, one each: the lower id.
+    [ "$(analyze a10pick 6 "$t/a10.pre")" = "1 1" ]; st "a10pick keeps only the partitions the new node wins on a tie" $?
+    # Owner 4 shares 4 partitions with node 6 but loses 3 of them on the tie (p mod 2 = 0);
+    # owner 1 shares 3, and node 6 wins 2: owner 1 is picked.
+    s4_part() { # partition, owner, members
+        echo "partitions/$1 rev=9 PartitionRecord { owner: NodeId($2), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=$3"
+    }
+    { s4_part 2 4 "[4:owner,5:regular,6:regular]"; s4_part 3 4 "[4:owner,1:regular,6:regular]"
+      s4_part 6 4 "[4:owner,3:regular,6:regular]"; s4_part 8 4 "[4:owner,5:regular,6:regular]"
+      s4_part 4 1 "[1:owner,3:regular,6:regular]"; s4_part 5 1 "[1:owner,3:regular,6:regular]"
+      s4_part 7 1 "[1:owner,2:regular,6:regular,5:shadow]"; } > "$t/a10.tie"
+    out="$(analyze a10pick 6 "$t/a10.tie")"
+    [ "$out" = "1 5,7" ]; st "a10pick picks the owner whose partitions node 6 wins by choose_target's tie rule ($out)" $?
+    { s4_part 2 4 "[4:owner,5:regular,6:regular]"; } > "$t/a10.lose"
+    out="$(analyze a10pick 6 "$t/a10.lose")"
+    [ "$out" = "4 2" ]; st "a10pick falls back to a shared partition when node 6 wins none ($out)" $?
     fails analyze a10pick 7 "$t/stat.two" > /dev/null; st "a10pick fails where the new node is a copy nowhere" $?
     s4_status "[6:owner,5:regular,1:regular]" | sed 's/NodeId(4)/NodeId(6)/' > "$t/a10.post"
-    [ "$(analyze a10won 6 2,3 "$t/a10.post")" = 2 ]; st "a10won lists what the new node now owns" $?
-    fails analyze a10won 5 2,3 "$t/a10.post" > /dev/null; st "a10won fails when the new node owns none" $?
+    [ "$(analyze a10won 6 2,3 "$t/a10.post" 4)" = 2 ]; st "a10won lists what the new node now owns" $?
+    { s4_part 2 5 "[5:owner,6:regular]"; s4_part 3 1 "[1:owner,6:regular]"; } > "$t/a10.other"
+    out="$(analyze a10won 6 2,3 "$t/a10.other" 4)"; rc=$?
+    [ "$rc" = 3 ] && [ "$out" = "failover chose node 5 for partition 2, node 1 for partition 3" ]
+    st "a10won answers 3, naming the choice, when failover chose other copies (exit $rc: $out)" $?
+    out="$(analyze a10won 6 2,3 "$t/a10.pre" 4)"; rc=$?
+    [ "$rc" = 1 ]; st "a10won fails while the killed owner still owns them (exit $rc: $out)" $?
+    out="$( FAILS=0 NOTEX=0; a10_verdict 3 "failover chose node 5 for partition 2"; echo "fails=$FAILS notex=$NOTEX write=$A10_WRITE")"
+    [ "$out" = $'NOT EXERCISED A10: failover chose node 5 for partition 2\nfails=0 notex=1 write=0' ]
+    st "a10_verdict reports another copy's promote as NOT EXERCISED, neither PASS nor FAIL" $?
+    out="$( FAILS=0 NOTEX=0; a10_verdict 1 "unread"; echo "fails=$FAILS notex=$NOTEX write=$A10_WRITE")"
+    [ "$out" = $'FAIL A10 the new node\'s partitions after the kill could be read: unread\nfails=1 notex=0 write=0' ]
+    st "a10_verdict FAILs an unread or stuck answer" $?
+    out="$( FAILS=0 NOTEX=0; a10_verdict 0 "2"; echo "fails=$FAILS notex=$NOTEX write=$A10_WRITE")"
+    [ "$out" = "fails=0 notex=0 write=1" ]; st "a10_verdict sends a won partition on to the write" $?
     # nodes.txt helpers.
     out="$( NODES=5 NODES_TXT=""; live_ids | tr '\n' ' ')"
     [ "$out" = "1 2 3 4 5 " ]; st "live_ids is 1..NODES before nodes.txt" $?
