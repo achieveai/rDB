@@ -519,6 +519,100 @@ mod tests {
         });
     }
 
+    /// An `AsyncDb` over a fresh database on `rt`, ready.
+    fn opened(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> AsyncDb {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            failover: None,
+            partitions: Some(4),
+            ack_floor: true,
+            dir: dir.to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+            dedup_cap: None,
+            dedup_retention: None,
+            local: ALL_NODES.to_vec(),
+            links: None,
+            client: DEFAULT_CLIENT,
+            boot: None,
+            storage: crate::StorageOptions::default(),
+            addresses: None,
+        };
+        let handle = rt.handle().clone();
+        rt.block_on(async move {
+            let db = Db::open(config, store, handle).await.expect("open");
+            let db = AsyncDb::new(Arc::new(db));
+            db.wait_ready(Duration::from_secs(30)).await.expect("ready");
+            db
+        })
+    }
+
+    /// PR #178 review r3 T32: a bridge still registering holds the `Db` (its count first,
+    /// then the `Arc`, as `ownership_events`'s bridge does). `shutdown` stays pending while it
+    /// holds them and answers `Ok` once it lets go. Cut: `shutdown` answers `Err(self)` at once
+    /// on a failed `try_unwrap`: red, it is finished before the release. Integration: one
+    /// database open.
+    #[config_log::retcd_test]
+    fn shutdown_waits_for_a_registering_bridge() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = config_testkit::fs::temp_dir();
+        let db = opened(&rt, dir.path());
+        rt.block_on(async move {
+            let registration = super::Registration::new(Arc::clone(&db.registering));
+            let bridge = Arc::clone(&db.db);
+            let shut = tokio::spawn(db.shutdown());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !shut.is_finished(),
+                "shutdown waits while a bridge registers"
+            );
+            drop(bridge);
+            drop(registration);
+            let shut = tokio::time::timeout(Duration::from_secs(30), shut)
+                .await
+                .expect("shutdown ends once the bridge lets go")
+                .expect("the shutdown task");
+            assert!(shut.is_ok(), "no other clone is alive");
+        });
+    }
+
+    /// PR #178 review r3 T32 companion: with a live application clone, `shutdown` answers
+    /// `Err(self)` at once, even while a bridge registers, and the handle it hands back still
+    /// answers. Cut: never answer `Err` while a bridge is counted (`if false` on the clone
+    /// check): red, it waits past the 5 s bound. Integration: one database open.
+    #[config_log::retcd_test]
+    fn shutdown_answers_a_live_clone_at_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = config_testkit::fs::temp_dir();
+        let db = opened(&rt, dir.path());
+        rt.block_on(async move {
+            let registration = super::Registration::new(Arc::clone(&db.registering));
+            let bridge = Arc::clone(&db.db);
+            let app = db.clone();
+            let start = Instant::now();
+            let back = tokio::time::timeout(Duration::from_secs(5), db.shutdown())
+                .await
+                .expect("shutdown answers a live clone at once")
+                .expect_err("an application clone is alive");
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                start.elapsed()
+            );
+            back.route(super::AffinityId(1))
+                .await
+                .expect("the handle it hands back still answers");
+            drop((app, bridge, registration));
+            assert!(back.shutdown().await.is_ok(), "no other clone is alive");
+        });
+    }
+
     /// PR #178 review r1: a put the blocking pool never ran sent nothing, so it says
     /// `no_mutation` and its step sends it again as a new write, not a status look. Cut: drop
     /// the `no_mutation = true` line: red.
