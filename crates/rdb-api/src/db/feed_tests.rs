@@ -2095,3 +2095,118 @@ fn f87_3_a_failed_control_read_is_named_in_the_refusal() {
     assert!(failed.chars().count() <= 203, "{failed}");
     drop(procs.nodes);
 }
+
+/// Review r6 (thread 4655953455): a restart stops and starts its node outside the node lock, so
+/// while node 2's restart waits in its WAL join, a feed read from node 3 in the same `Db` is
+/// served, and the restart state reads (`Db::restart_note`, `Db::boot_of`) answer; node 2 stays
+/// protected: a feed call sent to it meanwhile waits and is answered by the restarted node,
+/// never dropped unanswered or refused as a stopped thread. Node 2's next WAL sync is held
+/// (`host::hold_sync`), a put makes one, and the restart is logged `node_restart_stopping`
+/// before its join.
+/// Cuts: `Db::nodes_for` waiting on every restart, red (node 3's read waits for the release);
+/// `Db::restart_note` taking the settled lock, red (the note waits for the release).
+/// Integration (~5 s): one open, one restart.
+#[config_log::retcd_test]
+fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
+    const METHOD: &str = "f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = Arc::new(opened(&rt, dir.path(), &store));
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    let three = Source::Node(NodeId(3));
+    let _ = tail(&db, FeedCursor::START, three, k1.seq);
+    let old_boot = db.boot_of(NodeId(2)).expect("node 2 runs");
+    let (held, release) = crate::host::hold_sync(&dir.path().join("nodes").join("2"));
+    let put = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.put(b"k2", b"two", None))
+    };
+    held.recv_timeout(patience())
+        .expect("node 2's next WAL sync is held");
+    let restart = {
+        let db = Arc::clone(&db);
+        // In this row's span, so its `node_restart_stopping` line is in this row's log.
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _span = span.enter();
+            db.restart_node(NodeId(2))
+        })
+    };
+    let deadline = Instant::now() + patience();
+    while !config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+        .iter()
+        .any(|line| line["@m"] == "node_restart_stopping" && line["node"] == 2)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "node 2's restart never stopped it"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Sent while the join is held: it must wait for the restart, not reach the old handle.
+    let to_two = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)))
+        })
+    };
+    let (read, answered) = mpsc::channel();
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _ = read.send(page_from(&db, FeedCursor::START, three));
+        });
+    }
+    let page = answered
+        .recv_timeout(patience())
+        .expect("node 3 serves a feed read while node 2's join is held");
+    assert!(
+        matches!(&page, FeedPage::Records { records, .. } if !records.is_empty()),
+        "{page:?}"
+    );
+    let (noted, note) = mpsc::channel();
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _ = noted.send((db.restart_note(), db.boot_of(NodeId(2))));
+        });
+    }
+    let (_, boot) = note
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the restart state reads answer while node 2's join is held");
+    assert_eq!(
+        boot,
+        Some(old_boot),
+        "mid-restart, node 2 is at its old boot"
+    );
+    assert!(
+        !restart.is_finished(),
+        "the restart still waits in its join"
+    );
+    assert!(
+        !to_two.is_finished(),
+        "a call to node 2 waits for its restart"
+    );
+    drop(release);
+    let boot = restart
+        .join()
+        .expect("the restart thread")
+        .expect("node 2 restarted");
+    assert!(boot > old_boot, "{boot:?} after {old_boot:?}");
+    let answer = to_two.join().expect("the node 2 caller");
+    if let Err(error) = &answer {
+        assert!(
+            !error.detail.contains("dropped the feed call unanswered")
+                && !error.detail.contains("node thread has stopped"),
+            "the call reached the half-restarted node: {error:?}"
+        );
+    }
+    put.join().expect("the put thread").expect("k2");
+}

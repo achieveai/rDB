@@ -1534,6 +1534,10 @@ pub struct NodeHandle {
     /// Set when a restart did not start this node again: `boot` is then the boot it was
     /// given, and no process runs it (F-013).
     pub(crate) start_failed: bool,
+    /// Set while [`crate::Db::restart_node`] stops and starts this node outside the node lock
+    /// (#170 review r6): a call to this node waits until the restart is over, while calls to
+    /// the other nodes go on.
+    pub(crate) restarting: bool,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
     /// The node's published views, for `Db::ownership` and `Db::still_owner` (#84).
@@ -1565,6 +1569,7 @@ impl NodeHandle {
                 node,
                 boot: BOOT,
                 start_failed: false,
+                restarting: false,
                 tx,
                 join: None,
                 owner_views: OwnerViews::new(node, HostClock::start()),
@@ -1575,14 +1580,26 @@ impl NodeHandle {
 
     /// Ask the thread to stop and wait for it.
     pub fn stop(&mut self) {
+        let join = self.ask_stop();
+        Self::await_stop(self.node, join, &self.owner_views);
+    }
+
+    /// Ask the thread to stop, and hand back its join for [`Self::await_stop`]: a restart waits
+    /// for it outside the node lock (#170 review r6).
+    pub(crate) fn ask_stop(&mut self) -> Option<JoinHandle<()>> {
         let _ = self.tx.send(Msg::Stop);
-        if let Some(join) = self.join.take() {
+        self.join.take()
+    }
+
+    /// Wait for `node`'s thread, asked to stop by [`Self::ask_stop`], to end.
+    pub(crate) fn await_stop(node: NodeId, join: Option<JoinHandle<()>>, owner_views: &OwnerViews) {
+        if let Some(join) = join {
             if join.join().is_err() {
-                tracing::error!(node = self.node.0, "node_thread_panicked");
+                tracing::error!(node = node.0, "node_thread_panicked");
             }
         }
         // A stopped node admits nothing, so it owns nothing (#84).
-        self.owner_views.clear();
+        owner_views.clear();
     }
 }
 
@@ -1702,6 +1719,7 @@ pub(crate) fn spawn_on(
         node,
         boot,
         start_failed: false,
+        restarting: false,
         tx,
         join: Some(join),
         owner_views,

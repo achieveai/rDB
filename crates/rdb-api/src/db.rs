@@ -611,6 +611,9 @@ struct Opened {
     /// database, otherwise [`ALL_NODES`]. Every node this `Db` starts, a restarted one too, is
     /// given it, so an owner re-seats the copies its partition was placed on.
     nodes: Arc<[NodeId]>,
+    /// Woken when a node's restart ends ([`NodeHandle::restarting`] cleared), for the calls
+    /// that wait on it (#170 review r6).
+    restarted: std::sync::Condvar,
 }
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
@@ -654,6 +657,7 @@ impl Default for Opened {
             instance: None,
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
+            restarted: std::sync::Condvar::new(),
         }
     }
 }
@@ -2940,12 +2944,13 @@ impl Db {
     }
 
     /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
-    /// an answer is awaited. A node this process does not run is reached over the peer links,
+    /// an answer is awaited. A node mid-restart is waited for; a send to another node is not
+    /// ([`Self::nodes_for`]). A node this process does not run is reached over the peer links,
     /// whatever their holds (ruling A-R226 h1): in a three-process database the owner is
     /// usually another process.
     fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
         {
-            let nodes = lock(&self.nodes);
+            let nodes = self.nodes_for(node);
             if let Some(handle) = nodes.iter().find(|handle| handle.node == node) {
                 return handle.send(msg);
             }
@@ -4312,7 +4317,8 @@ impl Db {
     #[must_use]
     pub fn ownership_events(&self) -> OwnershipEvents {
         let (subscriber, events) = Subscriber::new(SUBSCRIBER_CAPACITY);
-        let nodes = lock(&self.nodes);
+        // Every node is sent the subscriber, so none may be mid-restart.
+        let nodes = self.nodes_settled();
         let mut missing = BTreeSet::new();
         for handle in nodes.iter() {
             if handle.start_failed {
@@ -4457,7 +4463,8 @@ impl Db {
             how,
             reply,
         };
-        let sent = lock(&self.nodes)
+        let sent = self
+            .nodes_for(node)
             .iter()
             .find(|handle| handle.node == node)
             .map(|handle| handle.send(msg));
@@ -4505,7 +4512,8 @@ impl Db {
             seqs,
             reply,
         };
-        let sent = lock(&self.nodes)
+        let sent = self
+            .nodes_for(node)
             .iter()
             .find(|handle| handle.node == node)
             .map(|handle| handle.send(msg));
@@ -4541,7 +4549,8 @@ impl Db {
             generation,
             reply,
         };
-        let sent = lock(&self.nodes)
+        let sent = self
+            .nodes_for(node)
             .iter()
             .find(|handle| handle.node == node)
             .map(|handle| handle.send(msg));
@@ -4737,6 +4746,32 @@ impl Db {
             )),
             stuck => Some(stuck.to_string()),
         }
+    }
+
+    /// The node lock, taken once `node` is not mid-restart (#170 review r6): a restart stops
+    /// and starts a node outside the lock, so a call that sends to that node waits here, and a
+    /// call to another node does not. Reads that only look at the handles take the lock as it
+    /// is: they see a node mid-restart at its old boot, with no ownership.
+    fn nodes_for(&self, node: NodeId) -> MutexGuard<'_, Vec<NodeHandle>> {
+        self.opened
+            .restarted
+            .wait_while(lock(&self.nodes), |nodes| {
+                nodes
+                    .iter()
+                    .any(|handle| handle.node == node && handle.restarting)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The node lock, taken once no node is mid-restart ([`Self::nodes_for`]), for a call that
+    /// sends to every node or keeps their mailboxes.
+    fn nodes_settled(&self) -> MutexGuard<'_, Vec<NodeHandle>> {
+        self.opened
+            .restarted
+            .wait_while(lock(&self.nodes), |nodes| {
+                nodes.iter().any(|handle| handle.restarting)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether this `Db` runs `node`'s process, rather than reaching it over the links.
@@ -5038,7 +5073,8 @@ impl Db {
             BTreeMap<NodeId, mpsc::Sender<Msg>>,
             BTreeMap<NodeId, BootId>,
         ) = {
-            let nodes = lock(&self.nodes);
+            // Senders kept past the lock, so none of a node mid-restart.
+            let nodes = self.nodes_settled();
             (
                 nodes
                     .iter()
@@ -5176,8 +5212,10 @@ impl Db {
                 retry_after: None,
             });
         }
-        // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
-        let mut nodes = lock(&self.nodes);
+        // #170 review r6: marked `restarting` under the node lock, then stopped and started
+        // outside it. No call reaches a half-restarted node: a call to it waits in
+        // `Self::nodes_for`, while calls to the other nodes go on. One restart at a time.
+        let mut nodes = self.nodes_settled();
         let Some(at) = nodes.iter().position(|handle| handle.node == node) else {
             let runs: Vec<NodeId> = nodes.iter().map(|handle| handle.node).collect();
             return Err(no_such_node(node, &runs));
@@ -5223,7 +5261,13 @@ impl Db {
                 BootId(old_boot.0 + 1)
             }
         };
-        handle.stop();
+        handle.restarting = true;
+        let _mark = RestartMark { db: self, node };
+        let join = handle.ask_stop();
+        let owner_views = Arc::clone(&handle.owner_views);
+        drop(nodes);
+        tracing::info!(node = node.0, boot = old_boot.0, "node_restart_stopping");
+        NodeHandle::await_stop(node, join, &owner_views);
         self.control.forget_node(node, old_boot);
         let folder = respawn.nodes_dir.join(node.0.to_string());
         // M5: the record is read after the stop, so nothing can take the node back between the
@@ -5254,6 +5298,9 @@ impl Db {
                 Arc::clone(&self.opened.nodes),
             )
         };
+        // The handles are never added or removed after the open, so `at` is still this node.
+        let mut nodes = lock(&self.nodes);
+        let handle = &mut nodes[at];
         match started {
             Ok(started) => {
                 *handle = started;
@@ -6495,6 +6542,25 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(refused));
     }
     Ok(())
+}
+
+/// A restart's `restarting` mark on its node ([`NodeHandle::restarting`]): cleared, and the
+/// calls waiting on it woken, however the restart ends, a panic too (#170 review r6).
+struct RestartMark<'a> {
+    db: &'a Db,
+    node: NodeId,
+}
+
+impl Drop for RestartMark<'_> {
+    fn drop(&mut self) {
+        for handle in lock(&self.db.nodes)
+            .iter_mut()
+            .filter(|handle| handle.node == self.node)
+        {
+            handle.restarting = false;
+        }
+        self.db.opened.restarted.notify_all();
+    }
 }
 
 /// The refusal of a call naming `node`, which this `Db` does not run: `runs` are the nodes it
