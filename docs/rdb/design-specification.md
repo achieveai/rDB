@@ -416,6 +416,8 @@ Writes may commit while the fsync runs. A write that returned before the sync be
 
 While a sync is in flight, the node's thread runs no synced write and no second sync, because RocksDB would make either one wait for that fsync. Such writes are staged, unsynced, and the next sync makes them durable. A sync in flight longer than `sync_stuck_millis` (default 30 s; 5 s before issue #109) is a stuck disk: when the watchdog finds it still in flight past that limit, the node faults, and its grant lapses for another node to take over. A slower sync that returns within `sync_stuck_millis` is slow, not a fault: it credits nothing until it returns, L1 pauses admission on unsafe age meanwhile (§6.2), and the host logs it at Warn once it passes 5 s (`wal_sync_slow_in_flight` while it runs, then `wal_sync_slow` when it returns to the live node). A sync the watchdog finds still in flight past the limit faults the node, and its later return does not clear that fault. On that already-faulted path, the returning sync logs `sync_finished_after_fault` (Info), as a sync that returns at stop logs `sync_finished_at_stop`. A sync that returns past the limit but is handled before the watchdog looks is not a fault, and logs `wal_sync_slow` (Warn) like any other slow return. An fsync that returns an error advances nothing, as before.
 
+Known limit (issue #142, fix tracked as #152): on Linux with XFS, the node's thread still waits on the fsync, inside the kernel. XFS holds the WAL inode's lock (`xfs_ilock`) for the whole journal force of an fsync, and the node's next WAL append needs that lock. So a commit can wait as long as the syncer's journal force: a few milliseconds on a quiet disk, and 300-800 ms when other writers keep the journal busy (measured on the shared build host, 2026-11-20). `host_slow_step` logs such a step. Issue #152 removes the wait by moving the WAL's `write` to the syncer (`manual_wal_flush`). `scripts/thread-waits.py` shows which kernel wait a slow node thread is in.
+
 Disable manual WAL flushing and optional concurrent or pipelined writes unless this ordering is requalified. The adapter must prove that the chosen native version fsyncs every captured complete transaction; a memtable flush is not a substitute.
 
 Only unambiguous success publishes the captured prefixes. Error or partial completion advances nothing. This contract requires validation; source inspection has not established it.
@@ -530,6 +532,8 @@ stateDiagram-v2
 **Amended for issue #80: control-plane uncertainty does not remove admission.** A node that cannot reach rEtcd, or does not know whether a renewal committed, keeps serving writes and reads on the grant it has already proved, up to that grant's horizon: `renewed_at + grant_millis − dispatch_margin_millis − 1`, about 5.9 s after its last committed renewal at the defaults. There it fences `Expired`. Meanwhile it takes no new grant and no promote runs. No-overlap rests on the grant alone: the old owner stops at `E − ε − δ` whatever it can read, and a new owner waits for `E + ε + δ`. [ADR-rdb-0007](../ADRs/rdb/0007-fenced-grants-and-epochs.md) "A control-plane `Unavailable` and an unknown CAS outcome neither deny nor fence" holds the full rule and what it costs.
 
 **Clock uncertainty is the clock guard's word (issue #80 S2c).** A node's clock bound holds only while the node and the peers whose fresh verdict (at most 5 s old) is Agree are a majority of the cluster, and outnumber the fresh Breaches. A node without one has no bound: it admits nothing (`ClockUnbounded`), and a promote run on its clock is refused before it writes anything.
+
+**Tick 0 is never a real step tick (issue #130).** A view that admits nothing has a horizon one tick before its step. At tick 0 that saturates to tick 0 itself, so check 6 would admit a view A1 denies. A real node's ticks count Unix-epoch milliseconds, so they never read 0. Only the clock's dev hooks (`--clock-step-file`, `--clock-offset-ms`) can push a node there, and the host then refuses to step any kernel and faults. The simulator starts at tick 0. Its rows treat tick 0 as test-only.
 
 
 The selected design requires new fenced-grant semantics; inspected rDB surfaces do not establish an existing implementation. A grant service uses rDB consensus to serialize grant/renew/revoke state; it is not a separate authority outside rDB.
@@ -854,7 +858,7 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
 | `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
 
-`ADOPTION_REFUSALS` holds every reason, 11 in all. The first three are `NotReady`:
+`ADOPTION_REFUSALS` is the wire vocabulary: the 11 reasons a peer can decode. The first three are `NotReady`. Two more refusals sit outside it: check B's floor refusals `tail_has_no_floor` and `tail_history_read_failed` (#121). A reason outside the list is reported as `Unchecked`, so it never crosses the wire as `Refused`.
 
 | Reason | State | Meaning |
 |---|---|---|

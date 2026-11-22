@@ -998,12 +998,21 @@ async fn e2e_14_identity_mismatch_at_process_level() {
 // ---------------------------------------------------------------------------------------
 
 /// A mutation interrupted by the leader's death is unknown-outcome, never silently retried.
+///
+/// Both followers are killed before the put, so the leader can append it but never commit it.
+/// Without that, a healthy leader commits and acks a put in tens of milliseconds, and whether
+/// the kill lands first was a race the row lost about 1 in 5 on a loaded host (issue #97): the
+/// put came back `Applied` from a leader that was still alive.
 #[retcd_test]
 async fn e2e_15_unknown_outcome_at_process_level() {
     let harness = Harness::new("e2e_15_unknown_outcome_at_process_level").await;
     let mut nodes = harness.start_all();
     let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
+    let survivors: Vec<usize> = (0..nodes.len()).filter(|i| *i != leader).collect();
+    for i in &survivors {
+        nodes[*i].kill();
+    }
 
     let client = client_for(
         &harness,
@@ -1042,7 +1051,10 @@ async fn e2e_15_unknown_outcome_at_process_level() {
         "an unknown outcome must never be retried automatically (ADR-0015)"
     );
 
-    let survivors: Vec<usize> = (0..nodes.len()).filter(|i| *i != leader).collect();
+    // The followers come back and elect a leader between them.
+    for i in &survivors {
+        nodes[*i] = harness.start(*i, false);
+    }
     let survivor_health: Vec<String> = survivors
         .iter()
         .map(|i| nodes[*i].health_endpoint().to_string())

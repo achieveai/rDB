@@ -6649,6 +6649,15 @@ impl Host {
                 .map_err(StepError::Host)?;
         }
         let now = self.clock.now();
+        // No kernel steps at tick 0 (issue #130). There A1's "already past" view saturates to
+        // the step tick itself, so check 6 would admit a view A1 denies. `HostClock` counts
+        // Unix-epoch ms, so only its dev hooks (`--clock-step-file`, `--clock-offset-ms`)
+        // can reach 0, and a fault is the honest answer to that clock.
+        if now == Tick::ZERO {
+            return Err(StepError::Host(Fault::from(format!(
+                "{module:?} not stepped: the host clock reads tick 0"
+            ))));
+        }
         self.stepped_at = now;
         let empty = EmptyView;
         let snapshot: &dyn SnapshotRead = match (self.views.get(&partition), reads_storage) {
@@ -16165,31 +16174,22 @@ impl Host {
             self.note_refusal(partition, identity, error.kind());
         }
         // A status query's answer, or its refusal, goes to the query being stepped, never to a
-        // write waiting under the same identity (F-014).
-        let for_status = matches!(
-            reply,
-            ReplyEffect::Status { .. } | ReplyEffect::Failed { .. }
-        ) && self
-            .answering
-            .as_ref()
-            .is_some_and(|(asked, _)| *asked == identity);
-        if let Some((_, waiter)) = self.answering.take_if(|_| for_status) {
-            let answer = match reply {
-                ReplyEffect::Status { status, .. } => Answer::Status(*status),
-                ReplyEffect::Failed { error, .. } => Answer::Error {
-                    error: ApiError::from_kernel(error),
-                    request: None,
-                },
-                ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => {
-                    return Err(fail_waiter(
-                        &self.owner_views,
-                        &waiter,
-                        format!("reply {} to a status query", reply_name(reply)),
-                    ));
-                }
-            };
-            let _ = waiter.send(answer);
-            return Ok(());
+        // write waiting under the same identity (F-014). Only those two replies can answer a
+        // status query, so a transaction or read reply never reaches its waiter: it has no
+        // `status_answer` and goes on to the pending table below (issue #130).
+        let status_answer = match reply {
+            ReplyEffect::Status { status, .. } => Some(Answer::Status(*status)),
+            ReplyEffect::Failed { error, .. } => Some(Answer::Error {
+                error: ApiError::from_kernel(error),
+                request: None,
+            }),
+            ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => None,
+        };
+        if let Some(answer) = status_answer {
+            if let Some((_, waiter)) = self.answering.take_if(|(asked, _)| *asked == identity) {
+                let _ = waiter.send(answer);
+                return Ok(());
+            }
         }
         if let ReplyEffect::Status { .. } = reply {
             return Err(Fault::from(format!(
