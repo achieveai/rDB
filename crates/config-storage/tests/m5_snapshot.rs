@@ -2419,3 +2419,73 @@ async fn c5_06b_an_install_that_fails_after_the_rename_leaves_no_install_behind(
         );
     }
 }
+
+/// #192 review: a live install publishes the installed schema watermark and a non-default
+/// membership into the applied mirror, and those survive a reopen.
+///
+/// Read through the cheap accessors that answer from the mirror (`max_applied_command_schema`,
+/// `membership`, `is_retired`), right after the install and before the receiver applies
+/// anything, then again after reopen. The expected values are written out, not read from the
+/// source store.
+#[retcd_test]
+async fn i192_live_install_publishes_schema_and_membership_to_the_mirror() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let voters: std::collections::BTreeSet<u64> = [1, 2, 3].into();
+    let nodes: std::collections::BTreeMap<u64, RaftNode> = voters
+        .iter()
+        .map(|id| (*id, RaftNode::same(format!("inproc://{id}"))))
+        .collect();
+    let entries = vec![
+        Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(openraft::Membership::new(vec![voters], nodes)),
+        },
+        put(1, 2, "/i192/a", "v"),
+        // A schema-2 command: it raises the source's watermark to 2.
+        Entry {
+            log_id: log_id(1, 3),
+            payload: EntryPayload::Normal(Command::RetireNode { node_id: NodeId(9) }),
+        },
+    ];
+    let check = |what: &str, dst: &RocksStore| {
+        let r = dst.reader();
+        assert_eq!(
+            r.max_applied_command_schema(),
+            config_core::COMMAND_SCHEMA_V2,
+            "{what}: installed schema watermark"
+        );
+        let m = r.membership();
+        assert_eq!(*m.log_id(), Some(log_id(1, 1)), "{what}: membership log id");
+        assert_eq!(
+            m.voter_ids().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "{what}: installed voters"
+        );
+        assert!(r.is_retired(NodeId(9)), "{what}: installed retired set");
+        assert_eq!(
+            r.last_applied(),
+            Some(log_id(1, 3)),
+            "{what}: applied index"
+        );
+    };
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        let dst = open_as(dst_dir.path(), identity_for(7, 2), Arc::new(NoFaults));
+        assert_eq!(
+            dst.reader().max_applied_command_schema(),
+            config_core::COMMAND_SCHEMA_V1,
+            "a fresh receiver starts at schema 1"
+        );
+        src.log_store()
+            .blocking_append(entries.clone())
+            .await
+            .expect("append");
+        src.state_machine().apply(entries).await.expect("apply");
+        let meta = build(&src).await.expect("build succeeds");
+        transfer(&src, &dst, &meta, |_| {}).await.expect("install");
+        check("live, before the receiver applies anything", &dst);
+    }
+    let dst = open_as(dst_dir.path(), identity_for(7, 2), Arc::new(NoFaults));
+    check("after reopen", &dst);
+}

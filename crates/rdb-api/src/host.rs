@@ -18215,12 +18215,17 @@ pub struct FenceFacts {
 /// `Fencing` and its owner's grant is frozen with `prior_grant_id` and that grant's expiry is
 /// proven past. Only the record's owner can admit (`partition::classify`). It admits on its
 /// grant alone, whatever the lifecycle (`Authority::may_admit_at`), so `Fencing` by itself is not
-/// enough: checks 2, 5 and 6 are one unit. A frozen grant never comes back: `grant::self_replace`
-/// answers `Never` on `frozen`, and `grant::clear_verdict` refuses a frozen record (guard 1) and
-/// one whose partition names the node and is not `Serving` (guard 3). So every fact checked here
-/// stays true until `partitions/1` moves, and that fails the commit CAS. The one refusal that
-/// can be wrong is this node's clock view lagging the promoter's; the host then reads and
-/// checks once more ([`fence_recheck_millis`]).
+/// enough: checks 2, 5 and 6 are one unit. A frozen grant does not thaw: `grant::self_replace`
+/// answers `Never` on `frozen`, and `grant::clear_verdict` refuses a frozen record (guard 1). It
+/// can be deleted after this check, though (#172): the failover planner's clear deletes the
+/// frozen grant of a gone boot whose partitions all read `Serving`, and a promote's `Fencing`
+/// can land after that read, so the node's new boot may heal the partition after this node
+/// bound the proof. The grant's absence does not keep one owner then; the partition compare
+/// does. The heal's commit and this node's F1 commit are both CASes on `partitions/{p}` at
+/// `control_revision`, and only one applies. When the heal's loses, the owner's recovery
+/// blocks; when this node's loses, its promote ends `Superseded` naming the owner. The one
+/// refusal that can be wrong is this node's clock view lagging the promoter's; the host then
+/// reads and checks once more ([`fence_recheck_millis`]).
 ///
 /// 0. the proof is for the partition it was routed to (critic-63 A1: F1 is given it there);
 /// 1. `partitions/1` is the proof's partition, at `control_revision`;
