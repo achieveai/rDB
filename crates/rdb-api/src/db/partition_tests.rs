@@ -2894,3 +2894,101 @@ fn own83_22_a_change_during_a_route_read_leaves_its_answer_stale() {
     assert_eq!(store.reads.load(Ordering::SeqCst), 2);
     db.shutdown();
 }
+
+/// Issue #79 (option A, owner ruling 2026-11-20): L1's floor is the durable quorum, the primary
+/// and its better regular secondary, so a lost third copy refuses no write. Node 3 of a one
+/// partition database stops and its links are held, as a dead process's connections drop
+/// (`stop_node` alone leaves the in-process link up, and a linked copy never starts the
+/// unreachable clock). Puts every 20 ms land until node 1 plans the drop on the unreachable
+/// clock (2 s, the least an open takes), and none is refused before it, though L1 pauses at
+/// 1 s here. That pause age is twice the slowest WAL sync seen on a loaded host (519 ms,
+/// 2026-11-22), so a slow disk on the quorum does not pause first, and still under the drop
+/// clock, so the old floor would refuse. The host warns instead: one `copy_durable_lagging`
+/// names node 3, at least the pause age behind, before the drop.
+/// A refusal stops the loop, and the drop must already be logged then: a re-plan's revoke
+/// refuses writes, a pause would not wait for it.
+/// Cuts: the floor back to the all-copies minimum, red at the zero-refusal assert (refused at
+/// about 1 s); `warn_lagging` not called, red at the Warn assert; the lag test as `>=` the
+/// floor, red at the Warn assert.
+/// Integration (~3 s): formation, then the 2 s unreachable clock.
+#[config_log::retcd_test]
+fn i79_a_lost_secondary_refuses_no_write_and_warns() {
+    const METHOD: &str = "i79_a_lost_secondary_refuses_no_write_and_warns";
+    const PAUSE_AGE_MILLIS: u64 = 1_000;
+    let dir = config_testkit::fs::temp_dir();
+    let rt = runtime();
+    let store = store();
+    let mut config = config(dir.path(), None);
+    config.timeouts.unreachable_drop_after =
+        Duration::from_millis(crate::host::MIN_UNREACHABLE_DROP_AFTER_MILLIS);
+    let mut db = rt
+        .block_on(Db::open_with(
+            config,
+            Arc::clone(&store),
+            rt.handle().clone(),
+            Budgets {
+                warn_age_millis: 500,
+                pause_age_millis: PAUSE_AGE_MILLIS,
+                ..crate::host::test_budgets()
+            },
+        ))
+        .expect("a fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    let group = group_in(&db, PARTITION);
+    db.put_in(group, b"before", b"0", None)
+        .expect("a write with all three");
+
+    let lines = || config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+    let planned = |lines: &[serde_json::Value]| {
+        lines
+            .iter()
+            .position(|line| line["@m"] == "membership_drop_planned")
+    };
+    stop_node(&db, 3);
+    db.links.hold(NodeId(1), NodeId(3));
+    db.links.hold(NodeId(2), NodeId(3));
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+    let mut landed = 0_u64;
+    let found = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no drop planned within the patience; {landed} puts landed"
+        );
+        let answer = db.put_in(group, format!("k{landed}").as_bytes(), b"v", None);
+        if let Err(error) = answer {
+            let found = lines();
+            assert!(
+                planned(&found).is_some(),
+                "put {landed} refused before any drop was planned: {error:?}"
+            );
+            break found;
+        }
+        landed += 1;
+        if landed.is_multiple_of(10) {
+            let found = lines();
+            if planned(&found).is_some() {
+                break found;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    tracing::info!(landed, "i79_puts_landed_before_the_drop");
+    let at = planned(&found).expect("planned");
+    let drop = &found[at];
+    assert_eq!(drop["clock"], "unreachable", "{drop}");
+    assert_eq!(drop["dropped"], 3, "{drop}");
+    let warns: Vec<&serde_json::Value> = found[..at]
+        .iter()
+        .filter(|line| line["@m"] == "copy_durable_lagging")
+        .collect();
+    assert_eq!(warns.len(), 1, "one Warn before the drop: {warns:?}");
+    assert_eq!(warns[0]["holder"], 3, "{}", warns[0]);
+    assert_eq!(warns[0]["@l"], "Warning", "{}", warns[0]);
+    assert!(
+        warns[0]["lagging_ms"].as_u64() >= Some(PAUSE_AGE_MILLIS),
+        "{}",
+        warns[0]
+    );
+    db.shutdown();
+}
