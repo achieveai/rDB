@@ -3512,7 +3512,9 @@ fn every_view_p1_opens_is_released_exactly_once() {
 /// `PreviousPublished` answers from it once storage binds it; design §4.2's `Recovered` row
 /// rebases `published_snapshot`. A read-only recovery serves **both** reads there: it refuses
 /// writes, never reads. Near-miss: storage above the position is never visible — a `Fresh` read
-/// over it is refused, and a view bound there is released rather than kept.
+/// over it is refused, and a view bound there is released rather than kept. One above in the
+/// read-only recovery is refused at once and parks nothing: only `Serving` makes a fresh read
+/// wait for the next seq's candidate (issue #184; PR #178 review r6 B3).
 #[retcd_test]
 fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
     let next = Generation(GEN.0 + 1);
@@ -3558,8 +3560,13 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
         ("install", |_| {}, 0, GEN, START),
     ];
     for (label, enter, n, generation, at) in entries {
-        for above in [false, true] {
-            let label = format!("{label}, bound above: {above}");
+        for above in [0, 1, 2] {
+            // One above in `Serving` (the install) makes a fresh read wait for that seq's
+            // candidate instead (issue #184, its own rows).
+            if above == 1 && label == "install" {
+                continue;
+            }
+            let label = format!("{label}, bound above by: {above}");
             let mut rig = Rig::new();
             enter(&mut rig);
             assert_eq!(
@@ -3576,11 +3583,9 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
                 "{label}: the gap before storage binds it"
             );
             rig.snapshot.generation = generation;
-            if above {
-                // Two above: storage at the next seq in `Serving` makes a fresh read wait for
-                // that seq's candidate instead (issue #184, its own rows).
-                rig.snapshot_at(at + 2);
-                assert_eq!(rig.step(ready(n, at + 2)), vec![release(n)], "{label}");
+            if above > 0 {
+                rig.snapshot_at(at + above);
+                assert_eq!(rig.step(ready(n, at + above)), vec![release(n)], "{label}");
                 assert_eq!(
                     rig.admitted(read_previous(31)),
                     vec![previous(31, Err(ErrorKind::Unavailable))],
@@ -3594,6 +3599,7 @@ fn a_recovered_or_installed_position_serves_both_reads_from_its_own_view() {
                     ],
                     "{label}: the row above the position is never visible"
                 );
+                assert!(rig.view().waiters.is_empty(), "{label}: parked nothing");
             } else {
                 rig.snapshot_at(at);
                 assert_eq!(rig.step(ready(n, at)), vec![], "{label}");
