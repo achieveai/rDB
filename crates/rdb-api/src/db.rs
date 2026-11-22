@@ -16391,4 +16391,64 @@ mod tests {
             .expect("list the id");
         assert_eq!(left.len(), 1, "the chunk is still there: {left:?}");
     }
+
+    /// PR #178 review r5 B3: a prefix delete drains an id with 255 chunks and no root, more
+    /// than one batch carries (254 records). After batch 1, between batch 2's compile and its
+    /// send, a new upload's chunk is written there and published. Batch 2's guard that the root
+    /// is absent fails, the drain rereads the root, finds it and stops: the walk succeeds, and
+    /// the new blob reads back whole, root and chunk. Cut: in `drain`, answer a rootless batch's
+    /// failed condition without rereading the root; the walk answers CONDITION_FAILED.
+    /// Integration (~3 s): one open, the publish from an `on_send` step.
+    #[test]
+    fn r5_b3_a_root_committed_between_batches_of_a_rootless_drain_survives() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let db = opened(dir.path(), &rt, None);
+        let prefix: &[u8] = b"r5-b3/";
+        let id: &[u8] = b"r5-b3/blob";
+        rootless_chunks(&db, id, [0x53; 16], 255);
+        let bytes = Bytes::from_static(b"published between batches");
+        let size = bytes.len() as u64;
+        let sha256: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        let upload = [0x54; 16];
+        let written = bytes.clone();
+        on_send(
+            rdb_value::keys::root_key(TENANT, GROUP, id).to_bytes(),
+            1,
+            Box::new(move |db: &Db| {
+                let chunk = Change::Chunk {
+                    upload,
+                    index: 0,
+                    bytes: written,
+                };
+                db.write_in(GROUP, b"r5-b3/blob", chunk, None)
+                    .expect("the new chunk");
+                let publish = Change::Publish {
+                    upload,
+                    size,
+                    chunk_size: size,
+                    sha256,
+                };
+                db.write_in(GROUP, b"r5-b3/blob", publish, None)
+                    .expect("the publish between batches")
+                    .expect("the publish writes the root");
+            }),
+        );
+        db.delete_prefix_in(GROUP, prefix, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("delete prefix: {} after {}", e.error, e.deleted));
+        let read = db
+            .read_in(
+                GROUP,
+                id,
+                Look::Range {
+                    offset: 0,
+                    len: size,
+                },
+            )
+            .unwrap_or_else(|e| panic!("the blob reads back: {e}"));
+        match read.seen {
+            Seen::Range { bytes: seen, .. } => assert_eq!(seen, bytes, "the new blob's bytes"),
+            other => panic!("a range read answered {other:?}"),
+        }
+    }
 }
