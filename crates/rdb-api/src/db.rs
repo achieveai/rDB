@@ -2631,8 +2631,9 @@ impl Db {
     }
 
     /// Issue #61 (t4, #137): why an open whose roll-forward linked no copy is refused. The
-    /// owner's copy here and empty is #137's case and says what [`empty_owner_refusal`] says;
-    /// any other open is `Stale`, naming the generation no copy could take.
+    /// owner's copy here and empty is #137's case and is refused as [`empty_owner`] refuses it;
+    /// any other open, an empty owner that [`empty_owner`] would let roll forward included, is
+    /// `Stale`, naming the generation no copy could take.
     async fn unrolled(
         engines: &BTreeMap<NodeId, RocksEngine>,
         store: &Arc<dyn ConfigStore>,
@@ -2652,7 +2653,10 @@ impl Db {
             "roll_forward_linked_none"
         );
         if empty_owner {
-            return empty_owner_refusal(store, instance, &roll.record, &roll.root).await;
+            if let Err(refused) = self::empty_owner(store, instance, &roll.record, &roll.root).await
+            {
+                return refused;
+            }
         }
         OpenError::Stale {
             generation: roll.to.0,
