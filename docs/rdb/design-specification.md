@@ -364,7 +364,7 @@ stateDiagram-v2
 | `RECOVERY_READ_ONLY` | Retry after health/authority recovers; do not assume already-admitted request failed |
 | `PROTECTION_PAUSED` | Retry after health/authority recovers; do not assume already-admitted request failed. Proves no mutation by this submission (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | Definitive rejection before mutation; caller changes request intentionally |
-| `TOO_LARGE` | Definitive rejection before anything is sent (#148): an id, key, value, whole write, op or put count, or chunk over its limit; the error names which, the size and the most allowed. Never retried as is: split or shrink the call |
+| `TOO_LARGE` | Definitive rejection before anything is sent (#148): an id, key, value, op or put count, or chunk over its limit, or a byte put's or transaction's whole write over the write limit; the error names which, the size and the most allowed. Never retried as is: split or shrink the call. A map, set or list write, or a document write that is not a byte document, over the record is the compile's `INVALID_ARGUMENT` instead, and nothing is written |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | Definitive no-admission; bounded jittered retry |
 | `UNKNOWN_OUTCOME` | Query status with same identity; do not generate a new request ID |
 | `GENERATION_CHANGED`, `REQUEST_ID_REUSE`, `UPLOAD_CHUNK_CONFLICT` | Reconcile or fail; never transparent replay; chunk conflict means the upload/index identity was reused with different bytes |

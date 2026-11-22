@@ -120,9 +120,12 @@ answer was lost with no request id (read the object, then decide).
   largest value is **`MAX_VALUE`, 1,044,480 bytes** (1 MiB less 4 KiB), for any key the server
   accepts, new or existing, with or without `ifVersion` (#148; it no longer moves with the key).
   A transaction's puts share the 1 MiB.
-  The server checks them, exactly as the embedded API does: a key over 1,024 bytes, a value or a
-  whole write over its limit is `TOO_LARGE` (`Kind = TooLarge`, `NoMutation = true`, never
-  retried), and the message names the limit, the size and the most it allows.
+  The server checks them, exactly as the embedded API does: a key over 1,024 bytes, a value
+  over its limit, or a put's or transaction's whole write over the write limit is `TOO_LARGE`
+  (`Kind = TooLarge`, `NoMutation = true`, never retried), and the message names the limit, the
+  size and the most it allows. (`TOO_LARGE` covers byte puts and transactions only. The embedded
+  API's map, set, list and non-byte document writes, which this client does not send, are
+  `INVALID_ARGUMENT` over the record.)
 - **No Delete yet** (slice 2). Workaround: write an empty value (or your format's tombstone) and
   treat it as absent.
 - A version is the partition's, not the object's: every write in the partition raises it, so an
