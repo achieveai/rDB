@@ -1419,6 +1419,10 @@ async fn dial_once(
         }
         false
     }
+    // Fault `refuse-links`: no dial, so no `Hello` names this node's boot to the peer.
+    if shared.faults.refuses_links() {
+        return Err("fault refuse-links: this node dials no link".to_owned());
+    }
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| format!("bad address {address}: {error}"))?
         .tls_config(tls.client_tls_config_for(&certs::node_domain(node)))
@@ -1629,6 +1633,11 @@ impl RdbNet for Service {
                     return;
                 }
             };
+            // Fault `refuse-links`: no `Welcome`; the stream ends and the dial fails.
+            if shared.faults.refuses_links() {
+                tracing::info!(peer = %label, "net_handshake_refused_by_fault");
+                return;
+            }
             if let Some(reason) = refusal(&shared, &label, &hello) {
                 tracing::warn!(peer = %label, %reason, "net_handshake_refused");
                 let _ = tx.send(envelope(&Frame::Refused { reason }));

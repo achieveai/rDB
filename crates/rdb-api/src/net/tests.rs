@@ -711,6 +711,8 @@ struct Spec<'a> {
     peers: &'a [u32],
     /// Whether its node is registered before its links start.
     registered: bool,
+    /// A fault file text its net applies before it starts.
+    fault: &'static str,
 }
 
 impl<'a> Spec<'a> {
@@ -724,7 +726,14 @@ impl<'a> Spec<'a> {
             dial: BTreeMap::new(),
             peers,
             registered: true,
+            fault: "",
         }
+    }
+
+    /// Start its net with fault file `text` already applied.
+    fn faulted(mut self, text: &'static str) -> Self {
+        self.fault = text;
+        self
     }
 
     /// Start the links before the node is registered, as `rdb_node` does: its `Db` opens after.
@@ -758,6 +767,7 @@ async fn side(spec: Spec<'_>, listen: bool) -> Side {
         None
     };
     let faults = Faults::new();
+    faults.apply(spec.fault);
     let net = Net::start(
         NetConfig {
             label,
@@ -1893,6 +1903,81 @@ async fn a_node_dials_only_once_its_node_can_take_messages() {
         format!("{got:?}"),
         format!("{:?}", ask()),
         "delivered, not dropped"
+    );
+}
+
+/// PR #181 review round 4: fault `refuse-links` brings up no link, whichever end holds it, and
+/// no handshake tells the other end its boot. First node 2, the dialler, holds it; then node 1,
+/// the listener. Each time no link comes up within a window and the other end has no boot for
+/// it; lifted, the link comes up and carries the boot. Unit (~3 s).
+/// Cuts: the dial-side check skipped, red in the first half; the accept-side check skipped,
+/// red in the second.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_refuse_links_brings_up_no_link_either_way_until_lifted() {
+    const WINDOW: Duration = Duration::from_millis(1_500);
+    let patience = crate::host::test_patience(PATIENCE);
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1, 2]);
+
+    // The dialler refuses.
+    let one = side(Spec::node(1, dir.path(), &[2]), true).await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(
+        Spec::node(2, dir.path(), &[1])
+            .dialling(1, addr)
+            .faulted("refuse-links\n"),
+        false,
+    )
+    .await;
+    let early = one.net.wait_up(&[NodeId(2)], WINDOW).await;
+    assert!(
+        early.is_err(),
+        "node 2 refuses links, so it dials none: {early:?}"
+    );
+    assert_eq!(
+        one.net.boot_of(NodeId(2)),
+        None,
+        "node 1 never heard node 2's Hello"
+    );
+    two.faults.apply("");
+    one.net
+        .wait_up(&[NodeId(2)], patience)
+        .await
+        .expect("up once node 2's fault is lifted");
+    assert_eq!(
+        one.net.boot_of(NodeId(2)),
+        Some(BootId(22)),
+        "the Hello named node 2's boot"
+    );
+    drop((one, two));
+
+    // The listener refuses.
+    let one = side(
+        Spec::node(1, dir.path(), &[2]).faulted("refuse-links\n"),
+        true,
+    )
+    .await;
+    let addr = one.net.addr().expect("listening");
+    let two = side(Spec::node(2, dir.path(), &[1]).dialling(1, addr), false).await;
+    let early = two.net.wait_up(&[NodeId(1)], WINDOW).await;
+    assert!(
+        early.is_err(),
+        "node 1 refuses links, so it answers no Hello: {early:?}"
+    );
+    assert_eq!(
+        two.net.boot_of(NodeId(1)),
+        None,
+        "node 2 never got node 1's Welcome"
+    );
+    one.faults.apply("");
+    two.net
+        .wait_up(&[NodeId(1)], patience)
+        .await
+        .expect("up once node 1's fault is lifted");
+    assert_eq!(
+        two.net.boot_of(NodeId(1)),
+        Some(BootId(11)),
+        "the Welcome named node 1's boot"
     );
 }
 
