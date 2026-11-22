@@ -9327,11 +9327,14 @@ mod tests {
         );
     }
 
-    /// PR #218 review, round 3 (thread kmMx): a re-plan that the deadline cuts while it waits for
-    /// a peer's handshake, with the store answering, gets advice that names both waits, never
-    /// the store's alone, and sends nothing. Paused tokio time, the deadline at 610 ms: off the
-    /// 20 ms polls of [`member_boots`], so the deadline ends it and not that wait's own check.
-    /// Cut, 2026-11-22, reverted and checked with `cmp`: the round-2 store-only advice.
+    /// PR #218 review, round 3 (thread kmMx): a re-plan that waits for a peer's handshake, with
+    /// the store answering, never gets the store's advice alone, and sends nothing. Since #181
+    /// (877e8589) [`member_boots`] ends its own wait before the deadline, so the answer is
+    /// [`HealError::PeersUnknown`] naming nodes 2 and 3 (reason `os_boot_unknown`: no leave-out
+    /// on an unknown OS boot), not the deadline's text; the two-partition stalled-read row pins
+    /// that text. Paused tokio time, the deadline at 610 ms.
+    /// Cut, 2026-11-22, before the merge with #181, reverted and checked with `cmp`: the round-2
+    /// store-only advice, red. That cut no longer reaches this row after the merge.
     /// Unit (well under 1 s): `MemStore`, paused time.
     #[config_log::retcd_test]
     fn i172_a_heal_replan_cut_while_a_peer_boot_is_unknown_does_not_blame_the_store() {
@@ -9370,11 +9373,11 @@ mod tests {
         });
         assert_eq!(
             ended,
-            Err(HealError::Control(
-                "the re-plan of partition 1 did not finish before the heal's deadline; open \
-                 again once every member's node is up and the control store answers"
-                    .to_owned()
-            ))
+            Err(HealError::PeersUnknown {
+                nodes: vec![2, 3],
+                within_ms: 610,
+                reason: "os_boot_unknown",
+            })
         );
         let sent: Vec<Msg> = mailbox.try_iter().collect();
         assert!(sent.is_empty(), "nothing sent: {sent:?}");
