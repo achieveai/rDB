@@ -2652,7 +2652,10 @@ const LEAVE_OUT_EVERY: Duration = Duration::from_millis(250);
 /// decides with a whole budget for the clear, rather than reaching it with none. A late
 /// decision logs `heal_leave_out_expired` and ends with reason `decided_past_deadline`; a late
 /// wait ends with its own `heal_wait_all` reason. A link that came up during the late read is
-/// found by the next attempt. `rooted` and `forming` are the members each of the
+/// found by the next attempt. The attempt also ends `PeersUnknown`, with the reason it is
+/// waiting on, when its next look at the links ([`MEMBER_LOOK_EVERY`] on) would fall at or
+/// past `deadline` (PR #181 review round 4): that look could find every copy known and reach
+/// the clear with no budget left. `rooted` and `forming` are the members each of the
 /// heal's partitions pins, by partition, in `ctx.partitions` and `ctx.bootstrap` order.
 async fn member_boots(
     ctx: &HealCtx,

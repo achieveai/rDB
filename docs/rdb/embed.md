@@ -459,18 +459,21 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   - **Host crash or reboot:** the owner waits for every copy, as above, or for
     `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
     steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
-  - Each attempt logs `heal_wait_all` with its first wait reason, and again when that reason
-    changes. The reasons: `os_boot_changed`, `os_boot_unknown`,
+  - Each attempt that waits logs `heal_wait_all` with its first wait reason, and again when
+    that reason changes. The reasons: `os_boot_changed`, `os_boot_unknown`,
     `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
     `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
     `no_clock_bound`. One more reason is not a wait: `decided_past_deadline`. Only a late
     **decision** gets it: the heal decided it may leave a copy out, but only after its
     attempt's deadline. That attempt acts on nothing and logs `heal_leave_out_expired`. A late
     **wait** keeps its own reason and logs `heal_wait_all`. Both end the attempt, and the heal
-    tries again by itself, with a new window. After a late decision there is nothing to do.
-    After a late wait the new attempt waits for the same copy, so that copy must come back:
-    start node N, as the error says ("start node N, then open again"). A `wait_ready` that
-    times out names the latest reason.
+    tries again by itself, with a new window. An attempt also ends `PeersUnknown`, keeping its
+    wait reason, when its next look at the links would fall at or past its deadline; it too is
+    retried. After a late decision there is nothing to do. After a late wait the new attempt
+    asks again: it leaves the copy out if it now may (`live_readd` on, with the copy's grant
+    frozen or proven expired, or no grant record past one heal window), and otherwise waits,
+    and only then must that copy come back: start node N, as the error says ("start node N,
+    then open again"). A `wait_ready` that times out names the latest reason.
   - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
     (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
     done. Node processes that share one folder each keep their own. A first open, a missing,

@@ -18,6 +18,9 @@
 //!   `Welcome`), so no peer learns its boot. A link already up is left alone: pair it with
 //!   `mute`, whose silence closes that link at the peer's probe timeout, as the formation
 //!   rig's `Rig::mute` does. A node with `mute` alone still completes every handshake.
+//!   Logged: each refused accept as `net_handshake_refused_by_fault{peer}` (info), once per
+//!   dial; a refused dial through the dial loop's `net_dial_failed{reason}` with reason
+//!   `fault refuse-links: ...`, once until its reason changes.
 //!
 //! Every client call is logged `net_client_request{n, client, request}`, so a discovery run
 //! maps `N` to a request before a fault run names it. Blank lines and `#` comments are
