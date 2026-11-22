@@ -1445,3 +1445,153 @@ fn s80s4_rebalance_on_the_formed_ring_ends_with_copy_skew_at_most_one() {
         "s80s4_m10b_done"
     );
 }
+
+/// #80 S4 row 2 (A-R456 narrowed by the lead, 2026-11-21: refill): after R1's kill, the dead
+/// node is removed and `admin::rebalance` refills each partition it held a copy of back to
+/// three regular copies. Once no `partitions/` record pins the dead node (its copies dropped by
+/// the unreachable clock, its partitions promoted by the planner), `admin::remove_member` with
+/// the dead node named in `unreachable_ok` writes its record removed; the dead node is only ever
+/// the one left out, never a refill target. Then `rebalance` refills: every partition the dead
+/// node owned or held a copy of before the kill is in the report's `refilled`, every
+/// `rebalance_refill_skipped` line is followed by a `rebalance_refill` of that partition onto
+/// another node, and every record pins three regular copies on three machines, none on the
+/// dead node, with a put landing in every partition. The skip count is logged on
+/// `s80s4_refill_done`. Integration (~40-80 s).
+/// Cut: `rebalance` skips its refill phase (`next_refill` answers `None`). Red, observed
+/// 2026-11-21 at load 51: "a partition was refilled: RebalanceReport { moved: [], refilled:
+/// [], residuals: [\"no_live_handoff: partition 2's primary from node 2 to node 4 ..\", ..] }".
+/// Again with the held and skip asserts, at load 14: the same assert, `refilled: []`.
+#[config_log::retcd_test]
+fn s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three() {
+    let lost = lose_one(Loss::Kill, probe_timeouts(), Some(Failover::default()));
+    after_loss(
+        &lost,
+        "s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three",
+    );
+    let (rig, dead) = (&lost.rig, lost.dead);
+    let db = rig.of(survivor(&lost));
+    let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(60));
+    loop {
+        let pinning: Vec<u32> = (1..=S1B_P)
+            .filter(|p| pinned_roles(rig, *p).contains_key(&dead.0))
+            .collect();
+        if pinning.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partitions {pinning:?} still pin dead node {}",
+            dead.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let short: Vec<u32> = (1..=S1B_P)
+        .filter(|p| pinned_roles(rig, *p).len() < 3)
+        .collect();
+    assert!(
+        !short.is_empty(),
+        "the kill left a partition below three copies"
+    );
+    admin::remove_member(
+        db,
+        rig.rt.handle(),
+        &rig.store,
+        dead,
+        &[dead],
+        crate::host::test_patience(Duration::from_secs(5)),
+    )
+    .unwrap_or_else(|e| panic!("dead node {} is removed: {e}", dead.0));
+    let machines: BTreeMap<NodeId, String> = rig
+        .rt
+        .block_on(admin::read_nodes(&*rig.store))
+        .expect("nodes/ reads")
+        .into_iter()
+        .map(|(node, record)| (node, record.machine))
+        .collect();
+    assert!(!machines.contains_key(&dead), "nodes/{} is removed", dead.0);
+    let report = admin::rebalance(
+        db,
+        rig.rt.handle(),
+        &*rig.store,
+        &admin::RebalanceOpts {
+            max_moves: 64,
+            draining: BTreeSet::new(),
+        },
+    )
+    .unwrap_or_else(|e| panic!("the rebalance runs: {e}"));
+    assert!(
+        !report.refilled.is_empty(),
+        "a partition was refilled: {report:?}"
+    );
+    // Every partition the dead node owned or held a copy of before the kill (`seats`, read from
+    // the records before it) took a refill.
+    let held: Vec<u32> = lost
+        .seats
+        .iter()
+        .filter(|(_, seat)| **seat != Seat::Untouched)
+        .map(|(p, _)| *p)
+        .collect();
+    let refilled: BTreeSet<u32> = report.refilled.iter().map(|(p, _)| *p).collect();
+    assert!(
+        held.iter().all(|p| refilled.contains(p)),
+        "every partition dead node {} held ({held:?}) was refilled: {report:?}",
+        dead.0
+    );
+    // A skip is followed by a refill of the same partition onto another node.
+    config_log::layer::flush_test_logs();
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three",
+    );
+    let field = |line: &serde_json::Value, name: &str| {
+        line[name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("a {name} field: {line}"))
+    };
+    let mut skips = 0usize;
+    for (at, line) in lines.iter().enumerate() {
+        if line["@m"] != "rebalance_refill_skipped" {
+            continue;
+        }
+        skips += 1;
+        let (partition, to) = (field(line, "partition"), field(line, "to"));
+        assert!(
+            lines[at + 1..]
+                .iter()
+                .any(|later| later["@m"] == "rebalance_refill"
+                    && field(later, "partition") == partition
+                    && field(later, "to") != to),
+            "the skip of node {to} for partition {partition} is followed by a refill onto another \
+             node: {line}"
+        );
+    }
+    for p in 1..=S1B_P {
+        let roles = pinned_roles(rig, p);
+        let regular: Vec<u32> = roles
+            .iter()
+            .filter(|(_, role)| **role != ReplicaRole::Shadow)
+            .map(|(node, _)| *node)
+            .collect();
+        let on: BTreeSet<&str> = regular
+            .iter()
+            .filter_map(|node| machines.get(&NodeId(*node)).map(String::as_str))
+            .collect();
+        assert!(
+            regular.len() == 3 && on.len() == 3 && !roles.contains_key(&dead.0),
+            "partitions/{p} pins {roles:?}, not three regular copies on three machines without \
+             node {}",
+            dead.0
+        );
+        put_lands(db, group_of(db, p), b"refill", p.to_string().as_bytes());
+    }
+    tracing::info!(
+        dead = dead.0,
+        short = ?short,
+        held = ?held,
+        refilled = ?report.refilled,
+        skips,
+        moved = report.moved.len(),
+        residuals = ?report.residuals,
+        "s80s4_refill_done"
+    );
+}
