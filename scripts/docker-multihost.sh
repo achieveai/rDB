@@ -1657,6 +1657,27 @@ rebalance_cmd() {
     rebalance_run || die "rebalance"
 }
 
+# A drained rdb_node owns nothing and shows replace_stopped, so about 5 s after the drain it
+# prints `rdb_node restart-wanted` and exits 75 (#81 V10; D2 run 1, 2026-11-22). remove-node
+# asks every live member for a status, so the remove waits for the supervisor's restart: up
+# to 15 s for the exit, then up to 60 s for the new boot to be ready. Both are printed on their
+# own lines. A 75 with no restart policy stops the remove, saying so.
+drained_restart() { # node, restart count before the drain, drain end (Unix seconds)
+    local n="$1" c="$NAME-d$1" i st
+    for i in $(seq 1 15); do
+        st="$(docker inspect -f '{{.State.Running}} {{.RestartCount}} {{.State.ExitCode}}' "$c" 2>/dev/null || true)"
+        [ "$st" = "true $2 0" ] || break
+        sleep 1
+    done
+    [ "$st" = "true $2 0" ] && { say "remove $n: node $n kept running after the drain"; return 0; }
+    docker logs --since "$3" "$c" 2>&1 | grep -E '^rdb_node (restart-wanted|stopped) ' | sed "s/^/multihost: remove $n: after the drain: /"
+    say "remove $n: after the drain $c exited 75 or restarted (running restarts exit: $st)"
+    [ "$(setting restart)" != none ] \
+        || die "remove $n: $c stopped after the drain, and up ran without --restart-on-exit, so nothing starts it; remove it with --unreachable-ok, or restart it"
+    node_ready_since "$n" "$3" 60 || die "remove $n: node $n not ready again within 60 s of its restart"
+    say "remove $n: node $n restarted by Docker (restarts $(docker inspect -f '{{.RestartCount}}' "$c")) and is ready; removing it"
+}
+
 # remove N: a running node is drained, then removed, and must exit 0 saying `removed`; a node
 # whose container is not running is removed with --unreachable-ok N, again every 5 s for up to
 # 90 s while its copies are still pinned (about Timeouts::unreachable_drop_after).
@@ -1671,11 +1692,15 @@ remove_node() {
     ok="$(unreachable_args "$n")"
     [ -z "$ok" ] || say "remove $n: naming the other nodes not running: $ok"
     if [ "$(docker inspect -f '{{.State.Running}}' "$NAME-d$n" 2>/dev/null)" = true ]; then
+        local restarts0 drained_at
+        restarts0="$(docker inspect -f '{{.RestartCount}}' "$NAME-d$n")" || die "remove $n: inspect $NAME-d$n"
         rc=0; session_run "$tmp/drain.out" "admin drain $n" || rc=$?
         grep -E '^(drain: |moved |refilled |residual: |rebalance: |drained |err )' "$tmp/drain.out" | sed 's/^/  /'
         if [ "$rc" != 0 ] || ! grep -q "^drained node=$n " "$tmp/drain.out"; then
             die "remove $n: the drain session exited $rc without 'drained node=$n'"
         fi
+        drained_at="$(date +%s)"
+        drained_restart "$n" "$restarts0" "$drained_at"
         rc=0; session_run "$tmp/remove.out" "admin remove-node $n $ok" || rc=$?
         line="$(grep -E '^(removed |err )' "$tmp/remove.out" | tail -n 1 || true)"
         if [ "$rc" != 0 ] || [ "${line%% addr=*}" != "removed node=$n" ]; then
@@ -2740,6 +2765,20 @@ SH
     PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" rebalance --name rdbst-s4 > "$t/out" 2>&1; rc=$?
     [ "$rc" = 1 ] && grep -q "FAILED at load: rdbst-s4-init has no nodes.txt" "$t/out"
     st "a rig without nodes.txt is refused (exit $rc)" $?
+    # A drained node that exited 75 on a rig with no restart policy: the remove stops, naming it.
+    cat > "$t/bin/docker" <<'SH'
+#!/bin/sh
+case "$*" in
+    "inspect -f"*RestartCount*) echo "false 0 75"; exit 0 ;;
+    "logs "*) echo "rdb_node restart-wanted node=2 reason=replace_stopped"; exit 0 ;;
+    *multihost.restart*) echo none; exit 0 ;;
+esac
+exit 1
+SH
+    out="$(PATH="$t/bin:$PATH" NAME=rdbst-s4 NET=rdbst-s4-net; ( drained_restart 2 0 0 ) 2>&1)"; rc=$?
+    [ "$rc" = 1 ] && grep -q "after the drain: rdb_node restart-wanted node=2 reason=replace_stopped" <<< "$out" \
+        && grep -q "up ran without --restart-on-exit, so nothing starts it" <<< "$out"
+    st "remove stops, printing the 75, when a drained node exits with no restart policy (exit $rc)" $?
     rm -rf "$t"
 }
 
