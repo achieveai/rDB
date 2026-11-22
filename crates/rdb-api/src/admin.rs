@@ -2767,7 +2767,10 @@ async fn member_boots(
                     .collect(),
             });
         }
-        if late {
+        // PR #181 review round 4: a look that would come at or past the deadline ends the
+        // attempt now. A link that came up meanwhile would make every copy known there and
+        // reach `clear_until` with no budget left: `NotCleared`, which ends the heal.
+        if late || tokio::time::Instant::now() + MEMBER_LOOK_EVERY >= deadline {
             tracing::warn!(missing = ?missing, reason, "heal_peers_unknown");
             return Err(HealError::PeersUnknown {
                 nodes: missing,
@@ -2775,9 +2778,12 @@ async fn member_boots(
                 reason,
             });
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(MEMBER_LOOK_EVERY).await;
     }
 }
+
+/// How often [`member_boots`] reads the links again while a copy is unknown.
+const MEMBER_LOOK_EVERY: Duration = Duration::from_millis(20);
 
 /// R5: may the reopen's heal go on without the regular copies on `missing`, whose nodes have
 /// no link yet? `Ok` with each such node, at [`UNLINKED_BOOT`], and the evidence, or `Err`
@@ -9193,8 +9199,36 @@ mod tests {
         clock: HostClock,
         within: Duration,
     ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
-        let rt = runtime();
-        rooted(&*store, &rt, BootId(5));
+        r5_heal_on(
+            &runtime(),
+            store,
+            waiting,
+            retrying,
+            live_readd,
+            os_boot,
+            owner_node,
+            boot_of,
+            grants,
+            clock,
+            within,
+        )
+    }
+
+    /// [`r5_heal_in`] on `rt`, for a row that runs on paused tokio time.
+    fn r5_heal_on(
+        rt: &tokio::runtime::Runtime,
+        store: Arc<dyn ConfigStore>,
+        waiting: Arc<std::sync::Mutex<Option<String>>>,
+        retrying: bool,
+        live_readd: bool,
+        os_boot: OsBoot,
+        owner_node: NodeId,
+        boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
+        grants: &[GrantRecord],
+        clock: HostClock,
+        within: Duration,
+    ) -> (Result<Healed, HealError>, Vec<Msg>, Duration) {
+        rooted(&*store, rt, BootId(5));
         for grant in grants {
             rt.block_on(store.put(PutRequest {
                 key: Bytes::from(ControlKey::Grant(grant.node).encode()),
@@ -10005,6 +10039,56 @@ mod tests {
             3,
             "the frozen, expired and absent decisions came late"
         );
+    }
+
+    /// PR #181 review round 4: node 3's live grant is read in a read that ends 10 ms before the
+    /// attempt's deadline, and its link comes up during the read. The answer is a wait
+    /// (`copy_not_proven_down`), on time, so nothing is left out; the next look at the links
+    /// would come past the deadline. The attempt ends `PeersUnknown` with that reason instead,
+    /// and the next one plans node 3 at its boot. Paused tokio time, so the read ends exactly
+    /// 10 ms before the deadline and the row is deterministic. Unit (~10 ms).
+    /// Cut: no look-ahead before the 20 ms sleep: the attempt looks again past its deadline,
+    /// finds every copy, and reaches `clear_until` with no budget: `NotCleared`, red.
+    #[config_log::retcd_test]
+    fn r5_edge_a_read_ending_just_before_the_deadline_with_the_link_up_is_retried() {
+        const METHOD: &str =
+            "r5_edge_a_read_ending_just_before_the_deadline_with_the_link_up_is_retried";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let window = Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        let store = Arc::new(GrantGets::new(
+            NodeId(3),
+            vec![r5_delay(Duration::ZERO, window - ms(10))],
+        ));
+        let started: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
+        let boot_of: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync> = Arc::new(move |node| {
+            let since = *started.get_or_init(tokio::time::Instant::now);
+            (node != NodeId(3) || since.elapsed() >= ms(500)).then_some(OPEN_2)
+        });
+        let (healed, sent, _) = r5_heal_on(
+            &rt,
+            store,
+            Arc::default(),
+            true,
+            true,
+            OsBoot::Same,
+            OWNER,
+            boot_of,
+            &[r5_grant(3, utc_now() + 3_600_000, false)],
+            HostClock::start(),
+            window,
+        );
+        healed.unwrap_or_else(|e| panic!("the next attempt plans node 3: {e}"));
+        r5_one_full_plan("edge", &sent);
+        let unknown = r5_lines(METHOD, "heal_peers_unknown");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(unknown[0]["reason"], "copy_not_proven_down", "a late wait keeps its reason");
+        assert_eq!(r5_lines(METHOD, "heal_retry").len(), 1, "one retry");
+        assert!(r5_lines(METHOD, "heal_leave_out_expired").is_empty(), "no late decision");
     }
 
     /// PR #181 review round 2, blocker 1: two attempts in a row each get a grant read that ends
