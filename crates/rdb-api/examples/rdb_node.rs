@@ -2891,7 +2891,7 @@ mod tests {
                 .chain(extra)
                 .map(|a| (*a).to_owned())
                 .collect();
-            super::run(argv.into_iter(), |_| Ok(None))
+            super::run(argv.into_iter(), |_| Ok(None), super::serve)
         };
         let read = |path: std::path::PathBuf| {
             std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
