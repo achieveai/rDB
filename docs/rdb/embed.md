@@ -685,11 +685,21 @@ than another. A refill adds a copy; it never removes one, and the owner stays.
 **Draining before a remove: `admin::drain`.** `admin::drain(db, rt, store, node)` moves every
 copy off the node, promotes another owner for each partition it owned, and ends with a
 rebalance, which refills to 3 copies. Then `admin::remove_member` can take the node out.
-A drained `rdb_node` does not stay up for that: about 5 s after the drain it exits 75
-(restart wanted, reason `replace_stopped`), because the drain's freeze is not lifted (issue
-#226). Under a supervisor it restarts, and the remove then works. Without one, remove it as a
-node that is down: `admin::remove_member` with it in `unreachable_ok` (in `rdb_dev`,
-`admin remove-node N --unreachable-ok N`).
+
+- **Drain works for a node whose `Db` runs in your process** (tested by M11, both rows
+  `s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_*`).
+- **Drain does not work yet for a node run as `rdb_node` (#226).** The drain's freeze is not
+  lifted, so about 5 s after it the node exits 75 (restart wanted, reason
+  `replace_stopped`):
+  - With no supervisor, the node stays down, and the remove refuses it as down.
+  - With a supervisor, the node restarts and is re-added in the middle of the drain, and the
+    drain fails.
+- **To remove a node run as `rdb_node`, do not drain it.** Stop it, then remove it as a dead
+  host, below: `admin::remove_member` with it in `unreachable_ok` (in `rdb_dev`,
+  `admin remove-node N --unreachable-ok N`), then `admin::rebalance`. Its copies drop and
+  refill as for a killed host (row 2,
+  `s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three`). The cost: each
+  partition it owned pauses writes for one failover, within the 15 s lost-host bound.
 
 **Removing a host that died.** Drain is for a node that still runs: it needs the node to
 answer. For a dead host:

@@ -213,10 +213,8 @@ plus ids still linked).
       in `RebalanceReport::refilled`. A refill counts against `max_moves`.
     - **Drain's last step is "rebalance again"**, so a drain refills each partition its
       promotes left below RF (`admin::drain`, step 4).
-    - **A drained `rdb_node` exits 75 about 5 s after the drain** (restart wanted, reason
-      `replace_stopped`), because the drain's freeze is not lifted (issue #226). Under a
-      supervisor it restarts, and `remove_member` then works. Without one, remove it with it
-      in `unreachable_ok` (`rdb_dev`: `admin remove-node N --unreachable-ok N`).
+    - **Drain works for an in-process `Db` only in this release** (M11). For a node run as
+      `rdb_node` it does not yet (#226): see Consequences, "Known limits in this release".
     - **A left-out target is skipped.** A new or restarted owner's `Host::restore_left_out`
       re-seats a partition's first-placement nodes that hold no copy as left out. The owner
       refuses a refill onto such a node (guard `left_out`). Rebalance skips it, logs
@@ -258,6 +256,14 @@ plus ids still linked).
   - If a host hangs while it is the last reachable copy of a partition, and the partition's
     other copies are also down, restarting that host does not bring the partition back; it
     returns when one of its other copies returns. See #168 and #172.
+  - **#226: drain does not work for a node run as `rdb_node`.** It works for an in-process
+    `Db` (M11). The drain's freeze is not lifted, so about 5 s after the drain the node exits
+    75 (restart wanted, reason `replace_stopped`). With no supervisor, it stays down and the
+    remove refuses it as down. With one, it restarts, is re-added in the middle of the drain,
+    and the drain fails. For `rdb_node`, stop the node and remove it as a dead host:
+    `remove_member` with it in `unreachable_ok` (`rdb_dev`: `admin remove-node N
+    --unreachable-ok N`), then `rebalance`. Its copies drop and refill as for a killed host
+    (row 2), and each partition it owned pauses writes for one failover, within 15 s.
 
 - **Removing a node is one more reason the whole cluster upgrades together.** The S4
   protocol bump means an older node cannot link, and an older build cannot read layout 3.
