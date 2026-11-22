@@ -146,6 +146,9 @@ async fn ids(scope: &ScopedDb, group: u64, prefix: &[u8], after: Option<&[u8]>) 
 /// Every user record, of any kind (root, element, item, block or chunk), stored under raw key
 /// prefix `prefix` in lineage `(partition, generation)`, read with the engine's own range read
 /// (`SnapshotRead::scan`, as `rdb_value::repair` reads) from every copy that holds the lineage.
+/// The object `left_after` writes after a row, outside every scope, so no count includes it.
+const LEFT_AFTER_MARKER: &[u8] = b"left-after-marker";
+
 /// The `Db` must be shut down. Panics when no copy holds it, so an empty answer is never vacuous.
 fn stored_under(
     dir: &std::path::Path,
@@ -668,6 +671,18 @@ fn left_after(w: World, scope: &Scope, group: u64) -> Vec<Bytes> {
         w.db.list_in(PIN, &scope.prefix(group), None, 1)
             .expect("list")
             .generation;
+    // PR #178 review r2: every copy is read, and an answer does not wait for every copy, so a
+    // marker written after the row's last write, outside the scope, must be durable on each
+    // regular copy first (`sbx_147_o` once read a secondary 31 chunks and the deletes behind).
+    let marker =
+        w.db.put_in(PIN, LEFT_AFTER_MARKER, b"m", None)
+            .expect("the marker");
+    w.db.wait_durable(
+        PIN,
+        (marker.generation, marker.seq),
+        Duration::from_secs(30) * scale(),
+    )
+    .expect("every copy proves the row's writes");
     let World {
         db,
         async_db,
