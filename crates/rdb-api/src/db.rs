@@ -2798,7 +2798,9 @@ impl Db {
     /// or its restart failed, answers at once: the owner stays out until the folder is opened
     /// again. So does a
     /// recovery that ended `Blocked` on an owner this `Db` runs: only a fresh fence leaves that
-    /// phase, and an open sends one fence only (ruling F-a, A-R196). An owner in another process
+    /// phase, and an open sends one fence only (ruling F-a, A-R196), except while that owner
+    /// re-plans at a restarted copy's new boot (#67 Wait 2): that is waited on to `within`, then
+    /// answered `Blocked` (A-R196 narrowed, #202). An owner in another process
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
@@ -2819,6 +2821,9 @@ impl Db {
         let mut phase = String::from(NO_ANSWER);
         let mut remote_blocked: Option<String> = None;
         let mut remote_faulted: Option<String> = None;
+        // #202: the latest look found an owner this `Db` runs blocked while it re-plans at a
+        // restarted copy's new boot; what to answer if the bound passes on that look.
+        let mut replanning: Option<(NodeId, String)> = None;
         // Each partition is looked at until it admits, in order (issue #79): every one for an
         // app or a single partition, otherwise the ones the nodes here lead (ruling Q4).
         let lead_only = self.route.partitions() > 1 && !lock(&self.nodes).is_empty();
@@ -2887,16 +2892,33 @@ impl Db {
                     }
                     continue;
                 }
+                let was_replanning = replanning.take();
                 match stuck_recovery(&owner) {
+                    // A-R196 narrowed by the lead, 2026-11-21, after A-R433/A-R434 (#202). A
+                    // `Blocked` owner this `Db` runs is final, except while its host re-plans
+                    // at a restarted copy's new boot (#67 Wait 2): pending = mark held for the
+                    // current Planned plan, or the rejoin (Revoking or Planned) carries the
+                    // boot re-plan's since (`Host::boot_replan_pending`). That is waited on to
+                    // `within`, then answered `Blocked` with the same text. History: f6b8b38
+                    // (A-R196, F-a: Blocked final in an open), 2c22bd4 (W6b: remote owner
+                    // waits, A-R314 item 2 / A-R282), b33d1c5 (F-005: cached Blocked kept only
+                    // for a local owner), 77ac6dc (#67 Wait 2, A-R433/434: local re-plan on
+                    // boot change).
                     Some(ReadyError::Blocked {
                         owner: node,
                         reason,
                     }) if self.runs(node) => {
-                        tracing::warn!(owner = node.0, reason, "ready_blocked");
-                        return Err(ReadyError::Blocked {
-                            owner: node,
-                            reason,
-                        });
+                        if !self.boot_replan_pending(partition, node) {
+                            tracing::warn!(owner = node.0, reason, "ready_blocked");
+                            return Err(ReadyError::Blocked {
+                                owner: node,
+                                reason,
+                            });
+                        }
+                        if was_replanning.as_ref() != Some(&(node, reason.clone())) {
+                            tracing::info!(owner = node.0, reason, "ready_owner_replanning");
+                        }
+                        replanning = Some((node, reason));
                     }
                     Some(ReadyError::Blocked { reason, .. }) => {
                         // Another process's owner is not ended by one blocked recovery: it
@@ -2931,10 +2953,32 @@ impl Db {
                 phase = owner.recovery.unwrap_or_else(|| NO_RECOVERY.to_owned());
             }
             if std::time::Instant::now() >= deadline {
+                // #202: the boot re-plan did not land within the bound: its block is final.
+                if let Some((node, reason)) = replanning {
+                    tracing::warn!(owner = node.0, reason, "ready_blocked");
+                    return Err(ReadyError::Blocked {
+                        owner: node,
+                        reason,
+                    });
+                }
                 return Err(timed_out(partition, phase));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// #202: whether `node`, an owner this `Db` runs, is re-planning `partition` at a restarted
+    /// copy's new boot ([`Msg::BootReplan`], local only). No answer within the read timeout,
+    /// or a node that has stopped, is `false`: its block is final, as before #202.
+    fn boot_replan_pending(&self, partition: PartitionId, node: NodeId) -> bool {
+        let (reply, answer) = mpsc::channel();
+        if self
+            .send_to(node, Msg::BootReplan { partition, reply })
+            .is_err()
+        {
+            return false;
+        }
+        answer.recv_timeout(self.timeouts.read).unwrap_or(false)
     }
 
     /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
@@ -11430,6 +11474,168 @@ mod tests {
         drop(db);
         node_1.join().expect("the stub");
         assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
+    }
+
+    /// #202: node 1, run by this `Db`, as a stub: its looks answer `Blocked` on a barrier until
+    /// look `blocked_looks`, then writable; its `Msg::BootReplan` asks answer `true` until ask
+    /// `replanning_asks`, then `false`. Returns the `Db`, the stub's thread and both counts.
+    #[allow(clippy::type_complexity)]
+    fn replanning_owner(
+        blocked_looks: u64,
+        replanning_asks: u64,
+    ) -> (
+        Db,
+        tokio::runtime::Runtime,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let blocked = format!(
+            "{:?}",
+            rdb_core::recovery::RecoveryPhase::Blocked(
+                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                    missing: vec![rdb_core::contracts::membership::CopyId(4)],
+                }
+            )
+        );
+        let status = move |recovery: Option<String>, admits: bool| NodeStatus {
+            node: OWNER,
+            boot: host::BOOT,
+            fault: None,
+            holds: None,
+            authority: "held(grant 1)".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
+            recovery,
+            recovered: None,
+            role: "primary",
+            protection: None,
+            admits: Some(admits),
+            published: None,
+            in_flight: None,
+            waits_on: None,
+            stalled: None,
+            reload_pending: None,
+            lengths: None,
+            pinned: Vec::new(),
+            config_version: None,
+            qualifying_copy: None,
+            clock_bound_lost: false,
+            committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
+            tail_refused: None,
+        };
+        let (db, mailbox, rt) = unanswered(Duration::from_millis(20));
+        let looks = Arc::new(AtomicU64::new(0));
+        let asks = Arc::new(AtomicU64::new(0));
+        let node_1 = {
+            let (looks, asks) = (Arc::clone(&looks), Arc::clone(&asks));
+            std::thread::spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let seen = looks.fetch_add(1, Ordering::Relaxed);
+                            let _ = reply.send(if seen < blocked_looks {
+                                status(Some(blocked.clone()), false)
+                            } else {
+                                status(None, true)
+                            });
+                        }
+                        Msg::BootReplan { reply, .. } => {
+                            let seen = asks.fetch_add(1, Ordering::Relaxed);
+                            let _ = reply.send(seen < replanning_asks);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+        (db, rt, node_1, looks, asks)
+    }
+
+    /// The `Blocked` answer of [`replanning_owner`]'s stub.
+    fn replanning_blocked() -> ReadyError {
+        ReadyError::Blocked {
+            owner: OWNER,
+            reason: "BarrierIncomplete { missing: [CopyId(4)] }".to_owned(),
+        }
+    }
+
+    /// #202 row 1 (A-R196 narrowed, 2026-11-21): an owner this `Db` runs is blocked on a
+    /// barrier while its host re-plans at a restarted copy's new boot (#67 Wait 2): the wait
+    /// goes on through the blocked looks, and the open is ready once the re-plan lands. The
+    /// host half, that the re-plan is pending through its revoke as well as while its mark is
+    /// held, is `m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced`.
+    /// Cut: the arm answers `Blocked` without asking `Msg::BootReplan`, red (`Err(Blocked)`).
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn m10_bb_202_wait_ready_waits_out_a_local_owner_re_planning_on_a_boot() {
+        let (db, _rt, node_1, looks, asks) = replanning_owner(3, u64::MAX);
+        assert_eq!(db.wait_ready(Duration::from_secs(5)), Ok(()));
+        drop(db);
+        node_1.join().expect("the stub");
+        assert_eq!(
+            looks.load(Ordering::Relaxed),
+            4,
+            "three blocked looks, then ready"
+        );
+        assert_eq!(asks.load(Ordering::Relaxed), 3, "one ask per blocked look");
+    }
+
+    /// #202 row 2: the boot re-plan never lands. The wait goes on to the bound, then answers
+    /// `Blocked` with today's text, not `TimedOut`.
+    /// Cut: at the bound, answer `timed_out` as for a remote owner, red (`TimedOut`). Cut: no
+    /// wait (as before #202), red (answered before the bound).
+    /// Unit (~300 ms): no node thread.
+    #[test]
+    fn m10_bb_202_a_boot_replan_that_never_lands_is_blocked_at_the_bound() {
+        let (db, _rt, node_1, _looks, asks) = replanning_owner(u64::MAX, u64::MAX);
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_millis(300));
+        let waited = started.elapsed();
+        assert_eq!(answer, Err(replanning_blocked()));
+        assert_eq!(
+            answer.expect_err("blocked").to_string(),
+            "the open's recovery stopped before node 1 took writes (BarrierIncomplete { missing: \
+             [CopyId(4)] }), and it does not try again in this open. If the last open of this \
+             folder stopped the same way, stop and report it with this message; otherwise shut \
+             this Db down and open the folder again"
+        );
+        assert!(
+            waited >= Duration::from_millis(300),
+            "answered after {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(2), "answered after {waited:?}");
+        drop(db);
+        node_1.join().expect("the stub");
+        assert!(
+            asks.load(Ordering::Relaxed) > 1,
+            "asked on each blocked look"
+        );
+    }
+
+    /// #202 row 3: the host stops re-planning on the boot while the owner is still blocked (a
+    /// `retry_blocked_rejoin` or a newer plan replaced it): the next look answers today's final
+    /// `Blocked`, well inside the bound. The host half, that a replaced boot re-plan is no
+    /// longer pending, is `m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced`.
+    /// Cut: once seen re-planning, the wait keeps waiting to the bound, red (answered at 5 s).
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn m10_bb_202_a_replaced_boot_replan_is_blocked_at_the_next_look() {
+        let (db, _rt, node_1, looks, asks) = replanning_owner(u64::MAX, 2);
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_secs(5));
+        let waited = started.elapsed();
+        assert_eq!(answer, Err(replanning_blocked()));
+        assert!(waited < Duration::from_secs(1), "answered after {waited:?}");
+        drop(db);
+        node_1.join().expect("the stub");
+        assert_eq!(
+            asks.load(Ordering::Relaxed),
+            3,
+            "two pending asks, then the final one"
+        );
+        assert_eq!(looks.load(Ordering::Relaxed), 3);
     }
 
     /// PR #60 review F3, merged into slice 2 (w18): a fault ends an owner this `Db` runs at once

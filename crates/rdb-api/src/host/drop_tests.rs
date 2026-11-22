@@ -3184,6 +3184,8 @@ fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
             member: NodeId(node),
         },
     );
+    // #202: a mark for another plan is no boot re-plan, so a ready wait does not wait on it.
+    assert!(!trio.nodes[0].0.boot_replan_pending(PartitionId(1)));
     until_through_blocks(&mut trio, "node 1 sends the plan again", |trio| {
         let same = matches!(
             trio.nodes[0].0.rejoins.get(&PartitionId(1)),
@@ -3191,10 +3193,106 @@ fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
         );
         (!same).then_some(())
     });
+    // #202: nor is `retry_blocked_rejoin`'s re-plan.
+    assert!(!trio.nodes[0].0.boot_replan_pending(PartitionId(1)));
     assert_eq!(logged!(METHOD, "rejoin_retry").len(), 1);
     let dropped = logged!(METHOD, "rejoin_boot_mark_dropped");
     assert_eq!(dropped.len(), 1, "{dropped:?}");
     assert!(logged!(METHOD, "rejoin_replan_on_boot").is_empty());
+}
+
+/// #202 (A-R196 narrowed, 2026-11-21), the host half of `Db::wait_ready`'s wait on a local
+/// owner: [`Host::boot_replan_pending`] through the whole #67 Wait 2 re-plan, and not after.
+/// As `m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once`, with node 1's next
+/// `DrainProof` lost (the seam [`Host::drain_proofs_to_lose`]), so the re-plan's revoke stays
+/// in flight while F1 is still `Blocked` on the old plan, with no mark: the window #202's trace
+/// fell into. Then `retry_blocked_rejoin` asks the revocation again under a new `since`, which
+/// is no boot re-plan, and the rejoin commits.
+/// - mark held, F1 blocked on the planned plan: pending;
+/// - re-plan revoking, F1 still blocked, no mark: pending.
+///   Cut: `boot_replan_pending` answers `false` for `Rejoin::Revoking`, red here;
+/// - replaced by the revoke retry, F1 still blocked: not pending.
+///   Cut: `start_revoke` keeps `boot_replans` when the `since` changes, red here;
+/// - committed: not pending, nothing remembered.
+///
+/// Integration (~5 s): bootstrap, the drop clock, the re-plan, one revoke retry.
+#[config_log::retcd_test]
+fn m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced() {
+    const METHOD: &str = "m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        since,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    assert!(
+        !trio.nodes[0].0.boot_replan_pending(p),
+        "a drop plan is no boot re-plan"
+    );
+    trio.nodes[0].0.drain_proofs_to_lose = 1;
+    let node = kept.1;
+    restart_dead(&mut trio, kept);
+    let reboot = trio.links.boot_of(NodeId(node)).expect("registered");
+
+    let (marked, pending) = until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        let host = &trio.nodes[0].0;
+        host.f1_blocked(p).then(|| {
+            (
+                host.boot_seen_while_planned.contains_key(&p),
+                host.boot_replan_pending(p),
+            )
+        })
+    });
+    assert!(marked, "the boot was heard before the block");
+    assert!(pending, "mark held for the planned plan");
+
+    let boot_since = until_through_blocks(&mut trio, "the boot re-plan revokes", |trio| match trio
+        .nodes[0]
+        .0
+        .rejoins
+        .get(&p)
+    {
+        Some(Rejoin::Revoking { replan, .. }) if replan.since != since => Some(replan.since),
+        _ => None,
+    });
+    {
+        let host = &trio.nodes[0].0;
+        assert!(host.f1_blocked(p), "F1 is still blocked on the old plan");
+        assert!(
+            !host.boot_seen_while_planned.contains_key(&p),
+            "the mark is spent"
+        );
+        assert!(
+            host.boot_replan_pending(p),
+            "the re-plan's revoke is in flight"
+        );
+    }
+    assert_eq!(logged!(METHOD, "rejoin_replan_on_boot").len(), 1);
+
+    until_through_blocks(
+        &mut trio,
+        "the revocation is asked again",
+        |trio| match trio.nodes[0].0.rejoins.get(&p) {
+            Some(Rejoin::Revoking { replan, .. }) if replan.since != boot_since => Some(()),
+            _ => None,
+        },
+    );
+    {
+        let host = &trio.nodes[0].0;
+        assert!(host.f1_blocked(p), "F1 is still blocked on the old plan");
+        assert!(
+            !host.boot_replan_pending(p),
+            "a revoke retry is no boot re-plan"
+        );
+    }
+    assert_eq!(logged!(METHOD, "rejoin_revoke_retry").len(), 1);
+
+    kept_rejoined(&mut trio, node, reboot, request);
+    assert!(!trio.nodes[0].0.boot_replan_pending(p));
+    assert!(trio.nodes[0].0.boot_replans.is_empty());
 }
 
 /// d8's drop (#67 G5): exactly one `membership_drop_planned`, on the paused clock.

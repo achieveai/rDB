@@ -683,6 +683,16 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<NodeStatus>,
     },
+    /// #202: answer whether this node is re-planning `partition` at a restarted copy's new boot
+    /// ([`Host::boot_replan_pending`]). Local only, like [`Msg::PeerBooted`]: never sent over
+    /// the links, so no wire change. `Db::wait_ready` asks an owner it runs whose recovery is
+    /// `Blocked`.
+    BootReplan {
+        /// The partition.
+        partition: PartitionId,
+        /// Where the answer goes.
+        reply: Sender<bool>,
+    },
     /// Peer `node` started again as `boot` (#42, A-R249). Local only: the net handshake posts
     /// it when it sees a new boot for a known peer, and [`crate::db::Db::restart_node`] does in
     /// process. The record owner re-plans each partition whose pinned config holds a member at an
@@ -3152,6 +3162,11 @@ struct Host {
     /// drop check that finds F1 blocked on that same plan re-plans at once
     /// ([`Self::replan_on_boot`]); a mark for any other plan is dropped unused.
     boot_seen_while_planned: BTreeMap<PartitionId, BootMark>,
+    /// #202: per partition, the `since` of the re-plan [`Self::replan_for_boot`] started, while
+    /// that re-plan is the partition's rejoin (revoking, then planned). Removed as soon as any
+    /// other re-plan replaces it ([`Self::start_revoke`]) or the rejoin ends. In memory only: a
+    /// restarted node holds none, and an open's wait starts fresh.
+    boot_replans: BTreeMap<PartitionId, Tick>,
     /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
     /// no link to it ([`Self::count_unreachable`]).
     unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
@@ -3364,6 +3379,7 @@ impl Host {
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
             boot_seen_while_planned: BTreeMap::new(),
+            boot_replans: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             shadow_unreachable: BTreeMap::new(),
             move_catching_up: BTreeMap::new(),
@@ -4114,6 +4130,10 @@ impl Host {
             Msg::Client(client) => self.client(client),
             Msg::Inspect { partition, reply } => {
                 let _ = reply.send(self.status(partition));
+                Ok(())
+            }
+            Msg::BootReplan { partition, reply } => {
+                let _ = reply.send(self.boot_replan_pending(partition));
                 Ok(())
             }
             Msg::PeerBooted { node, boot } => {
@@ -7374,6 +7394,28 @@ impl Host {
                 ..replan
             },
         );
+        self.boot_replans.insert(partition, now);
+    }
+
+    /// #202: whether this node is re-planning `partition` at a restarted copy's new boot (the
+    /// #67 Wait 2 case, A-R433, A-R434): a boot mark held for the plan that is planned now, or
+    /// the partition's rejoin (revoking or planned) is the re-plan [`Self::replan_for_boot`]
+    /// started. `Db::wait_ready` waits on a `Blocked` owner it runs only while this holds
+    /// (A-R196 narrowed by the lead, 2026-11-21). Any other re-plan, a
+    /// [`Self::retry_blocked_rejoin`] included, is not one.
+    pub(crate) fn boot_replan_pending(&self, partition: PartitionId) -> bool {
+        match self.rejoins.get(&partition) {
+            Some(Rejoin::Planned { generation, replan }) => {
+                self.boot_seen_while_planned
+                    .get(&partition)
+                    .is_some_and(|mark| {
+                        (mark.generation, mark.since) == (*generation, replan.since)
+                    })
+                    || self.boot_replans.contains_key(&partition)
+            }
+            Some(Rejoin::Revoking { .. }) => self.boot_replans.contains_key(&partition),
+            None => false,
+        }
     }
 
     /// A-R329: a member a drop left out of `partition` that started again since, while `config`
@@ -7553,6 +7595,11 @@ impl Host {
 
     /// Ask A1 to revoke `partition`'s committed `epoch` for `replan`.
     fn start_revoke(&mut self, partition: PartitionId, epoch: OwnerEpoch, replan: Replan) {
+        // #202: a re-plan with another `since` is not the boot re-plan any more (a T7 re-ask
+        // keeps the `since`, and stays it).
+        if self.boot_replans.get(&partition) != Some(&replan.since) {
+            self.boot_replans.remove(&partition);
+        }
         self.rejoins
             .insert(partition, Rejoin::Revoking { epoch, replan });
         if self.authority.state().is_held() {
@@ -7902,6 +7949,7 @@ impl Host {
             return;
         }
         self.rejoins.remove(&partition);
+        self.boot_replans.remove(&partition);
         self.readd_shadow_pinned(partition, generation, replan);
         let waited_ms = HostClock::millis_until(replan.since, self.clock.now());
         self.move_committed(partition, generation, waited_ms);
@@ -10564,6 +10612,7 @@ impl Host {
             }
             self.quarantines.remove(&partition);
             self.rejoins.remove(&partition);
+            self.boot_replans.remove(&partition);
             tracing::warn!(
                 node = self.node.0,
                 partition = partition.0,
@@ -17276,6 +17325,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
+        Msg::BootReplan { .. } => "boot_replan",
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",

@@ -1594,6 +1594,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
   is planned.
+- After a same-process restart, `ReadyError::Blocked` is final except while the owner is
+  re-planning at a restarted copy's new boot (#202). The open then waits up to its `within`
+  for that re-plan, and answers `Blocked` with the same text if it does not land.
 
 ## 6. When an open is refused
 
