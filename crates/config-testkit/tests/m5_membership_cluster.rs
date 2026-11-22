@@ -871,6 +871,24 @@ async fn m5_64_crash_after_learner_added() {
     // `config-engine/src/node.rs::add_learner_inner`, and — because that is exactly the kind
     // of claim this file must not simply assert into existence — re-derived empirically below
     // rather than hard-coded: arm on the very next crossing.
+    //
+    // "The very next crossing" is the learner entry's only once the leader has applied
+    // everything formation wrote. Formation returns once membership agrees, which can be before
+    // the leader's state batch for its blank entry; armed then, the crash lands on that batch,
+    // `AddLearner` never reaches the log, and the row waits 10 deadlines for a learner nobody
+    // committed. Seen once at fb79bb8 (`after_state_batch` index 1, then `ChangeMembership`).
+    cluster
+        .wait_for(
+            "the leader to apply everything formation wrote",
+            cluster.deadline(6),
+            || {
+                let m = cluster.metrics(leader);
+                (m.last_log_index.is_some() && m.last_applied.map(|a| a.index) == m.last_log_index)
+                    .then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
     scripts[&leader].crash_on_nth(Boundary::AfterStateBatch, 1);
 
     // The crash lands mid-RPC; the outcome is deliberately unobserved (ADR-0015) — a crash can
