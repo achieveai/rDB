@@ -443,3 +443,47 @@ fn sbx_146_f_resend_within_does_not_block_the_worker() {
         db
     });
 }
+
+/// PR #178 review r3 T31: the public `txn_as` and `resend_within`, under an id a real write
+/// already used, on the handle of a runtime already dropped, so the blocking pool never runs
+/// them. Each answers `no_mutation` false, since the earlier send applied, and the resend
+/// hands back the identical request it was given. Cut: answer both with `put_answer`: red,
+/// `no_mutation` true and no request. Integration (~2 s): one database open.
+#[config_log::retcd_test]
+fn sbx_146_g_a_reused_id_the_pool_never_ran_may_have_applied() {
+    on_current_thread("sbx_146_g", |db| async move {
+        let request = rdb_api::app_request_id(201).expect("an app id");
+        let write = || TxnWrite {
+            group: AffinityId(1),
+            object: Bytes::from_static(b"g"),
+            value: Bytes::from_static(b"v"),
+            if_version: None,
+        };
+        let ok = db.txn_as(request, vec![write()], MAX_TXN_DEADLINE).await;
+        let saved = *ok.unwrap_or_else(|e| panic!("txn_as: {e}")).sent;
+        let other = db.clone();
+        let (txn, resend) = std::thread::spawn(move || {
+            let gone = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let handle = gone.handle().clone();
+            drop(gone);
+            let txn = handle.block_on(other.txn_as(request, vec![write()], MAX_TXN_DEADLINE));
+            let resend = handle.block_on(other.resend_within(saved.clone(), MAX_TXN_DEADLINE));
+            (txn, (resend, saved))
+        })
+        .join()
+        .expect("the dead-handle thread");
+        let txn = txn.expect_err("the pool never ran it");
+        assert!(!txn.error.no_mutation, "txn_as: {txn:?}");
+        let (resend, saved) = resend;
+        let resend = resend.expect_err("the pool never ran it");
+        assert!(!resend.error.no_mutation, "resend_within: {resend:?}");
+        assert_eq!(
+            resend.request.as_deref(),
+            Some(&saved),
+            "the request comes back"
+        );
+        db
+    });
+}
