@@ -2145,13 +2145,93 @@ fn f87_3_a_failed_control_read_is_named_in_the_refusal() {
     drop(procs.nodes);
 }
 
-/// Review r6 (thread 4655953455): a restart stops and starts its node outside the node lock, so
-/// while node 2's restart waits in its WAL join, a feed read from node 3 in the same `Db` is
-/// served, and the restart state reads (`Db::restart_note`, `Db::boot_of`) answer; node 2 stays
-/// protected: a feed call sent to it meanwhile waits and is answered by the restarted node,
-/// never dropped unanswered or refused as a stopped thread. Node 2's next WAL sync is held
-/// (`host::hold_sync`), a put makes one, and the restart is logged `node_restart_stopping`
-/// before its join.
+/// A fresh open whose calls wait `timeouts`.
+fn opened_timed(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    store: &Arc<dyn ConfigStore>,
+    timeouts: Timeouts,
+) -> Db {
+    let db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                timeouts,
+                ..config(dir)
+            },
+            Arc::clone(store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("ready");
+    db
+}
+
+/// Wait until `done`, or fail naming `what` once `patience` has passed.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + patience();
+    while !done() {
+        assert!(Instant::now() < deadline, "never {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A restart of node 2 held in its WAL join: node 2's next sync is held (`host::hold_sync`), a
+/// put makes one, and node 2 is restarted on its own thread, in this row's span. Returns once
+/// the restart logged `node_restart_stopping` (it waits on the join from then on), with the
+/// put, the restart and the sync's release.
+struct HeldRestart {
+    put: std::thread::JoinHandle<Result<PutOk, PutError>>,
+    restart: std::thread::JoinHandle<Result<BootId, ApiError>>,
+    release: mpsc::Sender<()>,
+}
+
+fn restart_held_in_join(db: &Arc<Db>, dir: &Path, method: &'static str) -> HeldRestart {
+    let (held, release) = crate::host::hold_sync(&dir.join("nodes").join("2"));
+    let put = {
+        let db = Arc::clone(db);
+        std::thread::spawn(move || db.put(b"k2", b"two", None))
+    };
+    held.recv_timeout(patience())
+        .expect("node 2's next WAL sync is held");
+    let restart = {
+        let db = Arc::clone(db);
+        // In this row's span, so its `node_restart_stopping` line is in this row's log.
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _span = span.enter();
+            db.restart_node(NodeId(2))
+        })
+    };
+    until("node 2's restart stopped it", || {
+        config_testkit::logs::lines_for_current_test(module_path!(), method)
+            .iter()
+            .any(|line| line["@m"] == "node_restart_stopping" && line["node"] == 2)
+    });
+    HeldRestart {
+        put,
+        restart,
+        release,
+    }
+}
+
+/// A feed call to node 2 from `START` on its own thread.
+fn call_two(db: &Arc<Db>) -> std::thread::JoinHandle<Result<FeedPage, ApiError>> {
+    let db = Arc::clone(db);
+    std::thread::spawn(move || {
+        db.changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)))
+    })
+}
+
+/// Review r6/r7 (threads 4655953455, 4657364900): a restart stops and starts its node outside
+/// the node lock. While node 2's restart waits in its WAL join ([`restart_held_in_join`]), a
+/// feed call sent to node 2 is counted waiting at the restart's guard (`Db::restart_waiters`),
+/// a feed read from node 3 in the same `Db` is served, and the restart state reads
+/// (`Db::restart_note`, `Db::boot_of`) answer. The join is let go; the restart succeeds, and the
+/// waiting call is answered by the restarted node: a page, or a retryable no-mutation refusal
+/// of a node still catching up (`BoundedJitter`), after which a retry is served a page. The
+/// read timeout is the row's patience, so the call never times out at the guard.
 /// Cuts: `Db::nodes_for` waiting on every restart, red (node 3's read waits for the release);
 /// `Db::restart_note` taking the settled lock, red (the note waits for the release).
 /// Integration (~5 s): one open, one restart.
@@ -2161,7 +2241,11 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
     let rt = runtime();
     let store = store();
     let dir = config_testkit::fs::temp_dir();
-    let db = Arc::new(opened(&rt, dir.path(), &store));
+    let timeouts = Timeouts {
+        read: patience(),
+        ..Timeouts::default()
+    };
+    let db = Arc::new(opened_timed(&rt, dir.path(), &store, timeouts));
     let k1 = db.put(b"k1", b"one", None).expect("k1");
     db.wait_durable(
         DEFAULT_GROUP,
@@ -2172,40 +2256,11 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
     let three = Source::Node(NodeId(3));
     let _ = tail(&db, FeedCursor::START, three, k1.seq);
     let old_boot = db.boot_of(NodeId(2)).expect("node 2 runs");
-    let (held, release) = crate::host::hold_sync(&dir.path().join("nodes").join("2"));
-    let put = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || db.put(b"k2", b"two", None))
-    };
-    held.recv_timeout(patience())
-        .expect("node 2's next WAL sync is held");
-    let restart = {
-        let db = Arc::clone(&db);
-        // In this row's span, so its `node_restart_stopping` line is in this row's log.
-        let span = tracing::Span::current();
-        std::thread::spawn(move || {
-            let _span = span.enter();
-            db.restart_node(NodeId(2))
-        })
-    };
-    let deadline = Instant::now() + patience();
-    while !config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
-        .iter()
-        .any(|line| line["@m"] == "node_restart_stopping" && line["node"] == 2)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "node 2's restart never stopped it"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    // Sent while the join is held: it must wait for the restart, not reach the old handle.
-    let to_two = {
-        let db = Arc::clone(&db);
-        std::thread::spawn(move || {
-            db.changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)))
-        })
-    };
+    let held = restart_held_in_join(&db, dir.path(), METHOD);
+    let to_two = call_two(&db);
+    until("the call to node 2 waits at the restart's guard", || {
+        db.restart_waiters() == 1
+    });
     let (read, answered) = mpsc::channel();
     {
         let db = Arc::clone(&db);
@@ -2236,28 +2291,39 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
         "mid-restart, node 2 is at its old boot"
     );
     assert!(
-        !restart.is_finished(),
+        !held.restart.is_finished(),
         "the restart still waits in its join"
     );
+    assert_eq!(db.restart_waiters(), 1, "the call to node 2 still waits");
     assert!(
         !to_two.is_finished(),
         "a call to node 2 waits for its restart"
     );
-    drop(release);
-    let boot = restart
+    drop(held.release);
+    let boot = held
+        .restart
         .join()
         .expect("the restart thread")
         .expect("node 2 restarted");
     assert!(boot > old_boot, "{boot:?} after {old_boot:?}");
-    let answer = to_two.join().expect("the node 2 caller");
-    if let Err(error) = &answer {
-        assert!(
-            !error.detail.contains("dropped the feed call unanswered")
-                && !error.detail.contains("node thread has stopped"),
-            "the call reached the half-restarted node: {error:?}"
-        );
+    match to_two.join().expect("the node 2 caller") {
+        Ok(page) => assert!(matches!(page, FeedPage::Records { .. }), "{page:?}"),
+        Err(error) => {
+            assert!(
+                matches!(error.kind, ErrorKind::Unavailable | ErrorKind::LeaseExpired)
+                    && error.retry == RetryRule::BoundedJitter
+                    && error.no_mutation,
+                "the restarted node's refusal, retryable: {error:?}"
+            );
+            let page = page_from(&db, FeedCursor::START, Source::Node(NodeId(2)));
+            assert!(
+                matches!(&page, FeedPage::Records { records, .. } if !records.is_empty()),
+                "{page:?}"
+            );
+        }
     }
-    put.join().expect("the put thread").expect("k2");
+    assert_eq!(db.restart_waiters(), 0);
+    held.put.join().expect("the put thread").expect("k2");
 }
 
 /// Review r7 (thread 4655953455): a restart that has published its new handle clears only its

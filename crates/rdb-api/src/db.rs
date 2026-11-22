@@ -622,6 +622,8 @@ struct Opened {
     restarted: std::sync::Condvar,
     /// The last restart id handed out ([`NodeHandle::restarting`], review r7).
     restarts: AtomicU64,
+    /// How many calls wait on a node's restart now (review r7: a row proves one waits).
+    restart_waiters: std::sync::atomic::AtomicUsize,
     /// Holds a crate test armed at a restart's stages ([`Db::hold_restart`]).
     #[cfg(test)]
     restart_holds: Mutex<Vec<RestartHold>>,
@@ -686,6 +688,7 @@ impl Default for Opened {
             nodes: ALL_NODES.into(),
             restarted: std::sync::Condvar::new(),
             restarts: AtomicU64::new(0),
+            restart_waiters: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             restart_holds: Mutex::new(Vec::new()),
         }
@@ -4841,10 +4844,28 @@ impl Db {
     /// call to another node does not. Reads that only look at the handles take the lock as it
     /// is: they see a node mid-restart at its old boot, with no ownership.
     fn nodes_for(&self, node: NodeId) -> MutexGuard<'_, Vec<NodeHandle>> {
+        let nodes = lock(&self.nodes);
+        if !mid_restart(&nodes, Some(node)) {
+            return nodes;
+        }
+        let _waiting = self.restart_wait(node);
         self.opened
             .restarted
-            .wait_while(lock(&self.nodes), |nodes| mid_restart(nodes, Some(node)))
+            .wait_while(nodes, |nodes| mid_restart(nodes, Some(node)))
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Count a call waiting on `node`'s restart until the returned guard drops.
+    fn restart_wait(&self, node: NodeId) -> RestartWait<'_> {
+        tracing::info!(node = node.0, "call_waits_on_restart");
+        self.opened.restart_waiters.fetch_add(1, Ordering::SeqCst);
+        RestartWait(&self.opened.restart_waiters)
+    }
+
+    /// How many calls wait on a restart now.
+    #[cfg(test)]
+    pub(crate) fn restart_waiters(&self) -> usize {
+        self.opened.restart_waiters.load(Ordering::SeqCst)
     }
 
     /// Hold the next restart that reaches `stage` there (#170 review r7). The receiver hears
@@ -6691,6 +6712,15 @@ fn mid_restart(nodes: &[NodeHandle], node: Option<NodeId>) -> bool {
     nodes
         .iter()
         .any(|handle| handle.restarting.is_some() && node.is_none_or(|node| handle.node == node))
+}
+
+/// A call counted in [`Opened::restart_waiters`] while it waits on a restart.
+struct RestartWait<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for RestartWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A restart's `restarting` mark on its node ([`NodeHandle::restarting`]): cleared, and the
