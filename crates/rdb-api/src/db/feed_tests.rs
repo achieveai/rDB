@@ -1984,6 +1984,55 @@ fn f87_3_a_seam_on_a_faulted_node_says_why_not_that_it_timed_out() {
     );
 }
 
+/// Review r6 (thread 4655953458): a feed call node 2 takes and drops unread, as a thread that
+/// stops with the call still queued does, is refused as a stopped node is: `UNAVAILABLE`,
+/// `RetryAfterRecovery`, no mutation, ending with the stop step, not a host fault. Node 2 is a
+/// threadless handle whose mailbox is read once and dropped.
+/// Cut: the dropped reply a plain `ApiError::new` again, red (`BoundedJitter`).
+/// Unit (~0.1 s): a `Db` built by hand.
+#[config_log::retcd_test]
+fn f87_3_a_feed_call_dropped_unanswered_is_a_stopped_node() {
+    let rt = runtime();
+    let (one, _one_mailbox) = NodeHandle::unanswered(OWNER);
+    let (two, two_mailbox) = NodeHandle::unanswered(NodeId(2));
+    let db = Db::by_hand(
+        vec![one, two],
+        store(),
+        rt.handle(),
+        Timeouts::default(),
+        None,
+    );
+    let dropper = std::thread::spawn(move || {
+        let taken = two_mailbox.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(taken, Ok(Msg::Client(_))),
+            "node 2 takes the feed call"
+        );
+    });
+    let error = db
+        .changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)))
+        .expect_err("dropped unanswered");
+    dropper.join().expect("the dropper");
+    assert!(
+        error
+            .detail
+            .contains("node 2 dropped the feed call unanswered"),
+        "{error:?}"
+    );
+    assert!(!error.is_host_fault(), "{error:?}");
+    assert_eq!(
+        (error.kind, error.retry),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery),
+        "{error:?}"
+    );
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_STOPPED_STEP),
+        "{error:?}"
+    );
+    assert_eq!(error.next_step(), None, "its own step only: {error:?}");
+}
+
 /// Review r3/r4/r5 (thread 4654680317): a feed call to a member that cannot take it keeps the
 /// cause, and gives a feed reader a step it can act on. Node 2's thread stops while its process
 /// stays up. From node 2's own process: "node 2's node thread has stopped", `UNAVAILABLE`,

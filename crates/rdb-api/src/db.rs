@@ -3331,8 +3331,10 @@ impl Db {
     /// once, `RetryAfterRecovery`: read another copy now, or this node once it has restarted.
     /// `UNAVAILABLE` also when no answer came within the read timeout, or
     /// `Source::Node(n)` names a node in another process this one has no link up to
-    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped (also
-    /// `RetryAfterRecovery`: read another copy now, or that node once it has restarted).
+    /// (`RetryAfterRecovery`), or a node in this process whose thread has stopped, or a node
+    /// that dropped the call unanswered, as one that stops with the call still queued does
+    /// (both `RetryAfterRecovery`: read another copy now, or that node once it has restarted).
+    /// Every such refusal has `no_mutation` set.
     /// `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
@@ -3413,11 +3415,11 @@ impl Db {
                 Ok(answer) => match answer.recv_timeout(wait) {
                     Ok(answer) => Some(answer),
                     Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    // Review r6 (thread 4655953458): the node took the call but dropped it
+                    // unread, as a thread that stops with it still queued does. The same rule
+                    // as a clean stop's drain and a stopped thread: a feed call writes nothing.
                     Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                        error: ApiError::new(
-                            ErrorKind::Unavailable,
-                            format!("node {} dropped the feed call unanswered", node.0),
-                        ),
+                        error: feed_dropped(node),
                         request: None,
                     }),
                 },
@@ -6542,6 +6544,24 @@ async fn declared_open_refusal(
         return Err(OpenError::Config(refused));
     }
     Ok(())
+}
+
+/// The refusal of a feed call `node` dropped unanswered (#170 review r6): taken, then dropped
+/// unread, as by a thread that stops with the call still queued. Retryable after recovery with
+/// the stopped-node step, as a clean stop's drain answers; a feed call writes nothing.
+fn feed_dropped(node: NodeId) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "node {} dropped the feed call unanswered (it stopped before reading it); nothing \
+             was read; next: {}",
+            node.0,
+            error::FEED_STOPPED_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
 }
 
 /// A restart's `restarting` mark on its node ([`NodeHandle::restarting`]): cleared, and the
