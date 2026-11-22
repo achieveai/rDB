@@ -1031,11 +1031,11 @@ impl Planner {
     /// `partitions/` again after it, so no partition can come to name the node, or leave
     /// `Serving`, between the ownership read and the grant it judges (PR #171 review): a read
     /// that fails refuses the clear. A promote whose `Fencing` write lands after that read and
-    /// before the delete is settled by the freeze's and F1's single-key CASes, not here (#172
-    /// design section 3). The planner's grant is checked again ([`Self::still_held`]) right before the
-    /// delete, which goes at the grant read's `mod_revision`: a renewal or a fresh freeze in
-    /// between makes it a conflict, and nothing is cleared. Every refusal is logged, and the
-    /// next sweep tries again.
+    /// before the delete is settled on the promote side, not here (spec §7.3, "The clearing
+    /// service does not race a fence"). The planner's grant is checked again
+    /// ([`Self::still_held`]) right before the delete, which goes at the grant read's
+    /// `mod_revision`: a renewal or a fresh freeze in between makes it a conflict, and nothing
+    /// is cleared. Every refusal is logged, and the next sweep tries again.
     async fn clear_frozen(&self, node: NodeId, held: Option<Held>) {
         let key = ControlKey::Grant(node).encode();
         let found = match self

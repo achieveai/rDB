@@ -2930,8 +2930,12 @@ pub enum Clearance {
 /// "The clearing service does not race a fence"): every `Fencing` write is followed by a
 /// `freeze` attempt on this same grant key. A freeze that fails for another reason than
 /// [`PromoteError::OwnerAlive`] can return before it writes anything.
-/// - A delete after the freeze cannot apply: the freeze moved the grant's revision, so this
-///   delete's compare fails, and guard 1 refuses a frozen record on any later pass.
+/// - A delete after a freeze that wrote cannot apply: the freeze moved the grant's revision,
+///   so this delete's compare fails, and guard 1 refuses a frozen record on any later pass.
+/// - A delete after a freeze that wrote nothing (`promote_frozen_already`: the record was
+///   already frozen) applies, at the unchanged revision. The promote then cannot bind its proof
+///   on its target, which needs the frozen grant the proof names (`bind_routed_fence`), so it
+///   commits nothing, and the owner's next heal takes the partition back (#172).
 /// - A delete between the `Fencing` write and the freeze: when the promote judged the owner
 ///   dead, the freeze finds the record moved and refuses with [`PromoteError::OwnerAlive`], and
 ///   the promote undoes its `Fencing` write (or rereads and reports, when the undo is unproven);

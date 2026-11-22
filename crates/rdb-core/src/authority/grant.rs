@@ -326,10 +326,9 @@ pub enum FrozenClearRefusal {
 /// 4. control time is past `E + epsilon + delta` of the frozen record
 ///    ([`crate::authority::clock::expiry_proven`]).
 ///
-/// A freeze after the delete recreates the key frozen, so a later takeover still fences. A
-/// promote whose `Fencing` write lands after the caller's `partitions/` read and before its
-/// delete is settled by the single-key CASes that already exist (the freeze, and F1's commit
-/// at the `Fencing` revision), never by this verdict (#172 design section 3).
+/// A promote whose `Fencing` write lands after the caller's `partitions/` read and before its
+/// delete is settled on the promote side, never by this verdict: spec §7.3, "The clearing
+/// service does not race a fence", lists the outcomes (#172).
 ///
 /// # Errors
 ///

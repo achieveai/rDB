@@ -957,13 +957,16 @@ impl ConfigStore for SwapPartitionOneInstance {
 }
 
 /// Any control store that, once armed, parks **one** call on a key under a prefix until the row
-/// lets it go (#172, the race row): [`CallGate::arm_put_reply`] applies the next such put and
-/// holds its reply (a promote's `Fencing` write that has landed, its promote not yet gone on),
+/// lets it go (#172, the race rows): [`CallGate::arm_put`] holds the next such put before it
+/// reaches the store (a heal's commit CAS, planned but not yet sent),
+/// [`CallGate::arm_put_reply`] applies the next such put and holds its reply (a promote's
+/// `Fencing` write that has landed, its promote not yet gone on),
 /// [`CallGate::arm_delete`] holds the next such delete before it reaches the store (the
 /// planner's clear, its reads done, its delete not yet sent). Each parked call adds one to
 /// [`CallGate::parked`] and waits for one [`CallGate::release`]. Every other call passes.
 pub(crate) struct CallGate {
     inner: std::sync::Arc<dyn ConfigStore>,
+    put: Mutex<Option<Vec<u8>>>,
     put_reply: Mutex<Option<Vec<u8>>>,
     delete: Mutex<Option<Vec<u8>>>,
     parked: std::sync::atomic::AtomicU32,
@@ -974,11 +977,17 @@ impl CallGate {
     pub(crate) fn new(inner: std::sync::Arc<dyn ConfigStore>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             inner,
+            put: Mutex::new(None),
             put_reply: Mutex::new(None),
             delete: Mutex::new(None),
             parked: std::sync::atomic::AtomicU32::new(0),
             gate: Semaphore::new(0),
         })
+    }
+
+    /// Hold the next put under `prefix` before it reaches the store.
+    pub(crate) fn arm_put(&self, prefix: &str) {
+        *self.put.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
     }
 
     /// Apply the next put under `prefix`, then hold its reply.
@@ -1042,6 +1051,10 @@ impl ConfigStore for CallGate {
     }
 
     async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        if Self::take(&self.put, &request.key) {
+            let key = request.key.clone();
+            self.park("put", &key).await;
+        }
         if !Self::take(&self.put_reply, &request.key) {
             return self.inner.put(request).await;
         }
@@ -1057,6 +1070,99 @@ impl ConfigStore for CallGate {
             let key = request.key.clone();
             self.park("delete", &key).await;
         }
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// Any control store that keeps every put under a prefix, applied or refused for its compare:
+/// the revision, key and value, in the order the store answered (#172, the freeze-first rows). A
+/// `MemStore` serves no watches, so this is how a row reads every version a key took, not only
+/// the last one, and sees a CAS that lost.
+pub(crate) struct PutLog {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    prefix: Vec<u8>,
+    applied: Mutex<Vec<(u64, Vec<u8>, bytes::Bytes)>>,
+    refused: Mutex<Vec<(u64, Vec<u8>, bytes::Bytes)>>,
+}
+
+impl PutLog {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        prefix: &str,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            applied: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every put applied under the prefix so far: `(revision, key, value)`.
+    pub(crate) fn applied(&self) -> Vec<(u64, Vec<u8>, bytes::Bytes)> {
+        self.applied.lock().expect("put log").clone()
+    }
+
+    /// Every put under the prefix its compare refused: `(expected revision, key, value)`.
+    pub(crate) fn refused(&self) -> Vec<(u64, Vec<u8>, bytes::Bytes)> {
+        self.refused.lock().expect("put log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PutLog {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        let key = request.key.to_vec();
+        let value = request.value.clone();
+        let expected = request.expected_mod_revision.unwrap_or(0);
+        let answer = self.inner.put(request).await;
+        if !key.starts_with(&self.prefix) {
+            return answer;
+        }
+        match &answer {
+            Ok(response) if response.outcome == config_core::MutationOutcome::Applied => self
+                .applied
+                .lock()
+                .expect("put log")
+                .push((response.revision, key, value)),
+            Ok(_) | Err(ConfigError::Conflict { .. }) => self
+                .refused
+                .lock()
+                .expect("put log")
+                .push((expected, key, value)),
+            Err(_) => {}
+        }
+        answer
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
         self.inner.delete(request).await
     }
 

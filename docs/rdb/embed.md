@@ -416,13 +416,28 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   owner at a new generation. No `admin promote` is needed. The open logs
   `heal_grant_frozen_waiting` once while it waits; the planner logs
   `planner_frozen_grant_cleared`. This is what brings back a host that was killed or hung and
-  then restarted while one of its partitions had no second copy to move to, and a rack of
-  such hosts after a power cycle: each one is cleared on its own. The wait ends at the heal's
-  deadline (the grant, its margins and 10 s).
+  then restarted while one of its partitions had no second copy to move to. The planner clears
+  each frozen node on its own; several at once (a rack after a power cycle) is not tested. The
+  wait ends at the heal's deadline (the grant, its margins and 10 s).
 - **Without a planner, or with a move under way, the open still fails.** With failover off, or
   any partition the node owns in `Fencing` (a promote is under way), its open fails with
   `HealError::Frozen` at once, naming what it still owns; those partitions can still be moved
   while it runs.
+- **A promote that races the clear never makes a second owner.** If a promote of a partition
+  the restarted node owns runs while the planner clears its grant, one of these happens:
+  - A planner promote, or an operator promote over more than one partition, that wrote
+    `Fencing` before the clear's delete and froze after it: refused as `PromoteError::OwnerAlive` ("it came back
+    during the promote"), and its `Fencing` write is undone. Nothing moves.
+  - A single-partition operator promote in the same place: it recreates the grant frozen and
+    takes the partition over.
+  - A promote whose freeze came before the clear's delete: it cannot commit. Its target refuses
+    the proof (`routed_fence_refused`), the node's heal commits, and the promote ends
+    `PromoteError::Superseded` naming the node.
+
+  One case needs a second open. If the node's heal planned against a `Fencing` write that the
+  promote then undid, the heal's commit is refused and the open fails `Blocked` with
+  `CasContention` (`ready_blocked`). It does not retry; the partition has no owner until you
+  open the node again, and that open heals it.
 - **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
   but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
   boot) whose partitions are all `Serving` (none at all included), a failover planner, where
