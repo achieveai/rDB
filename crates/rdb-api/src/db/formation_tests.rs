@@ -3335,10 +3335,15 @@ fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinn
     );
     assert!(now_ms() > past, "C's grant has expired");
     rig.restart(copy, Timeouts::default());
+    // Review round 4: the boot C runs now, and the one node 2 pins it at.
+    let b2 = rig.of(copy).boot_of(copy).expect("C runs");
+    assert_ne!(b2, b1, "C runs at a new boot");
     rig.of(R5_OWNER)
         .wait_ready(crate::host::test_patience(Duration::from_secs(60)))
         .unwrap_or_else(|e| panic!("node 2 is ready once node {} links: {e}", copy.0));
-    fully_pinned_and_writable(&rig, &shared_with(&owned, copy), copy);
+    let shared = shared_with(&owned, copy);
+    fully_pinned_and_writable(&rig, &shared, copy);
+    owner_pins_at(&rig, &shared, copy, b2);
     left_nothing_out(METHOD, from);
     let kept = grant_of(&rig, copy).expect("C's own heal never cleared its old grant");
     assert_eq!(kept.boot, b1, "grants/C still names the old boot");
@@ -3347,6 +3352,38 @@ fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinn
         "C's own heal is still blocked: {:?}",
         rig.of(copy).heal_state()
     );
+}
+
+/// Asserts that node 2's own status for each of `shared` pins `copy` at `boot`, within a
+/// patience: the boot its heal planned, not only the node.
+fn owner_pins_at(rig: &Rig, shared: &[(u32, AffinityId)], copy: NodeId, boot: BootId) {
+    for (partition, _) in shared {
+        let deadline = Instant::now() + crate::host::test_patience(Duration::from_secs(30));
+        loop {
+            let pinned: Vec<rdb_core::contracts::membership::Member> = rig
+                .of(R5_OWNER)
+                .node_status_in(PartitionId(*partition))
+                .expect("node 2's status")
+                .into_iter()
+                .find(|status| status.node == R5_OWNER)
+                .map(|status| status.pinned)
+                .unwrap_or_default();
+            let at: Vec<BootId> = pinned
+                .iter()
+                .filter(|member| member.node == copy)
+                .map(|member| member.boot)
+                .collect();
+            if at == [boot] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {partition}: node 2 pins node {} at {boot:?}, not {at:?}",
+                copy.0
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// The nodes `partitions/{partition}` pins now, from its layout-4 members; empty before any.
