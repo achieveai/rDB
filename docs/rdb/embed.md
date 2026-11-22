@@ -1813,8 +1813,9 @@ loop {
   names. This also keeps a plain app from mapping other tenants' write positions and digests
   through `next` and cursors. Do not give an app the admin certificate unless it may read every
   tenant.
-- **A fault shows seq positions to any app.** When a feed read meets stored damage, the node
-  faults, and its fault names the offending sequence positions, never a digest or a value. The
+- **A fault shows seq positions to any app.** A failed History read, an undecodable stored
+  record, or a hole below the cap faults the node; a malformed User key is refused to that
+  caller. The fault names the offending sequence positions, never a digest or a value. The
   fault is the node's, not one partition's: a node's status (`Db::node_status`,
   `WireMsg::Inspect`) carries the same text whichever partition is asked about, and any
   authenticated app may read status. So an app can learn sequence positions in other tenants'
