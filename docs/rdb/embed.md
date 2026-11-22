@@ -1007,8 +1007,11 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
   runs voters and data nodes (peer port 7101) on one private Docker network and publishes no
   port to the host. Neither is a production deployment, so until #154 that boundary is the
   embedder's network policy.
-  For SBX (checked 2026-11-20): rDB is embedded in-process only, its ports are firewalled from
-  the sandbox and app networks, and gateways talk to each other over their own mTLS.
+  For SBX (checked 2026-11-22): no network control covers an rDB node listener yet. SBX's
+  nftables rules block only sandboxes, whose outbound traffic is dropped except to the egress
+  proxy (SBX ADR 0027); nothing stops another holder of an app certificate on the network. So
+  the real control is #154's node-side check, and until it lands, the refusal above of Delete
+  and List from a non-admin app.
 - `route`, `ownership` and ownership events return partition and node facts only, never a
   record.
 
