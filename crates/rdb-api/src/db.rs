@@ -620,7 +620,28 @@ struct Opened {
     /// Woken when a node's restart ends ([`NodeHandle::restarting`] cleared), for the calls
     /// that wait on it (#170 review r6).
     restarted: std::sync::Condvar,
+    /// The last restart id handed out ([`NodeHandle::restarting`], review r7).
+    restarts: AtomicU64,
+    /// Holds a crate test armed at a restart's stages ([`Db::hold_restart`]).
+    #[cfg(test)]
+    restart_holds: Mutex<Vec<RestartHold>>,
 }
+
+/// Where a crate test may hold a restart ([`Db::hold_restart`], #170 review r7).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartStage {
+    /// The old thread has ended; the new one has not started, and the node is still marked.
+    Stopped,
+    /// The new handle is in place under the node lock, and the restart has not yet dropped
+    /// its mark.
+    Published,
+}
+
+/// One held restart stage: where it holds, the sender that says it got there, and the
+/// receiver it waits on until the test releases it ([`Db::hold_restart`]).
+#[cfg(test)]
+type RestartHold = (RestartStage, mpsc::Sender<()>, mpsc::Receiver<()>);
 
 /// An ownership subscriber that a down node has not been given yet ([`Opened::waiting`]).
 #[derive(Debug)]
@@ -664,6 +685,9 @@ impl Default for Opened {
             waiting: Mutex::new(Vec::new()),
             nodes: ALL_NODES.into(),
             restarted: std::sync::Condvar::new(),
+            restarts: AtomicU64::new(0),
+            #[cfg(test)]
+            restart_holds: Mutex::new(Vec::new()),
         }
     }
 }
@@ -4819,12 +4843,38 @@ impl Db {
     fn nodes_for(&self, node: NodeId) -> MutexGuard<'_, Vec<NodeHandle>> {
         self.opened
             .restarted
-            .wait_while(lock(&self.nodes), |nodes| {
-                nodes
-                    .iter()
-                    .any(|handle| handle.node == node && handle.restarting)
-            })
+            .wait_while(lock(&self.nodes), |nodes| mid_restart(nodes, Some(node)))
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold the next restart that reaches `stage` there (#170 review r7). The receiver hears
+    /// when it is held; it goes on once the sender sends or drops.
+    #[cfg(test)]
+    pub(crate) fn hold_restart(
+        &self,
+        stage: RestartStage,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        lock(&self.opened.restart_holds).push((stage, entered, released));
+        (held, release)
+    }
+
+    /// Wait at `stage` if a crate test armed a hold there.
+    #[cfg(test)]
+    fn restart_held(&self, node: NodeId, stage: RestartStage) {
+        let armed = {
+            let mut holds = lock(&self.opened.restart_holds);
+            holds
+                .iter()
+                .position(|(at, _, _)| *at == stage)
+                .map(|at| holds.remove(at))
+        };
+        if let Some((_, entered, released)) = armed {
+            tracing::info!(node = node.0, ?stage, "test_restart_held");
+            let _ = entered.send(());
+            let _ = released.recv();
+        }
     }
 
     /// The node lock, taken once no node is mid-restart ([`Self::nodes_for`]), for a call that
@@ -4832,9 +4882,7 @@ impl Db {
     fn nodes_settled(&self) -> MutexGuard<'_, Vec<NodeHandle>> {
         self.opened
             .restarted
-            .wait_while(lock(&self.nodes), |nodes| {
-                nodes.iter().any(|handle| handle.restarting)
-            })
+            .wait_while(lock(&self.nodes), |nodes| mid_restart(nodes, None))
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
@@ -5327,13 +5375,16 @@ impl Db {
                 BootId(old_boot.0 + 1)
             }
         };
-        handle.restarting = true;
-        let _mark = RestartMark { db: self, node };
+        let id = self.opened.restarts.fetch_add(1, Ordering::SeqCst) + 1;
+        handle.restarting = Some(id);
+        let _mark = RestartMark { db: self, node, id };
         let join = handle.ask_stop();
         let owner_views = Arc::clone(&handle.owner_views);
         drop(nodes);
         tracing::info!(node = node.0, boot = old_boot.0, "node_restart_stopping");
         NodeHandle::await_stop(node, join, &owner_views);
+        #[cfg(test)]
+        self.restart_held(node, RestartStage::Stopped);
         self.control.forget_node(node, old_boot);
         let folder = respawn.nodes_dir.join(node.0.to_string());
         // M5: the record is read after the stop, so nothing can take the node back between the
@@ -5367,7 +5418,7 @@ impl Db {
         // The handles are never added or removed after the open, so `at` is still this node.
         let mut nodes = lock(&self.nodes);
         let handle = &mut nodes[at];
-        match started {
+        let result = match started {
             Ok(started) => {
                 *handle = started;
                 tracing::info!(
@@ -5412,7 +5463,11 @@ impl Db {
                 handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
-        }
+        };
+        drop(nodes);
+        #[cfg(test)]
+        self.restart_held(node, RestartStage::Published);
+        result
     }
 
     /// Hand the node `handle` now runs every ownership subscriber still open that left it out
@@ -6631,20 +6686,29 @@ fn feed_dropped(node: NodeId) -> ApiError {
     error
 }
 
+/// Whether `node` (any node, for `None`) is mid-restart.
+fn mid_restart(nodes: &[NodeHandle], node: Option<NodeId>) -> bool {
+    nodes
+        .iter()
+        .any(|handle| handle.restarting.is_some() && node.is_none_or(|node| handle.node == node))
+}
+
 /// A restart's `restarting` mark on its node ([`NodeHandle::restarting`]): cleared, and the
 /// calls waiting on it woken, however the restart ends, a panic too (#170 review r6).
 struct RestartMark<'a> {
     db: &'a Db,
     node: NodeId,
+    /// The restart's id: only a mark still holding it is cleared (review r7).
+    id: u64,
 }
 
 impl Drop for RestartMark<'_> {
     fn drop(&mut self) {
         for handle in lock(&self.db.nodes)
             .iter_mut()
-            .filter(|handle| handle.node == self.node)
+            .filter(|handle| handle.node == self.node && handle.restarting == Some(self.id))
         {
-            handle.restarting = false;
+            handle.restarting = None;
         }
         self.db.opened.restarted.notify_all();
     }

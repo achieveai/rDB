@@ -2259,3 +2259,48 @@ fn f87_3_a_restart_held_in_its_wal_join_blocks_no_other_copy() {
     }
     put.join().expect("the put thread").expect("k2");
 }
+
+/// Review r7 (thread 4655953455): a restart that has published its new handle clears only its
+/// own mark, never the next restart's. Restart A of node 2 is held after it published, before
+/// its mark is dropped (`RestartStage::Published`); restart B of node 2 then marks it and is
+/// held with the old thread ended (`RestartStage::Stopped`). A is let go and ends: node 2 is
+/// still marked by B. Then B is let go and ends. No sleep orders them: each stage is waited
+/// for by its hold.
+/// Cut: `RestartMark` clearing whatever mark the node holds, red (B's mark cleared by A).
+/// Integration (~5 s): one open, two restarts.
+#[config_log::retcd_test]
+fn f87_3_a_finished_restart_leaves_the_next_restarts_mark() {
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let db = Arc::new(opened(&rt, dir.path(), &store));
+    let marked = |db: &Db| {
+        lock(&db.nodes)
+            .iter()
+            .find(|handle| handle.node == NodeId(2))
+            .and_then(|handle| handle.restarting)
+    };
+    let restart = |db: &Arc<Db>| {
+        let db = Arc::clone(db);
+        std::thread::spawn(move || db.restart_node(NodeId(2)))
+    };
+    let (a_held, a_release) = db.hold_restart(crate::db::RestartStage::Published);
+    let a = restart(&db);
+    a_held
+        .recv_timeout(patience())
+        .expect("restart A published its handle");
+    assert_eq!(marked(&db), None, "A's new handle carries no mark");
+    let (b_held, b_release) = db.hold_restart(crate::db::RestartStage::Stopped);
+    let b = restart(&db);
+    b_held
+        .recv_timeout(patience())
+        .expect("restart B stopped node 2");
+    let b_mark = marked(&db).expect("B marked node 2");
+    drop(a_release);
+    let a_boot = a.join().expect("restart A").expect("A restarted node 2");
+    assert_eq!(marked(&db), Some(b_mark), "A's end left B's mark");
+    drop(b_release);
+    let b_boot = b.join().expect("restart B").expect("B restarted node 2");
+    assert!(b_boot > a_boot, "{b_boot:?} after {a_boot:?}");
+    assert_eq!(marked(&db), None, "B's end cleared its own mark");
+}

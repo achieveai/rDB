@@ -1535,10 +1535,11 @@ pub struct NodeHandle {
     /// Set when a restart did not start this node again: `boot` is then the boot it was
     /// given, and no process runs it (F-013).
     pub(crate) start_failed: bool,
-    /// Set while [`crate::Db::restart_node`] stops and starts this node outside the node lock
-    /// (#170 review r6): a call to this node waits until the restart is over, while calls to
-    /// the other nodes go on.
-    pub(crate) restarting: bool,
+    /// The id of the restart that stops and starts this node outside the node lock, while it
+    /// does (#170 review r6): a call to this node waits until the restart is over, while calls
+    /// to the other nodes go on. Only that restart clears it (review r7): a restart that has
+    /// already published its new handle never clears the next one's mark.
+    pub(crate) restarting: Option<u64>,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
     /// The node's published views, for `Db::ownership` and `Db::still_owner` (#84).
@@ -1570,7 +1571,7 @@ impl NodeHandle {
                 node,
                 boot: BOOT,
                 start_failed: false,
-                restarting: false,
+                restarting: None,
                 tx,
                 join: None,
                 owner_views: OwnerViews::new(node, HostClock::start()),
@@ -1720,7 +1721,7 @@ pub(crate) fn spawn_on(
         node,
         boot,
         start_failed: false,
-        restarting: false,
+        restarting: None,
         tx,
         join: Some(join),
         owner_views,
