@@ -15843,6 +15843,37 @@ mod tests {
         );
     }
 
+    /// PR #181 review round 6: a marker write that fails logs `os_boot_record_failed` once,
+    /// at Warning, with the folder, and leaves no file; the id is taken all the same, so a later
+    /// ready answer does not write it either, and the next open waits for every copy. Here the
+    /// node folder does not exist. Unit (~10 ms). Cut: the warn removed, red.
+    #[config_log::retcd_test]
+    fn r5_record_failed_a_marker_that_cannot_be_written_is_warned_once() {
+        const METHOD: &str = "r5_record_failed_a_marker_that_cannot_be_written_is_warned_once";
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let gone = dir.path().join("no-such-node");
+        let (db, marker) = r5_queued(&rt, &gone, HealState::Handed(R5_HANDED));
+        db.record_os_boot(std::time::Instant::now());
+        db.record_os_boot(std::time::Instant::now());
+        assert!(!marker.exists(), "no marker");
+        assert!(
+            lock(&db.opened.os_boot_record).is_empty(),
+            "the id is taken"
+        );
+        let failed: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "os_boot_record_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["@l"], "Warning", "{failed:?}");
+        assert_eq!(
+            failed[0]["dir"].as_str(),
+            Some(gone.display().to_string().as_str()),
+            "{failed:?}"
+        );
+    }
+
     /// PR #181 review round 2, blocker 2: `record_os_boot` with the heal `Failed` writes no
     /// marker, at once (a failed heal is not waited for), logs
     /// `os_boot_record_deferred{heal=failed}` and keeps the queued id; a later call with the

@@ -337,7 +337,9 @@ mod tests {
     }
 
     /// PR #181 review: a stale file that cannot be removed refuses the open as before, and logs
-    /// why first, with the path. Unit (~5 ms). Cut: the `os_boot_remove_failed` warn removed,
+    /// why first, with the path. The file cannot be read either: one `os_boot_file_unreadable`
+    /// warning with its path (review round 6). Unit (~5 ms). Cuts: the
+    /// `os_boot_remove_failed` warn removed, red; the `os_boot_file_unreadable` warn removed,
     /// red.
     #[config_log::retcd_test]
     fn r5_n_a_stale_file_that_cannot_be_removed_is_logged_and_refuses() {
@@ -361,5 +363,13 @@ mod tests {
                 .is_some_and(|file| file.ends_with(OS_BOOT_FILE)),
             "{lines:?}"
         );
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "os_boot_file_unreadable")
+            .collect();
+        assert_eq!(unreadable.len(), 1, "{lines:?}");
+        assert_eq!(unreadable[0]["@l"], "Warning");
+        assert_eq!(unreadable[0]["file"], failed[0]["file"], "{lines:?}");
+        assert!(unreadable[0]["error"].is_string(), "{lines:?}");
     }
 }

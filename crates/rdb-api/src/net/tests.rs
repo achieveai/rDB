@@ -1909,11 +1909,21 @@ async fn a_node_dials_only_once_its_node_can_take_messages() {
 /// PR #181 review round 4: fault `refuse-links` brings up no link, whichever end holds it, and
 /// no handshake tells the other end its boot. First node 2, the dialler, holds it; then node 1,
 /// the listener. Each time no link comes up within a window and the other end has no boot for
-/// it; lifted, the link comes up and carries the boot. Unit (~3 s).
+/// it; lifted, the link comes up and carries the boot. Logged (review round 6): the refusing
+/// dialler's `net_dial_failed` with the fault's reason once, and no accept refused while only
+/// it holds the fault; the refusing listener's `net_handshake_refused_by_fault`, info, at
+/// least once (once per dial; the redial count depends on timing). Unit (~3 s).
 /// Cuts: the dial-side check skipped, red in the first half; the accept-side check skipped,
 /// red in the second.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_refuse_links_brings_up_no_link_either_way_until_lifted() {
+    const METHOD: &str = "r5_refuse_links_brings_up_no_link_either_way_until_lifted";
+    let logged = |message: &str| -> Vec<serde_json::Value> {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .collect()
+    };
     const WINDOW: Duration = Duration::from_millis(1_500);
     let patience = crate::host::test_patience(PATIENCE);
     let dir = config_testkit::fs::temp_dir();
@@ -1938,6 +1948,23 @@ async fn r5_refuse_links_brings_up_no_link_either_way_until_lifted() {
         one.net.boot_of(NodeId(2)),
         None,
         "node 1 never heard node 2's Hello"
+    );
+    let refused_dials: Vec<_> = logged("net_dial_failed")
+        .into_iter()
+        .filter(|line| {
+            line["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("fault refuse-links"))
+        })
+        .collect();
+    assert_eq!(
+        refused_dials.len(),
+        1,
+        "once until its reason changes: {refused_dials:?}"
+    );
+    assert!(
+        logged("net_handshake_refused_by_fault").is_empty(),
+        "node 2 dialled nothing, so node 1 refused no accept"
     );
     two.faults.apply("");
     one.net
@@ -1968,6 +1995,14 @@ async fn r5_refuse_links_brings_up_no_link_either_way_until_lifted() {
         two.net.boot_of(NodeId(1)),
         None,
         "node 2 never got node 1's Welcome"
+    );
+    let refused = logged("net_handshake_refused_by_fault");
+    assert!(!refused.is_empty(), "node 1 refused node 2's Hello");
+    assert!(
+        refused
+            .iter()
+            .all(|line| line["@l"] == "Information" && line["peer"].is_string()),
+        "{refused:?}"
     );
     one.faults.apply("");
     two.net

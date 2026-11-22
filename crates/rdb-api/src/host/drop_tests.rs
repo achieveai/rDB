@@ -64,6 +64,27 @@ fn present(trio: &mut Trio, request: u64, asked_as: u64) -> bool {
     }
 }
 
+/// The document node 1 reads back at key `k<request>`, asked under `asked_as`; `None` when it
+/// reads nothing there.
+fn doc_of(trio: &mut Trio, request: u64, asked_as: u64) -> Option<Value> {
+    let get = ClientCall::Get {
+        identity: identity(asked_as),
+        group: AffinityId(1),
+        object: key(request),
+        look: Look::Doc,
+    };
+    match trio.ask(get) {
+        Answer::Read {
+            seen: Seen::Doc(doc),
+            ..
+        } => Some(doc.value),
+        Answer::Read {
+            seen: Seen::Absent, ..
+        } => None,
+        other => panic!("read of k{request}: {other:?}"),
+    }
+}
+
 /// Node 1's last commit: its generation, mode and member nodes.
 pub(super) fn commit_of(trio: &Trio) -> Option<(Generation, PartitionMode, Vec<u32>)> {
     trio.nodes[0]
@@ -7623,9 +7644,11 @@ fn r5_j_a_copy_the_heal_left_out_with_no_grant_returns_live_at_its_boot() {
         "node 3's process was never replaced"
     );
     assert_eq!(logged!(METHOD, "live_readd_planned").len(), 1);
+    // PR #181 review round 6: the bytes each put wrote, not only that something is there.
     for taken in 1..request {
-        assert!(
-            present(&mut trio, taken, 1_000 + taken),
+        assert_eq!(
+            doc_of(&mut trio, taken, 1_000 + taken),
+            Some(Value::Bytes(b"v".to_vec())),
             "k{taken} reads back"
         );
     }
