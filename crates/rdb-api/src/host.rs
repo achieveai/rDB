@@ -15907,10 +15907,10 @@ pub struct FenceFacts {
 /// can land after that read, so the node's new boot may heal the partition after this node
 /// bound the proof. The grant's absence does not keep one owner then; the partition compare
 /// does. The heal's commit and this node's F1 commit are both CASes on `partitions/{p}` at
-/// `control_revision`, and only one applies; the other is refused and its recovery blocks. The
-/// one refusal that
-/// can be wrong is this node's clock view lagging the promoter's; the host then reads and
-/// checks once more ([`fence_recheck_millis`]).
+/// `control_revision`, and only one applies. When the heal's loses, the owner's recovery
+/// blocks; when this node's loses, its promote ends `Superseded` naming the owner. The one
+/// refusal that can be wrong is this node's clock view lagging the promoter's; the host then
+/// reads and checks once more ([`fence_recheck_millis`]).
 ///
 /// 0. the proof is for the partition it was routed to (critic-63 A1: F1 is given it there);
 /// 1. `partitions/1` is the proof's partition, at `control_revision`;

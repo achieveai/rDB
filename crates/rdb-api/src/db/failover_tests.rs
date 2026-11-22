@@ -2533,15 +2533,27 @@ struct RaceSetup {
 /// planner is built over a second gate on the rig's store, holds `planner/grant`, and its
 /// delete of `grants/1` is armed to park.
 fn race_setup(store: Arc<dyn ConfigStore>) -> RaceSetup {
+    race_setup_over(store, 6)
+}
+
+/// [`race_setup`] over `partitions` partitions: with 9, node 1 still owns a third partition
+/// beside `p` after `q`'s promote.
+fn race_setup_over(store: Arc<dyn ConfigStore>, partitions: u32) -> RaceSetup {
     let mut gate3 = None;
-    let mut rig = opened_on(store, 6, [None; 3], &|_| {}, &mut |node, control| {
-        if node != NodeId(3) {
-            return control;
-        }
-        let gate = crate::test_store::CallGate::new(control);
-        gate3 = Some(Arc::clone(&gate));
-        gate
-    });
+    let mut rig = opened_on(
+        store,
+        partitions,
+        [None; 3],
+        &|_| {},
+        &mut |node, control| {
+            if node != NodeId(3) {
+                return control;
+            }
+            let gate = crate::test_store::CallGate::new(control);
+            gate3 = Some(Arc::clone(&gate));
+            gate
+        },
+    );
     let gate3 = gate3.expect("node 3's store is gated");
     rig.wait_ready();
     rig.wait_for_owner_grants();
@@ -3064,6 +3076,182 @@ fn i172_a_heal_planned_against_an_undone_fencing_plans_again_in_the_same_open() 
         "{after:?}"
     );
     assert_only_the_owner_admits(&rig, p, NodeId(1));
+    let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
+    let put = put_lands(&app, group_of(&app, p), lifetimes(5));
+    assert_eq!(put.partition, PartitionId(p), "{put:?}");
+}
+
+/// PR #218 review, round 2 (the two-partition blocker): the undone-`Fencing` row with a
+/// sibling. Nine partitions, so node 1 owns `p` and a sibling `s` after `q`'s promote. Node 1's
+/// heal plans both; `p`'s commit is held, `s` commits, and node 1's A1 acquires `grants/1` at
+/// the new boot before `p`'s commit goes. The promote then undoes its `Fencing`, `p`'s commit
+/// is refused (`CasContention`), and the heal's watch plans `p` again. That re-plan meets the
+/// grant `s`'s recovery holds at this boot (`ClearVerdict::Current`), which is never cleared;
+/// it reuses the first heal's evidence that the old boot's grant is gone instead.
+/// Asserted first: one owner per generation; then `s` was admitting before `p`'s commit went,
+/// `grants/1` still holds the same grant of the new boot (never cleared), node 1 owns `p` at
+/// the next generation, the same open is ready, only node 1 admits on `p` and `s`, and a put
+/// lands on `p`.
+/// Integration (~20 s alone): a grant lapse, a hand promote, two restarts.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: the re-plan clears the grant again
+/// (`heal_from` ignores `proved`). Red: the re-plan waits on the current grant until the
+/// deadline, "the same open became ready: Err(Heal(Control(\"the re-plan of partition 4 had no
+/// answer before the heal's deadline; ...\")))".
+#[config_log::retcd_test]
+fn i172_a_heal_replan_with_a_sibling_holding_the_grant_heals_in_the_same_open() {
+    const METHOD: &str =
+        "i172_a_heal_replan_with_a_sibling_holding_the_grant_heals_in_the_same_open";
+    let log = crate::test_store::PutLog::new(
+        Arc::new(config_testkit::MemStore::new()),
+        ControlPrefix::Partitions.encode(),
+    );
+    let RaceSetup {
+        mut rig,
+        gate3,
+        clear_gate,
+        planner,
+        mut memory,
+        p,
+        old_boot: _,
+        before,
+    } = race_setup_over(Arc::clone(&log) as Arc<dyn ConfigStore>, 9);
+    let siblings: Vec<u32> = rig
+        .owned_by(NodeId(1))
+        .into_iter()
+        .filter(|owned| *owned != p)
+        .collect();
+    let [s] = siblings[..] else {
+        panic!("node 1 owns one partition beside p={p}: {siblings:?}");
+    };
+    let key = ControlKey::Partition(PartitionId(p)).encode();
+    let span = tracing::Span::current();
+    let handle = rig.rt.handle().clone();
+    let node3 = rig.procs.remove(2);
+    let (answer, healed, held) = std::thread::scope(|scope| {
+        let release = crate::test_store::ReleaseOnUnwind::default();
+        release.watch(&gate3);
+        release.watch(&clear_gate);
+        let sweep = scope.spawn(|| {
+            let _test = span.enter();
+            handle.block_on(planner.sweep(&mut memory))
+        });
+        until(
+            "the clear has read and parks its delete",
+            lifetimes(5),
+            || clear_gate.parked() == 1,
+        );
+        gate3.arm_put_reply(&key);
+        let promote = scope.spawn(|| {
+            let _test = span.enter();
+            node3
+                .db
+                .promote_partition(PartitionId(p), NodeId(3), Some(NodeId(1)))
+        });
+        until(
+            "the promote's Fencing write lands and parks",
+            lifetimes(5),
+            || gate3.parked() == 1,
+        );
+        clear_gate.release();
+        until("the clear deletes grants/1", lifetimes(5), || {
+            grant_revision(&rig, NodeId(1)).is_none()
+        });
+        sweep.join().expect("the sweep thread");
+        let mut gate1 = None;
+        rig.restart_wrapped(0, None, |control| {
+            let gate = crate::test_store::CallGate::new(control);
+            gate.arm_put(&key);
+            gate1 = Some(Arc::clone(&gate));
+            gate
+        });
+        let gate1 = gate1.expect("node 1's restarted store is gated");
+        release.watch(&gate1);
+        let boot = rig.procs[0].boot;
+        until(
+            "node 1's heal commit of p parks at its CAS",
+            lifetimes(5),
+            || gate1.parked() == 1,
+        );
+        let status_s = || {
+            rig.procs[0]
+                .db
+                .node_status_in(PartitionId(s))
+                .ok()
+                .and_then(|statuses| statuses.into_iter().find(|status| status.node == NodeId(1)))
+        };
+        until(
+            "s admits and node 1 holds grants/1 at its new boot",
+            lifetimes(5),
+            || {
+                rig.grants()
+                    .get(&NodeId(1))
+                    .is_some_and(|grant| grant.boot == boot)
+                    && status_s().is_some_and(|status| status.admits == Some(true))
+            },
+        );
+        let held = (
+            rig.grants()
+                .get(&NodeId(1))
+                .map(|grant| (grant.grant, grant.boot)),
+            status_s(),
+        );
+        gate3.release();
+        let answer = promote.join().expect("the promote thread");
+        gate1.release();
+        let healed = rig.procs[0]
+            .db
+            .wait_ready(crate::host::test_patience(Duration::from_secs(30)));
+        (answer, healed, held)
+    });
+    rig.procs.push(node3);
+    let after = rig.record(p);
+    let history = partition_history(&log, p);
+    println!("i172 sibling p={p} s={s} before={before:?} after={after:?} answer={answer:?}");
+    println!("i172 sibling healed={healed:?} held={held:?}");
+    for (revision, record) in &history {
+        println!("i172 sibling history {revision}: {record:?}");
+    }
+    assert_one_owner_per_generation(&history);
+    assert_one_owner_per_generation(&partition_history(&log, s));
+    let (grant_at, status_s) = held;
+    assert!(
+        status_s
+            .as_ref()
+            .is_some_and(|status| status.admits == Some(true)),
+        "s admitted before p's commit went: {status_s:?}"
+    );
+    assert!(
+        matches!(
+            &answer,
+            Err(admin::PromoteError::OwnerAlive { node: 1, .. })
+        ),
+        "{answer:?}"
+    );
+    let replans = logged(METHOD, "heal_replan_after_conflict")
+        .into_iter()
+        .filter(|line| line["owner"] == 1)
+        .count();
+    assert!(replans > 0, "the heal planned p again in this open");
+    assert!(healed.is_ok(), "the same open became ready: {healed:?}");
+    // Renewals move its revision; a clear and a fresh acquire would name another grant.
+    assert_eq!(
+        rig.grants()
+            .get(&NodeId(1))
+            .map(|grant| (grant.grant, grant.boot)),
+        grant_at,
+        "the re-plan left the grant s's recovery holds as it was"
+    );
+    assert_eq!(
+        (after.owner, after.generation.0, after.lifecycle),
+        (
+            NodeId(1),
+            before.generation.0 + 1,
+            PartitionLifecycle::Serving
+        ),
+        "{after:?}"
+    );
+    assert_only_the_owner_admits(&rig, p, NodeId(1));
+    assert_only_the_owner_admits(&rig, s, NodeId(1));
     let (app, _net, _links) = rig.app(&[NodeId(1), NodeId(3)]);
     let put = put_lands(&app, group_of(&app, p), lifetimes(5));
     assert_eq!(put.partition, PartitionId(p), "{put:?}");

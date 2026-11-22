@@ -962,14 +962,20 @@ impl ConfigStore for SwapPartitionOneInstance {
 /// [`CallGate::arm_put_reply`] applies the next such put and holds its reply (a promote's
 /// `Fencing` write that has landed, its promote not yet gone on),
 /// [`CallGate::arm_delete`] holds the next such delete before it reaches the store (the
-/// planner's clear, its reads done, its delete not yet sent). Each parked call adds one to
-/// [`CallGate::parked`] and waits for one [`CallGate::release`]. Every other call passes.
+/// planner's clear, its reads done, its delete not yet sent), and [`CallGate::arm_list_after`]
+/// lets a number of lists under a prefix through and holds the next one before it reaches the
+/// store (a heal's second `partitions/` read, PR #218 review round 2). One mode is sticky:
+/// [`CallGate::arm_puts`] holds **every** put under its prefix, re-sends included, until
+/// [`CallGate::disarm_puts`]. Each parked call adds one to [`CallGate::parked`] and waits for
+/// one [`CallGate::release`], or for [`CallGate::open`]. Every other call passes.
 pub(crate) struct CallGate {
     inner: std::sync::Arc<dyn ConfigStore>,
     put: Mutex<Option<Vec<u8>>>,
     puts: Mutex<Option<Vec<u8>>>,
     put_reply: Mutex<Option<Vec<u8>>>,
     delete: Mutex<Option<Vec<u8>>>,
+    /// The prefix of [`Self::arm_list_after`], and how many such lists still pass first.
+    list: Mutex<Option<(Vec<u8>, u32)>>,
     parked: std::sync::atomic::AtomicU32,
     gate: Semaphore,
 }
@@ -982,6 +988,7 @@ impl CallGate {
             puts: Mutex::new(None),
             put_reply: Mutex::new(None),
             delete: Mutex::new(None),
+            list: Mutex::new(None),
             parked: std::sync::atomic::AtomicU32::new(0),
             gate: Semaphore::new(0),
         })
@@ -1012,6 +1019,28 @@ impl CallGate {
     /// Hold the next delete under `prefix` before it reaches the store.
     pub(crate) fn arm_delete(&self, prefix: &str) {
         *self.delete.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Let `pass` lists under `prefix` through, then hold the next one before it reaches the
+    /// store.
+    pub(crate) fn arm_list_after(&self, prefix: &str, pass: u32) {
+        *self.list.lock().expect("gate") = Some((prefix.as_bytes().to_vec(), pass));
+    }
+
+    /// Whether a list of `prefix` takes the armed list hold, disarming it if so.
+    fn take_list(&self, prefix: &[u8]) -> bool {
+        let mut armed = self.list.lock().expect("gate");
+        match armed.as_mut() {
+            Some((armed_prefix, pass)) if prefix.starts_with(armed_prefix) => {
+                if *pass == 0 {
+                    *armed = None;
+                    return true;
+                }
+                *pass -= 1;
+                false
+            }
+            _ => false,
+        }
     }
 
     /// How many calls have parked so far.
@@ -1089,6 +1118,10 @@ impl ConfigStore for CallGate {
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        if self.take_list(&request.prefix) {
+            let prefix = request.prefix.clone();
+            self.park("list", &prefix).await;
+        }
         self.inner.list(request).await
     }
 

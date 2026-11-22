@@ -1260,9 +1260,12 @@ pub enum ReadyError {
         /// [`Db::restart_note`].
         note: String,
     },
-    /// The owner's recovery ended `Blocked` before it took writes. It does not try again in this
-    /// open (ruling F-a), so no wait helps (A-R196). A new open usually gets past it; one that
-    /// is blocked again is not a slow host, so the text says to stop then (review-s1 F-007).
+    /// The owner's recovery ended `Blocked` before it took writes, and nothing in this open will
+    /// try it again (ruling F-a), so no wait helps (A-R196). For `CasContention` that holds
+    /// only once the reopen's heal has stopped watching: until then [`admin::heal_settling`]
+    /// plans it again, and a re-plan that failed is answered as [`Self::Heal`] with its cause,
+    /// not as this (#172, PR #218 review). A new open usually gets past it; one that is blocked
+    /// again is not a slow host, so the text says to stop then (review-s1 F-007).
     #[error(
         "the open's recovery stopped before node {node} took writes ({reason}), and it does \
          not try again in this open. If the last open of this folder stopped the same way, stop \
@@ -2682,9 +2685,9 @@ impl Db {
                 for ctx in ctxs {
                     let watch = ctx.again();
                     match admin::heal_retrying(ctx).await {
-                        Ok(healed) => {
+                        Ok((healed, proved)) => {
                             first.get_or_insert(healed);
-                            handed.push(watch);
+                            handed.push((watch, proved));
                         }
                         Err(error) => {
                             tracing::error!(%error, "heal_failed");
@@ -2700,9 +2703,19 @@ impl Db {
                     (Ok(()), None) => HealState::NotNeeded,
                 };
                 // #172 (PR #218 review): a recovery whose commit lost to an undone `Fencing`
-                // is planned again in this open; `wait_ready` waits while this runs.
+                // is planned again in this open; `wait_ready` waits while this runs. A re-plan
+                // that failed is the heal's error from then on, so `wait_ready` names its cause
+                // (round 2); it is set before the flag clears.
                 if healed && !handed.is_empty() {
-                    futures::future::join_all(handed.into_iter().map(admin::heal_settling)).await;
+                    let watched = futures::future::join_all(
+                        handed
+                            .into_iter()
+                            .map(|(watch, proved)| admin::heal_settling(watch, proved)),
+                    )
+                    .await;
+                    if let Some(error) = watched.into_iter().find_map(Result::err) {
+                        *lock(&state) = HealState::Failed(error);
+                    }
                 }
                 settling.store(false, Ordering::Release);
             },
@@ -2719,7 +2732,8 @@ impl Db {
     /// phase (ruling F-a, A-R196). The one exception is `Blocked(CasContention)` while the
     /// reopen's heal still runs: [`admin::heal_settling`] plans that recovery again with a fresh
     /// fence (#172, PR #218 review), so this waits on, and answers `Blocked` only once the heal
-    /// has stopped watching. An owner in another process
+    /// has stopped watching; a re-plan that failed answers [`ReadyError::Heal`] with its cause
+    /// instead. An owner in another process
     /// is not ended by it: that owner re-plans a rejoin that does not end writable (A-R282), so
     /// this waits on to `within` and answers [`ReadyError::TimedOut`] naming the phase (A-R314
     /// item 2). A quarantined recovery answers at once wherever the owner runs, since nothing in
@@ -2806,6 +2820,11 @@ impl Db {
                         && !(reason == "CasContention"
                             && self.opened.heal_settling.load(Ordering::Acquire)) =>
                     {
+                        // A re-plan that failed just before the flag cleared: its cause, not
+                        // the block it left (PR #218 review, round 2).
+                        if let HealState::Failed(error) = &*lock(&self.opened.heal) {
+                            return Err(ReadyError::Heal(error.clone()));
+                        }
                         tracing::warn!(owner = node.0, reason, "ready_blocked");
                         return Err(ReadyError::Blocked {
                             owner: node,
@@ -2813,8 +2832,10 @@ impl Db {
                         });
                     }
                     Some(ReadyError::Blocked { reason, .. }) => {
-                        // Another process's owner is not ended by one blocked recovery: it
-                        // re-plans a rejoin that does not end writable (A-R282, A-R314 item 2).
+                        // Not ended by this block: an owner in another process re-plans a rejoin
+                        // that does not end writable (A-R282, A-R314 item 2), and an owner this
+                        // `Db` runs blocked `CasContention` is planned again while the heal's
+                        // watch runs ([`admin::heal_settling`]).
                         if remote_blocked.as_ref() != Some(&reason) {
                             tracing::info!(owner = owner.node.0, reason, "ready_owner_blocked");
                             remote_blocked = Some(reason);

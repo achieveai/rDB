@@ -454,8 +454,9 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   If the node's heal planned against a `Fencing` write that the promote then undid, the heal's
   first commit is refused (`CasContention`). The same open plans it again against the record
   as it now is and heals the partition (`heal_replan_after_conflict`); no second open is
-  needed. Until that commit, no process admits writes on the partition, though its record
-  still names the node.
+  needed, also when the node's other partitions have already taken writes. If that second
+  plan fails, `wait_ready` returns `ReadyError::Heal` with the reason. Until that commit, no
+  process admits writes on the partition, though its record still names the node.
 - **A frozen node cannot lead again at the boot that was frozen.** It can start and hold copies,
   but a promote onto it is refused as `PromoteError::TargetFrozen`. After a restart (a new
   boot) whose partitions are all `Serving` (none at all included), a failover planner, where
