@@ -1689,14 +1689,14 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
-- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
-  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
-  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
-  last check, the answer is still `UNKNOWN_OUTCOME`. A move or a refill re-plans the
-  partition too, and each such re-plan can answer one put in flight `UNKNOWN_OUTCOME`. Treat
-  that as "may have applied": ask `db.status`, send it again with `db.resend`, or read the key
-  back. Never send it again as a new write.
+- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** The owner re-plans a
+  partition when a copy rejoins, and during a move or a refill, and a put can be in flight
+  when it does. Every re-plan answers that put the same way. If the re-plan keeps the put, the
+  answer is `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under
+  (issue #111). If the re-plan cannot tell, or the put had already published and was waiting
+  on its last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied":
+  ask `db.status`, send it again with `db.resend`, or read the key back. Never send it again
+  as a new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
