@@ -494,7 +494,7 @@ flowchart LR
 | Key family | Required content |
 |---|---|
 | `cluster/schema` | Cluster UUID, protocol/schema versions, minimum compatible data version |
-| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only, written by the declaration (`admin::declare`), create-only; the boot comes from the link handshake; the rest is not stored yet |
+| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only, written by the declaration (`admin::declare`), create-only; the boot comes from the link handshake; the rest is not stored yet. *Amended by ADR-rdb-0023 Decision 6 (#83 B2):* layout 2 adds the node's app address, which the node itself CASes into its own record at open, changing only that address; the declared address and machine are never rewritten. An open given no app address on a new or emptied node folder also writes the record: a fence that CASes the record's own bytes back at the revision it read, so the revision changes and the body and layout do not (PR #159 review r4) |
 | `grants/{node}` | Grant ID, authority generation, allowed boot UUID, expiry, renewal version, mode |
 | `partitions/{id}` | Range, group-hash version, owner, owner epoch, generation, membership/config version, lineage root, lifecycle state |
 | `routes/{range}` | Versioned route root/manifest pointer; authoritative atomic cutover key |
