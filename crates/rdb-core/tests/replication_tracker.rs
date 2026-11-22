@@ -2369,6 +2369,13 @@ fn a_cursor_is_dropped_when_it_stops() {
 /// B-R48 ruling 6 and c11's case: `Recovered` drops every cursor. B's cursor was chasing head
 /// 12 when recovery cut the head to 10. Kept alive, it would call B caught up at 10 on the
 /// first ACK B sends under the new root. A copy past the cut gets the snapshot request.
+///
+/// Issue #61 (lead ruling 2026-11-22): that request now starts a catching-up cursor
+/// (`Primary::await_snapshot`). Ruling 6 still holds: the cursor is born after `Recovered`,
+/// fresh (no mark, nothing in flight), and B's ACKs at the old head 12 report nothing. Only an
+/// ACK the new root's ladder verifies, at 10, reports `CopyCaughtUp`, once. The last assertion
+/// was `cursor(COPY_B).is_none()` after the request; it changed with the 2026-11-22 ruling.
+/// Cut: no cursor in `Primary::await_snapshot`, red at "a fresh cursor waits for the snapshot".
 #[retcd_test]
 fn recovered_drops_every_cursor_and_a_head_cut_reports_no_copy_caught_up() {
     let result = recovery(10, d(10), pin_with_b());
@@ -2391,17 +2398,46 @@ fn recovered_drops_every_cursor_and_a_head_cut_reports_no_copy_caught_up() {
     let want = deliver(&mut reference, &at_cut);
     assert_eq!(want[0], peer_progress(B, 10), "the tracker admits it");
     assert_eq!(route(&mut module, accepted(&at_cut)), want);
+    let past_cut = vec![
+        rejected(AckRejectReason::Unverifiable),
+        kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(10),
+        }),
+    ];
     assert_eq!(
         route(&mut module, accepted(&new_root(b(HEAD, HEAD, 10)))),
-        vec![
-            rejected(AckRejectReason::Unverifiable),
-            kernel(KernelEffect::SnapshotCatchupRequired {
-                copy: COPY_B,
-                barrier: Seq(10),
-            }),
-        ]
+        past_cut
     );
+    let fresh = primary_side(&module)
+        .cursor(COPY_B)
+        .expect("a fresh cursor waits for the snapshot");
+    assert_eq!(
+        (fresh.mark(), fresh.outstanding(), fresh.unacked()),
+        (None, None, None),
+        "fresh: no mark, nothing in flight"
+    );
+    assert_eq!(
+        route(&mut module, accepted(&new_root(b(HEAD, HEAD, 10)))),
+        past_cut,
+        "the old head still reports no caught-up"
+    );
+    let caught = |effects: &[EffectKind]| {
+        effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    EffectKind::Kernel(KernelEffect::CopyCaughtUp { .. })
+                )
+            })
+            .count()
+    };
+    let rebuilt = route(&mut module, accepted(&at_cut));
+    assert_eq!(caught(&rebuilt), 1, "caught up at 10, once: {rebuilt:?}");
     assert!(primary_side(&module).cursor(COPY_B).is_none());
+    let again = route(&mut module, accepted(&at_cut));
+    assert_eq!(caught(&again), 0, "once: {again:?}");
 }
 
 /// `Recovered` on a node that holds both halves of the partition answers the receiver's effects
@@ -7601,4 +7637,89 @@ fn m10_r197_c4_a_kept_copy_s_received_is_clamped_to_its_applied_head() {
         tracker.peer(COPY_B).map(|peer| peer.progress),
         Some(progress(HEAD, HEAD, HEAD))
     );
+}
+
+// --- issue #61: the ladder floor -----------------------------------------------------------
+
+/// Issue #61 A3 (history-trim design §0, §1b): the host trims the primary's ladder to the
+/// History floor before it trims the engine. The tracker vouches for 5..=12; trimmed to 8, an
+/// ACK at 6 — which counted before the trim — is unverifiable and asks for a snapshot, the only
+/// answer an engine below its floor has, and changes nothing. Never divergence: absence is not
+/// proof.
+/// Cut: `DigestLadder::trim_below` keeps every rung (a no-op), red (B's ACK at 6 counts).
+#[retcd_test]
+fn t61_ack_below_floor_is_unverifiable_and_asks_snapshot() {
+    let mut untrimmed = tracker();
+    assert_eq!(
+        deliver(&mut untrimmed, &b(6, 6, 6)),
+        vec![peer_progress(B, 6)],
+        "control: 6 counts before the trim"
+    );
+
+    let mut tracker = tracker();
+    assert_eq!(tracker.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(tracker.history().floor(), Some(Seq(8)));
+    assert_eq!(tracker.history().digest_at(Seq(7)), None);
+    for ack in [b(6, 6, 6), forked(b(7, 7, 7))] {
+        let before = tracker.clone();
+        assert_eq!(
+            deliver(&mut tracker, &ack),
+            vec![
+                rejected(AckRejectReason::Unverifiable),
+                kernel(KernelEffect::SnapshotCatchupRequired {
+                    copy: COPY_B,
+                    barrier: Seq(HEAD),
+                }),
+            ],
+            "{ack:?}"
+        );
+        assert_eq!(tracker, before, "a dropped ACK changes nothing");
+        assert!(!tracker.is_diverged(COPY_B), "absence is not divergence");
+    }
+}
+
+/// Issue #61 A3: an ACK at the floor itself counts, because History keeps the record at the
+/// floor and the ladder keeps its rung (design §0, "`seq` included"). Twice: a dense ladder
+/// trimmed to 8 keeps its rung at 8, and a ladder that held only the root and its head (what
+/// `Recovered` builds) gets the floor rung from the host's digest. A trim above the head, or one
+/// whose digest contradicts the rung held, is refused and changes nothing.
+/// Cuts: `trim_below` drops the rung at `seq` too (`>` for `>=`), red (the ladder's floor is 9);
+/// `trim_history` skips writing the floor rung, red (the sparse ladder's ACK at 8 is
+/// unverifiable).
+#[retcd_test]
+fn t61_ack_at_floor_counts() {
+    let mut ladder = ladder(5);
+    ladder.trim_below(Seq(8));
+    assert_eq!(ladder.floor(), Some(Seq(8)), "the rung at the floor stays");
+    assert_eq!(ladder.len(), (8..=HEAD).count());
+
+    let mut dense = tracker();
+    assert_eq!(dense.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(dense.history().floor(), Some(Seq(8)));
+    assert_eq!(deliver(&mut dense, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+
+    let mut sparse_history = DigestLadder::new();
+    sparse_history.insert(Seq::ZERO, Digest::ROOT);
+    sparse_history.insert(Seq(HEAD), d(HEAD));
+    let mut sparse = ProgressTracker::new(TrackerInit {
+        history: sparse_history,
+        ..init(config())
+    })
+    .expect("a root-and-head tracker");
+    assert_eq!(sparse.trim_history(Seq(8), d(8)), Ok(()));
+    assert_eq!(sparse.history().floor(), Some(Seq(8)), "(0, ROOT) is gone");
+    assert_eq!(sparse.history().len(), 2, "the floor and the head");
+    assert_eq!(deliver(&mut sparse, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+
+    let invalid = |field| Err(RdbError::InvalidArgument { field });
+    for (name, seq, digest, field) in [
+        ("above the head", Seq(HEAD + 1), d(HEAD + 1), "seq"),
+        ("contradicts the rung held", Seq(9), d(10), "digest"),
+        ("not the root at 0", Seq::ZERO, d(0), "digest"),
+    ] {
+        let mut refused = tracker();
+        let before = refused.clone();
+        assert_eq!(refused.trim_history(seq, digest), invalid(field), "{name}");
+        assert_eq!(refused, before, "{name}: nothing changes");
+    }
 }

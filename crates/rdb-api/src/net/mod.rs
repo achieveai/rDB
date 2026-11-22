@@ -137,14 +137,25 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
 /// until tenants are bound to certificates (#151; [`sender_refused`]).
 ///
-/// `11` came with #147 and #148, which change three types and one: `WireChange::Delete`,
+/// `11` came with issue #61 (PR-A, design rev 5 M2): `WirePeerAsk::Probe`, F1's digest probe of
+/// a copy that another node holds, answered by `Host::probe` in the plan anchor's generation. A
+/// build before it has no such ask and faults on F1's `ProbeDigestAt`, so a mixed cluster is
+/// refused at the handshake. The snapshot transfer frames of the same PR ride this bump
+/// (`WireMsg::SnapshotOffer`, `SnapshotOfferRefused`, `SnapshotPull` and `SnapshotChunk`, each
+/// offer and refusal naming its transfer), and so do (A8b) `WireNodeStatus::needs_operator`,
+/// `WireMsg::SnapshotOfferRefused`'s `tail_held` reason with its `through`, and the adoption
+/// state `trimmed` (`WireTailRefused::adoption`, reasons `tail_below_floor` and
+/// `base_below_floor`). A build before 11 never reads `trimmed`: the handshake refuses it first,
+/// peer and app alike. Upgrade as for 10: every node and app process together.
+///
+/// `12` came with #147 and #148, which change three types and one: `WireChange::Delete`,
 /// `WireLook::List` and `WireSeen::Objects` (the ordinary delete and the object list, each added
 /// last so earlier variants keep their numbers), and the `TooLarge` error kind, which
 /// `WireApiError::kind` carries. Only the `Db` raises `TooLarge`, before it sends, so no node
 /// answers it today; the type changed all the same. The number is main's version + 1, set by the
 /// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
 /// as for `10`: every node and every linked app process together.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1313,6 +1324,13 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         (Label::Node(_), WireMsg::Frame { from, .. }) => from.node,
         (Label::Node(_), WireMsg::PeerAsk { asker, .. } | WireMsg::CatchUp { asker, .. }) => *asker,
         (Label::Node(_), WireMsg::Landed { emitter, .. }) => *emitter,
+        // Issue #61: each snapshot message names its sender, so it is held to the certificate
+        // like a frame. The host's checks then read an authenticated node: the offer's primary,
+        // a page's source, and a pull's or a refusal's planned receiver.
+        (Label::Node(_), WireMsg::SnapshotOffer { offer, .. }) => offer.from,
+        (Label::Node(_), WireMsg::SnapshotChunk { chunk, .. }) => chunk.from,
+        (Label::Node(_), WireMsg::SnapshotPull { pull, .. }) => pull.node,
+        (Label::Node(_), WireMsg::SnapshotOfferRefused { refused, .. }) => refused.node,
         (Label::Node(_), _) => return None,
     };
     match peer {

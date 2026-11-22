@@ -41,13 +41,15 @@ ADR that supersedes.
 | [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 | [0024](0024-tls-to-the-control-store.md) | TLS to the control store — plaintext to rEtcd only when every node is on a loopback IP (extends 0023) | Proposed |
 | [0026](0026-check-b-at-adoption.md) | Check B at adoption (supersedes 0021 decision 7) | **Accepted** |
+| [0027](0027-history-trim-floor-and-snapshot-rebuild.md) | History trim floor and snapshot rebuild — History kept from a per-lineage floor; a copy behind it is rebuilt from a state snapshot (extends 0010) | Proposed |
 | [0028](0028-reopen-heal-on-a-majority-within-one-os-boot.md) | Reopen heal on a majority within one OS boot — only with `live_readd` on (extends 0009, amends 0022) | Proposed |
 | [0029](0029-change-feed-as-built.md) | The change feed as built (supersedes 0020's Decision) | **Accepted** |
 
 0015 is held for RocksDB Merge (spec §4.3.4), deferred: ADR-rdb-0011 and ADR-rdb-0012 name it, and M8
 enables no Merge family. 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
 plan it implements, and the range between is reserved for the decisions the kernel teams have not
-reached yet.
+reached yet. 0025 is taken by ADRs on other branches in flight and 0026 is on main, so issue #61's ADR is
+0027.
 
 ## Who owns what
 
@@ -58,6 +60,7 @@ reached yet.
 | 0004, 0007, 0008 | kernel-a (transaction, authority, control records) |
 | 0005, 0006, 0009, 0021 | kernel-b (replication, lag protection, recovery) |
 | 0019 | verification (gates, evidence, the release boundary) |
+| 0027 | storage, t5 (history trim floor, snapshot rebuild); it amends kernel-b's 0005, 0009 and 0021 |
 
 ## Naming
 

@@ -78,12 +78,16 @@ use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::append::{
     record_batch, AppendReceiver, CatchUpPlan, Head, ReceiverInit,
 };
+use rdb_core::replication::progress::DigestLookup;
 use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
+#[cfg(debug_assertions)]
+use rdb_storage::TrimFloor;
 use rdb_storage::{
-    Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions, MAX_CHAIN_DEPTH,
+    InheritError, Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions,
+    MAX_CHAIN_DEPTH,
 };
 use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
@@ -103,6 +107,11 @@ use crate::ownership::{
     OwnerViews, OwnershipEvent, Step, Subscriber,
 };
 use crate::transport::Links;
+
+mod dedup_fill;
+use dedup_fill::{Crossed, Fill};
+pub mod snapshot;
+use snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
 /// (`rdb_sim` tests, `support::scenarios::run::BOOT`). `Db::restart_node` starts a node again
@@ -226,6 +235,11 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// below `Active` in silence (defect D2, lead ruling 2026-10-07). It is a report, not a fault:
 /// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
+
+/// Issue #61 (design N3): the "not before" poll hint on a write refused read-only while this
+/// owner rebuilds a copy from a snapshot. Fixed, and not an estimate: the source knows how much
+/// it has sent, not how much is left.
+pub const REBUILD_RETRY_HINT: Duration = Duration::from_secs(5);
 
 /// How long the owner lets L1 refuse writes on account of one copy before it re-plans the
 /// partition without that copy (M10 S2 part (b), rulings A-R277, A-R281, A-R282): the paused
@@ -643,6 +657,14 @@ pub enum Msg {
         /// How far.
         through: Seq,
     },
+    /// Issue #61 S2: a primary offers `copy` a snapshot ([`snapshot`] module docs).
+    SnapshotOffer(Box<SnapshotOffer>),
+    /// Issue #61 S2: the target asks for the next page.
+    SnapshotPull(SnapshotPull),
+    /// Issue #61 S2: one page of the source's pinned view.
+    SnapshotChunk(Box<SnapshotChunk>),
+    /// Issue #61 S2: the target refused an offer or stopped an install.
+    SnapshotOfferRefused(SnapshotOfferRefused),
     /// A copy's answer to an inventory ask, stamped with the anchor it was asked about. The
     /// asker drops it when that is not its current plan's anchor: a late answer to an older
     /// run's ask, queued by the link while the copy was down (D8, A-R337).
@@ -743,6 +765,19 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<Result<Seq, String>>,
     },
+    /// **Dev tool only**, debug builds (issue #61, design section 2 A5): trim this node's copy
+    /// of `partition` to `through` (`Host::trim_history_through`) and answer the new floor,
+    /// or why not. Local only, like [`Msg::Damage`]. `rdb_dev admin trim-history` uses it
+    /// through [`crate::db::Db::trim_history`].
+    #[cfg(debug_assertions)]
+    TrimHistory {
+        /// The partition.
+        partition: PartitionId,
+        /// The new floor: the record at it is kept, every one below is deleted.
+        through: Seq,
+        /// Where the answer goes.
+        reply: Sender<Result<Seq, String>>,
+    },
     /// #65 (critic-bb §3): rebuild node `node`'s copy of `partition`. Local only, like
     /// [`Msg::PeerBooted`]: [`crate::db::Db::rebuild`] sends it to an owner in its own process.
     /// The owner checks the guards; a pinned `node` is dropped first, and a quarantined F1 is
@@ -829,6 +864,19 @@ pub enum PeerAsk {
         generation: Generation,
         /// The asker's barrier.
         barrier: u64,
+    },
+    /// Issue #61 (design rev 4 N4, rev 5e): F1's `ProbeDigestAt` for one copy, under the plan's
+    /// anchor. The holder answers in the anchor's generation, the one its inventory reported
+    /// (`Host::probe`): `ProbeAnswered` with the digest it holds at `seq`, `ProbeUnavailable`
+    /// when it holds no record there (below its trim floor, or above its head), and nothing
+    /// when its read fails, so F1's probe deadline drops the copy.
+    Probe {
+        /// The copy probed.
+        copy: CopyId,
+        /// The plan's anchor: its generation is the one probed.
+        anchor: LineageAnchor,
+        /// The seq probed.
+        seq: Seq,
     },
 }
 
@@ -1345,6 +1393,7 @@ pub struct TailRefused {
 /// | `NotReady` | holds | needs `--give-up-live-copy`: a later landing can make it adoptable |
 /// | `Refused` | holds | needs no flag: a failed proof can restore nothing |
 /// | `Unchecked` | holds | needs `--give-up-live-copy`, as before unit 2 |
+/// | `Trimmed` | holds | needs `--give-up-live-copy`: it cannot come back, but nothing proved it superseded |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailAdoption {
     /// Every adoption proof holds against the generation (P1 to P3, and replay's
@@ -1365,16 +1414,24 @@ pub enum TailAdoption {
     /// `tail_has_no_floor` and `tail_history_read_failed` (#121), or a write that failed after
     /// the proofs held. The next landing scan replaces it.
     Unchecked,
+    /// Issue #61 (lead rulings R10 and R16, #61's protocol version): the proofs could not run because the
+    /// history they read is trimmed, named by one of [`ADOPTION_TRIMMED`]. The tail cannot come
+    /// back by adoption, yet giving it up still takes `--give-up-live-copy`: the copy may hold
+    /// the only record of an acknowledged write (design rev 5a).
+    Trimmed(&'static str),
 }
 
 impl TailAdoption {
-    /// The state [`Host::adoption`]'s answer names. A reason outside [`ADOPTION_REFUSALS`], the
-    /// wire vocabulary, is `Unchecked`, at adoption and at landing alike (#153 lead ruling): as
-    /// `Refused` it would not decode on a peer, so a status naming it would close the link, and
-    /// a bare `forget-tail` over it would need no `--give-up-live-copy`.
+    /// The state [`Host::adoption`]'s answer names. Issue #61's trimmed-history reasons
+    /// ([`ADOPTION_TRIMMED`]) are [`Self::Trimmed`] (lead ruling R16). Any other reason outside
+    /// [`ADOPTION_REFUSALS`], the wire vocabulary, is `Unchecked`, at adoption and at landing
+    /// alike (#153 lead ruling): as `Refused` it would not decode on a peer, so a status naming
+    /// it would close the link, and a bare `forget-tail` over it would need no
+    /// `--give-up-live-copy`.
     pub(crate) fn of<T>(answer: &Result<T, &'static str>) -> Self {
         match answer {
             Ok(_) => Self::Adoptable,
+            Err(reason) if ADOPTION_TRIMMED.contains(reason) => Self::Trimmed(reason),
             Err(reason) if ADOPTION_REFUSALS[..ADOPTION_NOT_READY].contains(reason) => {
                 Self::NotReady(reason)
             }
@@ -1389,13 +1446,23 @@ impl TailAdoption {
         matches!(self, Self::Adoptable)
     }
 
-    /// Whether this tail could come back without the operator, so giving it up must be named
-    /// (`--give-up-live-copy`). Only a failed proof cannot.
+    /// Whether `admin forget-tail --through` over this tail needs `--give-up-live-copy` (lead
+    /// ruling R16 item 2: named for the flag, not for whether the tail can come back). A tail
+    /// that could come back without the operator needs it, and so does a [`Self::Trimmed`] one,
+    /// which cannot come back but was never proved superseded. Only a failed proof needs none.
     #[must_use]
-    pub const fn could_return(self) -> bool {
-        !matches!(self, Self::Refused(_))
+    pub const fn needs_give_up_flag(self) -> bool {
+        match self {
+            Self::Adoptable | Self::NotReady(_) | Self::Unchecked | Self::Trimmed(_) => true,
+            Self::Refused(_) => false,
+        }
     }
 }
+
+/// Issue #61 (lead ruling R16, #61's protocol version): the reasons [`TailAdoption::Trimmed`] names. Each
+/// says the history the adoption proofs read is trimmed: `tail_below_floor` before P1,
+/// `base_below_floor` from `Host::chain`.
+pub const ADOPTION_TRIMMED: [&str; 2] = ["tail_below_floor", "base_below_floor"];
 
 /// How many of [`ADOPTION_REFUSALS`], from the first, are [`TailAdoption::NotReady`]'s.
 pub const ADOPTION_NOT_READY: usize = 3;
@@ -1535,6 +1602,12 @@ pub struct NodeStatus {
     /// inventory, or from a staged child on the newest lineage, so a restart cannot hide one.
     /// Crosses the wire.
     pub tail_refused: Option<TailRefused>,
+    /// Issue #61 (design rev 5 M1): the command an operator must run, when a copy holds a tail
+    /// past the history floor that only `admin forget-tail` can give up. On that copy, from its
+    /// own `tail_held` refusal of an offer; on the owner, from a refusal it heard and no
+    /// forget-tail has released yet. Names the copy, its node, `H` and the full command.
+    /// `None` while nothing needs one. Crosses the wire.
+    pub needs_operator: Option<String>,
 }
 
 /// The entry counts of a node's per-write indexes for one partition (M10 S2, A-R272). Each is
@@ -1549,6 +1622,12 @@ pub struct IndexLengths {
     pub ladder: usize,
     /// The host's `published_at` publish marks.
     pub published_at: usize,
+    /// T1's dedup cap (`Limits::dedup_cap`, `DbConfig::dedup_cap`): `dedup` at this many
+    /// answers `OVERLOADED` to a new write (issue #98). 0 where the node holds no T1 index.
+    pub dedup_cap: usize,
+    /// Issue #61: the trim floor of this copy's newest lineage of the partition, the lowest seq
+    /// whose History record it keeps. 0 while it was never trimmed, or holds no lineage.
+    pub history_floor: u64,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -1935,6 +2014,9 @@ struct CatchUp {
     low: u64,
     /// What the shadow had acknowledged at the last duty.
     acked: u64,
+    /// Issue #61 (design M5): entries this owner's snapshot transfer to the shadow had served
+    /// at the last duty, 0 with none. The owner is the source, so the copy advancing counts.
+    pulled: u64,
 }
 
 /// A-R458, A-R461: a ladder of verified digests this node keeps for one partition across
@@ -1953,6 +2035,21 @@ struct KeptLadder {
     /// dormant ladder, the generation's base for an inventory ladder read cold (critic-s1b A1).
     rungs: Vec<(Seq, Digest)>,
 }
+
+/// Issue #61 (design section 3.5): a hold on trimming one partition's History, from boot or
+/// from an inventory this node answered.
+#[derive(Debug, Clone, Copy)]
+struct InventoryPin {
+    /// Held until this node lands a generation newer than this one.
+    generation: Generation,
+    /// When it was taken: it expires [`Host::inventory_pin_millis`] later. Read only by the
+    /// trim, which is debug-only until the snapshot transfer (issue #61 PR-A).
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    since: Tick,
+}
+
+/// Issue #61 (design section 3.5, rev 4 m-c): an inventory pin holds at most 10 minutes.
+pub(crate) const INVENTORY_PIN_MILLIS: u64 = 600_000;
 
 /// #65: an `admin rebuild` the owner answers once the commit that leaves `node` out lands.
 #[derive(Debug)]
@@ -3053,6 +3150,9 @@ struct Host {
     /// How many trims the duty sent and how many durable deletes ran, for the rows.
     trims_sent: u64,
     trim_deletes: u64,
+    /// Issue #98: per partition, which of `dedup_cap_high` and `dedup_cap_full` were logged and
+    /// not yet re-armed ([`Host::watch_dedup_fill`]).
+    dedup_fill: BTreeMap<PartitionId, Fill>,
     /// D6 (A-R170 A, critic-d6 C1): per committed generation this node landed, when the Dedup
     /// rows of every older generation it holds retire: one retention after the landing.
     retire_due: BTreeMap<(PartitionId, Generation), Tick>,
@@ -3112,12 +3212,60 @@ struct Host {
     /// Critic-s1b A2: how many passes [`Self::ladder_duty`] has made. Each starts one partition
     /// further on, so a write rate above its budget cannot starve the partitions at the end.
     ladder_passes: usize,
-    /// H2 (A-R254): `(partition, generation)` whose primary holds its engine's ladder, restored
-    /// once by the first `SnapshotCatchupRequired` served at that generation.
-    primary_ladders: BTreeSet<(PartitionId, Generation)>,
-    /// H2 (A-R254): each `(partition, copy, barrier)` already served, so a repeat is dropped
-    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups).
-    snapshots_served: BTreeSet<(PartitionId, CopyId, Seq)>,
+    /// H2 (A-R254): each `(partition, copy)`'s last barrier served, so a repeat is dropped
+    /// (B-R48: R1 keeps no memory of its asks; the consumer dedups). Issue #61: one per copy,
+    /// so a new barrier replaces it; a transfer that ends other than by refusal forgets it. With
+    /// the generation it was served under (lead ruling R18), so a new commit serves it again.
+    snapshots_served: BTreeMap<(PartitionId, CopyId), (Generation, Seq)>,
+    /// Issue #61: per `(partition, copy)`, the `install_retryable` refusals heard
+    /// at one `(generation, barrier)` of [`Self::snapshots_served`]. The first
+    /// [`snapshot::SNAPSHOT_RETRY_LIMIT`] (3) such refusals each forget the barrier, so R1's next
+    /// ask re-offers it. The 4th keeps the barrier and records the tick it ran out, until
+    /// `Host::retry_duty` re-opens it. Cleared on the copy's caught-up release.
+    snapshot_retries: BTreeMap<(PartitionId, CopyId), snapshot::RetryCount>,
+    /// How long an exhausted barrier stays kept before the retry duty re-opens
+    /// it and probes the copy. [`snapshot::SNAPSHOT_RETRY_BACKOFF_MILLIS`]; rows set it lower.
+    snapshot_retry_backoff_millis: u64,
+    /// Issue #61 S2: the snapshot transfers this primary serves, by `(partition, copy)`.
+    transfers: BTreeMap<(PartitionId, CopyId), snapshot::Transfer>,
+    /// The next [`snapshot::Transfer`]'s instance.
+    next_transfer_id: u64,
+    /// Issue #61 S2: the install this target runs, per partition.
+    installs: BTreeMap<PartitionId, snapshot::Install>,
+    /// Issue #61 S2: the most entries one snapshot page carries. [`COPY_BATCH_KEYS`]; rows set
+    /// it lower to reach a later page with few keys.
+    ///
+    /// [`COPY_BATCH_KEYS`]: rdb_storage::COPY_BATCH_KEYS
+    snapshot_page_keys: usize,
+    /// The most bytes one snapshot page carries, in
+    /// [`rdb_storage::snapshot_entry_bytes`]: [`SNAPSHOT_PAGE_BYTES`]. Rows set it lower to
+    /// reach a page cut by size with few keys.
+    ///
+    /// [`SNAPSHOT_PAGE_BYTES`]: snapshot::SNAPSHOT_PAGE_BYTES
+    snapshot_page_bytes: usize,
+    /// Issue #61 S2-R3: flip one byte of the page with this index (0 is the first) this source
+    /// sends, after its chain is computed. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_chunk_fault: Option<u64>,
+    /// Issue #61 S2-R1b: while set, this source opens transfers but sends no offer, so a row
+    /// can land writes past `S` first. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_offer_held: bool,
+    /// Issue #61: while set, this source's next export fails once at its view
+    /// read (`snapshot_catchup_unserved{reason = view_failed}`), as a storage fault there would.
+    /// Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_export_fault: bool,
+    /// Issue #61 S2-R2b: while set, this source answers no pull for a page at or past this
+    /// index (0 is the first), so a row can stop a target mid-install. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_pages_held_from: Option<u64>,
+    /// Issue #61: while above 0, this target's next page write fails as a storage
+    /// fault would (`InstallError::Storage`), once per page, counting down. Rows only.
+    #[cfg(debug_assertions)]
+    snapshot_install_faults: u32,
+    /// [`snapshot::SNAPSHOT_PULL_RETRY_MILLIS`]; crate tests set it directly.
+    snapshot_pull_retry_millis: u64,
     /// H3 (A-R254): the correlation `committed` was heard under, for a re-post of that root,
     /// with the committing owner's `live_readd` it came with, which the re-post relays (#107
     /// slice 2b). Inserted with `committed`, always.
@@ -3190,6 +3338,11 @@ struct Host {
     /// Per partition, since when a member its `ReadOnly` commit left outside the barrier has
     /// been linked again (critic-degraded M3).
     repair_since: BTreeMap<PartitionId, Tick>,
+    /// Issue #61 R26 (b): per partition, the copy a `ReadOnly` commit left outside that R1 has
+    /// since caught up, with its node and the commit's generation. The repair re-plans with it
+    /// at the next check, and until then a refused write names it
+    /// ([`Self::rebuilding_read_only`]). Read only while the commit's generation is current.
+    caught_up_outside: BTreeMap<PartitionId, (Generation, CopyId, NodeId)>,
     /// Per partition, the last repair ([`RepairHeld`], A-R346 M1, A-R353). Kept across the
     /// generations it makes, until the commit is not `ReadOnly` or such a member's link goes
     /// down, so a repair that ends `ReadOnly` again runs again only once a member moved or its
@@ -3207,6 +3360,15 @@ struct Host {
     /// Per partition, the refusals a repair is held on, as last logged (#79 S4d). Read back to
     /// log once per change and to name the copy in the `RECOVERY_READ_ONLY` text.
     tail_holds: BTreeMap<PartitionId, Vec<TailHold>>,
+    /// Issue #61 (design rev 5b): per partition and copy, a `tail_held` refusal of this
+    /// primary's offer, with the tail's head. In memory: an owner restart loses it, and the
+    /// next refused offer records it again. Dropped by an accepted forget-tail whose `--through`
+    /// covers it, on that copy's `CopyCaughtUp`, or when a commit pins it as a member again.
+    offer_holds: BTreeMap<PartitionId, BTreeMap<CopyId, snapshot::OfferHold>>,
+    /// Issue #61 (design rev 5 M1): per partition, the tail this copy refused an offer for,
+    /// warned `copy_needs_forget_tail` once. Cleared by an install, or when an inventory ask
+    /// gives the tail up (`Host::tail_released`).
+    offer_tail_held: BTreeMap<PartitionId, snapshot::OfferTailHeld>,
     /// Per partition, the pinned generation and the answering stalled nodes a repair waits on
     /// (A-R383), as last logged `membership_repair_rebuild_hold_started` (issue #106). Read back
     /// to log once per change and to log the hold's end.
@@ -3298,6 +3460,16 @@ struct Host {
     /// D10 (A-R196(1)): asks F1 put to a copy this node holds, answered once every effect of the
     /// step that made them is out, so the asks to peers leave before this node's own fsync.
     own_asks: Vec<(Site, PeerAsk)>,
+    /// Issue #61 (design section 3.5, rev 4 m-c): each partition whose History this node must
+    /// not trim yet. One is held from boot at the newest generation held then, and replaced by
+    /// each inventory this node answers, at the anchor's generation. It is released once this
+    /// node lands a newer generation, or after [`Self::inventory_pin_millis`] (logged
+    /// `inventory_pin_expired`). No byte cap overrides it.
+    inventory_pins: BTreeMap<PartitionId, InventoryPin>,
+    /// Issue #61: how long an inventory pin holds at most ([`INVENTORY_PIN_MILLIS`]). Read only by
+    /// the trim, which is debug-only until the snapshot transfer.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub(crate) inventory_pin_millis: u64,
     /// F4 (A-R317): this node's syncer. `None` runs each sync inline, on this thread: a host a
     /// crate row drives by hand has none.
     syncer: Option<Syncer>,
@@ -3343,6 +3515,16 @@ impl Host {
         let engine_instance = engine.instance();
         let engine_sync_stuck = engine.storage_options().effective_sync_stuck_millis();
         let after_commit = after_commit_for(engine.path());
+        // Issue #61 (rev 4 m-c): from boot, each partition held is pinned at its newest
+        // generation until this node lands a newer one.
+        let mut inventory_pins: BTreeMap<PartitionId, InventoryPin> = BTreeMap::new();
+        for (partition, generation) in engine.lineages() {
+            let pin = inventory_pins.entry(partition).or_insert(InventoryPin {
+                generation,
+                since: now,
+            });
+            pin.generation = pin.generation.max(generation);
+        }
         let refusal_window = refusal_window_for(engine.path());
         Self {
             node,
@@ -3378,6 +3560,7 @@ impl Host {
             trim_deleted_at: BTreeMap::new(),
             trims_sent: 0,
             trim_deletes: 0,
+            dedup_fill: BTreeMap::new(),
             retire_due: BTreeMap::new(),
             marks_restored: BTreeSet::new(),
             marks_written: BTreeMap::new(),
@@ -3402,8 +3585,25 @@ impl Host {
             dormant_ladders: BTreeMap::new(),
             inventory_ladders: BTreeMap::new(),
             ladder_passes: 0,
-            primary_ladders: BTreeSet::new(),
-            snapshots_served: BTreeSet::new(),
+            snapshots_served: BTreeMap::new(),
+            snapshot_retries: BTreeMap::new(),
+            snapshot_retry_backoff_millis: snapshot::SNAPSHOT_RETRY_BACKOFF_MILLIS,
+            transfers: BTreeMap::new(),
+            next_transfer_id: 1,
+            installs: BTreeMap::new(),
+            snapshot_page_keys: rdb_storage::COPY_BATCH_KEYS,
+            snapshot_page_bytes: snapshot::SNAPSHOT_PAGE_BYTES,
+            #[cfg(debug_assertions)]
+            snapshot_chunk_fault: None,
+            #[cfg(debug_assertions)]
+            snapshot_offer_held: false,
+            #[cfg(debug_assertions)]
+            snapshot_export_fault: false,
+            #[cfg(debug_assertions)]
+            snapshot_pages_held_from: None,
+            #[cfg(debug_assertions)]
+            snapshot_install_faults: 0,
+            snapshot_pull_retry_millis: snapshot::SNAPSHOT_PULL_RETRY_MILLIS,
             committed_correlation: BTreeMap::new(),
             land_linked: BTreeSet::new(),
             caught_up_resends: BTreeMap::new(),
@@ -3429,11 +3629,14 @@ impl Host {
             #[cfg(test)]
             hold_repairs: false,
             repair_since: BTreeMap::new(),
+            caught_up_outside: BTreeMap::new(),
             repaired: BTreeMap::new(),
             repair_retry_first_millis: REPAIR_RETRY_FIRST_MILLIS,
             repair_probes: BTreeMap::new(),
             tail_refused: BTreeMap::new(),
             tail_holds: BTreeMap::new(),
+            offer_holds: BTreeMap::new(),
+            offer_tail_held: BTreeMap::new(),
             rebuild_hold: BTreeMap::new(),
             stall_step: BTreeMap::new(),
             latest_stall: BTreeMap::new(),
@@ -3466,6 +3669,8 @@ impl Host {
             subscribers: Vec::new(),
             frames_received: 0,
             own_asks: Vec::new(),
+            inventory_pins,
+            inventory_pin_millis: INVENTORY_PIN_MILLIS,
             syncer: None,
             syncing: None,
             sync_next: Vec::new(),
@@ -4007,16 +4212,18 @@ impl Host {
                 frame,
             } => {
                 self.frames_received += 1;
-                let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
-                self.push(
-                    Site {
-                        partition,
-                        correlation,
-                    },
-                    kind,
-                    false,
-                    None,
-                );
+                if !self.append_deferred(partition, &frame) {
+                    let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
+                    self.push(
+                        Site {
+                            partition,
+                            correlation,
+                        },
+                        kind,
+                        false,
+                        None,
+                    );
+                }
                 Ok(())
             }
             Msg::PeerAsk {
@@ -4047,6 +4254,16 @@ impl Host {
             }
             Msg::Restore { partition, seed } => {
                 self.restore_dormant(partition, &seed, false);
+                Ok(())
+            }
+            Msg::SnapshotOffer(offer) => self.snapshot_offer(*offer),
+            Msg::SnapshotPull(pull) => {
+                self.snapshot_pull(pull);
+                Ok(())
+            }
+            Msg::SnapshotChunk(chunk) => self.snapshot_chunk(*chunk),
+            Msg::SnapshotOfferRefused(refused) => {
+                self.snapshot_refused_heard(&refused);
                 Ok(())
             }
             Msg::DurableProved {
@@ -4320,6 +4537,25 @@ impl Host {
                 let _ = reply.send(answer);
                 Ok(())
             }
+            #[cfg(debug_assertions)]
+            Msg::TrimHistory {
+                partition,
+                through,
+                reply,
+            } => {
+                let answer = self.trim_history_through(partition, through);
+                if let Err(reason) = &answer {
+                    tracing::warn!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        through = through.0,
+                        reason = reason.as_str(),
+                        "host_history_trim_refused"
+                    );
+                }
+                let _ = reply.send(answer);
+                Ok(())
+            }
             Msg::Rebuild {
                 partition,
                 node,
@@ -4560,6 +4796,11 @@ impl Host {
             self.slow_step("duty", || "ladder".to_owned(), started);
         }
         self.rebuild_duty(now);
+        self.transfer_duty(now);
+        if let Err(fault) = self.install_duty(now) {
+            self.set_fault(fault);
+            return;
+        }
         self.resend_caught_up(now);
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
@@ -5900,10 +6141,13 @@ impl Host {
     }
 
     /// A read-only refusal's detail, with the copies a held repair names and the step this owner
-    /// can actually give (#79 S4d), when that is why it stays read-only. Unchanged otherwise.
+    /// can actually give (#79 S4d), when that is why it stays read-only. Issue #61 (design N3):
+    /// else, while this owner rebuilds a copy from a snapshot, the copy and the transfer's
+    /// progress, [`crate::db::error::REBUILDING_STEP`], and a "not before" poll hint of
+    /// [`REBUILD_RETRY_HINT`], which is not an estimate. Unchanged otherwise.
     fn named_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
         let Some(holds) = self.tail_holds.get(&partition) else {
-            return refused;
+            return self.rebuilding_read_only(partition, refused);
         };
         let named = holds
             .iter()
@@ -5937,6 +6181,57 @@ impl Host {
             (false, false) => crate::db::error::TAIL_HELD_RESEND,
         };
         refused.detail = format!("{}: {named}; {step}", refused.detail);
+        refused
+    }
+
+    /// [`Self::named_read_only`]'s rebuild arm (issue #61, design N3): the first transfer this
+    /// node serves for `partition`, by copy, named with its progress. Unchanged with none.
+    fn rebuilding_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let Some(((_, copy), transfer)) = self
+            .transfers
+            .range((partition, CopyId(0))..)
+            .find(|((at, _), _)| *at == partition)
+        else {
+            return self.caught_up_read_only(partition, refused);
+        };
+        let millis = transfer.opened.millis_until(self.clock.now());
+        refused.detail = format!(
+            "{}: copy {} on node {} is being rebuilt from a snapshot: {} entries ({:.1} MiB) sent \
+             in {}.{} s; writes resume when it is caught up",
+            refused.detail,
+            copy.0,
+            transfer.node.0,
+            transfer.pulled,
+            transfer.bytes as f64 / f64::from(1u32 << 20),
+            millis / 1000,
+            (millis % 1000) / 100,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
+        refused
+    }
+
+    /// [`Self::rebuilding_read_only`] once the transfer has ended (issue #61 R26): a copy the
+    /// `ReadOnly` commit left outside is caught up, and writes wait for the owner's re-plan with
+    /// it ([`Self::repair_on_caught_up`]). Unchanged when none is, or for an older commit.
+    fn caught_up_read_only(&self, partition: PartitionId, mut refused: ApiError) -> ApiError {
+        let current = self
+            .committed
+            .get(&partition)
+            .map(|committed| committed.new_generation);
+        let Some((_, copy, node)) = self
+            .caught_up_outside
+            .get(&partition)
+            .filter(|(generation, _, _)| Some(*generation) == current)
+        else {
+            return refused;
+        };
+        refused.detail = format!(
+            "{}: copy {} on node {} is caught up; writes resume when the owner re-plans with it",
+            refused.detail, copy.0, node.0,
+        );
+        let mut refused = refused.with_retry_after(REBUILD_RETRY_HINT);
+        refused.detail = format!("{}; {}", refused.detail, crate::db::error::REBUILDING_STEP);
         refused
     }
 
@@ -6021,6 +6316,53 @@ impl Host {
             });
         let runs = retire.into_iter().chain(aged).min()?;
         Some(Duration::from_millis(runs.0.saturating_sub(now.0)))
+    }
+
+    /// Issue #98: after each step, warn once when `partition`'s dedup index reaches 80% of its
+    /// cap (`dedup_cap_high`) and once when it reaches the cap (`dedup_cap_full`), each re-armed
+    /// only once the index falls well below its mark ([`dedup_fill`]). Every change to the index
+    /// is a T1 step, so watching here sees each one. A node with no T1 instance for the
+    /// partition holds no index, and its marks are re-armed. Fields: the fill and the cap, the
+    /// retention, and when the trim duty can first free an entry (`frees_in_ms`, absent when no
+    /// time is known: the same "not before" an `OVERLOADED` carries).
+    fn watch_dedup_fill(&mut self, partition: PartitionId) {
+        let Some(kernel) = self.transaction.kernel(self.node, partition) else {
+            self.dedup_fill.remove(&partition);
+            return;
+        };
+        let (len, cap) = (kernel.dedup().len(), kernel.limits().dedup_cap);
+        let crossed = self
+            .dedup_fill
+            .entry(partition)
+            .or_default()
+            .observe(len, cap);
+        for mark in crossed {
+            let frees_in_ms = self
+                .cap_frees_in(partition, self.clock.now())
+                .map(|after| u64::try_from(after.as_millis()).unwrap_or(u64::MAX));
+            let retention_ms = self.budgets.dedup_retention_millis;
+            match mark {
+                Crossed::High => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    len,
+                    cap,
+                    high_mark = dedup_fill::high_mark(cap),
+                    retention_ms,
+                    frees_in_ms,
+                    "dedup_cap_high"
+                ),
+                Crossed::Full => tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    len,
+                    cap,
+                    retention_ms,
+                    frees_in_ms,
+                    "dedup_cap_full"
+                ),
+            }
+        }
     }
 
     /// A-R187: whether the retire due for `(partition, serving)` would free an entry T1 holds.
@@ -6624,6 +6966,7 @@ impl Host {
             );
             stepped?;
         }
+        self.watch_dedup_fill(event.partition);
         // P1 answers a status query in the step that takes it, START_RECORD included.
         if let Some((identity, reply)) = self.answering.take() {
             return Err(fail_waiter(
@@ -6732,6 +7075,13 @@ impl Host {
             if let Some((_, view)) = self.views.get(&partition) {
                 view_whole(view, &format!("{module:?} step")).map_err(StepError::Host)?;
             }
+        }
+        // Issue #61 (design section 3.4): a `Recovered` builds or re-anchors R1's sides from
+        // the kernel's own state; they are aligned to this engine's trim floor in the same step.
+        if module == ModuleName::Replication
+            && matches!(event.kind, EventKind::Kernel(KernelEvent::Recovered(_)))
+        {
+            self.align_ladders(partition);
         }
         answer.map_err(StepError::Module)
     }
@@ -7124,6 +7474,18 @@ impl Host {
             KernelEffect::CopyCaughtUp { copy, head, digest } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
                 self.shadow_at_head(site.partition, *copy);
+                // Issue #61 rev 5b: the copy is caught up, so a hold its offer refusal left
+                // here has ended.
+                if let Some(holds) = self.offer_holds.get_mut(&site.partition) {
+                    holds.remove(copy);
+                }
+                self.end_transfer(
+                    site.partition,
+                    *copy,
+                    "caught_up",
+                    "snapshot_transfer_released",
+                );
+                self.repair_on_caught_up(site.partition, *copy);
                 // A catch-up this node sourced for another node's F1 reports there (B-R59).
                 if let Some((asker, correlation)) = self.catch_ups.remove(&(site.partition, *copy))
                 {
@@ -7253,9 +7615,18 @@ impl Host {
             "recovered"
         );
         self.end_barriers_below(partition, result.new_generation);
-        self.inherit(partition, result)?;
+        self.inherit(partition, result, false)?;
         self.note_left_out(partition, result);
         self.committed.insert(partition, Box::new(result.clone()));
+        // Issue #61 rev 5b: a copy pinned as a regular member again is back in the re-plan's
+        // inventory, so no offer hold stands for it.
+        if let Some(holds) = self.offer_holds.get_mut(&partition) {
+            holds.retain(|copy, _| {
+                !result.committed.pinned_config.members.iter().any(|member| {
+                    member.copy == *copy && member.role == ReplicaRole::RegularSecondary
+                })
+            });
+        }
         self.committed_correlation
             .insert(partition, (site.correlation, self.live_readd.on));
         if self.landed.insert((partition, result.new_generation)) {
@@ -7319,6 +7690,7 @@ impl Host {
             link_boot = ?link_boot,
             "peer_booted"
         );
+        self.transfers_peer_booted(node);
         if self.committed.is_empty() {
             tracing::info!(
                 node = self.node.0,
@@ -8176,12 +8548,12 @@ impl Host {
     /// shadow given up, leaves the copy restart-only. Slice 3 replaces this with a schedule.
     ///
     /// Protocol (Rev 5 m5, #107 slice 2b, ADR-rdb-0009 section 7): every peer that completes a
-    /// handshake at [`crate::net::PROTOCOL_VERSION`] 10 or later has check A in
-    /// [`Self::land_link`] (a refused landing in a commit that takes writes drops the live
-    /// receiver), check B (`from_has_no_floor`) and the refusal mark
-    /// (`AppendReceiver::refuse_landing`), which a `ReadOnly` return needs. A peer at 9 never
-    /// links, so it is never probed or re-added here. The copy marks by this owner's setting,
-    /// carried on the `Landed`, not by its own. Any change that weakens check A takes a bump.
+    /// handshake at [`crate::net::PROTOCOL_VERSION`] 10 or later has check A in [`Self::land_link`] (a
+    /// refused landing in a commit that takes writes drops the live receiver), check B
+    /// (`from_has_no_floor`) and the refusal mark (`AppendReceiver::refuse_landing`), which a
+    /// `ReadOnly` return needs. A peer at 9 never links, so it is never probed or re-added
+    /// here. The copy marks by this owner's setting, carried on the `Landed`, not by its own.
+    /// Any change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none. R5 (PR #181): a partition with no commit here yet is the reopen's
@@ -9040,6 +9412,50 @@ impl Host {
             "membership_repair_planned"
         );
         self.revoke(partition, epoch, None, None);
+    }
+
+    /// Issue #61 R26 (b): `copy` caught up. When it is a member this node's `ReadOnly` commit
+    /// left outside and F1 armed no rebuild (a two-copy plan never arms one, arch-s2 R2-M2),
+    /// nothing else ends the window: the repair would first wait for the member's link to age
+    /// `resume_hold_millis`. A caught-up copy has just proved it answers, so that wait is
+    /// skipped: the next check probes it, and the one after re-plans (A-R350's probe still
+    /// applies). Logged `read_only_repair_on_caught_up`.
+    fn repair_on_caught_up(&mut self, partition: PartitionId, copy: CopyId) {
+        let Some((generation, node)) = self.committed.get(&partition).and_then(|committed| {
+            committed
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .find(|member| member.copy == copy)
+                .map(|member| (committed.new_generation, member.node))
+        }) else {
+            return;
+        };
+        if !self.read_only_outside(partition).contains(&node) {
+            return;
+        }
+        let armed = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| f1.phase() == RecoveryPhase::Rebuilding);
+        if armed {
+            return;
+        }
+        let now = self.clock.now();
+        let aged = Tick(now.0.saturating_sub(self.budgets.resume_hold_millis));
+        let since = self.repair_since.entry(partition).or_insert(aged);
+        *since = (*since).min(aged);
+        self.caught_up_outside
+            .insert(partition, (generation, copy, node));
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            copy = copy.0,
+            holder = node.0,
+            "read_only_repair_on_caught_up"
+        );
     }
 
     /// Issue #106: the A-R383 hold [`Self::repair_duty`] logged as started has ended, for
@@ -9997,11 +10413,19 @@ impl Host {
         let behind = head.saturating_sub(acked);
         if acked < cutoff.0 || behind > PROMOTE_LAG_RECORDS {
             if moving.is_some() {
+                let pulled = Self::transfer_pulled(
+                    self.transfers
+                        .iter()
+                        .map(|(key, transfer)| (*key, transfer.node, transfer.pulled)),
+                    (partition, shadow.copy),
+                    shadow.node,
+                );
                 let seen = CatchUp {
                     to: shadow.node,
                     since: now,
                     low: behind,
                     acked,
+                    pulled,
                 };
                 self.move_lag_duty(partition, lagging, seen, cutoff.0, epoch);
             }
@@ -10030,11 +10454,26 @@ impl Host {
         self.start_revoke(partition, epoch, replan);
     }
 
+    /// Issue #61 (design M5): the entries this owner's snapshot transfer to copy `at` on `node`
+    /// has served, 0 with no such transfer or one to another node. Over `(key, node, pulled)`
+    /// projections of the transfers, so a unit row needs no snapshot.
+    fn transfer_pulled(
+        transfers: impl IntoIterator<Item = ((PartitionId, CopyId), NodeId, u64)>,
+        at: (PartitionId, CopyId),
+        node: NodeId,
+    ) -> u64 {
+        transfers
+            .into_iter()
+            .find(|(key, to, _)| *key == at && *to == node)
+            .map_or(0, |(_, _, pulled)| pulled)
+    }
+
     /// A-R459, A-R463: a move's shadow (`seen.to`) that this owner found `seen.low` records
     /// behind its head, further than [`PROMOTE_LAG_RECORDS`], having acknowledged `seen.acked`.
     /// The clock starts at the first such duty and runs while no duty sees progress: a lag below
     /// every one seen since the clock began, or, below the pin's `cutoff`, the bulk copy
-    /// advancing (`lagging` is the entry this duty took). Either starts it again. Past
+    /// advancing (`lagging` is the entry this duty took), or this owner's snapshot transfer to
+    /// the shadow serving more entries (issue #61, M5). Any of them starts it again. Past
     /// `move_catch_up_millis` with no progress the move is given up as
     /// [`Self::shadow_give_up_duty`] gives one up: the owner re-plans without the shadow and the
     /// source keeps its copy, and the move's next ask says the copy made no progress. Logged
@@ -10050,8 +10489,9 @@ impl Host {
         let (to, behind, now) = (seen.to, seen.low, seen.since);
         let clock = match lagging {
             Some(last) if last.to == to => {
-                let progress =
-                    behind < last.low || (last.acked < cutoff && seen.acked > last.acked);
+                let progress = behind < last.low
+                    || (last.acked < cutoff && seen.acked > last.acked)
+                    || seen.pulled > last.pulled;
                 CatchUp {
                     since: if progress { now } else { last.since },
                     low: last.low.min(behind),
@@ -10878,7 +11318,7 @@ impl Host {
     ///
     /// - `--through H` at or below the committed cutoff, or with no held tail to give up;
     /// - `--through H` while a live copy reports a tail above the cutoff that could come back
-    ///   ([`TailAdoption::could_return`]: adoptable, not ready yet, or unchecked), unless
+    ///   ([`TailAdoption::needs_give_up_flag`]: adoptable, not ready yet, unchecked, or trimmed), unless
     ///   `give_up_live_copy`. A tail whose adoption proof failed needs no flag. A holder the
     ///   committed ledger marks that no probe has reported on yet counts as unchecked;
     /// - `--no-intact-copy` when the intact rule did not cap this owner's last commit;
@@ -10968,6 +11408,16 @@ impl Host {
                 live.push((held.node, held.head, TailAdoption::Unchecked));
             }
         }
+        // Issue #61 rev 5b: a copy that refused this primary's snapshot offer for a held tail
+        // is counted too, unchecked: nothing has run its adoption proofs for this generation.
+        live.extend(
+            self.offer_holds
+                .get(&partition)
+                .into_iter()
+                .flatten()
+                .filter(|(_, hold)| hold.head > cutoff)
+                .map(|(_, hold)| (hold.node, hold.head, TailAdoption::Unchecked)),
+        );
         live.sort_unstable_by_key(|(node, head, _)| (*node, *head));
         live.dedup_by_key(|(node, head, _)| (*node, *head));
         let mut given_up = Vec::new();
@@ -10997,10 +11447,29 @@ impl Host {
             // or not ready yet, needs giving up named. One whose adoption proof failed can
             // restore nothing.
             // Lead ruling R8: the refusal says what is true of the tail's state.
-            let restorable = live.iter().find(|(_, _, adoption)| adoption.could_return());
+            let restorable = live
+                .iter()
+                .find(|(_, _, adoption)| adoption.needs_give_up_flag());
             if let Some((node, head, adoption)) = restorable.filter(|_| !give_up_live_copy) {
                 // An Unchecked holder may be one only the ledger names, possibly down, so its
                 // refusal says it holds the seqs, not that a live copy does.
+                // Lead rulings R10 and R16: a trimmed tail cannot come back, and its text says
+                // so, naming the whole command.
+                if matches!(adoption, TailAdoption::Trimmed(_)) {
+                    return refuse(
+                        InvalidArgument,
+                        format!(
+                            "node {} holds seqs {} to {} of partition {}; they cannot come back: \
+                             the history needed to adopt them is trimmed. To give them up \
+                             anyway, for good, run {}",
+                            node.0,
+                            cutoff.0 + 1,
+                            head.0,
+                            partition.0,
+                            snapshot::forget_tail_command(partition, *head)
+                        ),
+                    );
+                }
                 let state = if matches!(adoption, TailAdoption::Unchecked) {
                     "; it has not been checked whether that copy can bring them back"
                 } else {
@@ -11023,6 +11492,8 @@ impl Host {
                 through.0
             ));
         }
+        // Every check runs before any hold is released, so a refused
+        // combination leaves the held-copy warning standing.
         if release.no_intact_copy {
             let capped = self
                 .recoveries
@@ -11039,6 +11510,23 @@ impl Host {
                     ),
                 );
             }
+        }
+        let mut offered = Vec::new();
+        if let Some(through) = release.through {
+            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
+            // writable commit supersedes its tail for the next ordinary offer.
+            for (copy, node, head) in self.offer_holds_released(partition, through) {
+                offered.push(format!(
+                    "copy {} on node {}: seqs {}..={} given up for good",
+                    copy.0,
+                    node.0,
+                    cutoff.0 + 1,
+                    head.0
+                ));
+            }
+        }
+        given_up.extend(offered);
+        if release.no_intact_copy {
             given_up.push(
                 "no copy of the last writable generation has answered; records confirmed in \
                  that generation, up to an amount the system cannot see, are given up, for \
@@ -11433,7 +11921,42 @@ impl Host {
             );
             return;
         }
-        let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
+        // A required copy this node is sending a snapshot to, with a
+        // page pulled within `SNAPSHOT_IDLE_MILLIS`, is being rebuilt, not stalled: the check
+        // waits another pin wait instead of naming a stall. A transfer left idle that long is
+        // abandoned (`transfer_duty`), so a dead one still reaches the line.
+        let now = self.clock.now();
+        let live: Vec<(u8, u64)> = watch
+            .required
+            .iter()
+            .filter_map(|copy| {
+                self.transfers
+                    .get(&(partition, *copy))
+                    .filter(|transfer| {
+                        HostClock::millis_until(transfer.touched, now)
+                            < snapshot::SNAPSHOT_IDLE_MILLIS
+                    })
+                    .map(|transfer| (copy.0, transfer.pages))
+            })
+            .collect();
+        if !live.is_empty() {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                transfers = ?live,
+                "rebuild_check_transfer_live"
+            );
+            self.delay(
+                now.plus_millis(self.rebuild_pin_wait_millis),
+                Delayed::RebuildCheck {
+                    partition,
+                    generation,
+                },
+            );
+            return;
+        }
+        let waited_ms = now.0.saturating_sub(watch.since.0);
         let f1_phase = self.recoveries.get(&partition).map(|f1| f1.phase());
         let phase = f1_phase
             .as_ref()
@@ -11584,7 +12107,7 @@ impl Host {
         // #90: outside the `first` guard: a landing repeats, and a barrier may start between.
         self.end_barriers_below(partition, landed_generation);
         if first && barrier {
-            self.inherit(partition, &result)?;
+            self.inherit(partition, &result, true)?;
             self.tail_refused.remove(&partition);
         }
         // Ruling A-R185 (critic-d7fix (c), C1): a copy outside the barrier links the new
@@ -11674,9 +12197,10 @@ impl Host {
     /// answers nothing: its `Recovered` asks the primary for the rest. Linked either way, a live
     /// receiver it already holds is kept only at the linked head or while quarantined, and is
     /// replaced at the link otherwise (check A, issue #105 unit 1). Either arm links only onto a
-    /// lineage that reaches seq 1, or one that applied nothing (check B, #107, in
-    /// [`Self::land_at`] after its depth guard; only seq 1 is read): a holed one is refused
-    /// `from_has_no_floor`, and one whose seq 1 read fails `history_read_failed`.
+    /// lineage that reaches its floor (seq 1, or its trim floor, issue #61), or one that applied
+    /// nothing (check B, #107, in [`Self::land_at`] after its depth guard; only the record at
+    /// the floor is read): a holed one is refused `from_has_no_floor`, and one whose floor read
+    /// fails `history_read_failed`.
     ///
     /// Otherwise it links nothing, sends nothing and logs `land_link_refused{reason}`. A copy
     /// refused `not_a_member` or `held_at_or_above_generation` is refused before any receiver
@@ -11959,23 +12483,96 @@ impl Host {
         );
     }
 
-    fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), Fault> {
+    /// Link `result`'s generation onto its predecessor at the cutoff, as F1's commit and a
+    /// barrier member's landing do. Any refusal faults the node, except one (issue #61, design
+    /// section 1a): on a `landing`, a copied inherit whose scan met this copy's trim floor
+    /// (`HistoryMissing{below_floor:..}`) cannot rebuild the parent as of the cutoff here. That
+    /// copy links nothing, logs `land_inherit_refused{reason="inherit_below_floor"}` (warn),
+    /// and marks its receiver refused for the generation ([`Replication::refuse_landing`]), so
+    /// its `Recovered` anchors at the root and the copy is rebuilt by snapshot.
+    ///
+    /// Only when its receiver does not hold the cutoff with the
+    /// cutoff's digest. A refused receiver that does still anchors at the cutoff (a proven
+    /// prefix, `AppendReceiver::on_recovered`), and would then take the suffix into a
+    /// generation this copy never linked, which holds none of the keys before the cutoff. That
+    /// landing faults the node instead, with nothing linked or anchored: a stopped node is
+    /// loud, lost keys are silent.
+    ///
+    /// Reachability, read from code and not shown to happen. The refusal needs a copied inherit
+    /// with the copy's head past the cutoff (`held > base`; a flatten at `held == base` touches
+    /// nothing and cannot refuse `below_floor`). F1 takes the cutoff as the longest verified
+    /// head (`recovery::lineage::select_prefix`), and answering the inventory seals the
+    /// receiver, which then refuses plain appends (`AppendReceiver::sealed`). So a barrier
+    /// member is past the cutoff only if (a) a record already staged completes after the seal,
+    /// or (b) a required copy proved the cutoff durable without reporting an inventory.
+    ///
+    /// After the fault, also read from code and not run: the landed set is in memory, so on
+    /// reopen the owner re-plans rather than re-sending this landing. The copy's inventory
+    /// links the missed generation by the same copy, which is refused again; that answers
+    /// `InventoryFailed` (an expected `missed_generation_*` reason), the copy is left out, lands
+    /// outside the barrier through `land_link`, and is expected to stay in #79's tail hold
+    /// (`held_past_base`) until `forget-tail` or a snapshot rebuild. No crash loop is expected,
+    /// since the fault is reached only from an in-barrier landing.
+    fn inherit(
+        &mut self,
+        partition: PartitionId,
+        result: &RecoveryResult,
+        landing: bool,
+    ) -> Result<(), Fault> {
         self.views.remove(&partition);
-        self.engine
-            .inherit(
-                partition,
-                result.retained_status_map.predecessor_generation,
-                result.new_generation,
-                result.selected.cutoff_seq,
-            )
-            .map(drop)
-            .map_err(|e| {
-                Fault::from(format!(
+        let generation = result.new_generation;
+        match self.engine.inherit(
+            partition,
+            result.retained_status_map.predecessor_generation,
+            generation,
+            result.selected.cutoff_seq,
+        ) {
+            Ok(_) => {}
+            Err(InheritError::HistoryMissing { at })
+                if landing && at.starts_with("below_floor") =>
+            {
+                let holds_cutoff =
+                    self.replication
+                        .receiver(self.node, partition)
+                        .is_some_and(|receiver| {
+                            receiver
+                                .history()
+                                .lookup(result.selected.cutoff_seq, result.selected.cutoff_digest)
+                                == DigestLookup::Match
+                        });
+                if holds_cutoff {
+                    return Err(Fault::from(format!(
+                        "inherit p{} to g{} at cutoff {}: {at}: this copy's trimmed history \
+                         cannot rebuild its state at the cutoff, and it holds the cutoff, so it \
+                         would serve the new generation without the keys written before it. \
+                         Stopped instead. On reopen the copy is left out of the next plan and \
+                         waits for `forget-tail` or a snapshot rebuild",
+                        partition.0, generation.0, result.selected.cutoff_seq.0
+                    )));
+                }
+                let marked = self
+                    .replication
+                    .refuse_landing(self.node, partition, generation);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = result.selected.cutoff_seq.0,
+                    at,
+                    marked,
+                    reason = "inherit_below_floor",
+                    "land_inherit_refused"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Fault::from(format!(
                     "inherit p{} to g{}: {e}",
-                    partition.0, result.new_generation.0
-                ))
-            })?;
-        self.sync_link(partition, result.new_generation)
+                    partition.0, generation.0
+                )))
+            }
+        }
+        self.sync_link(partition, generation)
     }
 
     /// Ruling A-R217 (review-s1 F-001): a generation's link is durable before anything can
@@ -12460,6 +13057,228 @@ impl Host {
         Ok((record, envelope.record_digest))
     }
 
+    /// Issue #61 (design section 1a): the verified digest this copy holds at `seq` of
+    /// `generation`'s lineage. [`Digest::ROOT`] at seq 0 while the lineage was never trimmed,
+    /// the record's own digest ([`Self::checked`]) at or above its trim floor, and
+    /// `below_floor` under it: History below the floor is gone, so nothing there is proved.
+    /// The record **at** the floor is kept, so every head and cutoff read stays a record read.
+    fn digest_at(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        seq: Seq,
+    ) -> Result<Digest, &'static str> {
+        if seq < self.engine.floor_seq(partition, generation) {
+            return Err("below_floor");
+        }
+        if seq == Seq::ZERO {
+            return Ok(Digest::ROOT);
+        }
+        self.checked(partition, generation, seq)
+            .map(|(_, digest)| digest)
+    }
+
+    /// Issue #61 (design section 3.4): the first rung any ladder of `generation` read from this
+    /// engine starts at: `(0, ROOT)` while the lineage was never trimmed, else its trim floor
+    /// and the digest of the record kept there.
+    fn first_rung(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Result<(Seq, Digest), &'static str> {
+        let floor = self.engine.floor_seq(partition, generation);
+        Ok((floor, self.digest_at(partition, generation, floor)?))
+    }
+
+    /// The newest generation of `partition` this engine holds: a bounded lookup, never a copy
+    /// of every lineage key (explicit status requests call it).
+    fn newest_held(&self, partition: PartitionId) -> Option<Generation> {
+        self.engine.newest_generation(partition)
+    }
+
+    /// Issue #61 (design section 3.4): R1's sides of `partition` hold no rung below this
+    /// engine's trim floor. After a trim, a restore or a `Recovered`, a side whose ladder starts
+    /// below the floor is trimmed to it, so a refused receiver's `at_or_below(cutoff)` finds no
+    /// rung under F and re-anchors at the root (A3). A side whose head is below the floor (one
+    /// anchored at the root, waiting for a snapshot) is left as it is: it holds nothing to trim.
+    /// A refusal is logged `ladder_align_refused{reason}` (warn). A debug build then asserts it.
+    fn align_ladders(&mut self, partition: PartitionId) {
+        let Some(generation) = self.newest_held(partition) else {
+            return;
+        };
+        let floor = self.engine.floor_seq(partition, generation);
+        if floor == Seq::ZERO {
+            return;
+        }
+        let below = |first: Option<Seq>, head: Seq| {
+            first.is_some_and(|first| first < floor) && head >= floor
+        };
+        let sides = |host: &Self| {
+            let primary = host
+                .replication
+                .primary(host.node, partition)
+                .is_some_and(|side| below(side.tracker().history().floor(), side.tracker().head()));
+            let receiver = host
+                .replication
+                .receiver(host.node, partition)
+                .is_some_and(|side| below(side.history().floor(), side.applied_head().seq));
+            primary || receiver
+        };
+        if !sides(self) {
+            return;
+        }
+        let aligned = self
+            .digest_at(partition, generation, floor)
+            .and_then(|digest| {
+                self.replication
+                    .trim_history(self.node, partition, floor, digest)
+                    .map_err(|_| "ladder_refused")
+            });
+        match aligned {
+            Ok(()) => tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                floor = floor.0,
+                "ladder_aligned"
+            ),
+            Err(reason) => tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                floor = floor.0,
+                reason,
+                "ladder_align_refused"
+            ),
+        }
+        debug_assert!(
+            !sides(self),
+            "p{} g{}: an R1 ladder holds a rung below the trim floor {}",
+            partition.0,
+            generation.0,
+            floor.0
+        );
+    }
+
+    /// Issue #61 (design section 2, A5): trim `partition`'s History on this copy to `through`,
+    /// as `admin trim-history --through N` asks ([`Msg::TrimHistory`]). Answers the new floor.
+    ///
+    /// Refused, with nothing changed, when this node holds no lineage of the partition
+    /// (`no_lineage`); while an inventory pin is held (`inventory_pinned`, rev 4 m-c); past the
+    /// lowest `S` of a snapshot transfer this node serves (`transfer_pinned`, design 3.1); when the
+    /// newest generation's root is unknown here (`root_unknown`: neither its commit nor a mark
+    /// of its own names it); or when the record at `through` is not held (`digest_at`'s
+    /// reason). Then in one step (design section 3.4): R1's ladders first
+    /// ([`Replication::trim_history`]; a node holding no side has none to trim), then the
+    /// engine ([`RocksEngine::stage_trim_history`], whose own refusal answers `engine:<reason>`
+    /// and is logged `history_trim_refused`), then the kept ladders, then
+    /// [`Self::align_ladders`]. Logged `host_history_trimmed`.
+    #[cfg(debug_assertions)]
+    fn trim_history_through(
+        &mut self,
+        partition: PartitionId,
+        through: Seq,
+    ) -> Result<Seq, String> {
+        let generation = self.newest_held(partition).ok_or("no_lineage")?;
+        if let Some(pin) = self.inventory_pins.get(&partition).copied() {
+            let landed_past = self
+                .landed
+                .iter()
+                .any(|(p, g)| *p == partition && *g > pin.generation);
+            let now = self.clock.now();
+            if landed_past {
+                self.inventory_pins.remove(&partition);
+            } else if now >= pin.since.plus_millis(self.inventory_pin_millis) {
+                self.inventory_pins.remove(&partition);
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = pin.generation.0,
+                    millis = self.inventory_pin_millis,
+                    "inventory_pin_expired"
+                );
+            } else {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = pin.generation.0,
+                    through = through.0,
+                    "history_trim_pinned"
+                );
+                return Err("inventory_pinned".to_owned());
+            }
+        }
+        if let Some(pin) = self.transfer_pin(partition).filter(|pin| through > *pin) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                pin = pin.0,
+                through = through.0,
+                "history_trim_transfer_pinned"
+            );
+            return Err("transfer_pinned".to_owned());
+        }
+        let root = match self
+            .committed
+            .get(&partition)
+            .filter(|result| result.new_generation == generation)
+        {
+            Some(result) => (result.selected.cutoff_seq, result.selected.cutoff_digest),
+            None => match self
+                .engine
+                .floor(partition, generation)
+                .filter(|(level, _)| *level == generation)
+            {
+                Some((_, mark)) => (mark.root_base, mark.root_digest),
+                None => return Err("root_unknown".to_owned()),
+            },
+        };
+        let digest = self.digest_at(partition, generation, through)?;
+        match self
+            .replication
+            .trim_history(self.node, partition, through, digest)
+        {
+            Ok(()) | Err(RdbError::InvalidArgument { field: "side" }) => {}
+            Err(error) => return Err(format!("ladder_refused: {error:?}")),
+        }
+        let levels = self
+            .engine
+            .stage_trim_history(
+                partition,
+                generation,
+                TrimFloor {
+                    seq: through,
+                    root_base: root.0,
+                    root_digest: root.1,
+                },
+            )
+            .map_err(|refused| format!("engine:{}", refused.reason()))?;
+        for kept in [
+            self.dormant_ladders.get_mut(&partition),
+            self.inventory_ladders.get_mut(&partition),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            kept.rungs.retain(|(seq, _)| *seq >= through);
+        }
+        self.dormant_ladders
+            .retain(|p, ladder| *p != partition || !ladder.rungs.is_empty());
+        self.inventory_ladders
+            .retain(|p, ladder| *p != partition || !ladder.rungs.is_empty());
+        self.align_ladders(partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            floor = through.0,
+            root_base = root.0 .0,
+            levels,
+            "host_history_trimmed"
+        );
+        Ok(through)
+    }
+
     // ------------------------------------------------------------------ recovery providers
 
     fn recovery_effect(&mut self, effect: &RecoveryEffect, site: Site) -> Result<(), Fault> {
@@ -12633,8 +13452,36 @@ impl Host {
                 self.route_catch_up(site, (*from, *to, *through, *through_digest), *credential);
                 Ok(())
             }
-            RecoveryEffect::ProbeDigestAt { .. } => {
-                Err(unsupported(self.node, "recovery_probe_digest"))
+            // Issue #61 (design rev 4 N4): asked of the copy's holder under the plan's anchor.
+            // No holder gives no answer, logged `probe_unasked`: F1's probe deadline drops the
+            // copy, as for a holder that is down.
+            RecoveryEffect::ProbeDigestAt { copy, seq } => {
+                let Some(plan) = self.plans.get(&site.partition) else {
+                    return Err(Fault::from(format!(
+                        "ProbeDigestAt for p{} with no plan",
+                        site.partition.0
+                    )));
+                };
+                let anchor = plan.anchor;
+                match holder_of(&plan.config.members, *copy) {
+                    Some(holder) => self.ask(
+                        holder,
+                        site,
+                        PeerAsk::Probe {
+                            copy: *copy,
+                            anchor,
+                            seq: *seq,
+                        },
+                    ),
+                    None => tracing::warn!(
+                        node,
+                        partition = site.partition.0,
+                        copy = copy.0,
+                        seq = seq.0,
+                        "probe_unasked"
+                    ),
+                }
+                Ok(())
             }
             RecoveryEffect::QuarantineSuffix { .. } => {
                 Err(unsupported(self.node, "recovery_quarantine_suffix"))
@@ -12984,14 +13831,15 @@ impl Host {
         .map_err(|_| "receiver_refused")
     }
 
-    /// Every verified digest `(0, ROOT)` through this copy's head of `generation`. A record
-    /// below the lineage's base is read through its parent, as `history_at` does.
+    /// Every verified digest from this copy's first rung ([`Self::first_rung`]: `(0, ROOT)`,
+    /// or the trim floor, issue #61) through its head of `generation`. A record below the
+    /// lineage's base is read through its parent, as `history_at` does.
     fn dormant_rungs(
         &self,
         partition: PartitionId,
         generation: Generation,
     ) -> Result<Vec<(Seq, Digest)>, &'static str> {
-        let mut rungs = vec![(Seq::ZERO, Digest::ROOT)];
+        let mut rungs = vec![self.first_rung(partition, generation)?];
         self.extend_rungs(partition, generation, &mut rungs, u64::MAX)?;
         Ok(rungs)
     }
@@ -13020,35 +13868,37 @@ impl Host {
     }
 
     /// A-R458: the kept dormant ladder of `partition` when its base still matches, or a new one
-    /// holding only `(0, ROOT)`, with which it is. The base is the generation, the plan's
-    /// primary (node and boot), and a tip whose digest this engine still holds; anything else
-    /// reads every record again.
+    /// holding only its first rung ([`Self::first_rung`]: `(0, ROOT)`, or the trim floor, issue
+    /// #61), with which it is. The base is the generation, the plan's primary (node and boot),
+    /// and a tip whose digest this engine still holds; anything else reads every record again.
     fn kept_ladder(
         &mut self,
         partition: PartitionId,
         generation: Generation,
         owner: Option<(NodeId, BootId)>,
-    ) -> (&'static str, KeptLadder) {
+    ) -> Result<(&'static str, KeptLadder), &'static str> {
         let kept = self.dormant_ladders.remove(&partition).filter(|ladder| {
             ladder.generation == generation
                 && ladder.owner == owner
                 && self.holds_tip(partition, generation, ladder)
         });
-        match kept {
+        Ok(match kept {
             Some(ladder) => ("extended", ladder),
             None => (
                 "rebuilt",
                 KeptLadder {
                     generation,
                     owner,
-                    rungs: vec![(Seq::ZERO, Digest::ROOT)],
+                    rungs: vec![self.first_rung(partition, generation)?],
                 },
             ),
-        }
+        })
     }
 
     /// Whether this engine holds `ladder`'s tip in `generation`, at or below its head and at the
-    /// same digest. The digests chain, so that proves every rung below the tip too.
+    /// same digest. The digests chain, so that proves every rung below the tip too. Issue #61:
+    /// a ladder whose first rung is below the engine's trim floor is not held either, so no
+    /// kept ladder carries a rung the engine no longer has (design section 3.4).
     fn holds_tip(
         &self,
         partition: PartitionId,
@@ -13056,13 +13906,17 @@ impl Host {
         ladder: &KeptLadder,
     ) -> bool {
         let head = self.engine.buffered_applied(partition, generation).0;
-        ladder.rungs.last().is_some_and(|&(seq, digest)| {
-            seq.0 <= head
-                && (seq == Seq::ZERO
-                    || self
-                        .checked(partition, generation, seq)
-                        .is_ok_and(|(_, held)| held == digest))
-        })
+        let floor = self.engine.floor_seq(partition, generation);
+        ladder
+            .rungs
+            .first()
+            .is_some_and(|(first, _)| *first >= floor)
+            && ladder.rungs.last().is_some_and(|&(seq, digest)| {
+                seq.0 <= head
+                    && self
+                        .digest_at(partition, generation, seq)
+                        .is_ok_and(|held| held == digest)
+            })
     }
 
     /// A-R461: the kept inventory ladder of `partition`, extended through this copy's head of
@@ -13076,7 +13930,9 @@ impl Host {
     /// `floor` is the inventory's base (issue #105, design section 5.1, M1): a kept ladder is
     /// used only when its first rung is at or below it, and a cold one starts at the lower of
     /// the floor and the generation's link, so an adopted lineage linked above the base still
-    /// reaches it. `ladder_duty`'s warm reads have no anchor and pass `None`.
+    /// reaches it. `ladder_duty`'s warm reads have no anchor and pass `None`. Issue #61: neither
+    /// starts below the trim floor, so a cold ladder starts at `max(min(link, floor), F)` and a
+    /// kept one is used when its first rung is at or below `max(floor, F)`.
     fn inventory_ladder(
         &mut self,
         partition: PartitionId,
@@ -13084,6 +13940,7 @@ impl Host {
         most: u64,
         floor: Option<Seq>,
     ) -> Result<(&'static str, KeptLadder, u64), &'static str> {
+        let trimmed = self.engine.floor_seq(partition, generation);
         let kept = self
             .inventory_ladders
             .remove(&partition)
@@ -13093,7 +13950,7 @@ impl Host {
                     ladder
                         .rungs
                         .first()
-                        .is_some_and(|(first, _)| *first <= floor)
+                        .is_some_and(|(first, _)| *first <= floor.max(trimmed))
                 })
             });
         let (how, mut ladder) = match kept {
@@ -13112,12 +13969,8 @@ impl Host {
                     .engine
                     .link(partition, generation)
                     .map_or(Seq::ZERO, |link| link.base);
-                let base = floor.map_or(linked, |floor| floor.min(linked));
-                let digest = if base == Seq::ZERO {
-                    Digest::ROOT
-                } else {
-                    self.checked(partition, generation, base)?.1
-                };
+                let base = floor.map_or(linked, |floor| floor.min(linked)).max(trimmed);
+                let digest = self.digest_at(partition, generation, base)?;
                 (
                     "rebuilt",
                     KeptLadder {
@@ -13185,7 +14038,8 @@ impl Host {
     }
 
     /// A-R458: give this node's dormant receiver of `partition` its ladder, and say whether the
-    /// kept one was `extended` or the ladder `rebuilt` from `(0, ROOT)` ([`Self::kept_ladder`]).
+    /// kept one was `extended` or the ladder `rebuilt` from its first rung ([`Self::kept_ladder`],
+    /// [`Self::first_rung`]: `(0, ROOT)`, or the trim floor, issue #61).
     /// The ladder is dropped when a read or the receiver refuses it, so the next restore
     /// rebuilds.
     fn dormant_ladder(
@@ -13195,7 +14049,7 @@ impl Host {
     ) -> Result<(&'static str, usize), &'static str> {
         let generation = seed.lineage.generation;
         let (how, mut ladder) =
-            self.kept_ladder(partition, generation, Self::ladder_owner(&seed.config));
+            self.kept_ladder(partition, generation, Self::ladder_owner(&seed.config))?;
         self.extend_rungs(partition, generation, &mut ladder.rungs, u64::MAX)?;
         self.replication
             .restore_history(self.node, partition, &ladder.rungs)
@@ -13217,9 +14071,14 @@ impl Host {
         generation: Generation,
         owner: Option<(NodeId, BootId)>,
     ) {
-        let (_, mut ladder) = self.kept_ladder(partition, generation, owner);
-        match self.extend_rungs(partition, generation, &mut ladder.rungs, WARM_RUNGS) {
-            Ok(()) => {
+        let warmed = self
+            .kept_ladder(partition, generation, owner)
+            .and_then(|(_, mut ladder)| {
+                self.extend_rungs(partition, generation, &mut ladder.rungs, WARM_RUNGS)
+                    .map(|()| ladder)
+            });
+        match warmed {
+            Ok(ladder) => {
                 self.dormant_ladders.insert(partition, ladder);
             }
             Err(reason) => tracing::warn!(
@@ -13255,77 +14114,14 @@ impl Host {
             .dormant_rungs(partition, ladder.generation)
             .expect("a full read of the ladder's generation");
         let tip = ladder.rungs.last().map_or(Seq::ZERO, |(seq, _)| *seq);
-        let first = ladder.rungs.first().map_or(0, |(seq, _)| seq.0);
+        // Issue #61: the full read starts at the trim floor, not at seq 0.
+        let floor = full.first().map_or(0, |(seq, _)| seq.0);
+        let first = ladder.rungs.first().map_or(0, |(seq, _)| seq.0) - floor;
         let first = usize::try_from(first).expect("a ladder index");
         Some((
             full.get(first..first + ladder.rungs.len()) == Some(ladder.rungs.as_slice()),
             tip,
         ))
-    }
-
-    /// H2 (A-R223, A-R254): R1's `SnapshotCatchupRequired`. The primary here met a record it
-    /// does not retain; this engine still holds every record, so the primary is given its
-    /// engine's ladder ([`Replication::restore_primary_history`], K3), once per generation, and
-    /// the copy's next `NeedPrefix` walks it record by record. The sim's twin is
-    /// `snapshot_catchup` in `rdb-sim`'s dispatch.
-    ///
-    /// Never faults the node. A repeat `(copy, barrier)` is dropped (B-R48). An ask after the
-    /// ladder was restored cannot be served by re-sending, so it is logged
-    /// `snapshot_catchup_unservable` (warn) and the copy stays behind, named. No primary here, an
-    /// unreadable ladder or a refused one is logged `snapshot_catchup_unserved{reason}` (warn).
-    fn snapshot_catchup(&mut self, partition: PartitionId, copy: CopyId, barrier: Seq) {
-        let node = self.node;
-        let started = Instant::now();
-        let unserved = |reason: &str| {
-            tracing::warn!(
-                node = node.0,
-                partition = partition.0,
-                copy = copy.0,
-                barrier = barrier.0,
-                reason,
-                "snapshot_catchup_unserved"
-            );
-        };
-        let Some(primary) = self.replication.primary(node, partition) else {
-            return unserved("no_primary");
-        };
-        let generation = primary.tracker().lineage().generation;
-        if !self.snapshots_served.insert((partition, copy, barrier)) {
-            return;
-        }
-        if self.primary_ladders.contains(&(partition, generation)) {
-            tracing::warn!(
-                node = node.0,
-                partition = partition.0,
-                copy = copy.0,
-                barrier = barrier.0,
-                generation = generation.0,
-                "snapshot_catchup_unservable"
-            );
-            return;
-        }
-        let read = match self.dormant_rungs(partition, generation) {
-            Ok(read) => read,
-            Err(reason) => return unserved(reason),
-        };
-        if self
-            .replication
-            .restore_primary_history(node, partition, &read)
-            .is_err()
-        {
-            return unserved("ladder_refused");
-        }
-        self.primary_ladders.insert((partition, generation));
-        tracing::info!(
-            node = node.0,
-            partition = partition.0,
-            copy = copy.0,
-            barrier = barrier.0,
-            generation = generation.0,
-            rungs = read.len(),
-            millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "snapshot_catchup_served"
-        );
     }
 
     /// H3 (I1, A-R254): R1's `CopyAheadOnControl`. `copy` answered `NeedLineage`, `NeedConfig`
@@ -13555,7 +14351,22 @@ impl Host {
                 anchor,
                 last_writable,
                 release_through,
-            } => Some(self.inventory(partition, copy, anchor, last_writable, release_through)),
+            } => {
+                let answer =
+                    self.inventory(partition, copy, anchor, last_writable, release_through);
+                // Issue #61 (design section 3.5): what this answer reported stays provable until
+                // the plan's run lands, so this node's History is not trimmed under it.
+                if !matches!(answer, RecoveryEvent::InventoryFailed { .. }) {
+                    self.inventory_pins.insert(
+                        partition,
+                        InventoryPin {
+                            generation: anchor.lineage.generation,
+                            since: self.clock.now(),
+                        },
+                    );
+                }
+                Some(answer)
+            }
             PeerAsk::Sync {
                 copy,
                 cutoff,
@@ -13585,7 +14396,67 @@ impl Host {
                 self.durable_through(partition, asker, proof);
                 None
             }
+            PeerAsk::Probe { copy, anchor, seq } => self.probe(partition, copy, anchor, seq),
         }
+    }
+
+    /// Issue #61 (design rev 4 N4 and m-a, rev 5e): F1's `ProbeDigestAt` of `copy` at `seq`,
+    /// answered in the anchor's generation, the one this copy's inventory reported (as the
+    /// sim's `current_inventory` does), never in a newer one it landed since.
+    ///
+    /// * `ProbeAnswered` with the digest this copy holds at `seq` ([`Self::digest_at`]).
+    /// * `ProbeUnavailable` when it holds no record there: below its trim floor, or above its
+    ///   head. F1 then drops the shorter copies of a pair probe below this copy's head (A4).
+    /// * No answer when it does not hold the anchor's generation, or its read fails, logged
+    ///   `probe_unanswered{reason}` (warn): F1's probe deadline drops this copy, as for a holder
+    ///   that is down. A fault never stands for "not held".
+    fn probe(
+        &self,
+        partition: PartitionId,
+        copy: CopyId,
+        anchor: LineageAnchor,
+        seq: Seq,
+    ) -> Option<RecoveryEvent> {
+        let generation = anchor.lineage.generation;
+        let unanswered = |reason: &str| {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = copy.0,
+                generation = generation.0,
+                seq = seq.0,
+                reason,
+                "probe_unanswered"
+            );
+            None
+        };
+        if !self.engine.lineages().contains(&(partition, generation))
+            || self.engine.staging(partition, generation).is_some()
+        {
+            return unanswered("anchor_generation_not_held");
+        }
+        let floor = self.engine.floor_seq(partition, generation);
+        let head = Seq(self.engine.buffered_applied(partition, generation).0);
+        let answer = if seq < floor || seq > head {
+            RecoveryEvent::ProbeUnavailable { copy, seq }
+        } else {
+            match self.digest_at(partition, generation, seq) {
+                Ok(digest) => RecoveryEvent::ProbeAnswered { copy, seq, digest },
+                Err(reason) => return unanswered(reason),
+            }
+        };
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            generation = generation.0,
+            seq = seq.0,
+            floor = floor.0,
+            head = head.0,
+            answered = matches!(answer, RecoveryEvent::ProbeAnswered { .. }),
+            "probe_answered"
+        );
+        Some(answer)
     }
 
     /// What this copy reports for a plan anchored at `anchor`.
@@ -13599,9 +14470,10 @@ impl Host {
     ///   `InventoryFailed`, logged as `inventory_failed{reason}`, never an invented ladder.
     ///   A copy that missed the anchor's generation while it was silent links it first, when
     ///   it holds the base exactly ([`Self::inherit_missed_link`], A-R177), and only onto a
-    ///   lineage that reaches seq 1 or applied nothing (check B, #107, after the depth guard;
-    ///   only seq 1 is read). A holed one answers `InventoryFailed` with
-    ///   `missed_generation_from_has_no_floor`, and one whose seq 1 read fails with
+    ///   lineage that reaches its floor (seq 1, or its trim floor, issue #61) or applied nothing
+    ///   (check B, #107, after the depth guard; only the record at the floor is read). A holed
+    ///   one answers `InventoryFailed` with `missed_generation_from_has_no_floor`, and one whose
+    ///   floor read fails with
     ///   `missed_generation_history_read_failed`. When a tail above the base was released
     ///   (or adopted) for this ask, the same refusal answers `TailHeld` instead, with that
     ///   reason, logged `tail_release_refused` (or `tail_adopted_refused`), never a bare
@@ -13667,7 +14539,7 @@ impl Host {
                             );
                             // A write that failed after the proofs held, or check B's
                             // refusal, proves nothing the wire can name: `of` holds it
-                            // `Unchecked`.
+                            // `Unchecked`. A trimmed-history reason stays `Trimmed`.
                             let adoption = TailAdoption::of::<()>(&Err(refusal));
                             return self.tail_held(partition, copy, anchor, hit, adoption);
                         }
@@ -13780,6 +14652,25 @@ impl Host {
                         generation = anchor.lineage.generation.0,
                         base = anchor.base_seq.0,
                         reason,
+                        "inventory_failed"
+                    );
+                    RecoveryEvent::InventoryFailed { copy }
+                }
+                // A copy installing a snapshot of this partition has wiped its
+                // old lineages and links the new one only when the install finishes, so its own
+                // unlinked anchor is the install's normal state, not a fault: the re-plan that
+                // follows the install asks again.
+                Err(reason @ "anchor_generation_unlinked")
+                    if self.installs.contains_key(&partition) =>
+                {
+                    tracing::info!(
+                        node = self.node.0,
+                        partition = partition.0,
+                        copy = copy.0,
+                        generation = anchor.lineage.generation.0,
+                        base = anchor.base_seq.0,
+                        reason,
+                        installing = true,
                         "inventory_failed"
                     );
                     RecoveryEvent::InventoryFailed { copy }
@@ -14020,7 +14911,8 @@ impl Host {
 
     /// Whether this copy holds the last writable generation `last_writable` intact (issue
     /// #105, design section 3.7): it holds lineage `(partition, L)`, not staging, and where
-    /// that lineage applied above seq 0, the record at seq 1 is reachable through its chain.
+    /// that lineage applied above seq 0, the record at its floor (seq 1, or its trim floor,
+    /// issue #61; [`Self::has_floor`]) is reachable through its chain.
     /// A wiped copy, a holed lineage or a copy rebuilt after L does not. F1 checks the node
     /// is one of L's regulars. `false` while L is unknown: F1 waives the rule then.
     fn holds_last_writable(
@@ -14051,12 +14943,13 @@ impl Host {
         }
     }
 
-    /// Whether `generation`'s lineage of `partition` reaches seq 1 through its chain, or applied
-    /// nothing: the one read behind both the intact rule ([`Self::holds_last_writable`]) and
-    /// check B (`from_has_no_floor`, issue #107 slice 1), which refuses to link a new generation
-    /// onto a lineage holed below its head. `history_at` walks the chain to the bottom, and
-    /// `History` falls through a copied level, so one read answers for every level. Depends on
-    /// seq 1 being kept: a history trim (#61) must revisit both callers.
+    /// Whether `generation`'s lineage of `partition` reaches its floor through its chain, or
+    /// applied nothing: the one read behind both the intact rule ([`Self::holds_last_writable`])
+    /// and check B (`from_has_no_floor`, issue #107 slice 1), which refuses to link a new
+    /// generation onto a lineage holed below its head. The floor is seq 1 while the lineage was
+    /// never trimmed, else its trim floor F (issue #61, design section 1a): the record **at** F
+    /// is kept, and nothing below it is meant to be. `history_at` walks the chain to the bottom,
+    /// and `History` falls through a copied level, so one read answers for every level.
     fn has_floor(
         &self,
         partition: PartitionId,
@@ -14065,9 +14958,10 @@ impl Host {
         if self.engine.buffered_applied(partition, generation).0 == 0 {
             return Ok(true);
         }
+        let floor = self.engine.floor_seq(partition, generation).max(Seq(1));
         Ok(self
             .engine
-            .history_at(partition, generation, Seq(1))?
+            .history_at(partition, generation, floor)?
             .is_some())
     }
 
@@ -14125,6 +15019,14 @@ impl Host {
         hit: TailHit,
         through: Seq,
     ) {
+        // Issue #61: an offer refusal this copy holds for that tail clears too.
+        if self
+            .offer_tail_held
+            .get(&partition)
+            .is_some_and(|held| held.head <= through)
+        {
+            self.offer_tail_held.remove(&partition);
+        }
         tracing::warn!(
             node = self.node.0,
             partition = partition.0,
@@ -14169,6 +15071,13 @@ impl Host {
     ///   base and below the tail's, at most [`ADOPT_REPLAY_MAX`] records short, and the first
     ///   record replayed names its head's digest as `prev_digest` (N1). A lineage not yet linked
     ///   or below the base is `replay_not_ready`, which a later generation's landing can end.
+    ///
+    /// Issue #61: before P1, a tail lineage trimmed above the anchor's base is
+    /// `tail_below_floor` (the history P1 and P2 read is gone; the copy is rebuilt by snapshot).
+    /// That reason and [`Self::chain`]'s `base_below_floor` are [`ADOPTION_TRIMMED`], not
+    /// [`ADOPTION_REFUSALS`]: they answer [`TailAdoption::Trimmed`] ([`TailAdoption::of`]), which
+    /// crosses the wire from the protocol version #61 introduces (lead ruling R16). t4's check-B reasons stay
+    /// [`TailAdoption::Unchecked`].
     fn adoption(
         &self,
         partition: PartitionId,
@@ -14203,6 +15112,11 @@ impl Host {
         }
         let base = anchor.base_seq;
         let to = anchor.lineage.generation;
+        // Issue #61 (design section 1a): the tail's lineage was trimmed above the anchor's base,
+        // so neither P1 nor P2 can be proved. No adoption; the copy is rebuilt by snapshot.
+        if self.engine.floor_seq(partition, hit.from) > base {
+            return Err("tail_below_floor");
+        }
         // PR #110 review blocker 2: a Replay gap over the limit is refused before P1 and P2, so
         // the node thread never walks a tail it would refuse anyway. Only the Replay shape: a
         // linked, settled lineage at the anchor's generation, replaying from at or above the base.
@@ -14215,13 +15129,9 @@ impl Host {
                 return Err("tail_too_long");
             }
         }
-        let at_base = if base == Seq::ZERO {
-            Digest::ROOT
-        } else {
-            self.checked(partition, hit.from, base)
-                .map_err(|_| "base_digest_differs")?
-                .1
-        };
+        let at_base = self
+            .digest_at(partition, hit.from, base)
+            .map_err(|_| "base_digest_differs")?;
         if at_base != anchor.base_digest {
             return Err("base_digest_differs");
         }
@@ -14421,6 +15331,9 @@ impl Host {
     /// each reads and verifies ([`Self::checked`]), and names the digest before it as its
     /// `prev_digest`, starting at `base_digest`. A gap, an unreadable record or a broken link is
     /// `tail_not_contiguous`.
+    ///
+    /// Issue #61: a base below `generation`'s trim floor is `base_below_floor`, before anything
+    /// is read: the records after it are gone, so the walk cannot prove them.
     fn chain(
         &self,
         partition: PartitionId,
@@ -14429,6 +15342,9 @@ impl Host {
         base_digest: Digest,
         head: Seq,
     ) -> Result<(), &'static str> {
+        if base < self.engine.floor_seq(partition, generation) {
+            return Err("base_below_floor");
+        }
         let mut prev = base_digest;
         for seq in base.0 + 1..=head.0 {
             let (record, digest) = self
@@ -14454,11 +15370,14 @@ impl Host {
     /// too (D8, A-R337). A link above the base is an adopted tail's (issue #105 unit 2, design
     /// section 5.1, M1): it passes only when the chain from the base through the link verifies
     /// record by record from the anchor's digest ([`Self::chain`]), and is refused
-    /// `base_differs` otherwise. A copy missing the anchor's generation, or holding it staged
-    /// under a release, links it first ([`Self::inherit_missed_link`]). A copy holding a newer
-    /// generation of the partition is ahead of the plan and answers nothing; roll-forward is
-    /// decided before the plan is made, never here. Its ladder is the kept one, extended through
-    /// the head ([`Self::inventory_ladder`], A-R461), cut at the base.
+    /// `base_differs` otherwise. A lineage a snapshot installed has no link: it answers when its
+    /// own trim mark roots it at or below the anchor's base, and is refused
+    /// `anchor_generation_unlinked` otherwise, as any other unlinked lineage (issue #61 R26). A
+    /// copy missing the anchor's generation, or holding it staged under a release, links it
+    /// first ([`Self::inherit_missed_link`]). A copy holding a newer generation of the partition
+    /// is ahead of the plan and answers nothing; roll-forward is decided before the plan is
+    /// made, never here. Its ladder is the kept one, extended through the head
+    /// ([`Self::inventory_ladder`], A-R461), cut at the base.
     fn survivor(
         &mut self,
         partition: PartitionId,
@@ -14490,33 +15409,60 @@ impl Host {
                 "inventory_link_inherited"
             );
         }
-        let link = self
-            .engine
-            .link(partition, generation)
-            .ok_or("anchor_generation_unlinked")?;
-        // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
-        // tail's. It passes only when the chain from the base through the link verifies, record
-        // by record, from the anchor's digest; anything else is refused as before.
-        if link.base > anchor.base_seq {
-            self.chain(
-                partition,
-                generation,
-                anchor.base_seq,
-                anchor.base_digest,
-                link.base,
-            )
-            .map_err(|_| "base_differs")?;
+        // Issue #61 R26 (A8): a lineage a snapshot installed has no link (a link names an older
+        // parent); its own trim mark roots it at the barrier instead (B1). It answers when that
+        // mark is the anchor generation's own and is rooted at or below the anchor's base; the
+        // base digest check below then proves the prefix as for any lineage. Anything else
+        // unlinked is refused as before.
+        let link = self.engine.link(partition, generation);
+        if link.is_none()
+            && !self
+                .engine
+                .floor(partition, generation)
+                .is_some_and(|(level, mark)| {
+                    level == generation && mark.root_base <= anchor.base_seq
+                })
+        {
+            return Err("anchor_generation_unlinked");
         }
-        let digest_at = |seq: Seq| -> Result<Digest, &'static str> {
-            if seq == Seq::ZERO {
-                return Ok(Digest::ROOT);
+        // Issue #61 (design section 3.5, rev 4 m-e): History below the trim floor is gone, so a
+        // base under it is proved by the mark the trim wrote, never by a record. The mark
+        // counts only when it is the anchor generation's own and names the anchor's base as
+        // its root; a parent's mark, or one rooted elsewhere, is `base_below_floor`. Before
+        // the trim deleted anything, this copy checked it descends from that root, so a mark
+        // naming the anchor's digest proves the prefix, an adopted tail's link included.
+        let trimmed = self.engine.floor_seq(partition, generation);
+        let root = if anchor.base_seq < trimmed {
+            let (level, mark) = self
+                .engine
+                .floor(partition, generation)
+                .ok_or("base_below_floor")?;
+            if level != generation || mark.root_base != anchor.base_seq {
+                return Err("base_below_floor");
             }
-            self.checked(partition, generation, seq)
-                .map(|(_, digest)| digest)
+            if mark.root_digest != anchor.base_digest {
+                return Err("base_digest_differs");
+            }
+            Some((anchor.base_seq, anchor.base_digest))
+        } else {
+            // Issue #105 unit 2 (design section 5.1, M1): a link above the base is an adopted
+            // tail's. It passes only when the chain from the base through the link verifies,
+            // record by record, from the anchor's digest; anything else is refused as before.
+            if let Some(link) = link.filter(|link| link.base > anchor.base_seq) {
+                self.chain(
+                    partition,
+                    generation,
+                    anchor.base_seq,
+                    anchor.base_digest,
+                    link.base,
+                )
+                .map_err(|_| "base_differs")?;
+            }
+            if self.digest_at(partition, generation, anchor.base_seq)? != anchor.base_digest {
+                return Err("base_digest_differs");
+            }
+            None
         };
-        if digest_at(anchor.base_seq)? != anchor.base_digest {
-            return Err("base_digest_differs");
-        }
         let head = Seq(self.engine.buffered_applied(partition, generation).0);
         if head < anchor.base_seq {
             return Err("head_below_base");
@@ -14526,14 +15472,19 @@ impl Host {
         let (how, kept, read) =
             self.inventory_ladder(partition, generation, u64::MAX, Some(anchor.base_seq))?;
         let first = kept.rungs.first().map_or(0, |(seq, _)| seq.0);
+        // Issue #61: dense from `max(base, F)`, with the root rung in front when the base is
+        // below F: `verify_ancestry` finds the base rung, so no root probe is asked.
         let from = anchor
             .base_seq
+            .max(trimmed)
             .0
             .checked_sub(first)
             .and_then(|from| usize::try_from(from).ok())
             .ok_or("base_out_of_range")?;
-        let ladder = match kept.rungs.get(from..) {
-            Some(rungs) if rungs.last().map(|(seq, _)| *seq) == Some(head) => rungs.to_vec(),
+        let ladder: Vec<(Seq, Digest)> = match kept.rungs.get(from..) {
+            Some(rungs) if rungs.last().map(|(seq, _)| *seq) == Some(head) => {
+                root.into_iter().chain(rungs.iter().copied()).collect()
+            }
             _ => return Err("ladder_short_of_head"),
         };
         tracing::info!(
@@ -14570,10 +15521,11 @@ impl Host {
     /// truncate); its digest at the base is the anchor's. Then only a link (C1): a parent
     /// already at [`MAX_CHAIN_DEPTH`] levels would need a multi-batch copy inside the discovery
     /// window, so it is refused. Then check B (#107, after the depth guard): the parent's lineage
-    /// must reach seq 1 through its chain ([`Self::has_floor`]), so the anchor's generation is
-    /// never linked over a hole; a holed parent is refused `missed_generation_from_has_no_floor`.
-    /// A lineage that applied nothing has no seq 1 and passes. Only seq 1 is read: the read walks
-    /// the chain, so it answers for every level. A read that fails refuses
+    /// must reach its floor (seq 1, or its trim floor, issue #61) through its chain
+    /// ([`Self::has_floor`]), so the anchor's generation is never linked over a hole; a holed
+    /// parent is refused `missed_generation_from_has_no_floor`. A lineage that applied nothing
+    /// has no seq 1 and passes. Only the record at the floor is read: the read walks the chain,
+    /// so it answers for every level. A read that fails refuses
     /// `missed_generation_history_read_failed`, logged first as
     /// `missed_generation_floor_read_failed` with the fault. A refusal writes nothing and names
     /// its reason.
@@ -14617,11 +15569,7 @@ impl Host {
             );
             return Err("missed_generation_held_past_base");
         }
-        let digest = if base == Seq::ZERO {
-            Digest::ROOT
-        } else {
-            self.checked(partition, from, base)?.1
-        };
+        let digest = self.digest_at(partition, from, base)?;
         if digest != anchor.base_digest {
             return Err("missed_generation_base_digest_differs");
         }
@@ -14687,11 +15635,11 @@ impl Host {
     /// this order: the head at or below the base (`held_past_base`); the record at the
     /// head reads and verifies ([`Self::checked`]), and at the base its digest is the anchor's
     /// (`base_digest_differs`); the depth guard
-    /// (`link_depth_ceiling`); then check B (#107): `from`'s lineage must reach seq 1 through its
-    /// chain ([`Self::has_floor`]), so the new generation is never linked over a hole
-    /// (`from_has_no_floor`). A lineage that applied nothing, as an empty copy's generation 0,
-    /// has no seq 1 and passes. Only seq 1 is read: the read walks the chain, so it answers for
-    /// every level. A read that fails refuses `history_read_failed`, logged first as
+    /// (`link_depth_ceiling`); then check B (#107): `from`'s lineage must reach its floor (seq 1,
+    /// or its trim floor, issue #61) through its chain ([`Self::has_floor`]), so the new
+    /// generation is never linked over a hole (`from_has_no_floor`). A lineage that applied
+    /// nothing, as an empty copy's generation 0, has no seq 1 and passes. Only the record at the
+    /// floor is read: the read walks the chain, so it answers for every level. A read that fails refuses `history_read_failed`, logged first as
     /// `land_floor_read_failed` with the fault.
     fn land_at(
         &mut self,
@@ -14748,11 +15696,7 @@ impl Host {
             );
             return Err("held_past_base");
         }
-        let at = if head == Seq::ZERO {
-            Digest::ROOT
-        } else {
-            self.checked(partition, from, head)?.1
-        };
+        let at = self.digest_at(partition, from, head)?;
         if head == base && at != anchor.base_digest {
             return Err("base_digest_differs");
         }
@@ -14935,22 +15879,19 @@ impl Host {
         // Seq 0 is the empty prefix: no record is stored there, and every lineage starts at
         // `Digest::ROOT`. This holder answers it after its own WAL sync, before and after commit
         // (D2 ruling, rule 3). Any other seq is the stored record's own digest, or nothing.
-        let digest = if cutoff == Seq::ZERO {
-            Some(Digest::ROOT)
-        } else {
-            match self.checked(partition, generation, cutoff) {
-                Ok((_, digest)) => Some(digest),
-                Err(why) => {
-                    tracing::warn!(
-                        node,
-                        copy = copy.0,
-                        cutoff = cutoff.0,
-                        why,
-                        reason = "no_digest",
-                        "sync_withheld"
-                    );
-                    None
-                }
+        // Issue #61: below this copy's trim floor nothing is proved ([`Self::digest_at`]).
+        let digest = match self.digest_at(partition, generation, cutoff) {
+            Ok(digest) => Some(digest),
+            Err(why) => {
+                tracing::warn!(
+                    node,
+                    copy = copy.0,
+                    cutoff = cutoff.0,
+                    why,
+                    reason = "no_digest",
+                    "sync_withheld"
+                );
+                None
             }
         }?;
         tracing::info!(
@@ -15406,6 +16347,14 @@ impl Host {
                 ),
             );
         }
+        // Mid-install the lineage is wiped and the floor reads 1, so a cursor
+        // would be rewound to START over a history this node does not hold.
+        if self.installs.contains_key(&partition) {
+            return refused(
+                ErrorKind::Unavailable,
+                format!("node {node} is installing a snapshot of partition {p}"),
+            );
+        }
         let mut chain = vec![feed::Level {
             generation: newest,
             exit: None,
@@ -15499,6 +16448,18 @@ impl Host {
                     ),
                 );
             }
+            // A copy anchored at the root with no lineage of the newest generation (an aborted
+            // install removed it, and the rebuild has not landed) holds none of its history: its
+            // floor reads 1, so an older cursor would be rewound to START over records this copy
+            // only lacks.
+            if receiver.applied_head().seq == Seq::ZERO
+                && self.engine.newest_generation(partition) != Some(newest)
+            {
+                return refused(
+                    ErrorKind::Unavailable,
+                    format!("node {node} holds none of partition {p} yet: it is being rebuilt"),
+                );
+            }
             match self.feed_fresh(partition, newest, wait) {
                 Freshness::Fresh => {}
                 Freshness::Reading => return Ok(FeedCall::WaitForRead),
@@ -15552,7 +16513,7 @@ impl Host {
             match envelope.compute_record_digest() {
                 Ok(digest) if digest == envelope.record_digest => {}
                 computed => {
-                    // Round 3: both digests go to this local line only, never into the fault's
+                    // Both digests go to this local line only, never into the fault's
                     // detail. That detail is shared: every later call and every status read,
                     // over the links too, carries it, and the admin gate guards only `Changes`.
                     tracing::error!(
@@ -16625,6 +17586,7 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             tail_refused: self.tail_refused_of(partition),
+            needs_operator: self.needs_operator(partition),
             reload_pending: None,
             lengths: Some(IndexLengths {
                 dedup: self
@@ -16640,6 +17602,13 @@ impl Host {
                     None => receiver.map_or(0, |receiver| receiver.history().len()),
                 },
                 published_at: self.published_at.get(&partition).map_or(0, VecDeque::len),
+                dedup_cap: self
+                    .transaction
+                    .kernel(self.node, partition)
+                    .map_or(0, |kernel| kernel.limits().dedup_cap),
+                history_floor: self.newest_held(partition).map_or(0, |generation| {
+                    self.engine.floor_seq(partition, generation).0
+                }),
             }),
             pinned: self
                 .committed
@@ -17514,6 +18483,10 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Restore { .. } => "restore",
         Msg::Routed { .. } => "routed",
         Msg::DurableProved { .. } => "durable_proved",
+        Msg::SnapshotOffer(_) => "snapshot_offer",
+        Msg::SnapshotPull(_) => "snapshot_pull",
+        Msg::SnapshotChunk(_) => "snapshot_chunk",
+        Msg::SnapshotOfferRefused(_) => "snapshot_offer_refused",
         Msg::Answered { .. } => "answered",
         Msg::Landed { .. } => "landed",
         Msg::Client(_) => "client",
@@ -17525,6 +18498,8 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::DropHistory { .. } => "drop_history",
         #[cfg(debug_assertions)]
         Msg::Fork { .. } => "fork",
+        #[cfg(debug_assertions)]
+        Msg::TrimHistory { .. } => "trim_history",
         Msg::Rebuild { .. } => "rebuild",
         Msg::Synced(_) => "synced",
         #[cfg(test)]

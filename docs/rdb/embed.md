@@ -1496,6 +1496,14 @@ So a partition sustains about `cap / retention` writes per second:
 | 10 min | 109 |
 
 - **Bursts are free.** A burst may use the whole cap at once.
+- **You are warned before the cap is full.** The owner logs `dedup_cap_high` (warn) once when a
+  partition's kept answers reach 80% of the cap, and `dedup_cap_full` (warn) once when they
+  reach the cap. Each line has `node`, `partition`, `len`, `cap`, `retention_ms` and, when
+  known, `frees_in_ms` (the earliest an answer frees). Each is logged again only after the count
+  falls 5% of the cap (at least one answer) below its mark, so a count sitting on a mark does
+  not log on every write.
+- **`Db::node_status` shows how full it is:** `lengths.dedup` (kept answers) beside
+  `lengths.dedup_cap` (the cap), on the owner. A node holding no answers reports 0 for both.
 - **A full cap answers `OVERLOADED`.** Its `retry_after` (on `ApiError`, also in the message)
   is the earliest time an entry frees. Wait at least that long before you send again. It is
   left out when no time is known.
@@ -1562,6 +1570,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -1645,14 +1654,15 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (11 at this commit;
-  set at merge), whether or not this setting is on. A build older than 10 speaks 9, even one
-  that has this setting, and the two refuse each other when they connect, each logging
-  `net_handshake_refused` with both versions. So an older node is never added back live, and it cannot link at all. The
-  same holds for an app process with no copy (`--nodes`): an app at 9 is refused by nodes at
-  10. To upgrade (to 10, or to 11): stop every node and every app process that links to them, upgrade
-  them all, start the nodes, then the apps. A rolling upgrade, with processes at different
-  versions, does not link.
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (12 at this commit:
+  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list), whether or not this setting is on. A
+  build before these guards speaks 9, even one that has this setting, and a build at 10 or 11 lacks
+  the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
+  connect, each logging `net_handshake_refused` with both versions. So an older node is never
+  added back live, and it cannot link at all. The same holds for an app process with no copy
+  (`--nodes`): an app at an older version is refused by nodes at 12. To upgrade: stop every
+  node and every app process that links to them, upgrade them all, start the nodes, then the
+  apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
   whose node has the setting off is still protected when an owner with it on adds it back. A
   copy whose owner has it off is not re-added live, so its own setting does not matter. Set it
@@ -1745,6 +1755,19 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
 
 ### Known limits in this release
 
+- **Writes pause while a copy is rebuilt after the owner dies.** This happens when history was
+  trimmed, a copy was down for longer than the trimmed history covers, and then the owner died.
+  The one copy left owns the partition read-only until the other copy has a snapshot and has
+  caught up. Until then writes are refused `RECOVERY_READ_ONLY`, naming the copy being rebuilt
+  ("When writes pause"). How long that takes grows with the partition's size. `retry_after` is
+  a fixed 5 s poll hint, not an estimate: rDB cannot yet count a partition's bytes cheaply
+  enough to give one.
+- **The same pause follows `admin promote --drop`** when the copy left behind is behind the
+  trimmed history. Reads keep working through the rebuild. Once the copy has caught up, the
+  owner re-plans with it to take writes again. That re-plan fences the partition first, so a
+  read may get `LEASE_EXPIRED` (retry after recovery) for about 2 s. During the re-plan (about
+  a second), writes are refused with retryable, no-mutation errors (`UNAVAILABLE`,
+  `LEASE_EXPIRED`, `GENERATION_CHANGED`, `PROTECTION_PAUSED`); retry them.
 - **A move whose new copy makes no progress for 90 s is given up.** A move's new copy catches
   up one record per round trip. Copying a long history is progress, however long it takes.
   The clock counts only time in which the copy gets no closer to the head. That happens when
@@ -1884,6 +1907,27 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
     (24 hours by default, `DbConfig::dedup_retention`). Adoption does not restart that window,
     so a tail adopted late in it can lose its dedup rows soon after, and a resend then could
     apply twice (design specification §8.5.10).
+  - `Trimmed` (issue #61): the history needed to adopt the tail is trimmed, so it cannot come
+    back. Giving it up still needs `--give-up-live-copy`, and forget-tail's refusal names the
+    whole command.
+- **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
+  `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
+  set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,
+  command}` on that copy's node. The partition still takes writes on its other copies. The named
+  copy cannot be rebuilt, because it holds records no other copy has, and history needed to
+  bring them back has been trimmed. It happens only on a partition whose record an older build
+  wrote and that has committed no writable generation since.
+  - To let it rejoin, run on the owner:
+    `admin forget-tail --partition P --through H --give-up-live-copy`, with the H the warn
+    names. The copy is then rebuilt from a snapshot and returns by itself.
+  - **THIS CAN LOSE ACKNOWLEDGED WRITES.** Seqs above the partition's cutoff, up to H, on that
+    copy are deleted for good. Some of them may be writes your app was told succeeded (`Ok`
+    without `wait_durable`). Before running it, read what that copy holds, if you need it
+    (`rdb_storage::dump` on a stopped node, or a backup). Do not wipe or rebuild the node first:
+    that loses the same records without the check.
+  - If `degraded` still names the copy after the command was accepted, run the same command
+    again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
+    copies.
 - **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
   the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
   `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
@@ -1932,8 +1976,8 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (11 at this commit; set
-  at merge; issues #107, #87, #147 and #148), and the handshake
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (12 at this commit: 10 for
+  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148), and the handshake
   refuses any other version, from nodes and app processes alike.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once.

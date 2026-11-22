@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::ApiError;
 use crate::feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
+use crate::host::snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
 use crate::host::{
     Answer, Change, ClientCall, DormantSeed, Holding, ListEdit, Look, MoveAnswer, Msg, NodeStatus,
     PeerAsk, PutOp, Seen,
@@ -213,6 +214,18 @@ pub enum WireMsg {
         generation: Generation,
         through: Seq,
     },
+    /// Appended (PR-A's protocol bump, issue #61 S2): a snapshot offer, its pulls, its pages and
+    /// its refusal. Last, so no earlier kind's encoded index moves (`net::tests::kind`).
+    SnapshotOffer { to: NodeId, offer: SnapshotOffer },
+    /// Issue #61 S2: the target asks for a page.
+    SnapshotPull { to: NodeId, pull: SnapshotPull },
+    /// Issue #61 S2: one page.
+    SnapshotChunk { to: NodeId, chunk: SnapshotChunk },
+    /// Issue #61 S2: the target refused.
+    SnapshotOfferRefused {
+        to: NodeId,
+        refused: SnapshotOfferRefused,
+    },
 }
 
 impl WireMsg {
@@ -226,6 +239,10 @@ impl WireMsg {
             | Self::Restore { to, .. }
             | Self::Routed { to, .. }
             | Self::DurableProved { to, .. }
+            | Self::SnapshotOffer { to, .. }
+            | Self::SnapshotPull { to, .. }
+            | Self::SnapshotChunk { to, .. }
+            | Self::SnapshotOfferRefused { to, .. }
             | Self::Landed { to, .. }
             | Self::Client { to, .. }
             | Self::Inspect { to, .. }
@@ -243,6 +260,10 @@ impl WireMsg {
             Self::Restore { .. } => "restore",
             Self::Routed { .. } => "routed",
             Self::DurableProved { .. } => "durable_proved",
+            Self::SnapshotOffer { .. } => "snapshot_offer",
+            Self::SnapshotPull { .. } => "snapshot_pull",
+            Self::SnapshotChunk { .. } => "snapshot_chunk",
+            Self::SnapshotOfferRefused { .. } => "snapshot_offer_refused",
             Self::Landed { .. } => "landed",
             Self::Client { .. } => "client",
             Self::Inspect { .. } => "inspect",
@@ -365,6 +386,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
             generation,
             through,
         },
+        Msg::SnapshotOffer(offer) => WireMsg::SnapshotOffer { to, offer: *offer },
+        Msg::SnapshotPull(pull) => WireMsg::SnapshotPull { to, pull },
+        Msg::SnapshotChunk(chunk) => WireMsg::SnapshotChunk { to, chunk: *chunk },
+        Msg::SnapshotOfferRefused(refused) => WireMsg::SnapshotOfferRefused { to, refused },
         Msg::Routed {
             partition,
             correlation,
@@ -447,6 +472,10 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         }
         #[cfg(debug_assertions)]
         local @ Msg::Fork { .. } => return Err(Box::new((WireError::LocalOnly("Fork"), local))),
+        #[cfg(debug_assertions)]
+        local @ Msg::TrimHistory { .. } => {
+            return Err(Box::new((WireError::LocalOnly("TrimHistory"), local)))
+        }
     };
     Ok(Outbound::Plain(plain))
 }
@@ -577,6 +606,16 @@ pub fn inbound(msg: WireMsg) -> Result<Inbound, WireError> {
                 through,
             },
         ),
+        WireMsg::SnapshotOffer { to, offer } => {
+            Inbound::Plain(to, Msg::SnapshotOffer(Box::new(offer)))
+        }
+        WireMsg::SnapshotPull { to, pull } => Inbound::Plain(to, Msg::SnapshotPull(pull)),
+        WireMsg::SnapshotChunk { to, chunk } => {
+            Inbound::Plain(to, Msg::SnapshotChunk(Box::new(chunk)))
+        }
+        WireMsg::SnapshotOfferRefused { to, refused } => {
+            Inbound::Plain(to, Msg::SnapshotOfferRefused(refused))
+        }
         WireMsg::Restore {
             to,
             partition,
@@ -721,6 +760,12 @@ pub enum WirePeerAsk {
         generation: Generation,
         barrier: u64,
     },
+    /// Issue #61 (PR-A's protocol bump): F1's digest probe of one copy, under the plan's anchor.
+    Probe {
+        copy: CopyId,
+        anchor: LineageAnchor,
+        seq: Seq,
+    },
 }
 
 impl From<PeerAsk> for WirePeerAsk {
@@ -759,6 +804,7 @@ impl From<PeerAsk> for WirePeerAsk {
                 generation,
                 barrier,
             },
+            PeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }
@@ -799,6 +845,7 @@ impl From<WirePeerAsk> for PeerAsk {
                 generation,
                 barrier,
             },
+            WirePeerAsk::Probe { copy, anchor, seq } => Self::Probe { copy, anchor, seq },
         }
     }
 }
@@ -2185,6 +2232,8 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
+    /// Added by #61's protocol version (rev 5 M1): the command an operator must run.
+    pub needs_operator: Option<String>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2204,12 +2253,13 @@ pub struct WireTailRefused {
 
 /// A [`crate::host::TailAdoption`] as [`WireTailRefused::adoption`] and its reason.
 fn adoption_to_wire(adoption: crate::host::TailAdoption) -> (String, Option<String>) {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let (state, reason) = match adoption {
         Adoptable => ("adoptable", None),
         NotReady(reason) => ("not_ready", Some(reason)),
         Refused(reason) => ("refused", Some(reason)),
         Unchecked => ("unchecked", None),
+        Trimmed(reason) => ("trimmed", Some(reason)),
     };
     (state.to_owned(), reason.map(str::to_owned))
 }
@@ -2220,10 +2270,11 @@ fn adoption_from_wire(
     state: &str,
     reason: Option<&str>,
 ) -> Result<crate::host::TailAdoption, WireError> {
-    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Unchecked};
+    use crate::host::TailAdoption::{Adoptable, NotReady, Refused, Trimmed, Unchecked};
     let known = |reason: &str| {
         crate::host::ADOPTION_REFUSALS
             .iter()
+            .chain(crate::host::ADOPTION_TRIMMED.iter())
             .copied()
             .find(|known| *known == reason)
             .ok_or_else(|| WireError::Value(format!("unknown adoption reason {reason:?}")))
@@ -2240,10 +2291,11 @@ fn adoption_from_wire(
         ("unchecked", None) => Unchecked,
         ("not_ready", Some(reason)) => NotReady(known(reason)?),
         ("refused", Some(reason)) => Refused(known(reason)?),
+        ("trimmed", Some(reason)) => Trimmed(known(reason)?),
         (state, reason) => return mismatch(state, reason),
     };
     match adoption {
-        NotReady(reason) | Refused(reason)
+        NotReady(reason) | Refused(reason) | Trimmed(reason)
             if crate::host::TailAdoption::of::<()>(&Err(reason)) != adoption =>
         {
             mismatch(state, Some(reason))
@@ -2297,6 +2349,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            needs_operator: status.needs_operator.clone(),
         }
     }
 }
@@ -2359,6 +2412,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                     })
                 })
                 .transpose()?,
+            needs_operator: status.needs_operator,
             lengths: None,
         })
     }
