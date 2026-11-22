@@ -60,6 +60,12 @@ pub(crate) struct Script {
     pub(crate) fail_gets: u32,
     /// Lists still to fail with `Unavailable`, without reading (M9 S2a, scenario 2f).
     pub(crate) fail_lists: u32,
+    /// Lists still to let through before `fail_lists` applies (PR #218 review, round 3: a
+    /// heal's second `partitions/` read).
+    pub(crate) pass_lists: u32,
+    /// The next list fails with this, without reading (PR #218 review, round 3: an error no
+    /// retry gets past).
+    pub(crate) fail_list_with: Option<ConfigError>,
     /// Lists still to read and then hold their answer until [`Scripted::release_lists`]: a
     /// list in flight, whose snapshot is older than anything written after it read.
     pub(crate) hold_lists: u32,
@@ -249,10 +255,14 @@ impl ConfigStore for Scripted {
             .lock()
             .expect("lists")
             .push(tokio::time::Instant::now());
-        if self.take(|script| &mut script.fail_lists) {
+        if !self.take(|script| &mut script.pass_lists) && self.take(|script| &mut script.fail_lists)
+        {
             return Box::pin(std::future::ready(Err(ConfigError::Unavailable {
                 reason: "scripted: the list failed".to_owned(),
             })));
+        }
+        if let Some(error) = self.script.lock().expect("script").fail_list_with.take() {
+            return Box::pin(std::future::ready(Err(error)));
         }
         if self.take(|script| &mut script.block_lists) {
             return Box::pin(async move {
@@ -954,4 +964,358 @@ impl ConfigStore for SwapPartitionOneInstance {
     async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
         self.inner.watch_leader(request).await
     }
+}
+
+/// Any control store that, once armed, parks **one** call on a key under a prefix until the row
+/// lets it go (#172, the race rows): [`CallGate::arm_put`] holds the next such put before it
+/// reaches the store (a heal's commit CAS, planned but not yet sent),
+/// [`CallGate::arm_put_reply`] applies the next such put and holds its reply (a promote's
+/// `Fencing` write that has landed, its promote not yet gone on),
+/// [`CallGate::arm_delete`] holds the next such delete before it reaches the store (the
+/// planner's clear, its reads done, its delete not yet sent), and [`CallGate::arm_list_after`]
+/// lets a number of lists under a prefix through and holds the next one before it reaches the
+/// store (a heal's second `partitions/` read, PR #218 review round 2). One mode is sticky:
+/// [`CallGate::arm_puts`] holds **every** put under its prefix, re-sends included, until
+/// [`CallGate::disarm_puts`]. Each parked call adds one to [`CallGate::parked`] and waits for
+/// one [`CallGate::release`], or for [`CallGate::open`]. Every other call passes.
+pub(crate) struct CallGate {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    put: Mutex<Option<Vec<u8>>>,
+    puts: Mutex<Option<Vec<u8>>>,
+    put_reply: Mutex<Option<Vec<u8>>>,
+    delete: Mutex<Option<Vec<u8>>>,
+    /// The prefix of [`Self::arm_list_after`], and how many such lists still pass first.
+    list: Mutex<Option<(Vec<u8>, u32)>>,
+    parked: std::sync::atomic::AtomicU32,
+    gate: Semaphore,
+}
+
+impl CallGate {
+    pub(crate) fn new(inner: std::sync::Arc<dyn ConfigStore>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            put: Mutex::new(None),
+            puts: Mutex::new(None),
+            put_reply: Mutex::new(None),
+            delete: Mutex::new(None),
+            list: Mutex::new(None),
+            parked: std::sync::atomic::AtomicU32::new(0),
+            gate: Semaphore::new(0),
+        })
+    }
+
+    /// Hold the next put under `prefix` before it reaches the store.
+    pub(crate) fn arm_put(&self, prefix: &str) {
+        *self.put.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Hold every put under `prefix` before it reaches the store, until [`Self::disarm_puts`]:
+    /// a kernel's control call re-sends a held put after its deadline, and the re-send is held
+    /// too.
+    pub(crate) fn arm_puts(&self, prefix: &str) {
+        *self.puts.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Stop holding puts that [`Self::arm_puts`] armed; held ones stay held until released.
+    pub(crate) fn disarm_puts(&self) {
+        *self.puts.lock().expect("gate") = None;
+    }
+
+    /// Apply the next put under `prefix`, then hold its reply.
+    pub(crate) fn arm_put_reply(&self, prefix: &str) {
+        *self.put_reply.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Hold the next delete under `prefix` before it reaches the store.
+    pub(crate) fn arm_delete(&self, prefix: &str) {
+        *self.delete.lock().expect("gate") = Some(prefix.as_bytes().to_vec());
+    }
+
+    /// Let `pass` lists under `prefix` through, then hold the next one before it reaches the
+    /// store.
+    pub(crate) fn arm_list_after(&self, prefix: &str, pass: u32) {
+        *self.list.lock().expect("gate") = Some((prefix.as_bytes().to_vec(), pass));
+    }
+
+    /// Whether a list of `prefix` takes the armed list hold, disarming it if so.
+    fn take_list(&self, prefix: &[u8]) -> bool {
+        let mut armed = self.list.lock().expect("gate");
+        match armed.as_mut() {
+            Some((armed_prefix, pass)) if prefix.starts_with(armed_prefix) => {
+                if *pass == 0 {
+                    *armed = None;
+                    return true;
+                }
+                *pass -= 1;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// How many calls have parked so far.
+    pub(crate) fn parked(&self) -> u32 {
+        self.parked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Let one parked call go on.
+    pub(crate) fn release(&self) {
+        self.gate.add_permits(1);
+    }
+
+    /// Whether `key` takes the armed hold in `slot`, disarming it if so.
+    fn take(slot: &Mutex<Option<Vec<u8>>>, key: &[u8]) -> bool {
+        let mut armed = slot.lock().expect("gate");
+        if armed.as_ref().is_some_and(|prefix| key.starts_with(prefix)) {
+            *armed = None;
+            return true;
+        }
+        false
+    }
+
+    async fn park(&self, call: &'static str, key: &[u8]) {
+        tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_parked");
+        self.parked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.gate.acquire().await {
+            Ok(permit) => permit.forget(),
+            // Opened for good by [`ReleaseOnUnwind`]: the row failed, so let every call go on.
+            Err(_closed) => {}
+        }
+        tracing::info!(call, key = %String::from_utf8_lossy(key), "test_call_gate_released");
+    }
+
+    /// Let every parked and every later held call go on, for good.
+    pub(crate) fn open(&self) {
+        self.gate.close();
+    }
+}
+
+/// Opens every [`CallGate`] it watches when it is dropped during a panic (PR #218 review):
+/// a row whose wait fails while a call is parked would otherwise hang in the scoped join on
+/// the thread that made that call. Create it inside the scope, before the first wait.
+#[derive(Default)]
+pub(crate) struct ReleaseOnUnwind(Mutex<Vec<std::sync::Arc<CallGate>>>);
+
+impl ReleaseOnUnwind {
+    /// Open `gate` too if this is dropped during a panic.
+    pub(crate) fn watch(&self, gate: &std::sync::Arc<CallGate>) {
+        self.0
+            .lock()
+            .expect("gates")
+            .push(std::sync::Arc::clone(gate));
+    }
+}
+
+impl Drop for ReleaseOnUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            for gate in self
+                .0
+                .lock()
+                .map_or_else(|e| e.into_inner().clone(), |g| g.clone())
+            {
+                gate.open();
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for CallGate {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        if self.take_list(&request.prefix) {
+            let prefix = request.prefix.clone();
+            self.park("list", &prefix).await;
+        }
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        let every = self
+            .puts
+            .lock()
+            .expect("gate")
+            .as_ref()
+            .is_some_and(|prefix| request.key.starts_with(prefix));
+        if every || Self::take(&self.put, &request.key) {
+            let key = request.key.clone();
+            self.park("put", &key).await;
+        }
+        if !Self::take(&self.put_reply, &request.key) {
+            return self.inner.put(request).await;
+        }
+        let key = request.key.clone();
+        let applied = self.inner.put(request).await;
+        tracing::info!(?applied, "test_call_gate_put_applied");
+        self.park("put_reply", &key).await;
+        applied
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        if Self::take(&self.delete, &request.key) {
+            let key = request.key.clone();
+            self.park("delete", &key).await;
+        }
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// Any control store that keeps every put under a prefix, applied or refused for its compare:
+/// the revision, key and value, in the order the store answered (#172, the freeze-first rows). A
+/// `MemStore` serves no watches, so this is how a row reads every version a key took, not only
+/// the last one, and sees a CAS that lost.
+pub(crate) struct PutLog {
+    inner: std::sync::Arc<dyn ConfigStore>,
+    prefix: Vec<u8>,
+    applied: Mutex<Vec<(u64, Vec<u8>, bytes::Bytes)>>,
+    refused: Mutex<Vec<(u64, Vec<u8>, bytes::Bytes)>>,
+}
+
+impl PutLog {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn ConfigStore>,
+        prefix: &str,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            applied: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every put applied under the prefix so far: `(revision, key, value)`.
+    pub(crate) fn applied(&self) -> Vec<(u64, Vec<u8>, bytes::Bytes)> {
+        self.applied.lock().expect("put log").clone()
+    }
+
+    /// Every put under the prefix its compare refused: `(expected revision, key, value)`.
+    pub(crate) fn refused(&self) -> Vec<(u64, Vec<u8>, bytes::Bytes)> {
+        self.refused.lock().expect("put log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PutLog {
+    async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
+        self.inner.get(request).await
+    }
+
+    async fn list(&self, request: ListRequest) -> Result<ListResponse, ConfigError> {
+        self.inner.list(request).await
+    }
+
+    async fn list_page(
+        &self,
+        request: config_core::PageRequest,
+    ) -> Result<config_core::ListPage, ConfigError> {
+        self.inner.list_page(request).await
+    }
+
+    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        let key = request.key.to_vec();
+        let value = request.value.clone();
+        let expected = request.expected_mod_revision.unwrap_or(0);
+        let answer = self.inner.put(request).await;
+        if !key.starts_with(&self.prefix) {
+            return answer;
+        }
+        match &answer {
+            Ok(response) if response.outcome == config_core::MutationOutcome::Applied => self
+                .applied
+                .lock()
+                .expect("put log")
+                .push((response.revision, key, value)),
+            Ok(_) | Err(ConfigError::Conflict { .. }) => self
+                .refused
+                .lock()
+                .expect("put log")
+                .push((expected, key, value)),
+            Err(_) => {}
+        }
+        answer
+    }
+
+    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        self.inner.delete(request).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch(request).await
+    }
+
+    async fn watch_leader(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.inner.watch_leader(request).await
+    }
+}
+
+/// PR #218 review (thread io1w): a row whose wait fails while a call is parked at a
+/// [`CallGate`] fails; it does not hang in the scoped join. The early failure is a panic in the
+/// scope's own thread, as an `until` that runs out of patience makes, while a spawned thread's
+/// delete is parked. Unit (well under 1 s): `MemStore`, one delete, no cluster.
+#[config_log::retcd_test]
+fn i172_a_row_that_fails_while_a_call_is_parked_fails_instead_of_hanging() {
+    let gate = CallGate::new(std::sync::Arc::new(MemStore::new()));
+    gate.arm_delete("grants/");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (done, ended) = std::sync::mpsc::channel();
+    let watched = std::sync::Arc::clone(&gate);
+    // The scope runs on its own thread so this row can bound it: without the guard it hangs.
+    std::thread::spawn(move || {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                let release = ReleaseOnUnwind::default();
+                release.watch(&watched);
+                let parked = scope.spawn(|| {
+                    rt.block_on(watched.delete(DeleteRequest {
+                        key: bytes::Bytes::from_static(b"grants/1"),
+                        expected_mod_revision: None,
+                        dedup: None,
+                    }))
+                });
+                while watched.parked() == 0 {
+                    std::thread::yield_now();
+                }
+                let _ = &parked;
+                panic!("the promote failed before its gate opened");
+            });
+        }));
+        let _ = done.send(failed.is_err());
+    });
+    let failed = ended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the row failed rather than hung");
+    assert!(failed, "the scope's panic reached the caller");
+    assert_eq!(gate.parked(), 1);
 }

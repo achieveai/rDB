@@ -5,7 +5,10 @@
 **Spec:** `docs/rdb/design-specification.md` §7.1 (authoritative records)
 **Extends:** [ADR-rdb-0008](0008-control-records-in-retcd.md) (two new `operations/` records).
 **Amended by:** [ADR-rdb-0023](0023-node-records-ring-placement-one-node-per-machine.md) (#80 S1b:
-nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decision 6 below).
+nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decision 6 below);
+[ADR-rdb-0028](0028-reopen-heal-on-a-majority-within-one-os-boot.md) (R5, PR #181: with
+`Timeouts::live_readd` on, after a process restart within one OS boot, a reopen's heal goes on
+with a majority; Decision 5 below).
 **Issue:** #80 slice S1a.
 
 ## Context
@@ -65,6 +68,12 @@ nodes 1 to K, `nodes/{id}` records, ring placement, reservation layout 2; Decisi
    The bootstrap plan pins each member at the boot its handshake reported. In one process all
    members share one boot, so nothing changes there. The heal waits for every member's boot, so a
    declared node that never starts blocks the partitions it shares, and `heal_retry` names it.
+   *Amended by ADR-rdb-0028 (R5, PR #181):* with `Timeouts::live_readd` on and the same OS boot
+   since the owner's last ready open, the reopen's heal of a partition already rooted goes on
+   without a down regular copy once a majority is up: one whose grant is frozen or proven
+   expired, or that has no grant record after one heal window. A partition still to form
+   keeps this rule and waits for every member (`partition_forming`), and so does every heal with
+   `live_readd` off or after a host crash.
 6. **The node set is the initial declaration only.** This build declares nodes 1, 2 and 3 and keeps
    today's placement (`initial_owner`). More nodes, `nodes/{id}` records and add or remove are
    later slices.

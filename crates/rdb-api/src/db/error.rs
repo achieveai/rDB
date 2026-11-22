@@ -22,12 +22,57 @@ pub struct ApiError {
     /// candidate 3): a lower bound, "not before", never a promise that it will be. `None` when
     /// nothing is known. Set it with [`Self::with_retry_after`], which also says it in `detail`.
     pub retry_after: Option<Duration>,
+    /// The size limit a `TOO_LARGE` refusal broke, with the size found and the maximum (#148).
+    /// Set on every `TOO_LARGE` the `Db` raises and on nothing else. The `Db` checks before it
+    /// sends, so an answer that crossed a link never carries it. Set it with
+    /// [`Self::too_large_refusal`].
+    pub too_large: Option<TooLarge>,
+    /// Whether the owner's node faulted, so a call can succeed once another node takes the
+    /// partition over (#134). Set by [`Self::owner_fault`] only, and on an answer that crossed a
+    /// link when it is `NotWired` and its detail starts with that constructor's
+    /// `"host fault: "`: the wire carries the detail, not this field. Every other `NotWired`
+    /// refusal, [`Self::host`]'s included, keeps "retrying will not help".
+    pub(crate) owner_fault: bool,
 }
 
-/// How the detail of a host fault ([`ApiError::host`]) starts. A `NotWired` error whose detail
-/// starts with it is an owner fault, and gets [`owner_fault_step`]; the other `NotWired`
-/// refusals (admin, an undecodable call) keep `step_for`'s (#134).
-const HOST_FAULT: &str = "host fault: ";
+/// Which fixed size limit a `TOO_LARGE` refusal broke (#148).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// An object id's raw bytes, over `MAX_OBJECT_ID`.
+    ObjectId,
+    /// A map key's or set member's bytes, over `MAX_KEY`.
+    Key,
+    /// One byte value of a put, over `MAX_VALUE`.
+    Value,
+    /// A whole byte write's upper-bound record size, over `MAX_WRITE`.
+    Write,
+    /// The ops of one change, or the puts of one transaction, over `MAX_OPS`.
+    Ops,
+    /// One blob chunk's bytes, over `rdb_value::blob::MAX_CHUNK`.
+    Chunk,
+}
+
+/// What a `TOO_LARGE` refusal found: the limit, the size the call carried and the most that
+/// limit allows. `size` is always above `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooLarge {
+    /// The limit broken.
+    pub limit: Limit,
+    /// The size the call carried, in the limit's unit (bytes, or ops for [`Limit::Ops`]).
+    pub size: usize,
+    /// The most the limit allows.
+    pub max: usize,
+}
+
+/// How the detail of an owner fault ([`ApiError::owner_fault`], or the host's typed damage)
+/// starts. It is what marks one on the wire: an answer that crossed a link is an owner fault
+/// when it is `NotWired` and its detail starts with this ([`ApiError::fault_from_wire`], #134).
+/// Typed damage keeps its own kind and still gets [`owner_fault_step`] whatever that kind is
+/// ([`ApiError::is_host_fault`], #170 review r4).
+pub(crate) const HOST_FAULT: &str = "host fault: ";
+
+/// How the detail of [`ApiError::host`] starts: a node error that no takeover fixes.
+const HOST_ERROR: &str = "host error: ";
 
 /// The tail every "open the folder again" step in `db.rs` ends with ([`super::REOPEN_STEP`] and
 /// the stuck-recovery step). A detail that ends with it already says what to do next.
@@ -82,6 +127,15 @@ pub(crate) const MOVE_ENDED: &str = "the move ended with that commit";
 /// the step, which "retrying will not help: report this" would contradict (#79 S3 P2).
 pub(crate) const PROMOTE_ALIVE_STEP: &str = "stop that node first, then promote again";
 
+/// The tails of the other `NotWired` promote refusals that name their own step (#134 audit):
+/// "retrying will not help: report this" contradicted `Unanswered`'s "promote again" and
+/// misdirected the rest. `Unanswered`, `Superseded`, `Unconfigured`, `NoControlStore`.
+pub(crate) const PROMOTE_UNANSWERED_STEP: &str = "it may have written: promote again";
+pub(crate) const PROMOTE_SUPERSEDED_STEP: &str = "run status before promoting again";
+pub(crate) const PROMOTE_UNCONFIGURED_STEP: &str =
+    "promote a node that has not restarted since that node stopped";
+pub(crate) const PROMOTE_NO_STORE_STEP: &str = "open it with Db::open, which connects it to one";
+
 /// The tails of a `RECOVERY_READ_ONLY` refusal whose repair is held on a copy's tail (#79 S4d).
 /// "Writes return when the lost copies are back" is false there: the copy is back, and its tail
 /// is why it cannot rejoin. One per way the refused send can be sent again, and (issue #105
@@ -111,6 +165,16 @@ pub(crate) const TAIL_ADOPTABLE_RESEND: &str = "reads still work and nothing was
     return, send the same request again with `Db::resend`, or ask `Db::status`; never send it \
     under a new request id";
 
+/// The tail of [`super::Db::route`]'s `INCOMPATIBLE_VERSION` (#135): a control record this
+/// build cannot decode. A newer build may have written it, or its bytes are damaged; either way
+/// every retry decodes the same bytes, so the step is an upgrade, then corruption recovery, not
+/// "try again" (PR #159 review).
+pub(crate) const ROUTE_NEWER_RECORD_STEP: &str = "a newer build may have written this record, \
+    or it is damaged; retrying will not help: run this app on the rDB build the database's \
+    nodes run, or a newer one; if the nodes' own build cannot read it either, it is damaged: \
+    stop sending this partition's calls, keep the store as it is, never edit the record by \
+    hand, and report it with this message";
+
 /// The tail of [`crate::admin::PromoteError::TargetFrozen`], for the same reason.
 pub(crate) const PROMOTE_FROZEN_STEP: &str = "promote another node";
 
@@ -130,6 +194,39 @@ pub(crate) const DAMAGED_OBJECT_STEP: &str =
     "the object's own stored value is damaged, so delete the whole object with `Change::Clear` \
      (in rdb_dev: `admin clear <object>`), then write it again";
 
+/// The step of a feed read's `CORRUPT_HISTORY` (#87): the cursor's record has another digest
+/// here, or a stored `User` key the call scans does not parse; or the copy's stored history is
+/// missing or damaged (a record unreadable, not decoding, not matching its digest, naming
+/// another seq, or missing between the retained floor and what the copy may serve), or a read
+/// of its floor finds it corrupt, which faults the node, and then only feed replies carry this
+/// step (review r3).
+/// "Write over its key" is a map entry's step, which a feed caller cannot act on.
+pub(crate) const FEED_HISTORY_STEP: &str = "the history at this copy is unreadable from this \
+     cursor: read from another copy (the owner or another member), or rebuild from your own \
+     source";
+
+/// The step of a feed read refused by a copy that holds no current copy of the partition (#87):
+/// left out of the generation `partitions/{p}` names, or never a member. Its rule is
+/// `Definitive`: calling this copy again answers the same until it is a member again, so the
+/// caller switches source rather than retrying here.
+pub(crate) const FEED_OTHER_COPY_STEP: &str = "read from the owner or another member \
+     (`Source::Owner`, or `Source::Node` of a member); calling this copy again will not help \
+     while it holds no current copy";
+
+/// The step of a feed call that a node stopping or stopped could not answer (#170 review r5): a
+/// clean stop's answer to a call parked on its control read. Its rule is `RetryAfterRecovery`:
+/// this node serves again once it has restarted, and another copy can serve now.
+pub(crate) const FEED_STOPPED_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once it has \
+     restarted";
+
+/// The step of a feed call whose link to a node in another process closed before the answer
+/// came (#170 review r7): the node may have read, but a feed call changes nothing. Its rule is
+/// `RetryAfterRecovery`: another copy can serve now, and this node once its link is up again.
+pub(crate) const FEED_LINK_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once its link \
+     is up again";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -146,7 +243,7 @@ impl ApiError {
     ///
     /// | kind | `retry` | `no_mutation` |
     /// |---|---|---|
-    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
+    /// | `ConditionFailed`, `InvalidArgument`, `TooLarge` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
     /// | `CorruptHistory`, `CorruptBlob`, `IncompatibleVersion` | `Quarantine` | `false` |
     /// | `UploadChunkConflict` | `Reconcile` | `true` |
@@ -159,7 +256,7 @@ impl ApiError {
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
         let (retry, no_mutation) = match kind {
-            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument => {
+            ErrorKind::ConditionFailed | ErrorKind::InvalidArgument | ErrorKind::TooLarge => {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
@@ -175,6 +272,8 @@ impl ApiError {
             no_mutation,
             detail: detail.into(),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -187,6 +286,8 @@ impl ApiError {
             no_mutation: error.proves_no_mutation(),
             detail: error.to_string(),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -194,6 +295,22 @@ impl ApiError {
     #[must_use]
     pub fn invalid(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidArgument, detail)
+    }
+
+    /// `TOO_LARGE` for a call over a fixed size limit, refused before anything was sent
+    /// (#148): `Definitive`, `no_mutation`, and [`Self::too_large`] set to `found`.
+    #[must_use]
+    pub fn too_large_refusal(found: TooLarge, detail: impl Into<String>) -> Self {
+        Self {
+            too_large: Some(found),
+            ..Self::new(ErrorKind::TooLarge, detail)
+        }
+    }
+
+    /// The size limit this error broke, when it is a `TOO_LARGE` the `Db` raised (#148).
+    #[must_use]
+    pub const fn too_large(&self) -> Option<TooLarge> {
+        self.too_large
     }
 
     /// A put refused before it was sent: this node has adopted no generation yet, so there is
@@ -211,6 +328,8 @@ impl ApiError {
                 partition.0, node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -231,6 +350,8 @@ impl ApiError {
                 node.0, node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -252,6 +373,8 @@ impl ApiError {
                 node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -277,6 +400,8 @@ impl ApiError {
                 node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
@@ -297,19 +422,47 @@ impl ApiError {
                 node.0, node.0
             ),
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
     }
 
-    /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
+    /// The owner's node faulted (§4.4): it stopped, dropped the call, or could not serve an
+    /// effect, so it serves nothing more this boot. Retrying at it will not help, but another
+    /// node taking its partitions over can serve the call, which [`Self::next_step`] says (#134).
+    #[must_use]
+    pub fn owner_fault(detail: &str) -> Self {
+        Self {
+            owner_fault: true,
+            detail: format!("{HOST_FAULT}{detail}"),
+            ..Self::host_error(String::new())
+        }
+    }
+
+    /// A node error that is not an owner fault: an answer of the wrong shape, a call that
+    /// compiled to nothing, a call the blocking pool did not run. No retry and no takeover fixes
+    /// it, so its step is "retrying will not help: report this" (#134).
     #[must_use]
     pub fn host(detail: &str) -> Self {
+        Self::host_error(format!("{HOST_ERROR}{detail}"))
+    }
+
+    const fn host_error(detail: String) -> Self {
         Self {
             kind: ErrorKind::Unavailable,
             retry: RetryRule::NotWired,
             no_mutation: false,
-            detail: format!("{HOST_FAULT}{detail}"),
+            detail,
             retry_after: None,
+            too_large: None,
+            owner_fault: false,
         }
+    }
+
+    /// Whether an answer that crossed a link with this rule and detail is an owner fault: the
+    /// wire carries [`Self::owner_fault`]'s detail prefix, not its field (#134).
+    pub(crate) fn fault_from_wire(retry: RetryRule, detail: &str) -> bool {
+        retry == RetryRule::NotWired && detail.starts_with(HOST_FAULT)
     }
 
     /// This error with a "not before" hint: a retry is not admitted sooner than `after` from
@@ -327,6 +480,16 @@ impl ApiError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    /// Whether this is a host fault: the owner's node faulted ([`Self::owner_fault`], or a fault
+    /// that names stored damage, whose detail starts the same way). Retrying at that node will
+    /// not help, whatever the kind and retry rule, but a takeover can; [`Self::next_step`] says
+    /// so (#170 review r4). [`Self::host`]'s errors are not host faults: their detail starts
+    /// `"host error: "` and no takeover fixes them (#134).
+    #[must_use]
+    pub fn is_host_fault(&self) -> bool {
+        self.owner_fault || self.detail.starts_with(HOST_FAULT)
     }
 
     /// The §5.4 wire name, `SCREAMING_SNAKE_CASE`.
@@ -364,8 +527,17 @@ impl ApiError {
             || self.detail.ends_with(ADMIN_LOST_STEP)
             || self.detail.ends_with(QUARANTINED_STEP)
             || self.detail.ends_with(DAMAGED_OBJECT_STEP)
+            || self.detail.ends_with(FEED_HISTORY_STEP)
+            || self.detail.ends_with(FEED_OTHER_COPY_STEP)
+            || self.detail.ends_with(FEED_STOPPED_STEP)
+            || self.detail.ends_with(FEED_LINK_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
+            || self.detail.ends_with(PROMOTE_UNANSWERED_STEP)
+            || self.detail.ends_with(PROMOTE_SUPERSEDED_STEP)
+            || self.detail.ends_with(PROMOTE_UNCONFIGURED_STEP)
+            || self.detail.ends_with(PROMOTE_NO_STORE_STEP)
+            || self.detail.ends_with(ROUTE_NEWER_RECORD_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)
             || self.detail.ends_with(TAIL_HELD_RESEND)
             || self.detail.ends_with(TAIL_ADOPTABLE_NEW_WRITE)
@@ -373,7 +545,10 @@ impl ApiError {
         {
             return None;
         }
-        if self.retry == RetryRule::NotWired && self.detail.starts_with(HOST_FAULT) {
+        // #170 review r4: every host fault, typed damage included. A damaged node's fault is
+        // not a damaged entry of the caller's (`step_for(CorruptHistory)` says to write over
+        // its key): only a takeover helps, so it gets the owner-fault step whatever its kind.
+        if self.is_host_fault() {
             return Some(owner_fault_step(self.no_mutation));
         }
         Some(step_for(self.kind, self.retry, self.no_mutation))
@@ -570,6 +745,10 @@ const fn step_for(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> &'sta
              send again; call `Db::wait_durable` again"
         }
         ErrorKind::CorruptBlob => "write `Change::Clear` to the blob, then upload it again",
+        ErrorKind::TooLarge => {
+            "make it smaller: `ApiError::too_large` names the limit, the size and the maximum; \
+             the same request fails the same way"
+        }
     }
 }
 
@@ -710,6 +889,7 @@ mod tests {
             UploadChunkConflict,
             CorruptBlob,
             DurabilityUnconfirmed,
+            TooLarge,
         ];
         for kind in &all {
             match kind {
@@ -734,7 +914,8 @@ mod tests {
                 | Unavailable
                 | UploadChunkConflict
                 | CorruptBlob
-                | DurabilityUnconfirmed => {}
+                | DurabilityUnconfirmed
+                | TooLarge => {}
             }
         }
         all
@@ -1056,7 +1237,7 @@ mod tests {
             "{explained}"
         );
 
-        let host = ApiError::host("the owner's node thread has stopped").for_barrier();
+        let host = ApiError::owner_fault("the owner's node thread has stopped").for_barrier();
         let explained = host.explain();
         assert!(explained.contains(BARRIER_NOTE), "{explained}");
         assert_eq!(
@@ -1093,7 +1274,7 @@ mod tests {
     #[test]
     fn a_host_fault_says_retrying_will_not_help() {
         for no_mutation in [false, true] {
-            let mut error = ApiError::host("storage read fault");
+            let mut error = ApiError::owner_fault("storage read fault");
             error.no_mutation = no_mutation;
             let text = error.explain();
             let case = format!("no_mutation={no_mutation}: {text}");
@@ -1135,7 +1316,7 @@ mod tests {
     /// true: red.
     #[test]
     fn an_unsent_host_fault_says_a_read_reads_again() {
-        let mut error = ApiError::host("storage read fault");
+        let mut error = ApiError::owner_fault("storage read fault");
         error.no_mutation = true;
         let step = error.next_step().expect("a host fault has a step");
         assert!(
@@ -1149,7 +1330,7 @@ mod tests {
     /// names or "not with `Db::resend`" from `owner_fault_step` true: red.
     #[test]
     fn an_unsent_host_fault_sends_a_write_as_new_never_resend() {
-        let mut error = ApiError::host("storage read fault");
+        let mut error = ApiError::owner_fault("storage read fault");
         error.no_mutation = true;
         let step = error.next_step().expect("a host fault has a step");
         assert!(
@@ -1159,6 +1340,58 @@ mod tests {
             ),
             "{step}"
         );
+    }
+
+    /// #134: only a true owner fault gets the takeover step. An owner fault from a real site
+    /// (`unanswered`, a local owner that dropped the call) gets it on both `no_mutation`
+    /// branches; a host error that is not an owner fault (`written` of nothing, an answer of the
+    /// wrong shape) keeps "retrying will not help". Cut: `next_step` testing
+    /// `detail.contains("host ")` instead of the marker, or `host` setting the marker: red on
+    /// the non-fault half.
+    #[test]
+    fn only_an_owner_fault_gets_the_takeover_step() {
+        const PLAIN: &str = "retrying will not help: keep this Db's log and report this message";
+        let fault = super::super::unanswered(true, NodeId(1), super::super::Carries::Nothing);
+        for no_mutation in [false, true] {
+            let mut fault = fault.clone();
+            fault.no_mutation = no_mutation;
+            assert_eq!(
+                fault.next_step(),
+                Some(owner_fault_step(no_mutation)),
+                "no_mutation={no_mutation}: {fault}"
+            );
+            assert!(
+                fault
+                    .explain()
+                    .contains("once another node takes over (an operator promote does that)"),
+                "{fault}"
+            );
+        }
+        let nothing = super::super::written(None).expect_err("nothing was written");
+        let shape = ApiError::host("a write was answered with Unchanged");
+        for error in [nothing.error, shape] {
+            assert!(!error.owner_fault, "{error}");
+            assert!(error.detail.starts_with(HOST_ERROR), "{error}");
+            assert_eq!(error.next_step(), Some(PLAIN), "{error}");
+            assert!(!error.explain().contains("takes over"), "{error}");
+        }
+    }
+
+    /// #134: the wire carries no marker, so an answer that crossed a link is an owner fault by
+    /// its detail's prefix: an owner fault keeps the takeover step and a host error keeps its
+    /// plain step after a round trip. Cut: `From<WireApiError>` setting `owner_fault: false`:
+    /// red on the fault.
+    #[test]
+    fn the_owner_fault_marker_survives_the_wire() {
+        use crate::net::wire::WireApiError;
+        for error in [
+            ApiError::owner_fault("the owner's node thread has stopped"),
+            ApiError::host("a read was answered with Unchanged"),
+        ] {
+            let landed = ApiError::from(WireApiError::from(&error));
+            assert_eq!(landed, error);
+            assert_eq!(landed.next_step(), error.next_step(), "{error}");
+        }
     }
 
     /// When `db.rs` already ended the detail with "open the folder again", no second step is

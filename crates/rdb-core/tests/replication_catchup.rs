@@ -1748,7 +1748,7 @@ fn t61_need_prefix_zero_after_trim_asks_snapshot() {
     );
 }
 
-/// Issue #61 PR-B (lead ruling 2026-11-22): an ACK the ladder no longer holds asks for a
+/// Issue #61 (lead ruling 2026-11-22): an ACK the ladder no longer holds asks for a
 /// snapshot with no cursor behind it (`ProgressTracker::ack_ladder`, `NotRetained`). R1 now
 /// starts a catching-up cursor there, so the copy's ACK at the head after the install ends the
 /// catch-up with `CopyCaughtUp`, which is what releases the host's transfer. An ACK below the
@@ -1757,7 +1757,7 @@ fn t61_need_prefix_zero_after_trim_asks_snapshot() {
 /// it".
 /// Unit (<10 ms).
 #[retcd_test]
-fn t61_pr_b_an_ack_below_the_floor_starts_a_cursor_that_reports_caught_up() {
+fn t61_an_ack_below_the_floor_starts_a_cursor_that_reports_caught_up() {
     use routed::{b_ack, cursor, from_b, primary, sends, step};
 
     // The ladder holds 5..=12: an ACK at 4 cannot be verified.

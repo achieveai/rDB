@@ -53,7 +53,8 @@ the floor).
      `base_below_floor` (wire word `trimmed`). Giving such a tail up needs
      `--give-up-live-copy`.
    - The full copy of a late write stops its scan at F, and a landing that needs a record below F
-     is refused (`inherit_below_floor`); that copy is rebuilt by snapshot.
+     is refused (`inherit_below_floor`). That copy is rebuilt by snapshot only when it does not
+     hold the cutoff; with the cutoff held, it faults.
 5. **State transfer reuses what exists, started by the target.**
    - Export: a paged `RocksSnapshot` view at `(g, S = applied)`, pinned so a trim cannot pass `S`.
    - Wire: `SnapshotOffer`, then the target pulls `SnapshotChunk`s one page at a time. Each
@@ -91,8 +92,9 @@ the floor).
   over a current #105 tail.
 - **Disk and memory are bounded only once the automatic trim lands.** Until then History still
   grows unless an operator runs the debug tool. The automatic trim is a later change.
-- `PROTOCOL_VERSION` moved: the probe ask, the snapshot frames, `needs_operator` and `trimmed` are
-  new wire vocabulary, and the handshake requires an exact match.
+- `PROTOCOL_VERSION` moves to 11 (10 is issue #107's and issue #87's): the probe ask, the
+  snapshot frames, `needs_operator` and `trimmed` are new wire vocabulary, and the handshake
+  requires an exact match.
 
 ## Alternatives rejected
 

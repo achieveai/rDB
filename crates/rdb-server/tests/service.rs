@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use config_core::ConfigStore;
-use rdb_api::{Db, DbConfig, NodeId, Timeouts};
+use rdb_api::{Db, DbConfig, NodeId, Timeouts, MAX_VALUE};
 use rdb_server::pb::rdb_client::RdbClient;
 use rdb_server::pb::{self, GetRequest, PutRequest, StatusRequest, TxnPut, TxnRequest};
 use rdb_server::{rdb_error_of, Gateway};
@@ -245,9 +245,10 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     let over = put(&mut client, &vec![b'k'; 1025], b"v", None)
         .await
         .expect_err("a 1025-byte key");
+    // #148: a size limit is `TOO_LARGE` on the wire, still under gRPC's `INVALID_ARGUMENT`.
     assert_eq!(over.code(), tonic::Code::InvalidArgument, "{over:?}");
     let detail = rdb_error_of(&over).expect("the server decided");
-    assert_eq!(detail.kind_name, "INVALID_ARGUMENT");
+    assert_eq!(detail.kind_name, "TOO_LARGE");
     assert!(detail.no_mutation);
 
     // C7: a stale conditional write is refused, changes nothing, and names no Rust call.
@@ -318,7 +319,7 @@ async fn the_gateway_serves_the_slice_1_contracts() {
         ("Get", "OK"),
         ("Get", "OK"),
         ("Put", "OK"),
-        ("Put", "INVALID_ARGUMENT"),
+        ("Put", "TOO_LARGE"),
         ("Put", "OK"),
         ("Put", "CONDITION_FAILED"),
         ("Get", "OK"),
@@ -381,25 +382,20 @@ async fn the_gateway_serves_the_slice_1_contracts() {
     full_stop.send(()).expect("full server still running");
     full_server.await.expect("join").expect("serve");
 
-    // F-016: a put's whole record must fit 1 MiB. Measured by binary search on 2026-11-01: a
-    // replace's largest value is 1,048,241 bytes less the key (335 bytes of record, envelope, CBOR
-    // and key framing), with or without `if_version`. A put to a new key carries an "absent"
-    // condition, one byte more. So with a 3-byte key: 1,048,237 new, 1,048,238 existing. The key
-    // encoding (`rdb_value::keys::esc`) writes a 0x00 byte as two, so each costs one byte more.
+    // F-016, then #148: a value's limit is the fixed `MAX_VALUE`, whatever the key and whether
+    // the key is new. Before #148 it was the 1 MiB record less its framing, measured on
+    // 2026-11-01 as 1,048,237 bytes for a new 3-byte key and 1,048,238 for an existing one,
+    // one byte less per 0x00 in the key. `MAX_VALUE` sits below all of those.
     for (key, largest, what) in [
-        (&b"big"[..], 1_048_240 - 3, "a new key"),
-        (&b"big"[..], 1_048_241 - 3, "an existing key"),
-        (
-            &b"b\0g"[..],
-            1_048_240 - 3 - 1,
-            "a new key holding a 0x00 byte",
-        ),
+        (&b"big"[..], MAX_VALUE, "a new key"),
+        (&b"big"[..], MAX_VALUE, "an existing key"),
+        (&b"b\0g"[..], MAX_VALUE, "a new key holding a 0x00 byte"),
     ] {
         let over = put(&mut client, key, &vec![b'z'; largest + 1], None)
             .await
             .expect_err(what);
         let detail = rdb_error_of(&over).expect("the server decided");
-        assert_eq!(detail.kind_name, "INVALID_ARGUMENT", "{what}: {over:?}");
+        assert_eq!(detail.kind_name, "TOO_LARGE", "{what}: {over:?}");
         assert!(detail.no_mutation, "{what}: {over:?}");
         put(&mut client, key, &vec![b'z'; largest], None)
             .await

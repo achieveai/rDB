@@ -62,7 +62,45 @@ pub const SNAPSHOT_CHUNK_LABEL: &[u8] = b"rdb snapshot chunk v1";
 /// A source drops a transfer no pull has touched for this long (design section 2, step 6).
 pub(crate) const SNAPSHOT_IDLE_MILLIS: u64 = 60_000;
 
-/// PR #204 review: the most bytes one snapshot page carries by default, a quarter of the
+/// A target that has had no page for this long re-sends its pull, the same
+/// cursor, so a lost pull or page is asked again. A source serves a repeated pull again.
+pub(crate) const SNAPSHOT_PULL_RETRY_MILLIS: u64 = 5_000;
+
+/// The pulls a target re-sends with no page between them before its install
+/// expires (`snapshot_install_expired`) and the source is told `install_retryable`.
+pub(crate) const SNAPSHOT_PULL_RETRIES: u32 = 3;
+
+/// The `install_retryable` refusals a source takes at one barrier, each
+/// forgetting it so R1's next ask re-offers it. So 3 retries are allowed: refusals 1 to 3
+/// forget the barrier, and refusal 4 keeps it (`snapshot_retry_exhausted`). Kept, it is
+/// re-opened after [`SNAPSHOT_RETRY_BACKOFF_MILLIS`], or a new barrier is offered.
+pub(crate) const SNAPSHOT_RETRY_LIMIT: u32 = 3;
+
+/// How long a source keeps a barrier whose retries ran out before
+/// `Host::retry_duty` re-opens it, counts afresh, and probes the copy with the head. A target
+/// whose fault has cleared is then rebuilt; one whose fault persists is refused again, at most
+/// [`SNAPSHOT_RETRY_LIMIT`] + 1 times per this interval.
+pub(crate) const SNAPSHOT_RETRY_BACKOFF_MILLIS: u64 = 30_000;
+
+/// One `Host.snapshot_retries` entry: the `(generation, barrier)` counted, the
+/// `install_retryable` refusals heard there, and the tick the limit ran out, once it has.
+pub(crate) type RetryCount = (
+    Generation,
+    Seq,
+    u32,
+    Option<rdb_core::contracts::time::Tick>,
+);
+
+/// Which refusal an engine install error is. A storage fault may pass; every
+/// other error would recur on a re-offer at the same barrier.
+pub(crate) const fn install_refusal(error: &rdb_storage::InstallError) -> SnapshotRefusal {
+    match error {
+        rdb_storage::InstallError::Storage(_) => SnapshotRefusal::InstallRetryable,
+        _ => SnapshotRefusal::Install,
+    }
+}
+
+/// The most bytes one snapshot page carries by default, a quarter of the
 /// 64 MiB frame ([`crate::net::MAX_FRAME`]), so a page of large values always fits it with the
 /// frame's own fields to spare. A page holds at least one entry, so a single entry larger than
 /// the frame still cannot be sent.
@@ -89,8 +127,15 @@ pub enum SnapshotRefusal {
     /// A chunk's chain did not match the entries it carried. Nothing was switched.
     Chain,
     /// The engine refused a step of the install (`install_begin`, `install_chunk` or
-    /// `install_finish`): a newer generation held, or a storage fault.
+    /// `install_finish`) for a reason a re-offer cannot cure: a newer generation held, or an
+    /// entry or barrier the export never sends.
     Install,
+    /// The install stopped for a reason a re-offer may cure, a storage fault in
+    /// an install step or the target's install expiry (no page after
+    /// [`SNAPSHOT_PULL_RETRIES`] retried pulls). The source forgets the barrier for the first
+    /// [`SNAPSHOT_RETRY_LIMIT`] (3) such refusals at it, so R1's next ask re-offers it; the 4th
+    /// keeps it until the retry back-off re-opens it.
+    InstallRetryable,
 }
 
 impl SnapshotRefusal {
@@ -105,6 +150,7 @@ impl SnapshotRefusal {
             Self::TailHeld => "tail_held",
             Self::Chain => "chain",
             Self::Install => "install",
+            Self::InstallRetryable => "install_retryable",
         }
     }
 }
@@ -129,6 +175,9 @@ pub struct SnapshotOffer {
     pub root: (Seq, Digest),
     /// The canonical record at `S`.
     pub barrier: Bytes,
+    /// The source's transfer instance, unique on its node. A refusal names it, so one
+    /// from an earlier transfer at the same `S` never ends a later one.
+    pub transfer: u64,
 }
 
 /// The target's request for the next page after `after` (design section 2, steps 3 and 4).
@@ -153,6 +202,9 @@ pub struct SnapshotPull {
 /// One page of the source's view, answering a [`SnapshotPull`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotChunk {
+    /// The source's node. The net layer holds it to the sender's certificate, and the target
+    /// takes a page only from the node its install's offer came from.
+    pub from: NodeId,
     /// The partition.
     pub partition: PartitionId,
     /// The offer's generation, echoed (m-d): a chunk that does not match the install is dropped.
@@ -189,6 +241,8 @@ pub struct SnapshotOfferRefused {
     /// For [`SnapshotRefusal::TailHeld`], the held tail's head: the `--through` an operator
     /// passes to `admin forget-tail`. `None` otherwise.
     pub through: Option<Seq>,
+    /// The refused offer's [`SnapshotOffer::transfer`].
+    pub transfer: u64,
 }
 
 /// The command that gives up a held tail through `through` on `partition` (design rev 5a): the
@@ -319,6 +373,8 @@ pub(crate) struct Transfer {
     pub(crate) pages: u64,
     /// The last time the transfer was opened, offered or pulled.
     pub(crate) touched: rdb_core::contracts::time::Tick,
+    /// This transfer's instance ([`SnapshotOffer::transfer`]).
+    pub(crate) id: u64,
 }
 
 /// An install in progress (target side).
@@ -343,6 +399,10 @@ pub(crate) struct Install {
     pub(crate) deferred: u64,
     /// The largest page written, in [`rdb_storage::snapshot_entry_bytes`].
     pub(crate) largest_page: u64,
+    /// When the offer was accepted, a page written, or a pull re-sent.
+    pub(crate) touched: rdb_core::contracts::time::Tick,
+    /// Pulls re-sent since the last page written.
+    pub(crate) retries: u32,
 }
 
 impl Host {
@@ -445,7 +505,7 @@ impl Host {
         // same barrier must reach the transfer branch, never be dropped (ruling 1: a refill
         // can repeat). Keyed by generation too (lead ruling R18): a refused offer at `S` must
         // not hold back the offer a later commit makes at the same `S`.
-        // Written only beside the transfer, after every fallible step below (PR #204 review):
+        // Written only beside the transfer, after every fallible step below:
         // a step that fails leaves no marker, so R1's next ask at this barrier is served.
         if self.snapshots_served.get(&(partition, copy)) == Some(&(generation, barrier)) {
             return;
@@ -507,7 +567,10 @@ impl Host {
             at,
             root,
             barrier: barrier_record,
+            transfer: self.next_transfer_id,
         };
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
         self.snapshots_served
             .insert((partition, copy), (generation, barrier));
         let replaced = self
@@ -525,6 +588,7 @@ impl Host {
                     opened: self.clock.now(),
                     pages: 0,
                     touched: self.clock.now(),
+                    id,
                 },
             )
             .map(|old| old.at.0);
@@ -609,6 +673,135 @@ impl Host {
                 self.end_transfer(partition, copy, "idle", "snapshot_transfer_abandoned");
             }
         }
+        self.retry_duty(now);
+    }
+
+    /// Every step: a barrier kept because its retries ran out
+    /// ([`Self::refusal_kept`]) is re-opened once [`Host::snapshot_retry_backoff_millis`] has
+    /// passed: the served barrier is forgotten (`snapshot_retry_reopened`), and the copy is
+    /// probed with the head (`Host::send_envelopes`, the `SendEnvelopes` R1's keepalive and
+    /// shadow timer send). An idle copy would otherwise never be heard again: on a writable
+    /// partition with no writes nothing else is sent to it. Its answer reaches its cursor,
+    /// which asks again, and that ask is served. The count is re-armed with
+    /// this tick before the probe, so a probe that sends nothing is tried again after the
+    /// back-off. It stops only when a transfer is open, when a new barrier was served, or when
+    /// this node no longer leads the generation (a retired primary leads nothing).
+    pub(super) fn retry_duty(&mut self, now: rdb_core::contracts::time::Tick) {
+        let due: Vec<_> = self
+            .snapshot_retries
+            .iter()
+            .filter(|(_, &(_, _, _, at))| {
+                at.is_some_and(|at| {
+                    super::HostClock::millis_until(at, now) >= self.snapshot_retry_backoff_millis
+                })
+            })
+            .map(|(&key, &(generation, barrier, ..))| (key, generation, barrier))
+            .collect();
+        for (key, generation, barrier) in due {
+            let (partition, copy) = key;
+            if self.transfers.contains_key(&key) {
+                continue;
+            }
+            if self
+                .snapshots_served
+                .get(&key)
+                .is_some_and(|&served| served != (generation, barrier))
+            {
+                self.snapshot_retries.remove(&key);
+                continue;
+            }
+            self.snapshots_served.remove(&key);
+            let head = self
+                .replication
+                .primary(self.node, partition)
+                .filter(|primary| {
+                    !primary.tracker().retired()
+                        && primary.tracker().lineage().generation == generation
+                })
+                .map(|primary| primary.tracker().head());
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = copy.0,
+                barrier = barrier.0,
+                probe = ?head.map(|head| head.0),
+                "snapshot_retry_reopened"
+            );
+            let Some(head) = head else {
+                self.snapshot_retries.remove(&key);
+                continue;
+            };
+            if let Some(retry) = self.snapshot_retries.get_mut(&key) {
+                retry.3 = Some(now);
+            }
+            let site = Site {
+                partition,
+                correlation: rdb_core::contracts::ids::CorrelationId(0),
+            };
+            if let Err(fault) = self.send_envelopes(copy, head, head, site) {
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    ?fault,
+                    "snapshot_retry_probe_failed"
+                );
+            }
+        }
+    }
+
+    /// The `why` a heard refusal ends its transfer with. Every refusal is
+    /// `refused`, which keeps the served barrier, except the first [`SNAPSHOT_RETRY_LIMIT`] (3)
+    /// `install_retryable` ones at that barrier: `refused_retryable`, which forgets it, so R1's
+    /// next ask re-offers the same barrier. The count is per `(generation, barrier)`: a new one
+    /// starts it again. The 4th is `snapshot_retry_exhausted`: the barrier is kept, and the
+    /// tick is recorded for [`Self::retry_duty`].
+    fn refusal_kept(&mut self, refused: &SnapshotOfferRefused) -> &'static str {
+        if refused.reason != SnapshotRefusal::InstallRetryable {
+            return "refused";
+        }
+        let key = (refused.partition, refused.copy);
+        let Some(&(generation, barrier)) = self.snapshots_served.get(&key) else {
+            return "refused";
+        };
+        let count = match self.snapshot_retries.get(&key) {
+            Some(&(at_generation, at_barrier, count, _))
+                if (at_generation, at_barrier) == (generation, barrier) =>
+            {
+                count + 1
+            }
+            _ => 1,
+        };
+        let exhausted = count > SNAPSHOT_RETRY_LIMIT;
+        self.snapshot_retries.insert(
+            key,
+            (
+                generation,
+                barrier,
+                count,
+                exhausted.then(|| self.clock.now()),
+            ),
+        );
+        if exhausted {
+            tracing::warn!(
+                node = self.node.0,
+                partition = refused.partition.0,
+                copy = refused.copy.0,
+                barrier = barrier.0,
+                refusals = count,
+                "snapshot_retry_exhausted"
+            );
+            return "refused";
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = refused.partition.0,
+            copy = refused.copy.0,
+            barrier = barrier.0,
+            refusals = count,
+            "snapshot_retry_allowed"
+        );
+        "refused_retryable"
     }
 
     /// Drop `(partition, copy)`'s transfer and its pin, logged `event{why}`. A dropped transfer
@@ -631,6 +824,9 @@ impl Host {
         };
         if why != "refused" {
             self.snapshots_served.remove(&(partition, copy));
+        }
+        if why == "caught_up" {
+            self.snapshot_retries.remove(&(partition, copy));
         }
         if event == "snapshot_transfer_abandoned" {
             tracing::warn!(
@@ -666,7 +862,8 @@ impl Host {
     }
 
     /// Peer `node` started again: its transfers are dropped at once (m-d), so R1's next ask
-    /// re-offers to the new process.
+    /// re-offers to the new process. A barrier kept for one of its copies, and
+    /// that copy's retry count, are forgotten too; the new process is not the one that refused.
     pub(super) fn transfers_peer_booted(&mut self, node: NodeId) {
         let gone: Vec<_> = self
             .transfers
@@ -682,23 +879,86 @@ impl Host {
                 "snapshot_transfer_abandoned",
             );
         }
+        let kept: Vec<_> = self
+            .snapshots_served
+            .keys()
+            .chain(self.snapshot_retries.keys())
+            .copied()
+            .filter(|key| !self.transfers.contains_key(key))
+            .filter(|&(partition, copy)| {
+                self.replication
+                    .primary(self.node, partition)
+                    .is_some_and(|primary| {
+                        primary
+                            .tracker()
+                            .config()
+                            .members
+                            .iter()
+                            .any(|member| member.copy == copy && member.node == node)
+                    })
+            })
+            .collect();
+        for key in kept {
+            self.snapshots_served.remove(&key);
+            self.snapshot_retries.remove(&key);
+        }
+    }
+
+    /// Whether `transfer`'s receiver is still authorised. This node still leads
+    /// the transfer's generation, and its committed config still names `copy` at the
+    /// transfer's node. A pull from a copy removed from the plan, or after this node stopped
+    /// leading that generation, ends the transfer (`why = not_a_member`). A retired tracker
+    /// keeps its old lineage and config, so it is skipped first.
+    fn still_a_member(&self, partition: PartitionId, copy: CopyId, transfer: &Transfer) -> bool {
+        self.replication
+            .primary(self.node, partition)
+            .map(|primary| primary.tracker())
+            .filter(|tracker| !tracker.retired())
+            .is_some_and(|tracker| {
+                tracker.lineage().generation == transfer.lineage.generation
+                    && tracker
+                        .config()
+                        .members
+                        .iter()
+                        .any(|member| member.copy == copy && member.node == transfer.node)
+            })
     }
 
     /// A pull from the target: answer with the next page, or drop it when no transfer matches.
     pub(super) fn snapshot_pull(&mut self, pull: SnapshotPull) {
         let key = (pull.partition, pull.copy);
-        let matches = self.transfers.get(&key).is_some_and(|transfer| {
-            transfer.lineage.generation == pull.generation
-                && transfer.at == pull.at
-                && transfer.offer.is_none()
-        });
-        if !matches {
+        let why = match self.transfers.get(&key) {
+            None => Some("no_transfer"),
+            Some(transfer) if transfer.node != pull.node => Some("not_the_planned_receiver"),
+            Some(transfer)
+                if transfer.lineage.generation != pull.generation
+                    || transfer.at != pull.at
+                    || transfer.offer.is_some() =>
+            {
+                Some("mismatch")
+            }
+            Some(transfer) if !self.still_a_member(pull.partition, pull.copy, transfer) => {
+                Some("not_a_member")
+            }
+            Some(_) => None,
+        };
+        if why == Some("not_a_member") {
+            self.end_transfer(
+                pull.partition,
+                pull.copy,
+                "not_a_member",
+                "snapshot_transfer_abandoned",
+            );
+        }
+        if let Some(why) = why {
             tracing::info!(
                 node = self.node.0,
                 partition = pull.partition.0,
                 copy = pull.copy.0,
                 generation = pull.generation.0,
                 at = pull.at.0,
+                from = pull.node.0,
+                why,
                 "snapshot_pull_dropped"
             );
             return;
@@ -721,7 +981,7 @@ impl Host {
             );
             return;
         }
-        // PR #204 review: capped by size too, so a page of large values fits the frame, and
+        // Capped by size too, so a page of large values fits the frame, and
         // ended from the cursor: a page cut short by size is not the last.
         let page = transfer.view.page_after(
             pull.after.as_ref().map(|(ns, key)| (*ns, key.as_ref())),
@@ -758,6 +1018,7 @@ impl Host {
         transfer.pages += 1;
         let done = !more;
         let chunk = SnapshotChunk {
+            from: self.node,
             partition: pull.partition,
             generation: pull.generation,
             at: pull.at,
@@ -816,24 +1077,41 @@ impl Host {
             at = refused.at.0,
             reason = refused.reason.reason(),
             through = ?refused.through.map(|seq| seq.0),
+            transfer = refused.transfer,
             "snapshot_offer_refused_heard"
         );
-        let ours = self
-            .transfers
-            .get(&(refused.partition, refused.copy))
-            .is_some_and(|transfer| {
-                transfer.lineage.generation == refused.generation && transfer.at == refused.at
-            });
+        let open = self.transfers.get(&(refused.partition, refused.copy));
+        let ours = open.is_some_and(|transfer| {
+            transfer.node == refused.node
+                && transfer.lineage.generation == refused.generation
+                && transfer.at == refused.at
+                && transfer.id == refused.transfer
+        });
+        // A refusal of an earlier transfer at the same `S` (an install that expired,
+        // its refusal delayed past the transfer that replaced it) ends nothing and counts
+        // toward no limit.
+        if let Some(open) = open.filter(|open| !ours && open.id != refused.transfer) {
+            tracing::info!(
+                node = self.node.0,
+                partition = refused.partition.0,
+                copy = refused.copy.0,
+                at = refused.at.0,
+                transfer = refused.transfer,
+                open = open.id,
+                "snapshot_refusal_stale"
+            );
+        }
         if ours {
+            let why = self.refusal_kept(refused);
             self.end_transfer(
                 refused.partition,
                 refused.copy,
-                "refused",
+                why,
                 "snapshot_transfer_released",
             );
         }
         // Rev 5b: a held tail is recorded, so `admin forget-tail` counts it and the owner's
-        // status names the command. Only for the transfer open now (PR #204 review): a late
+        // status names the command. Only for the transfer open now: a late
         // refusal of an ended one, after the writable re-plan cleared its hold, records none.
         if let (true, SnapshotRefusal::TailHeld, Some(through)) =
             (ours, refused.reason, refused.through)
@@ -907,8 +1185,9 @@ impl Host {
             .or_else(|| self.needs_history_budget(partition))
     }
 
-    /// An offer reached this target (module docs, "Target").
-    pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) {
+    /// An offer reached this target (module docs, "Target"). A held install it replaces is
+    /// aborted first; a failed abort faults the node.
+    pub(super) fn snapshot_offer(&mut self, offer: SnapshotOffer) -> Result<(), super::Fault> {
         let partition = offer.lineage.partition;
         match self.offer_check(&offer) {
             Ok(()) => {}
@@ -929,17 +1208,19 @@ impl Host {
                     self.copy_needs_forget_tail(&offer, hit);
                 }
                 self.refuse_offer(&offer, reason, held.map(|hit| hit.head));
-                return;
+                return Ok(());
             }
         }
-        if let Some(held) = self.installs.get(&partition) {
+        if let Some(held) = self.installs.remove(&partition) {
             tracing::info!(
                 node = self.node.0,
                 partition = partition.0,
                 replaced_at = held.offer.at.0,
                 at = offer.at.0,
+                deferred = held.deferred,
                 "snapshot_install_replaced"
             );
+            self.abort_begun(&held)?;
         }
         let barrier = ReplicationEnvelope::decode(&offer.barrier)
             .map(|envelope| envelope.record_digest)
@@ -963,9 +1244,12 @@ impl Host {
             started: std::time::Instant::now(),
             deferred: 0,
             largest_page: 0,
+            touched: self.clock.now(),
+            retries: 0,
         };
         self.pull_next(&install);
         self.installs.insert(partition, install);
+        Ok(())
     }
 
     /// Design section 2 step 2: the offer's authority and freshness, or why not.
@@ -1093,6 +1377,7 @@ impl Host {
             node: self.node,
             reason,
             through,
+            transfer: offer.transfer,
         };
         self.send_peer(
             offer.from,
@@ -1115,8 +1400,12 @@ impl Host {
         self.send_peer(install.offer.from, Msg::SnapshotPull(pull), "snapshot_pull");
     }
 
-    /// PR #204 review: whether `frame`, delivered for `partition`, is an ordinary append of the
-    /// lineage an install here owns, and so is not handed to the receiver. Staged, its commit
+    /// Whether `frame`, delivered for `partition`, is an ordinary append of the
+    /// lineage an install here owns, contiguous with the receiver's accept head, and so is not
+    /// handed to the receiver. Only such a record would be staged; any other append (a head
+    /// probe or a keepalive past a gap, or a repeat) reaches the receiver's validation, which
+    /// answers it without staging (`NeedPrefix`, or `AlreadyHave` and an ACK), so R1 still
+    /// hears where this copy stands and can ask again. Staged, its commit
     /// would meet the engine's installing guard (which stays) as `WriteFailed`, and R1 would
     /// fence the partition for this boot. Dropped, it is not lost: R1's retransmit re-sends an
     /// unacked record, and the re-seed's ACK at `S` walks `S + 1 ..= head`. Every other frame
@@ -1134,6 +1423,13 @@ impl Host {
             || rdb_core::replication::wire::classify(&frame.body)
                 != Some(rdb_core::replication::wire::R1Frame::Append)
         {
+            return false;
+        }
+        let contiguous = ReplicationEnvelope::decode_header(&frame.body)
+            .ok()
+            .zip(self.replication.receiver(self.node, partition))
+            .is_some_and(|(header, receiver)| header.seq == receiver.accept_head().seq.next());
+        if !contiguous {
             return false;
         }
         install.deferred += 1;
@@ -1168,7 +1464,13 @@ impl Host {
             self.installs.insert(partition, install);
             return Ok(());
         }
-        // m-d: a target that re-adopted another lineage drops the install it held.
+        if chunk.from != offer.from {
+            self.chunk_dropped(&chunk, "not_the_source");
+            self.installs.insert(partition, install);
+            return Ok(());
+        }
+        // m-d: a target that re-adopted another lineage drops the install it held, and aborts
+        // it as an expiry does, so no installing marker outlives the install.
         let adopted = self
             .replication
             .receiver(self.node, partition)
@@ -1178,19 +1480,18 @@ impl Host {
                 node = self.node.0,
                 partition = partition.0,
                 at = install.offer.at.0,
+                deferred = install.deferred,
                 "snapshot_install_dropped"
             );
-            return Ok(());
+            return self.abort_begun(&install);
         }
         if chunk_chain(install.chain, &chunk.entries) != chunk.chain {
-            self.install_refused(&install, SnapshotRefusal::Chain, "chain");
-            return Ok(());
+            return self.install_refused(&install, SnapshotRefusal::Chain, "chain");
         }
         let (generation, at) = (install.offer.lineage.generation, install.offer.at);
         if !install.begun {
             if let Err(error) = self.engine.install_begin(partition, generation, at) {
-                self.install_refused(&install, SnapshotRefusal::Install, error.reason());
-                return Ok(());
+                return self.install_refused(&install, install_refusal(&error), error.reason());
             }
             install.begun = true;
             self.offer_tail_held.remove(&partition);
@@ -1198,12 +1499,9 @@ impl Host {
             self.inventory_ladders.remove(&partition);
             self.ladders.remove(&partition);
         }
-        if let Err(error) = self
-            .engine
-            .install_chunk(partition, generation, at, &chunk.entries)
-        {
-            self.install_refused(&install, SnapshotRefusal::Install, error.reason());
-            return Ok(());
+        let written = self.write_page(partition, generation, at, &chunk.entries);
+        if let Err(error) = written {
+            return self.install_refused(&install, install_refusal(&error), error.reason());
         }
         install.chain = chunk.chain;
         install.entries += chunk.entries.len() as u64;
@@ -1220,6 +1518,8 @@ impl Host {
             .map(|(ns, key, ..)| (*ns, key.clone()))
             .or(install.after);
         if !chunk.done {
+            install.touched = self.clock.now();
+            install.retries = 0;
             self.pull_next(&install);
             self.installs.insert(partition, install);
             return Ok(());
@@ -1229,10 +1529,87 @@ impl Host {
             self.engine
                 .install_finish(partition, generation, at, &offer.barrier, offer.root)
         {
-            self.install_refused(&install, SnapshotRefusal::Install, error.reason());
-            return Ok(());
+            return self.install_refused(&install, install_refusal(&error), error.reason());
         }
         self.reseed(&install)
+    }
+
+    /// `install_chunk`, or, while [`Host::snapshot_install_faults`] is above 0, a storage fault
+    /// in its place, counting it down. Rows only set it.
+    fn write_page(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        entries: &[SnapshotEntry],
+    ) -> Result<usize, rdb_storage::InstallError> {
+        #[cfg(debug_assertions)]
+        if self.snapshot_install_faults > 0 {
+            self.snapshot_install_faults -= 1;
+            return Err(rdb_storage::InstallError::Storage(
+                rdb_core::contracts::storage::StorageFault::WriteFailed,
+            ));
+        }
+        self.engine
+            .install_chunk(partition, generation, at, entries)
+    }
+
+    /// Every step: an install with no page for
+    /// [`Host::snapshot_pull_retry_millis`] re-sends its pull (`snapshot_pull_retried`), up to
+    /// [`SNAPSHOT_PULL_RETRIES`] times between pages. Past that it expires: the install is
+    /// dropped (`snapshot_install_expired`) and the source is told `install_retryable`, so it
+    /// ends the transfer and R1's next ask re-offers. Nothing here touches the owner's repair
+    /// or its read-only window, which `Host::repair_duty` ends on its own clock. An install
+    /// that had begun is given up first ([`Self::abort_begun`]), whose failure is the fault
+    /// this answers.
+    pub(super) fn install_duty(
+        &mut self,
+        now: rdb_core::contracts::time::Tick,
+    ) -> Result<(), super::Fault> {
+        let partitions: Vec<PartitionId> = self.installs.keys().copied().collect();
+        for partition in partitions {
+            let Some(install) = self.installs.get_mut(&partition) else {
+                continue;
+            };
+            if super::HostClock::millis_until(install.touched, now)
+                < self.snapshot_pull_retry_millis
+            {
+                continue;
+            }
+            if install.retries < SNAPSHOT_PULL_RETRIES {
+                install.retries += 1;
+                install.touched = now;
+                let install = install.clone();
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    copy = install.offer.copy.0,
+                    at = install.offer.at.0,
+                    chunks = install.chunks,
+                    retry = install.retries,
+                    "snapshot_pull_retried"
+                );
+                self.pull_next(&install);
+                continue;
+            }
+            let Some(install) = self.installs.remove(&partition) else {
+                continue;
+            };
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = install.offer.copy.0,
+                at = install.offer.at.0,
+                begun = install.begun,
+                chunks = install.chunks,
+                deferred = install.deferred,
+                retries = install.retries,
+                "snapshot_install_expired"
+            );
+            self.abort_begun(&install)?;
+            self.refuse_offer(&install.offer, SnapshotRefusal::InstallRetryable, None);
+        }
+        Ok(())
     }
 
     fn chunk_dropped(&self, chunk: &SnapshotChunk, why: &str) {
@@ -1242,13 +1619,20 @@ impl Host {
             copy = chunk.copy.0,
             generation = chunk.generation.0,
             at = chunk.at.0,
+            from = chunk.from.0,
             why,
             "snapshot_chunk_dropped"
         );
     }
 
-    /// Stop `install` (dropped from `installs` already), log why, and tell the source.
-    fn install_refused(&mut self, install: &Install, reason: SnapshotRefusal, detail: &str) {
+    /// Stop `install` (dropped from `installs` already), log why, give up what it began
+    /// ([`Self::abort_begun`]), and tell the source.
+    fn install_refused(
+        &mut self,
+        install: &Install,
+        reason: SnapshotRefusal,
+        detail: &str,
+    ) -> Result<(), super::Fault> {
         tracing::warn!(
             node = self.node.0,
             partition = install.offer.lineage.partition.0,
@@ -1256,11 +1640,62 @@ impl Host {
             at = install.offer.at.0,
             begun = install.begun,
             chunks = install.chunks,
+            deferred = install.deferred,
             reason = reason.reason(),
             detail,
             "snapshot_install_refused"
         );
+        self.abort_begun(install)?;
         self.refuse_offer(&install.offer.clone(), reason, None);
+        Ok(())
+    }
+
+    /// `install` ran `install_begin` and ends without `install_finish`, expired
+    /// or refused. `install_begin` wiped the partition and left the engine's installing guard,
+    /// while the receiver still claims the head it held before. Left so, a contiguous append
+    /// (the head the keepalive or the shadow timer sends) would be staged and refused at commit
+    /// as `WriteFailed`, and A1 fences the partition for the boot. So the lineage is removed
+    /// ([`rdb_storage::RocksEngine::install_abort`], synced), and the receiver of the offer's
+    /// lineage starts again at the root, as `Recovered` builds one for a copy holding nothing.
+    /// Every later frame then meets a receiver that says what the disk holds: its
+    /// `NeedPrefix(0)` draws a catch-up from seq 1, or, below a source's floor, a new ask.
+    /// Logged `snapshot_install_receiver_rooted{held}` (warn). An abort that fails faults the
+    /// node: the guard would stay under a receiver that claims a head the disk lacks.
+    fn abort_begun(&mut self, install: &Install) -> Result<(), super::Fault> {
+        if !install.begun {
+            return Ok(());
+        }
+        let offer = &install.offer;
+        let partition = offer.lineage.partition;
+        self.engine
+            .install_abort(partition, offer.lineage.generation, offer.at)
+            .map_err(|error| {
+                super::Fault::from(format!(
+                    "snapshot install of p{} at {} could not be aborted: {error}",
+                    partition.0, offer.at.0
+                ))
+            })?;
+        let Some(held) = self
+            .replication
+            .receiver(self.node, partition)
+            .filter(|held| held.lineage() == offer.lineage)
+        else {
+            return Ok(());
+        };
+        let before = held.accept_head().seq;
+        let receiver = held.rewound().map_err(|error| {
+            super::Fault::from(format!("snapshot abort re-root refused: {error:?}"))
+        })?;
+        self.replication.install_receiver(receiver);
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = offer.copy.0,
+            at = offer.at.0,
+            held = before.0,
+            "snapshot_install_receiver_rooted"
+        );
+        Ok(())
     }
 
     /// After `install_finish`: a live receiver at `(S, barrier digest)`, then its ACK to the
@@ -1292,6 +1727,8 @@ impl Host {
             durable: rdb_core::contracts::ids::DurableSeq(offer.at.0),
         })
         .map_err(|error| super::Fault::from(format!("snapshot re-seed refused: {error:?}")))?;
+        let mut receiver = receiver;
+        receiver.carry_control_from(held);
         let ack = reseed_ack(&receiver, offer.at);
         self.replication.install_receiver(receiver);
         self.dormant_ladders.remove(&partition);

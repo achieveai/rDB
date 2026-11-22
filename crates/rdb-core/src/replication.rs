@@ -275,7 +275,7 @@ impl Replication {
         self.primaries.get(&(node, partition))
     }
 
-    /// **Test seam**, debug builds (issue #61 PR-B): ask for `copy`'s snapshot as R1 does, with
+    /// **Test seam**, debug builds (issue #61): ask for `copy`'s snapshot as R1 does, with
     /// its cursor catching up (`Primary::await_snapshot`), for a row that must ask while the
     /// copy can say nothing. `None` when `(node, partition)` holds no primary side.
     #[cfg(debug_assertions)]

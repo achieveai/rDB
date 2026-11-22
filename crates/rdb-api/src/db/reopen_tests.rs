@@ -473,6 +473,199 @@ impl ConfigStore for CasFault {
     }
 }
 
+// ---- #172 (PR #218 review, round 3): a failed re-plan's cause reaches `wait_ready` ----
+
+/// Where a [`ReplanReadFault`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplanStage {
+    /// Every call passes.
+    Off,
+    /// The next recovery CAS on `partitions/1` meets a conflict.
+    Armed,
+    /// The CAS met it; the next read of `partitions/1` (F1's, after the conflict) passes.
+    Conflicted,
+    /// Every read of `partitions/1` is refused from now on.
+    Refusing,
+}
+
+/// A `MemStore` that, once armed, makes the reopen's recovery CAS on `partitions/1` meet a
+/// conflict: it writes the record again unchanged first, so its revision moves past the fence's
+/// and nobody else owns it (`Blocked(CasContention)`). It lets F1's one read after that conflict
+/// through, then refuses every later read of `partitions/1` with `PermissionDenied`, an error
+/// no retry gets past: the first of them is the heal's re-plan's.
+struct ReplanReadFault {
+    inner: config_testkit::MemStore,
+    stage: Mutex<ReplanStage>,
+    /// Reads of `partitions/1` refused so far.
+    refused: AtomicU64,
+}
+
+impl ReplanReadFault {
+    fn new() -> Self {
+        Self {
+            inner: config_testkit::MemStore::new(),
+            stage: Mutex::new(ReplanStage::Off),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    fn stage(&self) -> ReplanStage {
+        *lock(&self.stage)
+    }
+}
+
+impl ConfigStore for ReplanReadFault {
+    fn get<'a, 'b>(
+        &'a self,
+        request: config_core::GetRequest,
+    ) -> Reply<'b, config_core::GetResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        if request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes() {
+            let mut stage = lock(&self.stage);
+            match *stage {
+                ReplanStage::Conflicted => *stage = ReplanStage::Refusing,
+                ReplanStage::Refusing => {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                    return Box::pin(std::future::ready(Err(
+                        config_core::ConfigError::PermissionDenied {
+                            detail: "scripted: the read was refused".to_owned(),
+                        },
+                    )));
+                }
+                ReplanStage::Off | ReplanStage::Armed => {}
+            }
+        }
+        self.inner.get(request)
+    }
+
+    fn list<'a, 'b>(
+        &'a self,
+        request: config_core::ListRequest,
+    ) -> Reply<'b, config_core::ListResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.list(request)
+    }
+
+    fn put<'a, 'b>(
+        &'a self,
+        request: config_core::PutRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        Box::pin(async move {
+            let cas = request.key.as_ref() == ControlKey::Partition(PARTITION).encode().as_bytes()
+                && request.expected_mod_revision != Some(0);
+            if cas && self.stage() == ReplanStage::Armed {
+                let found = self
+                    .inner
+                    .get(config_core::GetRequest {
+                        key: request.key.clone(),
+                    })
+                    .await?
+                    .record
+                    .expect("the reopen's CAS is over a record");
+                self.inner
+                    .put(config_core::PutRequest {
+                        key: request.key.clone(),
+                        value: found.value,
+                        expected_mod_revision: Some(found.mod_revision),
+                        dedup: None,
+                    })
+                    .await?;
+                *lock(&self.stage) = ReplanStage::Conflicted;
+            }
+            self.inner.put(request).await
+        })
+    }
+
+    fn delete<'a, 'b>(
+        &'a self,
+        request: config_core::DeleteRequest,
+    ) -> Reply<'b, config_core::MutationResponse>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.delete(request)
+    }
+
+    fn capabilities(&self) -> config_core::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn watch<'a, 'b>(
+        &'a self,
+        request: config_core::WatchRequest,
+    ) -> Reply<'b, config_core::WatchStream>
+    where
+        'a: 'b,
+        Self: 'b,
+    {
+        self.inner.watch(request)
+    }
+}
+
+/// PR #218 review, round 3 (thread kmMs): the reopen's heal hands node 1 its plan; the
+/// recovery CAS then meets a conflict on a record nobody else owns, so F1 blocks
+/// `CasContention` and the heal's watch plans it again. That re-plan's first read is refused
+/// with an error no retry gets past. Public `wait_ready` then answers `ReadyError::Heal` with
+/// that read's own words, not the block it left. `wait_ready` is called once the watch has
+/// logged `heal_replan_failed`, so its own owner reads cannot take F1's read.
+/// Cut, 2026-11-22, reverted and checked with `cmp`: the watch's `HealState::Failed` update
+/// removed. Red: `Err(Blocked { owner: NodeId(1), reason: "CasContention" })`.
+/// Integration (~4 s): one fresh open until ready, one reopen.
+#[config_log::retcd_test]
+fn i172_a_wait_ready_reports_the_failed_replan_cause() {
+    const METHOD: &str = "i172_a_wait_ready_reports_the_failed_replan_cause";
+    let rt = runtime();
+    let faulty = Arc::new(ReplanReadFault::new());
+    let store: Arc<dyn ConfigStore> = faulty.clone();
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    *lock(&faulty.stage) = ReplanStage::Armed;
+
+    let mut db = open(&rt, dir.path(), &store).expect("the reopen");
+    let patience = crate::host::test_patience(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + patience;
+    let logged = |message: &str| {
+        config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == message)
+            .count()
+    };
+    while logged("heal_replan_failed") == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-plan did not fail within {patience:?}: stage {:?}, heal {:?}, node 1 {:?}",
+            faulty.stage(),
+            db.heal_state(),
+            db.node_status().into_iter().next().map(|n| n.recovery)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(logged("heal_replan_after_conflict"), 1, "one re-plan");
+    assert_eq!(
+        faulty.refused.load(Ordering::Relaxed),
+        1,
+        "the re-plan's first read alone was refused, and not retried"
+    );
+    assert_eq!(
+        db.wait_ready(patience),
+        Err(ReadyError::Heal(admin::HealError::Control(
+            "get partitions/1: permission denied: scripted: the read was refused".to_owned()
+        )))
+    );
+    db.shutdown();
+}
+
 /// a=1 reads back, and a new write lands and reads back.
 fn reads_back_and_writes(db: &Db, case: &str) {
     let got = db
@@ -1401,6 +1594,10 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
 
     let (owner, mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1410,6 +1607,7 @@ fn m10_cut_a_heal_over_a_grant_naming_this_opens_boot_clears_nothing_and_sends_n
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(move |_| Some(open)),
+        failover: false,
         owner_node: crate::admin::OWNER,
         partitions: vec![PARTITION],
         bootstrap: Vec::new(),
@@ -1506,6 +1704,10 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
     let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
     let (owner, _mailbox) = std::sync::mpsc::channel();
     let healed = rt.block_on(crate::admin::heal(crate::admin::HealCtx {
+        os_boot: crate::os_boot::OsBoot::Unknown,
+        links_since: Default::default(),
+        live_readd: false,
+        waiting: Default::default(),
         partition_count: 1,
         nodes: crate::db::ALL_NODES.into(),
         store: Arc::clone(&store),
@@ -1515,6 +1717,7 @@ fn m10_r191b_a_heal_over_a_grant_still_in_use_says_when_and_what_to_do_in_words(
         owner,
         within: Duration::from_millis(300),
         member_boot: Arc::new(|_| Some(BootId((1 << 16) + 1))),
+        failover: false,
         owner_node: crate::admin::OWNER,
         partitions: vec![PARTITION],
         bootstrap: Vec::new(),
@@ -3703,6 +3906,134 @@ fn m10_s2_a_node_whose_peers_start_after_the_heal_window_heals_without_a_restart
         2,
         "nodes 2 and 3 opened as copies: {logged:?}"
     );
+}
+
+/// R5 side fixes: node 1's process opens alone, so its heal waits for nodes 2 and 3 and logs
+/// `heal_retry`. (1) That line lands in this row's own log file: the heal task runs in the span
+/// of the open that started it, not untagged. (2) `wait_ready`'s time-out names what the heal
+/// waits for, the `heal_retry` error, not only "none". Cuts: the heal task spawned without
+/// `instrument`: no `heal_retry` in this row's file, red at the wait for it; `wait_ready`'s
+/// `timed_out` leaves `heal_waiting` out: the text names no heal reason, red.
+/// Integration (~16 s): the first attempt must run out the heal's window (`heal_within`).
+#[config_log::retcd_test]
+fn r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why() {
+    const METHOD: &str = "r5_a_waiting_heal_logs_in_its_open_and_wait_ready_names_why";
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    written_and_closed(&rt, dir.path(), &store);
+    let mut one = rt
+        .block_on(Db::open_with(
+            node_config(dir.path(), &[1]),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("node 1's process opens");
+    let window = heal_within(&fast());
+    let deadline =
+        std::time::Instant::now() + crate::host::test_patience(window + Duration::from_secs(10));
+    let retry = loop {
+        let found = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .find(|line| line["@m"] == "heal_retry");
+        if let Some(line) = found {
+            break line;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no heal_retry in this row's own log within {window:?} and patience"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let reason = retry["error"].as_str().expect("heal_retry names its error");
+    assert!(reason.contains("no link to node"), "{retry}");
+    let timed_out = one
+        .wait_ready(Duration::from_millis(300))
+        .expect_err("node 1 cannot heal alone");
+    assert!(
+        matches!(timed_out, ReadyError::TimedOut { .. }),
+        "{timed_out:?}"
+    );
+    let text = timed_out.to_string();
+    assert!(
+        text.contains(&format!("the reopen's heal is waiting: {reason}")),
+        "{text}"
+    );
+    one.shutdown();
+}
+
+/// PR #181 review questions 1 and 2: node processes share one folder, each with its own
+/// copy, so the OS boot marker is per copy (`nodes/<n>/os_boot`). After a reboot (copies on
+/// `boot-a`, the OS on `boot-b`), owner node 1's process opens and dies before it is ready;
+/// then node 3's process, which leads neither partition, is ready at once and records its own
+/// copy's boot. Node 1's marker stays absent, so its next open is `Unknown` and waits for every
+/// copy, never `Same`. Integration (~2 s): a fresh open, three node-process opens.
+/// Cut: one marker for the whole folder, at `config.dir`: node 3's ready stamps it and node
+/// 1's reopen reads `Same`, red.
+#[config_log::retcd_test]
+fn r5_o_a_node_that_leads_nothing_never_stamps_an_owners_os_boot() {
+    let rt = runtime();
+    let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+    let dir = config_testkit::fs::temp_dir();
+    let mut db = rt
+        .block_on(Db::open_with(
+            DbConfig {
+                partitions: Some(2),
+                ..config(dir.path())
+            },
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fast(),
+        ))
+        .expect("the fresh open");
+    db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+        .expect("the fresh open is ready");
+    db.shutdown();
+    drop(db);
+    assert_eq!(admin::initial_owner(PartitionId(1)), NodeId(1));
+    assert_eq!(admin::initial_owner(PartitionId(2)), NodeId(2));
+    let copy = |node: u32| dir.path().join("nodes").join(node.to_string());
+    let marker = |node: u32| copy(node).join(crate::os_boot::OS_BOOT_FILE);
+    for node in 1..=3 {
+        crate::os_boot::record(&copy(node), "boot-a").expect("the marker is written");
+        crate::os_boot::inject(&copy(node), Ok("boot-b"));
+    }
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Changed)
+    );
+    owner.shutdown();
+    drop(owner);
+    assert!(!marker(1).exists(), "a reboot removes node 1's marker");
+
+    let mut third = open_node(&rt, dir.path(), &store, &[3]).expect("node 3's process opens");
+    third
+        .wait_ready(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("node 3 leads nothing, so it is ready at once");
+    third.shutdown();
+    drop(third);
+    assert_eq!(
+        std::fs::read_to_string(marker(3))
+            .expect("node 3's marker")
+            .trim(),
+        "boot-b"
+    );
+    assert!(!marker(1).exists(), "node 3 never writes node 1's marker");
+    assert!(
+        !dir.path().join(crate::os_boot::OS_BOOT_FILE).exists(),
+        "no folder-wide marker"
+    );
+
+    let mut owner = open_node(&rt, dir.path(), &store, &[1]).expect("node 1's process opens");
+    assert_eq!(
+        owner.opened.os_boot.get(&NodeId(1)),
+        Some(&crate::os_boot::OsBoot::Unknown),
+        "node 1 waits for every copy"
+    );
+    owner.shutdown();
 }
 
 // ---- S2-3 then a reopen (A-R256 follow-up, W5): the heal after a promote ----

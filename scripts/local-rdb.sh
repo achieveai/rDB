@@ -71,7 +71,9 @@
 #   drop-reply N    the N-th client call is served and its answer lost
 #   cut-control N   node N's rEtcd calls fail Unavailable and its watches end
 # Every client call is logged `net_client_request{n, client, request}` in that node's log, so a
-# discovery run finds N before a fault run names it.
+# discovery run finds N before a fault run names it. That line is debug under target
+# `rdb_api::net::request` (#158), so nodes start with RUST_LOG=info,rdb_api::net::request=debug;
+# set RUST_LOG to override.
 #
 # Binaries: $CARGO_TARGET_DIR (default ./target)/debug: rdb_node (example of rdb-api), pilot_kv,
 # config-server. Every `up` builds them first (cargo skips what is fresh); `LR_BUILD=0` skips the
@@ -252,10 +254,19 @@ os_pid_is() { # os-pid exe-name: true while that pid runs that program
     fi
 }
 
-os_pid_of_child() { # $! of a child of this shell, program name: prints its OS pid
+os_pid_of_child() { # $! of a child of this shell, program name: prints its OS pid once the
+    # child runs that program. Until it execs, it is a copy of this shell, so a check of its name
+    # made then fails a start that is fine (#107 manual walk: 1 `up` in 12 at load 85).
     local pid="$1" name="$2" i
-    if [ ! -r "/proc/$pid/winpid" ]; then echo "$pid"; return 0; fi
-    for i in $(seq 1 100); do
+    if ! is_msys; then
+        for i in $(seq 1 200); do
+            [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$name" ] && { echo "$pid"; return 0; }
+            kill -0 "$pid" 2>/dev/null || return 1
+            sleep 0.05
+        done
+        return 1
+    fi
+    for i in $(seq 1 200); do
         case "$(cat "/proc/$pid/exename" 2>/dev/null)" in
             *"$name"*) cat "/proc/$pid/winpid"; return 0 ;;
         esac
@@ -293,16 +304,20 @@ start_node() { # n [stopped]: `stopped` skips the running check when the caller 
     # `--admin-apps admin`: the app `lr move`/`rebuild`/`promote` run as (A-R480: unset is none).
     # A later `--admin-apps` in LR_NODE_ARGS wins.
     # shellcheck disable=SC2086
+    RUST_LOG="${RUST_LOG:-info,rdb_api::net::request=debug}" \
     "$NODE_BIN" --node "$n" --dir "$RUN/db" --listen "127.0.0.1:$(node_port "$n")" \
         --peers "$(peers)" --control "$CONTROL" --cert-dir "${LR_CERT_DIR:-$RUN/certs}" \
         --faults "$RUN/faults/node-$n.txt" --stop-file "$RUN/stop/node-$n" \
         --log-dir "$RUN/logs" --ready-secs "$FIRST_WAIT_SEC" --admin-apps admin \
         ${LR_NODE_ARGS:-} >"$out" 2>"$err" &
     pid=$!
-    os="$(os_pid_of_child "$pid" rdb_node)" || { cat "$err" >&2; die "node $n exited at start"; }
+    os="$(os_pid_of_child "$pid" rdb_node)" || {
+        cat "$err" >&2 2>/dev/null || true
+        die "node $n exited at start, or did not run rdb_node within 10s (see $err)"
+    }
     record_pid "node-$n" "$os"
     if ! wait_line "$out" "^rdb_node listening" 30 "$os"; then
-        cat "$err" >&2
+        cat "$err" >&2 2>/dev/null || true
         die "node $n did not start listening (see $err)"
     fi
     say "node $n started: pid $os, $(head -n1 "$out")"

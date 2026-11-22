@@ -27,7 +27,7 @@ mod lineage;
 mod snapshot;
 
 pub use engine::{
-    dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RocksEngine,
+    dump, BindError, DamageRefused, InjectedFault, OpenError, RawRecord, RecordDamage, RocksEngine,
     StorageOptions, TrimRefused, WalSync, DEFAULT_BLOCK_CACHE_BYTES, DEFAULT_MEMTABLE_BUDGET_BYTES,
     DEFAULT_SYNC_STUCK_MILLIS, DEFAULT_WRITE_BUFFER_BYTES, HISTORY_RECORD_BYTES_SEED, WAL_BUDGETS,
 };
@@ -37,6 +37,4 @@ pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
 pub use install::InstallError;
 pub use keys::{Link, PublishMark, TrimFloor, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
-pub use snapshot::{
-    snapshot_entry_bytes, RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH, SNAPSHOT_ENTRY_OVERHEAD,
-};
+pub use snapshot::{snapshot_entry_bytes, RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};

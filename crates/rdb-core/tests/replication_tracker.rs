@@ -2370,7 +2370,7 @@ fn a_cursor_is_dropped_when_it_stops() {
 /// 12 when recovery cut the head to 10. Kept alive, it would call B caught up at 10 on the
 /// first ACK B sends under the new root. A copy past the cut gets the snapshot request.
 ///
-/// Issue #61 PR-B (lead ruling 2026-11-22): that request now starts a catching-up cursor
+/// Issue #61 (lead ruling 2026-11-22): that request now starts a catching-up cursor
 /// (`Primary::await_snapshot`). Ruling 6 still holds: the cursor is born after `Recovered`,
 /// fresh (no mark, nothing in flight), and B's ACKs at the old head 12 report nothing. Only an
 /// ACK the new root's ladder verifies, at 10, reports `CopyCaughtUp`, once. The last assertion

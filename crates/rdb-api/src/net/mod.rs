@@ -120,23 +120,42 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// receiver), but check A alone is not enough: a `ReadOnly` return also needs the copy's check B
 /// (`from_has_no_floor`) and its refusal mark (`AppendReceiver::refuse_landing`), which some
 /// builds at 9 lack (main at 1eb3fe0 has neither), and the handshake cannot tell them apart.
-/// ADR-rdb-0009 section 7 sets the prerequisites. Upgrade: `Timeouts::live_readd` goes on only
-/// once every node runs a build with both, and on every node, an operator rule while it is off by
-/// default. Default on: a version bump, or a capability bit that gates the re-add. Any change that
+/// ADR-rdb-0009 section 7 sets the prerequisites. `10` settles that (below). Any change that
 /// weakens check A takes a bump.
 ///
-/// Issue #61 (PR-A, design rev 5 M2): this bump adds `WirePeerAsk::Probe`, F1's digest probe of
+/// `10` came with issue #107 slice 2b: `WireMsg::Landed::owner_live_readd`, the committing
+/// owner's `Timeouts::live_readd`, by which a refused copy marks its receiver. Every build at 10
+/// has check A, check B and the refusal mark, so a peer that could lack them speaks 9 and is
+/// refused at the handshake. That includes an app process with no copy (`--nodes`): an app at
+/// 9 is refused by nodes at 10. Upgrade: stop every node and every app process that links to
+/// them, upgrade them all, start the nodes, then the apps.
+///
+/// `10` also carries issue #87's change feed, in the same bump: `WireCall::Changes`,
+/// `WireAnswer::Changes` and `WireFeedPage` with its `WireFeedBody`, `WireFeedRecord`,
+/// `WireFeedWrite` and `WireFeedCursor`. A page names its records' format
+/// ([`wire::FEED_RECORD_FORMAT`], `1`: physical writes), so a later record shape is refused
+/// `INCOMPATIBLE_VERSION` by name rather than misread. Only a node or an admin app may call it
+/// until tenants are bound to certificates (#151; [`sender_refused`]).
+///
+/// `11` came with issue #61 (PR-A, design rev 5 M2): `WirePeerAsk::Probe`, F1's digest probe of
 /// a copy that another node holds, answered by `Host::probe` in the plan anchor's generation. A
 /// build before it has no such ask and faults on F1's `ProbeDigestAt`, so a mixed cluster is
-/// refused at the handshake. The number is assigned at merge (main's current version + 1, in one
-/// line here); every row and message derives it from this constant. The snapshot transfer frames
-/// of the same PR ride this bump, and so do (A8b) `WireNodeStatus::needs_operator`,
+/// refused at the handshake. The snapshot transfer frames of the same PR ride this bump
+/// (`WireMsg::SnapshotOffer`, `SnapshotOfferRefused`, `SnapshotPull` and `SnapshotChunk`, each
+/// offer and refusal naming its transfer), and so do (A8b) `WireNodeStatus::needs_operator`,
 /// `WireMsg::SnapshotOfferRefused`'s `tail_held` reason with its `through`, and the adoption
 /// state `trimmed` (`WireTailRefused::adoption`, reasons `tail_below_floor` and
-/// `base_below_floor`). A build
-/// before this version never reads `trimmed`: the handshake refuses it first, peer and app
-/// alike.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// `base_below_floor`). A build before 11 never reads `trimmed`: the handshake refuses it first,
+/// peer and app alike. Upgrade as for 10: every node and app process together.
+///
+/// `12` came with #147 and #148, which change three types and one: `WireChange::Delete`,
+/// `WireLook::List` and `WireSeen::Objects` (the ordinary delete and the object list, each added
+/// last so earlier variants keep their numbers), and the `TooLarge` error kind, which
+/// `WireApiError::kind` carries. Only the `Db` raises `TooLarge`, before it sends, so no node
+/// answers it today; the type changed all the same. The number is main's version + 1, set by the
+/// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
+/// as for `10`: every node and every linked app process together.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -156,6 +175,10 @@ const CONNECT: Duration = Duration::from_secs(2);
 
 /// Frames kept for a node whose link is not up yet, before the oldest is dropped.
 const QUEUE_CAP: usize = 10_000;
+
+/// The target of `net_client_request`, one debug line per client call (#158). Fault discovery
+/// turns it on alone with `RUST_LOG=info,rdb_api::net::request=debug` ([`faults`]).
+pub const REQUEST_LOG_TARGET: &str = "rdb_api::net::request";
 
 /// Generated stubs for `proto/rdb_net.proto`.
 #[allow(missing_docs, clippy::all, clippy::pedantic)]
@@ -1210,10 +1233,28 @@ const DEFAULT_LR_ADMIN: &str = "admin";
 /// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
 ///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
 ///   reason is the whole refusal, which [`receive`] answers the call with;
+/// - a delete or a list (#147) names ids the node does not yet hold to the certificate's app,
+///   so only an admin app or a node may send one; [`unscoped_verb`] names them. #154 replaces
+///   this refusal with that node-side scope check (PR #178 review r4 T29, T30);
+/// - a change feed call (`Changes`) names a tenant no certificate binds yet (#151), so only an
+///   app on `admin_apps` may send one (owner ruling 2026-11-20, fail closed);
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
 fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
     let claimed = match (peer, msg) {
+        (Label::App(app), WireMsg::Client { call, to, .. })
+            if !admin_apps.contains(app) && unscoped_verb(call).is_some() =>
+        {
+            let (verb, done) = unscoped_verb(call)?;
+            return Some(format!(
+                "app {app} is not an admin app on node {}: a {verb} over a link is refused for \
+                 a non-admin app until the node checks the certificate's app against the ids it \
+                 names (#154); add {app} to the node's admin apps (`rdb_node --admin-apps`, \
+                 `NetConfig::admin_apps`) or make the call in process through a `ScopedDb`; \
+                 {done}",
+                to.0
+            ));
+        }
         (
             Label::App(app),
             WireMsg::Client {
@@ -1247,6 +1288,25 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 to.0
             ));
         }
+        // #170 review (owner ruling 2026-11-20, fail closed): a feed call names its tenant but
+        // no certificate binds an app to one yet (#151), so only an app on `admin_apps`, whom
+        // the operator trusts with every tenant, may read the feed. Nodes are trusted (below).
+        (
+            Label::App(app),
+            WireMsg::Client {
+                call: wire::WireCall::Changes { .. },
+                to,
+                ..
+            },
+        ) if !admin_apps.contains(app) => {
+            return Some(format!(
+                "app {app} may not read the change feed on node {}: the change feed needs the \
+                 admin certificate until tenants are bound to certificates (#151); add {app} to \
+                 the node's admin apps (`rdb_node --admin-apps`, `NetConfig::admin_apps`) only if \
+                 it may read every tenant",
+                to.0
+            ));
+        }
         (
             Label::App(_),
             WireMsg::Client { .. }
@@ -1264,6 +1324,13 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         (Label::Node(_), WireMsg::Frame { from, .. }) => from.node,
         (Label::Node(_), WireMsg::PeerAsk { asker, .. } | WireMsg::CatchUp { asker, .. }) => *asker,
         (Label::Node(_), WireMsg::Landed { emitter, .. }) => *emitter,
+        // Issue #61: each snapshot message names its sender, so it is held to the certificate
+        // like a frame. The host's checks then read an authenticated node: the offer's primary,
+        // a page's source, and a pull's or a refusal's planned receiver.
+        (Label::Node(_), WireMsg::SnapshotOffer { offer, .. }) => offer.from,
+        (Label::Node(_), WireMsg::SnapshotChunk { chunk, .. }) => chunk.from,
+        (Label::Node(_), WireMsg::SnapshotPull { pull, .. }) => pull.node,
+        (Label::Node(_), WireMsg::SnapshotOfferRefused { refused, .. }) => refused.node,
         (Label::Node(_), _) => return None,
     };
     match peer {
@@ -1272,6 +1339,26 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             msg.name(),
             claimed.0
         )),
+        _ => None,
+    }
+}
+
+/// The verb of a client call that names ids under any app's scope, which [`sender_refused`]
+/// takes from an admin app or a node only until #154, and what a refusal of it did: a delete
+/// ([`wire::WireChange::Delete`], alone or in a transaction) or a list ([`wire::WireLook::List`]).
+fn unscoped_verb(call: &wire::WireCall) -> Option<(&'static str, &'static str)> {
+    let deletes = |change: &wire::WireChange| matches!(change, wire::WireChange::Delete);
+    match call {
+        wire::WireCall::Put { change, .. } if deletes(change) => {
+            Some(("delete", "nothing was deleted"))
+        }
+        wire::WireCall::Compile { puts, .. } if puts.iter().any(|put| deletes(&put.change)) => {
+            Some(("delete", "nothing was deleted"))
+        }
+        wire::WireCall::Get {
+            look: wire::WireLook::List { .. },
+            ..
+        } => Some(("list", "nothing was listed")),
         _ => None,
     }
 }
@@ -1297,7 +1384,10 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
         WireMsg::Client { call, .. } => {
             let n = shared.faults.next_client_request();
             let identity = call.identity();
-            tracing::info!(
+            // One per client call, so debug (#158), under a target of its own so fault
+            // discovery turns on this line alone: `RUST_LOG=info,rdb_api::net::request=debug`.
+            tracing::debug!(
+                target: REQUEST_LOG_TARGET,
                 n,
                 client = identity.map(|identity| identity.client.0),
                 request = identity.map(|identity| identity.request.0),
@@ -1367,8 +1457,10 @@ fn receive(shared: &Arc<Shared>, conn: &Arc<Conn>, msg: WireMsg) {
                 }),
             );
             if posted.is_err() {
-                let error =
-                    ApiError::host(&format!("node {} is not served by {}", to.0, shared.label));
+                let error = ApiError::owner_fault(&format!(
+                    "node {} is not served by {}",
+                    to.0, shared.label
+                ));
                 conn.out(Frame::Reply {
                     correlation: reply,
                     reply: WireReply::Answer(WireAnswer::carry(&Answer::Error {
@@ -1453,6 +1545,8 @@ fn undecodable_call(to: NodeId, error: &str) -> ApiError {
             to.0
         ),
         retry_after: None,
+        too_large: None,
+        owner_fault: false,
     }
 }
 
@@ -1502,6 +1596,7 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        unmuted(&shared, node).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
                 backoff = Duration::from_millis(100);
@@ -1523,6 +1618,18 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Wait while this node is muted: a stopped process dials nobody, so its links stay down for
+/// as long as the fault lasts (#107 slice 2b manual walk).
+async fn unmuted(shared: &Shared, node: NodeId) {
+    if !shared.faults.muted() {
+        return;
+    }
+    tracing::info!(peer = node.0, "net_dial_muted");
+    while shared.faults.muted() {
+        tokio::time::sleep(faults::POLL).await;
     }
 }
 
@@ -1549,6 +1656,10 @@ async fn dial_once(
             source = cause.source();
         }
         false
+    }
+    // Fault `refuse-links`: no dial, so no `Hello` names this node's boot to the peer.
+    if shared.faults.refuses_links() {
+        return Err("fault refuse-links: this node dials no link".to_owned());
     }
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .map_err(|error| format!("bad address {address}: {error}"))?
@@ -1760,6 +1871,17 @@ impl RdbNet for Service {
                     return;
                 }
             };
+            // Fault `refuse-links`: no `Welcome`; the stream ends and the dial fails.
+            if shared.faults.refuses_links() {
+                tracing::info!(peer = %label, "net_handshake_refused_by_fault");
+                return;
+            }
+            // Mute: a stopped process answers no handshake, so the dialler's link stays down.
+            if shared.faults.muted() {
+                // Debug: the dialler retries about once a second for as long as the mute lasts.
+                tracing::debug!(peer = %label, "net_handshake_muted");
+                return;
+            }
             if let Some(reason) = refusal(&shared, &label, &hello) {
                 tracing::warn!(peer = %label, %reason, "net_handshake_refused");
                 let _ = tx.send(envelope(&Frame::Refused { reason }));
