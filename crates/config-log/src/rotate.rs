@@ -467,6 +467,67 @@ mod tests {
         assert!(live.contains("\"n\":\"0029\""), "{live}");
     }
 
+    /// Review r5 (PR #182): the failed-open rows inject one failed open, so a writer that
+    /// called a failed reopen live would pass them. Here two rotations in a row each meet two
+    /// failed opens (the rotation's own open, then the first reopen), and each is repaired. After
+    /// every repair the newest line is in the live file and the live file is within the bound.
+    /// Cut: `reopen_live` sets `live` on a failed open, red (no live file holds the newest line).
+    #[test]
+    fn r158_two_failed_reopens_in_a_row_twice_still_end_on_a_bounded_live_file() {
+        let rotation = SizeRotation {
+            max_bytes: 100,
+            max_files: 20,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut file = SizeRotatingFile::open(dir.path(), "n.jsonl", rotation).expect("open");
+        let offered = std::sync::Arc::default();
+        file.diagnostics = Box::new(Unwritable(std::sync::Arc::clone(&offered)));
+        let live = dir.path().join("n.jsonl");
+        let mut next = 0;
+        for outage in 0..2 {
+            // Fill the live file to the bound, so the next write rotates.
+            while file.written + line(next).len() as u64 <= rotation.max_bytes {
+                file.write_all(&line(next)).expect("write");
+                next += 1;
+            }
+            file.fail_live_open = 2;
+            // The rotation's open fails, then the first reopen fails, then the second opens.
+            for _ in 0..3 {
+                file.write_all(&line(next))
+                    .expect("a write through a failed open");
+                next += 1;
+            }
+            assert_eq!(
+                file.fail_live_open, 0,
+                "outage {outage}: both failures were used"
+            );
+            file.flush().expect("flush");
+            let held = std::fs::read_to_string(&live).expect("a live file");
+            let newest = format!("\"n\":\"{:04}\"", next - 1);
+            assert!(
+                held.contains(&newest),
+                "outage {outage}: {newest} not live: {held}"
+            );
+            assert!(
+                held.len() as u64 <= rotation.max_bytes,
+                "outage {outage}: live file {} B over the {} B bound",
+                held.len(),
+                rotation.max_bytes
+            );
+        }
+        assert_eq!(lines_on_disk(dir.path()), (0..next).collect::<Vec<_>>());
+        let offered = String::from_utf8(offered.lock().expect("offered").clone()).expect("utf8");
+        let again = format!(
+            "config-log: log rotation of {}: live file open again\n",
+            live.display()
+        );
+        assert_eq!(
+            offered.matches(&again).count(),
+            2,
+            "one recovery per outage: {offered}"
+        );
+    }
+
     /// Review r1 (PR #182): a live rename that failed ran after the oldest file was removed and
     /// the rest shifted, and every later over-cap write did both again while the live file never
     /// turned over, so three failures used up the history. Now a retry finds the slot already
