@@ -2378,6 +2378,49 @@ fn u2_b1_a_target_restore_installs_a_receiver_holding_the_plan_and_its_cutoff() 
     assert_eq!(plan.cutoff, cutoff, "the plan carries the cutoff");
 }
 
+/// Issue #61, PR #204 review: a held copy's offer hold (rev 5b) survives a refused combined
+/// forget-tail. `--through H --no-intact-copy --give-up-live-copy`, while the intact rule is
+/// not what holds the partition, is refused, and the owner's `needs_operator` still names the
+/// held copy: no hold was released, since no re-plan follows a refusal.
+/// Cut: the intact-rule check run after `offer_holds_released` (as at 67d028c), red
+/// (`needs_operator` is `None`).
+#[config_log::retcd_test]
+fn t61_pr204_a_refused_combined_forget_tail_keeps_the_held_copy_warning() {
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), Trio::fast);
+    trio.bootstrap();
+    trio.ready();
+    let p = PartitionId(1);
+    let cutoff = trio.nodes[0].0.committed[&p].selected.cutoff_seq;
+    let head = Seq(cutoff.0 + 3);
+    let owner = &mut trio.nodes[0].0;
+    owner.offer_holds.entry(p).or_default().insert(
+        CopyId(2),
+        crate::host::snapshot::OfferHold {
+            node: NodeId(3),
+            head,
+        },
+    );
+    let warning = owner.needs_operator(p).expect("the held copy is named");
+    let error = owner
+        .forget_tail_asked(
+            p,
+            TailRelease {
+                through: Some(head),
+                no_intact_copy: true,
+            },
+            true,
+        )
+        .expect_err("the intact rule does not hold the partition");
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.contains("the intact rule is not what holds"),
+        "{error:?}"
+    );
+    assert_eq!(owner.needs_operator(p), Some(warning), "the warning stands");
+    assert!(!owner.rejoins.contains_key(&p), "no re-plan");
+}
+
 /// Issue #105 (design section 8.1): `admin forget-tail` on the owner. Each refusal is
 /// `no_mutation`, names why, and ends "nothing was given up": no flag; a node that is not the
 /// owner; `--through` at or below the cutoff; `--through` with no tail anywhere to give up; a

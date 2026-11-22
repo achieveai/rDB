@@ -10720,21 +10720,8 @@ impl Host {
                 through.0
             ));
         }
-        let mut offered = Vec::new();
-        if let Some(through) = release.through {
-            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
-            // writable commit supersedes its tail for the next ordinary offer.
-            for (copy, node, head) in self.offer_holds_released(partition, through) {
-                offered.push(format!(
-                    "copy {} on node {}: seqs {}..={} given up for good",
-                    copy.0,
-                    node.0,
-                    cutoff.0 + 1,
-                    head.0
-                ));
-            }
-        }
-        given_up.extend(offered);
+        // PR #204 review: every check runs before any hold is released, so a refused
+        // combination leaves the held-copy warning standing.
         if release.no_intact_copy {
             let capped = self
                 .recoveries
@@ -10751,6 +10738,23 @@ impl Host {
                     ),
                 );
             }
+        }
+        let mut offered = Vec::new();
+        if let Some(through) = release.through {
+            // Rev 5b, lead ruling R18: a copy whose offer was held is no longer; the re-plan's
+            // writable commit supersedes its tail for the next ordinary offer.
+            for (copy, node, head) in self.offer_holds_released(partition, through) {
+                offered.push(format!(
+                    "copy {} on node {}: seqs {}..={} given up for good",
+                    copy.0,
+                    node.0,
+                    cutoff.0 + 1,
+                    head.0
+                ));
+            }
+        }
+        given_up.extend(offered);
+        if release.no_intact_copy {
             given_up.push(
                 "no copy of the last writable generation has answered; records confirmed in \
                  that generation, up to an amount the system cannot see, are given up, for \
