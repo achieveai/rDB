@@ -9279,6 +9279,58 @@ fn t61_pr204_a_replayed_earlier_page_changes_nothing_and_the_next_page_lands() {
     rebuilt(&mut trio, METHOD, floor);
 }
 
+/// Issue #61 PR #204 review, idle abandonment: as S2-R1, node 1 holds the pull for page 1, so
+/// node 3's next pull is never answered. A transfer duty past `SNAPSHOT_IDLE_MILLIS` abandons
+/// the transfer (`snapshot_transfer_abandoned{why = idle}`) and forgets the barrier it served,
+/// so R1's ask at that same barrier opens a fresh transfer; node 3 replaces its install with
+/// the new offer and is rebuilt.
+/// Cuts: the idle check removed from `transfer_duty`, red (the transfer stands); the served
+/// barrier kept by `end_transfer`, red (the ask at the same barrier opens nothing).
+/// Integration (~4 s): S2-R1's setup; the duty and the ask are direct calls.
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afresh() {
+    const METHOD: &str =
+        "t61_pr204_an_idle_transfer_is_abandoned_and_the_same_barrier_is_offered_afresh";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, floor) = trimmed(dir.path(), 4, |host| {
+        if host.node == NodeId(1) {
+            host.snapshot_pages_held_from = Some(1);
+        }
+    });
+    trio.until("node 1 held page 1", |_| {
+        (!logged!(METHOD, "snapshot_pull_held").is_empty()).then_some(())
+    });
+    let three = copy_of(&trio, 3);
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    let barrier = Seq(opened[0]["barrier"].as_u64().expect("a barrier"));
+    let past = trio
+        .clock
+        .now()
+        .plus_millis(super::snapshot::SNAPSHOT_IDLE_MILLIS);
+    let owner = &mut trio.nodes[0].0;
+    owner.transfer_duty(past);
+    assert!(
+        !owner.transfers.contains_key(&(p, three)),
+        "the idle transfer is abandoned"
+    );
+    let abandoned = logged!(METHOD, "snapshot_transfer_abandoned");
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["why"], "idle", "{abandoned:?}");
+    assert_eq!(owner.snapshots_served.get(&(p, three)), None, "the barrier is forgotten");
+    owner.snapshot_pages_held_from = None;
+    owner.snapshot_catchup(p, three, barrier);
+    let opened = logged!(METHOD, "snapshot_transfer_opened");
+    assert_eq!(opened.len(), 2, "a fresh transfer: {opened:?}");
+    assert_eq!(opened[1]["barrier"], barrier.0, "{opened:?}");
+    trio.until("node 3 replaced its install", |_| {
+        (!logged!(METHOD, "snapshot_install_replaced").is_empty()).then_some(())
+    });
+    rebuilt(&mut trio, METHOD, floor);
+}
+
 /// S2-R1's end: node 3 promoted, and put `request` durable on it.
 #[cfg(debug_assertions)]
 fn promoted_and_durable(trio: &mut Trio, request: u64) {
