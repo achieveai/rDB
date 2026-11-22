@@ -2818,6 +2818,9 @@ const MEMBER_LOOK_EVERY: Duration = Duration::from_millis(20);
 ///   record:
 ///   [`no_grant_record`], until one full heal window has passed (`window_passed`). A clock with
 ///   no established bound proves nothing: `no_clock_bound`.
+///
+/// The missing copies' grants are read at once, so an ask takes its slowest read, and judged
+/// in `missing` order: the first refusal is the answer, as with one read after another.
 async fn leave_out(
     ctx: &HealCtx,
     found: &[(RecordMember, Option<BootId>)],
@@ -2869,9 +2872,22 @@ async fn leave_out(
         }
         short.push((*partition, gone, present, majority));
     }
+    // PR #181 review round 7: every missing copy's grant is read at once, so an ask costs its
+    // slowest read, not their sum (six copies at 2.8 s each would pass a 16.2 s deadline).
+    // Each read is judged in `missing` order as soon as it and those before it are in, as one
+    // read after another would be, so the answer, the warnings and `failed` are the same. The
+    // first refusal ends the ask: the reads still in flight are dropped (each is a plain read,
+    // so dropping it changes nothing), and their nodes are judged by the next ask.
+    let mut reads: futures::stream::FuturesOrdered<_> = missing
+        .iter()
+        .map(|node| read_grant(ctx, NodeId(*node)))
+        .collect();
     let mut down = Vec::with_capacity(missing.len());
     for node in missing {
-        let evidence = copy_down(ctx, NodeId(*node), window_passed, failed).await?;
+        let read = futures::StreamExt::next(&mut reads)
+            .await
+            .expect("one read per missing copy");
+        let evidence = copy_down(ctx, NodeId(*node), read, window_passed, failed)?;
         down.push((NodeId(*node), UNLINKED_BOOT, evidence));
     }
     Ok(LeaveOut { down, short })
@@ -2956,6 +2972,15 @@ const fn no_grant_record(window_passed: bool) -> Result<&'static str, &'static s
     }
 }
 
+/// R5: one read of `grants/{node}`, for [`copy_down`] to judge.
+async fn read_grant(ctx: &HealCtx, node: NodeId) -> Result<config_core::GetResponse, ConfigError> {
+    ctx.store
+        .get(GetRequest {
+            key: Bytes::from(ControlKey::Grant(node).encode()),
+        })
+        .await
+}
+
 /// R5: whether the copy on `node` is proven down: its `grants/{node}` frozen (`grant_frozen`),
 /// or its expiry proven past on this node's clock (`grant_expired`). The boot the record names
 /// is not used: a frozen or expired record can outlive the process it names while a newer one
@@ -2966,21 +2991,18 @@ const fn no_grant_record(window_passed: bool) -> Result<&'static str, &'static s
 /// is warned with its cause, `heal_copy_grant_unread{error}` or
 /// `heal_copy_grant_unreadable{revision}`, once while the cause stays the same: `failed` holds
 /// each node's last one, and a read that succeeds clears it.
-async fn copy_down(
+///
+/// `read` is this node's `grants/{node}` read, from [`read_grant`]: [`leave_out`] reads every
+/// missing copy's grant at once and judges each here, in order (PR #181 review round 7).
+fn copy_down(
     ctx: &HealCtx,
     node: NodeId,
+    read: Result<config_core::GetResponse, ConfigError>,
     window_passed: bool,
     failed: &mut BTreeMap<NodeId, String>,
 ) -> Result<&'static str, &'static str> {
     const NOT_PROVEN: &str = "copy_not_proven_down";
-    let key = ControlKey::Grant(node).encode();
-    let read = match ctx
-        .store
-        .get(GetRequest {
-            key: Bytes::from(key.clone()),
-        })
-        .await
-    {
+    let read = match read {
         Ok(read) => read,
         Err(error) => {
             let cause = error.to_string();
@@ -10524,6 +10546,88 @@ mod tests {
         }
         assert!(phase("the second owner waits").contains(HEAL_WAITING_PREFIX));
         task.abort();
+    }
+
+    /// PR #181 review round 7: six down copies whose grant reads take 2.8 s each are proven
+    /// in one attempt of the spec's 16.2 s heal window (`grant_millis` + clock error + dispatch
+    /// margin + 10 s): the reads run at once, so the attempt takes the slowest one, about
+    /// 2.8 s, not the 16.8 s of their sum. Each partition pins [1, 2, x] for x of 3 to 8, and
+    /// nodes 3 to 8 are down with frozen grants. All six are left out, in node order, with one
+    /// `heal_proceed_without` per partition and no late decision. Paused tokio time, so the
+    /// reads take exactly 2.8 s. Unit (~10 ms). Cut: the reads one after another: the answer
+    /// comes 16.8 s in, past the deadline, and the attempt ends `PeersUnknown` with
+    /// `decided_past_deadline`, red.
+    #[config_log::retcd_test]
+    fn r5_six_slow_grant_reads_are_proven_in_one_attempt() {
+        const METHOD: &str = "r5_six_slow_grant_reads_are_proven_in_one_attempt";
+        const READ: Duration = Duration::from_millis(2_800);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let down: Vec<u32> = (3..=8).collect();
+        let store = down.iter().fold(
+            GrantGets::new(NodeId(3), vec![r5_delay(Duration::ZERO, READ)]),
+            |store, node| {
+                if *node == 3 {
+                    store
+                } else {
+                    store.and(NodeId(*node), vec![r5_delay(Duration::ZERO, READ)])
+                }
+            },
+        );
+        for node in &down {
+            let grant = r5_grant(*node, utc_now() + 3_600_000, true);
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(grant.node).encode()),
+                value: grant.encode(),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("the grant is written");
+        }
+        let within = Duration::from_millis(
+            Budgets::SPEC_DEFAULTS.grant_millis
+                + Budgets::SPEC_DEFAULTS.clock_error_millis
+                + Budgets::SPEC_DEFAULTS.dispatch_margin_millis
+                + 10_000,
+        );
+        assert_eq!(within, Duration::from_millis(16_200));
+        let partitions: Vec<PartitionId> = (1..=6).map(PartitionId).collect();
+        let ctx = HealCtx {
+            partitions: partitions.clone(),
+            partition_count: 6,
+            within,
+            member_boot: Arc::new(|node| (node.0 <= 2).then_some(OPEN_2)),
+            ..r5_ctx(Arc::new(store))
+        };
+        let rooted: Vec<Vec<RecordMember>> = down.iter().map(|x| r5_members(&[1, 2, *x])).collect();
+        let pinned: Vec<RecordMember> = rooted[0][..2]
+            .iter()
+            .chain(rooted.iter().map(|members| &members[2]))
+            .copied()
+            .collect();
+        let (boots, took) = rt.block_on(async {
+            let start = tokio::time::Instant::now();
+            let boots = member_boots(&ctx, &pinned, &rooted, &[], start + within).await;
+            (boots, start.elapsed())
+        });
+        let boots = boots.unwrap_or_else(|e| panic!("one attempt proves all six: {e}"));
+        assert_eq!(
+            boots.left,
+            down.iter()
+                .map(|node| (NodeId(*node), UNLINKED_BOOT))
+                .collect::<Vec<_>>(),
+            "all six left out"
+        );
+        assert!(
+            took < READ + Duration::from_secs(1),
+            "the slowest read, not the sum: {took:?}"
+        );
+        assert_eq!(r5_lines(METHOD, "heal_proceed_without").len(), 6);
+        assert!(r5_lines(METHOD, "heal_leave_out_expired").is_empty());
+        assert!(r5_lines(METHOD, "heal_peers_unknown").is_empty());
     }
 
     /// PR #181 review round 6: a heal that ends in an error other than `PeersUnknown` logs
