@@ -7647,8 +7647,8 @@ impl Host {
     /// (`AppendReceiver::refuse_landing`) and check B (`from_has_no_floor`), which a peer of
     /// 1eb3fe0 lacks at the same protocol. Hence the prerequisites there: the setting goes on
     /// only once every node runs a build with both, on every node (an operator rule while it is
-    /// off by default), and a bump to 10 or a capability bit before it is on by default. Any
-    /// change that weakens check A takes a bump.
+    /// off by default), and a protocol bump (its merge commit sets the number) or a capability
+    /// bit before it is on by default. Any change that weakens check A takes a bump.
     fn live_readd_duty(&mut self, now: Tick) {
         // A node no longer the pinned primary forgets its entries, so ownership coming back
         // later revives none.

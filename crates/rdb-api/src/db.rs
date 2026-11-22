@@ -189,11 +189,12 @@ pub struct Timeouts {
     /// owner and as a returning copy (which marks a refused landing only with it on).
     ///
     /// Prerequisites (ADR-rdb-0009 section 7): turn it on only once every node runs a build
-    /// with check B and the refused-receiver mark, and on every node. Older builds speak the
-    /// same protocol 9, so nothing refuses the pairing; with such a copy, or one with the
-    /// setting off, a read-only return can leave the partition read-only until that copy
-    /// restarts, or, without check B, a holed copy. Before it is on by default the protocol
-    /// moves to 10, or a capability bit gates the re-add.
+    /// with check B and the refused-receiver mark, and on every node. A build without them can
+    /// speak the same protocol version, so nothing refuses the pairing; with such a copy, or one
+    /// with the setting off, a read-only return can leave the partition read-only until that
+    /// copy restarts, or, without check B, a holed copy. Before it is on by default, a protocol
+    /// bump no such build shares (its merge commit sets the number) or a capability bit gates
+    /// the re-add.
     pub live_readd: bool,
 }
 
