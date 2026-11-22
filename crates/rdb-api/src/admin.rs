@@ -9218,6 +9218,7 @@ mod tests {
     }
 
     /// [`r5_heal_in`] on `rt`, for a row that runs on paused tokio time.
+    #[allow(clippy::too_many_arguments)]
     fn r5_heal_on(
         rt: &tokio::runtime::Runtime,
         store: Arc<dyn ConfigStore>,
