@@ -2404,6 +2404,85 @@ fn f87_3_a_call_to_a_node_held_mid_restart_is_refused_within_its_wait() {
     held.put.join().expect("the put thread").expect("k2");
 }
 
+/// Review r7 (threads 4657364905, 4657364923): a restart whose new start fails wakes the feed
+/// call waiting at its guard with the stopped node's refusal, the failed restart named before
+/// its step. Node 2's restart waits in its WAL join ([`restart_held_in_join`]); a call to node
+/// 2 is counted waiting (`Db::restart_waiters`); node 2's folder is moved aside and a file put
+/// in its place, as `a_failed_restart_leaves_the_node_stopped_and_says_so` does with `nodes`;
+/// the join is let go. The restart fails; within 5 s the call is refused `UNAVAILABLE`,
+/// `RetryAfterRecovery`, no mutation, "node 2's node thread has stopped", then "its restart as
+/// boot .. failed", then the stop step, last. Then node 3 serves a feed read. The read timeout
+/// is the row's patience, so the call is woken, not timed out.
+/// Cuts: `RestartMark` without `notify_all`, red (no answer within 5 s); `Db::explained`
+/// without the note, red (no "failed" before the step).
+/// Integration (~5 s): one open, one failed restart.
+#[config_log::retcd_test]
+fn f87_3_a_failed_restart_wakes_its_waiting_feed_call_refused() {
+    const METHOD: &str = "f87_3_a_failed_restart_wakes_its_waiting_feed_call_refused";
+    let rt = runtime();
+    let store = store();
+    let dir = config_testkit::fs::temp_dir();
+    let timeouts = Timeouts {
+        read: patience(),
+        ..Timeouts::default()
+    };
+    let db = Arc::new(opened_timed(&rt, dir.path(), &store, timeouts));
+    let k1 = db.put(b"k1", b"one", None).expect("k1");
+    db.wait_durable(
+        DEFAULT_GROUP,
+        (k1.generation, k1.seq),
+        Duration::from_secs(30),
+    )
+    .expect("k1 on every disk");
+    let held = restart_held_in_join(&db, dir.path(), METHOD);
+    let (sent, answered) = mpsc::channel();
+    {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _ =
+                sent.send(db.changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2))));
+        });
+    }
+    until("the call to node 2 waits at the restart's guard", || {
+        db.restart_waiters() == 1
+    });
+    let folder = dir.path().join("nodes").join("2");
+    std::fs::rename(&folder, dir.path().join("nodes").join("2.aside")).expect("moved aside");
+    std::fs::write(&folder, b"a file where node 2's folder goes").expect("a file");
+    drop(held.release);
+    let failed = held
+        .restart
+        .join()
+        .expect("the restart thread")
+        .expect_err("node 2's new start fails");
+    assert_eq!(failed.kind, ErrorKind::Unavailable, "{failed:?}");
+    let error = answered
+        .recv_timeout(crate::host::test_patience(Duration::from_secs(5)))
+        .expect("the waiting call is woken")
+        .expect_err("node 2 did not start again");
+    stopped_refusal("node 2, failed restart", &error);
+    let stopped = error
+        .detail
+        .find("node 2's node thread has stopped")
+        .unwrap_or_else(|| panic!("the stopped node: {error:?}"));
+    let note = error
+        .detail
+        .find("its restart as boot")
+        .unwrap_or_else(|| panic!("the failed restart: {error:?}"));
+    let step = error
+        .detail
+        .rfind("next: ")
+        .unwrap_or_else(|| panic!("the step: {error:?}"));
+    assert!(stopped < note && note < step, "{error:?}");
+    assert_eq!(db.restart_waiters(), 0);
+    let page = page_from(&db, FeedCursor::START, Source::Node(NodeId(3)));
+    assert!(
+        matches!(&page, FeedPage::Records { records, .. } if !records.is_empty()),
+        "{page:?}"
+    );
+    held.put.join().expect("the put thread").expect("k2");
+}
+
 /// Review r7 (thread 4655953455): a restart that has published its new handle clears only its
 /// own mark, never the next restart's. Restart A of node 2 is held after it published, before
 /// its mark is dropped (`RestartStage::Published`); restart B of node 2 then marks it and is

@@ -3401,7 +3401,8 @@ impl Db {
     /// dropped the call unanswered, as one that stops with the call still queued does, or one
     /// still mid-restart when the read timeout ends: the timeout covers the wait for the
     /// restart too (all `RetryAfterRecovery`: read another copy now, or that node once it has
-    /// restarted). Every such refusal has `no_mutation` set.
+    /// restarted; after a failed restart, the refusal says so before that step). Every such
+    /// refusal has `no_mutation` set.
     /// `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
@@ -4806,8 +4807,18 @@ impl Db {
     /// rebuild) is left as it is (review r1): a note after it would hide that step and add the
     /// kind's generic "call again", which contradicts it.
     fn explained(&self, mut error: ApiError) -> ApiError {
+        // Review r7 (thread 4657364923): a stopped node's feed refusal after a failed restart
+        // names that restart, before its own step, which stays last.
+        if error.detail.ends_with(error::FEED_STOPPED_STEP) {
+            let failed = lock(&self.nodes).iter().any(|handle| handle.start_failed);
+            if let (true, Some(note), Some(at)) =
+                (failed, self.restart_note(), error.detail.rfind("next: "))
+            {
+                error.detail.insert_str(at, &format!("{note}; "));
+            }
+            return error;
+        }
         if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
-            || error.detail.ends_with(error::FEED_STOPPED_STEP)
             || error.detail.ends_with(error::FEED_HISTORY_STEP)
         {
             return error;
