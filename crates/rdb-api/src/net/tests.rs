@@ -1546,6 +1546,103 @@ async fn pr74_r479_a_rebuild_from_an_app_not_on_the_admin_list_is_refused_and_do
     );
 }
 
+/// PR #178 review r4 T29, T30: the refusal a non-admin app gets for a delete or a list until
+/// #154's node-side scope check: the call never reaches node 1's node, takes no request number,
+/// is definitive `INVALID_ARGUMENT` with no_mutation, and says why and what to do instead. Then
+/// the admin app sends `call` again and node 1's node gets it.
+async fn assert_unscoped_refused(test: &str, call: ClientCall, verb: &str, done: &str) {
+    let (got, answer) = app_admin_call("pilot", call.clone()).await;
+    assert!(
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
+        "a non-admin app's {verb} never reaches node 1's node: {got:?}"
+    );
+    assert_eq!(
+        client_requests(test),
+        [(1, "status".to_owned())],
+        "a refused {verb} takes no request number and logs no request event"
+    );
+    let Answer::Error { error, request } = answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    for part in [
+        "app pilot is not an admin app on node 1",
+        &format!("a {verb} over a link is refused for a non-admin app"),
+        "(#154)",
+        "--admin-apps",
+        done,
+    ] {
+        assert!(text.contains(part), "{part:?} in {text}");
+    }
+    assert!(!text.contains("  "), "one space between words: {text:?}");
+    let (got, _answer) = app_admin_call("admin", call.clone()).await;
+    let Msg::Client(Client { call: reached, .. }) = got else {
+        panic!("the admin app's {verb} reaches node 1's node: {got:?}");
+    };
+    assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+}
+
+/// PR #178 review r4 T29: a delete, compiled as `Db` sends one, from an app not on node 1's
+/// admin-app list is refused: nothing is deleted. The admin app's still reaches node 1's node.
+/// Cut: drop the delete from `unscoped_verb`, red: node 1's first message is the compile.
+/// Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_t29_a_delete_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let delete = ClientCall::Compile {
+        identity: identity(9, 1),
+        puts: vec![PutOp {
+            group: crate::db::DEFAULT_GROUP,
+            object: Bytes::from_static(b"doc"),
+            change: Change::Delete,
+            expect: None,
+        }],
+        remaining_millis: 1_000,
+    };
+    assert_unscoped_refused(
+        "r4_t29_a_delete_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        delete,
+        "delete",
+        "nothing was deleted",
+    )
+    .await;
+}
+
+/// PR #178 review r4 T30: as the row above, for a list: nothing is listed.
+/// Cut: drop the list from `unscoped_verb`, red: node 1's first message is the get.
+/// Integration (~300 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_nothing() {
+    let list = ClientCall::Get {
+        identity: identity(9, 1),
+        group: crate::db::DEFAULT_GROUP,
+        object: Bytes::new(),
+        look: Look::List {
+            after: None,
+            limit: 10,
+            rootless: true,
+        },
+    };
+    assert_unscoped_refused(
+        "r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_nothing",
+        list,
+        "list",
+        "nothing was listed",
+    )
+    .await;
+}
+
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
 /// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
 /// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its

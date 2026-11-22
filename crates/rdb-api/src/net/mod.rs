@@ -1206,10 +1206,26 @@ const DEFAULT_LR_ADMIN: &str = "admin";
 /// - a copy move or a rebuild changes who holds a copy: the owner completes it with its own
 ///   store credentials, so only an app on `admin_apps` may send one (ruling A-R479). The
 ///   reason is the whole refusal, which [`receive`] answers the call with;
+/// - a delete or a list (#147) names ids the node does not yet hold to the certificate's app,
+///   so only an admin app or a node may send one; [`unscoped_verb`] names them. #154 replaces
+///   this refusal with that node-side scope check (PR #178 review r4 T29, T30);
 /// - a node may name no other node as a frame's `from`, an ask's or catch-up's `asker`, or a
 ///   landed result's `emitter`.
 fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) -> Option<String> {
     let claimed = match (peer, msg) {
+        (Label::App(app), WireMsg::Client { call, to, .. })
+            if !admin_apps.contains(app) && unscoped_verb(call).is_some() =>
+        {
+            let (verb, done) = unscoped_verb(call)?;
+            return Some(format!(
+                "app {app} is not an admin app on node {}: a {verb} over a link is refused for \
+                 a non-admin app until the node checks the certificate's app against the ids it \
+                 names (#154); add {app} to the node's admin apps (`rdb_node --admin-apps`, \
+                 `NetConfig::admin_apps`) or make the call in process through a `ScopedDb`; \
+                 {done}",
+                to.0
+            ));
+        }
         (
             Label::App(app),
             WireMsg::Client {
@@ -1268,6 +1284,26 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             msg.name(),
             claimed.0
         )),
+        _ => None,
+    }
+}
+
+/// The verb of a client call that names ids under any app's scope, which [`sender_refused`]
+/// takes from an admin app or a node only until #154, and what a refusal of it did: a delete
+/// ([`wire::WireChange::Delete`], alone or in a transaction) or a list ([`wire::WireLook::List`]).
+fn unscoped_verb(call: &wire::WireCall) -> Option<(&'static str, &'static str)> {
+    let deletes = |change: &wire::WireChange| matches!(change, wire::WireChange::Delete);
+    match call {
+        wire::WireCall::Put { change, .. } if deletes(change) => {
+            Some(("delete", "nothing was deleted"))
+        }
+        wire::WireCall::Compile { puts, .. } if puts.iter().any(|put| deletes(&put.change)) => {
+            Some(("delete", "nothing was deleted"))
+        }
+        wire::WireCall::Get {
+            look: wire::WireLook::List { .. },
+            ..
+        } => Some(("list", "nothing was listed")),
         _ => None,
     }
 }

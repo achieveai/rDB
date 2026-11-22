@@ -999,6 +999,10 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 - An app connected over a network link is not scoped by the node. **rDB's client and peer ports
   must never be reachable from sandbox or app networks.** Untrusted code reaches rDB only through
   your gateway. A node-side check of the certificate's app against the id is owed (#154).
+  Until it lands, a node refuses a delete (`Change::Delete`, alone or in a `txn`) and a list
+  from an app link not on its admin apps (`rdb_node --admin-apps`) with `INVALID_ARGUMENT`,
+  and nothing is deleted or listed; admin apps and nodes still send both. #154 replaces that
+  refusal with the scope check.
   rDB ships development and multihost-test config only: `docker/` (the `rdb-bf-node` image,
   whose Dockerfile `EXPOSE`s 7001-7004: the rEtcd voter's peer, client and gossip ports and its
   health port, which the voter binds to loopback only) and `scripts/docker-multihost.sh`, which
