@@ -136,8 +136,14 @@
      it, and no earlier write may still be in flight (below), nothing is written, so a
      restart with the same address changes nothing. Otherwise it puts node layout 2 at the
      revision it read: node, declared address and machine as they are. An open with no app
-     address writes nothing and keeps the stored one, unless an earlier write may still be in
-     flight (below): then it is refused, before any host starts, with the step to open again
+     address keeps the stored one. It skips the address write only on a settled folder: the
+     node's data exists and the folder holds no pending (`app-addr-pending`) or fence
+     (`app-addr-fence`) debt. On a new, wiped or owed folder (no data yet, or `app-addr-fence`
+     still there) it CASes the record's own bytes at the revision it read (an own-bytes fence,
+     below), and can be refused with `OpenError::Control` when the record cannot be read, is
+     absent, changed after the read, or the fence's outcome is unknown. While
+     `app-addr-pending` is there (an earlier write may still be in flight, below) it is
+     refused with `OpenError::Config`, before any host starts, with the step to open again
      with the address the node should hold. An address cannot be cleared: `None` keeps it,
      and an empty string is refused. An app address on an undeclared open is
      refused, and so is `rdb_node --app-addr` with `--form`, `--declare` or `--gen-certs`.

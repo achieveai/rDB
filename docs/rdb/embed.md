@@ -931,7 +931,15 @@ address to the node, so the address alone proves nothing:
   [Fencing your own side effects](#fencing-your-own-side-effects).
 
 **Upgrading from an earlier build.** `NodeAddresses` gained `app`: add `app: None` to an
-existing `NodeAddresses { listen, peers }`, which behaves as before. `RouteInfo` is no longer
+existing `NodeAddresses { listen, peers }`. That behaves as before, with no address write, only
+on a settled folder: the node's data exists and the folder holds neither `app-addr-pending`
+(pending debt) nor `app-addr-fence` (fence debt). On a new, wiped or owed folder (no data yet,
+or `app-addr-fence` still there), an open with `app: None` writes the node's record: it CASes
+the record's own bytes back at the revision it read (an own-bytes fence, above), so it keeps the
+stored address but moves the revision on, and it can be refused with `OpenError::Control` (the
+record cannot be read or is absent, it changed after the read, or the fence's outcome is
+unknown; open again). While `app-addr-pending` is there, it is refused with
+`OpenError::Config` (above). `RouteInfo` is no longer
 `Copy` (it owns the address): add `.clone()` where an answer is used after it moved, and
 match it with `..`. It can no longer be built with a struct literal outside rDB, since the
 address field is private: take it from `route` or `leader_of`. Its equality now includes the

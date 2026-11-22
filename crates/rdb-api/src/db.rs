@@ -283,8 +283,15 @@ pub struct DbConfig {
 /// What [`DbConfig::addresses`] holds.
 ///
 /// **Migration (#83 B2):** this struct gained [`Self::app`]. It is built by struct literal, so
-/// an existing `NodeAddresses { listen, peers }` no longer compiles: add `app: None`, which
-/// behaves exactly as before (nothing is written).
+/// an existing `NodeAddresses { listen, peers }` no longer compiles: add `app: None`. Only on a
+/// settled folder, where the node's data exists and the folder holds neither an
+/// `app-addr-pending` file (pending debt) nor an `app-addr-fence` file (fence debt), does that
+/// behave as before: no address write, and the stored address is kept. On a new, wiped or owed
+/// folder (no data yet, or `app-addr-fence` still there) an open with `None` writes the record:
+/// it CASes the record's own bytes back at the revision it read (an own-bytes fence), and is
+/// refused with [`OpenError::Control`] when the record cannot be read, is absent, changed
+/// after the read, or the fence's outcome is unknown. While `app-addr-pending` is there, an
+/// open with `None` is refused with [`OpenError::Config`]. See [`Self::app`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAddresses {
     /// The address the node's listener is bound to, `host:port`: its record's, or the same
