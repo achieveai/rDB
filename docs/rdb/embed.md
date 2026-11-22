@@ -387,19 +387,20 @@ record = 265 + for each put: value_len + id_len + zero_bytes_in_id + 65 + head +
 To size a cap, use the upper bound for every put: `value_len + id_len + zero_bytes_in_id + 71`.
 
 - 768 KiB of values (786,432 bytes) fits in any transaction of up to `MAX_OPS` (255) puts whose
-  ids are at most 955 bytes each, counting zero bytes twice. That bound comes to 1,048,327 bytes.
+  ids count at most 955 bytes each, with each zero byte counted twice: 955 bytes with no zero
+  byte, or fewer with some (an id of 955 zero bytes counts 1,910). That bound comes to
+  1,048,327 bytes.
 - The largest single value a put takes is `MAX_VALUE`, 1,044,480 bytes, for any id. A byte
   write over the bound is refused by the `Db` with `TOO_LARGE` before it is sent (see
   [Size limits](#size-limits)). So is a byte document one byte over: a `Change::Doc` that is
   one `Op::Replace(Value::Bytes(..))`, the shape a byte put writes.
 
-A `write` (`Change::Doc`, a map, a set or a list) one byte over the record is refused with
-`INVALID_ARGUMENT`, and nothing is written:
-
-| Over the limit | Refused by | Detail |
-|---|---|---|
-| One put, alone | the compile, with the kernel's `record_len` | `over the 1 MiB limit for the whole write` |
-| Only all the puts together | the kernel's admission check | `envelope_bytes` |
+A `write` of a map, a set, a list, or a `Change::Doc` that is not a byte document, one byte over
+the record, is refused by the compile, with the kernel's `record_len`, as `INVALID_ARGUMENT`
+(`over the 1 MiB limit for the whole write`), and nothing is written. A byte document over
+`MAX_VALUE` is `TOO_LARGE` instead (above). A `txn` whose puts fit one by one but not together
+is refused first by the `Db`'s upper-bound sum, as `TOO_LARGE` (`Limit::Write`), before the
+kernel's admission check (`envelope_bytes`) could see it.
 
 - The ack floor uses only the room a transaction leaves, so it is not part of the sum.
 - `write` (`Change::Doc`, maps, sets, lists and blob chunks) has the same limit, but its overhead
@@ -917,12 +918,15 @@ with `id` inside the scope. `next` is the last id when the page is full; pass it
 
 **Delete.** `write(workspace, id, Change::Delete, expect)` deletes any kind of object.
 
-- A document is one call. A larger map, set, list or blob is deleted in batches of up to 254
-  records: call again until `Ok(None)`. Between batches the object reads as valid or absent,
+- An object that fits one record is one call. Anything larger, including a document with
+  upload chunks under it, is deleted in batches of up to 254 records: call again until
+  `Ok(None)`. Between batches the object reads as valid or absent,
   never as damage: a map, set or list reads with fewer entries, and a blob reads as absent
   (its root goes first; the chunks left go in the next calls). A new object at that id never
   inherits old entries.
 - `expect: Some(Expected::Version(v))` makes every batch conditional on the root's version.
+  With no root left it is `ObjectAbsent`, even when only chunks remain, since they may be a
+  later upload's: finish a blob's leftover chunks with `expect: None`.
   `Some(Expected::Absent)` is `INVALID_ARGUMENT`. Nothing stored answers `Ok(None)`.
 - `delete_prefix(workspace, prefix, deadline)` deletes every object under `prefix`, upload
   chunks with no root included, and returns how many. **It is not atomic.** On an error,
