@@ -436,12 +436,14 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     expired on the owner's clock. It logs `heal_proceed_without` and leaves that copy out. A
     copy with a live grant is waited for: it may be alive with a slow link. A copy that has
     stopped no longer renews its grant. Its expiry can be proven only while the owner's clock
-    has an admissible bound (otherwise the heal waits, `no_clock_bound`); with one, it is
-    proven at most one grant lifetime plus the clock margins after the copy stopped, and the
-    heal's next look after that leaves it out. A copy that is alive keeps renewing its grant,
-    so while it renews and its link to the owner is missing there is no fixed wait. The wait
-    ends when the link comes up, or when the copy stops renewing and the owner proves its grant
-    expired. A copy with no grant record
+    has an admissible bound. With no bound established the heal waits as `no_clock_bound`;
+    with a sample that is too old or whose error is too wide it waits as
+    `copy_not_proven_down`. With an admissible bound the expiry is proven at most one grant
+    lifetime plus the clock margins after the copy stopped, and the heal's next look after
+    that leaves it out. A copy that is alive keeps renewing its grant, so while it renews and
+    its link to the owner is missing there is no fixed wait. The wait ends when the link comes
+    up, when the copy's grant is frozen, or when the copy stops renewing and the owner proves
+    its grant expired. A copy with no grant record
     is waited for one heal window (`no_grant_record`), then
     left out too (`evidence=no_grant_after_window`). That costs availability only, never an
     acknowledged write.
@@ -457,14 +459,18 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   - **Host crash or reboot:** the owner waits for every copy, as above, or for
     `admin forget-tail`. Writes are acknowledged before they are synced to disk (spec §5.2
     steps 3, 6 and 7), so after a crash the down copy may be the only one holding them.
-  - Every wait logs `heal_wait_all` with its reason: `os_boot_changed`, `os_boot_unknown`,
+  - Each attempt logs `heal_wait_all` with its first wait reason, and again when that reason
+    changes. The reasons: `os_boot_changed`, `os_boot_unknown`,
     `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`,
     `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record` or
     `no_clock_bound`. One more reason is not a wait: `decided_past_deadline`. Only a late
     **decision** gets it: the heal decided it may leave a copy out, but only after its
     attempt's deadline. That attempt acts on nothing and logs `heal_leave_out_expired`. A late
     **wait** keeps its own reason and logs `heal_wait_all`. Both end the attempt, and the heal
-    tries again by itself, with a new window: there is nothing to do. A `wait_ready` that times out names the latest reason.
+    tries again by itself, with a new window. After a late decision there is nothing to do.
+    After a late wait the new attempt waits for the same copy, so that copy must come back:
+    start node N, as the error says ("start node N, then open again"). A `wait_ready` that
+    times out names the latest reason.
   - How it tells: each copy's folder, `nodes/<n>`, holds an `os_boot` file with the OS boot id
     (`/proc/sys/kernel/random/boot_id`) once an open of that node has been ready with its heal
     done. Node processes that share one folder each keep their own. A first open, a missing,

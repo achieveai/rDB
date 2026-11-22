@@ -2698,8 +2698,10 @@ async fn member_boots(
                 &mut failed,
             )
             .await;
-            // PR #181 review: the grant reads may have used up the attempt's budget; acting
-            // now would leave `clear_until` none, and its `NotCleared` ends the heal.
+            // PR #181 review: the grant reads may have used up the attempt's budget. That
+            // matters for a wait: looking again then, with every copy known, would reach
+            // `clear_until` with no budget left, and its `NotCleared` ends the heal. (A
+            // non-empty left-out set gets a fresh clear window of its own.)
             let answered_late = tokio::time::Instant::now() >= deadline;
             match asked {
                 Ok(_) if answered_late => {
@@ -2882,7 +2884,8 @@ struct LeaveOut {
 
 impl LeaveOut {
     /// Logs `heal_proceed_without` for each partition left short of a copy. [`member_boots`]
-    /// calls it only for an answer it acts on, so each accepted decision logs once.
+    /// calls it only for an answer it acts on, so each accepted decision logs once per short
+    /// partition.
     fn log(&self, owner: NodeId) {
         for (partition, gone, present, majority) in &self.short {
             let evidence: Vec<&str> = self
