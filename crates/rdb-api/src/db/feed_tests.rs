@@ -2033,6 +2033,53 @@ fn f87_3_a_feed_call_dropped_unanswered_is_a_stopped_node() {
     assert_eq!(error.next_step(), None, "its own step only: {error:?}");
 }
 
+/// Review r7 (thread 4657364908): a feed call to a node in another process whose link drops
+/// the reply is not a stopped node: the node may have read. It is refused naming the link,
+/// "nothing was changed", with the link step, `UNAVAILABLE`, `RetryAfterRecovery`, no
+/// mutation, and never "nothing was read" or the stop step. Node 2 is reached through the
+/// links (a mailbox registered on them, which this `Db` does not run), read once and dropped.
+/// Cut: the dropped reply's local wording for every node, red (the stop step).
+/// Unit (~0.1 s): a `Db` built by hand.
+#[config_log::retcd_test]
+fn f87_3_a_feed_call_whose_link_drops_the_reply_names_the_link() {
+    let rt = runtime();
+    let (one, _one_mailbox) = NodeHandle::unanswered(OWNER);
+    let db = Db::by_hand(vec![one], store(), rt.handle(), Timeouts::default(), None);
+    let (tx, two_mailbox) = mpsc::channel();
+    db.links.register(NodeId(2), tx, BootId(1));
+    let dropper = std::thread::spawn(move || {
+        let taken = two_mailbox.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(taken, Ok(Msg::Client(_))),
+            "node 2 takes the feed call over the links"
+        );
+    });
+    let error = db
+        .changes(PARTITION, FeedCursor::START, 10, Source::Node(NodeId(2)))
+        .expect_err("the reply is lost");
+    dropper.join().expect("the dropper");
+    assert!(
+        error
+            .detail
+            .starts_with("the link to node 2 closed before its answer to the feed call came"),
+        "{error:?}"
+    );
+    assert!(error.detail.contains("nothing was changed"), "{error:?}");
+    assert!(!error.detail.contains("nothing was read"), "{error:?}");
+    assert!(!error.is_host_fault(), "{error:?}");
+    assert_eq!(
+        (error.kind, error.retry),
+        (ErrorKind::Unavailable, RetryRule::RetryAfterRecovery),
+        "{error:?}"
+    );
+    assert!(error.no_mutation, "{error:?}");
+    assert!(
+        error.detail.ends_with(crate::db::error::FEED_LINK_STEP),
+        "{error:?}"
+    );
+    assert_eq!(error.next_step(), None, "its own step only: {error:?}");
+}
+
 /// Review r3/r4/r5 (thread 4654680317): a feed call to a member that cannot take it keeps the
 /// cause, and gives a feed reader a step it can act on. Node 2's thread stops while its process
 /// stays up. From node 2's own process: "node 2's node thread has stopped", `UNAVAILABLE`,

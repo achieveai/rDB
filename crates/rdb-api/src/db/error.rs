@@ -149,6 +149,13 @@ pub(crate) const FEED_STOPPED_STEP: &str = "read from the owner or another membe
      (`Source::Owner`, or `Source::Node` of a member), or call this node again once it has \
      restarted";
 
+/// The step of a feed call whose link to a node in another process closed before the answer
+/// came (#170 review r7): the node may have read, but a feed call changes nothing. Its rule is
+/// `RetryAfterRecovery`: another copy can serve now, and this node once its link is up again.
+pub(crate) const FEED_LINK_STEP: &str = "read from the owner or another member now \
+     (`Source::Owner`, or `Source::Node` of a member), or call this node again once its link \
+     is up again";
+
 impl std::fmt::Display for ApiError {
     /// `NAME (detail; next: step)`, or `NAME (detail)` when the detail already ends with the
     /// step. See [`ApiError::explain`].
@@ -393,6 +400,7 @@ impl ApiError {
             || self.detail.ends_with(FEED_HISTORY_STEP)
             || self.detail.ends_with(FEED_OTHER_COPY_STEP)
             || self.detail.ends_with(FEED_STOPPED_STEP)
+            || self.detail.ends_with(FEED_LINK_STEP)
             || self.detail.ends_with(PROMOTE_ALIVE_STEP)
             || self.detail.ends_with(PROMOTE_FROZEN_STEP)
             || self.detail.ends_with(TAIL_HELD_NEW_WRITE)

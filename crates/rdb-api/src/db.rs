@@ -3401,8 +3401,10 @@ impl Db {
     /// dropped the call unanswered, as one that stops with the call still queued does, or one
     /// still mid-restart when the read timeout ends: the timeout covers the wait for the
     /// restart too (all `RetryAfterRecovery`: read another copy now, or that node once it has
-    /// restarted; after a failed restart, the refusal says so before that step). Every such
-    /// refusal has `no_mutation` set.
+    /// restarted; after a failed restart, the refusal says so before that step). A node in
+    /// another process whose link closed before its answer came may have read: that refusal
+    /// names the link, says nothing was changed, and is `RetryAfterRecovery` too: another copy
+    /// now, or that node once its link is up again. Every such refusal has `no_mutation` set.
     /// `INCOMPATIBLE_VERSION` when
     /// this build refuses the node's records because their format is one it does not read.
     /// An owner whose grant no longer admits, such as one a promote left out, refuses as a
@@ -3488,11 +3490,17 @@ impl Db {
                     {
                         Ok(answer) => Some(answer),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        // Review r6 (thread 4655953458): the node took the call but dropped it
+                        // Review r6 (thread 4655953458): a local node took the call but dropped it
                         // unread, as a thread that stops with it still queued does. The same rule
                         // as a clean stop's drain and a stopped thread: a feed call writes nothing.
+                        // Review r7: a remote node's link can close after it read, so that reply
+                        // names the link, not a stop.
                         Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
-                            error: feed_dropped(node),
+                            error: if self.runs(node) {
+                                feed_dropped(node)
+                            } else {
+                                feed_link_dropped(node)
+                            },
                             request: None,
                         }),
                     },
@@ -4819,6 +4827,7 @@ impl Db {
             return error;
         }
         if error.detail.ends_with(error::FEED_OTHER_COPY_STEP)
+            || error.detail.ends_with(error::FEED_LINK_STEP)
             || error.detail.ends_with(error::FEED_HISTORY_STEP)
         {
             return error;
@@ -6790,6 +6799,23 @@ fn feed_restarting(node: NodeId, wait: Duration) -> ApiError {
              nothing was read; next: {}",
             node.0,
             error::FEED_STOPPED_STEP
+        ),
+    );
+    error.retry = RetryRule::RetryAfterRecovery;
+    error.no_mutation = true;
+    error
+}
+
+/// The refusal of a feed call whose link to `node`, in another process, closed before its
+/// answer came (#170 review r7). The node may have read; a feed call changes nothing.
+fn feed_link_dropped(node: NodeId) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorKind::Unavailable,
+        format!(
+            "the link to node {} closed before its answer to the feed call came; nothing was \
+             changed; next: {}",
+            node.0,
+            error::FEED_LINK_STEP
         ),
     );
     error.retry = RetryRule::RetryAfterRecovery;
