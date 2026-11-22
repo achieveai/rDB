@@ -2820,7 +2820,8 @@ const MEMBER_LOOK_EVERY: Duration = Duration::from_millis(20);
 ///   no established bound proves nothing: `no_clock_bound`.
 ///
 /// The missing copies' grants are read at once, so an ask takes its slowest read, and judged
-/// in `missing` order: the first refusal is the answer, as with one read after another.
+/// in `missing` order: the first refusal is the answer. The reads see the store at different
+/// times, so what they observe can differ from one read after another.
 async fn leave_out(
     ctx: &HealCtx,
     found: &[(RecordMember, Option<BootId>)],
@@ -2874,10 +2875,14 @@ async fn leave_out(
     }
     // PR #181 review round 7: every missing copy's grant is read at once, so an ask costs its
     // slowest read, not their sum (six copies at 2.8 s each would pass a 16.2 s deadline).
-    // Each read is judged in `missing` order as soon as it and those before it are in, as one
-    // read after another would be, so the answer, the warnings and `failed` are the same. The
-    // first refusal ends the ask: the reads still in flight are dropped (each is a plain read,
-    // so dropping it changes nothing), and their nodes are judged by the next ask.
+    // The judgment order is kept: each read is judged in `missing` order once it and those
+    // before it are in, and the first refusal is the answer. What the reads observe is not
+    // that of one read after another, because they see the store at different times (round
+    // 8): if node 3's read takes 2.8 s and node 4's fails at once, with the store recovered
+    // before node 3's ends, a serial ask would read node 4 after the recovery, and this one
+    // reports its failure. The first refusal ends the ask: the reads still in flight are
+    // dropped (each is a plain read, so dropping it changes nothing), and their nodes are
+    // judged by the next ask.
     let mut reads: futures::stream::FuturesOrdered<_> = missing
         .iter()
         .map(|node| read_grant(ctx, NodeId(*node)))
@@ -10773,6 +10778,335 @@ mod tests {
             &mut BTreeMap::new(),
         ));
         assert_eq!(asked, Err("no_majority"));
+    }
+
+    /// How [`DropGets`] saw one node's scripted grant reads: started, ended, and dropped before
+    /// they ended.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct ReadsSeen {
+        started: u32,
+        ended: u32,
+        dropped: u32,
+    }
+
+    /// Counts a scripted read into [`ReadsSeen`]: `ended` once it finishes, `dropped` when its
+    /// future is dropped before then.
+    struct PendingRead {
+        seen: Arc<std::sync::Mutex<BTreeMap<u32, ReadsSeen>>>,
+        node: u32,
+        ended: bool,
+    }
+
+    impl Drop for PendingRead {
+        fn drop(&mut self) {
+            let mut seen = self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let counts = seen.entry(self.node).or_default();
+            if self.ended {
+                counts.ended += 1;
+            } else {
+                counts.dropped += 1;
+            }
+        }
+    }
+
+    /// A `MemStore` whose reads of each scripted grant take that grant's steps in order: sleep
+    /// the step's delay, then fail as `Unavailable` (`true`) or read. Every scripted read is
+    /// counted in `seen`, by node; a read once its steps are used up goes straight through,
+    /// uncounted.
+    struct DropGets {
+        inner: config_testkit::MemStore,
+        steps: std::sync::Mutex<BTreeMap<u32, std::collections::VecDeque<(Duration, bool)>>>,
+        seen: Arc<std::sync::Mutex<BTreeMap<u32, ReadsSeen>>>,
+    }
+
+    impl DropGets {
+        fn new(steps: impl IntoIterator<Item = (u32, Vec<(Duration, bool)>)>) -> Self {
+            Self {
+                inner: config_testkit::MemStore::new(),
+                steps: std::sync::Mutex::new(
+                    steps
+                        .into_iter()
+                        .map(|(node, steps)| (node, steps.into()))
+                        .collect(),
+                ),
+                seen: Arc::default(),
+            }
+        }
+
+        fn seen(&self, node: u32) -> ReadsSeen {
+            self.seen
+                .lock()
+                .expect("seen")
+                .get(&node)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ConfigStore for DropGets {
+        fn get<'a, 'b>(&'a self, request: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let scripted = (1..=8).find_map(|node| {
+                (request.key.as_ref() == ControlKey::Grant(NodeId(node)).encode().as_bytes())
+                    .then(|| {
+                        self.steps
+                            .lock()
+                            .expect("steps")
+                            .get_mut(&node)
+                            .and_then(std::collections::VecDeque::pop_front)
+                            .map(|step| (node, step))
+                    })
+                    .flatten()
+            });
+            let read = self.inner.get(request);
+            let Some((node, (delay, fail))) = scripted else {
+                return read;
+            };
+            self.seen
+                .lock()
+                .expect("seen")
+                .entry(node)
+                .or_default()
+                .started += 1;
+            let mut pending = PendingRead {
+                seen: Arc::clone(&self.seen),
+                node,
+                ended: false,
+            };
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                pending.ended = true;
+                drop(pending);
+                if fail {
+                    Err(ConfigError::Unavailable {
+                        reason: format!("node {node}'s grant read refused"),
+                    })
+                } else {
+                    read.await
+                }
+            })
+        }
+
+        fn list<'a, 'b>(&'a self, request: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.list(request)
+        }
+
+        fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.put(request)
+        }
+
+        fn delete<'a, 'b>(
+            &'a self,
+            request: DeleteRequest,
+        ) -> Reply<'b, config_core::MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.delete(request)
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn watch<'a, 'b>(
+            &'a self,
+            request: config_core::WatchRequest,
+        ) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            self.inner.watch(request)
+        }
+    }
+
+    /// PR #181 review round 8: a refusal in the middle of a batch of six concurrent grant reads.
+    /// Each partition pins [1, 2, x] for x of 3 to 8; nodes 3 to 8 are down with frozen
+    /// grants. In the first ask, nodes 3 to 5 read in 100 ms, node 6's read (the fourth) fails
+    /// at once, and nodes 7 and 8 take 10 s. The ask is refused at 100 ms (`grant_unread`), with
+    /// no proceed, and the reads of nodes 7 and 8, still pending, are dropped, not awaited. The
+    /// second ask is refused too (node 6 fails again), and the third reads every grant at once
+    /// and leaves all six out: one decision, one `heal_proceed_without` per partition, one wait
+    /// logged and one warning for the unchanged cause. Paused tokio time. Unit (~10 ms).
+    /// Cuts: the judgment goes on past a refusal: nodes 7 and 8 are awaited, the ask proceeds
+    /// without node 6 at 10 s, red; a refusal judged as proven: the first ask proceeds, no wait
+    /// is logged, red.
+    #[config_log::retcd_test]
+    fn r5_concurrent_grant_reads_refuse_and_drop_pending_suffix() {
+        const METHOD: &str = "r5_concurrent_grant_reads_refuse_and_drop_pending_suffix";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let quick = (Duration::from_millis(100), false);
+        let refused = (Duration::ZERO, true);
+        let slow = (Duration::from_secs(10), false);
+        let store = Arc::new(DropGets::new([
+            (3, vec![quick]),
+            (4, vec![quick]),
+            (5, vec![quick]),
+            (6, vec![refused, refused]),
+            (7, vec![slow]),
+            (8, vec![slow]),
+        ]));
+        let down: Vec<u32> = (3..=8).collect();
+        for node in &down {
+            let grant = r5_grant(*node, utc_now() + 3_600_000, true);
+            rt.block_on(store.inner.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(grant.node).encode()),
+                value: grant.encode(),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("the grant is written");
+        }
+        let within = Duration::from_millis(16_200);
+        let ctx = HealCtx {
+            partitions: (1..=6).map(PartitionId).collect(),
+            partition_count: 6,
+            within,
+            member_boot: Arc::new(|node| (node.0 <= 2).then_some(OPEN_2)),
+            ..r5_ctx(Arc::clone(&store) as Arc<dyn ConfigStore>)
+        };
+        let rooted: Vec<Vec<RecordMember>> = down.iter().map(|x| r5_members(&[1, 2, *x])).collect();
+        let pinned: Vec<RecordMember> = rooted[0][..2]
+            .iter()
+            .chain(rooted.iter().map(|members| &members[2]))
+            .copied()
+            .collect();
+        let (boots, took) = rt.block_on(async {
+            let start = tokio::time::Instant::now();
+            let boots = member_boots(&ctx, &pinned, &rooted, &[], start + within).await;
+            (boots, start.elapsed())
+        });
+        let boots = boots.unwrap_or_else(|e| panic!("the third ask leaves all six out: {e}"));
+        assert_eq!(
+            boots.left,
+            down.iter()
+                .map(|node| (NodeId(*node), UNLINKED_BOOT))
+                .collect::<Vec<_>>(),
+            "all six left out, by the third ask"
+        );
+        let counted = ReadsSeen {
+            started: 1,
+            ended: 1,
+            dropped: 0,
+        };
+        for node in [3, 4, 5] {
+            assert_eq!(store.seen(node), counted, "node {node}");
+        }
+        assert_eq!(
+            store.seen(6),
+            ReadsSeen {
+                started: 2,
+                ended: 2,
+                dropped: 0
+            },
+            "node 6 refused twice"
+        );
+        for node in [7, 8] {
+            assert_eq!(
+                store.seen(node),
+                ReadsSeen {
+                    started: 1,
+                    ended: 0,
+                    dropped: 1
+                },
+                "node {node}'s pending read is dropped, not awaited"
+            );
+        }
+        assert!(
+            took < Duration::from_secs(1),
+            "no 10 s read was waited for: {took:?}"
+        );
+        assert_eq!(r5_wait_reasons(METHOD), ["grant_unread"]);
+        assert_eq!(r5_lines(METHOD, "heal_copy_grant_unread").len(), 1);
+        let proceeds = r5_lines(METHOD, "heal_proceed_without");
+        assert_eq!(
+            proceeds.len(),
+            6,
+            "one decision, six partitions: {proceeds:?}"
+        );
+        assert!(
+            proceeds
+                .iter()
+                .all(|line| line["evidence"] == "grant_frozen"),
+            "{proceeds:?}"
+        );
+    }
+
+    /// PR #181 review round 8: two refused asks, then one that proves the copy down, send one
+    /// plan. Node 3 is down with a frozen grant, and its first two grant reads fail; the third
+    /// reads it. The heal sends one `HealLeftOut` for node 3 and one plan of nodes 1 and 2,
+    /// after one wait (`grant_unread`, logged once) and one proceed. Paused tokio time. Unit
+    /// (~10 ms). Cuts: a refusal judged as proven: no wait logged, red; the judgment goes on
+    /// past a refusal: each refused ask proceeds with no copy left out, three proceeds, red.
+    #[config_log::retcd_test]
+    fn r5_concurrent_two_refused_asks_then_one_plan() {
+        const METHOD: &str = "r5_concurrent_two_refused_asks_then_one_plan";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let store = Arc::new(DropGets::new([(
+            3,
+            vec![(Duration::ZERO, true), (Duration::ZERO, true)],
+        )]));
+        let (healed, sent, _) = r5_heal_on(
+            &rt,
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            Arc::default(),
+            false,
+            true,
+            OsBoot::Same,
+            OWNER,
+            r5_up_but(&[3]),
+            &[r5_grant(3, utc_now() + 3_600_000, true)],
+            HostClock::start(),
+            Duration::from_secs(2),
+        );
+        healed.unwrap_or_else(|e| panic!("the third ask leaves node 3 out: {e}"));
+        let plans = sent
+            .iter()
+            .filter(|msg| {
+                matches!(
+                    msg,
+                    Msg::Inject {
+                        kind: EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(_))),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(plans, 1, "one plan");
+        assert_eq!(r5_planned(&sent), [(1, OPEN_2), (2, OPEN_2)]);
+        let (_, left) = r5_left_out(&sent).expect("node 3 is left out");
+        assert_eq!(
+            left.iter().map(|m| (m.node, m.boot)).collect::<Vec<_>>(),
+            [(NodeId(3), UNLINKED_BOOT)]
+        );
+        assert_eq!(store.seen(3).started, 2, "two refused reads");
+        assert_eq!(r5_wait_reasons(METHOD), ["grant_unread"]);
+        assert_eq!(r5_lines(METHOD, "heal_copy_grant_unread").len(), 1);
+        assert_eq!(r5_lines(METHOD, "heal_proceed_without").len(), 1);
     }
 
     /// PR #181 review: a grant read that fails keeps its cause and its own reason,
