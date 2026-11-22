@@ -3204,10 +3204,12 @@ fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
 /// #202 (A-R196 narrowed, 2026-11-21), the host half of `Db::wait_ready`'s wait on a local
 /// owner: [`Host::boot_replan_pending`] through the whole #67 Wait 2 re-plan, and not after.
 /// As `m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once`, with node 1's next
-/// `DrainProof` lost (the seam [`Host::drain_proofs_to_lose`]), so the re-plan's revoke stays
-/// in flight while F1 is still `Blocked` on the old plan, with no mark: the window #202's trace
-/// fell into. Then `retry_blocked_rejoin` asks the revocation again under a new `since`, which
-/// is no boot re-plan, and the rejoin commits.
+/// two `DrainProof`s lost (the seam [`Host::drain_proofs_to_lose`]), so the re-plan's revoke
+/// stays in flight while F1 is still `Blocked` on the old plan, with no mark: the window #202's
+/// trace fell into. Then `retry_blocked_rejoin` asks the revocation again under a new `since`
+/// (`rejoin_revoke_retry`), which is no boot re-plan; its proof is lost too, so the row sees
+/// that state between steps (with one lost, the retry's proof lands and the rejoin commits
+/// in the same round). The next retry's proof lands and the rejoin commits.
 /// - mark held, F1 blocked on the planned plan: pending;
 /// - re-plan revoking, F1 still blocked, no mark: pending.
 ///   Cut: `boot_replan_pending` answers `false` for `Rejoin::Revoking`, red here;
@@ -3232,7 +3234,7 @@ fn m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced() {
         !trio.nodes[0].0.boot_replan_pending(p),
         "a drop plan is no boot re-plan"
     );
-    trio.nodes[0].0.drain_proofs_to_lose = 1;
+    trio.nodes[0].0.drain_proofs_to_lose = 2;
     let node = kept.1;
     restart_dead(&mut trio, kept);
     let reboot = trio.links.boot_of(NodeId(node)).expect("registered");
