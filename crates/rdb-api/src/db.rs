@@ -778,6 +778,14 @@ struct Opened {
     heal_waiting: Arc<Mutex<Option<String>>>,
     /// The failover planner's task ([`DbConfig::failover`]), aborted at shutdown.
     planner_task: Option<tokio::task::JoinHandle<()>>,
+    /// The `nodes/` watcher of a declared node process (#80 S4, [`admin::watch_members`]),
+    /// aborted at shutdown.
+    members_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set by the watcher to this process's node once its `nodes/` record is removed: the `Db`
+    /// is then [`Db::removed`] for good (#80 S4, S-5).
+    removed: Arc<std::sync::OnceLock<NodeId>>,
+    /// Whether [`Db::removed`] has stopped this process's nodes and tasks, so it does so once.
+    removed_stopped: AtomicBool,
     /// Node 1's recovery as the latest look at it found it, when stuck for this open
     /// (A-R200). Every refusal reads this instead of asking node 1 again.
     stuck: Mutex<Option<ReadyError>>,
@@ -872,6 +880,9 @@ impl Default for Opened {
             heal_settling: Arc::new(AtomicBool::new(false)),
             heal_waiting: Arc::new(Mutex::new(None)),
             planner_task: None,
+            members_task: None,
+            removed: Arc::new(std::sync::OnceLock::new()),
+            removed_stopped: AtomicBool::new(false),
             stuck: Mutex::new(None),
             control: None,
             instance: None,
@@ -888,7 +899,9 @@ impl Default for Opened {
     }
 }
 
-/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299).
+/// The least time between two reads of `partitions/1` by one `Db`'s route (A-R299). It bounds
+/// every trigger alike: a `NOT_PRIMARY` or `LEASE_EXPIRED` answer, a send the owner cannot take,
+/// and a call the owner does not answer in time (#80 S3).
 const OWNER_REREAD_GAP: Duration = Duration::from_millis(250);
 
 /// How long past a barrier's own timeout a `Db` waits for the owner to say so (#90).
@@ -899,8 +912,8 @@ const BARRIER_ANSWER_MARGIN: Duration = Duration::from_secs(1);
 struct Route {
     /// The node calls go to, per partition: index `p - 1`, one entry at N=1.
     owners: Vec<std::sync::atomic::AtomicU32>,
-    /// What a `NOT_PRIMARY` answer, or an owner that cannot be reached, re-reads `partitions/1`
-    /// with. `None`: the owner is fixed.
+    /// What a `NOT_PRIMARY` answer, an owner that cannot be reached, or one that does not answer
+    /// in time re-reads `partitions/1` with. `None`: the owner is fixed.
     refresh: Option<(Arc<dyn ConfigStore>, Handle)>,
     /// When `refresh` last read each partition's record, by partition number. A read within
     /// [`OWNER_REREAD_GAP`] of it is not made: the call goes on with the owner that read named
@@ -1101,13 +1114,6 @@ fn not_ready(status: &NodeStatus) -> Option<NotReady> {
                 .unwrap_or_else(|| NO_RECOVERY.to_owned()),
         )
     })
-}
-
-/// Whether a partition reported as `reason` may have moved to another owner by a promote this
-/// `Db` did not hear of: its owner cannot be reached, or answered without admitting. An owner
-/// that gave no answer at all is not one this tells anything about.
-const fn may_have_moved(reason: &NotReady) -> bool {
-    !matches!(reason, NotReady::NoAnswer)
 }
 
 /// The kind a node refused a call with, for a put's or a status look's error and a read's
@@ -1347,6 +1353,10 @@ async fn register_app_addr(
         .map_err(|error| refused(format!("read before the app address is written: {error}")))?
         .record
         .ok_or_else(|| refused("absent, so node's app address has no record".to_owned()))?;
+    // #80 S4: a removed record (layout 3) is terminal; nothing writes a live one over it.
+    if NodeRecord::decode_removed(&found.value).is_some_and(|(record, _)| record.node == node) {
+        return Err(refused(admin::removed_node_text(node)));
+    }
     let (record, held) = NodeRecord::decode_with_app(&found.value)
         .filter(|(record, _)| record.node == node)
         .ok_or_else(|| refused("not a node record this build reads".to_owned()))?;
@@ -1530,7 +1540,7 @@ async fn read_route(
 
 /// The app address `nodes/{node}` holds (#83 B2): `None` when the record is absent (a database
 /// formed in one process has none) or holds none (layout 1, or a node opened with no app
-/// address).
+/// address). #80 S4: a removed record (layout 3) keeps the address it held.
 async fn read_app_addr(
     store: &dyn ConfigStore,
     node: NodeId,
@@ -1540,6 +1550,7 @@ async fn read_app_addr(
         return Ok(None);
     };
     NodeRecord::decode_with_app(&found)
+        .or_else(|| NodeRecord::decode_removed(&found))
         .filter(|(record, _)| record.node == node)
         .map(|(_, app)| app)
         .ok_or_else(|| {
@@ -2348,6 +2359,12 @@ impl Db {
             storage: config.storage,
             retention,
         };
+        // #80 S4: a declared node process keeps its links' members the `nodes/` records.
+        let declared_net = config
+            .addresses
+            .as_ref()
+            .and(config.links.as_ref())
+            .and_then(|links| links.net());
         let mut db = Self::open_spawning(
             config,
             store,
@@ -2374,10 +2391,25 @@ impl Db {
         .await
         .map_err(open_refused)?;
         db.respawn = Some(respawn);
+        if let Some(net) = declared_net {
+            db.start_members(net);
+        }
         if let Some(failover) = failover {
             db.start_planner(failover);
         }
         Ok(db)
+    }
+
+    /// Start this declared node process's `nodes/` watcher ([`admin::watch_members`]).
+    fn start_members(&mut self, net: Arc<crate::net::Net>) {
+        let Some(PromoteStore(store, rt, _)) = self.opened.control.clone() else {
+            return;
+        };
+        let own = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        self.opened.members_task = Some(rt.spawn(tracing::Instrument::instrument(
+            admin::watch_members(store, net, own, Arc::clone(&self.opened.removed)),
+            tracing::Span::current(),
+        )));
     }
 
     /// Start the failover planner of this node process ([`DbConfig::failover`]).
@@ -2427,7 +2459,8 @@ impl Db {
     /// process runs no node, claims no folder, bootstraps and heals nothing. It reads the owner
     /// from `partitions/1`, counts one open on the instance that record names so its own request
     /// ids start above every earlier open's, and sends every call over `DbConfig::links`. A
-    /// `NOT_PRIMARY` answer makes it read the owner again. It keeps the store and `budgets`,
+    /// `NOT_PRIMARY` or `LEASE_EXPIRED` answer, an owner it cannot reach, or one that does not
+    /// answer in time makes it read the owner again. It keeps the store and `budgets`,
     /// the ones [`Self::open`] gives every open, so it can run [`Self::promote`] (A-R261).
     async fn open_app(
         config: DbConfig,
@@ -3716,6 +3749,13 @@ impl Db {
                 // owner `partitions/1` names now.
                 self.refresh_owner(partition);
             }
+            if looked == Err(Unlooked::NoAnswer) {
+                // A silent owner (paused, hung, or cut with its sockets open) keeps its link up
+                // and answers nothing, so it gives neither signal around this one. Read the
+                // owner again, within `OWNER_REREAD_GAP`, so a promote that moved the partition
+                // away from it is followed (#80 S3).
+                self.refresh_owner(partition);
+            }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
                     if let Some(next) = waiting.next() {
@@ -3844,17 +3884,19 @@ impl Db {
     }
 
     /// Every partition's state now, one entry each in partition order (issue #79 S3). An owner
-    /// with no link is `NoLink` at once; the rest share one read timeout. A partition with no
-    /// link, or whose owner answers without admitting, has its record read once more, at most
-    /// once per [`OWNER_REREAD_GAP`], so one moved by another process is asked at its new owner
-    /// rather than reported lost or fenced. An owner that does not answer is left as it is.
+    /// with no link is `NoLink` at once; the rest share one read timeout. Every partition that is
+    /// not ready has its record read once more, at most once per [`OWNER_REREAD_GAP`], so one
+    /// moved by another process is asked at its new owner rather than reported lost, fenced or
+    /// unanswered: an owner with no link, one that answers without admitting, and one that does
+    /// not answer at all (a silent owner, paused or hung with its sockets open, #80 S3) may each
+    /// have been promoted away by a process this `Db` did not hear from.
     #[must_use]
     pub fn readiness(&self) -> Vec<PartitionReady> {
         let all: Vec<PartitionId> = (1..=self.route.partitions()).map(PartitionId).collect();
         let mut seen = self.look_at(&all);
         let unadmitted: Vec<PartitionId> = seen
             .iter()
-            .filter(|ready| ready.reason.as_ref().is_some_and(may_have_moved))
+            .filter(|ready| !ready.ready)
             .map(|ready| ready.partition)
             .collect();
         self.refresh_owners(&unadmitted);
@@ -4171,7 +4213,15 @@ impl Db {
                 }
                 Some(answer)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            // A silent owner (paused, hung, or cut with its sockets open) gives no send error
+            // and no refusal: the call waits on a link that is still up. A timeout is the only
+            // signal, so it re-reads the owner too, and the caller's retry goes to the owner the
+            // record names now (#80 S3 R1s). It moves the route only: the answer is still
+            // `None`, so each caller reports its own timeout outcome as before.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.refresh_owner(partition);
+                None
+            }
             // The node dropped the call's waiter unanswered: not a timeout, so not the
             // timeout's outcome either (F-001).
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
@@ -4185,7 +4235,8 @@ impl Db {
         }
     }
 
-    /// After a `NOT_PRIMARY` answer, or a send the owner could not take (A-R287 P1), read the
+    /// After a `NOT_PRIMARY` or `LEASE_EXPIRED` answer, a send the owner could not take (A-R287
+    /// P1), or a call the owner did not answer in time (a silent owner, #80 S3), read the
     /// owner `partition`'s record names now, so the next call, or the caller's retry that
     /// `RefreshRoute` asks for, goes there (ruling A-R226 h2). Waits at most the read timeout.
     fn refresh_owner(&self, partition: PartitionId) {
@@ -4343,7 +4394,8 @@ impl Db {
     /// rEtcd's partition record (A-R399), which needs a link to rEtcd. An owner cut off from rEtcd
     /// cannot learn it, gives no `Ok` once its grant stops admitting, and ends at the timeout.
     /// `NOT_PRIMARY` or `LEASE_EXPIRED` from a node that does not own the partition now. On
-    /// either, this `Db` tries to re-read the owner from rEtcd, best effort: at most once per
+    /// either, and when the owner does not answer by `timeout` plus a second, this `Db` tries to
+    /// re-read the owner from rEtcd, best effort: at most once per
     /// partition every 250 ms and within the read timeout. A re-read inside that gap is skipped,
     /// one can fail or time out, and a `Db` whose route is fixed (one running every node itself)
     /// never re-reads. The route changes only after a re-read that succeeds, so only then does a
@@ -4356,6 +4408,9 @@ impl Db {
         written: (Generation, Seq),
         timeout: Duration,
     ) -> Result<(), ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let (generation, through) = written;
         let call = ClientCall::WaitDurable {
             generation,
@@ -4490,6 +4545,10 @@ impl Db {
         max: u32,
         source: Source,
     ) -> Result<FeedPage, ApiError> {
+        // #80 S4 (PR #244 review): a removed node's Db sends no feed request.
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if partition.0 == 0 || partition.0 > self.route.partitions() {
             return Err(ApiError::invalid(format!(
                 "partition {} is not one of this database's {}",
@@ -4918,6 +4977,7 @@ impl Db {
         deadline: Duration,
         wait: Duration,
     ) -> Result<Option<PutOk>, PutError> {
+        self.removed_write_refusal()?;
         match self.compile(identity, puts, deadline)? {
             Some(request) => self.send_compiled(identity, request, wait).map(Some),
             None => Ok(None),
@@ -5053,6 +5113,7 @@ impl Db {
 
     /// Send a write and wait `wait` for its answer.
     fn send(&self, call: ClientCall, wait: Duration) -> Result<PutOk, PutError> {
+        self.removed_write_refusal()?;
         let sent = match &call {
             ClientCall::Resend { request } => Some(request.clone()),
             _ => None,
@@ -5200,6 +5261,9 @@ impl Db {
     }
 
     fn read_call(&self, call: ClientCall) -> Result<ReadOk, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         // A read over a limit is refused before it reaches the owner's thread (M9 S5).
         if let Some(error) = read_refusal(&call) {
             return Err(error);
@@ -5664,6 +5728,9 @@ impl Db {
         request: RequestId,
         generation: Option<Generation>,
     ) -> Result<TxnStatus, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let identity = RequestIdentity {
             tenant: TENANT,
             client: self.client,
@@ -5840,6 +5907,9 @@ impl Db {
     }
 
     fn route_partition(&self, partition: PartitionId) -> Result<RouteInfo, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let mut info = self.route_record(partition)?;
         info.owner_address = self.owner_address(info.owner)?;
         Ok(info)
@@ -6164,6 +6234,9 @@ impl Db {
     /// `INVALID_ARGUMENT` for a partition this `Db` does not have, as
     /// [`Self::promote_partition`] refuses one. An empty list never means no such partition.
     pub fn node_status_in(&self, partition: PartitionId) -> Result<Vec<NodeStatus>, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if self.owner_of(partition).is_none() {
             return Err(ApiError::invalid(format!(
                 "partition {} is not one of this database's {} partitions",
@@ -6734,13 +6807,56 @@ impl Db {
         self.look_in(PARTITION, node)
     }
 
+    /// The timeouts this `Db` was opened with (#80 S4: `admin::drain` waits on `read`).
+    pub(crate) fn timeouts(&self) -> &Timeouts {
+        &self.timeouts
+    }
+
+    /// A fresh status request to each of `nodes`, each answered within `within` (#80 S4, for
+    /// [`admin::membership_settled`]): its status, or why not, naming `within`.
+    #[must_use]
+    pub fn fresh_looks(
+        &self,
+        nodes: &[NodeId],
+        within: Duration,
+    ) -> BTreeMap<NodeId, Result<NodeStatus, String>> {
+        // #80 S4 (PR #244 review): a removed node's Db sends no status request.
+        if let Some(error) = self.removed_refusal() {
+            return nodes
+                .iter()
+                .map(|node| (*node, Err(error.detail.clone())))
+                .collect();
+        }
+        nodes
+            .iter()
+            .map(|node| {
+                let looked = match self.look_within(PARTITION, *node, within) {
+                    Ok(status) => Ok(status),
+                    Err(Unlooked::NoLink) => Err("no link to it is up".to_owned()),
+                    Err(Unlooked::NoAnswer) => Err(format!("it did not answer within {within:?}")),
+                };
+                (*node, looked)
+            })
+            .collect()
+    }
+
     /// [`Self::look`] at `partition`'s state on `node`.
     fn look_in(&self, partition: PartitionId, node: NodeId) -> Result<NodeStatus, Unlooked> {
+        self.look_within(partition, node, self.timeouts.read)
+    }
+
+    /// [`Self::look_in`], answered within `within`.
+    fn look_within(
+        &self,
+        partition: PartitionId,
+        node: NodeId,
+        within: Duration,
+    ) -> Result<NodeStatus, Unlooked> {
         let (reply, answer) = mpsc::channel();
         self.send_to(node, Msg::Inspect { partition, reply })
             .map_err(|_| Unlooked::NoLink)?;
         let status = answer
-            .recv_timeout(self.timeouts.read)
+            .recv_timeout(within)
             .map_err(|_| Unlooked::NoAnswer)?;
         if partition == PARTITION && node == self.route.owner() {
             // review-s2 F-005: an owner in another process is not ended by a blocked recovery;
@@ -6969,6 +7085,13 @@ impl Db {
         to: NodeId,
         drop: Option<NodeId>,
     ) -> Result<admin::Promoted, admin::PromoteError> {
+        if let Some(node) = self
+            .removed()
+            .then(|| self.opened.removed.get().copied())
+            .flatten()
+        {
+            return Err(admin::PromoteError::Removed { node: node.0 });
+        }
         if self.owner_of(partition).is_none() {
             return Err(admin::PromoteError::NoSuchPartition {
                 partition: partition.0,
@@ -7119,6 +7242,9 @@ impl Db {
         node: NodeId,
         aside: Option<Aside>,
     ) -> Result<BootId, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
@@ -7449,6 +7575,9 @@ impl Db {
     /// the fence refuses restarts `node` on its own folder and says so. An `UNAVAILABLE` with
     /// `no_mutation` false when `node` restarted but is not pinned regular again in time.
     pub fn rebuild(&self, node: NodeId, wipe: bool) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("rebuild", "it runs on one partition only") {
             return Err(error);
         }
@@ -7503,6 +7632,9 @@ impl Db {
     /// As [`Self::rebuild`]'s guards, and `UNAVAILABLE` with the fence's reason when it does
     /// not hold. Nothing is moved either way; the folder stays where it is.
     pub fn rebuild_fence(&self, node: NodeId) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         let (owner, generation) = self.left_out(node)?;
         if let Some(refused) = self.wipe_fenced(node, generation, None) {
             return Err(rebuild_refused(admin::rebuild::Refused {
@@ -7539,6 +7671,9 @@ impl Db {
     /// `NOT_PRIMARY` when the node asked is not the owner; `UNAVAILABLE` when no answer came in
     /// the read timeout.
     pub fn move_copy(&self, from: NodeId, to: NodeId) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("move_copy", "it runs on one partition only") {
             return Err(error);
         }
@@ -7563,6 +7698,152 @@ impl Db {
         }
     }
 
+    /// #80 S4: [`Self::move_copy`] for any partition: ask `partition`'s owner to move its copy
+    /// on node `from` to node `to`, or say where that move stands. The owner refuses a target
+    /// that is not a live member of its links (no `nodes/` record it has applied), changing
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::move_copy`]; `INVALID_ARGUMENT`, nothing sent, for a partition this database
+    /// does not have.
+    pub fn move_copy_in(
+        &self,
+        partition: PartitionId,
+        from: NodeId,
+        to: NodeId,
+    ) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
+        let partitions = self.route.partitions();
+        if partition.0 == 0 || partition.0 > partitions {
+            let mut error = ApiError::invalid(format!(
+                "move_copy_in: partition {} is not one of this database's {partitions}; nothing \
+                 was sent",
+                partition.0
+            ));
+            error.no_mutation = true;
+            return Err(error);
+        }
+        match self.call(
+            partition,
+            ClientCall::Move {
+                identity: self.identity(),
+                from,
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(moved)) => Ok(moved),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a move was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the move in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
+    /// #80 S4 (A-R456 narrowed by the lead, 2026-11-21: refill): ask `partition`'s owner to add
+    /// a copy on node `to` while the partition has fewer than rf regular copies, or say where
+    /// that refill stands. Asking again resumes it. Before sending, this reads `nodes/` and
+    /// `partitions/{partition}` and refuses a `to` on the machine of a node that already holds
+    /// a copy, or with no `nodes/` record. That read can be stale; the owner re-checks, on its
+    /// own committed configuration, that `to` is not a member and that a slot is free, so a
+    /// stale read cannot place two copies in one slot.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT`, nothing sent, for a partition this database does not have, a `to`
+    /// with no `nodes/` record, or one on a used machine; `UNAVAILABLE` when the records do not
+    /// read in time; otherwise the owner's refusal, which ends with
+    /// [`error::REFILL_STEP`] and changed nothing.
+    pub fn refill_in(
+        &self,
+        partition: PartitionId,
+        to: NodeId,
+    ) -> Result<host::MoveAnswer, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
+        let partitions = self.route.partitions();
+        if partition.0 == 0 || partition.0 > partitions {
+            let mut error = ApiError::invalid(format!(
+                "refill_in: partition {} is not one of this database's {partitions}; nothing \
+                 was sent",
+                partition.0
+            ));
+            error.no_mutation = true;
+            return Err(error);
+        }
+        // The same budget the read had before #178 gave `control_read` a deadline.
+        let deadline = Instant::now() + self.timeouts.read;
+        let (nodes, members) = self.control_read(
+            "nodes/ and the partition record",
+            deadline,
+            move |store| async move {
+                let nodes = admin::read_nodes(&*store)
+                    .await
+                    .map_err(|error| RouteReadError::Unavailable(format!("nodes/: {error}")))?;
+                let (_, members) = admin::drain::record_of(&*store, partition)
+                    .await
+                    .map_err(RouteReadError::Unavailable)?;
+                Ok((nodes, members))
+            },
+        )?;
+        let refuse = |guard: &'static str, detail: String| {
+            tracing::warn!(partition = partition.0, to = to.0, guard, "refill_refused");
+            let mut error = ApiError::invalid(format!("{detail}; {}", error::REFILL_STEP));
+            error.no_mutation = true;
+            Err(error)
+        };
+        let Some(machine) = nodes.get(&to).map(|record| record.machine.clone()) else {
+            return refuse(
+                "no_record",
+                format!(
+                    "node {} has no nodes/ record: add it with `admin add-node`, then refill",
+                    to.0
+                ),
+            );
+        };
+        if let Some(holder) = members.iter().find(|member| {
+            member.node != to
+                && nodes
+                    .get(&member.node)
+                    .is_some_and(|record| record.machine == machine)
+        }) {
+            return refuse(
+                "machine",
+                format!(
+                    "node {} is on machine {machine:?}, where node {} already holds a copy of \
+                     partition {}: name a node on another machine",
+                    to.0, holder.node.0, partition.0
+                ),
+            );
+        }
+        match self.call(
+            partition,
+            ClientCall::Refill {
+                identity: self.identity(),
+                to,
+            },
+            self.timeouts.read,
+        ) {
+            Some(Answer::Moved(refilled)) => Ok(refilled),
+            Some(Answer::Error { error, .. }) => Err(error),
+            Some(other) => Err(ApiError::host(&format!(
+                "a refill was answered with {other:?}"
+            ))),
+            None => Err(ApiError::new(
+                ErrorKind::Unavailable,
+                format!("no answer to the refill in {:?}", self.timeouts.read),
+            )),
+        }
+    }
+
     /// Issue #105 (design section 8.1): `admin forget-tail`. Asks the owner to re-plan
     /// partition 1 once, giving up what `release` names: with `through`, every held tail at or
     /// below that seq; with `no_intact_copy`, the intact rule. `give_up_live_copy` allows giving
@@ -7581,6 +7862,9 @@ impl Db {
         release: rdb_core::contracts::recovery::TailRelease,
         give_up_live_copy: bool,
     ) -> Result<String, ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("forget_tail", "it runs on one partition only") {
             return Err(error);
         }
@@ -7614,6 +7898,9 @@ impl Db {
     pub fn pinned_members(
         &self,
     ) -> Result<(NodeId, Vec<rdb_core::contracts::membership::Member>), ApiError> {
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if let Some(error) = self.refuse_groupless("pinned_members", "it reads one partition only")
         {
             return Err(error);
@@ -7901,6 +8188,57 @@ impl Db {
         }
     }
 
+    /// Whether this process's node was removed from the database (#80 S4, S-5): its `nodes/`
+    /// record is removed, as the `nodes/` watcher of a declared node process saw it. Terminal:
+    /// it never turns false, and the id is never used again. The first call that finds it,
+    /// this one or any refused call, stops this process's nodes, planner and heal (logged
+    /// `db_removed`); from then on every call is refused `INVALID_ARGUMENT` with nothing sent.
+    /// So the host stops at the first call after the removal, and an embedder should poll
+    /// `removed()` or handle the refusal. Always false for a `Db` that runs no declared node.
+    pub fn removed(&self) -> bool {
+        let Some(node) = self.opened.removed.get().copied() else {
+            return false;
+        };
+        if !self.opened.removed_stopped.swap(true, Ordering::AcqRel) {
+            for task in [&self.opened.planner_task, &self.opened.heal_task]
+                .into_iter()
+                .flatten()
+            {
+                task.abort();
+            }
+            for handle in lock(&self.nodes).iter_mut() {
+                handle.stop();
+            }
+            tracing::warn!(node = node.0, "db_removed");
+        }
+        true
+    }
+
+    /// The refusal of every call once [`Self::removed`]: `INVALID_ARGUMENT`, nothing sent.
+    fn removed_refusal(&self) -> Option<ApiError> {
+        if !self.removed() {
+            return None;
+        }
+        let node = self.opened.removed.get().map_or(0, |node| node.0);
+        let mut error = ApiError::invalid(format!(
+            "node {node} was removed; ids are never reused: this Db serves nothing again, and \
+             nothing was sent"
+        ));
+        error.no_mutation = true;
+        Some(error)
+    }
+
+    /// [`Self::removed_refusal`] as a write's refusal, with no request.
+    fn removed_write_refusal(&self) -> Result<(), PutError> {
+        match self.removed_refusal() {
+            Some(error) => Err(PutError {
+                error,
+                request: None,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Stop every node and every control call. The control store stays the caller's.
     ///
     /// This does not stop the process links: call [`crate::net::Net::shutdown`] (or drop every
@@ -7909,6 +8247,9 @@ impl Db {
         if let Some(task) = self.opened.planner_task.take() {
             task.abort();
             tracing::info!("planner_stopped");
+        }
+        if let Some(task) = self.opened.members_task.take() {
+            task.abort();
         }
         if let Some(task) = self.opened.heal_task.take() {
             task.abort();
@@ -8036,9 +8377,10 @@ enum Carries {
 fn carries(call: &ClientCall) -> Carries {
     match call {
         ClientCall::Put { .. } | ClientCall::Resend { .. } => Carries::Write,
-        ClientCall::Move { .. } | ClientCall::Rebuild { .. } | ClientCall::ForgetTail { .. } => {
-            Carries::Admin
-        }
+        ClientCall::Move { .. }
+        | ClientCall::Refill { .. }
+        | ClientCall::Rebuild { .. }
+        | ClientCall::ForgetTail { .. } => Carries::Admin,
         ClientCall::Compile { .. }
         | ClientCall::Status { .. }
         | ClientCall::Get { .. }
@@ -8463,6 +8805,16 @@ async fn declared_open_refusal(
             admin::S1A_STORE
         )));
     }
+    // #80 S4: a removed node's own id is refused before the TLS and address checks, with the
+    // reused-id text rather than "absent" (it has a record, a removed one).
+    if let Some(why) = admin::own_removed_refusal(store, *node, &records)
+        .await
+        .map_err(nodes_refused)?
+    {
+        return Err(OpenError::Config(format!(
+            "{why}; nothing but its folder was created"
+        )));
+    }
     // #80 S2 ruling 1 (ADR-rdb-0024): records on another machine need a TLS control link.
     if let Some(why) = admin::control_tls_refusal(
         records
@@ -8496,12 +8848,17 @@ async fn declared_open_refusal(
             node.0
         )));
     };
+    // #80 S4 (S-4): a peer whose record is removed is skipped, not refused.
+    let removed = admin::read_removed_nodes(store)
+        .await
+        .map_err(nodes_refused)?;
     if let Some(refused) = admin::node_start_refusal(
         *node,
         &addresses.listen,
         &addresses.peers,
         Some(formation),
         &records,
+        &removed,
     ) {
         return Err(OpenError::Config(refused));
     }
@@ -8951,7 +9308,7 @@ fn seam_unanswered(node: NodeId, error: mpsc::RecvTimeoutError, waited: Duration
 
 /// How long the heal may wait for old grants to clear: a whole grant, its clock error and
 /// dispatch margin, and 10 s of slack for the store.
-fn heal_within(budgets: &Budgets) -> Duration {
+pub(crate) fn heal_within(budgets: &Budgets) -> Duration {
     Duration::from_millis(
         budgets
             .grant_millis
@@ -9376,6 +9733,7 @@ fn read_refusal(call: &ClientCall) -> Option<ApiError> {
         | ClientCall::Resend { .. }
         | ClientCall::Status { .. }
         | ClientCall::Move { .. }
+        | ClientCall::Refill { .. }
         | ClientCall::Rebuild { .. }
         | ClientCall::ForgetTail { .. }
         | ClientCall::WaitDurable { .. }
@@ -9635,9 +9993,11 @@ mod clock_guard_tests;
 #[cfg(test)]
 mod failover_tests;
 #[cfg(test)]
-mod formation_tests;
+pub(crate) mod formation_tests;
 #[cfg(test)]
 pub(crate) mod reopen_tests;
+#[cfg(test)]
+mod s80s3_tests;
 
 #[cfg(test)]
 mod rebuild_tests;
@@ -9653,6 +10013,9 @@ mod dedup_cap_tests;
 
 #[cfg(test)]
 mod feed_tests;
+
+#[cfg(test)]
+mod s80s4_tests;
 
 #[cfg(test)]
 mod tests {
@@ -13096,6 +13459,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
         // is, so a stub the host did not schedule within `Timeouts::read` does not fail it.
@@ -13186,6 +13550,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
         let remote = |blocked_looks: usize| {
@@ -13285,6 +13650,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
         lock(&db.nodes).clear();
@@ -13387,6 +13753,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
         // call. A reply later than `Timeouts::read` (1 s) lands on a look that already gave up,
@@ -13505,6 +13872,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
         // `timeouts.read` for it, so that is a wait: at 50 ms a loaded host's stub thread missed
@@ -14345,6 +14713,194 @@ mod tests {
         nodes.shutdown();
     }
 
+    /// #80 S3: nodes 1-3 in this process and an app-only `Db` beside them, then node 1 goes
+    /// silent and another process moves partition 1 to node 2 without telling the app. Silent
+    /// is a paused or hung host: node 1's mailbox is swapped for one that holds every message
+    /// unanswered, so the link stays up and nothing is refused. `partitions/1` is rewritten to
+    /// name node 2, as a promote by another process would. The app's put and read timeouts are
+    /// 300 ms, and it has waited out [`OWNER_REREAD_GAP`], so the first re-read is not skipped.
+    struct SilentOwner {
+        nodes: Db,
+        app: Db,
+        /// Node 1's swapped mailbox: held, so a message to it is taken and never answered.
+        held: mpsc::Receiver<Msg>,
+        /// The nodes' and the app's folders, kept until the row ends.
+        _dirs: [Box<dyn std::any::Any>; 2],
+        rt: tokio::runtime::Runtime,
+    }
+
+    impl SilentOwner {
+        fn new() -> Self {
+            let rt = runtime();
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            let dir = config_testkit::fs::temp_dir();
+            let nodes = rt
+                .block_on(Db::open_with(
+                    config(dir.path()),
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                    fast(),
+                ))
+                .expect("the nodes' open");
+            admits(&nodes, "after the nodes' open");
+            let app_dir = config_testkit::fs::temp_dir();
+            let app = rt
+                .block_on(Db::open(
+                    DbConfig {
+                        local: Vec::new(),
+                        links: Some(Arc::clone(nodes.links())),
+                        client: ClientId(2),
+                        timeouts: Timeouts {
+                            put: Duration::from_millis(300),
+                            read: Duration::from_millis(300),
+                            ..Timeouts::default()
+                        },
+                        ..config(app_dir.path())
+                    },
+                    Arc::clone(&store),
+                    rt.handle().clone(),
+                ))
+                .expect("the app-only open");
+            app.put(b"a", b"1", None)
+                .expect("app A's put while node 1 answers");
+
+            let (silent, held) = mpsc::channel();
+            let boot = nodes.links().boot_of(OWNER).expect("node 1's boot");
+            nodes.links().register(OWNER, silent, boot);
+            let key = ControlKey::Partition(PartitionId(1)).encode();
+            let found = rt
+                .block_on(store.get(config_core::GetRequest {
+                    key: Bytes::from(key.clone()),
+                }))
+                .expect("get partitions/1")
+                .record
+                .expect("partitions/1");
+            let record = PartitionRecord::decode(&found.value).expect("a partition record");
+            let root = PartitionRoot::decode(&found.value).expect("a rooted record");
+            rt.block_on(
+                store.put(config_core::PutRequest {
+                    key: Bytes::from(key),
+                    value: PartitionRecord {
+                        owner: NodeId(2),
+                        ..record
+                    }
+                    .encode_with(&root),
+                    expected_mod_revision: Some(found.mod_revision),
+                    dedup: None,
+                }),
+            )
+            .expect("put partitions/1 naming node 2");
+            assert_eq!(app.route.owner(), OWNER, "nobody told app A");
+            std::thread::sleep(OWNER_REREAD_GAP + Duration::from_millis(50));
+            Self {
+                nodes,
+                app,
+                held,
+                _dirs: [Box::new(dir), Box::new(app_dir)],
+                rt,
+            }
+        }
+
+        fn finish(self) {
+            let Self {
+                mut nodes,
+                mut app,
+                held,
+                _dirs,
+                rt,
+            } = self;
+            drop(held);
+            app.shutdown();
+            nodes.shutdown();
+            drop(rt);
+        }
+    }
+
+    /// #80 S3 (R1s found it): an app whose owner goes silent re-reads the owner after one
+    /// timed-out call, so its retry goes to the owner the record names now ([`SilentOwner`]).
+    /// A silent owner gives no send error and no refusal, so before this the route stayed on it
+    /// for as long as it was silent. The re-read moves the route only: the put still answers the
+    /// compile's own `UNAVAILABLE`, nothing sent.
+    /// Cut: `Db::call`'s timeout arm does not re-read; the route still names node 1, red,
+    /// observed 2026-11-20 (the other two `s80s3_` rows here stayed green).
+    /// Unit (~5 s: three node threads opened, then one 300 ms put timeout).
+    #[config_log::retcd_test]
+    fn s80s3_an_app_whose_owner_goes_silent_rereads_the_owner_after_one_timeout() {
+        let rig = SilentOwner::new();
+        let refused = rig
+            .app
+            .put(b"a", b"2", None)
+            .expect_err("node 1 answers nothing")
+            .error;
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "a compile that timed out sent nothing: {refused:?}"
+        );
+        assert!(
+            refused.detail.contains("nothing was sent"),
+            "the compile's own timeout text: {refused:?}"
+        );
+        assert_eq!(
+            rig.app.route.owner(),
+            NodeId(2),
+            "one timed-out call re-read the owner"
+        );
+        rig.finish();
+    }
+
+    /// #80 S3: `wait_ready` against a silent owner ([`SilentOwner`]) re-reads the owner after a
+    /// look nothing answered, so it goes on to look at the owner the record names now instead
+    /// of waiting on the silent one until `within` runs out. Node 2 is named but was never
+    /// recovered as owner, so the call may still time out; the row pins where it looks.
+    /// Cut: the wait-ready loop does not re-read on `Unlooked::NoAnswer`; the route still names
+    /// node 1 and the time-out names owner 1, phase "unknown", red, observed 2026-11-20.
+    /// Unit (~5 s: three node threads opened, then 1 s of looks).
+    #[config_log::retcd_test]
+    fn s80s3_wait_ready_on_a_silent_owner_rereads_the_owner() {
+        let rig = SilentOwner::new();
+        let waited = rig.app.wait_ready(Duration::from_secs(1));
+        tracing::info!(?waited, "s80s3_wait_ready_silent");
+        assert_eq!(
+            rig.app.route.owner(),
+            NodeId(2),
+            "a look nothing answered re-read the owner: {waited:?}"
+        );
+        if let Err(ReadyError::TimedOut { owner, .. }) = &waited {
+            assert_eq!(
+                *owner,
+                NodeId(2),
+                "the time-out names the owner looked at last"
+            );
+        }
+        rig.finish();
+    }
+
+    /// #80 S3: `readiness` with a silent owner ([`SilentOwner`]) reads the owner of a partition
+    /// nothing answered for, and reports the partition at the owner the record names now, not
+    /// `NoAnswer` at the silent one.
+    /// Cut: `readiness` leaves `NotReady::NoAnswer` out of the re-read; partition 1 is reported
+    /// `NoAnswer` at node 1, red, observed 2026-11-20.
+    /// Unit (~5 s: three node threads opened, then two 300 ms looks).
+    #[config_log::retcd_test]
+    fn s80s3_readiness_with_a_silent_owner_reports_the_owner_the_record_names() {
+        let rig = SilentOwner::new();
+        let seen = rig.app.readiness();
+        tracing::info!(?seen, "s80s3_readiness_silent");
+        assert_eq!(seen[0].partition, PartitionId(1), "{seen:?}");
+        assert_eq!(
+            seen[0].owner,
+            NodeId(2),
+            "partition 1 is looked at again: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].reason,
+            Some(NotReady::NoAnswer),
+            "node 2 answers: {seen:?}"
+        );
+        rig.finish();
+    }
+
     /// Ruling A-R200: while node 1's recovery is `Blocked` or `Quarantined`, a put's and a get's
     /// `UNAVAILABLE` keep their kind, retry rule and proof, and their detail adds the state and
     /// the one step that helps: the reopen step for `Blocked`, the A-R196(2b) text for
@@ -14388,6 +14944,7 @@ mod tests {
                 committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
                 tail_refused: None,
                 needs_operator: None,
+                members_revision: None,
             };
             let node_1 = std::thread::spawn(move || {
                 // Held, not dropped: a dropped waiter is a host fault, not a timeout (F-001).
@@ -15446,6 +16003,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         let looks = Arc::new(AtomicU64::new(0));
         let node_1 = {

@@ -944,6 +944,11 @@ pub enum WireCall {
         from: WireFeedCursor,
         max: u32,
     },
+    // #80 S4 (A-R456 narrowed: refill): added after main's variants, under protocol 13.
+    Refill {
+        identity: RequestIdentity,
+        to: NodeId,
+    },
 }
 
 impl WireCall {
@@ -960,7 +965,8 @@ impl WireCall {
             | Self::Move { identity, .. }
             | Self::Rebuild { identity, .. }
             | Self::ForgetTail { identity, .. }
-            | Self::Changes { identity, .. } => Some(*identity),
+            | Self::Changes { identity, .. }
+            | Self::Refill { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -981,6 +987,7 @@ impl WireCall {
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
             Self::Changes { .. } => "changes",
+            Self::Refill { .. } => "refill",
         }
     }
 }
@@ -1048,6 +1055,10 @@ impl TryFrom<&ClientCall> for WireCall {
             ClientCall::Rebuild { identity, node } => Self::Rebuild {
                 identity: *identity,
                 node: *node,
+            },
+            ClientCall::Refill { identity, to } => Self::Refill {
+                identity: *identity,
+                to: *to,
             },
             ClientCall::ForgetTail {
                 identity,
@@ -1133,6 +1144,7 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::Refill { identity, to } => Self::Refill { identity, to },
             WireCall::ForgetTail {
                 identity,
                 through,
@@ -2234,6 +2246,8 @@ pub struct WireNodeStatus {
     pub tail_refused: Option<WireTailRefused>,
     /// Added by #61's protocol version (rev 5 M1): the command an operator must run.
     pub needs_operator: Option<String>,
+    /// Added under protocol 13 (#80 S4): [`NodeStatus::members_revision`].
+    pub members_revision: Option<u64>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2350,6 +2364,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                 }
             }),
             needs_operator: status.needs_operator.clone(),
+            members_revision: status.members_revision,
         }
     }
 }
@@ -2414,6 +2429,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 .transpose()?,
             needs_operator: status.needs_operator,
             lengths: None,
+            members_revision: status.members_revision,
         })
     }
 }

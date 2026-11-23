@@ -447,6 +447,11 @@ fn calls() -> Vec<ClientCall> {
         from: feed_cursor(7),
         max: 12,
     });
+    // #80 S4 (PR #244 review): `admin refill`, its identity and target carried.
+    calls.push(ClientCall::Refill {
+        identity: identity(4, 37),
+        to: NodeId(5),
+    });
     calls
 }
 
@@ -734,6 +739,7 @@ fn status() -> NodeStatus {
             NodeId(3),
             rdb_core::contracts::ids::Seq(9),
         )),
+        members_revision: Some(41),
     }
 }
 
@@ -1915,6 +1921,46 @@ async fn r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_no
     .await;
 }
 
+/// #80 S4 (PR #244 review, net/mod.rs): as the move row, for `admin refill`: an app not on the
+/// admin list is refused `INVALID_ARGUMENT`, no_mutation, and node 1's node never sees the call.
+/// Cut: no `WireCall::Refill` arm in `sender_refused`, red: node 1's first message is the refill.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr244_a_refill_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Refill {
+            identity: identity(9, 1),
+            to: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(
+        "pr244_a_refill_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "refill",
+    );
+}
+
+/// #80 S4 (PR #244 review): the admin app's `admin refill` reaches node 1's node whole, and
+/// takes request 1, the control for the row above. Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr244_the_admin_app_reaches_the_owner_with_a_refill() {
+    let call = ClientCall::Refill {
+        identity: identity(9, 1),
+        to: NodeId(4),
+    };
+    let (got, _answer) = app_admin_call("admin", call.clone()).await;
+    let Msg::Client(Client { call: reached, .. }) = got else {
+        panic!("the admin app's refill reaches node 1's node: {got:?}");
+    };
+    assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+    let taken = client_requests("pr244_the_admin_app_reaches_the_owner_with_a_refill");
+    assert!(taken.contains(&(1, "refill".to_owned())), "{taken:?}");
+}
+
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
 /// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
 /// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its
@@ -2446,6 +2492,52 @@ async fn a_certificate_from_another_ca_gets_no_link() {
         "a certificate the peer rejects does not heal by waiting"
     );
     assert!(!matches!(one.net.states()[&NodeId(2)], LinkState::Up(_)));
+}
+
+/// #80 S4 M12 (T10): a node added at runtime gets its certificate from `certs::issue_node`
+/// on the operator's existing `--cert-dir`. Node 3, issued from the folder that signed nodes 1
+/// and 2, links to node 1 both ways. Node 3 issued from another folder's CA dials the same
+/// listener and is refused at once, naming the certificate, and node 1 never holds it up. The
+/// other-CA half is the same check as `a_certificate_from_another_ca_gets_no_link`, here
+/// for an issued certificate. Integration (~300 ms: real TLS on loopback).
+/// Cut: `issue_node` signs with a freshly generated CA key instead of `ca.key`: the issued
+/// node 3 is refused like a stranger, red, observed 2026-11-20.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn s80s4_a_node_certificate_from_another_ca_is_refused_by_the_listener() {
+    let dir = config_testkit::fs::temp_dir();
+    let ours = dir.path().join("ours");
+    let other = dir.path().join("other");
+    certs_for(&ours, &[1, 2]);
+    certs_for(&other, &[1, 2]);
+    certs::issue_node(&ours, NodeId(3)).expect("issue node 3 from our CA");
+    certs::issue_node(&other, NodeId(3)).expect("issue node 3 from another CA");
+    let one = side(Spec::node(1, &ours, &[2, 3]), true).await;
+    let addr = one.net.addr().expect("listening");
+
+    let stranger = side(Spec::node(3, &other, &[1]).dialling(1, addr), false).await;
+    let error = stranger
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect_err("another CA gets no link");
+    assert!(
+        error.contains("node 1: refused") && error.contains("certificate"),
+        "names the certificate: {error}"
+    );
+    assert!(!matches!(one.net.states()[&NodeId(3)], LinkState::Up(_)));
+    drop(stranger);
+
+    let added = side(Spec::node(3, &ours, &[1]).dialling(1, addr), false).await;
+    added
+        .net
+        .wait_up(&[NodeId(1)], PATIENCE)
+        .await
+        .expect("an issued node 3 links to node 1");
+    one.net
+        .wait_up(&[NodeId(3)], PATIENCE)
+        .await
+        .expect("node 1 sees node 3");
+    assert_eq!(one.links.boot_of(NodeId(3)), Some(BootId(33)));
 }
 
 /// M10 S2, found walking `lr up`: node 3's link came up while its `Db` was still opening, so
@@ -3261,6 +3353,8 @@ fn a_link_that_replaces_a_live_one_comes_up_and_the_routes_still_answer() {
                 last_error: None,
             },
         )])),
+        members: std::sync::Mutex::new(BTreeSet::from([NodeId(1), NodeId(2)])),
+        members_revision: std::sync::atomic::AtomicU64::new(0),
         conns: std::sync::Mutex::new(BTreeMap::new()),
         next_conn: std::sync::atomic::AtomicU64::new(0),
         rt: rt.handle().clone(),
@@ -3340,6 +3434,8 @@ fn a_call_that_reaches_send_while_its_link_closes_is_let_go_at_once() {
                 last_error: None,
             },
         )])),
+        members: std::sync::Mutex::new(BTreeSet::from([NodeId(1), NodeId(2)])),
+        members_revision: std::sync::atomic::AtomicU64::new(0),
         conns: std::sync::Mutex::new(BTreeMap::new()),
         next_conn: std::sync::atomic::AtomicU64::new(0),
         rt: rt.handle().clone(),
@@ -3628,6 +3724,8 @@ fn a_future_or_duplicate_clock_echo_is_not_a_round() {
         faults: Faults::new(),
         links: std::sync::Weak::new(),
         routes: std::sync::Mutex::new(BTreeMap::new()),
+        members: std::sync::Mutex::new(BTreeSet::from([NodeId(1), NodeId(2)])),
+        members_revision: std::sync::atomic::AtomicU64::new(0),
         conns: std::sync::Mutex::new(BTreeMap::new()),
         next_conn: std::sync::atomic::AtomicU64::new(0),
         rt: rt.handle().clone(),
