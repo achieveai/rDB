@@ -447,6 +447,11 @@ fn calls() -> Vec<ClientCall> {
         from: feed_cursor(7),
         max: 12,
     });
+    // #80 S4 (PR #244 review): `admin refill`, its identity and target carried.
+    calls.push(ClientCall::Refill {
+        identity: identity(4, 37),
+        to: NodeId(5),
+    });
     calls
 }
 

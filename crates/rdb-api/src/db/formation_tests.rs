@@ -302,7 +302,7 @@ fn fresh_dirs_of(k: u32) -> Vec<Folder> {
 
 /// Every record in `store`: key, value, create and mod revision, in key order. Equal snapshots
 /// mean nothing was written between them, an identical-byte rewrite included.
-fn snapshot(
+pub(crate) fn snapshot(
     rt: &tokio::runtime::Runtime,
     store: &dyn ConfigStore,
 ) -> Vec<(Bytes, Bytes, u64, u64)> {

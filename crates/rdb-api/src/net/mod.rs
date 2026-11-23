@@ -541,10 +541,11 @@ impl Net {
     /// Admit the live members the `nodes/` records name at `revision` (#80 S4, B-2): a node in
     /// `live` gets a route, so its handshake is welcomed and installed, and the clock guard
     /// counts its verdicts and takes K as the live members plus any id still linked (ruling
-    /// R8-7). A node outside `live` is refused at the handshake from now on. Retiring a member
-    /// (closing its links, K shrinking) is not done here yet: a record is never removed before
-    /// layout 3. This node is always a member of its own set. Logged `net_members_set` when the
-    /// set changes.
+    /// R8-7). A node outside `live` is refused at the handshake from now on, and is retired
+    /// here: its route goes, so it is dialled no more, its open links are closed, the clock
+    /// guard drops its verdict, and K shrinks to the members left (a layout 3 record,
+    /// `remove_node`). This node is always a member of its own set. Logged `net_members_set`
+    /// when the set changes.
     pub fn set_members(&self, live: &BTreeSet<NodeId>, revision: u64) {
         let shared = &self.shared;
         let own = match &shared.label {

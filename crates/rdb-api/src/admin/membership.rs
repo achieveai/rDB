@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
-    ConfigError, ConfigStore, GetRequest, ListRequest, MutationOutcome, PutRequest, WatchItem,
-    WatchRequest,
+    ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest, WatchItem, WatchRequest,
 };
 use rdb_core::authority::node::{machine_refusal, parse_addr, NodeRecord, MAX_ADDR_LEN};
 use rdb_core::authority::partition::{PartitionRecord, RecordMember};
@@ -19,7 +18,7 @@ use rdb_core::contracts::ids::NodeId;
 use tokio_stream::StreamExt;
 
 use super::{
-    control_tls_refusal, machine_clash, read_formation, read_nodes, read_nodes_at,
+    control_tls_refusal, list_whole, machine_clash, read_formation, read_nodes, read_nodes_at,
     read_removed_nodes, DeclareError,
 };
 use crate::net::Net;
@@ -569,26 +568,7 @@ pub fn add_member(
 
 /// The newest `mod_revision` among the `nodes/` records, removed ones included; 0 for none.
 async fn newest_nodes_revision(store: &dyn ConfigStore) -> Result<u64, DeclareError> {
-    let prefix = ControlPrefix::Nodes.encode();
-    let listed = store
-        .list(ListRequest {
-            prefix: Bytes::from_static(prefix.as_bytes()),
-            max_items: 0,
-            max_bytes: 0,
-        })
-        .await
-        .map_err(|error| DeclareError::Store {
-            step: format!("list {prefix}"),
-            error,
-        })?;
-    if listed.truncated {
-        return Err(DeclareError::Store {
-            step: format!("list {prefix}"),
-            error: ConfigError::Unavailable {
-                reason: format!("truncated at revision {}", listed.read_revision),
-            },
-        });
-    }
+    let listed = list_whole(store, ControlPrefix::Nodes).await?;
     Ok(listed
         .records
         .iter()
@@ -599,27 +579,7 @@ async fn newest_nodes_revision(store: &dyn ConfigStore) -> Result<u64, DeclareEr
 
 /// The partitions whose `partitions/` record names `node` owner or pins a copy on it.
 async fn pinning(store: &dyn ConfigStore, node: NodeId) -> Result<Vec<u32>, DeclareError> {
-    let prefix = ControlPrefix::Partitions.encode();
-    let step = || format!("list {prefix}");
-    let listed = store
-        .list(ListRequest {
-            prefix: Bytes::from_static(prefix.as_bytes()),
-            max_items: 0,
-            max_bytes: 0,
-        })
-        .await
-        .map_err(|error| DeclareError::Store {
-            step: step(),
-            error,
-        })?;
-    if listed.truncated {
-        return Err(DeclareError::Store {
-            step: step(),
-            error: ConfigError::Unavailable {
-                reason: format!("truncated at revision {}", listed.read_revision),
-            },
-        });
-    }
+    let listed = list_whole(store, ControlPrefix::Partitions).await?;
     let mut pinned = Vec::new();
     for found in &listed.records {
         let record =

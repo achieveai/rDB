@@ -526,7 +526,7 @@ fn put_lands(db: &Db, group: AffinityId, within: Duration) -> PutOk {
 }
 
 /// Wait on a condition a live system will reach: no fixed sleep decides the result.
-fn until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+pub(super) fn until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + crate::host::test_patience(within);
     while !done() {
         assert!(Instant::now() < deadline, "not within {within:?}: {what}");

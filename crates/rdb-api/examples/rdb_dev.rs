@@ -515,6 +515,10 @@
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
 //!
+//! Membership and placement (#80 S4): `admin add-node`, `admin remove-node`, `admin rebalance`,
+//! `admin drain` and `admin placement`. A bare `admin` line in a session prints every admin
+//! verb's usage, these included.
+//!
 //! `rdb_dev admin plan <inventory.json> [--max-moves K]` (M11, model only) starts nothing and
 //! talks to no cluster. It reads an inventory file (nodes, and where each partition's copies and
 //! primary are; format in `docs/rdb/placement-plan.md`), plans at most K steps (no limit without
@@ -2736,7 +2740,10 @@ const ADD_NODE_USAGE: &str = "admin add-node --addr <host:port> [--machine <labe
 /// does not yet work for a node run as rdb_node (#226).
 const REMOVE_NODE_USAGE: &str = "admin remove-node <n> [--unreachable-ok <m>]..: for a node run \
                                  as rdb_node, stop it, then remove-node <n> --unreachable-ok \
-                                 <n>; for an in-process Db, run admin drain <n> first";
+                                 <n>; for an in-process Db, run admin drain <n> first; \
+                                 either way n must own no partition and no partitions/ record \
+                                 may pin a copy on it (after a stop, wait until its copies are \
+                                 dropped)";
 
 /// `admin rebalance`'s usage (#80 S4 T12).
 const REBALANCE_USAGE: &str = "admin rebalance [--max-moves <k>]";
@@ -6230,10 +6237,18 @@ fn record_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore, verb: &st
                     let key = String::from_utf8_lossy(&record.key).into_owned();
                     let body = match prefix {
                         "partitions/" => partition_body(&record.value),
-                        "nodes/" => rdb_core::authority::node::NodeRecord::decode(&record.value)
-                            .map(|r| {
+                        // #80 S4 (PR #244 review): a removed record (layout 3) is `removed`,
+                        // apart from bytes nothing decodes.
+                        "nodes/" => {
+                            use rdb_core::authority::node::NodeRecord;
+                            let line = |r: NodeRecord| {
                                 format!("node={} addr={} machine={}", r.node.0, r.addr, r.machine)
-                            }),
+                            };
+                            NodeRecord::decode(&record.value).map(line).or_else(|| {
+                                NodeRecord::decode_removed(&record.value)
+                                    .map(|(r, _)| format!("removed {}", line(r)))
+                            })
+                        }
                         _ => GrantRecord::decode(&record.value).map(|r| format!("{r:?}")),
                     };
                     lines.push(format!(
@@ -10622,6 +10637,9 @@ mod tests {
     /// `partitions/` and the grants line goes red. Unit.
     /// #80 S1b: and `nodes/`, a node record decoded as its address and machine; a failed store
     /// gives one error line per prefix, now three.
+    /// #80 S4 (PR #244 review): a removed record (layout 3) prints `removed node=..`, and bytes
+    /// nothing decodes still print `<undecodable>`. Cut: no `decode_removed` arm; node 5's line
+    /// is `<undecodable>`, red.
     #[test]
     fn admin_status_lists_partitions_and_grants_through_the_given_store() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -10638,6 +10656,16 @@ mod tests {
             ("grants/2", Bytes::from_static(b"x")),
             ("other/3", Bytes::from_static(b"x")),
             ("nodes/4", node.encode()),
+            (
+                "nodes/5",
+                rdb_core::authority::node::NodeRecord {
+                    node: NodeId(5),
+                    addr: "127.0.0.5:7100".to_owned(),
+                    machine: "m5".to_owned(),
+                }
+                .encode_removed(Some("127.0.0.5:7200")),
+            ),
+            ("nodes/6", Bytes::from_static(b"x")),
         ] {
             rt.block_on(store.put(PutRequest {
                 key: Bytes::from(key),
@@ -10652,7 +10680,9 @@ mod tests {
             [
                 "partitions/1 rev=1 <undecodable>",
                 "grants/2 rev=2 <undecodable>",
-                "nodes/4 rev=4 node=4 addr=127.0.0.4:7100 machine=m4"
+                "nodes/4 rev=4 node=4 addr=127.0.0.4:7100 machine=m4",
+                "nodes/5 rev=5 removed node=5 addr=127.0.0.5:7100 machine=m5",
+                "nodes/6 rev=6 <undecodable>"
             ]
         );
         store.failing_with(config_core::ConfigError::Unavailable {

@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
-    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
+    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, ListResponse,
+    MutationOutcome, PutRequest,
 };
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
@@ -905,7 +906,28 @@ pub async fn read_nodes(
 pub async fn read_nodes_at(
     store: &dyn ConfigStore,
 ) -> Result<(BTreeMap<NodeId, NodeRecord>, u64), DeclareError> {
-    let prefix = ControlPrefix::Nodes.encode();
+    let listed = list_whole(store, ControlPrefix::Nodes).await?;
+    let mut records = BTreeMap::new();
+    for found in &listed.records {
+        let key = String::from_utf8_lossy(&found.key).into_owned();
+        if removed_at_key(&found.value, &key).is_some() {
+            continue;
+        }
+        let record = NodeRecord::decode(&found.value)
+            .filter(|record| ControlKey::Node(record.node).encode() == key)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        records.insert(record.node, record);
+    }
+    Ok((records, listed.read_revision))
+}
+
+/// Every record under `prefix`, in one list (#80 S4): [`DeclareError::Store`] when the store
+/// fails or truncates it, so no reader takes part of a prefix for the whole.
+pub(crate) async fn list_whole(
+    store: &dyn ConfigStore,
+    prefix: ControlPrefix,
+) -> Result<ListResponse, DeclareError> {
+    let prefix = prefix.encode();
     let listed = store
         .list(ListRequest {
             prefix: Bytes::from_static(prefix.as_bytes()),
@@ -925,18 +947,7 @@ pub async fn read_nodes_at(
             },
         });
     }
-    let mut records = BTreeMap::new();
-    for found in &listed.records {
-        let key = String::from_utf8_lossy(&found.key).into_owned();
-        if removed_at_key(&found.value, &key).is_some() {
-            continue;
-        }
-        let record = NodeRecord::decode(&found.value)
-            .filter(|record| ControlKey::Node(record.node).encode() == key)
-            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
-        records.insert(record.node, record);
-    }
-    Ok((records, listed.read_revision))
+    Ok(listed)
 }
 
 /// The node of `body` when it is a removed record (layout 3, #80 S4) for `key`'s node.
@@ -981,26 +992,7 @@ pub async fn own_removed_refusal(
 ///
 /// [`DeclareError::Store`] when the store fails or truncates the list.
 pub async fn read_removed_nodes(store: &dyn ConfigStore) -> Result<BTreeSet<NodeId>, DeclareError> {
-    let prefix = ControlPrefix::Nodes.encode();
-    let listed = store
-        .list(ListRequest {
-            prefix: Bytes::from_static(prefix.as_bytes()),
-            max_items: 0,
-            max_bytes: 0,
-        })
-        .await
-        .map_err(|error| DeclareError::Store {
-            step: format!("list {prefix}"),
-            error,
-        })?;
-    if listed.truncated {
-        return Err(DeclareError::Store {
-            step: format!("list {prefix}"),
-            error: ConfigError::Unavailable {
-                reason: format!("truncated at revision {}", listed.read_revision),
-            },
-        });
-    }
+    let listed = list_whole(store, ControlPrefix::Nodes).await?;
     Ok(listed
         .records
         .iter()

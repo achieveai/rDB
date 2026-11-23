@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use config_core::{ConfigStore, ListRequest};
+use config_core::ConfigStore;
 use rdb_core::authority::node::NodeRecord;
 use rdb_core::contracts::ids::NodeId;
 
@@ -16,6 +16,7 @@ use super::super::{
     NodeDecl,
 };
 use super::{add_node, AddNodeError};
+use crate::db::formation_tests::snapshot;
 use crate::test_store::{Script, Scripted, TlsReported};
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -37,26 +38,6 @@ fn declaration(k: u32) -> Declaration {
             .collect(),
         partitions: 16,
     }
-}
-
-/// Every key in `store`, with its value and revisions.
-fn snapshot(
-    rt: &tokio::runtime::Runtime,
-    store: &dyn ConfigStore,
-) -> Vec<(Bytes, Bytes, u64, u64)> {
-    let listed = rt
-        .block_on(store.list(ListRequest {
-            prefix: Bytes::from_static(b""),
-            max_items: 0,
-            max_bytes: 0,
-        }))
-        .expect("the store answers");
-    assert!(!listed.truncated, "a whole list");
-    listed
-        .records
-        .into_iter()
-        .map(|r| (r.key, r.value, r.create_revision, r.mod_revision))
-        .collect()
 }
 
 /// A store holding a declaration of nodes 1 to `k`.

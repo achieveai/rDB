@@ -5,6 +5,8 @@
 //! and node 6's process opens with peer addresses for nodes 1 to 5. Every node's `nodes/`
 //! watcher (`admin::watch_members`) admits node 6 on its links (`Net::set_members`).
 
+use super::failover_tests::until;
+use super::formation_tests::group_of;
 use super::reopen_tests::{config, fast, runtime};
 use super::*;
 use crate::net::faults::Faults;
@@ -210,23 +212,6 @@ fn five_ready_with(failover: Option<crate::planner::Failover>) -> (Rig, tokio::n
     (rig, six)
 }
 
-/// `true` within `within` (scaled by `RETCD_TEST_DEADLINE_SCALE`), polled every 20 ms.
-fn until(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + crate::host::test_patience(within);
-    while !done() {
-        assert!(Instant::now() < deadline, "not within {within:?}: {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// A group that maps to `partition` of `db`.
-fn group_in(db: &Db, partition: PartitionId) -> AffinityId {
-    (1..10_000)
-        .map(AffinityId)
-        .find(|group| db.partition_for(*group) == partition)
-        .expect("some group maps to every partition")
-}
-
 /// Put `object` in `group` through `db` until it lands. Just after a commit re-plans the
 /// partition, its owner refuses with nothing written (`UNAVAILABLE` or `PROTECTION_PAUSED`,
 /// `no_mutation`) until the new generation serves, and the retry rule says send again; as
@@ -380,7 +365,7 @@ fn admitted_with(failover: Option<crate::planner::Failover>) -> Admitted {
         },
     );
     tracing::info!(partition = partition.0, from = from.0, last = ?last, "s80s4_move_done");
-    let group = group_in(asker, partition);
+    let group = group_of(asker, partition.0);
     put_landing(asker, group, b"m7", b"after-the-add");
     let (_, members) = rig.record(partition);
     assert!(
@@ -459,7 +444,7 @@ fn s80s4_an_embedded_node_db_writes_to_a_new_owner_without_restart() {
         .promote_partition(partition, ADDED, Some(owner))
         .unwrap_or_else(|e| panic!("partition {} is promoted to node 6: {e}", partition.0));
     tracing::info!(?promoted, "s80s4_promoted");
-    let group = group_in(one, partition);
+    let group = group_of(one, partition.0);
     put_landing(one, group, b"m7b", b"on-node-6");
     assert_eq!(rig.record(partition).0.owner, ADDED);
     let route = one.route(group).expect("a route");
@@ -652,7 +637,7 @@ fn s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working
 
     let one = &rig.of(NodeId(1)).db;
     for p in 1..=PARTITIONS {
-        let group = group_in(one, PartitionId(p));
+        let group = group_of(one, p);
         one.route(group)
             .unwrap_or_else(|e| panic!("route answers for partition {p}: {e:?}"));
     }
@@ -1052,9 +1037,8 @@ fn s80s4_rebalance_after_adding_a_node_ends_with_copy_skew_at_most_one() {
         .collect();
     assert_eq!(machines.len(), 6, "six live nodes: {machines:?}");
     let one = &rig.of(NodeId(1)).db;
-    let groups: BTreeMap<u32, AffinityId> = (1..=PARTITIONS)
-        .map(|p| (p, group_in(one, PartitionId(p))))
-        .collect();
+    let groups: BTreeMap<u32, AffinityId> =
+        (1..=PARTITIONS).map(|p| (p, group_of(one, p))).collect();
     let check = |phase: &str| {
         for p in 1..=PARTITIONS {
             let (_, members) = rig.record(PartitionId(p));
@@ -1334,12 +1318,7 @@ fn drain_then_remove(failover: Option<crate::planner::Failover>) {
         || two.removed(),
     );
     for p in 1..=PARTITIONS {
-        put_landing(
-            one,
-            group_in(one, PartitionId(p)),
-            b"m11",
-            p.to_string().as_bytes(),
-        );
+        put_landing(one, group_of(one, p), b"m11", p.to_string().as_bytes());
     }
     tracing::info!(
         owned = ?owned,
