@@ -22,13 +22,14 @@
 //! [`clear_grant`] (M9 S2b) is the planner's other duty here: it removes the `grants/{node}`
 //! record a restarted node's old process left behind, through rdb-core's three guards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use config_core::{
-    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
+    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, ListResponse,
+    MutationOutcome, PutRequest,
 };
 use rdb_core::authority::clock::{expiry_proven, ClockView};
 use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
@@ -880,7 +881,10 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
         .transpose()
 }
 
-/// Every `nodes/{id}` record, by node (#80 S1b, ADR-rdb-0023); empty when none was written.
+/// Every live `nodes/{id}` record, by node (#80 S1b, ADR-rdb-0023); empty when none was
+/// written. #80 S4: a removed record (layout 3) is not live and is left out, not undecodable,
+/// so one removed node does not fail the list for every reader; [`read_removed_nodes`] names
+/// it.
 ///
 /// # Errors
 ///
@@ -890,7 +894,40 @@ pub async fn read_formation(store: &dyn ConfigStore) -> Result<Option<Formation>
 pub async fn read_nodes(
     store: &dyn ConfigStore,
 ) -> Result<BTreeMap<NodeId, NodeRecord>, DeclareError> {
-    let prefix = ControlPrefix::Nodes.encode();
+    read_nodes_at(store).await.map(|(records, _)| records)
+}
+
+/// [`read_nodes`], with the revision the list read at (#80 S4: the watcher's
+/// `members_revision`, and where its watch starts).
+///
+/// # Errors
+///
+/// As [`read_nodes`].
+pub async fn read_nodes_at(
+    store: &dyn ConfigStore,
+) -> Result<(BTreeMap<NodeId, NodeRecord>, u64), DeclareError> {
+    let listed = list_whole(store, ControlPrefix::Nodes).await?;
+    let mut records = BTreeMap::new();
+    for found in &listed.records {
+        let key = String::from_utf8_lossy(&found.key).into_owned();
+        if removed_at_key(&found.value, &key).is_some() {
+            continue;
+        }
+        let record = NodeRecord::decode(&found.value)
+            .filter(|record| ControlKey::Node(record.node).encode() == key)
+            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
+        records.insert(record.node, record);
+    }
+    Ok((records, listed.read_revision))
+}
+
+/// Every record under `prefix`, in one list (#80 S4): [`DeclareError::Store`] when the store
+/// fails or truncates it, so no reader takes part of a prefix for the whole.
+pub(crate) async fn list_whole(
+    store: &dyn ConfigStore,
+    prefix: ControlPrefix,
+) -> Result<ListResponse, DeclareError> {
+    let prefix = prefix.encode();
     let listed = store
         .list(ListRequest {
             prefix: Bytes::from_static(prefix.as_bytes()),
@@ -910,15 +947,57 @@ pub async fn read_nodes(
             },
         });
     }
-    let mut records = BTreeMap::new();
-    for found in &listed.records {
-        let key = String::from_utf8_lossy(&found.key).into_owned();
-        let record = NodeRecord::decode(&found.value)
-            .filter(|record| ControlKey::Node(record.node).encode() == key)
-            .ok_or_else(|| DeclareError::Undecodable { key: key.clone() })?;
-        records.insert(record.node, record);
+    Ok(listed)
+}
+
+/// The node of `body` when it is a removed record (layout 3, #80 S4) for `key`'s node.
+fn removed_at_key(body: &[u8], key: &str) -> Option<NodeId> {
+    NodeRecord::decode_removed(body)
+        .map(|(record, _)| record.node)
+        .filter(|node| ControlKey::Node(*node).encode() == key)
+}
+
+/// Why a removed node may not open or start again (#80 S4): "node N was removed; ids are never
+/// reused". Each refusal adds what it left undone.
+#[must_use]
+pub fn removed_node_text(node: NodeId) -> String {
+    format!("node {} was removed; ids are never reused", node.0)
+}
+
+/// Whether `node`'s own `nodes/` record is removed: the refusal of its open or start, before
+/// any other check ([`removed_node_text`]). Reads the store only when `records` (the live
+/// ones) lack `node`.
+///
+/// # Errors
+///
+/// As [`read_removed_nodes`].
+pub async fn own_removed_refusal(
+    store: &dyn ConfigStore,
+    node: NodeId,
+    records: &BTreeMap<NodeId, NodeRecord>,
+) -> Result<Option<String>, DeclareError> {
+    if records.contains_key(&node) {
+        return Ok(None);
     }
-    Ok(records)
+    Ok(read_removed_nodes(store)
+        .await?
+        .contains(&node)
+        .then(|| removed_node_text(node)))
+}
+
+/// The nodes whose `nodes/` record is removed (layout 3, #80 S4); their ids are never reused.
+/// [`read_nodes`] leaves them out. Other records are not read here.
+///
+/// # Errors
+///
+/// [`DeclareError::Store`] when the store fails or truncates the list.
+pub async fn read_removed_nodes(store: &dyn ConfigStore) -> Result<BTreeSet<NodeId>, DeclareError> {
+    let listed = list_whole(store, ControlPrefix::Nodes).await?;
+    Ok(listed
+        .records
+        .iter()
+        .filter_map(|found| removed_at_key(&found.value, &String::from_utf8_lossy(&found.key)))
+        .collect())
 }
 
 /// Why node `node` may not start with `listen` and `peers` on a database declared as
@@ -927,13 +1006,20 @@ pub async fn read_nodes(
 /// it with `DbConfig::addresses` before it creates `nodes/` or writes anything.
 ///
 /// - No formation record: `None`; an undeclared database has no node records.
-/// - `node` not among the declared nodes: refused.
+/// - `node` neither in the formation record nor in a `nodes/` record: refused. A node added
+///   at runtime (#80 S4, `admin::add_node`) is in the records only, and is declared.
 /// - No `nodes/` record at all: an S1a store, refused with [`S1A_STORE`].
 /// - `node`'s record absent: refused.
 /// - `listen` must be its record's address, or the same port on the wildcard host (`0.0.0.0`,
 ///   `::`).
 /// - Every `peers` entry, this node's included, must be its node's record's address, and every
-///   declared node other than `node` must have one.
+///   recorded node with a **lower** id than `node` must have one: `node` dials those. A node
+///   with a higher id dials `node`, so it may be left out (#80 S4, ADR-rdb-0025): a node added
+///   after this one's `--peers` was written does not stop it starting.
+/// - A `peers` entry naming a node in `removed` (its record is removed) is skipped with a warn,
+///   `start_peer_removed_skipped`, and a removed node is not one that must be given, though
+///   every live lower id still is (S-4). A peer that is neither live nor removed is still
+///   refused. The caller dials none of them.
 ///
 /// Each refusal that compares a value with a record names the record (`nodes/N`) and both
 /// values.
@@ -944,11 +1030,25 @@ pub fn node_start_refusal(
     peers: &BTreeMap<NodeId, String>,
     formation: Option<&Formation>,
     records: &BTreeMap<NodeId, NodeRecord>,
+    removed: &BTreeSet<NodeId>,
 ) -> Option<String> {
     const NOTHING: &str = "nothing was started";
     let formation = formation?;
-    let declared = || formation.nodes.iter().map(|n| n.0).collect::<Vec<_>>();
-    if !formation.nodes.contains(&node) {
+    // #80 S4: the formation record's nodes and every node added since, which has a record,
+    // less the removed ones (S-4: a removed id is dropped from the next start's `--peers`).
+    let declared = || {
+        let mut all: Vec<u32> = formation
+            .nodes
+            .iter()
+            .chain(records.keys())
+            .filter(|n| !removed.contains(n))
+            .map(|n| n.0)
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    };
+    if !formation.nodes.contains(&node) && !records.contains_key(&node) {
         return Some(format!(
             "node {} is not declared: the database declares nodes {:?}; {NOTHING}",
             node.0,
@@ -981,6 +1081,15 @@ pub fn node_start_refusal(
         ));
     }
     for (peer, addr) in peers {
+        if removed.contains(peer) {
+            tracing::warn!(
+                node = node.0,
+                peer = peer.0,
+                %addr,
+                "start_peer_removed_skipped"
+            );
+            continue;
+        }
         let Some(record) = records.get(peer) else {
             return Some(format!(
                 "peer address {}={addr} names node {}, which has no {}: the database declares \
@@ -1000,15 +1109,17 @@ pub fn node_start_refusal(
             ));
         }
     }
-    for declared_node in &formation.nodes {
-        if *declared_node != node && !peers.contains_key(declared_node) {
+    for declared_node in declared().into_iter().map(NodeId) {
+        if declared_node < node && !peers.contains_key(&declared_node) {
             let addr = records
-                .get(declared_node)
+                .get(&declared_node)
                 .map_or("no address", |record| record.addr.as_str());
             return Some(format!(
-                "no peer address for node {}, which {} records at {addr}; {NOTHING}",
+                "no peer address for node {}, which {} records at {addr}: node {} dials every \
+                 node with a lower id; {NOTHING}",
                 declared_node.0,
-                key(*declared_node)
+                key(declared_node),
+                node.0
             ));
         }
     }
@@ -4022,6 +4133,16 @@ pub enum PromoteError {
         /// The partition.
         partition: u32,
     },
+    /// This process's node was removed from the database (#80 S4, S-5), so its `Db` promotes
+    /// nothing again. Nothing was changed.
+    #[error(
+        "node {node} was removed; ids are never reused: this Db serves nothing again, and \
+         nothing was changed"
+    )]
+    Removed {
+        /// The removed node.
+        node: u32,
+    },
     /// The node to drop is the node to promote.
     #[error(
         "the node to drop is the node to promote; drop another member, or name none to drop the \
@@ -4190,6 +4311,7 @@ impl PromoteError {
                 | Self::NotAMember { .. }
                 | Self::AlreadyOwner { .. }
                 | Self::DropIsTarget
+                | Self::Removed { .. }
                 | Self::PeersUnknown { .. }
                 | Self::Unconfigured { .. }
                 | Self::StaleMembers { .. }
@@ -4215,6 +4337,7 @@ impl From<PromoteError> for ApiError {
             | PromoteError::NotAMember { .. }
             | PromoteError::AlreadyOwner { .. }
             | PromoteError::DropIsTarget
+            | PromoteError::Removed { .. }
             | PromoteError::NoSuchPartition { .. } => return Self::invalid(error.to_string()),
             PromoteError::Record(_)
             | PromoteError::Unconfigured { .. }
@@ -5498,7 +5621,18 @@ async fn freeze(
     }
 }
 
+pub mod balance;
+pub mod drain;
+pub mod membership;
 pub(crate) mod rebuild;
+
+pub use balance::{inventory, rebalance, RebalanceOpts, RebalanceReport};
+pub use drain::{drain, freeze_grant, DrainReport};
+
+pub use membership::{
+    add_member, add_node, membership_settled, remove_member, remove_node, watch_members,
+    AddNodeError, RemoveNodeError, MIN_MACHINES,
+};
 
 #[cfg(test)]
 mod tests {
@@ -6510,18 +6644,42 @@ mod tests {
             (3, "127.0.0.3:7100"),
         ]);
         let three = NodeId(3);
-        assert_eq!(node_start_refusal(three, "x", &good, None, &records), None);
         assert_eq!(
-            node_start_refusal(three, "127.0.0.3:7100", &good, Some(&formation), &records),
+            node_start_refusal(three, "x", &good, None, &records, &BTreeSet::new()),
             None
         );
         assert_eq!(
-            node_start_refusal(three, "0.0.0.0:7100", &good, Some(&formation), &records),
+            node_start_refusal(
+                three,
+                "127.0.0.3:7100",
+                &good,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
+            None
+        );
+        assert_eq!(
+            node_start_refusal(
+                three,
+                "0.0.0.0:7100",
+                &good,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
             None
         );
         let others = peers(&[(1, "127.0.0.1:7100"), (2, "127.0.0.2:7100")]);
         assert_eq!(
-            node_start_refusal(three, "127.0.0.3:7100", &others, Some(&formation), &records),
+            node_start_refusal(
+                three,
+                "127.0.0.3:7100",
+                &others,
+                Some(&formation),
+                &records,
+                &BTreeSet::new()
+            ),
             None,
             "--peers need not name this node"
         );
@@ -6621,7 +6779,14 @@ mod tests {
                 vec!["no peer address for node 2", "nodes/2", "127.0.0.2:7100"],
             ),
         ] {
-            let refused = node_start_refusal(node, listen, &given, Some(&formation), &held);
+            let refused = node_start_refusal(
+                node,
+                listen,
+                &given,
+                Some(&formation),
+                &held,
+                &BTreeSet::new(),
+            );
             let Some(text) = refused else {
                 panic!("{what}: refused");
             };
@@ -7510,6 +7675,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         }
     }
 
@@ -8006,6 +8172,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            members_revision: None,
         };
         for (qualifying_copy, clock_bound_lost) in
             [(None, true), (Some(true), false), (Some(false), true)]
