@@ -30,6 +30,9 @@ install).
    (parent, `base`) and seals `g-1`. O(1). `durable` is not inherited, as in the oracle.
 4. **Tombstones.** A delete in a lineage **with a parent** writes a tombstone in `g`'s prefix. A lineage
    with no parent uses a plain RocksDB `Delete`. A tombstone reads as absent and stops the walk.
+   *Narrowed by issue #61 S5a:* a delete in a linked lineage writes a tombstone only when the read
+   walk from the first link reaches a value for the key; otherwise it is a plain `Delete` too, and
+   no row is left. One point read per level reached, paid only by deletes on linked lineages.
 5. **What falls through:** the five contract namespaces (`User`, `History`, `Dedup`, `Progress`, `Meta`),
    as `replay_into` does. `History` falls through only for `seq ≤ base`. Engine-private records
    (ns `0xFF`) never do. Nothing crosses partitions; a split child (§10.3) is a copy, not an inherit.

@@ -5293,6 +5293,7 @@ impl Fence {
                 boot,
                 partitions,
                 nodes,
+                host::HistoryRetention::DEFAULT,
             )
         };
         let opened = rt.block_on(Db::open_spawning(
@@ -6200,6 +6201,7 @@ fn open_counted(rig: &Rig, node: NodeId, dir: &Path, app: Option<&str>) -> Resul
             boot,
             partitions,
             nodes,
+            host::HistoryRetention::DEFAULT,
         )
     };
     let opened = rt.block_on(Db::open_spawning(

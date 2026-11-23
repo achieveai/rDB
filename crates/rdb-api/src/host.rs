@@ -83,7 +83,6 @@ use rdb_core::replication::{wire, Replication};
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::dedup::DedupIndex;
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
-#[cfg(debug_assertions)]
 use rdb_storage::TrimFloor;
 use rdb_storage::{
     InheritError, Inherited, PublishMark, RocksEngine, RocksSnapshot, StorageOptions,
@@ -112,6 +111,9 @@ mod dedup_fill;
 use dedup_fill::{Crossed, Fill};
 pub mod snapshot;
 use snapshot::{SnapshotChunk, SnapshotOffer, SnapshotOfferRefused, SnapshotPull};
+mod retention;
+pub(crate) use retention::HistoryRetention;
+use retention::{RetentionState, RETENTION_DUTY_MILLIS};
 
 /// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
 /// (`rdb_sim` tests, `support::scenarios::run::BOOT`). `Db::restart_node` starts a node again
@@ -1683,6 +1685,8 @@ pub struct NodeStatus {
     /// past the history floor that only `admin forget-tail` can give up. On that copy, from its
     /// own `tail_held` refusal of an offer; on the owner, from a refusal it heard and no
     /// forget-tail has released yet. Names the copy, its node, `H` and the full command.
+    /// It can instead carry budget advice: on a source that gave a copy up after the history
+    /// budget overran its transfers ([`rdb_core::replication::retention::needs_history_budget`]).
     /// `None` while nothing needs one. Crosses the wire.
     pub needs_operator: Option<String>,
     /// The `nodes/` revision this node's membership watcher last applied
@@ -1709,6 +1713,17 @@ pub struct IndexLengths {
     /// Issue #61: the trim floor of this copy's newest lineage of the partition, the lowest seq
     /// whose History record it keeps. 0 while it was never trimmed, or holds no lineage.
     pub history_floor: u64,
+    /// Issue #61 S3: the logical bytes of History this copy's newest lineage of the partition
+    /// keeps, from its trim floor through its applied head (an estimate, R25). 0 when it holds
+    /// no lineage.
+    pub history_bytes: u64,
+    /// Issue #149: the rungs of this node's kept inventory ladder of the partition, the one
+    /// an inventory answer extends instead of reading every record again.
+    pub inventory_rungs: usize,
+    /// Issue #149: the bytes in use in this node's block cache, shared by every partition, so
+    /// each partition reports the same number. `None` when the engine could not say, logged
+    /// `block_cache_unread`.
+    pub block_cache_bytes: Option<u64>,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -1836,6 +1851,7 @@ pub fn spawn(
         StorageOptions::default(),
         1,
         crate::db::ALL_NODES.into(),
+        HistoryRetention::DEFAULT,
     )
 }
 
@@ -1859,6 +1875,7 @@ pub(crate) fn spawn_with(
     storage: StorageOptions,
     partitions: u32,
     nodes: Arc<[NodeId]>,
+    retention: HistoryRetention,
 ) -> Result<NodeHandle, String> {
     // The open's storage options, on a restart too (A-R253).
     let engine = RocksEngine::open_with(&dir, storage)
@@ -1876,6 +1893,7 @@ pub(crate) fn spawn_with(
         boot,
         partitions,
         nodes,
+        retention,
     )
 }
 
@@ -1896,6 +1914,7 @@ pub(crate) fn spawn_on(
     boot: BootId,
     partitions: u32,
     nodes: Arc<[NodeId]>,
+    retention: HistoryRetention,
 ) -> Result<NodeHandle, String> {
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone(), boot);
@@ -1909,6 +1928,7 @@ pub(crate) fn spawn_on(
     host.live_readd.on = live_readd;
     host.partition_count = partitions;
     host.nodes = nodes;
+    host.history_retention = retention;
     host.transaction = Transaction::with_limits(limits);
     // In crate tests the node thread logs under the opener's span, so a `#[retcd_test]` row
     // reads its own nodes' lines from its own file rather than the shared untagged one.
@@ -2134,9 +2154,7 @@ struct KeptLadder {
 struct InventoryPin {
     /// Held until this node lands a generation newer than this one.
     generation: Generation,
-    /// When it was taken: it expires [`Host::inventory_pin_millis`] later. Read only by the
-    /// trim, which is debug-only until the snapshot transfer (issue #61 PR-A).
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    /// When it was taken: it expires [`Host::inventory_pin_millis`] later.
     since: Tick,
 }
 
@@ -3561,10 +3579,14 @@ struct Host {
     /// node lands a newer generation, or after [`Self::inventory_pin_millis`] (logged
     /// `inventory_pin_expired`). No byte cap overrides it.
     inventory_pins: BTreeMap<PartitionId, InventoryPin>,
-    /// Issue #61: how long an inventory pin holds at most ([`INVENTORY_PIN_MILLIS`]). Read only by
-    /// the trim, which is debug-only until the snapshot transfer.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    /// Issue #61: how long an inventory pin holds at most ([`INVENTORY_PIN_MILLIS`]).
     pub(crate) inventory_pin_millis: u64,
+    /// Issue #61 S3: this node's `history_keep` and `history_budget_bytes`.
+    pub(crate) history_retention: HistoryRetention,
+    /// Issue #61 S3: each held partition's retention state (`host::retention`).
+    retention: BTreeMap<PartitionId, RetentionState>,
+    /// When the retention duty runs next.
+    next_retention: Tick,
     /// F4 (A-R317): this node's syncer. `None` runs each sync inline, on this thread: a host a
     /// crate row drives by hand has none.
     syncer: Option<Syncer>,
@@ -3767,6 +3789,9 @@ impl Host {
             own_asks: Vec::new(),
             inventory_pins,
             inventory_pin_millis: INVENTORY_PIN_MILLIS,
+            history_retention: HistoryRetention::DEFAULT,
+            retention: BTreeMap::new(),
+            next_retention: now.plus_millis(RETENTION_DUTY_MILLIS),
             syncer: None,
             syncing: None,
             sync_next: Vec::new(),
@@ -4059,6 +4084,7 @@ impl Host {
         let due = [
             Some(self.next_flush),
             Some(self.next_trim),
+            Some(self.next_retention),
             Some(self.next_drop_check),
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
@@ -4883,6 +4909,12 @@ impl Host {
                 self.set_fault(fault);
                 return;
             }
+        }
+        if self.next_retention <= now {
+            self.next_retention = now.plus_millis(RETENTION_DUTY_MILLIS);
+            let started = Instant::now();
+            self.retention_duty(now);
+            self.slow_step("duty", || "retention".to_owned(), started);
         }
         if self.next_drop_check <= now {
             self.next_drop_check = now.plus_millis(DROP_CHECK_EVERY_MILLIS);
@@ -7174,10 +7206,15 @@ impl Host {
         }
         // Issue #61 (design section 3.4): a `Recovered` builds or re-anchors R1's sides from
         // the kernel's own state; they are aligned to this engine's trim floor in the same step.
-        if module == ModuleName::Replication
-            && matches!(event.kind, EventKind::Kernel(KernelEvent::Recovered(_)))
-        {
-            self.align_ladders(partition);
+        if module == ModuleName::Replication {
+            if let EventKind::Kernel(KernelEvent::Recovered(result)) = &event.kind {
+                self.align_ladders(partition);
+                // Issue #61 S3 (design 3.1 m2): a primary this `Recovered` left in place has
+                // heard no copy since it, so its window waits for their acks.
+                if answer.is_ok() {
+                    self.begin_grace(partition, result.new_generation);
+                }
+            }
         }
         answer.map_err(StepError::Module)
     }
@@ -13821,31 +13858,15 @@ impl Host {
     /// engine ([`RocksEngine::stage_trim_history`], whose own refusal answers `engine:<reason>`
     /// and is logged `history_trim_refused`), then the kept ladders, then
     /// [`Self::align_ladders`]. Logged `host_history_trimmed`.
-    #[cfg(debug_assertions)]
     fn trim_history_through(
         &mut self,
         partition: PartitionId,
         through: Seq,
     ) -> Result<Seq, String> {
         let generation = self.newest_held(partition).ok_or("no_lineage")?;
+        let now = self.clock.now();
         if let Some(pin) = self.inventory_pins.get(&partition).copied() {
-            let landed_past = self
-                .landed
-                .iter()
-                .any(|(p, g)| *p == partition && *g > pin.generation);
-            let now = self.clock.now();
-            if landed_past {
-                self.inventory_pins.remove(&partition);
-            } else if now >= pin.since.plus_millis(self.inventory_pin_millis) {
-                self.inventory_pins.remove(&partition);
-                tracing::info!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    generation = pin.generation.0,
-                    millis = self.inventory_pin_millis,
-                    "inventory_pin_expired"
-                );
-            } else {
+            if self.release_inventory_pin(partition, now) {
                 tracing::info!(
                     node = self.node.0,
                     partition = partition.0,
@@ -13908,7 +13929,10 @@ impl Host {
         .into_iter()
         .flatten()
         {
-            kept.rungs.retain(|(seq, _)| *seq >= through);
+            // Dense and ascending: find the cut by binary search and drop the prefix, so a
+            // round looks at no rung it keeps (PR #240 r4).
+            let expired = kept.rungs.partition_point(|(seq, _)| *seq < through);
+            kept.rungs.drain(..expired);
         }
         self.dormant_ladders
             .retain(|p, ladder| *p != partition || !ladder.rungs.is_empty());
@@ -18275,6 +18299,21 @@ impl Host {
                 history_floor: self.newest_held(partition).map_or(0, |generation| {
                     self.engine.floor_seq(partition, generation).0
                 }),
+                history_bytes: self.newest_held(partition).map_or(0, |generation| {
+                    let floor = self.engine.floor_seq(partition, generation);
+                    self.engine.history_bytes(partition, generation, floor)
+                }),
+                inventory_rungs: self
+                    .inventory_ladders
+                    .get(&partition)
+                    .map_or(0, |ladder| ladder.rungs.len()),
+                block_cache_bytes: match self.engine.block_cache() {
+                    Ok((_, usage)) => Some(usage),
+                    Err(error) => {
+                        tracing::warn!(node = self.node.0, error, "block_cache_unread");
+                        None
+                    }
+                },
             }),
             pinned: self
                 .committed
@@ -19465,6 +19504,8 @@ mod feed_tests;
 mod note_tests;
 #[cfg(test)]
 mod ownership_tests;
+#[cfg(test)]
+mod retention_tests;
 #[cfg(test)]
 mod seal_tests;
 #[cfg(test)]

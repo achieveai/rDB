@@ -263,8 +263,7 @@ impl RocksEngine {
         progress.extend_from_slice(&envelope.record_digest.0);
         let meta = self.cf(CF_METADATA);
         let mut write = WriteBatch::default();
-        write.put_cf(
-            self.cf(keys::cf_for(Namespace::History)),
+        let (key, record) = (
             encode_key(
                 partition,
                 generation,
@@ -273,6 +272,8 @@ impl RocksEngine {
             ),
             frame(at.0, barrier),
         );
+        let sample = key.len() + record.len();
+        write.put_cf(self.cf(keys::cf_for(Namespace::History)), key, record);
         write.put_cf(
             meta,
             encode_key(partition, generation, Namespace::Progress, PROGRESS_KEY),
@@ -294,6 +295,7 @@ impl RocksEngine {
                 tracing::error!(target: LOG_TARGET, error = %e, "snapshot_install_write_failed");
                 InstallError::Storage(StorageFault::WriteFailed)
             })?;
+        self.learn_history_bytes(partition, sample);
         self.lineages.insert(
             (partition, generation),
             Marks {

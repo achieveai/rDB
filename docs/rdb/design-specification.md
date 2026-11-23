@@ -149,7 +149,7 @@ A logical history record is retained in RocksDB as data; native engine WAL seque
 - **The ladders follow.** The host trims R1's ladders first, then the engine, then the ladders it keeps, in one step, so no ladder holds a rung below F (ADR-rdb-0005).
 - **A trim is local.** It is one copy's cleanup, not a replicated write. No `applied` mark moves.
 - **The other writer.** A snapshot install writes a floor at its barrier `S` (§10.1).
-- **Who trims in this release.** Only the debug-build dev tool `rdb_dev admin trim-history --through N` (`Db::trim_history`). The automatic trim, with its keep window and byte cap, is a later change.
+- **Who trims in this release.** Every copy's host trims automatically, each retention round (`Host::retention_duty`), to the floor its keep window (`history_keep`, default 30 minutes) and byte cap (`history_budget_bytes`, default 20 GiB) allow (§4.2). The debug-build dev tool `rdb_dev admin trim-history --through N` (`Db::trim_history`) remains for tests.
 
 ### 4.2 Initial bounded budgets
 
@@ -1082,7 +1082,7 @@ sequenceDiagram
 - **Delete at install, after that check.** The first chunk runs `install_begin`, which deletes every lineage the partition holds on that copy. `install_begin` and `install_chunk` are unsynced; `install_finish` is synced. A crash before the finish leaves either the old lineages, when the begin never reached disk, or an `installing` lineage, which the open clears (§8.4).
 - **Re-seed.** After `install_finish` the target re-seeds its receiver at `(S, barrier digest)` with `durable = S`, and sends the primary an unsolicited ACK at `S`. R1 takes it as any ACK: at the head it reports `CopyCaughtUp`; below it, it walks `S+1..=head`.
 - **Content is not proven.** The chain proves the pages arrived as the source sent them, in order, from that barrier. It does not prove the source's state is what its History would build (owner ruling Q5).
-- **Keep window plus cap.** The paragraph below names a 30-minute, 20-GB budget. In this build no automatic trim runs: History is trimmed only by the debug-build `rdb_dev admin trim-history`, and only the transfer pin and the inventory pin hold a trim back. A keep window (kept at least) and a byte cap (a hard cap that overrides a lagging copy and a transfer pin) are a later change.
+- **Keep window plus cap.** The paragraph below names a 30-minute, 20 GiB budget. In this build a trim runs automatically each retention round: the keep window (`history_keep`; the keep window retains recent History unless the byte cap requires trimming it sooner) and the byte cap (`history_budget_bytes`, a hard cap that overrides a lagging copy and a transfer pin) set the floor. An answered inventory holds all trim, the cap included, for up to 10 minutes. A degraded rebuild holds the floor at its cutoff, the cap included, until it activates or for up to max(`history_keep`, inventory pin). The debug-build `rdb_dev admin trim-history` remains for tests.
 - **A held #105 tail refuses the offer.** `Host::offer_tail` runs the tail scan with L from the target's landed commit.
   - A writable commit supersedes every older tail, so a copy left out of one never hits. A hit needs L unknown: a partition whose record an older build wrote, with no writable commit since.
   - On a hit the target refuses `tail_held` with the tail's head H. It warns `copy_needs_forget_tail` once per partition and copy, and its `NodeStatus::needs_operator` names the copy, H and the command.
@@ -1098,7 +1098,7 @@ Original intent:
 
 Take a partition-consistent snapshot at `(generation, seq, digest)`. Export only that partition prefix with a manifest of chunk hashes, sizes, format version and root digest; no assumption that a whole core-engine checkpoint is a per-partition transfer.
 
-Retain logical history from snapshot sequence until target catches up. Set a 30-minute/20-GB retained-history budget per partition, whichever comes first; exceeding it restarts snapshot rather than dropping required records silently. A slow target never causes unbounded history retention.
+Retain logical history from snapshot sequence until target catches up. Set a 30-minute/20 GiB retained-history budget per partition, whichever comes first; exceeding it restarts snapshot rather than dropping required records silently. A slow target never causes unbounded history retention.
 
 Target imports into an invisible staging prefix; verifies hashes; replays contiguous history and fsyncs. The ready ACK names the exact authoritative barrier. Atomic local manifest switching exposes only the validated prefix.
 

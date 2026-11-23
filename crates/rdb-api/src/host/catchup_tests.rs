@@ -5,9 +5,6 @@ use super::trio::{
     current_thread, host_over, logged, write_chain, write_chain_after, write_chain_in, Trio,
 };
 use super::*;
-// `host.rs` imports `TrimFloor` only under `debug_assertions`, but these rows also build in
-// the gate's release check (`cargo check --release --tests`).
-use rdb_storage::TrimFloor;
 
 /// M9 serves only an empty copy, so a copy that holds anything must answer
 /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
@@ -178,7 +175,7 @@ fn a_copy_that_missed_two_writeless_generations_links_the_newest_onto_its_own() 
 
 /// A commit into generation 2 at `(cutoff, digest)`, as node 2 hears it: a trio's
 /// bootstrap commit, moved on a generation. Its pin names node 2 a secondary.
-fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
+pub(super) fn landing_at(cutoff: u64, digest: Digest) -> RecoveryResult {
     let dir = config_testkit::fs::temp_dir();
     let mut trio = Trio::new(dir.path(), Trio::fast);
     trio.bootstrap();
@@ -1796,7 +1793,11 @@ fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
 
 /// Node 3's process starts again, as `Db::restart_node` restarts one: a new host on its own
 /// engine at the next boot, and nodes 1 and 2 told the new boot (`PeerBooted`). Its links heal.
-fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host)) -> BootId {
+pub(super) fn restart_three(
+    trio: &mut Trio,
+    dir: &std::path::Path,
+    tune: impl Fn(&mut Host),
+) -> BootId {
     let (old, _, _) = trio.nodes.remove(2);
     let boot = BootId(old.boot.0 + 1);
     let control = Arc::clone(&old.control);
@@ -1831,7 +1832,7 @@ fn restart_three(trio: &mut Trio, dir: &std::path::Path, tune: impl Fn(&mut Host
 /// [`Trio::fast_pause`] on the regular rejoin path: D9 (A-R398) pins a copy restarted from an
 /// `Active` commit as a shadow, and the rows below are for F1's routed catch-up, which every
 /// other restart still takes.
-fn regular_rejoin(host: &mut Host) {
+pub(super) fn regular_rejoin(host: &mut Host) {
     Trio::fast_pause(host);
     host.restart_shadow = false;
 }
