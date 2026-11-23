@@ -2338,6 +2338,7 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
 /// Cut: a retry drops `promote` (r366b), red (the retry pins node 3 as a shadow again).
 /// Integration (~5 s): b1's drop, the re-add, the promote and its one retry.
 #[config_log::retcd_test]
+#[ignore = "#79: flaky against the lagging clock (red 2 of 4 runs); re-cut in #248"]
 fn m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote() {
     const METHOD: &str =
         "m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote";

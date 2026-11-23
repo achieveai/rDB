@@ -10757,8 +10757,12 @@ impl Host {
         }
         // L1 blocking for an operator (a divergence, spec §8.1) is no drop clock's to clear,
         // as in `holding_up`; only a pause on lag hands over to it there.
-        let state = self.l1.get(&partition)?.protection.admission_state(now)?;
-        if !state.allow && state.reason != Some(ErrorKind::ProtectionPaused) {
+        let blocked = self
+            .l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(now))
+            .is_some_and(|state| !state.allow && state.reason != Some(ErrorKind::ProtectionPaused));
+        if blocked {
             return None;
         }
         let tracker = self.replication.primary(self.node, partition)?.tracker();

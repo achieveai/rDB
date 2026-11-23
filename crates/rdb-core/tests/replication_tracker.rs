@@ -7865,7 +7865,8 @@ fn t61_ack_below_floor_is_unverifiable_and_asks_snapshot() {
     let mut untrimmed = tracker();
     assert_eq!(
         deliver(&mut untrimmed, &b(6, 6, 6)),
-        vec![peer_progress(B, 6)],
+        // #79 option A: B's durable 6 is the quorum floor's secondary, so the view moves.
+        vec![peer_progress(B, 6), durable_advanced(&[(CONFIG, 6)])],
         "control: 6 counts before the trim"
     );
 
@@ -7909,7 +7910,11 @@ fn t61_ack_at_floor_counts() {
     let mut dense = tracker();
     assert_eq!(dense.trim_history(Seq(8), d(8)), Ok(()));
     assert_eq!(dense.history().floor(), Some(Seq(8)));
-    assert_eq!(deliver(&mut dense, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+    // #79 option A: B's durable 8 moves the quorum floor.
+    assert_eq!(
+        deliver(&mut dense, &b(8, 8, 8)),
+        vec![peer_progress(B, 8), durable_advanced(&[(CONFIG, 8)])]
+    );
 
     let mut sparse_history = DigestLadder::new();
     sparse_history.insert(Seq::ZERO, Digest::ROOT);
@@ -7922,7 +7927,10 @@ fn t61_ack_at_floor_counts() {
     assert_eq!(sparse.trim_history(Seq(8), d(8)), Ok(()));
     assert_eq!(sparse.history().floor(), Some(Seq(8)), "(0, ROOT) is gone");
     assert_eq!(sparse.history().len(), 2, "the floor and the head");
-    assert_eq!(deliver(&mut sparse, &b(8, 8, 8)), vec![peer_progress(B, 8)]);
+    assert_eq!(
+        deliver(&mut sparse, &b(8, 8, 8)),
+        vec![peer_progress(B, 8), durable_advanced(&[(CONFIG, 8)])]
+    );
 
     let invalid = |field| Err(RdbError::InvalidArgument { field });
     for (name, seq, digest, field) in [
