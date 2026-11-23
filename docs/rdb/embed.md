@@ -774,8 +774,20 @@ Call `admin::add_member` to add a data node and `admin::remove_member` to remove
 checks membership first, then writes. `admin::add_node` and `admin::remove_node` write
 without the check; do not call them from an app.
 
-<!-- TODO (S4): the `rdb_dev` verbs and the `scripts/docker-multihost.sh` commands, and the
-order "add, restart apps, rebalance". -->
+**Adding a node: add, restart the apps, rebalance.** In that order:
+
+1. Add the node's record with `admin::add_member` (`rdb_dev`: `admin add-node --addr A
+   --machine M`). It answers with the id it gave.
+2. Start the node with that id, its certificate, and `--peers` naming nodes 1 to K with no
+   gap, removed ids included (below).
+3. Restart every app-only process (`rdb-server`, `rdb_dev`, or any process that runs no copy)
+   with the new node in its `--nodes`. Such a process links only to the nodes it was started
+   with, so until it restarts it cannot reach a partition the new node comes to own. A node's
+   own embedded `Db` needs no restart: it admits the new node by itself.
+4. Run `admin::rebalance` (`rdb_dev`: `admin rebalance`) to give the new node its copies.
+
+`scripts/docker-multihost.sh` does steps 1 and 2 in `add` and step 4 in `rebalance`; its
+sessions name the new node in `--nodes` from then on.
 
 **What a remove does.** Removing node N marks its record removed. It is never deleted.
 Every running node drops N from its members. `route` still knows N's app address.
@@ -801,8 +813,9 @@ then stays down.
 
 **A removed id in `--peers` is skipped.** It is logged `start_peer_removed_skipped`, and
 nothing dials it. It must still be listed: `--node` and `--peers` together must name nodes
-1 to K with no gap, removed ids included. Only removed ids above every id you name may be left
-out.
+1 to K with no gap, removed ids included, up to the highest id you name or `--node`. Ids above
+that may be left out, live or removed, so a node started before a higher id was added can
+restart with the `--peers` it had.
 
 **One change at a time, and every node must answer.** Before it writes anything, the check
 asks every live node for a fresh status, within the time you pass (`within`). Each must

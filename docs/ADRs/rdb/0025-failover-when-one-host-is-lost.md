@@ -179,9 +179,10 @@ plus ids still linked).
 16. **A removed id in `--peers` is skipped, not refused (S-4).** The start check skips it
     with the warn `start_peer_removed_skipped` (`node`, `peer`, `addr`), and nothing dials it.
     It must still be listed: `peer_set` takes `--node` and `--peers` as nodes 1 to K with
-    no gap, so every id up to the highest one named is listed, removed or not. Only removed
-    ids above every id named may be left out. A peer that is neither live nor removed is still
-    refused.
+    no gap, so every id up to the highest one named, or `--node` if that is higher, is listed,
+    removed or not. Ids above that may be left out, live or removed: a node started before a
+    higher id was added restarts with its old `--peers`. A peer that is neither live nor
+    removed is still refused.
 
 17. **A re-plan never pins a node that is not live (S-2).** An owner pins a re-added node or
     a move's target only while that node is a live member of its `Net`. Otherwise it leaves
