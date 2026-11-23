@@ -83,9 +83,10 @@
 # the label set, failover checks that the killed node is still exited 137, with the restart
 # count it had before the kill, when its probe ends. A K6 FAIL means every failover measured
 # a node Docker brought back on its own.
-# OPEN, for D2 (#80 S4): rdb_node exits 2 when it is started as a removed node, so under this
-# policy Docker restarts a removed node 3 times, and then it stays down (exited 2, restart
-# count 3). That is expected. D2's remove step judges that final state, not the first exit.
+# PASSED in D2 run 3b (2026-11-22, #80 S4): rdb_node exits 2 when it is started as a removed
+# node, so under this policy Docker restarts a removed node 3 times, and then it stays down
+# (exited 2, restart count 3). That is expected. D2's remove step judges that final state,
+# not the first exit.
 #   pause N      needs --restart-on-exit. `docker pause` node N, an owner, until it owns no
 #                partition; then `docker unpause`. P1 within 60 s of the pause N owns nothing;
 #                P2 within 60 s of the unpause N printed `rdb_node restart-wanted node=N
