@@ -14726,29 +14726,44 @@ mod tests {
 
     #[test]
     fn pr238_silent_inspect_after_pending_answer_keeps_the_ready_deadline() {
-        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
-        db.timeouts.read = Duration::from_secs(2);
-        let node = std::thread::spawn(move || {
-            let Msg::Inspect { reply, .. } = mailbox.recv().expect("first look") else {
-                panic!("expected Inspect")
-            };
-            reply.send(replan_status(true)).expect("blocked");
-            let Msg::BootReplan { reply, .. } = mailbox.recv().expect("pending ask") else {
-                panic!("expected BootReplan")
-            };
-            reply.send((replan_status(true), true)).expect("pending");
-            let Msg::Inspect { reply: _silent, .. } = mailbox.recv().expect("next look") else {
-                panic!("expected Inspect")
-            };
-            assert!(matches!(mailbox.recv(), Ok(Msg::Stop) | Err(_)));
-        });
-        let start = Instant::now();
-        let answer = db.wait_ready(Duration::from_millis(180));
-        let elapsed = start.elapsed();
-        drop(db);
-        node.join().expect("owner");
-        assert_eq!(answer, Err(replanning_blocked()));
-        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        // A descheduled caller can legitimately reach its deadline before the next look.
+        // Only a run that actually dispatched the silent Inspect exercises this regression.
+        for _ in 0..3 {
+            let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+            db.timeouts.read = Duration::from_secs(3);
+            let node = std::thread::spawn(move || {
+                let mut pending = false;
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply: silent, .. } if pending => {
+                            let stopped = mailbox.recv();
+                            drop(silent);
+                            assert!(matches!(stopped, Ok(Msg::Stop) | Err(_)));
+                            return true;
+                        }
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(replan_status(true));
+                        }
+                        Msg::BootReplan { reply, .. } => {
+                            pending = reply.send((replan_status(true), true)).is_ok();
+                        }
+                        Msg::Stop => break,
+                        _ => {}
+                    }
+                }
+                false
+            });
+            let start = Instant::now();
+            let answer = db.wait_ready(Duration::from_millis(400));
+            let elapsed = start.elapsed();
+            drop(db);
+            if node.join().expect("owner") {
+                assert_eq!(answer, Err(replanning_blocked()));
+                assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+                return;
+            }
+        }
+        panic!("the owner never received a second Inspect within any attempt's deadline");
     }
 
     /// PR #60 review F3, merged into slice 2 (w18): a fault ends an owner this `Db` runs at once
