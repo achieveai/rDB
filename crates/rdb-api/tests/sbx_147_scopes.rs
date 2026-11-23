@@ -86,6 +86,8 @@ fn world_retaining(
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         addresses: None,
+        history_budget_bytes: None,
+        history_keep: None,
     };
     let db = rt
         .block_on(Db::open(config, store, rt.handle().clone()))

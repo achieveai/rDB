@@ -158,6 +158,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: Vec::new(),   // this process holds no copy
         links: Some(links),  // it reaches the nodes through these links
         client: ClientId(7), // one id per app process

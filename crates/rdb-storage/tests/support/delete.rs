@@ -43,7 +43,7 @@ pub fn delete_batch(lineage: Lineage, seq: Seq, prev_digest: Digest) -> Result<B
 /// The batch T1 commits for a request of tenant 1, affinity 1 with these `conditions` (all
 /// met) and this one user `mutation`, chained from `prev_digest`: the user write, the request's
 /// dedup row, the History record and Progress.
-#[allow(dead_code)] // the example builds deletes only
+#[allow(dead_code)] // the example binary builds deletes only; its tests use this too
 pub fn request_batch(
     lineage: Lineage,
     seq: Seq,

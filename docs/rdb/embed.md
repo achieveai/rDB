@@ -181,6 +181,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
@@ -1731,6 +1733,24 @@ floor), so the table above no longer limits it.
 - **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.
 
+### How much history a partition keeps
+
+Each copy keeps the history it applied, so a copy that was down can catch up record by record.
+A duty trims it about once a second. Two `DbConfig` options set how much is kept:
+
+- `history_keep`: how long each copy keeps history, at least. Default 30 min (`None`). A copy
+  down for longer may be rebuilt from a snapshot instead.
+- `history_budget_bytes`: the most history each copy keeps. Default 20 GiB (`None`). It is a
+  hard cap: it trims past a copy that has not acknowledged, and past a snapshot transfer, which
+  then starts again (`history_budget_overran_pin`).
+
+A copy keeps more than `history_keep` while something still needs it: a copy that has not
+acknowledged, a snapshot transfer, a recovery, or an answered inventory (at most 10 minutes).
+After a failover the new primary also trims nothing past its copies until each has
+acknowledged, or `max(history_keep, 10 minutes)` has passed. Before a partition's first trim, a
+copy that never acks holds history until the history budget (`history_budget_bytes`, default
+20 GiB) is reached; after that, a grace that expires releases it.
+
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
@@ -1768,7 +1788,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
-| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. History is trimmed by each copy's retention duty ("How much history a partition keeps"). | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -2111,6 +2131,23 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `Trimmed` (issue #61): the history needed to adopt the tail is trimmed, so it cannot come
     back. Giving it up still needs `--give-up-live-copy`, and forget-tail's refusal names the
     whole command.
+- **A copy whose snapshot the history budget keeps cutting short needs an operator** (issue
+  #61). Under heavy writes and a small `history_budget_bytes`, the budget can trim past a
+  snapshot transfer before it finishes. The source restarts it, and after 3 in a row it stops
+  and sets `needs_operator` in `Db::node_status()` on that node: "copy N cannot be rebuilt from
+  node M: the history budget overran its snapshot transfer 3 times in a row; ...". It is
+  logged `history_budget_gave_up` (warn). To change the history budget, reopen the `Db` with a
+  larger `history_budget_bytes`: the budget is fixed when the node starts. Reducing writes alone
+  does not clear an existing give-up. A newer generation clears it without restart and logs
+  `history_budget_give_up_cleared`, so a later snapshot request is offered again. A caught-up
+  release also clears it, silently.
+  The budget is a hard cap except for holds: staging, installing, recovering, landing and an
+  answered inventory (up to 10 minutes). A degraded rebuild also keeps History from its cutoff
+  while F1 stays `Rebuilding`, for up to max(`history_keep`, inventory pin), 30 min at the
+  defaults. Each round held that way logs `history_trim_held_rebuild{cutoff, floor_was}`
+  (info); past the limit the cap applies again, logged once `history_trim_rebuild_hold_expired`
+  (warn). The activation needs the record at the cutoff, so a trim past it makes the primary
+  refuse its own activation.
 - **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
   `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
   set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,

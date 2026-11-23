@@ -28,8 +28,8 @@ use rdb_sim::storage::history::{canonical_history, canonical_history_from, Canon
 use rdb_storage::LineageFault;
 use rdb_storage::{
     dump, verify_lineage, BindError, OpenError, PublishMark, RocksEngine, RocksSnapshot,
-    SnapshotEntry, StorageOptions, TrimFloor, DEFAULT_WRITE_BUFFER_BYTES, INSTANCE_LEN,
-    WAL_BUDGETS,
+    SnapshotEntry, StorageOptions, TrimFloor, DEFAULT_WRITE_BUFFER_BYTES,
+    HISTORY_RECORD_BYTES_SEED, INSTANCE_LEN, WAL_BUDGETS,
 };
 
 const X: [u8; INSTANCE_LEN] = [0x11; INSTANCE_LEN];
@@ -2016,8 +2016,9 @@ fn t61_install_begin_is_one_batch() {
 /// An inherit from a lineage mid snapshot install is refused (`installing_inherit_refused`):
 /// its view is half written, so neither a link nor a copy may read it. Refused at base 0 (an
 /// empty view a link would accept) and at the barrier S (which would otherwise read as behind
-/// the cutoff), and nothing is written. After `install_finish` the same inherit at S links. Red
-/// if the refusal is dropped (base 0 links a half-installed parent).
+/// the cutoff), and nothing is written. After `install_finish` the same inherit at S links, and
+/// the partition's mean History record size is the barrier's (issue #61 R25). Red if the refusal
+/// is dropped (base 0 links a half-installed parent), or `install_finish` learns nothing.
 #[retcd_test]
 fn t61_inherit_from_installing_lineage_is_refused() {
     use rdb_storage::{InheritError, Inherited};
@@ -2069,7 +2070,237 @@ fn t61_inherit_from_installing_lineage_is_refused() {
     target
         .install_finish(P61, g2, at, &barrier, (Seq::ZERO, Digest::ROOT))
         .expect("finish");
+    // Issue #61 R25: this engine learnt nothing since its reopen, and its History holds only the
+    // barrier, so the mean is that one record, key plus framed value, and not the seed.
+    let learnt = target.history_record_bytes(P61);
+    assert_ne!(
+        learnt, HISTORY_RECORD_BYTES_SEED,
+        "install_finish learnt nothing"
+    );
+    assert_eq!(
+        learnt,
+        t61_exact_history_bytes(&db, g2, 0),
+        "the barrier record"
+    );
     assert_eq!(target.inherit(P61, g2, g3, at), Ok(Inherited::Linked));
     drop((view, source, target));
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+// Issue #61 S3, lead ruling R25: `RocksEngine::history_bytes`, the estimate the retention cap
+// binary-searches.
+
+/// The exact bytes, key plus framed value, of the History records lineage `(P61, generation)`'s
+/// own level holds at seqs `from..`, read from the database at `db` by [`dump`].
+fn t61_exact_history_bytes(db: &std::path::Path, generation: Generation, from: u64) -> u64 {
+    dump(db)
+        .expect("dump")
+        .iter()
+        .filter(|r| r.cf == "history" && r.key.len() == 21)
+        .filter(|r| r.key[0..4] == P61.0.to_be_bytes())
+        .filter(|r| r.key[4..12] == generation.0.to_be_bytes())
+        .filter(|r| u64::from_be_bytes(r.key[13..21].try_into().expect("seq")) >= from)
+        .map(|r| (r.key.len() + r.value.len()) as u64)
+        .sum()
+}
+
+/// Within ±25% of exact.
+fn t61_within_quarter(estimate: u64, exact: u64) -> bool {
+    estimate.abs_diff(exact) * 4 <= exact
+}
+
+/// g1 holds 1..=100 canonical records. For every `from` the estimate is within ±25% of the exact
+/// bytes `dump` reads (canonical records are near uniform), and it never grows as `from` does.
+/// A trim at 40 makes every `from <= 40` answer the same, the 61 records 40..=100 kept. A trim
+/// at the head leaves the one record at F (B1). `from` above the head, an unknown lineage, and a
+/// lineage with nothing committed answer 0. Red if the floor is ignored (the trim leaves the
+/// answer unchanged) or the count runs past the head.
+#[retcd_test]
+fn t61_history_bytes_tracks_exact_bytes_and_falls_with_from_and_floor() {
+    let g1 = Generation(1);
+    let dir = data_dir("t61-history-bytes");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    assert_eq!(
+        engine.history_bytes(P61, g1, Seq(1)),
+        0,
+        "nothing committed"
+    );
+    t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 100);
+    let mean = engine.history_record_bytes(P61);
+
+    let mut last = u64::MAX;
+    for from in 0..=101 {
+        let estimate = engine.history_bytes(P61, g1, Seq(from));
+        assert!(estimate <= last, "grew at from={from}: {estimate} > {last}");
+        last = estimate;
+        let exact = t61_exact_history_bytes(&db, g1, from);
+        assert!(
+            t61_within_quarter(estimate, exact),
+            "from={from}: estimate {estimate}, exact {exact}"
+        );
+    }
+    assert_eq!(engine.history_bytes(P61, g1, Seq(1)), 100 * mean);
+    assert_eq!(engine.history_bytes(P61, g1, Seq(101)), 0, "above the head");
+    assert_eq!(
+        engine.history_bytes(P61, Generation(9), Seq(1)),
+        0,
+        "unknown"
+    );
+
+    let whole = engine.history_bytes(P61, g1, Seq(1));
+    assert_eq!(engine.stage_trim_history(P61, g1, t61_floor(40)), Ok(1));
+    let trimmed = engine.history_bytes(P61, g1, Seq(1));
+    assert!(
+        trimmed < whole,
+        "the floor rose and the answer did not fall"
+    );
+    assert_eq!(trimmed, 61 * mean);
+    assert_eq!(engine.history_bytes(P61, g1, Seq(40)), trimmed);
+    assert_eq!(engine.history_bytes(P61, g1, Seq(41)), 60 * mean);
+    let exact = t61_exact_history_bytes(&db, g1, 0);
+    assert!(
+        t61_within_quarter(trimmed, exact),
+        "after the trim: estimate {trimmed}, exact {exact}"
+    );
+
+    assert_eq!(engine.stage_trim_history(P61, g1, t61_floor(100)), Ok(1));
+    assert_eq!(
+        engine.history_bytes(P61, g1, Seq(1)),
+        mean,
+        "the record at F"
+    );
+    assert_eq!(engine.history_bytes(P61, g1, Seq(101)), 0);
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// The walk counts through links and stops at the lineage: g1 holds 1..=10, g2 is linked at 10
+/// and holds 11..=20, so g2 counts 20 records and g1 still 10. A trim of g2 at 15 drops g2 to 6
+/// (15..=20) and g1, cut at its own level, to 0 below its new mark. Partition 2's records are
+/// sixteen times larger and move partition 1's mean not at all. Red if the count stops at the
+/// link (g2 answers 10), or one mean is shared by every partition.
+#[retcd_test]
+fn t61_history_bytes_walks_the_chain_and_keeps_partitions_apart() {
+    let (g1, g2, p2) = (Generation(1), Generation(2), PartitionId(2));
+    let dir = data_dir("t61-history-bytes-chain");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let h1 = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 10);
+    engine.inherit(P61, g1, g2, Seq(10)).expect("link g2");
+    t61_commit(&mut engine, g2, (Seq(10), h1.digest(10)), 20);
+    let mean = engine.history_record_bytes(P61);
+    assert_eq!(engine.history_bytes(P61, g2, Seq(1)), 20 * mean);
+    assert_eq!(engine.history_bytes(P61, g1, Seq(1)), 10 * mean);
+
+    let lineage = Lineage {
+        partition: p2,
+        generation: g1,
+        owner_epoch: OwnerEpoch(1),
+    };
+    let big = bytes::Bytes::from(vec![0xab_u8; 16 * usize::try_from(mean).expect("mean")]);
+    for mut batch in canonical_history(lineage, ConfigVersion(1), 5)
+        .expect("canonical history")
+        .batches
+    {
+        for w in &mut batch.writes {
+            if w.ns == Namespace::History {
+                w.value = Some(big.clone());
+            }
+        }
+        engine.commit(batch).expect("commit");
+    }
+    assert_eq!(engine.history_record_bytes(P61), mean, "p2 moved p1's mean");
+    assert!(engine.history_record_bytes(p2) > 15 * mean);
+
+    assert_eq!(engine.stage_trim_history(P61, g2, t61_floor(15)), Ok(2));
+    assert_eq!(engine.history_bytes(P61, g2, Seq(1)), 6 * mean);
+    assert_eq!(
+        engine.history_bytes(P61, g1, Seq(1)),
+        0,
+        "g1 is cut below its own mark"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// The learning resets at restart and the seed takes over. A fresh database answers with
+/// [`HISTORY_RECORD_BYTES_SEED`]; after 200 records the mean is learnt; after a reopen nothing
+/// is learnt, so the mean comes from the History column family's own estimates (RocksDB
+/// flushes the replayed WAL to a table at open), which stay within ±25% of the learnt mean on
+/// these near-uniform records. One commit after the reopen moves it back to the learnt mean.
+#[retcd_test]
+fn t61_history_bytes_seeds_from_column_family_estimates_after_reopen() {
+    let g1 = Generation(1);
+    let dir = data_dir("t61-history-bytes-seed");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    assert_eq!(engine.history_record_bytes(P61), HISTORY_RECORD_BYTES_SEED);
+    let h = t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 200);
+    let learnt = engine.history_record_bytes(P61);
+    assert_ne!(
+        learnt, HISTORY_RECORD_BYTES_SEED,
+        "the fixture must tell them apart"
+    );
+    drop(engine);
+
+    let mut engine = RocksEngine::open(&db).expect("reopen");
+    let seeded = engine.history_record_bytes(P61);
+    assert_ne!(
+        seeded, HISTORY_RECORD_BYTES_SEED,
+        "the seed path, not the constant"
+    );
+    assert!(
+        t61_within_quarter(seeded, learnt),
+        "seeded {seeded}, learnt before the restart {learnt}"
+    );
+    assert!(t61_within_quarter(
+        engine.history_bytes(P61, g1, Seq(1)),
+        t61_exact_history_bytes(&db, g1, 0)
+    ));
+    t61_commit(&mut engine, g1, (Seq(200), h.digest(200)), 201);
+    assert!(t61_within_quarter(engine.history_record_bytes(P61), learnt));
+    drop(engine);
+    std::fs::remove_dir_all(&dir).expect("remove the test directory");
+}
+
+/// Cost bound: the estimate reads no data. On a lineage of 2000 records, reopened so they sit
+/// in a table and the mean is seeded, RocksDB's per-thread perf counters stay at 0 across a
+/// `history_bytes` call, where a single `history_at` read moves them (the positive control). Red
+/// if the estimate reads or iterates History.
+#[retcd_test]
+fn t61_history_bytes_reads_no_data() {
+    use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
+    let g1 = Generation(1);
+    let dir = data_dir("t61-history-bytes-cost");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    t61_commit(&mut engine, g1, (Seq::ZERO, Digest::ROOT), 2000);
+    drop(engine);
+    // A reopen moves the records into a table and empties what was learnt, so the call below
+    // takes the seed path, column-family properties, too.
+    let engine = RocksEngine::open(dir.join("db")).expect("reopen");
+    let metrics = [
+        PerfMetric::UserKeyComparisonCount,
+        PerfMetric::BlockReadCount,
+        PerfMetric::GetFromMemtableCount,
+        PerfMetric::SeekOnMemtableCount,
+        PerfMetric::InternalKeySkippedCount,
+    ];
+    set_perf_stats(PerfStatsLevel::EnableCount);
+    let mut perf = PerfContext::default();
+    let read = |perf: &PerfContext| metrics.map(|m| perf.metric(m));
+
+    perf.reset();
+    let estimate = engine.history_bytes(P61, g1, Seq(1));
+    assert!(estimate > 0);
+    assert_eq!(read(&perf), [0; 5], "{}", perf.report(true));
+
+    perf.reset();
+    engine
+        .history_at(P61, g1, Seq(1000))
+        .expect("history_at")
+        .expect("record 1000");
+    assert_ne!(read(&perf), [0; 5], "the control must move a counter");
+    set_perf_stats(PerfStatsLevel::Disable);
+    drop(engine);
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }

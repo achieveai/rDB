@@ -4,6 +4,7 @@
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //!                                           [--dedup-cap N] [--dedup-retention-ms N]
+//!                                           [--history-keep-ms N]
 //!                                           [--control host:port[,host:port...]] [--requests F]
 //!                                           [--control-tls T]
 //!                                           [--abort-after-commit] [--pause-before-sync N=MS]
@@ -85,6 +86,12 @@
 //! publishes after it, so a cap filled by condition failures alone also frees up by hand. A
 //! `retry` of a trimmed request is no longer recognised and is sent afresh; every rdb_dev write
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
+//!
+//! `--history-keep-ms N` keeps each node's History N ms instead of 30 minutes
+//! (`DbConfig::history_keep`, issue #61). A copy down for longer than N ms may find its primary
+//! has trimmed past it, and is then rebuilt from a snapshot (`snapshot_transfer_installed`) instead
+//! of walking the History it missed. Unset keeps the 30-minute default; a release build reads the
+//! flag the same way, since it is the example's and not the library's.
 //!
 //! Limits, checked before anything is compiled, sent or read: an object id is at most 1,024
 //! bytes, for every write and read; a `doc`, `map`, `set` or `list` write carries at most 255
@@ -592,6 +599,9 @@ struct Args {
     dedup_cap: Option<usize>,
     /// How long a published write's answer is retained, shortened as a dev budget.
     dedup_retention: Option<Duration>,
+    /// `--history-keep-ms N`: how long each node keeps its History, shortened so a trim and a
+    /// snapshot rebuild can be reached by hand (issue #61). Unset keeps the 30-minute default.
+    history_keep: Option<Duration>,
     /// `--control E`: an external rEtcd's client endpoints. The run then starts no voters and
     /// never removes `--dir`, so a later run can reopen it.
     control: Option<Vec<String>>,
@@ -649,6 +659,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         put_timeout: None,
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
         control: None,
         control_tls: None,
         requests: None,
@@ -724,6 +735,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| format!("--dedup-retention-ms takes a number, not {text:?}"))?;
                 parsed.dedup_retention = Some(Duration::from_millis(millis));
             }
+            "--history-keep-ms" => {
+                let text = value("--history-keep-ms")?;
+                let millis = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--history-keep-ms takes a number, not {text:?}"))?;
+                parsed.history_keep = Some(Duration::from_millis(millis));
+            }
             "--hold" => {
                 for pair in value("--hold")?.split(',') {
                     parsed.hold.push(parse_pair(pair)?);
@@ -783,6 +801,7 @@ fn app_only_check(args: &Args) -> Result<(), String> {
         ("--hold", !args.hold.is_empty()),
         ("--dedup-cap", args.dedup_cap.is_some()),
         ("--dedup-retention-ms", args.dedup_retention.is_some()),
+        ("--history-keep-ms", args.history_keep.is_some()),
         ("--abort-after-commit", args.abort_after_commit),
         ("--pause-before-sync", !args.pause_before_sync.is_empty()),
     ];
@@ -1035,6 +1054,8 @@ where
         },
         dedup_cap: args.dedup_cap,
         dedup_retention: args.dedup_retention,
+        history_keep: args.history_keep,
+        history_budget_bytes: None,
         local: if links.is_some() {
             Vec::new()
         } else {
@@ -8455,6 +8476,7 @@ mod tests {
             put_timeout: None,
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
             control: None,
             control_tls: None,
             requests: None,
@@ -8620,6 +8642,7 @@ mod tests {
             put_timeout: None,
             dedup_cap: Some(65_537),
             dedup_retention: None,
+            history_keep: None,
             control: None,
             control_tls: None,
             requests: None,
@@ -9409,6 +9432,7 @@ mod tests {
             put_timeout: None,
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
             control: None,
             control_tls: None,
             requests: None,
@@ -10188,6 +10212,7 @@ mod tests {
             ("--hold", Some("1-2")),
             ("--dedup-cap", Some("8")),
             ("--dedup-retention-ms", Some("8")),
+            ("--history-keep-ms", Some("8")),
             ("--abort-after-commit", None),
             ("--pause-before-sync", Some("1=5")),
         ] {
@@ -10197,6 +10222,27 @@ mod tests {
                 format!("{flag} sets up a node this process runs; with --nodes it runs none"),
             );
         }
+    }
+
+    /// Issue #61 PR-B: `--history-keep-ms N` reaches the run's `history_keep` as N ms, unset is
+    /// the 30-minute default, and a word that is not a number is refused by name. `run` hands
+    /// `history_keep` to `DbConfig` as it is. Cut: the arm sets `history_keep` to `None`, red at
+    /// "N ms". Unit (~1 ms).
+    #[test]
+    fn t61_history_keep_ms_sets_the_run_s_history_keep() {
+        let args = |words: &[&str]| parse(words.iter().map(|w| (*w).to_owned()));
+        assert_eq!(
+            args(&["--history-keep-ms", "250"])
+                .expect("parses")
+                .history_keep,
+            Some(Duration::from_millis(250)),
+            "N ms"
+        );
+        assert_eq!(args(&[]).expect("parses").history_keep, None, "unset");
+        assert_eq!(
+            args(&["--history-keep-ms", "soon"]).map(|_| ()),
+            Err("--history-keep-ms takes a number, not \"soon\"".to_owned())
+        );
     }
 
     /// A-R245: each `--nodes` link is said as up, down with its last dial error, or refused,
@@ -11083,6 +11129,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: rdb_api::db::ALL_NODES.to_vec(),
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
@@ -11165,6 +11213,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: rdb_api::db::ALL_NODES.to_vec(),
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
@@ -11223,6 +11273,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: rdb_api::db::ALL_NODES.to_vec(),
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,
@@ -11388,6 +11440,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: rdb_api::db::ALL_NODES.to_vec(),
             links: None,
             client: rdb_api::db::DEFAULT_CLIENT,

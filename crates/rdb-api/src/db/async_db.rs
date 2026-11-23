@@ -490,6 +490,8 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             addresses: None,
+            history_budget_bytes: None,
+            history_keep: None,
         };
         let handle = rt.handle().clone();
         rt.block_on(async move {
@@ -542,6 +544,8 @@ mod tests {
             boot: None,
             storage: crate::StorageOptions::default(),
             addresses: None,
+            history_budget_bytes: None,
+            history_keep: None,
         };
         let handle = rt.handle().clone();
         rt.block_on(async move {

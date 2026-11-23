@@ -302,6 +302,12 @@ impl CatchupCursor {
         Repeat::judge(mark, Some(digest), self.staged_bound(mark), ack, history)
     }
 
+    /// Whether the cursor is catching up: it reports `CopyCaughtUp` on an ACK at the head.
+    #[must_use]
+    pub const fn catching_up(&self) -> bool {
+        self.catching_up
+    }
+
     /// Issue #61 (lead ruling 2026-11-22): R1 asked for this copy's snapshot from outside
     /// the cursor (`Primary::await_snapshot`).
     /// The cursor then waits as a `NotRetained` need leaves it: catching up, nothing in flight. The
