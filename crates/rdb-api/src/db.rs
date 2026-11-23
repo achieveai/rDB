@@ -8097,7 +8097,8 @@ impl Db {
     /// hold a record cannot be checked or discovery times out. A lost answer after dispatch
     /// leaves the clear outcome unknown: read status or retry the same generation. A local
     /// storage read failure is a host error. If all possible holders report absence, the
-    /// owner's idempotent ack is `Ok`.
+    /// owner's idempotent ack is `Ok`. Absence reflects the registry snapshot and the
+    /// individual marker reads. A concurrent promotion can create a newer marker.
     pub fn ack_possible_loss(&self, generation: Generation) -> Result<(), ApiError> {
         if let Some(error) =
             self.refuse_groupless("ack_possible_loss", "it runs on one partition only")

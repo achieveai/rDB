@@ -514,7 +514,9 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     clears nothing, so a stale ack cannot clear a newer record. Before reporting that no record
     stands, the ack checks the formation nodes and the durable `nodes/` registry, including
     removal tombstones. An unreachable former member leaves the result unknown and no ack is
-    sent. A missing reply after dispatch leaves the clear outcome unknown. Read node status
+    sent. If all checked nodes report no record, success reflects the registry snapshot and
+    each node’s marker when read. A concurrent promotion can create a newer marker.
+    A missing reply after dispatch leaves the clear outcome unknown. Read node status
     or retry the same generation. Discovery assumes the registry has been maintained by rDB;
     manual deletion of historical node records is unsupported.
     Only an admin app may ack, as for `forget_tail`. It logs INFO
