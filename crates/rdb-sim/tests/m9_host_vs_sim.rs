@@ -578,6 +578,8 @@ fn run_host(steps: &[Step]) -> (Vec<Reply>, (Generation, Seq)) {
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         addresses: None,
+        history_budget_bytes: None,
+        history_keep: None,
     };
     let mut db = rt
         .block_on(Db::open(

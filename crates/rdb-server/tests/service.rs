@@ -61,6 +61,8 @@ async fn open_db_of(partitions: Option<u32>) -> (Arc<Db>, impl Sized) {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,

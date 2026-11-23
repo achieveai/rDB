@@ -40,6 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         boot: None,
         storage: StorageOptions::default(),
         addresses: None,
+        history_budget_bytes: None,
+        history_keep: None,
     };
     let handle = rt.handle().clone();
     rt.block_on(async move {

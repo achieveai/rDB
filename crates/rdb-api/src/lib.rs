@@ -63,7 +63,7 @@ pub use host::{Change, ListEdit, Look, Seen};
 pub use ownership::{
     OwnerToken, Ownership, OwnershipEvent, OwnershipEvents, RouteInfo, DEACTIVATING_LEAD_MILLIS,
 };
-pub use planner::Failover;
+pub use planner::{write_outage_bound, Failover, OutageBound, OutageClass};
 /// The longest [`NodeAddresses::app`] a node registers, in bytes (#83 B2): 512.
 pub use rdb_core::authority::node::MAX_APP_ADDR_LEN;
 pub use rdb_core::partition_map::{affinity_hash, partition_of, MAX_PARTITIONS};

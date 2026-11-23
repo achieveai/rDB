@@ -460,6 +460,8 @@ fn run(args: &Args) -> ExitCode {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local,
         links,
         client: ClientId(args.client_id),
