@@ -1975,6 +1975,63 @@ async fn i186_applied_past_the_durable_log_is_refused_as_corrupt() {
     }
 }
 
+/// A same-node log checkpoint from first open has the right identity, but cannot account
+/// for a root that subsequently applied its first entry and whose log had recorded a vote.
+#[retcd_test]
+async fn i186_first_open_log_cannot_cover_an_applied_index_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let copies = tempfile::tempdir().unwrap();
+    let log = config_storage::log_dir(tmp.path());
+    let early = copies.path().join("first-open");
+    let intact = copies.path().join("with-vote");
+    drop(open_plain(tmp.path()));
+    {
+        let db = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            &log,
+            config_storage::LOG_COLUMN_FAMILIES,
+        )
+        .unwrap();
+        rocksdb::checkpoint::Checkpoint::new(&db)
+            .unwrap()
+            .create_checkpoint(&early)
+            .unwrap();
+    }
+
+    let vote = Vote::new(1, 1);
+    {
+        let s = open_plain(tmp.path());
+        s.log_store().save_vote(&vote).await.unwrap();
+        append_apply(&s, vec![membership_entry(0, &[1])])
+            .await
+            .unwrap();
+    }
+    {
+        let s = open_plain(tmp.path());
+        assert_eq!(s.reader().last_applied().unwrap().index, 0);
+        assert_eq!(s.log_store().read_vote().await.unwrap(), Some(vote));
+    }
+
+    std::fs::rename(&log, &intact).unwrap();
+    std::fs::rename(&early, &log).unwrap();
+    match open_result(tmp.path(), identity()) {
+        Err(StorageOpenError::Corrupt { what, path, .. }) => {
+            assert_eq!(what, "state_meta/last_applied");
+            assert_eq!(path, tmp.path());
+        }
+        Err(other) => panic!("expected an uncovered applied index, got {other:?}"),
+        Ok(s) => panic!(
+            "reopened applied index zero with stale log and vote {:?}",
+            s.log_store().read_vote().await.unwrap()
+        ),
+    }
+    std::fs::rename(&log, &early).unwrap();
+    std::fs::rename(&intact, &log).unwrap();
+    let s = open_plain(tmp.path());
+    assert_eq!(s.log_store().read_vote().await.unwrap(), Some(vote));
+    assert_eq!(s.reader().last_applied().unwrap().index, 0);
+}
+
 /// The harness shortcut the strict I1 check replaces: applying entries that were never appended
 /// (which real Raft never does) leaves a store that the next open refuses as `Corrupt`. Rows
 /// that used the shortcut now append first; this row is the evidence the check fires on it.

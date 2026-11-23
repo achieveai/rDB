@@ -212,19 +212,24 @@ place. That reopens cleanly with no redo, and the purge OpenRaft issues again is
   checked at open: a store that breaks it is refused as
   `Corrupt { what: "state_meta/last_applied" }`. OpenRaft would otherwise purge the log up to
   `last_applied` without a word and hide the fault. Applying entries that were never appended
-  breaks I1. Real Raft never does that. Storage rows that used to do it now append first.
+  breaks I1. Even applied index zero requires a real log entry, purge pointer or covering
+  snapshot with a log id. Real Raft never does that. Storage rows that used to do it now append first.
 - **I2.** Purge sorts a request as covered, deferred or refused, the same way as before.
 - **I3.** `committed` is never past the last log index.
 - **I5.** `truncate` stays synced.
 - **I6.** Both halves are present and carry the same identity, or both are fresh.
   - A state machine with state and no bound log is refused with `MissingLogStore`, naming the
     log directory.
-  - A log with a vote, an entry or a pointer, and no state machine, is refused with
-    `MissingLogStore`, naming the root.
+  - A log with a vote, an entry or a pointer requires a bound state machine. An absent root
+    or a root without an identity is refused with `MissingLogStore`, naming the root.
   - A log bound to another node is refused with `IdentityMismatch`, naming the log directory.
   - A first open binds the log first, with its own synced write, then writes the root batch. A
     crash between the two leaves a log holding only its identity. The next open treats that as
     fresh.
+  - A fresh receiver can install a snapshot before its log records a vote or an entry. A
+    covering snapshot therefore permits an identity-only log at reopen. Format 4 cannot
+    distinguish that state from the same root paired with an older same-identity log copy.
+    Recover both halves together.
 
 **Old directories are refused, not migrated.** A directory with `raft_log` in its root
 database was written before format 4 (formats 1 to 3). It is refused with
@@ -253,8 +258,8 @@ openraft 0.10) may do the same. The first bump after it must replace `refuse_pre
 `validate_snapshot_file` and `restore_into_fresh_store` currently require exact format equality.
 
 **Rows.** `crates/config-storage/tests/rocks.rs` (`i186_*`): the pre-split refusal, both
-`MissingLogStore` directions, the foreign log, the identity-only log, a crash after apply, and
+`MissingLogStore` directions, an existing unbound root beside a purged log, a stale first-open log beside
+applied index zero, the foreign log, the identity-only retry, a crash after apply, and
 I1 at open, together with the apply-without-append shape it refuses. M4-13, the M5 v2 row and
 M5-127 became `PreSplitLayout` rows, and so did M5-71 in the testkit.
-`crates/config-storage/tests/m5_snapshot.rs` `i186_crash_before_the_deferred_purge_*` covers
-the new install window.
+`crates/config-storage/tests/m5_snapshot.rs` covers crashes immediately before and after the deferred log purge.

@@ -339,8 +339,9 @@ pub enum StorageOpenError {
     ///
     /// The usual shape is a state-machine database with applied state and no log database (or
     /// an empty one) beside it. Recreating the log there would lose the durable vote, which is a
-    /// double-vote hazard, so the open refuses instead. The reverse — a log database holding a
-    /// vote or entries next to no state-machine database — is refused the same way.
+    /// double-vote hazard, so the open refuses instead. A log with a vote, an entry or a pointer
+    /// requires a bound state machine. An absent root or a root without an identity is refused,
+    /// naming the root.
     #[error(
         "data directory {path} is missing half of its store: {missing} is absent or empty while \
              the other half holds Raft state; recreating it would lose {}",
@@ -369,8 +370,7 @@ pub enum StorageOpenError {
     /// applied. A residual of applied, decodable entries -- which is all OpenRaft's purge ever
     /// leaves behind -- is not an obstacle and never was.
     ///
-    /// The fix depends on which build wrote the directory, so the message does too -- see
-    /// [`drained_log_remedy`], and finding F-016 for why naming only the drain was wrong.
+    /// [`drained_log_remedy`] selects the recovery procedure for the admitted split directory's marker.
     #[error(
         "data directory {path} is on-disk format version {format} and {log_entries} of its \
              Raft log entrie(s) cannot be carried across an in-place upgrade -- this build \
@@ -2451,15 +2451,13 @@ fn check_applied_within_log(loaded: &Loaded, path: &Path) -> Result<(), StorageO
     let Some(applied) = loaded.last_applied.map(|l| l.index) else {
         return Ok(());
     };
-    let log_last = loaded
-        .last_log_id
-        .or(loaded.last_purged)
-        .map_or(0, |l| l.index);
+    let log_last = loaded.last_log_id.or(loaded.last_purged).map(|l| l.index);
     let covered = loaded
         .current_snapshot
         .as_ref()
-        .map_or(0, |c| c.covered_index());
-    if applied <= log_last.max(covered) {
+        .and_then(|c| c.last_log_id)
+        .map(|l| l.index);
+    if log_last.max(covered).is_some_and(|index| applied <= index) {
         return Ok(());
     }
     tracing::error!(
@@ -2473,8 +2471,8 @@ fn check_applied_within_log(loaded: &Loaded, path: &Path) -> Result<(), StorageO
         what: "state_meta/last_applied".to_string(),
         path: path.to_path_buf(),
         detail: format!(
-            "applied index {applied} is past both the durable log (last index {log_last}) and \
-             the snapshot (covers {covered}); the state machine cannot be ahead of the log it \
+            "applied index {applied} is past both the durable log (last index {log_last:?}) and \
+             the snapshot (covers {covered:?}); the state machine cannot be ahead of the log it \
              was applied from (I1)"
         ),
     })
@@ -3501,8 +3499,8 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
     /// Phase one makes the file durable under its final name and writes an
     /// `install_in_progress` marker in its own synced batch. Phase two clears the data column
     /// families, streams the records in, and commits one final synced batch carrying the new
-    /// applied state, the new `current_snapshot`, the **deletion** of the marker, and any purge
-    /// that was deferred waiting for exactly this moment. Between the two phases the state
+    /// applied state, the new `current_snapshot` and the **deletion** of the marker. A deferred
+    /// purge then runs as its own synced log write. Between the two phases the state
     /// machine is a mixture of the old and new states — which is why a marker found at open
     /// means "redo", not "continue".
     async fn install_snapshot(

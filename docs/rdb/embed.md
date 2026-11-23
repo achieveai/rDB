@@ -2370,7 +2370,7 @@ inside that node's data directory. **A node directory written by an older build 
 
 - The node exits with code 3 and logs `storage_open_failed` with a message explaining that the Raft log lives inside
   the state-machine database. The separate `store_pre_split_layout` event records the node's
-  data directory in `path` and its old marker in `format_version` (0 when absent). The check only reads, so the directory is left exactly as it was.
+  data directory in `path` and its old marker in `format_version` (0 when absent or unreadable). The check only reads, so the directory is left exactly as it was.
 - Your app then sees rEtcd as down: `OpenError::Control` at open.
 - **What to do:** run that rEtcd with the build that wrote it, or `clean` it and start fresh.
   Replacing a single node in a surviving compatible cluster requires a fresh node id.

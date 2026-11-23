@@ -3,9 +3,9 @@
 **Superseded for format 4.** ADR-0008 records the split database layout. A root containing
 `raft_log` is refused before missing-family checks. The historical LegacyV1/LegacyV2 family
 migrations below applied to older builds. The marker migration still handles split directories
-with a legacy marker, including format 1 written under `--compat-schema 1`.
+with marker 1 or 2, including format 1 written under `--compat-schema 1`.
 
-**Status:** Accepted
+**Status:** Accepted, superseded in part by the format-4 note in ADR-0008.
 **Date:** 2026-09-18
 **Spec:** §9.2, §17, §21 M4
 

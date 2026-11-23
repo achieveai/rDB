@@ -269,7 +269,8 @@ slot is always open at the moment the follower purge is issued.
 
 `pending_purge` is in-memory only. It is dropped, not executed, if the install aborts or the
 process restarts, and it is executed only inside install's final synced batch, after
-`current_snapshot` is durable. The next `purge` call re-evaluates from scratch. Rows:
+`current_snapshot` is durable. Since format 4, the deferred purge runs after the final state
+batch as its own synced log write (ADR-0008). The next `purge` call re-evaluates from scratch. Rows:
 `m5_24a_purge_during_install_is_deferred_then_executed`,
 `m5_24b_aborted_install_drops_the_pending_purge`,
 `m5_24c_restart_mid_defer_reports_the_lower_last_purged`, and
