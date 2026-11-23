@@ -1939,6 +1939,11 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   larger `history_budget_bytes`: the budget is fixed when the node starts. Reducing writes alone
   does not clear an existing give-up. A new generation or the copy catching up clears it with no
   restart (`history_budget_give_up_cleared`), and the copy is retried.
+  The budget is a hard cap with one exception: while a degraded rebuild runs (F1 `Rebuilding`
+  after a commit below `Active`), History is kept from that rebuild's cutoff, so it can go past
+  `history_budget_bytes` until the rebuild activates. Each round held that way logs
+  `history_trim_held_rebuild{cutoff, floor_was}` (info). The activation needs the record at the
+  cutoff, and a trim past it would make the primary refuse its own activation.
 - **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
   `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
   set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,

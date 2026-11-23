@@ -7678,6 +7678,42 @@ fn t61_ack_below_floor_is_unverifiable_and_asks_snapshot() {
     }
 }
 
+/// Issue #61 (PR #240 r3): `DigestLadder::trim_below` drops only the prefix below the floor and
+/// stops at the first rung it keeps. A ladder with a gap (`0, 3, 8, 9, 12`) trimmed to 5 keeps
+/// `8, 9, 12`, whose lowest is above the floor; trimmed again to 9 it keeps `9, 12`; a trim at
+/// or below the lowest rung changes nothing.
+/// Cuts: the pop does not stop (`break` removed), red (the ladder is empty); the stop test
+/// `>` for `>=`, red (the rung at 9 goes).
+/// Unit (<1 ms).
+#[retcd_test]
+fn t61_trim_below_pops_only_the_prefix_below_the_floor() {
+    let mut ladder = DigestLadder::new();
+    for seq in [0, 3, 8, 9, 12] {
+        ladder.insert(Seq(seq), d(seq));
+    }
+    let held = |ladder: &DigestLadder| {
+        (0..=12)
+            .filter(|seq| ladder.digest_at(Seq(*seq)).is_some())
+            .collect::<Vec<u64>>()
+    };
+    ladder.trim_below(Seq(5));
+    assert_eq!(
+        held(&ladder),
+        [8, 9, 12],
+        "a floor in the gap keeps the rungs above it"
+    );
+    ladder.trim_below(Seq(9));
+    assert_eq!(held(&ladder), [9, 12], "the rung at the floor stays");
+    ladder.trim_below(Seq(9));
+    ladder.trim_below(Seq(2));
+    assert_eq!(
+        held(&ladder),
+        [9, 12],
+        "a floor at or below the lowest rung drops nothing"
+    );
+    assert_eq!(ladder.digest_at(Seq(12)), Some(d(12)));
+}
+
 /// Issue #61 A3: an ACK at the floor itself counts, because History keeps the record at the
 /// floor and the ladder keeps its rung (design §0, "`seq` included"). Twice: a dense ladder
 /// trimmed to 8 keeps its rung at 8, and a ladder that held only the root and its head (what

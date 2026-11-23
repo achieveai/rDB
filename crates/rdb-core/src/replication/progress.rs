@@ -226,8 +226,16 @@ impl DigestLadder {
     /// included, and the ladder mirrors it. So once `seq` is above 0 the genesis rung
     /// `(0, ROOT)` goes too, and a copy that asks from the root meets `NotRetained`, which asks
     /// for a snapshot, instead of a walk from record 1 that the engine can no longer serve.
+    ///
+    /// Pops from the front while the lowest rung is below `seq`, so a trim costs the rungs it
+    /// drops, not the ladder's length: a retention round runs it each time the floor moves.
     pub fn trim_below(&mut self, seq: Seq) {
-        self.entries.retain(|held, _| *held >= seq);
+        while let Some(lowest) = self.entries.first_entry() {
+            if *lowest.key() >= seq {
+                break;
+            }
+            lowest.remove();
+        }
     }
 
     /// The lowest sequence the ladder holds, or `None` when it holds nothing. After

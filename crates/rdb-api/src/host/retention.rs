@@ -26,7 +26,7 @@
 use super::*;
 use rdb_core::replication::retention::{
     cap_seq, needs_history_budget, overrun_action, retention_floor, OverrunAction,
-    RetentionDecision, RetentionHold, RetentionInput, RetentionSamples,
+    RetentionDecision, RetentionFloor, RetentionHold, RetentionInput, RetentionSamples,
     HISTORY_BUDGET_GIVE_UP_CLEARED, HISTORY_BUDGET_OVERRAN_PIN, HISTORY_COPY_BEHIND_FLOOR,
 };
 
@@ -67,6 +67,9 @@ pub(crate) struct RetentionState {
     pub(crate) behind: BTreeSet<CopyId>,
     /// The open grace: the generation whose `Recovered` began it, and when.
     pub(crate) grace: Option<(Generation, Tick)>,
+    /// The generation the last grace began in, kept after it ends, so a replayed `Recovered`
+    /// of that generation does not open a second one (PR #240 r3: one grace per generation).
+    pub(crate) graced: Option<Generation>,
     /// Per copy, the overruns in a row of its transfers from this node (issue #61 S3-R4 (b),
     /// owner ruling 2026-11-20, option 1): one more each time the cap ends one
     /// `budget_overran`, reset by any round for the copy that is not an overrun: a `caught_up`
@@ -167,7 +170,10 @@ impl Host {
             cap,
             hold: self.retention_hold(partition, generation),
         };
-        let decision = retention_floor(&input);
+        let mut decision = retention_floor(&input);
+        if let RetentionDecision::Floor(floor) = &mut decision {
+            self.clamp_at_rebuild(partition, generation, prev, &input, floor);
+        }
         let floor = match &decision {
             RetentionDecision::Held(hold) => {
                 tracing::debug!(
@@ -245,6 +251,58 @@ impl Host {
             self.trim_history_through(partition, floor.floor)?;
         }
         Ok(decision)
+    }
+
+    /// While F1 here is `Rebuilding` its commit of `generation` below `Active`, keep the floor at
+    /// or below that commit's cutoff, logged `history_trim_held_rebuild` when that lowers it.
+    /// `activate` restates the commit at that cutoff, and the primary's R1 refuses a
+    /// restatement whose cutoff rung it no longer holds (`BarrierNotDurable`), so a trim past it
+    /// would make the primary refuse its own activation. This overrides the byte cap for the
+    /// length of the rebuild (lead ruling, PR #240 r3 Q1). A commit F1 armed no rebuild for (a
+    /// two-copy drop, a capped commit) never activates, so it is not held.
+    fn clamp_at_rebuild(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        prev: Seq,
+        input: &RetentionInput,
+        floor: &mut RetentionFloor,
+    ) {
+        let rebuilding = self
+            .recoveries
+            .get(&partition)
+            .is_some_and(|f1| f1.phase() == RecoveryPhase::Rebuilding);
+        let Some(watch) = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| rebuilding && watch.generation == generation)
+        else {
+            return;
+        };
+        let held = prev.max(watch.cutoff);
+        if floor.floor <= held {
+            return;
+        }
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            mode = ?watch.mode,
+            cutoff = watch.cutoff.0,
+            floor_was = floor.floor.0,
+            floor = held.0,
+            "history_trim_held_rebuild"
+        );
+        floor.floor = held;
+        floor.overran_pins.retain(|pin| *pin < held);
+        let below: BTreeSet<CopyId> = input
+            .copies
+            .iter()
+            .flatten()
+            .filter(|(_, durable)| Seq(durable.0) < held)
+            .map(|(copy, _)| *copy)
+            .collect();
+        floor.behind.retain(|copy| below.contains(copy));
     }
 
     /// Record `applied` in `partition`'s samples of `generation` and answer `keep`. A newer
@@ -424,9 +482,9 @@ impl Host {
     }
 
     /// A `Recovered` of `generation` stepped into R1 here: when it leaves this node a primary,
-    /// its window waits for its copies' acks (design 3.1 m2). A repeat in the open grace's
-    /// generation keeps its start (lead ruling R24); a newer generation ends the open one
-    /// `superseded` and begins afresh.
+    /// its window waits for its copies' acks (design 3.1 m2). A repeat in the last graced
+    /// generation keeps an open grace's start (lead ruling R24) and leaves a closed one closed;
+    /// a newer generation ends the open one `superseded` and begins afresh.
     pub(super) fn begin_grace(&mut self, partition: PartitionId, generation: Generation) {
         if self.replication.primary(self.node, partition).is_none() {
             return;
@@ -434,10 +492,10 @@ impl Host {
         let now = self.clock.now();
         let node = self.node.0;
         let state = self.retention.entry(partition).or_default();
-        let open = state.grace.map(|(held, _)| held);
-        if open == Some(generation) {
+        if state.graced == Some(generation) {
             return;
         }
+        let open = state.grace.map(|(held, _)| held);
         if let Some(held) = open {
             tracing::info!(
                 node,
@@ -448,6 +506,7 @@ impl Host {
             );
         }
         state.grace = Some((generation, now));
+        state.graced = Some(generation);
         tracing::info!(
             node,
             partition = partition.0,

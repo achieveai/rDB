@@ -1330,3 +1330,232 @@ fn t61_pr_b_a_copy_trimmed_past_by_retention_with_a_write_after_is_released_caug
             .then_some(())
     });
 }
+
+/// The tune of [`t61_s3_scheduled_retention_stays_bounded_under_steady_writes`]: the rejoin
+/// tune with the retention duty on its own schedule, no inventory pin, a 300 ms window and no
+/// byte cap.
+fn steady_tune(host: &mut Host) {
+    regular_rejoin(host);
+    host.inventory_pin_millis = 0;
+    host.history_retention = HistoryRetention {
+        keep_millis: 300,
+        budget_bytes: u64::MAX,
+    };
+}
+
+/// Issue #61 S3 (PR #240 r3): the host's own schedule keeps History bounded under steady
+/// writes. No round is called by the row: `run_due` runs the duty every
+/// `RETENTION_DUTY_MILLIS`. Over four periods node 1 takes three puts each; within each period
+/// its floor rises past the last one and reaches the head held before that period's puts, so
+/// History never holds more than the period's own writes.
+///
+/// Cut: the duty runs once a lineage is trimmed and never again (`next_retention` set to the
+/// end of time after the first trim), red (period 1's floor never moves).
+/// Integration (~6 s): bootstrap and four duty periods.
+#[config_log::retcd_test]
+fn t61_s3_scheduled_retention_stays_bounded_under_steady_writes() {
+    const METHOD: &str = "t61_s3_scheduled_retention_stays_bounded_under_steady_writes";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), steady_tune);
+    trio.bootstrap();
+    trio.ready();
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    let floor = |trio: &Trio| trio.nodes[0].0.engine.floor_seq(P, generation).0;
+    let mut request = 1;
+    let mut last = floor(&trio);
+    for period in 0..4 {
+        let before = trio.head().expect("node 1 holds a head");
+        for _ in 0..3 {
+            put_durable(&mut trio, request);
+            request += 1;
+        }
+        let head = trio.head().expect("node 1 holds a head");
+        let reached = trio.until(
+            &format!("period {period}: the scheduled duty trims past {last} to {before}"),
+            |trio| {
+                let now = floor(trio);
+                (now > last && now >= before).then_some(now)
+            },
+        );
+        assert!(
+            reached <= head && head - reached <= 3,
+            "period {period}: History holds only this period's writes: floor {reached}, head {head}"
+        );
+        last = reached;
+    }
+    assert_eq!(trio.nodes[0].0.newest_held(P), Some(generation));
+    assert!(logged!(METHOD, "host_history_trimmed").len() >= 4);
+}
+
+/// Issue #61 S3 (PR #240 r3, lead ruling R23): a binding byte cap trims during an open failover
+/// grace. After [`failed_over_with_copy_3_held`], copy 3 stays held, so it never acks and the
+/// grace stays open. Node 2 has `history_budget_bytes` = 0 (only the head record fits), a keep
+/// of an hour and a 10-minute pin window, so neither the window nor an expiry moves the floor;
+/// its lineage is synced through its head. Node 2's own schedule, not a called round, trims to
+/// the head, and the grace is still open afterwards.
+///
+/// Cut: the grace arm of `retention_floor` holds whatever the cap says (`floor == input.prev`
+/// for `true`), red (the floor stays).
+/// Integration (~5 s): bootstrap, a promote and one duty period.
+#[config_log::retcd_test]
+fn t61_s3_a_binding_cap_trims_during_open_failover_grace() {
+    const METHOD: &str = "t61_s3_a_binding_cap_trims_during_open_failover_grace";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, second) = failed_over_with_copy_3_held(dir.path());
+    let node2 = &mut trio.nodes[1].0;
+    node2.history_retention = HistoryRetention {
+        keep_millis: 3_600_000,
+        budget_bytes: 0,
+    };
+    node2.inventory_pin_millis = 600_000;
+    let before = node2.engine.floor_seq(P, second);
+    let head = Seq(node2.engine.buffered_applied(P, second).0);
+    assert!(
+        before < head,
+        "there is History to trim: {before:?} {head:?}"
+    );
+    synced(&mut node2.engine, second, head.0);
+    node2.next_retention = trio.clock.now();
+    trio.until("node 2's scheduled duty trims to its head", |trio| {
+        (trio.nodes[1].0.engine.floor_seq(P, second) == head).then_some(())
+    });
+    assert_eq!(
+        grace_of(&trio.nodes[1].0),
+        Some(second),
+        "the grace is open"
+    );
+    let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
+        .into_iter()
+        .filter(|line| line["node"] == 2)
+        .collect();
+    assert!(ends.is_empty(), "no grace of node 2 ended: {ends:?}");
+}
+
+/// Issue #61 S3 (PR #240 r3, design 3.1): a queued `Delayed::Landing` alone holds the floor.
+/// A `Landed` whose `not_before` is an hour away goes through `Host::handle` and waits in the
+/// delay queue; no link sync is awaited and no other hold applies (keep 0, budget 0, no pin).
+/// The host's own schedule runs a round: it is held `LandingPending` and the floor stays.
+///
+/// Cut: the `Delayed::Landing` arm of `Host::retention_hold`'s landing check removed (only
+/// `link_pending` read), red (the round trims to 3).
+/// Unit, under a second here (one trio bootstrap, for the commit it queues).
+#[config_log::retcd_test]
+fn t61_s3_a_delayed_landing_alone_holds_the_floor() {
+    let result = super::catchup_tests::landing_at(3, Digest::ROOT);
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = trimmable_host(&dir.path().join("node"), &rt, |_| {});
+    let now = host.clock.now();
+    host.handle(Msg::Landed {
+        result: Box::new(result),
+        partition: P,
+        correlation: CorrelationId(0),
+        emitter: NodeId(1),
+        not_before: now.plus_millis(3_600_000),
+        owner_live_readd: false,
+    });
+    assert!(host.link_pending.is_empty(), "no link sync awaited");
+    assert_eq!(
+        host.delayed
+            .values()
+            .filter(|item| matches!(item, Delayed::Landing { .. }))
+            .count(),
+        1,
+        "the landing waits in the queue"
+    );
+    let before = host.engine.floor_seq(P, Generation(1));
+    host.next_retention = host.clock.now();
+    host.run_due();
+    assert_eq!(host.fault, None);
+    assert!(host.next_retention > now, "the scheduled duty ran");
+    assert_eq!(
+        host.retention_hold(P, Generation(1)),
+        Some(RetentionHold::LandingPending)
+    );
+    assert_eq!(host.engine.floor_seq(P, Generation(1)), before);
+}
+
+/// Issue #61 S3 (PR #240 r3, lead ruling R24: one grace per generation): a closed grace stays
+/// closed when a `Recovered` of its generation is replayed. Node 1's bootstrap grace ends
+/// `acked` through its rounds; a repeat `begin_grace` of that generation leaves no grace open
+/// and logs no second `history_grace_begun`.
+///
+/// Cut: `begin_grace` checks only the open grace (`graced` ignored), red (the grace reopens).
+/// Integration (~1 s): bootstrap.
+#[config_log::retcd_test]
+fn t61_s3_a_closed_grace_stays_closed_on_a_replayed_recovered() {
+    const METHOD: &str = "t61_s3_a_closed_grace_stays_closed_on_a_replayed_recovered";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), no_duty);
+    trio.bootstrap();
+    trio.ready();
+    let first = trio.status(0).recovered.expect("bootstrap committed");
+    rounds_until(&mut trio, "node 1's grace ends", |host| {
+        grace_of(host).is_none()
+    });
+    let host = &mut trio.nodes[0].0;
+    host.begin_grace(P, first);
+    assert_eq!(grace_of(host), None, "the closed grace stays closed");
+    let begun: Vec<_> = logged!(METHOD, "history_grace_begun")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .collect();
+    assert_eq!(begun.len(), 1, "{begun:?}");
+}
+
+/// Issue #61 S3 (PR #240 r3 Q1, lead ruling option A): a byte cap does not trim past the cutoff
+/// of a degraded rebuild, so the primary can still take its own activation. The trio boots with
+/// node 3's links held: F1 commits `DegradedRf2` with nodes 1 and 2 at cutoff 0 and arms a
+/// rebuild of node 3. Writes land; node 1 has `history_budget_bytes` = 0 and keep 0, and its
+/// own schedule runs. While F1 is `Rebuilding` every trim is held at the cutoff
+/// (`history_trim_held_rebuild{cutoff = 0}`) and the floor stays 0. Healed, node 3 proves the
+/// point, the activation's `Recovered` (now `Active`) is taken, and the cap trims again.
+///
+/// Cut: no clamp in `clamp_at_rebuild` (an early return), red (the floor passes the cutoff, the
+/// primary refuses its activation `BarrierNotDurable`, and the commit never reaches `Active`).
+/// Integration (~5 s): bootstrap, writes, a heal and the activation.
+#[config_log::retcd_test]
+fn t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates() {
+    const METHOD: &str = "t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), |host| {
+        Trio::fast(host);
+        host.inventory_pin_millis = 0;
+        host.history_retention = HistoryRetention {
+            keep_millis: 0,
+            budget_bytes: 0,
+        };
+    });
+    trio.links.hold(NodeId(1), NodeId(3));
+    trio.links.hold(NodeId(2), NodeId(3));
+    trio.bootstrap();
+    trio.ready();
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    let mode = |trio: &Trio| trio.nodes[0].0.committed.get(&P).map(|c| c.mode.clone());
+    assert_eq!(mode(&trio), Some(PartitionMode::DegradedRf2));
+    assert_eq!(trio.status(0).recovery.as_deref(), Some("Rebuilding"));
+    for request in 1..=4 {
+        put_durable(&mut trio, request);
+    }
+    let held_lines = || {
+        logged!(METHOD, "history_trim_held_rebuild")
+            .into_iter()
+            .filter(|line| line["node"] == 1)
+            .count()
+    };
+    trio.until("node 1's scheduled duty holds a trim at the cutoff", |_| {
+        (held_lines() >= 2).then_some(())
+    });
+    let floor = |trio: &Trio| trio.nodes[0].0.engine.floor_seq(P, generation);
+    assert_eq!(floor(&trio), Seq::ZERO, "held at the rebuild's cutoff");
+    let held = logged!(METHOD, "history_trim_held_rebuild");
+    assert_eq!(held[0]["cutoff"], 0, "{:?}", held[0]);
+    trio.links.heal_all();
+    trio.until("the activation reaches Active on node 1", |trio| {
+        (mode(trio) == Some(PartitionMode::Active)).then_some(())
+    });
+    put_durable(&mut trio, 5);
+    trio.until("the cap trims once the rebuild is done", |trio| {
+        (floor(trio) > Seq::ZERO).then_some(())
+    });
+}

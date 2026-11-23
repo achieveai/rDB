@@ -69,9 +69,15 @@ the floor).
    records the hold (`offer_holds`), shows the command in `needs_operator`, and `admin
    forget-tail` counts the hold. The forget-tail's writable commit supersedes the tail, and the
    next ordinary offer rebuilds the copy.
-7. **Who trims, in this change.** Only the debug-build dev tool `rdb_dev admin trim-history
-   --through N` (`Db::trim_history`). The automatic trim, its keep window and its byte cap are a
-   later change.
+7. **Who trims.** The host's retention duty (`Host::retention_duty`, issue #61 PR-B), in every
+   build, once a second per partition. The keep window (`history_keep`, default 30 minutes) and
+   the byte cap (`history_budget_bytes`, default 20 GiB, a hard cap that overrides a lagging copy
+   and a transfer pin) set the floor. A staging, installing, recovering or landing lineage, an
+   answered inventory (for up to 10 minutes) and a failover grace hold it back; the grace yields
+   to the cap. A degraded rebuild keeps the floor at its cutoff until it activates, the cap
+   included (`history_trim_held_rebuild`), because the activation restates that cutoff. The
+   debug-build dev tool `rdb_dev admin trim-history --through N`
+   (`Db::trim_history`) remains for tests.
 
 ## Consequences
 
@@ -90,8 +96,10 @@ the floor).
 - **The old lineages are deleted at install start**, not kept as a quarantined suffix for seven
   days (spec §8.4). They are deleted only after the offer passed the authority check, and never
   over a current #105 tail.
-- **Disk and memory are bounded only once the automatic trim lands.** Until then History still
-  grows unless an operator runs the debug tool. The automatic trim is a later change.
+- **Disk and memory are bounded by the retention duty.** History holds about the keep window,
+  and never more than the byte cap unless a hold applies: a lineage being staged, installed,
+  recovered or landed, an answered inventory for up to 10 minutes, or a degraded rebuild until
+  it activates.
 - `PROTOCOL_VERSION` moves to 11 (10 is issue #107's and issue #87's): the probe ask, the
   snapshot frames, `needs_operator` and `trimmed` are new wire vocabulary, and the handshake
   requires an exact match.
