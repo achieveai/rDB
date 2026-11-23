@@ -169,3 +169,97 @@ interferes with snapshot files. `<data_dir>/snapshots/*.snap` holds published Ra
 (retain-last-2, ADR-0022); backup artifacts are written to an operator-supplied destination
 directory (`--out`/`Backup{dest_dir}`, ADR-0024), never under `<data_dir>` by default, since a
 backup is meant to survive the loss of `data_dir` entirely.
+
+### Note (2026-11-21, #186 part 2): the Raft log moves to its own database; format 4
+
+**What changed.** Each node's store is now **two RocksDB databases** in one data directory.
+Format 4 (`FORMAT_VERSION = 4`, `CURRENT_SCHEMA.format_version = 4`):
+
+| Database | Where | Column families | Holds |
+|---|---|---|---|
+| log | `<data_dir>/raft-log/` | `raft_log`, `raft_meta` | entries, `vote`, `committed`, `last_purged`, and a copy of `identity` |
+| state machine | `<data_dir>/` (root) | `kv`, `state_meta`, `events`, `dedup` | records, `last_applied`, membership, `identity`, `format_version`, the journal, dedup |
+
+`snapshots/` stays where it was. Both databases are opened by one `RocksShared` and closed
+together. `COLUMN_FAMILIES` names the root set and `LOG_COLUMN_FAMILIES` the log set.
+
+**Why.** With one database, every apply batch's fsync also flushed every log entry. A second
+database gives the log its own write-ahead log, so the two are synced on their own. That is
+what PR-2 needs to make append asynchronous. PR-1 changes only the layout and keeps every
+write synced as before.
+
+**Write order across the two WALs (L = log database, S = state machine).**
+
+| Operation | Order |
+|---|---|
+| `append` | one L batch, synced, before the flush callback |
+| `save_vote`, `truncate` | one synced L write |
+| `save_committed` | one unsynced L write, as before |
+| `apply` | L first (the entries were appended), then the S batch |
+| `purge` | S must cover the index (`last_applied` or the snapshot), then the L delete |
+| install | L truncate, S install marker, S final batch, then the deferred purge as its own synced L write |
+| snapshot build | a checkpoint of S only; L is not part of a snapshot |
+
+The deferred purge used to ride in the install's final batch. It cannot share a batch across
+two databases, so it now runs right after that batch and crosses `BeforePurge`/`AfterPurge` a
+second time. A crash between the two leaves the snapshot installed and the old log entries in
+place. That reopens cleanly with no redo, and the purge OpenRaft issues again is covered.
+
+**Invariants.**
+
+- **I1.** `last_applied` is never past `max(durable last log index, snapshot index)`. On
+  openraft 0.9 this holds because `RaftCore` awaits the log flush before it applies. It is
+  checked at open: a store that breaks it is refused as
+  `Corrupt { what: "state_meta/last_applied" }`. OpenRaft would otherwise purge the log up to
+  `last_applied` without a word and hide the fault. Applying entries that were never appended
+  breaks I1. Even applied index zero requires a real log entry, purge pointer or covering
+  snapshot with a log id. Real Raft never does that. Storage rows that used to do it now append first.
+- **I2.** Purge sorts a request as covered, deferred or refused, the same way as before.
+- **I3.** `committed` is never past the last log index.
+- **I5.** `truncate` stays synced.
+- **I6.** Both halves are present and carry the same identity, or both are fresh.
+  - A state machine with state and no bound log is refused with `MissingLogStore`, naming the
+    log directory.
+  - A log with a vote, an entry or a pointer requires a bound state machine. An absent root
+    or a root without an identity is refused with `MissingLogStore`, naming the root.
+  - A log bound to another node is refused with `IdentityMismatch`, naming the log directory.
+  - A first open binds the log first, with its own synced write, then writes the root batch. A
+    crash between the two leaves a log holding only its identity. The next open treats that as
+    fresh.
+  - A fresh receiver can install a snapshot before its log records a vote or an entry. A
+    covering snapshot therefore permits an identity-only log at reopen. Format 4 cannot
+    distinguish that state from the same root paired with an older same-identity log copy.
+    Recover both halves together.
+
+**Old directories are refused, not migrated.** A directory with `raft_log` in its root
+database was written before format 4 (formats 1 to 3). It is refused with
+`PreSplitLayout { found, path }`, where `found` is its marker or 0 if the marker cannot be read.
+
+- The check is one probe function, `refuse_pre_split_layout`. It has one call site, at the top
+  of `RocksStore::open`, and it is read-only, so the directory is left exactly as it was found.
+- The legacy column-family branches are deleted (`CfLayout::LegacyV1`/`LegacyV2`, the v1/v2
+  family lists, and the read-only legacy log scan).
+- The marker migration (`FormatAction::Migrate`) stays. A `--compat-schema 1` node writes the
+  split layout stamped 1 (ADR-0030, M6-R22), so that is still a directory a current build
+  upgrades, with the drained-log scan reading the log database.
+- A snapshot file records the format it was built under, so a format-3 snapshot is refused by
+  a format-4 restore. Offline export bypasses directory format and layout admission: it can
+  read a pre-split directory and stamps the exported snapshot with format 4.
+
+**Owner ruling, 2026-11-21: a standing rule for storage format changes.**
+
+> From SBX's first real deploy on, every storage format change must migrate in place at
+> startup and support a rolling upgrade, one node at a time.
+
+Until that deploy, a format bump refuses old folders with a typed error and no migration.
+Format 4 is such a bump. A further bump before the first deploy (for example a format 5 for
+openraft 0.10) may do the same. The first bump after it must replace `refuse_pre_split_layout`
+(and any refusal like it) with an in-place migration. Rolling upgrades also need cross-version snapshots: both
+`validate_snapshot_file` and `restore_into_fresh_store` currently require exact format equality.
+
+**Rows.** `crates/config-storage/tests/rocks.rs` (`i186_*`): the pre-split refusal, both
+`MissingLogStore` directions, an existing unbound root beside a purged log, a stale first-open log beside
+applied index zero, the foreign log, the identity-only retry, a crash after apply, and
+I1 at open, together with the apply-without-append shape it refuses. M4-13, the M5 v2 row and
+M5-127 became `PreSplitLayout` rows, and so did M5-71 in the testkit.
+`crates/config-storage/tests/m5_snapshot.rs` covers crashes immediately before and after the deferred log purge.

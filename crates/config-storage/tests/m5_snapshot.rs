@@ -140,9 +140,13 @@ struct FailAt {
 
 impl FailAt {
     fn new(boundary: Boundary, action: FaultAction) -> Arc<Self> {
+        Self::nth(boundary, 1, action)
+    }
+
+    fn nth(boundary: Boundary, nth: u64, action: FaultAction) -> Arc<Self> {
         Arc::new(Self {
             boundary,
-            nth: 1,
+            nth,
             action,
             seen: AtomicU64::new(0),
         })
@@ -688,7 +692,7 @@ async fn m5_24_uncovered_purge_with_no_transfer_is_refused() {
 
 /// M5-24a (ruling M5-R11, rule 2): a purge OpenRaft issues while a snapshot is being received
 /// is deferred — nothing deleted, nothing persisted, no error — and then executed by the
-/// install that justifies it, in the same synced batch as `current_snapshot`.
+/// install that justifies it, in a separate synced log batch after the final state batch.
 #[retcd_test]
 async fn m5_24a_purge_during_install_is_deferred_then_executed() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -733,6 +737,113 @@ async fn m5_24a_purge_during_install_is_deferred_then_executed() {
         let state = dst.log_store().get_log_state().await.expect("log state");
         assert_eq!(state.last_purged_log_id, Some(log_id(1, 10)));
     }
+}
+
+/// #186 (format 4): a crash between an install's final batch and its deferred log purge leaves
+/// a store that reopens consistently, with nothing to redo.
+///
+/// Since format 4 the deferred purge is its own synced write to the log database, run after
+/// the install's final batch to the state machine; the two are in different WALs, so they can
+/// no longer share one batch. That opens one new crash window, and this row sits in it: the
+/// state machine has the snapshot applied (index 6) while the log still holds its old entries
+/// (1..=3). I1 must accept that shape because the snapshot covers it, the install must not be
+/// redone (the marker went with the final batch), and the purge OpenRaft re-issues must be
+/// accepted as covered.
+#[retcd_test]
+async fn i186_crash_before_the_deferred_purge_reopens_without_a_redo() {
+    check_deferred_purge_crash(Boundary::BeforePurge).await;
+}
+
+#[retcd_test]
+async fn i186_crash_after_the_deferred_purge_reopens_without_a_redo() {
+    check_deferred_purge_crash(Boundary::AfterPurge).await;
+}
+
+async fn check_deferred_purge_crash(boundary: Boundary) {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    {
+        let src = open_as(src_dir.path(), identity_for(7, 1), Arc::new(NoFaults));
+        seed(&src, 6).await;
+        let meta = build(&src).await.expect("build succeeds");
+
+        // Crossing 1 of this boundary is the purge call itself, which defers; crossing 2 is the
+        // install executing it. The crash lands on the second, after the final batch.
+        let dst = open_as(
+            dst_dir.path(),
+            identity_for(7, 2),
+            FailAt::nth(boundary, 2, FaultAction::Crash),
+        );
+        seed(&dst, 3).await;
+        let bytes = std::fs::read(snap_path(&src, &meta)).unwrap();
+        let mut sm = dst.state_machine();
+        let mut file = sm.begin_receiving_snapshot().await.expect("receive slot");
+        file.write_all(&bytes).await.unwrap();
+        dst.log_store()
+            .purge(log_id(1, 6))
+            .await
+            .expect("a purge during a transfer is deferred, not refused");
+        assert_eq!(dst.metrics().purge_deferrals, 1);
+        assert!(
+            sm.install_snapshot(&meta, file).await.is_err(),
+            "the crash at the deferred purge fails the install"
+        );
+        assert!(dst.is_poisoned());
+    }
+    let dst = open_as(dst_dir.path(), identity_for(7, 2), Arc::new(NoFaults));
+    assert_eq!(
+        dst.metrics().snapshot_install_redos,
+        0,
+        "the final batch had landed, so there is nothing to redo"
+    );
+    assert_eq!(
+        dst.reader().cluster_revision(),
+        6,
+        "the installed snapshot is the applied state"
+    );
+    let keys: Vec<u64> = {
+        let db = rocksdb::DB::open_cf_for_read_only(
+            &rocksdb::Options::default(),
+            config_storage::log_dir(dst_dir.path()),
+            config_storage::LOG_COLUMN_FAMILIES,
+            false,
+        )
+        .expect("open the log database read-only");
+        let cf = db.cf_handle("raft_log").expect("raft_log cf");
+        db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .map(|item| {
+                let (key, _) = item.expect("scan raft_log");
+                u64::from_be_bytes(key.as_ref().try_into().expect("8-byte key"))
+            })
+            .collect()
+    };
+    assert_eq!(dst.reader().last_applied(), Some(log_id(1, 6)));
+    assert_eq!(dst.snapshot_meta().unwrap().last_log_id, Some(log_id(1, 6)));
+    if boundary == Boundary::AfterPurge {
+        assert!(keys.is_empty());
+        assert_eq!(
+            dst.log_store()
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id,
+            Some(log_id(1, 6))
+        );
+        return;
+    }
+    assert_eq!(
+        keys,
+        vec![1, 2, 3],
+        "the purge never ran, and the log is intact"
+    );
+    let state = dst.log_store().get_log_state().await.expect("log state");
+    assert_eq!(state.last_purged_log_id, None);
+    dst.log_store()
+        .purge(log_id(1, 6))
+        .await
+        .expect("the re-issued purge is covered by the installed snapshot");
+    assert_eq!(dst.raft_log_len(), 0);
+    assert_eq!(dst.metrics().purged_index, 6);
 }
 
 /// M5-24b (ruling M5-R11): an install that aborts **drops** the deferred purge rather than

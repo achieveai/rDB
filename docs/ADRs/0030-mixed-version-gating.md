@@ -311,7 +311,9 @@ trigger a snapshot, let purge drain the rest — that the only released build wr
 `format_version` 1 directory cannot perform, having neither a snapshot engine nor an admin
 plane (F-016). The format-1 arm now leads with rejoining as a fresh learner, which works on any
 build, and still names the drain for the other producer of a marker-1 directory, this build
-pinned (OQ-65, ruling M6-R22). `CURRENT_SCHEMA.proto_rev` stays 1, deliberately, and now says
+pinned (OQ-65, ruling M6-R22). Since format 4, the pre-split layout is refused. For a split
+marker-1 directory, the remedy leads with draining under the pin when its retained entries
+can be applied pinned. `CURRENT_SCHEMA.proto_rev` stays 1, deliberately, and now says
 why: M6's gRPC additions are all new fields and new services that an older peer parses and
 never calls, and `--compat-schema 1` removes no service from the surface, so bumping one triple
 and not the other would make the pinned node advertise a revision it is in fact serving past

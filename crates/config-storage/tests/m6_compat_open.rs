@@ -16,7 +16,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use config_core::{
     ClusterId, ClusterIdentity, Command, Limits, NodeId, RecoveryEpoch, COMMAND_SCHEMA_V1,
-    COMMAND_SCHEMA_V2, FEATURE_COMPACT,
+    FEATURE_COMPACT,
 };
 use config_log::retcd_test;
 use config_storage::{
@@ -62,6 +62,21 @@ fn open_with_ceiling(dir: &Path, max_format_version: u32) -> Result<RocksStore, 
         },
         Arc::new(NoopSink),
     )
+}
+
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
 }
 
 /// M6-98 `downgrading_a_v2_store_is_refused_with_one_specific_message`.
@@ -243,13 +258,7 @@ async fn m6_r20_b_an_unapplied_entry_still_refuses_the_migration() {
         }
         other => panic!("expected a typed drained-log refusal, got {other:?}"),
     }
-    // The operator has to be able to act on this without reading the source — and finding
-    // F-016 is that "act on it" was the part missing. This directory is stamped format 1, and
-    // the message's old single remedy named a snapshot trigger and a log purge, neither of
-    // which exists on the only released build that writes a format-1 directory (M0-M3,
-    // `main` 7d524ac: no snapshot engine, no admin plane). The format-1 arm must therefore
-    // lead with the path that works everywhere — rejoin as a fresh learner — while still
-    // naming the drain for the other producer of a marker-1 directory, this build pinned.
+    // The split marker-1 directory can be drained pinned, or replaced from a surviving member.
     let message = refused.to_string();
     for needle in [
         "learner",
@@ -334,13 +343,16 @@ async fn f015_a_pinned_store_refuses_to_apply_a_committed_schema_2_command() {
 
     // An ordinary write first: the fence is about the *dedup/maintenance* grammar, not about
     // writing. A rolling upgrade that stopped ordinary traffic would be its own outage.
-    pinned
-        .state_machine()
-        .apply(vec![put(1, "/f015/plain", "v")])
+    append_apply(&pinned, vec![put(1, "/f015/plain", "v")])
         .await
         .expect("a schema-1 command must still apply on a pinned node");
     assert_eq!(watermark(&pinned), COMMAND_SCHEMA_V1);
 
+    pinned
+        .log_store()
+        .blocking_append(vec![compact(2, 1)])
+        .await
+        .unwrap();
     let refused = pinned
         .state_machine()
         .apply(vec![compact(2, 1)])
@@ -365,12 +377,17 @@ async fn f015_a_pinned_store_refuses_to_apply_a_committed_schema_2_command() {
     );
     drop(pinned);
 
-    // The same directory, unpinned, carries the same entry without complaint — proving the
-    // refusal is the pin talking and not damage to the log.
-    let full = open_with_ceiling(dir.path(), FORMAT_VERSION).expect("unpinned open");
-    full.state_machine()
-        .apply(vec![compact(2, 1)])
-        .await
-        .expect("this build can carry its own generation");
-    assert_eq!(watermark(&full), COMMAND_SCHEMA_V2);
+    match open_with_ceiling(dir.path(), FORMAT_VERSION) {
+        Err(StorageOpenError::UpgradeRequiresDrainedLog {
+            format,
+            log_entries,
+            path,
+        }) => {
+            assert_eq!(format, 1);
+            assert_eq!(log_entries, 1);
+            assert_eq!(path, dir.path());
+        }
+        Err(other) => panic!("expected UpgradeRequiresDrainedLog, got {other:?}"),
+        Ok(_) => panic!("unpinned upgrade admitted an unapplied Compact"),
+    }
 }

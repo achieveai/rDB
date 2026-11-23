@@ -71,7 +71,9 @@ pub const BUILD_VIEW_PREFIX: &str = "build-";
 
 /// Column families that are **not** state-machine data and are therefore never exported.
 ///
-/// `raft_log` and `raft_meta` belong to the log store, which a snapshot deliberately does not
+/// `raft_log` and `raft_meta` belong to the log store (since format 4 a separate database under
+/// `raft-log/`, so they no longer appear in the root's family list at all; kept for the
+/// exclusion's sake), which a snapshot deliberately does not
 /// carry (openraft rebuilds the log relationship from `meta.last_log_id`); `state_meta` is
 /// excluded for the identity reason in the module docs; `default` is RocksDB's own and is
 /// unused by rEtcd but cannot be dropped.
@@ -1215,6 +1217,45 @@ pub fn restore_into_fresh_store(
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
+
+    // Format 4 (#186): the log database is created first and bound to the new identity, then
+    // the state-machine database below. `RocksStore::open` refuses a state machine with data
+    // and no bound log beside it (I6), and the restored log carries nothing else: no vote, no
+    // entry, no committed or purged pointer, which is what keeps the store formable (OQ-45).
+    let log_path = crate::log_dir(data_dir);
+    {
+        let log_cfs: Vec<rocksdb::ColumnFamilyDescriptor> = crate::LOG_COLUMN_FAMILIES
+            .iter()
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(*name, rocksdb::Options::default()))
+            .collect();
+        let log_db = rocksdb::DB::open_cf_descriptors(&opts, &log_path, log_cfs).map_err(|e| {
+            SnapshotFileError::Io {
+                file: show(&log_path),
+                detail: format!("cannot create the destination log store: {e}"),
+            }
+        })?;
+        let meta = log_db.cf_handle(crate::CF_RAFT_META).ok_or_else(|| {
+            SnapshotFileError::UnknownColumnFamily {
+                name: crate::CF_RAFT_META.to_string(),
+            }
+        })?;
+        let encoded =
+            postcard::to_stdvec(new_identity).map_err(|e| SnapshotFileError::Malformed {
+                file: show(&log_path),
+                detail: format!("cannot encode raft_meta/identity: {e}"),
+            })?;
+        let mut write = rocksdb::WriteOptions::default();
+        write.set_sync(true);
+        let mut bind = rocksdb::WriteBatch::default();
+        bind.put_cf(meta, restore_keys::IDENTITY, encoded);
+        log_db
+            .write_opt(bind, &write)
+            .map_err(|e| SnapshotFileError::Io {
+                file: show(&log_path),
+                detail: format!("cannot bind the restored log store: {e}"),
+            })?;
+    }
+
     let cfs: Vec<rocksdb::ColumnFamilyDescriptor> = crate::COLUMN_FAMILIES
         .iter()
         .map(|name| rocksdb::ColumnFamilyDescriptor::new(*name, rocksdb::Options::default()))

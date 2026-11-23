@@ -683,23 +683,21 @@ async fn m5_70_new_identity_over_an_old_dir_is_refused_at_store_open() {
 ///
 /// # Which refusal is the oracle
 ///
-/// The plan text predates ruling M5-R19 and says only "a typed format error naming
-/// `format_version`". R19 is the more specific statement and is what the product implements: a
-/// legacy directory whose log is **drained** migrates in place, and one whose log is
-/// **undrained** is refused, because a log entry is a positional `postcard` encoding of a
-/// `Command` that a narrower build may decode into a *different* command. So the store this row
-/// seeds carries exactly one log entry — the difference between the migration path and the
-/// refusal path — and the assertion is `UpgradeRequiresDrainedLog`, naming both the format and
-/// the entry count.
+/// The plan text predates two rulings and says only "a typed format error naming
+/// `format_version`". Ruling M5-R19 made it `UpgradeRequiresDrainedLog` for an undrained legacy
+/// log. Format 4 (#186) then moved the Raft log out of the root database into `raft-log/`, and
+/// the owner ruled on 2026-11-21 that, until the first real deploy, a format change refuses old
+/// folders with a typed error and no migration (ADR-0008). So any directory with the log still
+/// in the root, drained or not, is refused as `PreSplitLayout`, naming the marker it found,
+/// before its log is read. That is the oracle now.
 ///
 /// # Why the directory is hand-built
 ///
 /// This build cannot write a v1 directory; that format predates it. The seed below therefore
 /// creates one directly through a raw `rocksdb` handle, in the only window where that is
 /// possible — `Cluster::provision_seeded_dir` hands the caller the directory before the node's
-/// first open. The shape it writes is the one `verify_column_families` classifies as
-/// `CfLayout::LegacyV1`: the four v1 families, no `events`, no `dedup`, and a `format_version`
-/// marker of 1.
+/// first open: the four v1 families in the root, no `events`, no `dedup`, no `raft-log/`, and a
+/// `format_version` marker of 1.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
     let (cluster, _scripts) = three_voters_and_a_spare().await;
@@ -714,20 +712,15 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
         .await
         .expect_err("a legacy directory that still holds history must not open");
     match refusal {
-        NodeStartError::Storage(StorageOpenError::UpgradeRequiresDrainedLog {
-            format,
-            log_entries,
-            path,
-        }) => {
-            assert_eq!(format, 1, "the refusal must name the format it found");
-            assert_eq!(log_entries, 1, "...and how much history blocks the upgrade");
+        NodeStartError::Storage(StorageOpenError::PreSplitLayout { found, path }) => {
+            assert_eq!(found, 1, "the refusal must name the format it found");
             assert_eq!(path, cluster.data_dir(legacy));
         }
         other => panic!("expected a typed legacy-format refusal, got {other:?}"),
     }
 
-    // The refusal is read-only: the directory an operator has to go back and drain is
-    // byte-for-byte the one they left. Had the open reached `create_missing_column_families`,
+    // The refusal is read-only: the operator can return to the build that wrote this directory,
+    // or start fresh. Had the open reached `create_missing_column_families`,
     // `events` and `dedup` would exist here and that evidence would be gone.
     let families = rocksdb::DB::list_cf(&rocksdb::Options::default(), cluster.data_dir(legacy))
         .expect("the refused directory is still a readable database");
@@ -737,6 +730,10 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
             "a refused open must not have created the {manufactured:?} family: {families:?}"
         );
     }
+    assert!(
+        !config_storage::log_dir(&cluster.data_dir(legacy)).exists(),
+        "nor the split log database"
+    );
 
     // And it never joins: committed membership is untouched by the attempt.
     let members_after = cluster
@@ -755,11 +752,8 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
 
 /// Write the directory an M2/M3-era build would have left behind, still holding one log entry.
 ///
-/// Only the three facts the refusal keys on are reproduced, because only those are load-bearing
-/// and the rest would be a guess at bytes this build cannot write: the v1 column-family set, a
-/// `format_version` marker of `1`, and a non-empty `raft_log`. The entry's *contents* are
-/// deliberately opaque — `count_log_entries` counts without decoding, and "this build cannot
-/// decode them" is the very reason the open is refused.
+/// The root `raft_log` family identifies a pre-split layout. The marker supplies the reported
+/// version. The opaque entry and old family set let the row check what the refusal preserved.
 fn seed_v1_dir_with_one_log_entry(dir: &std::path::Path) {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
@@ -874,6 +868,24 @@ async fn m5_64_crash_after_learner_added() {
     // `config-engine/src/node.rs::add_learner_inner`, and — because that is exactly the kind
     // of claim this file must not simply assert into existence — re-derived empirically below
     // rather than hard-coded: arm on the very next crossing.
+    //
+    // "The very next crossing" is the learner entry's only once the leader has applied
+    // everything formation wrote. Formation returns once membership agrees, which can be before
+    // the leader's state batch for its blank entry; armed then, the crash lands on that batch,
+    // `AddLearner` never reaches the log, and the row waits 10 deadlines for a learner nobody
+    // committed. Seen once at fb79bb8 (`after_state_batch` index 1, then `ChangeMembership`).
+    cluster
+        .wait_for(
+            "the leader to apply everything formation wrote",
+            cluster.deadline(6),
+            || {
+                let m = cluster.metrics(leader);
+                (m.last_log_index.is_some() && m.last_applied.map(|a| a.index) == m.last_log_index)
+                    .then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
     scripts[&leader].crash_on_nth(Boundary::AfterStateBatch, 1);
 
     // The crash lands mid-RPC; the outcome is deliberately unobserved (ADR-0015) — a crash can
