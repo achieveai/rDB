@@ -1124,6 +1124,72 @@ fn certs_for(dir: &FsPath, nodes: &[u32]) {
     certs::generate(dir, &labels).expect("certs generate");
 }
 
+/// A successful list and a reopened stream leave the warning suppressed. Receiving a
+/// membership event starts a new run, so the next stream error warns again.
+#[config_log::retcd_test(flavor = "current_thread")]
+async fn members_watch_warns_once_per_run_of_stream_errors() {
+    use crate::test_store::{Script, Scripted};
+    use config_core::{ConfigError, MutationEvent, MutationEventKind, WatchItem};
+
+    const METHOD: &str = "members_watch_warns_once_per_run_of_stream_errors";
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1]);
+    let node = side(Spec::node(1, dir.path(), &[]), false).await;
+    let failure = |message: &str| {
+        Err(ConfigError::Unavailable {
+            reason: message.to_owned(),
+        })
+    };
+    let event = Ok(WatchItem::Event(MutationEvent {
+        revision: 1,
+        key: Bytes::from_static(b"nodes/2"),
+        kind: MutationEventKind::Delete,
+    }));
+    let store = Arc::new(Scripted::new(Script {
+        watch_items: [
+            failure("first outage"),
+            failure("first retry"),
+            event,
+            failure("second outage"),
+            failure("second retry"),
+        ]
+        .into(),
+        ..Script::default()
+    }));
+    tokio::time::pause();
+    let mut watcher = std::pin::pin!(crate::admin::watch_members(
+        store.clone(),
+        node.net.clone(),
+        BTreeSet::new(),
+        Arc::default()
+    ));
+    for (lists, expected_warnings) in [(1, 1), (2, 1), (4, 2), (5, 2)] {
+        assert!(futures::poll!(&mut watcher).is_pending());
+        assert_eq!(
+            store.list_arrivals().len(),
+            lists,
+            "each event or failure re-lists"
+        );
+        let warnings: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "members_watch_failed")
+            .collect();
+        assert_eq!(warnings.len(), expected_warnings, "{warnings:?}");
+        assert!(warnings[0]["error"]
+            .as_str()
+            .expect("error")
+            .contains("first outage"));
+        if expected_warnings == 2 {
+            assert!(warnings[1]["error"]
+                .as_str()
+                .expect("error")
+                .contains("second outage"));
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    node.net.shutdown();
+}
+
 const PATIENCE: Duration = Duration::from_secs(5);
 
 /// The admin-app list `lr` passes to `rdb_node` (A-R479, A-R480).
@@ -3013,22 +3079,30 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Writes go on with node 3 away until the owner pauses them for the unheard copy (B-R38).
+    // Writes go on with node 3 away until the owner warns that node 3 lags the durable floor
+    // (#79 option A: one copy of three away no longer pauses writes; B-R38's pause is gone).
+    // A refusal that wrote nothing is sent again under a fresh id.
     let mut landed = 0u32;
-    let paused_by = std::time::Instant::now() + patience;
+    let warned_by = std::time::Instant::now() + patience;
     loop {
         match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
             Ok(_) => landed += 1,
-            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) if e.error.no_mutation => {}
             Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
         }
+        config_log::layer::flush_test_logs();
+        let warned = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .any(|line| line["@m"] == "copy_durable_lagging" && line["holder"] == 3);
+        if landed >= 1 && warned {
+            break;
+        }
         assert!(
-            std::time::Instant::now() < paused_by,
-            "writes never paused with node 3 away: {landed} landed"
+            std::time::Instant::now() < warned_by,
+            "node 1 never warned node 3 lagging: {landed} landed"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(landed >= 1, "no put landed with node 3 away");
     teardown.join().expect("node 3's process stops");
     let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
     let mut again = start(3, relisten);
@@ -3207,20 +3281,6 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
     // `PEER_DROP_AFTER_MILLIS` later, leaving two copies pinned.
     three.db.shutdown();
     drop(three);
-    let paused_by = std::time::Instant::now() + patience;
-    let mut landed = 0u32;
-    loop {
-        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
-            Ok(_) => landed += 1,
-            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
-            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
-        }
-        assert!(
-            std::time::Instant::now() < paused_by,
-            "writes never paused with node 3 away: {landed} landed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let owner_pins = |one: &NodeProcess| -> Vec<(u32, rdb_core::contracts::ids::ReplicaRole)> {
         one.db
             .node_status()
@@ -3235,15 +3295,25 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
             })
             .unwrap_or_default()
     };
+    // #79 option A: one copy of three away no longer pauses writes, so puts go on until the
+    // lagging clock drops node 3. A refusal that wrote nothing (the drop's re-plan: a pause,
+    // a lapsed lease, or an unactivated generation) is sent again under a fresh id.
     let pinned_by = std::time::Instant::now() + patience;
+    let mut landed = 0u32;
     while owner_pins(&one).len() != 2 {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.no_mutation => {}
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
         assert!(
             std::time::Instant::now() < pinned_by,
-            "node 1 did not pin two copies with node 3 down: {:?}",
+            "node 1 did not pin two copies with node 3 down after {landed} puts: {:?}",
             owner_pins(&one)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(landed >= 1, "no put landed with node 3 away");
 
     let app_links = Links::new();
     let app_net = {

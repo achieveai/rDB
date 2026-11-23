@@ -363,8 +363,10 @@ requested, because a slow copy ACKing below the primary's retained floor is not 
 **A diverged copy is out of every derived set, including the durable ones.** Its later ACKs are
 dropped (`DIVERGED_COPY`) and its watermarks freeze. Three sets are defined once:
 `configured_regulars()` (the config's regular members, including the primary),
-`required_copies()` (the same **minus diverged** — the domain of `min_required_durable()` and
-`all_durable_through()`, which feed ADR-0006's barrier and ADR-0009's), and `regular_secondaries()`
+`required_copies()` (the same **minus diverged** — the domain of the durable views:
+`min_required_durable()` and `all_durable_through()` over every copy, and the durable quorum
+floor that `DurableAdvanced` carries to ADR-0006, the primary capped by the `min_regular_acks`
+most-durable regular secondaries, amended 2026-11-22), and `regular_secondaries()`
 (`required_copies()` minus self — the ACK predicate's domain). An earlier draft left `diverged` in
 `required_copies()`, and both readings failed: counting its ACKs let a copy on another history
 satisfy the resume barrier; not counting them froze `all_durable_through` forever and the partition
@@ -534,6 +536,12 @@ Same-batch atomicity carries over from rEtcd ADR-0019 unchanged: a transaction's
 history record and its progress metadata are one atomic batch. A history entry written outside its
 mutation's batch is a side channel, and a partition can then recover into a state its own history
 does not describe.
+
+**Amended 2026-11-22 (issue #79, option A; owner ruling
+<https://github.com/achieveai/rDB/issues/79#issuecomment-7078410724>).** Only the value sent to L1
+changed: `DurableAdvanced` carries the durable quorum floor per predicate, and ADR-0006's
+amendment of the same date says why it is safe. The all-copies views keep their meaning and their
+domain; the host's `copy_durable_lagging` Warn reads a copy against the quorum floor.
 
 ## Consequences
 

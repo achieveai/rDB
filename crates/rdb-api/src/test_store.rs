@@ -76,6 +76,8 @@ pub(crate) struct Script {
     /// Watches still to wait at a gate until [`Scripted::release_watches`], then open: a watch
     /// that answers only once the row lets it (M9 S2b review F-005).
     pub(crate) hold_watches: u32,
+    /// Each watch opens a stream with this one item until the queue is exhausted.
+    pub(crate) watch_items: std::collections::VecDeque<Result<config_core::WatchItem, ConfigError>>,
     /// The next delete fails with this, without deleting (M9 S2b review F-024).
     pub(crate) fail_delete_with: Option<ConfigError>,
     /// The next put the steps above apply to fails with this, without writing (A-R447: a
@@ -346,6 +348,10 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
+        if let Some(item) = self.script.lock().expect("script").watch_items.pop_front() {
+            let stream: WatchStream = Box::pin(tokio_stream::iter([item]));
+            return Box::pin(std::future::ready(Ok(stream)));
+        }
         if !self.take(|script| &mut script.hold_watches) {
             return self.inner.watch(request);
         }

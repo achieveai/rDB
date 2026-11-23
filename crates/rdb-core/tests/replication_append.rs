@@ -2629,7 +2629,11 @@ fn m7b_125_catch_up_sends_the_retained_prefix_and_asks_no_snapshot() {
         peer: B,
         contiguous_seq: Seq(40),
     });
-    assert_eq!(b_acks(&mut primary, 40), [progress, sends_b(41)]);
+    // B at 40 is the durable quorum's secondary, so the view moves too (issue #79).
+    let durable = EffectKind::Kernel(KernelEffect::DurableAdvanced {
+        per_predicate: vec![(NEW_CONFIG, DurableSeq(40))],
+    });
+    assert_eq!(b_acks(&mut primary, 40), [progress, durable, sends_b(41)]);
 
     // Twin (c), tester-kbr1 F3: a `Recovered` in the generation already served.
     let mut primary = primary_after_two_recoveries(51);

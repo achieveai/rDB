@@ -3,7 +3,8 @@
 //! The three membership sets, defined once:
 //!
 //! - *required copies* of a predicate: its non-shadow members, **the primary included**, minus
-//!   `diverged`. The durable views' domain; the primary can be the laggard (K-B-13).
+//!   `diverged`. The durable views' domain; the primary can be the laggard (K-B-13). L1's floor
+//!   is the durable quorum of that set, not its minimum (issue #79).
 //! - [`ProgressTracker::regular_secondaries`]: the pinned configuration's required copies minus
 //!   the primary. The ACK predicate's domain; an ACK from ourselves is not replication.
 //!
@@ -89,8 +90,14 @@ impl ProgressTracker {
         self.min_required_durable().0 >= seq.0
     }
 
-    /// `(config_version, all_durable_through)` for every active predicate, each over its own
-    /// members (K-B-49): what `DurableAdvanced` carries.
+    /// `(config_version, durable quorum floor)` for every active predicate, each over its own
+    /// members (K-B-49): what `DurableAdvanced` carries, and so what L1 reads for exposure,
+    /// resume and retirement (issue #79, option A).
+    ///
+    /// The floor is [`quorum_floor`]: the primary's durable watermark capped by the
+    /// `min_regular_acks` most-durable regular secondaries. The all-copies views
+    /// ([`Self::min_required_durable`], [`Self::all_durable_through`]) keep their meaning; the
+    /// host's `copy_durable_lagging` Warn reads a copy against this floor.
     #[must_use]
     pub fn durable_per_predicate(&self) -> Vec<(ConfigVersion, DurableSeq)> {
         self.predicates()
@@ -98,10 +105,43 @@ impl ProgressTracker {
             .map(|predicate| {
                 (
                     predicate.config_version,
-                    durable_floor(self.required_in(predicate)),
+                    quorum_floor(
+                        self.own(),
+                        usize::from(predicate.min_regular_acks),
+                        self.required_in(predicate),
+                    ),
                 )
             })
             .collect()
+    }
+}
+
+/// The durable quorum floor of one predicate's required copies (issue #79, option A).
+///
+/// The primary (`own`) is required and always counts: its durable watermark is the ceiling, and
+/// a primary outside `copies` proves nothing and answers zero. It is capped by the `k`-th most
+/// durable of the other copies, `k = min(min_regular_acks, secondaries)`. With no more
+/// secondaries than the threshold (RF2, `DegradedRf2`) that is every copy, so the floor is
+/// [`durable_floor`]'s minimum; with none left it is the primary's own value.
+fn quorum_floor<'a>(
+    own: CopyId,
+    min_regular_acks: usize,
+    copies: impl Iterator<Item = (CopyId, &'a CopyProgress)>,
+) -> DurableSeq {
+    let mut primary = DurableSeq(0);
+    let mut secondaries = Vec::new();
+    for (copy, peer) in copies {
+        if copy == own {
+            primary = peer.progress.durable;
+        } else {
+            secondaries.push(peer.progress.durable);
+        }
+    }
+    secondaries.sort_unstable_by_key(|seq| std::cmp::Reverse(seq.0));
+    let k = min_regular_acks.min(secondaries.len());
+    match k.checked_sub(1).map(|index| secondaries[index]) {
+        Some(kth) if kth.0 < primary.0 => kth,
+        _ => primary,
     }
 }
 
