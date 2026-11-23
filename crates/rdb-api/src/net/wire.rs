@@ -457,6 +457,7 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::HealLeftOut { .. }
         | Msg::PeerBooted { .. }
         | Msg::BootReplan { .. }
+        | Msg::PossibleLossOf { .. }
         | Msg::Rebuild { .. }
         | Msg::Synced(_)
         | Msg::Subscribe(_)
@@ -494,6 +495,7 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::HealLeftOut { .. } => "HealLeftOut",
         Msg::PeerBooted { .. } => "PeerBooted",
         Msg::BootReplan { .. } => "BootReplan",
+        Msg::PossibleLossOf { .. } => "PossibleLossOf",
         Msg::Rebuild { .. } => "Rebuild",
         #[cfg(test)]
         Msg::Stall(_) => "Stall",

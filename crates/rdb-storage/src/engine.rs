@@ -395,8 +395,10 @@ pub struct RocksEngine {
     pub(crate) lineages: BTreeMap<(PartitionId, Generation), Marks>,
     /// The instance id this copy is bound to (M10, arch R3b); `None` when unbound.
     instance: Option<[u8; INSTANCE_LEN]>,
-    /// The format marker on disk: [`FORMAT_VERSION`], or [`OLDEST_FORMAT_VERSION`] until the
-    /// first epoch revocation moves it.
+    /// The format marker on disk: [`FORMAT_VERSION`] (3) on a copy this build created. An
+    /// older copy keeps its own: [`OLDEST_FORMAT_VERSION`] (1) until an epoch revocation or an
+    /// ack floor moves it to [`FLOOR_FORMAT_VERSION`] (2), and 1 or 2 until a possible-loss
+    /// marker moves it to 3. A clear of the marker never moves it back.
     pub(crate) format: u32,
     /// Armed by [`Self::inject_fault`] (debug builds only); always `None` in release.
     injected: Option<InjectedFault>,
@@ -1207,7 +1209,7 @@ impl RocksEngine {
     /// Record that this node never serves `epoch` of `partition` again, with a synced write,
     /// before this returns `Ok` (spec §7.3 step 2; A1's `StoreEffect::PersistEpochRevocation`).
     /// Adds to the epochs already revoked; revoking one again writes the same set. On a
-    /// format-1 copy the same batch moves the marker to [`FORMAT_VERSION`], so a format-1 build
+    /// format-1 copy the same batch moves the marker to [`FLOOR_FORMAT_VERSION`], so a format-1 build
     /// refuses the copy from then on instead of opening it blind to the revocation.
     ///
     /// # Errors
@@ -1328,7 +1330,10 @@ impl RocksEngine {
     ///
     /// # Errors
     ///
-    /// [`StorageFault::WriteFailed`] when RocksDB refuses the delete; the marker then stands.
+    /// [`StorageFault::WriteFailed`] when the delete's synced write fails. Whether the marker
+    /// still stands is then unknown: RocksDB appends the batch to its WAL before it syncs, so a
+    /// write whose sync failed may still be replayed at the next open. The caller says so and
+    /// reads again. (The debug-only injected fault fails before the write, so there it stands.)
     pub fn clear_possible_loss(&mut self, partition: PartitionId) -> Result<(), StorageFault> {
         let fired = self.fire(InjectedFault::SyncedPut);
         let mut opts = WriteOptions::default();

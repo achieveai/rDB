@@ -7072,6 +7072,57 @@ mod routed_fence {
         assert_eq!(bind(&proof, facts), Err("plan_unreadable"));
     }
 
+    /// #177 (PR #238 review): version 5's bytes, written out: the byte 5, the plan, then the
+    /// reason as postcard writes an `Option` of a unit enum (`1` for `Some`, then the variant:
+    /// `0` `OsBootChanged`, `1` `OsBootUnknown`). Encode gives exactly these bytes and decode
+    /// reads them back. Cut: swap the two variants' order in `PossibleLossReason`, red.
+    /// Unit (<1 ms).
+    #[test]
+    fn pr238_version_5_plan_bytes_are_pinned_for_both_reasons() {
+        use crate::host::PossibleLossReason;
+        let plan = stored_plan();
+        for (reason, tail) in [
+            (PossibleLossReason::OsBootChanged, [1_u8, 0]),
+            (PossibleLossReason::OsBootUnknown, [1_u8, 1]),
+        ] {
+            let mut fixture = vec![5_u8];
+            fixture.extend(postcard::to_stdvec(&plan).expect("a plan serialises"));
+            fixture.extend(tail);
+            assert_eq!(
+                crate::admin::encode_promote_plan_with(&plan, Some(reason)),
+                fixture,
+                "{reason:?}"
+            );
+            assert_eq!(
+                crate::admin::decode_promote_plan_with(&fixture),
+                Ok((plan.clone(), Some(reason))),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// #177 (PR #238 review): the OS boot verdicts a restored copy can carry. `Same` is no
+    /// reason; `Changed` is `OsBootChanged`; `Unknown` and `Unsupported` are both
+    /// `OsBootUnknown`, so an open that cannot tell never passes for one that saw the same boot.
+    /// Cut: map `Unsupported` to `None`, red. Unit (<1 ms).
+    #[test]
+    fn pr238_unknown_and_unsupported_os_boots_are_both_os_boot_unknown() {
+        use crate::host::PossibleLossReason;
+        use crate::os_boot::OsBoot;
+        assert_eq!(PossibleLossReason::from_os_boot(OsBoot::Same), None);
+        assert_eq!(
+            PossibleLossReason::from_os_boot(OsBoot::Changed),
+            Some(PossibleLossReason::OsBootChanged)
+        );
+        for verdict in [OsBoot::Unknown, OsBoot::Unsupported] {
+            assert_eq!(
+                PossibleLossReason::from_os_boot(verdict),
+                Some(PossibleLossReason::OsBootUnknown),
+                "{verdict:?}"
+            );
+        }
+    }
+
     /// `stored_plan()` with `must_hold` {3} and a prior naming three members and no note, as #80
     /// S5n (`PROMOTE_PLAN_VERSION` 3) stored it: version byte `3`, version 2's fields, then the
     /// prior's members and note, with no ledger. Kept as bytes like [`V1_STORED_PLAN`].

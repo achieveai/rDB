@@ -3432,7 +3432,14 @@ impl Db {
         roll: &Roll,
     ) -> Result<Vec<NodeId>, OpenError> {
         let mut rolled = Vec::new();
-        for node in &roll.copies {
+        // #177 (PR #238 review): a marked roll links the owner's copy first. A reopen rolls
+        // forward only while no copy holds the generation, so a roll stopped after another
+        // copy's switch and before the owner's would leave the record nowhere, for good.
+        let mut copies = roll.copies.clone();
+        if roll.possible_loss.is_some() {
+            copies.sort_by_key(|node| *node != roll.record.owner);
+        }
+        for node in &copies {
             // #62: a crash part way through the roll-forward, in one process.
             #[cfg(test)]
             if roll_stops_before(dir, *node) {
@@ -3702,6 +3709,14 @@ impl Db {
             }
         };
         loop {
+            // PR #238 review: a re-plan seen on an owner `partitions/{p}` no longer names (it
+            // moved, perhaps to a node that cannot be reached) is not this partition's answer.
+            if replanning
+                .as_ref()
+                .is_some_and(|(node, _)| *node != self.route.owner_of(partition))
+            {
+                replanning = None;
+            }
             if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                 return Err(ReadyError::Heal(error.clone()));
             }
@@ -3721,6 +3736,10 @@ impl Db {
                 if owner.admits == Some(true) {
                     if let Some(next) = waiting.next() {
                         partition = next;
+                        // PR #238 review: the admitted partition's re-plan and phase are over;
+                        // the next partition is answered on its own looks.
+                        replanning = None;
+                        NO_ANSWER.clone_into(&mut phase);
                         continue;
                     }
                     self.ready_seen.store(true, Ordering::Relaxed);
@@ -3763,17 +3782,43 @@ impl Db {
                         if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                             return Err(ReadyError::Heal(error.clone()));
                         }
-                        if !self.boot_replan_pending(partition, node) {
-                            tracing::warn!(owner = node.0, reason, "ready_blocked");
-                            return Err(ReadyError::Blocked {
-                                owner: node,
-                                reason,
-                            });
+                        match self.boot_replan_look(partition, node, deadline) {
+                            // No answer in the time left: not known to be final. Waited on to
+                            // the bound, then the retryable `TimedOut` (PR #238 review).
+                            None => {
+                                tracing::info!(owner = node.0, reason, "ready_replan_unanswered");
+                            }
+                            // The recovery moved on since the look (it may admit now): look again.
+                            Some((now, _))
+                                if !matches!(
+                                    stuck_recovery(&now),
+                                    Some(ReadyError::Blocked { reason: ref still, .. })
+                                        if *still == reason
+                                ) =>
+                            {
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(timed_out(partition, phase));
+                                }
+                                continue;
+                            }
+                            Some((_, false)) => {
+                                tracing::warn!(owner = node.0, reason, "ready_blocked");
+                                return Err(ReadyError::Blocked {
+                                    owner: node,
+                                    reason,
+                                });
+                            }
+                            Some((_, true)) => {
+                                if was_replanning.as_ref() != Some(&(node, reason.clone())) {
+                                    tracing::info!(
+                                        owner = node.0,
+                                        reason,
+                                        "ready_owner_replanning"
+                                    );
+                                }
+                                replanning = Some((node, reason));
+                            }
                         }
-                        if was_replanning.as_ref() != Some(&(node, reason.clone())) {
-                            tracing::info!(owner = node.0, reason, "ready_owner_replanning");
-                        }
-                        replanning = Some((node, reason));
                     }
                     Some(ReadyError::Blocked { reason, .. }) => {
                         // Not ended by this block: an owner in another process re-plans a rejoin
@@ -3824,18 +3869,22 @@ impl Db {
         }
     }
 
-    /// #202: whether `node`, an owner this `Db` runs, is re-planning `partition` at a restarted
-    /// copy's new boot ([`Msg::BootReplan`], local only). No answer within the read timeout,
-    /// or a node that has stopped, is `false`: its block is final, as before #202.
-    fn boot_replan_pending(&self, partition: PartitionId, node: NodeId) -> bool {
+    /// #202: `node`'s status for `partition` and whether it is re-planning it at a restarted
+    /// copy's new boot, read together ([`Msg::BootReplan`], local only); `node` is an owner this
+    /// `Db` runs. `None` when that is not known by `deadline` (PR #238 review): the send waits
+    /// out a restart of `node` only until then, and the answer at most the read timeout or the
+    /// time left, whichever is less. A node that has stopped is `None` too.
+    fn boot_replan_look(
+        &self,
+        partition: PartitionId,
+        node: NodeId,
+        deadline: std::time::Instant,
+    ) -> Option<(NodeStatus, bool)> {
+        let left = || deadline.saturating_duration_since(std::time::Instant::now());
         let (reply, answer) = mpsc::channel();
-        if self
-            .send_to(node, Msg::BootReplan { partition, reply })
-            .is_err()
-        {
-            return false;
-        }
-        answer.recv_timeout(self.timeouts.read).unwrap_or(false)
+        self.send_to_within(node, Msg::BootReplan { partition, reply }, left())
+            .ok()?;
+        answer.recv_timeout(self.timeouts.read.min(left())).ok()
     }
 
     /// R5: this open is ready, so every partition it leads has recovered and its copies' logs
@@ -7656,45 +7705,61 @@ impl Db {
 
     /// #177: `admin ack-possible-loss`. Clear partition 1's possible-loss record
     /// ([`NodeStatus::possible_loss`]) for the promote that committed `generation`, once the
-    /// group has been re-checked. The call goes to the node of this process whose status reports
-    /// that record, else to the owner, and that node checks the generation again against its
-    /// own store. The clear is one synced write. Writes are never blocked by the record, so
-    /// nothing waits on this.
+    /// group has been re-checked. Writes are never blocked by the record, so nothing waits on
+    /// this.
+    ///
+    /// First every node that may hold a record is read: each node of this process, and the
+    /// owner and the members it pins, over the links ([`Self::possible_loss_holders`]). The ack
+    /// then goes to the holder whose record names `generation`, else to any holder, whose own
+    /// generation check refuses it; with no holder, to the owner. That node checks the
+    /// generation again against its own store, and the clear is one synced write.
     ///
     /// # Errors
     ///
     /// `INVALID_ARGUMENT`, nothing cleared, when the record that stands names another
     /// generation, so a stale ack cannot clear a newer record; `INVALID_ARGUMENT`, nothing
-    /// changed, when this `Db` runs over links as an app the node does not list as an admin app;
-    /// `UNAVAILABLE` when no answer came in the read timeout. No record standing is `Ok`.
+    /// cleared, when the record stands on a node this process does not run and that is not the
+    /// owner, naming it: the ack is run from that node's process (a holder-targeted ack is
+    /// #245); `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the
+    /// node does not list as an admin app; `UNAVAILABLE`, nothing cleared, when a node that may
+    /// hold a record cannot be read or did not answer in the read timeout, or the ack was not
+    /// answered; a host error when a node cannot read its record. No record standing on any
+    /// node read is `Ok`.
     pub fn ack_possible_loss(&self, generation: Generation) -> Result<(), ApiError> {
         if let Some(error) =
             self.refuse_groupless("ack_possible_loss", "it runs on one partition only")
         {
             return Err(error);
         }
+        let holders = self.possible_loss_holders()?;
         let call = ClientCall::AckPossibleLoss {
             identity: self.identity(),
             generation,
         };
-        let holder = self
-            .statuses_of(PARTITION)
-            .into_iter()
-            .find(|status| {
-                status
-                    .possible_loss
-                    .is_some_and(|loss| loss.generation == generation)
-            })
-            .map(|status| status.node);
-        let answer = match holder {
-            Some(node) => match self.send_call(node, PARTITION, call) {
-                Ok(answer) => answer.recv_timeout(self.timeouts.read).ok(),
-                Err(NodeStopped(node)) => Some(Answer::Error {
-                    error: ApiError::host(&format!("node {} has stopped", node.0)),
-                    request: None,
-                }),
-            },
-            None => self.call(PARTITION, call, self.timeouts.read),
+        let target = holders
+            .iter()
+            .find(|loss| loss.generation == generation)
+            .or_else(|| holders.first());
+        let answer = match target {
+            Some(loss) if self.runs(loss.copy) => {
+                match self.send_call(loss.copy, PARTITION, call) {
+                    Ok(answer) => answer.recv_timeout(self.timeouts.read).ok(),
+                    Err(NodeStopped(node)) => Some(Answer::Error {
+                        error: ApiError::host(&format!("node {} has stopped", node.0)),
+                        request: None,
+                    }),
+                }
+            }
+            Some(loss) if loss.copy != self.route.owner() => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    format!(
+                        "partition 1's possible-loss record for generation {} stands on node {},                          which this process does not run and which is not the owner: nothing                          was cleared; run the ack from node {}'s process",
+                        loss.generation.0, loss.copy.0, loss.copy.0
+                    ),
+                ));
+            }
+            _ => self.call(PARTITION, call, self.timeouts.read),
         };
         match answer {
             Some(Answer::PossibleLossAcked(line)) => {
@@ -7708,11 +7773,81 @@ impl Db {
             None => Err(ApiError::new(
                 ErrorKind::Unavailable,
                 format!(
-                    "no answer to the ack-possible-loss in {:?}",
+                    "no answer to the ack-possible-loss in {:?}; it may have cleared the record:                      read node status, or ack again",
                     self.timeouts.read
                 ),
             )),
         }
+    }
+
+    /// #177 (PR #238 review): partition 1's possible-loss records on the nodes that may hold
+    /// one: each node of this process, read on its own thread ([`Msg::PossibleLossOf`]), then
+    /// the owner and the members its status pins, over the links. A record on a node outside
+    /// those (a former member) is not found: #245.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when one of them did not answer in the read timeout, or cannot be reached;
+    /// a host error when a node of this process cannot read its record. Whether a record
+    /// stands there is then unknown, so nothing may be cleared on the strength of "none".
+    fn possible_loss_holders(&self) -> Result<Vec<host::PossibleLoss>, ApiError> {
+        let unknown = |node: NodeId, why: &str| {
+            ApiError::new(
+                ErrorKind::Unavailable,
+                format!(
+                    "node {} {why}, so whether it holds partition 1's possible-loss record is                      unknown: nothing was cleared; ack again once it answers",
+                    node.0
+                ),
+            )
+        };
+        let read = self.timeouts.read;
+        let mut holders = Vec::new();
+        let local: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        for node in &local {
+            let (reply, answer) = mpsc::channel();
+            self.send_to_within(
+                *node,
+                Msg::PossibleLossOf {
+                    partition: PARTITION,
+                    reply,
+                },
+                read,
+            )
+            .map_err(|_| unknown(*node, "could not be asked (stopped or restarting)"))?;
+            match answer.recv_timeout(read) {
+                Ok(Ok(found)) => holders.extend(found),
+                Ok(Err(why)) => {
+                    return Err(ApiError::host(&format!(
+                        "{why}; whether a record stands there is unknown: nothing was cleared"
+                    )))
+                }
+                Err(_) => return Err(unknown(*node, &format!("did not answer in {read:?}"))),
+            }
+        }
+        let owner = self.route.owner();
+        let pinned = match self.look(owner) {
+            Ok(status) => {
+                if !self.runs(owner) {
+                    holders.extend(status.possible_loss);
+                }
+                status.pinned
+            }
+            Err(_) => return Err(unknown(owner, "(the owner) did not answer its status look")),
+        };
+        let mut remote: Vec<NodeId> = pinned
+            .iter()
+            .map(|member| member.node)
+            .filter(|node| *node != owner && !local.contains(node))
+            .collect();
+        remote.sort_unstable();
+        remote.dedup();
+        for node in remote {
+            let status = self
+                .look(node)
+                .map_err(|_| unknown(node, "did not answer its status look"))?;
+            holders.extend(status.possible_loss);
+        }
+        Ok(holders)
     }
 
     /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
@@ -13391,29 +13526,20 @@ mod tests {
         assert!(looks.load(Ordering::Relaxed) > 1, "it looked again");
     }
 
-    /// #202: node 1, run by this `Db`, as a stub: its looks answer `Blocked` on a barrier until
-    /// look `blocked_looks`, then writable; its `Msg::BootReplan` asks answer `true` until ask
-    /// `replanning_asks`, then `false`. Returns the `Db`, the stub's thread and both counts.
-    #[allow(clippy::type_complexity)]
-    fn replanning_owner(
-        blocked_looks: u64,
-        replanning_asks: u64,
-    ) -> (
-        Db,
-        tokio::runtime::Runtime,
-        std::thread::JoinHandle<()>,
-        Arc<AtomicU64>,
-        Arc<AtomicU64>,
-    ) {
-        let blocked = format!(
-            "{:?}",
-            rdb_core::recovery::RecoveryPhase::Blocked(
-                rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
-                    missing: vec![rdb_core::contracts::membership::CopyId(4)],
-                }
+    /// #202: node 1's status in the [`replanning_owner`] stubs: `Blocked` on a barrier, or
+    /// writable.
+    fn replan_status(blocked: bool) -> NodeStatus {
+        let recovery = blocked.then(|| {
+            format!(
+                "{:?}",
+                rdb_core::recovery::RecoveryPhase::Blocked(
+                    rdb_core::contracts::authority::BlockReason::BarrierIncomplete {
+                        missing: vec![rdb_core::contracts::membership::CopyId(4)],
+                    }
+                )
             )
-        );
-        let status = move |recovery: Option<String>, admits: bool| NodeStatus {
+        });
+        NodeStatus {
             node: OWNER,
             boot: host::BOOT,
             fault: None,
@@ -13426,7 +13552,7 @@ mod tests {
             recovered: None,
             role: "primary",
             protection: None,
-            admits: Some(admits),
+            admits: Some(!blocked),
             published: None,
             in_flight: None,
             waits_on: None,
@@ -13441,26 +13567,61 @@ mod tests {
             tail_refused: None,
             needs_operator: None,
             possible_loss: None,
-        };
+        }
+    }
+
+    /// How a [`scripted_replan_owner`] stub answers one `Msg::BootReplan` ask.
+    #[derive(Clone, Copy)]
+    enum ReplanAsk {
+        /// After `after`, the status (blocked or writable) and whether the re-plan is pending.
+        Answer {
+            after: Duration,
+            blocked: bool,
+            pending: bool,
+        },
+        /// Never answered; the reply is kept, so the ask waits out its own bound.
+        Retain,
+    }
+
+    /// #202: node 1, run by this `Db`, as a stub: look `n` (from 0) answers `Blocked` while
+    /// `blocked(n)`, else writable; ask `n` answers `ask(n)`. Returns the `Db`, the stub's thread
+    /// and both counts.
+    #[allow(clippy::type_complexity)]
+    fn scripted_replan_owner(
+        blocked: impl Fn(u64) -> bool + Send + 'static,
+        ask: impl Fn(u64) -> ReplanAsk + Send + 'static,
+    ) -> (
+        Db,
+        tokio::runtime::Runtime,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
         let (db, mailbox, rt) = unanswered(Duration::from_millis(20));
         let looks = Arc::new(AtomicU64::new(0));
         let asks = Arc::new(AtomicU64::new(0));
         let node_1 = {
             let (looks, asks) = (Arc::clone(&looks), Arc::clone(&asks));
             std::thread::spawn(move || {
+                let mut kept = Vec::new();
                 while let Ok(msg) = mailbox.recv() {
                     match msg {
                         Msg::Inspect { reply, .. } => {
                             let seen = looks.fetch_add(1, Ordering::Relaxed);
-                            let _ = reply.send(if seen < blocked_looks {
-                                status(Some(blocked.clone()), false)
-                            } else {
-                                status(None, true)
-                            });
+                            let _ = reply.send(replan_status(blocked(seen)));
                         }
                         Msg::BootReplan { reply, .. } => {
-                            let seen = asks.fetch_add(1, Ordering::Relaxed);
-                            let _ = reply.send(seen < replanning_asks);
+                            match ask(asks.fetch_add(1, Ordering::Relaxed)) {
+                                ReplanAsk::Answer {
+                                    after,
+                                    blocked,
+                                    pending,
+                                } => {
+                                    std::thread::sleep(after);
+                                    let _ = reply.send((replan_status(blocked), pending));
+                                }
+                                ReplanAsk::Retain => kept.push(reply),
+                            }
                         }
                         _ => {}
                     }
@@ -13468,6 +13629,29 @@ mod tests {
             })
         };
         (db, rt, node_1, looks, asks)
+    }
+
+    /// #202: [`scripted_replan_owner`] blocked until look `blocked_looks`, then writable; its
+    /// asks answer, at once and still blocked, pending until ask `replanning_asks`, then not.
+    #[allow(clippy::type_complexity)]
+    fn replanning_owner(
+        blocked_looks: u64,
+        replanning_asks: u64,
+    ) -> (
+        Db,
+        tokio::runtime::Runtime,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        scripted_replan_owner(
+            move |look| look < blocked_looks,
+            move |ask| ReplanAsk::Answer {
+                after: Duration::ZERO,
+                blocked: true,
+                pending: ask < replanning_asks,
+            },
+        )
     }
 
     /// The `Blocked` answer of [`replanning_owner`]'s stub.
@@ -13553,6 +13737,371 @@ mod tests {
             "two pending asks, then the final one"
         );
         assert_eq!(looks.load(Ordering::Relaxed), 3);
+    }
+
+    /// PR #238 review: a pending ask that is never answered, with the read timeout far above
+    /// `within`, waits only the time left: the open answers the retryable `TimedOut` at the
+    /// bound, never a terminal `Blocked` before it. Cut: the ask waits the full read timeout,
+    /// red (answered after 5 s). Cut: an unanswered ask is `false`, red (`Blocked`).
+    /// Unit (~400 ms): no node thread.
+    #[test]
+    fn pr238_an_unanswered_replan_ask_waits_only_to_the_bound_and_is_not_final() {
+        let (mut db, _rt, node_1, _looks, asks) =
+            scripted_replan_owner(|_| true, |_| ReplanAsk::Retain);
+        db.timeouts.read = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let answer = db.wait_ready(Duration::from_millis(400));
+        let waited = started.elapsed();
+        assert!(
+            matches!(answer, Err(ReadyError::TimedOut { within_ms: 400, .. })),
+            "{answer:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(400),
+            "answered after {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(2), "answered after {waited:?}");
+        drop(db);
+        node_1.join().expect("the stub");
+        assert!(asks.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// PR #238 review: one, then two, asks time out before the re-plan answers, slowly but
+    /// pending, and the owner admits: the open is ready. Cut: an unanswered ask is `false`,
+    /// red (`Blocked` at the first timeout).
+    /// Unit (~1 s): no node thread.
+    #[test]
+    fn pr238_replan_asks_that_time_out_then_answer_pending_end_ready() {
+        for unanswered in [1, 2] {
+            let (mut db, _rt, node_1, _looks, asks) = scripted_replan_owner(
+                move |look| look <= unanswered,
+                move |ask| {
+                    if ask < unanswered {
+                        ReplanAsk::Retain
+                    } else {
+                        ReplanAsk::Answer {
+                            after: Duration::from_millis(60),
+                            blocked: true,
+                            pending: true,
+                        }
+                    }
+                },
+            );
+            db.timeouts.read = Duration::from_millis(100);
+            assert_eq!(
+                db.wait_ready(Duration::from_secs(5)),
+                Ok(()),
+                "{unanswered}"
+            );
+            drop(db);
+            node_1.join().expect("the stub");
+            assert_eq!(asks.load(Ordering::Relaxed), unanswered + 1, "{unanswered}");
+        }
+    }
+
+    /// PR #238 review: the recovery lands between the look that saw `Blocked` and the ask,
+    /// which answers "not pending" with the owner writable: the open is ready, not `Blocked`.
+    /// Cut: the ask answers pending only, as before, red (`Blocked`).
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn pr238_a_recovery_landing_before_the_replan_ask_ends_ready() {
+        let (db, _rt, node_1, looks, _asks) = scripted_replan_owner(
+            |look| look == 0,
+            |_| ReplanAsk::Answer {
+                after: Duration::ZERO,
+                blocked: false,
+                pending: false,
+            },
+        );
+        assert_eq!(db.wait_ready(Duration::from_secs(5)), Ok(()));
+        drop(db);
+        node_1.join().expect("the stub");
+        assert_eq!(looks.load(Ordering::Relaxed), 2, "blocked, then writable");
+    }
+
+    /// PR #238 review: node 1 starts a restart right after it answers the look `Blocked`, and
+    /// holds it 1.5 s. The ask is sent only within the time left, so the open answers the
+    /// retryable `TimedOut` by the bound, with the restart still held. Cut: the ask's send
+    /// waits out the restart, red (answered after 1.5 s).
+    /// Unit (~1.5 s, the stub's hold): no node thread.
+    #[test]
+    fn pr238_a_replan_ask_to_an_owner_mid_restart_returns_by_the_bound() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        let answer = std::thread::scope(|scope| {
+            let (nodes, restarted) = (&db.nodes, &db.opened.restarted);
+            scope.spawn(move || {
+                while let Ok(msg) = mailbox.recv() {
+                    if let Msg::Inspect { reply, .. } = msg {
+                        if let Some(handle) = lock(nodes).first_mut() {
+                            handle.restarting = Some(1);
+                        }
+                        let _ = reply.send(replan_status(true));
+                        std::thread::sleep(Duration::from_millis(1500));
+                        if let Some(handle) = lock(nodes).first_mut() {
+                            handle.restarting = None;
+                        }
+                        restarted.notify_all();
+                    }
+                }
+            });
+            let answer = db.wait_ready(Duration::from_millis(400));
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_millis(1200),
+                "answered after {waited:?}"
+            );
+            // Let the stub's mailbox close.
+            lock(&db.nodes).clear();
+            answer
+        });
+        assert!(
+            matches!(answer, Err(ReadyError::TimedOut { within_ms: 400, .. })),
+            "{answer:?}"
+        );
+    }
+
+    /// PR #238 review: partition 1's owner, run here, re-plans and then admits; partition 2's
+    /// never answers. The open answers partition 2's retryable `TimedOut`, not partition 1's
+    /// `Blocked`. Cut: keep the cached re-plan across partitions, red (`Blocked`).
+    /// Unit (~400 ms): no node thread.
+    #[test]
+    fn pr238_a_silent_partition_2_after_partition_1_re_plans_is_its_own_timeout() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.route = Route {
+            owners: vec![
+                std::sync::atomic::AtomicU32::new(OWNER.0),
+                std::sync::atomic::AtomicU32::new(OWNER.0),
+            ],
+            ..Route::default()
+        };
+        db.timeouts.read = Duration::from_millis(50);
+        let node_1 = std::thread::spawn(move || {
+            let (mut looks, mut kept) = (0, Vec::new());
+            while let Ok(msg) = mailbox.recv() {
+                match msg {
+                    Msg::Inspect {
+                        partition: PartitionId(1),
+                        reply,
+                    } => {
+                        looks += 1;
+                        let _ = reply.send(replan_status(looks < 3));
+                    }
+                    Msg::Inspect { reply, .. } => kept.push(reply),
+                    Msg::BootReplan { reply, .. } => {
+                        let _ = reply.send((replan_status(true), true));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let answer = db.wait_ready(Duration::from_millis(400));
+        assert_eq!(
+            answer,
+            Err(ReadyError::TimedOut {
+                within_ms: 400,
+                owner: OWNER,
+                phase: format!("partition 2: {NO_ANSWER}"),
+            })
+        );
+        drop(db);
+        node_1.join().expect("the stub");
+    }
+
+    /// PR #238 review: the owner run here re-plans, then `partitions/1` names node 2, which
+    /// this `Db` cannot reach. The open answers node 2's retryable `TimedOut`, not node 1's
+    /// `Blocked`. Cut: keep the cached re-plan when the owner moves, red (`Blocked`).
+    /// Unit (~400 ms): no node thread.
+    #[test]
+    fn pr238_a_re_planning_owner_replaced_by_an_unreachable_one_is_a_timeout() {
+        let (db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let answer = std::thread::scope(|scope| {
+            let owners = &db.route.owners;
+            scope.spawn(move || {
+                let mut looks = 0;
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            looks += 1;
+                            if looks == 2 {
+                                owners[0].store(2, Ordering::Relaxed);
+                            }
+                            let _ = reply.send(replan_status(true));
+                        }
+                        Msg::BootReplan { reply, .. } => {
+                            let _ = reply.send((replan_status(true), true));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let answer = db.wait_ready(Duration::from_millis(400));
+            lock(&db.nodes).clear();
+            answer
+        });
+        assert!(
+            matches!(
+                &answer,
+                Err(ReadyError::TimedOut { within_ms: 400, owner, .. }) if *owner == NodeId(2)
+            ),
+            "{answer:?}"
+        );
+    }
+
+    /// PR #238 review: node 1, run by this `Db`, as an ack stub: it answers `PossibleLossOf`
+    /// with `local` (`None`: the reply is kept and never answered) and each look with
+    /// `pinned` and no record. Node 2, reached over the links, answers each look with
+    /// `remote`. Returns the `Db` and the stub threads, which count the client calls (acks)
+    /// they got.
+    #[allow(clippy::type_complexity)]
+    fn ack_stub(
+        local: Option<Result<Option<host::PossibleLoss>, String>>,
+        pinned: Vec<rdb_core::contracts::membership::Member>,
+        remote: Option<host::PossibleLoss>,
+    ) -> (
+        Db,
+        tokio::runtime::Runtime,
+        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicU64>,
+    ) {
+        let (mut db, mailbox, rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_millis(100);
+        let acks = Arc::new(AtomicU64::new(0));
+        let status = move |node: NodeId, possible_loss, pinned| NodeStatus {
+            node,
+            pinned,
+            possible_loss,
+            ..replan_status(false)
+        };
+        let node_1 = {
+            let acks = Arc::clone(&acks);
+            std::thread::spawn(move || {
+                let mut kept = Vec::new();
+                while let Ok(msg) = mailbox.recv() {
+                    match msg {
+                        Msg::PossibleLossOf { reply, .. } => match local.clone() {
+                            Some(answer) => {
+                                let _ = reply.send(answer);
+                            }
+                            None => kept.push(reply),
+                        },
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(status(OWNER, None, pinned.clone()));
+                        }
+                        Msg::Client(_) => {
+                            acks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+        let (tx, node_2_mailbox) = std::sync::mpsc::channel();
+        db.links.register(NodeId(2), tx, host::BOOT);
+        let node_2 = {
+            let acks = Arc::clone(&acks);
+            std::thread::spawn(move || {
+                while let Ok(msg) = node_2_mailbox.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(status(NodeId(2), remote, Vec::new()));
+                        }
+                        Msg::Client(_) => {
+                            acks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+        (db, rt, node_1, node_2, acks)
+    }
+
+    fn member(node: u32) -> rdb_core::contracts::membership::Member {
+        rdb_core::contracts::membership::Member {
+            copy: rdb_core::contracts::membership::CopyId(u8::try_from(node).expect("small") - 1),
+            node: NodeId(node),
+            boot: host::BOOT,
+            role: rdb_core::contracts::ids::ReplicaRole::RegularSecondary,
+        }
+    }
+
+    /// PR #238 review: node 1 of this process never answers whether it holds a record. The
+    /// ack is `UNAVAILABLE`, says whether a record stands is unknown, and sends no ack to any
+    /// node. Cut: a node that does not answer is taken for "no record", red (`Ok`).
+    /// Unit (~100 ms): no node thread.
+    #[test]
+    fn pr238_an_ack_whose_holder_does_not_answer_is_unavailable_and_clears_nothing() {
+        let (db, _rt, node_1, node_2, acks) = ack_stub(None, Vec::new(), None);
+        let error = db
+            .ack_possible_loss(Generation(4))
+            .expect_err("the holder did not answer");
+        assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+        assert!(
+            error.detail.contains("node 1 did not answer")
+                && error.detail.contains("unknown: nothing was cleared"),
+            "{error:?}"
+        );
+        drop(db);
+        node_1.join().expect("node 1");
+        node_2.join().expect("node 2");
+        assert_eq!(acks.load(Ordering::Relaxed), 0, "no ack was sent");
+    }
+
+    /// PR #238 review: node 1 of this process cannot read its record. The ack is refused
+    /// with the read's failure, and no ack is sent. Cut: a failed read is "no record", red
+    /// (`Ok`).
+    /// Unit (~10 ms): no node thread.
+    #[test]
+    fn pr238_an_ack_whose_holder_cannot_read_its_record_is_refused_and_clears_nothing() {
+        let (db, _rt, node_1, node_2, acks) = ack_stub(
+            Some(Err("injected read failure".to_owned())),
+            Vec::new(),
+            None,
+        );
+        let error = db
+            .ack_possible_loss(Generation(4))
+            .expect_err("the record cannot be read");
+        assert!(
+            error.detail.contains("injected read failure")
+                && error.detail.contains("nothing was cleared"),
+            "{error:?}"
+        );
+        drop(db);
+        node_1.join().expect("node 1");
+        node_2.join().expect("node 2");
+        assert_eq!(acks.load(Ordering::Relaxed), 0, "no ack was sent");
+    }
+
+    /// PR #238 review: the record stands on node 2, a member the owner pins that this process
+    /// does not run; the owner, node 1, holds none. The ack is `INVALID_ARGUMENT` naming node 2,
+    /// and no ack is sent to either (a holder-targeted ack is #245). Cut: read only the nodes of
+    /// this process, red (`Ok` from the owner's "no record").
+    /// Unit (~10 ms): no node thread.
+    #[test]
+    fn pr238_an_ack_for_a_record_on_a_remote_member_names_it_and_clears_nothing() {
+        let loss = host::PossibleLoss {
+            copy: NodeId(2),
+            generation: Generation(4),
+            applied: 3,
+            reason: host::PossibleLossReason::OsBootChanged,
+        };
+        let (db, _rt, node_1, node_2, acks) =
+            ack_stub(Some(Ok(None)), vec![member(1), member(2)], Some(loss));
+        let error = db
+            .ack_possible_loss(Generation(4))
+            .expect_err("node 2 holds it");
+        assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}");
+        assert!(
+            error.detail.contains("stands on node 2")
+                && error.detail.contains("nothing was cleared"),
+            "{error:?}"
+        );
+        drop(db);
+        node_1.join().expect("node 1");
+        node_2.join().expect("node 2");
+        assert_eq!(acks.load(Ordering::Relaxed), 0, "no ack was sent");
     }
 
     /// PR #60 review F3, merged into slice 2 (w18): a fault ends an owner this `Db` runs at once
@@ -17426,7 +17975,8 @@ mod tests {
     /// generation; writes go on. An ack of another generation is `INVALID_ARGUMENT` and clears
     /// nothing. A reopen keeps it and logs WARN `failover_possible_loss` for it once. An ack of
     /// its generation clears it (INFO `failover_possible_loss_acked`), and a second ack, with no
-    /// record standing, is `Ok`.
+    /// record standing, is `Ok` (a retry after a lost answer). That retry sent again once a
+    /// newer promote's record stands is `INVALID_ARGUMENT`, and the newer record stands.
     /// Cuts: `Host::recovered` inherits with no mark, the first `possible_loss_on` is `None`,
     /// red; `Host::ack_possible_loss` skips its generation check, the stale ack clears it, red;
     /// `spawn_on` skips `warn_possible_losses`, no WARN at the reopen, red;
@@ -17540,7 +18090,184 @@ mod tests {
             .expect("an ack with no record standing is Ok");
         assert_eq!(logged(METHOD, "failover_possible_loss_acked").len(), 1);
         ready_and_reads_back(&db, "after the ack");
+        // PR #238 review: that second ack is the retry of one whose answer was lost. Sent
+        // again once a newer record stands, it is refused and the newer record is kept.
+        let newer = db
+            .promote_with(
+                PARTITION,
+                NodeId(3),
+                None,
+                Some(host::PossibleLossReason::OsBootUnknown),
+            )
+            .expect("a second promote, onto node 3");
+        let standing = possible_loss_on(&db, 3).expect("the newer record on node 3");
+        assert_eq!(standing.generation, newer.generation);
+        let late = db
+            .ack_possible_loss(generation)
+            .expect_err("a late retry of the older ack");
+        assert_eq!(late.kind, ErrorKind::InvalidArgument, "{late:?}");
+        assert_eq!(
+            possible_loss_on(&db, 3),
+            Some(standing),
+            "the newer record stands"
+        );
         db.shutdown();
+    }
+
+    /// #177 (PR #238 review): the record stands on node 2 after a promote onto it, and a
+    /// second promote moves partition 1 on to node 3, which holds none. An ack of another
+    /// generation still goes to node 2, the holder this process knows, and is
+    /// `INVALID_ARGUMENT` there: the record stands. Cut: send an ack that names no holder's
+    /// generation to the owner, red (`Ok` from node 3's "no record").
+    /// Integration (~10 s): a fresh open, two promotes.
+    #[config_log::retcd_test]
+    fn i177_a_wrong_generation_ack_after_the_owner_moves_on_is_refused_by_the_holder() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        let promoted = db
+            .promote_with(
+                PARTITION,
+                NodeId(2),
+                None,
+                Some(host::PossibleLossReason::OsBootChanged),
+            )
+            .expect("the promote onto node 2");
+        let loss = possible_loss_on(&db, 2).expect("the promote landed a record on node 2");
+        let deadline =
+            std::time::Instant::now() + crate::host::test_patience(Duration::from_secs(10));
+        loop {
+            match db.put(b"b", b"2", None) {
+                Ok(_) => break,
+                Err(error) if error.error.no_mutation && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("writes are not blocked: {error:?}"),
+            }
+        }
+        let moved = db
+            .promote_partition(PARTITION, NodeId(3), None)
+            .expect("the promote onto node 3");
+        assert_eq!(possible_loss_on(&db, 3), None, "node 3 holds none");
+        let stale = db
+            .ack_possible_loss(moved.generation)
+            .expect_err("an ack of another generation than the record's");
+        assert_eq!(stale.kind, ErrorKind::InvalidArgument, "{stale:?}");
+        assert!(stale.detail.contains("on node 2"), "{stale:?}");
+        assert_eq!(possible_loss_on(&db, 2), Some(loss), "the record stands");
+        assert_eq!(loss.generation, promoted.generation);
+        db.shutdown();
+    }
+
+    /// #177 (PR #238 review): what a reopen's roll takes from the plan a promote stored. A
+    /// plan for this partition and the record's parent generation gives its reason; one for
+    /// another partition, or another parent, gives none; bytes that are not a plan, and a read
+    /// that fails, refuse the open. Cuts: drop the partition check, red (a reason for
+    /// partition 2's plan); drop the parent check, red; map a decode failure to `Ok(None)`, red.
+    /// Unit (<10 ms): a store, no node.
+    #[test]
+    fn pr238_a_roll_takes_its_reason_only_from_this_partitions_parent_plan() {
+        use crate::test_store::{Script, Scripted};
+        use config_core::PutRequest;
+        use rdb_core::authority::partition::RecordMode;
+        use rdb_core::contracts::digest::Digest;
+        use rdb_core::contracts::ids::{
+            AuthorityGeneration, ConfigVersion, GrantId, OwnerEpoch, Revision,
+        };
+        use rdb_core::contracts::recovery::{LineageAnchor, PriorRecord};
+
+        let rt = runtime();
+        let record = PartitionRecord {
+            partition: PARTITION,
+            owner: NodeId(2),
+            generation: Generation(4),
+            owner_epoch: OwnerEpoch(3),
+            config_version: admin::CONFIG_VERSION,
+            lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+        };
+        let root = PartitionRoot {
+            mode: RecordMode::Active,
+            owner_boot: BootId(5),
+            base_seq: Seq(7),
+            base_digest: Digest::ROOT,
+            predecessor_generation: Generation(3),
+            predecessor_cutoff: Seq(7),
+            instance: [7; INSTANCE_LEN],
+            run: Revision(9),
+        };
+        let plan_of = |partition: PartitionId, generation: Generation| {
+            admin::recovery_plan(
+                LineageAnchor {
+                    lineage: rdb_core::contracts::authority::Lineage {
+                        partition,
+                        generation,
+                        owner_epoch: OwnerEpoch(2),
+                    },
+                    base_seq: Seq(7),
+                    base_digest: Digest::ROOT,
+                },
+                ConfigVersion(5),
+                admin::members(),
+                BootId(5),
+                GrantId(1),
+                AuthorityGeneration(1),
+                PriorRecord::fresh(),
+            )
+        };
+        let reason = Some(host::PossibleLossReason::OsBootUnknown);
+        let key = admin::promote_operation(root.run).expect("a key").encode();
+        let rolled = |value: Option<Bytes>| {
+            let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+            if let Some(value) = value {
+                rt.block_on(store.put(PutRequest {
+                    key: Bytes::from(key.clone()),
+                    value,
+                    expected_mod_revision: Some(0),
+                    dedup: None,
+                }))
+                .expect("put the plan");
+            }
+            rt.block_on(rolled_possible_loss(&store, PARTITION, &record, &root))
+        };
+        let encoded = |partition, generation| {
+            Some(admin::encode_promote_plan_with(
+                &plan_of(partition, generation),
+                reason,
+            ))
+        };
+        assert_eq!(
+            rolled(encoded(PARTITION, Generation(3))).expect("reads"),
+            reason
+        );
+        assert_eq!(rolled(None).expect("reads"), None, "no plan");
+        assert_eq!(
+            rolled(encoded(PartitionId(2), Generation(3))).expect("reads"),
+            None,
+            "another partition's plan"
+        );
+        assert_eq!(
+            rolled(encoded(PARTITION, Generation(2))).expect("reads"),
+            None,
+            "another parent's plan"
+        );
+        let corrupt = rolled(Some(Bytes::from_static(&[5, 0xff, 0xff])))
+            .expect_err("bytes that are not a plan");
+        assert!(
+            format!("{corrupt:?}").contains("not a promote plan this build reads"),
+            "{corrupt:?}"
+        );
+        let failing: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_gets: 1,
+            ..Script::default()
+        }));
+        let failed = rt
+            .block_on(rolled_possible_loss(&failing, PARTITION, &record, &root))
+            .expect_err("the read fails");
+        assert!(matches!(failed, OpenError::Control(_)), "{failed:?}");
     }
 
     /// #177, a crash between the promote's commit and its landing: node 2's commit of the
@@ -17600,6 +18327,86 @@ mod tests {
             "{loss:?}"
         );
         assert_eq!(logged(METHOD, "failover_possible_loss_recorded").len(), 1);
+        db.shutdown();
+    }
+
+    /// #177 (PR #238 review): as the row above, with the reopen's roll-forward stopped before
+    /// the owner's copy, as a crash there would stop it. A marked roll links the owner first, so
+    /// no copy holds the generation yet, and the next open rolls it forward again and lands the
+    /// record with the generation and reason the promote stored. A stale ack keeps it; the ack
+    /// of its generation clears it; a reopen after that does not bring it back.
+    /// Cut: link the copies in their own order (node 1 first); node 1 holds the generation, the
+    /// next open does not roll, and no record stands, red.
+    /// Integration (~15 s): a fresh open, a promote cut short at its commit, a roll stopped,
+    /// two opens until ready.
+    #[config_log::retcd_test]
+    fn i177_a_roll_stopped_before_the_owner_keeps_its_possible_loss_record_through_the_reopen() {
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let dir = config_testkit::fs::temp_dir();
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the fresh open");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(10)))
+            .expect("the fresh open is ready");
+        db.put(b"a", b"1", None).expect("put a=1");
+        let before = stored_generation(&rt, &store).expect("partitions/1");
+        crate::host::fault_next_commit(&dir.path().join("nodes").join("2"));
+        let answer = db.promote_with(
+            PARTITION,
+            NodeId(2),
+            None,
+            Some(host::PossibleLossReason::OsBootUnknown),
+        );
+        tracing::info!(?answer, "i177_promote_cut_short_answer");
+        until_stored(&rt, &store, before + 1);
+        db.shutdown();
+        drop(db);
+
+        stop_roll_before(dir.path(), NodeId(2));
+        match open_fast(&rt, dir.path(), &store) {
+            Err(OpenError::Node(text)) => assert!(
+                text.contains("roll forward stopped before node 2"),
+                "{text}"
+            ),
+            Err(other) => panic!("the roll stops at its hook, not: {other:?}"),
+            Ok(_) => panic!("the roll stops before node 2"),
+        }
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open that rolls forward");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the rolled-forward open is ready");
+        let generation = Generation(before + 1);
+        let loss = possible_loss_on(&db, 2).expect("the record stands on the owner");
+        assert_eq!(
+            (loss.copy, loss.generation, loss.reason),
+            (
+                NodeId(2),
+                generation,
+                host::PossibleLossReason::OsBootUnknown
+            ),
+            "{loss:?}"
+        );
+        let stale = db
+            .ack_possible_loss(Generation(before))
+            .expect_err("a stale ack is refused");
+        assert_eq!(stale.kind, ErrorKind::InvalidArgument, "{stale}");
+        assert_eq!(
+            possible_loss_on(&db, 2),
+            Some(loss),
+            "the stale ack kept it"
+        );
+        db.ack_possible_loss(generation)
+            .expect("the ack of its generation");
+        assert_eq!(possible_loss_on(&db, 2), None, "the ack cleared it");
+        db.shutdown();
+        drop(db);
+
+        let mut db = open_fast(&rt, dir.path(), &store).expect("the open after the ack");
+        db.wait_ready(crate::host::test_patience(Duration::from_secs(30)))
+            .expect("the open after the ack is ready");
+        assert_eq!(
+            possible_loss_on(&db, 2),
+            None,
+            "the reopen does not bring it back"
+        );
         db.shutdown();
     }
 

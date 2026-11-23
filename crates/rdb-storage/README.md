@@ -2,11 +2,15 @@
 
 The M1 storage seam on real RocksDB. S0: write batches, crash the process, reopen, check what
 survived. S1: generation inheritance (ADR-rdb-0010) — a new generation reads through to the old
-one (linked), or gets a copy of it as of `base` (copied). Format 2
-(`keys::FORMAT_VERSION = 2`, M10 S2); a format-1 copy still opens. S0's provisional 0 is
-refused at open (exit 6).
+one (linked), or gets a copy of it as of `base` (copied). Format 3
+(`keys::FORMAT_VERSION = 3`, #177); a format-1 or format-2 copy still opens. S0's provisional 0
+is refused at open (exit 6).
+- A new copy is stamped 3 when it is created, so a format-2 build refuses it.
+- An older copy keeps its marker until a write an older build would misread: an epoch
+  revocation or an ack floor moves 1 to 2 (below), and a possible-loss marker moves 1 or 2 to 3.
+  A clear of that marker leaves it at 3.
 
-## Format 2, in one screen
+## Format 3, in one screen
 
 - Key: `partition u32 BE | generation u64 BE | ns u8 | key`.
 - Value: `kind u8 | version u64 BE | bytes`. Kind 0 value, 1 tombstone (no bytes; only in a
@@ -30,6 +34,10 @@ refused at open (exit 6).
   but a format-1 build would re-execute a resend the floor dropped. So the first `commit`
   that carries a floor record or a `dedup` delete writes marker 2 in the same batch
   (review-s2 F-006, A-R411), logged `format_marker_moved_for_ack_floor`.
+- Possible-loss marker (format 3, #177): `metadata` key `possible` + partition u32 BE, the
+  promoted generation, the seq the copy held and the cause. Written in the same batch as the
+  generation switch, synced (`inherit_marked`); cleared by `clear_possible_loss`. A format-2
+  build does not define it, so the batch that writes it on an older copy writes marker 3.
 - A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
   does not define (A-R184), so a copy holding a newer build's key would not open here.
 - A stored `Meta` record is refused at open; a `Meta` write is refused at commit.

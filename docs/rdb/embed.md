@@ -513,7 +513,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     Only an admin app may ack, as for `forget_tail`. It logs INFO
     `failover_possible_loss_acked`. One partition only in this release: the ack is refused
     above one partition.
-  - A wiped or rebuilt copy loses its record.
+  - A rebuild keeps or moves the record with the copy's folder. `admin rebuild N` without
+    `--wipe` restarts node N on its own folder, so the record stands. With `--wipe` the folder
+    is moved aside (never deleted), so the record goes with it and the node comes back with
+    none. A rebuild of a quarantined owner's copy always wipes.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -1685,7 +1688,7 @@ above comes back by itself once its link is back:
   the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
   added back live, and it cannot link at all. The same holds for an app process with no copy
-  (`--nodes`): an app at an older version is refused by nodes at 12. To upgrade: stop every
+  (`--nodes`): an app at an older version is refused by nodes at 13. To upgrade: stop every
   node and every app process that links to them, upgrade them all, start the nodes, then the
   apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
@@ -1989,11 +1992,15 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
-- **Rolling back to an older build is not always possible.** Once this build has written an
-  ack floor or an epoch revocation into a folder, its copies are format 2. A format-1 build
-  refuses to open them, and its error names the format range it reads. So roll back only onto
-  a folder this build has written neither into. Otherwise, restore a backup taken before the
-  upgrade.
+- **Rolling back to an older build is not always possible.** Each build refuses a folder at a
+  newer format than it reads, and its error names the format range it reads.
+  - A folder this build creates is format 3, so a format-2 build refuses it.
+  - An older folder moves up when this build writes into it something an older build would
+    misread. An ack floor or an epoch revocation moves a format-1 folder to 2. A possible-loss
+    record (#177) moves a format-1 or format-2 folder to 3. Acking that record clears it, but
+    the folder stays at 3.
+  - So roll back only onto a folder at a format the older build reads. Otherwise, restore a
+    backup taken before the upgrade.
 - **An older build cannot open a folder after this build wrote `partitions/1`.** This build
   writes that record with its member list (layout 4). A build without layout 4 reads it as
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a

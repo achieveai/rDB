@@ -705,15 +705,25 @@ pub enum Msg {
         /// Where the answer goes.
         reply: Sender<NodeStatus>,
     },
-    /// #202: answer whether this node is re-planning `partition` at a restarted copy's new boot
-    /// ([`Host::boot_replan_pending`]). Local only, like [`Msg::PeerBooted`]: never sent over
-    /// the links, so no wire change. `Db::wait_ready` asks an owner it runs whose recovery is
-    /// `Blocked`.
+    /// #202: answer this node's state for `partition` and whether it is re-planning it at a
+    /// restarted copy's new boot ([`Host::boot_replan_pending`]), read together on the node's
+    /// thread, so a recovery that finished since a look cannot pass for a pending block (PR
+    /// #238 review). Local only, like [`Msg::PeerBooted`]: never sent over the links, so no
+    /// wire change. `Db::wait_ready` asks an owner it runs whose recovery is `Blocked`.
     BootReplan {
         /// The partition.
         partition: PartitionId,
-        /// Where the answer goes.
-        reply: Sender<bool>,
+        /// Where the answer goes: the status, and whether the re-plan is pending.
+        reply: Sender<(NodeStatus, bool)>,
+    },
+    /// #177 (PR #238 review): answer this node's possible-loss record for `partition`, or why
+    /// it cannot be read. Local only, like [`Msg::BootReplan`]: `Db::ack_possible_loss` asks
+    /// the nodes it runs, so a read that fails is never taken for "no record".
+    PossibleLossOf {
+        /// The partition.
+        partition: PartitionId,
+        /// Where the answer goes: the record, `None` when none stands, or the read's failure.
+        reply: Sender<Result<Option<PossibleLoss>, String>>,
     },
     /// Peer `node` started again as `boot` (#42, A-R249). Local only: the net handshake posts
     /// it when it sees a new boot for a known peer, and [`crate::db::Db::restart_node`] does in
@@ -4628,7 +4638,11 @@ impl Host {
                 Ok(())
             }
             Msg::BootReplan { partition, reply } => {
-                let _ = reply.send(self.boot_replan_pending(partition));
+                let _ = reply.send((self.status(partition), self.boot_replan_pending(partition)));
+                Ok(())
+            }
+            Msg::PossibleLossOf { partition, reply } => {
+                let _ = reply.send(self.read_possible_loss(partition));
                 Ok(())
             }
             Msg::PeerBooted { node, boot } => {
@@ -17779,8 +17793,9 @@ impl Host {
             .clear_possible_loss(partition)
             .map_err(|fault| {
                 ApiError::host(&format!(
-                    "node {}: clear the possible-loss record of partition {}: {fault:?}; it still \
-                 stands",
+                    "node {}: clear the possible-loss record of partition {}: {fault:?}; whether \
+                     it was cleared is unknown (a synced write that fails may still land at the \
+                     next open): read node status, then ack again",
                     self.node.0, partition.0
                 ))
             })?;
@@ -17814,6 +17829,27 @@ impl Host {
                 );
             }
         }
+    }
+
+    /// #177 (PR #238 review): the possible-loss record this node's store holds for
+    /// `partition`, or the read's failure as text. Never "no record" for a read that failed.
+    fn read_possible_loss(&self, partition: PartitionId) -> Result<Option<PossibleLoss>, String> {
+        self.engine
+            .possible_loss(partition)
+            .map(|mark| {
+                mark.map(|mark| PossibleLoss {
+                    copy: self.node,
+                    generation: mark.generation,
+                    applied: mark.applied,
+                    reason: PossibleLossReason::from_cause(mark.cause),
+                })
+            })
+            .map_err(|fault| {
+                format!(
+                    "node {}: read the possible-loss record of partition {}: {fault:?}",
+                    self.node.0, partition.0
+                )
+            })
     }
 
     /// #177: the possible-loss record this node's store holds for `partition`. A read that
@@ -18857,6 +18893,7 @@ const fn msg_name(msg: &Msg) -> &'static str {
         Msg::Client(_) => "client",
         Msg::Inspect { .. } => "inspect",
         Msg::BootReplan { .. } => "boot_replan",
+        Msg::PossibleLossOf { .. } => "possible_loss_of",
         Msg::PeerBooted { .. } => "peer_booted",
         #[cfg(debug_assertions)]
         Msg::Damage { .. } => "damage",

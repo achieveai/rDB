@@ -1414,6 +1414,45 @@ fn status_through_the_wire(
     NodeStatus::try_from(*back)
 }
 
+/// #177 (PR #238 review): a restored holding (`owner_epoch` `None`) crosses the wire
+/// unchanged, with a reason or none, and is still restored on the far side; so does one with
+/// an epoch, which is not. Cut: send a restored holding's epoch as `Some(0)`, red.
+/// Unit.
+#[test]
+fn pr238_a_restored_holding_round_trips_with_no_owner_epoch() {
+    for (owner_epoch, restored) in [
+        (None, Some(crate::host::PossibleLossReason::OsBootChanged)),
+        (None, None),
+        (Some(rdb_core::contracts::ids::OwnerEpoch(3)), None),
+    ] {
+        let mut sent = status();
+        sent.holds = sent.holds.map(|holds| Holding {
+            owner_epoch,
+            restored,
+            ..holds
+        });
+        let bytes = wire::encode(&Frame::Reply {
+            correlation: 2,
+            reply: WireReply::Status(Box::new(wire::WireNodeStatus::from(&sent))),
+        });
+        let Ok(Frame::Reply {
+            reply: WireReply::Status(back),
+            ..
+        }) = wire::decode(&bytes)
+        else {
+            panic!("not a status reply");
+        };
+        let back = NodeStatus::try_from(*back).expect("lands");
+        assert_eq!(format!("{back:?}"), format!("{sent:?}"), "{owner_epoch:?}");
+        let holds = back.holds.expect("a holding");
+        assert_eq!(
+            holds.is_restored(),
+            owner_epoch.is_none(),
+            "{owner_epoch:?}"
+        );
+    }
+}
+
 /// PR #110 review: a status naming a tail crosses the wire unchanged in each adoption state,
 /// `Adoptable`, `NotReady`, `Refused`, `Unchecked`, and (issue #61, its protocol version) `Trimmed` with
 /// each of its reasons. Unit.
@@ -2247,6 +2286,43 @@ fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
         assert!(!reason.contains("as an admin app"), "{reason}");
     }
     assert_eq!(super::sender_refused(&pilot, &status, &none), None);
+}
+
+/// #177 (PR #238 review): the gate for an ack of a possible loss reads the list, as for a
+/// move. With the list {ops}, app ops may send it; with an empty list, even an app named
+/// `admin` is refused, told nothing was cleared. A node may always send it. That the ack then
+/// clears the record is `i177_a_possible_loss_record_stands_through_a_reopen_until_its_own_generation_is_acked`.
+/// Cut: an ack arm that tests `app == "admin"`, red. Unit.
+#[test]
+fn pr238_an_ack_possible_loss_passes_the_listed_admin_and_an_empty_list_refuses_admin() {
+    let ack = WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call: wire::WireCall::AckPossibleLoss {
+            identity: identity(1, 1),
+            generation: Generation(4),
+        },
+        reply: 1,
+    };
+    let ops = BTreeSet::from(["ops".to_owned()]);
+    let none = BTreeSet::new();
+    assert_eq!(
+        super::sender_refused(&Label::App("ops".to_owned()), &ack, &ops),
+        None
+    );
+    assert_eq!(
+        super::sender_refused(&Label::Node(NodeId(2)), &ack, &none),
+        None
+    );
+    for list in [&none, &ops] {
+        let reason = super::sender_refused(&Label::App("admin".to_owned()), &ack, list)
+            .expect("app admin is not on the list");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1")
+                && reason.contains("nothing was cleared"),
+            "{reason}"
+        );
+    }
 }
 
 /// Revobot R3 4489400307: the gate reads the list, not the name `admin`. With the list {ops},

@@ -6259,6 +6259,65 @@ mod tests {
         }
     }
 
+    /// #177 (PR #238 review): the generation an ack names is kept exact at both ends of its
+    /// range. Cut: parse through `u32`, red. Unit.
+    #[test]
+    fn pr238_an_ack_keeps_generation_0_and_u64_max_exact() {
+        for generation in [0, u64::MAX] {
+            let word = generation.to_string();
+            assert_eq!(
+                parse_ack_possible_loss(&["--partition", "1", "--generation", &word]),
+                Ok(Generation(generation))
+            );
+        }
+    }
+
+    /// #177 (PR #238 review): a node's line. A holding with an owner epoch shows it; a
+    /// restored one shows `epoch=restored`, never 0. A standing record shows
+    /// `possible_loss=gen<G>@<applied>:<reason>` for each reason, and once it is cleared the
+    /// line has no `possible_loss=`. Cut: `epoch=0` for a restored holding, red; the record
+    /// left off the line, red. Unit.
+    #[test]
+    fn pr238_a_node_line_shows_the_epoch_or_restored_and_a_standing_record_until_cleared() {
+        let mut node = owner(None, true);
+        for (owner_epoch, shown) in [
+            (Some(rdb_core::contracts::ids::OwnerEpoch(4)), " epoch=4 "),
+            (None, " epoch=restored "),
+        ] {
+            node.holds = Some(rdb_api::host::Holding {
+                generation: Generation(5),
+                owner_epoch,
+                applied: 3,
+                durable: 3,
+                restored: None,
+            });
+            let line = node_line(&node, None);
+            assert!(line.contains(shown), "{line}");
+        }
+        for (reason, shown) in [
+            (
+                rdb_api::host::PossibleLossReason::OsBootChanged,
+                " possible_loss=gen5@3:os_boot_changed",
+            ),
+            (
+                rdb_api::host::PossibleLossReason::OsBootUnknown,
+                " possible_loss=gen5@3:os_boot_unknown",
+            ),
+        ] {
+            node.possible_loss = Some(rdb_api::host::PossibleLoss {
+                copy: NodeId(1),
+                generation: Generation(5),
+                applied: 3,
+                reason,
+            });
+            let line = node_line(&node, None);
+            assert!(line.contains(shown), "{line}");
+        }
+        node.possible_loss = None;
+        let line = node_line(&node, None);
+        assert!(!line.contains("possible_loss="), "{line}");
+    }
+
     /// Bug bash #65: after `rebuilt: node 3 ...` the poller still said "writes pause soon ...
     /// because node 3 restarted", though the owner had pinned 3 regular at its new boot. The
     /// note is stale only once every restarted node is pinned at its current boot.
@@ -9723,6 +9782,34 @@ mod tests {
             .output()
             .expect("spawn the run");
         String::from_utf8_lossy(&child.stdout).into_owned()
+    }
+
+    /// #177 (PR #238 review): `admin ack-possible-loss` with a negative generation, and with
+    /// one past `u64::MAX`, is each a usage error: the run exits 1 and no ack is sent (no
+    /// `cleared`, no refused ack). Cut: parse the generation as `i128` and saturate, red.
+    /// Integration (~3 s): two child runs with three real rEtcd voters each.
+    #[test]
+    fn pr238_an_ack_with_a_negative_or_overflowing_generation_exits_1_and_sends_nothing() {
+        let root = config_testkit::fs::temp_dir();
+        for (name, generation) in [("negative", "-1"), ("overflow", "18446744073709551616")] {
+            let said = script_output(
+                root.path(),
+                name,
+                1,
+                &format!(
+                    "admin ack-possible-loss --partition 1 --generation {generation}
+quit
+"
+                ),
+            );
+            assert!(
+                said.contains(&format!("--generation {generation} is not a number")),
+                "{said}"
+            );
+            assert!(!said.contains("cleared"), "{said}");
+            assert!(!said.contains("err admin ack-possible-loss"), "{said}");
+            assert!(said.contains("SCRIPT_CHILD_EXIT=1"), "{said}");
+        }
     }
 
     /// PR #102 review: a groupless `txn&` was queued at two partitions, where it is sent to
