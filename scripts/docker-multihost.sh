@@ -126,7 +126,7 @@
 #                its record at its own IP and machine; A3 no older node restarted since the add;
 #                A4 copy_skew <= 1; A5 3 copies on 3 machines everywhere; A6 a put and its get
 #                in every partition; A7 the removed node pinned nowhere, holding no copy, its
-#                nodes/ record no longer a live one; A8 started again it exits 2, "ids are never reused"; A11 d3,
+#                nodes/ record a removed one; A8 started again it exits 2, "ids are never reused"; A11 d3,
 #                whose --peers names it, restarts and logs start_peer_removed_skipped; A10 kill
 #                the owner most often sharing a partition with the new node; where the new node
 #                is chosen owner, a fresh session writes and reads back; A9 a node from the
@@ -970,13 +970,14 @@ def members(status_path, placement_path, partitions, removed, added):
         verdict(not pinned, f"A7 no partition's status names removed node {n}", [f"named by {pinned}"])
         held = nodes.get(n, (None, 0))[1]
         verdict(held == 0, f"A7 the placement gives removed node {n} no copy (copies={held})")
-        # rdb_dev's `admin status` decodes only a live node record (layouts 1 and 2), so the
-        # record remove-node leaves (layout 3, state removed) prints as `<undecodable>`. A live
-        # record prints `node=N addr=.. machine=..`; no line means no record at all.
+        # rdb_dev's `admin status` prints the record remove-node leaves (layout 3, state
+        # removed) as `removed node=N addr=.. machine=..`, a live record as `node=N ..`, and
+        # bytes nothing decodes as `<undecodable>` (PR #244 review). Only the first passes.
         body = node_records(status_path).get(n, "<no nodes/ line>")
-        verdict(body == "<undecodable>",
-                f"A7 removed node {n} is out of membership: nodes/{n} is not a live record",
-                [f"nodes/{n}: {body}"])
+        why = {"<undecodable>": "the record's bytes do not decode, as live or removed"}
+        verdict(body.startswith(f"removed node={n} "),
+                f"A7 removed node {n} is out of membership: nodes/{n} is a removed record",
+                [f"nodes/{n}: {body}" + (f" ({why[body]})" if body in why else "")])
 
 def node_records(path):
     """{n: body} for each `nodes/N rev=R <body>` line of `admin status`; the last line wins."""
@@ -2667,7 +2668,7 @@ selftest_s4() {
         echo "partitions/1 rev=5 PartitionRecord { owner: NodeId(1), generation: Generation(1), owner_epoch: OwnerEpoch(1) } members=[1:owner,3:regular,6:regular]"
         echo "partitions/2 rev=6 PartitionRecord { owner: NodeId(4), generation: Generation(1), owner_epoch: OwnerEpoch(2) } members=$1"
         echo "nodes/1 rev=2 node=1 addr=$ip.11:7101 machine=$ip.11"
-        [ "${2-<undecodable>}" = - ] || echo "nodes/2 rev=9 ${2-<undecodable>}"
+        [ "${2-}" = - ] || echo "nodes/2 rev=9 ${2:-removed node=2 addr=$ip.12:7101 machine=$ip.12}"
         echo "nodes/6 rev=8 node=6 addr=$ip.16:7101 machine=$ip.16"
     }
     s4_placement 1 0 > "$t/pl.ok"; s4_status "[4:owner,5:regular,6:regular]" > "$t/stat.ok"
@@ -2694,6 +2695,11 @@ selftest_s4() {
     s4_status "[4:owner,5:regular,6:regular]" "node=2 addr=$ip.12:7101 machine=$ip.12" > "$t/stat.live"
     grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$(analyze members "$t/stat.live" "$t/pl.ok" 2 2 -)"
     st "members fails A7 when nodes/2 is still a live record" $?
+    s4_status "[4:owner,5:regular,6:regular]" "<undecodable>" > "$t/stat.corrupt"
+    out="$(analyze members "$t/stat.corrupt" "$t/pl.ok" 2 2 -)"
+    grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$out" \
+        && grep -q 'nodes/2: <undecodable> (the record.s bytes do not decode, as live or removed)' <<< "$out"
+    st "members fails A7 on undecodable bytes, saying so apart from a removed record" $?
     s4_status "[4:owner,5:regular,6:regular]" - > "$t/stat.norec"
     out="$(analyze members "$t/stat.norec" "$t/pl.ok" 2 2 -)"
     grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$out" && grep -q 'nodes/2: <no nodes/ line>' <<< "$out"
