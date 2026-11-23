@@ -14,8 +14,9 @@ D5). It does not mean fsync. So between a client being told "yes" and the data b
 anywhere, there is a window, and the size of that window is the system's real exposure.
 
 Spec §6.2 bounds it with a table: warn at 1,000 ms, pause admission at 2,000 ms plus a 100 ms
-scheduler budget, evaluate every 50 ms plus progress events, resume only when all configured regular
-copies are durable through the paused prefix **and** lag has stayed below 250 ms for 5 s. It adds
+scheduler budget, and evaluate every 50 ms and on progress events. Under the issue #79 amendment,
+resume requires the pinned durable quorum through the paused prefix **and** lag below 250 ms for
+5 s on every copy still in the lag domain. It adds
 three sentences that are easy to lose and expensive to lose:
 
 - "If no regular secondary can ACK, success stops immediately. The 2 s threshold is not permission

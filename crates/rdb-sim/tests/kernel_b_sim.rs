@@ -902,6 +902,8 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
 }
 
 /// With the same RF3 membership and one failed flush, the configured threshold decides resume.
+/// The trace oracle derives m=1 from the RF3 pin count. This row checks the configured
+/// threshold directly in R1's durable floor and L1's admission and protection state.
 #[retcd_test]
 fn i79_rf3_resume_respects_the_pinned_min_regular_acks() {
     use rdb_core::contracts::storage::StorageFault;

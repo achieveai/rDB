@@ -425,7 +425,10 @@ Four conventions that every event literal below follows (critic T-06, T-04, T-23
 3. **`required_copy_set` is a membership list read by two invariants with opposite
    quantifiers, and they must not share a helper.** INV-PUB checks *membership plus the quorum
    rule's cardinality* (one qualifying regular ack under `DegradedRf2`, M7V-09); INV-LAG quantifies
-   over the primary and `min(m, n)` surviving regular secondaries, with `m` the derived minimum and `n` their count (M7V-36). A single `copy_set_satisfied()` gets one of the two rows wrong and
+   over the primary and `min(m, n)` surviving regular secondaries, where `n` counts the survivors (M7V-36).
+   The trace oracle derives `m` from the pin count, so it judges RF3 with `m = 1`.
+   The storage-backed `i79_rf3_resume_respects_the_pinned_min_regular_acks` test checks
+   configured `m = 2` directly in R1 and L1. A single `copy_set_satisfied()` gets one of the two rows wrong and
    the failure looks like a fixture bug. Each checker reads the field itself.
 4. **Every acknowledgement is grounded in a secondary apply, by construction (critic T-26, ruling
    V-R20 (8); design §4 convention 4 / §4.5 as amended).** A fixture with
