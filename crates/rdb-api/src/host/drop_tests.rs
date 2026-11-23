@@ -13829,3 +13829,301 @@ fn t61_r26_b_a_live_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught
         false,
     );
 }
+
+#[config_log::retcd_test]
+fn i250_a_restarted_receiver_refuses_the_previous_boots_committed_root() {
+    use rdb_core::contracts::control::{CasOutcome, ControlKey};
+
+    const METHOD: &str = "i250_a_restarted_receiver_refuses_the_previous_boots_committed_root";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = Trio::new(dir.path(), tuned);
+    let partition = PartitionId(1);
+    trio.bootstrap();
+    // The empty bootstrap committed. Hold its completion until node 2's replacement is registered.
+    let completion = super::seal_tests::only_until(&mut trio, &[1, 2], "bootstrap CAS", |trio| {
+        let (owner, _, incoming) = &mut trio.nodes[0];
+        owner.run_due();
+        owner.drain();
+        while let Ok(msg) = incoming.try_recv() {
+            if matches!(&msg, Msg::Control {
+                event: ControlEvent::CasResult {
+                    key: ControlKey::Partition(p),
+                    outcome: CasOutcome::Committed(_),
+                    ..
+                }, ..
+            } if *p == partition)
+            {
+                return Some(msg);
+            }
+            owner.handle(msg);
+        }
+        None
+    });
+    let old = &trio.nodes[1].0;
+    let old_boot = old.boot;
+    assert!(old.landed.is_empty());
+    assert!(!old.committed.contains_key(&partition));
+
+    let boot = restart_as(&mut trio, dir.path(), 2, true);
+    assert!(boot > old_boot);
+    assert!(trio.nodes[1].0.engine.lineages().is_empty());
+    let (owner, _, incoming) = &mut trio.nodes[0];
+    loop {
+        let msg = incoming.try_recv().expect("restart notification is queued");
+        let restarted =
+            matches!(&msg, Msg::PeerBooted { node: NodeId(2), boot: seen } if *seen == boot);
+        owner.handle(msg);
+        if restarted {
+            break;
+        }
+    }
+    assert!(!owner.committed.contains_key(&partition));
+    owner.handle(completion);
+    owner.drain();
+    let result = &owner.committed[&partition];
+    let generation = result.new_generation;
+    assert_eq!(result.selected.cutoff_seq, Seq(0));
+    assert!(in_barrier(result, NodeId(2)));
+    assert!(result.committed.pinned_config.members.iter().any(|member| {
+        member.node == NodeId(2)
+            && member.boot == old_boot
+            && member.boot != crate::admin::UNLINKED_BOOT
+    }));
+
+    // Observe the first fanout before the owner can finish the replacement plan.
+    super::seal_tests::only_until(
+        &mut trio,
+        &[1, 2],
+        "both receivers handled the fanout",
+        |trio| {
+            (trio.nodes[2].0.landed.contains(&(partition, generation))
+                && !logged!(METHOD, "recovered_refused_stale_boot").is_empty())
+            .then_some(())
+        },
+    );
+    let refused = logged!(METHOD, "recovered_refused_stale_boot");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["node"], 2);
+    assert_eq!(refused[0]["boot"], boot.0);
+    assert_eq!(refused[0]["pinned_boot"], old_boot.0);
+    assert_eq!(refused[0]["generation"], generation.0);
+    let receiver = &trio.nodes[1].0;
+    assert!(receiver.fault.is_none());
+    assert!(!receiver.landed.contains(&(partition, generation)));
+    assert!(!receiver.committed.contains_key(&partition));
+    assert!(receiver.engine.lineages().is_empty());
+    let peer = &trio.nodes[2].0;
+    assert_eq!(peer.committed[&partition].new_generation, generation);
+    assert!(peer.engine.lineages().contains(&(partition, generation)));
+
+    let current = trio.until(
+        "node 2 landed a commit pinning its replacement boot",
+        |trio| {
+            let receiver = &trio.nodes[1].0;
+            let result = receiver.committed.get(&partition)?;
+            (result.new_generation > generation
+                && result
+                    .committed
+                    .pinned_config
+                    .members
+                    .iter()
+                    .any(|member| member.node == NodeId(2) && member.boot == boot)
+                && receiver
+                    .landed
+                    .contains(&(partition, result.new_generation)))
+            .then_some(result.new_generation)
+        },
+    );
+    assert!(trio.nodes[1]
+        .0
+        .engine
+        .lineages()
+        .contains(&(partition, current)));
+}
+
+#[config_log::retcd_test]
+fn i250_a_receiver_lands_a_root_pinned_at_unlinked_boot() {
+    const METHOD: &str = "i250_a_receiver_lands_a_root_pinned_at_unlinked_boot";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _faults) = super::seal_tests::formed(dir.path());
+    let to = NodeId(3);
+    let receiver = NodeId(2);
+    let within = test_patience(Duration::from_secs(6));
+    let (members, members_version) =
+        crate::admin::promote_members(P1, to, Some(trio.status(2)), within)
+            .expect("target members");
+
+    // This promoter has a handshake with its target only. The real promote chooses the
+    // sentinel and commits the pin. Node 2 does not process messages until after that commit.
+    let handshakes = Links::new();
+    handshakes.register(to, trio.nodes[2].1.clone(), trio.nodes[2].0.boot);
+    assert_eq!(handshakes.boot_of(receiver), None);
+    let posted = Arc::clone(&trio.links);
+    let promote = trio
+        .rt
+        .spawn(crate::admin::promote(crate::admin::PromoteCtx {
+            possible_loss: None,
+            store: Arc::clone(&trio.store),
+            budgets: trio.nodes[0].0.budgets,
+            clock: trio.clock,
+            partition: P1,
+            to,
+            drop: None,
+            owner_must_be_dead: false,
+            look_within: Duration::from_secs(1),
+            within,
+            members,
+            members_version,
+            member_boot: Arc::new(move |node| handshakes.boot_of(node)),
+            send: Arc::new(move |node, msg| {
+                posted.post_local(node, msg).map_err(|_| NodeStopped(node))
+            }),
+        }));
+    super::seal_tests::only_until(&mut trio, &[0, 2], "promote commits without node 2", |_| {
+        promote.is_finished().then_some(())
+    });
+    trio.rt
+        .block_on(promote)
+        .expect("promote task")
+        .expect("promote");
+    let result = trio.nodes[2].0.committed[&P1].clone();
+    let generation = result.new_generation;
+    let pin = result
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .find(|member| member.node == receiver)
+        .expect("node 2 kept in config");
+    assert_eq!(pin.boot, crate::admin::UNLINKED_BOOT);
+    assert!(!in_barrier(&result, receiver));
+    assert!(!trio.nodes[1].0.landed.contains(&(P1, generation)));
+    super::seal_tests::only_until(&mut trio, &[1], "node 2 lands the unlinked pin", |trio| {
+        trio.nodes[1]
+            .0
+            .landed
+            .contains(&(P1, generation))
+            .then_some(())
+    });
+    let host = &trio.nodes[1].0;
+    assert_eq!(host.committed[&P1], result);
+    assert!(host.engine.lineages().contains(&(P1, generation)));
+    assert!(host.fault.is_none());
+    assert!(logged!(METHOD, "recovered_refused_stale_boot").is_empty());
+}
+
+#[config_log::retcd_test]
+fn i250_a_disk_preserving_receiver_refuses_the_previous_boots_committed_root() {
+    const METHOD: &str =
+        "i250_a_disk_preserving_receiver_refuses_the_previous_boots_committed_root";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, parent) = started(dir.path(), tuned);
+    kill(&trio, 3, &[1, 2]);
+    put_until_drop_planned(&mut trio, 1);
+    let generation = dropped_three(&mut trio, parent);
+    let result = trio.nodes[0].0.committed[&P1].clone();
+    let cutoff = result.selected.cutoff_seq;
+    assert!(cutoff > Seq(0));
+    assert_eq!(result.new_generation, generation);
+    assert_eq!(result.retained_status_map.predecessor_generation, parent);
+    let old_boot = trio.nodes[1].0.boot;
+    assert!(result
+        .committed
+        .pinned_config
+        .members
+        .iter()
+        .any(|member| member.node == NodeId(2) && member.boot == old_boot));
+    assert!(in_barrier(&result, NodeId(2)));
+    let retained = trio.nodes[1]
+        .0
+        .checked(P1, parent, cutoff)
+        .expect("parent record");
+    assert_eq!(retained.1, result.selected.cutoff_digest);
+
+    let boot = restart_as(&mut trio, dir.path(), 2, false);
+    let (host, mailbox, incoming) = &mut trio.nodes[1];
+    assert!(boot > old_boot);
+    assert_eq!(host.checked(P1, parent, cutoff), Ok(retained.clone()));
+    let lineages = host.engine.lineages();
+    assert!(lineages.contains(&(P1, parent)));
+    let landed = host.landed.clone();
+    let committed = host.committed.clone();
+    assert!(host.fault.is_none());
+    mailbox
+        .send(Msg::Landed {
+            result,
+            partition: P1,
+            correlation: CorrelationId(0),
+            emitter: NodeId(1),
+            not_before: host.clock.now(),
+            owner_live_readd: false,
+        })
+        .expect("replacement mailbox");
+    host.handle_msg(
+        incoming
+            .try_recv()
+            .expect("replacement receives old commit"),
+    );
+    host.run_due();
+    let refused = logged!(METHOD, "recovered_refused_stale_boot");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["node"], 2);
+    assert_eq!(refused[0]["pinned_boot"], old_boot.0);
+    assert_eq!(refused[0]["boot"], boot.0);
+    assert_eq!(refused[0]["generation"], generation.0);
+    assert_eq!(host.engine.lineages(), lineages);
+    assert_eq!(host.checked(P1, parent, cutoff), Ok(retained));
+    assert_eq!(host.landed, landed);
+    assert_eq!(host.committed, committed);
+    assert!(host.fault.is_none());
+}
+
+#[config_log::retcd_test]
+fn i250_a_wiped_receiver_refuses_an_old_boot_root_at_positive_cutoff() {
+    const METHOD: &str = "i250_a_wiped_receiver_refuses_an_old_boot_root_at_positive_cutoff";
+    let dir = config_testkit::fs::temp_dir();
+    let mut trio = shadow_landed(dir.path());
+    let shadow = &trio.nodes[2].0;
+    let result = shadow.committed[&P1].clone();
+    let generation = result.new_generation;
+    let old_boot = shadow.boot;
+    let (correlation, owner_live_readd) = shadow.committed_correlation[&P1];
+    assert!(result.selected.cutoff_seq > Seq(0));
+    assert!(result.committed.pinned_config.members.iter().any(|member| {
+        member.node == NodeId(3) && member.role == ReplicaRole::Shadow && member.boot == old_boot
+    }));
+    assert!(!in_barrier(&result, NodeId(3)));
+    assert!(shadow.landed.contains(&(P1, generation)));
+
+    let boot = restart_as(&mut trio, dir.path(), 3, true);
+    let (host, mailbox, incoming) = &mut trio.nodes[2];
+    assert!(boot > old_boot);
+    assert!(host.engine.lineages().is_empty());
+    mailbox
+        .send(Msg::Landed {
+            result,
+            partition: P1,
+            correlation,
+            emitter: NodeId(1),
+            not_before: host.clock.now(),
+            owner_live_readd,
+        })
+        .expect("replacement mailbox");
+    host.handle(
+        incoming
+            .try_recv()
+            .expect("replacement receives the shadow root"),
+    );
+    host.run_due();
+
+    let refused = logged!(METHOD, "recovered_refused_stale_boot");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["node"], 3);
+    assert_eq!(refused[0]["generation"], generation.0);
+    assert_eq!(refused[0]["pinned_boot"], old_boot.0);
+    assert_eq!(refused[0]["boot"], boot.0);
+    assert!(host.fault.is_none());
+    assert!(!host.landed.contains(&(P1, generation)));
+    assert!(!host.committed.contains_key(&P1));
+    assert!(host.engine.lineages().is_empty());
+}

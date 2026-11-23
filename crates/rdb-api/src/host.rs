@@ -7968,7 +7968,10 @@ impl Host {
             );
         }
         self.note_left_out(partition, result);
-        self.committed.insert(partition, Box::new(result.clone()));
+        let first_commit = self
+            .committed
+            .insert(partition, Box::new(result.clone()))
+            .is_none();
         // Issue #61 rev 5b: a copy pinned as a regular member again is back in the re-plan's
         // inventory, so no offer hold stands for it.
         if let Some(holds) = self.offer_holds.get_mut(&partition) {
@@ -8026,6 +8029,10 @@ impl Host {
         // A membership commit restarts a reachable copy's drop clock (A-R282 N1); a member
         // counted unreachable keeps its count ([`Self::count_unreachable`], #67).
         self.blamed.remove(&partition);
+        if first_commit && !self.rejoins.contains_key(&partition) {
+            // A restart heard before this first commit had no pinned membership to check.
+            self.rejoin_if_stale(partition);
+        }
         self.rejoin_committed(partition, result.new_generation);
         Ok(())
     }
@@ -13183,6 +13190,28 @@ impl Host {
     ) -> Result<(), Fault> {
         let partition = site.partition;
         let landed_generation = result.new_generation;
+        if let Some(member) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| {
+                member.node == self.node
+                    && member.boot != crate::admin::UNLINKED_BOOT
+                    && member.boot < self.boot
+            })
+        {
+            tracing::info!(
+                node = self.node.0,
+                boot = self.boot.0,
+                pinned_boot = member.boot.0,
+                partition = partition.0,
+                generation = landed_generation.0,
+                emitter = emitter.0,
+                "recovered_refused_stale_boot"
+            );
+            return Ok(());
+        }
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
         tracing::info!(
