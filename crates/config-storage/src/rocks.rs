@@ -326,7 +326,7 @@ pub enum StorageOpenError {
     #[error(
         "data directory {path} keeps the Raft log inside the state-machine database \
              (format {found}); this build keeps it in {path}/raft-log and cannot migrate it: \
-             wipe the directory and re-add the node"
+             return to the build that wrote it or start fresh. To replace a node in a surviving compatible cluster, use a fresh node id"
     )]
     PreSplitLayout {
         /// The format marker the directory carries, or `0` when it has none.
@@ -343,7 +343,8 @@ pub enum StorageOpenError {
     /// vote or entries next to no state-machine database — is refused the same way.
     #[error(
         "data directory {path} is missing half of its store: {missing} is absent or empty while \
-             the other half holds Raft state; recreating it would lose the durable vote"
+             the other half holds Raft state; recreating it would lose {}",
+        if missing == path { "the applied state" } else { "the durable vote" }
     )]
     MissingLogStore {
         /// The data directory.
@@ -421,33 +422,17 @@ pub enum StorageOpenError {
 /// The operator procedure that actually clears [`StorageOpenError::UpgradeRequiresDrainedLog`]
 /// on a directory stamped `format`.
 ///
-/// Finding F-016: the single message this replaced told every operator to "trigger a snapshot
-/// and let log purge drain the rest", which is unperformable on the only build that ships a
-/// `format_version` 1 directory. That build is M0-M3 (`main`, 7d524ac): it has no snapshot
-/// engine and no admin plane, so there is nothing to trigger and nothing to purge with. An
-/// error that names a remedy the reader cannot carry out is worse than one that names none,
-/// because it sends them looking for a command that does not exist.
-///
-/// The `format` 1 arm therefore names the path that works on any build: discard the directory
-/// and let the node rejoin as a fresh learner, which is ADR-0023's node-replacement flow and
-/// needs nothing from the old binary at all. The second sentence is for the other producer of
-/// a marker-1 directory -- this build running `--compat-schema 1`, which stamps its *ceiling*
-/// (OQ-65, ruling M6-R22) -- where the drain is available and is much the cheaper answer.
-///
-/// `format` 2 keeps the original wording: every build that writes that marker is an M4-or-later
-/// build from this line, which does have both.
+/// Only split directories pass the layout probe. Format 1 can be written by a pinned node;
+/// a manually stamped split directory can also carry format 2.
 fn drained_log_remedy(format: &u32) -> &'static str {
     if *format == FORMAT_VERSION_V1 {
-        "the build that writes an on-disk format version 1 directory has no snapshot engine \
-         and no admin plane, so its log cannot be drained in place -- move this node's data \
-         directory aside and let it rejoin the cluster as a fresh learner from a surviving \
-         member, which needs nothing from the older build. If instead this directory was \
-         written by this build under `--compat-schema 1`, restart it pinned, let it finish \
-         applying, trigger a snapshot and let log purge drain the rest, then retry unpinned"
+        "restart with `--compat-schema 1` if the retained entries can be applied pinned, \
+         finish applying them, trigger a snapshot and let log purge drain the rest, then retry \
+         unpinned. Otherwise replace the node as a fresh learner with a fresh node id from a \
+         surviving compatible member, or start a fresh cluster"
     } else {
-        "on the previous build, let the node catch up so nothing is unapplied, trigger a \
-         snapshot and let log purge drain the rest, shut the node down, then start this build \
-         against the drained directory"
+        "recover the split directory from a compatible backup, replace the node as a fresh \
+         learner with a fresh node id from a surviving compatible member, or start a fresh cluster"
     }
 }
 
@@ -657,8 +642,8 @@ struct RocksShared {
     /// A purge OpenRaft ordered before this node could prove it was covered, held until the
     /// install that justifies it commits.
     ///
-    /// In memory only, and deliberately so (ruling M5-R11): it is executed inside the install's
-    /// final synced batch, after `current_snapshot` is durable, and dropped without executing
+    /// In memory only, and deliberately so (ruling M5-R11): it is executed in a separate synced log
+    /// batch after the install's final state batch makes `current_snapshot` durable, and dropped without executing
     /// if that install aborts or the process restarts. Persisting it would mean a crash could
     /// resurrect a deletion whose justification never landed.
     pending_purge: Mutex<Option<LogId<RaftNodeId>>>,
@@ -1131,7 +1116,7 @@ impl RocksStore {
             // `raft_log` family), so the one pre-split probe runs first and read-only.
             refuse_pre_split_layout(dir, &path)?;
 
-            // The marker is read before anything else about the layout, because it is the
+            // The marker is read before exact-family-set validation, because it is the
             // only fact that can tell an operator "this directory is newer than this build"
             // (OQ-65, M6-98). Read after `verify_column_families`, a directory from a newer
             // build reports a missing column family instead — a true statement that names the
@@ -1199,18 +1184,8 @@ impl RocksStore {
             } else {
                 None
             };
-            // The reverse half-missing case: a log that has voted or holds entries, with no
-            // state machine beside it. Checked before the root database is created.
-            if log.as_ref().is_some_and(log_holds_raft_state) {
-                tracing::error!(
-                    path = %path.display(),
-                    missing = %path.display(),
-                    "missing_state_machine_store"
-                );
-                return Err(StorageOpenError::MissingLogStore {
-                    path: path.clone(),
-                    missing: path.clone(),
-                });
+            if let Some(log) = &log {
+                require_root_for_live_log(log, &path, &log_path)?;
             }
             (open_db(dir, &path, &COLUMN_FAMILIES)?, log)
         };
@@ -1219,6 +1194,19 @@ impl RocksStore {
         // whose layout this version selects, so reading them out of a directory written in
         // another format is exactly the silent misinterpretation the marker exists to prevent.
         let format_action = check_format_version(&db, &path, options.max_format_version)?;
+
+        let stored_identity: Option<ClusterIdentity> = read_meta(&db, CF_STATE_META, KEY_IDENTITY)
+            .map_err(|detail| StorageOpenError::Corrupt {
+                what: "state_meta/identity".to_string(),
+                path: path.clone(),
+                detail,
+            })?;
+
+        if existing && stored_identity.is_none() {
+            if let Some(log) = &preexisting_log {
+                require_root_for_live_log(log, &path, &log_path)?;
+            }
+        }
 
         // I6, the usual direction: applied state with no log database, or an empty one, next
         // to it. Recreating the log would lose the durable vote. Refused before the log
@@ -1233,7 +1221,7 @@ impl RocksStore {
                 }
             })?,
         };
-        if holds_persisted_state(&db) && log_identity.is_none() {
+        if log_identity.is_none() && holds_persisted_state(&db, &path)? {
             tracing::error!(
                 path = %path.display(),
                 missing = %log_path.display(),
@@ -1265,13 +1253,6 @@ impl RocksStore {
         // Created here rather than at the end so a fault injected *during* the migration is
         // counted on the same counters the test later inspects (M4-14, M4-18).
         let counters = Arc::new(FaultCounters::default());
-
-        let stored_identity: Option<ClusterIdentity> = read_meta(&db, CF_STATE_META, KEY_IDENTITY)
-            .map_err(|detail| StorageOpenError::Corrupt {
-                what: "state_meta/identity".to_string(),
-                path: path.clone(),
-                detail,
-            })?;
 
         let state_meta =
             db.cf_handle(CF_STATE_META)
@@ -2084,7 +2065,7 @@ fn check_format_version(
                 _ => Err(unsupported(found)),
             }
         }
-        None if holds_persisted_state(db) => Err(unsupported(0)),
+        None if holds_persisted_state(db, path)? => Err(unsupported(0)),
         None => Ok(FormatAction::Stamp),
     }
 }
@@ -2168,7 +2149,7 @@ fn scan_log_for_upgrade(
     let mut scan = LogUpgradeScan::default();
     for item in log_db.iterator_cf(handle, IteratorMode::Start) {
         let (key, value) = item.map_err(|e| StorageOpenError::Backend {
-            path: path.to_path_buf(),
+            path: log_dir(path),
             detail: format!("cannot scan the raft log while checking for an upgrade: {e}"),
         })?;
         // An unreadable key is history this build cannot place, which is strictly worse than an
@@ -2223,31 +2204,68 @@ fn refuse_if_undrained(
 /// probes the cheapest witnesses rather than scanning: the binding written on a first open, and
 /// the applied pointer written with every state batch. The log's witnesses are in the other
 /// database since format 4; see [`log_holds_raft_state`].
-fn holds_persisted_state(db: &DB) -> bool {
-    let has = |cf: &str, key: &[u8]| {
-        db.cf_handle(cf)
-            .and_then(|h| db.get_cf(h, key).ok().flatten())
-            .is_some()
-    };
-    has(CF_STATE_META, KEY_IDENTITY) || has(CF_STATE_META, KEY_LAST_APPLIED)
+fn holds_persisted_state(db: &DB, path: &Path) -> Result<bool, StorageOpenError> {
+    Ok(has_key(db, path, CF_STATE_META, KEY_IDENTITY)?
+        || has_key(db, path, CF_STATE_META, KEY_LAST_APPLIED)?)
 }
 
-/// Whether the log database holds Raft state: a vote, a committed or purged pointer, or an
-/// entry. Its `identity` alone is not state; that is all a crash between binding the two halves
-/// leaves behind, and such a directory is still fresh (I6).
-fn log_holds_raft_state(log_db: &DB) -> bool {
-    let has = |key: &[u8]| {
-        log_db
-            .cf_handle(CF_RAFT_META)
-            .and_then(|h| log_db.get_cf(h, key).ok().flatten())
-            .is_some()
+fn has_key(db: &DB, path: &Path, family: &str, key: &[u8]) -> Result<bool, StorageOpenError> {
+    let backend = |detail| StorageOpenError::Backend {
+        path: path.to_path_buf(),
+        detail,
     };
-    has(KEY_VOTE)
-        || has(KEY_COMMITTED)
-        || has(KEY_LAST_PURGED)
-        || log_db
-            .cf_handle(CF_RAFT_LOG)
-            .is_some_and(|h| log_db.iterator_cf(h, IteratorMode::Start).next().is_some())
+    let cf = db
+        .cf_handle(family)
+        .ok_or_else(|| backend(format!("missing column family {family}")))?;
+    db.get_cf(cf, key)
+        .map(|value| value.is_some())
+        .map_err(|e| {
+            backend(format!(
+                "cannot read {family}/{}: {e}",
+                String::from_utf8_lossy(key)
+            ))
+        })
+}
+
+/// A log bound during first open can contain just its identity. Every other Raft witness
+/// requires the original root to be present and bound.
+fn log_holds_raft_state(db: &DB, path: &Path) -> Result<bool, StorageOpenError> {
+    for key in [KEY_VOTE, KEY_COMMITTED, KEY_LAST_PURGED] {
+        if has_key(db, path, CF_RAFT_META, key)? {
+            return Ok(true);
+        }
+    }
+    let cf = db
+        .cf_handle(CF_RAFT_LOG)
+        .ok_or_else(|| StorageOpenError::MissingColumnFamily {
+            name: CF_RAFT_LOG.to_string(),
+            path: path.to_path_buf(),
+            expected: LOG_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+        })?;
+    Ok(db
+        .iterator_cf(cf, IteratorMode::Start)
+        .next()
+        .transpose()
+        .map_err(|e| StorageOpenError::Backend {
+            path: path.to_path_buf(),
+            detail: format!("cannot read {CF_RAFT_LOG}: {e}"),
+        })?
+        .is_some())
+}
+
+fn require_root_for_live_log(
+    log: &DB,
+    root: &Path,
+    log_path: &Path,
+) -> Result<(), StorageOpenError> {
+    if log_holds_raft_state(log, log_path)? {
+        tracing::error!(path = %root.display(), missing = %root.display(), "missing_state_machine_store");
+        return Err(StorageOpenError::MissingLogStore {
+            path: root.to_path_buf(),
+            missing: root.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether the `events` journal holds no entry at all. An absent family counts as empty, though
@@ -2258,7 +2276,7 @@ fn log_holds_raft_state(log_db: &DB) -> bool {
 /// unions by `max`, so it must never fire on a directory whose journal was merely trimmed.
 /// It cannot: retention trims through `Compact`, which is schema-gated and undecodable to a
 /// pinned build, so a marker-1 directory has never been trimmed; a trimmed current directory
-/// cannot be reopened pinned (the pre-open probe refuses marker 3 above ceiling 1, M6-98);
+/// cannot be reopened pinned (the pre-open probe refuses marker 4 above ceiling 1, M6-98);
 /// and snapshot installs repopulate the journal. What remains empty is a pinned store that never
 /// journalled anything, a crashed-mid-migration retry of one, or a store at
 /// `cluster_revision == 0`.
@@ -2293,13 +2311,19 @@ fn load_state(
         detail,
     };
 
+    let log_corrupt = |what: &str, detail: String| StorageOpenError::Corrupt {
+        what: what.to_string(),
+        path: log_dir(path),
+        detail,
+    };
+
     let vote: Option<Vote<RaftNodeId>> =
-        read_meta(log_db, CF_RAFT_META, KEY_VOTE).map_err(|d| corrupt("raft_meta/vote", d))?;
+        read_meta(log_db, CF_RAFT_META, KEY_VOTE).map_err(|d| log_corrupt("raft_meta/vote", d))?;
     let committed: Option<LogId<RaftNodeId>> = read_meta(log_db, CF_RAFT_META, KEY_COMMITTED)
-        .map_err(|d| corrupt("raft_meta/committed", d))?;
+        .map_err(|d| log_corrupt("raft_meta/committed", d))?;
     let last_purged: Option<LogId<RaftNodeId>> =
         read_meta(log_db, CF_RAFT_META, KEY_LAST_PURGED)
-            .map_err(|d| corrupt("raft_meta/last_purged", d))?;
+            .map_err(|d| log_corrupt("raft_meta/last_purged", d))?;
     let last_applied: Option<LogId<RaftNodeId>> = read_meta(db, CF_STATE_META, KEY_LAST_APPLIED)
         .map_err(|d| corrupt("state_meta/last_applied", d))?;
     let membership: StoredMembership<RaftNodeId, RaftNode> =
@@ -2333,12 +2357,12 @@ fn load_state(
             })?;
     let last_log_id = match log_db.iterator_cf(log_cf, IteratorMode::End).next() {
         None => None,
-        Some(Err(e)) => return Err(corrupt("raft_log", e.to_string())),
+        Some(Err(e)) => return Err(log_corrupt("raft_log", e.to_string())),
         Some(Ok((key, value))) => {
             let index = decode_index(&key)
-                .ok_or_else(|| corrupt("raft_log key", format!("{} bytes", key.len())))?;
+                .ok_or_else(|| log_corrupt("raft_log key", format!("{} bytes", key.len())))?;
             let entry: Entry<TypeConfig> = postcard::from_bytes(&value)
-                .map_err(|e| corrupt(&format!("raft_log entry {index}"), e.to_string()))?;
+                .map_err(|e| log_corrupt(&format!("raft_log entry {index}"), e.to_string()))?;
             Some(entry.log_id)
         }
     };
@@ -2860,7 +2884,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
     ///    are reconstructible from durable state machine or from the snapshot file. Purge.
     /// 2. **Deferred** — not covered, but a snapshot transfer is genuinely in flight
     ///    (an open receive slot or the install marker). Delete nothing, persist nothing, keep the
-    ///    request, and let the install execute it in the same synced batch that makes it legal.
+    ///    request, and execute it in a separate synced log batch after the install is durable.
     /// 3. **Refused** — not covered and nothing in flight. This is the logic error the original
     ///    guard was written for, and it still gets a `StorageError` (test plan M5-24). The
     ///    deferral is deliberately *not* the fallback: a mistake must surface as an error, not
@@ -2953,7 +2977,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
 /// Add "delete the log up to `log_id`, and say so" to `batch`.
 ///
 /// Shared by [`RocksLog::purge`] and by the install path, which executes a deferred purge in
-/// its own final batch: the deletion and the `last_purged` that explains it must land together
+/// a synced log batch after its final state batch: the deletion and the `last_purged` that explains it must land together
 /// or a crash between them leaves a log whose missing prefix nothing accounts for.
 #[allow(clippy::result_large_err)]
 fn purge_into(

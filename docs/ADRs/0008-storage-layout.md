@@ -238,7 +238,8 @@ database was written before format 4 (formats 1 to 3). It is refused with
   split layout stamped 1 (ADR-0030, M6-R22), so that is still a directory a current build
   upgrades, with the drained-log scan reading the log database.
 - A snapshot file records the format it was built under, so a format-3 snapshot is refused by
-  a format-4 restore.
+  a format-4 restore. Offline export bypasses directory format and layout admission: it can
+  read a pre-split directory and stamps the exported snapshot with format 4.
 
 **Owner ruling, 2026-11-21: a standing rule for storage format changes.**
 
@@ -248,7 +249,8 @@ database was written before format 4 (formats 1 to 3). It is refused with
 Until that deploy, a format bump refuses old folders with a typed error and no migration.
 Format 4 is such a bump. A further bump before the first deploy (for example a format 5 for
 openraft 0.10) may do the same. The first bump after it must replace `refuse_pre_split_layout`
-(and any refusal like it) with an in-place migration.
+(and any refusal like it) with an in-place migration. Rolling upgrades also need cross-version snapshots: both
+`validate_snapshot_file` and `restore_into_fresh_store` currently require exact format equality.
 
 **Rows.** `crates/config-storage/tests/rocks.rs` (`i186_*`): the pre-split refusal, both
 `MissingLogStore` directions, the foreign log, the identity-only log, a crash after apply, and

@@ -1,5 +1,10 @@
 # ADR-0021: Storage format v2, bounded migration, and refusal matrix
 
+**Superseded for format 4.** ADR-0008 records the split database layout. A root containing
+`raft_log` is refused before missing-family checks. The historical LegacyV1/LegacyV2 family
+migrations below applied to older builds. The marker migration still handles split directories
+with a legacy marker, including format 1 written under `--compat-schema 1`.
+
 **Status:** Accepted
 **Date:** 2026-09-18
 **Spec:** §9.2, §17, §21 M4

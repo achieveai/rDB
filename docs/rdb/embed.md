@@ -2368,15 +2368,15 @@ folder. Storage format 4 moved each rEtcd node's Raft log into its own database,
 inside that node's data directory. **A node directory written by an older build (format 1 to
 3) is refused, not upgraded.**
 
-- The node exits with code 3 and logs `storage_open_failed` with
-  `PreSplitLayout { found, path }`. `found` is the old format number, and `path` is the node's
-  data directory. The check only reads, so the directory is left exactly as it was.
+- The node exits with code 3 and logs `storage_open_failed` with a message explaining that the Raft log lives inside
+  the state-machine database. The separate `store_pre_split_layout` event records the node's
+  data directory in `path` and its old marker in `format_version` (0 when absent). The check only reads, so the directory is left exactly as it was.
 - Your app then sees rEtcd as down: `OpenError::Control` at open.
 - **What to do:** run that rEtcd with the build that wrote it, or `clean` it and start fresh.
-  Old directories are not migrated in this release.
+  Replacing a single node in a surviving compatible cluster requires a fresh node id.
 - **`MissingLogStore`** means a node directory has only one of its two halves. Either
   `raft-log/` is missing or empty next to stored data, or `raft-log/` holds Raft state and the
-  main database is missing. Restore the directory from where it came from. Do not make a new
+  main database is missing or unbound. Restore the directory from where it came from. Do not make a new
   `raft-log/`: that would lose the node's vote.
 - **`IdentityMismatch` naming `raft-log/`** means that `raft-log/` came from another node. Put
   back the node's own one.

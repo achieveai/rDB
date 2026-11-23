@@ -692,7 +692,7 @@ async fn m5_24_uncovered_purge_with_no_transfer_is_refused() {
 
 /// M5-24a (ruling M5-R11, rule 2): a purge OpenRaft issues while a snapshot is being received
 /// is deferred — nothing deleted, nothing persisted, no error — and then executed by the
-/// install that justifies it, in the same synced batch as `current_snapshot`.
+/// install that justifies it, in a separate synced log batch after the final state batch.
 #[retcd_test]
 async fn m5_24a_purge_during_install_is_deferred_then_executed() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -751,6 +751,15 @@ async fn m5_24a_purge_during_install_is_deferred_then_executed() {
 /// accepted as covered.
 #[retcd_test]
 async fn i186_crash_before_the_deferred_purge_reopens_without_a_redo() {
+    check_deferred_purge_crash(Boundary::BeforePurge).await;
+}
+
+#[retcd_test]
+async fn i186_crash_after_the_deferred_purge_reopens_without_a_redo() {
+    check_deferred_purge_crash(Boundary::AfterPurge).await;
+}
+
+async fn check_deferred_purge_crash(boundary: Boundary) {
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     {
@@ -758,12 +767,12 @@ async fn i186_crash_before_the_deferred_purge_reopens_without_a_redo() {
         seed(&src, 6).await;
         let meta = build(&src).await.expect("build succeeds");
 
-        // Crossing 1 of `BeforePurge` is the purge call itself, which defers; crossing 2 is the
+        // Crossing 1 of this boundary is the purge call itself, which defers; crossing 2 is the
         // install executing it. The crash lands on the second, after the final batch.
         let dst = open_as(
             dst_dir.path(),
             identity_for(7, 2),
-            FailAt::nth(Boundary::BeforePurge, 2, FaultAction::Crash),
+            FailAt::nth(boundary, 2, FaultAction::Crash),
         );
         seed(&dst, 3).await;
         let bytes = std::fs::read(snap_path(&src, &meta)).unwrap();
@@ -808,6 +817,20 @@ async fn i186_crash_before_the_deferred_purge_reopens_without_a_redo() {
             })
             .collect()
     };
+    assert_eq!(dst.reader().last_applied(), Some(log_id(1, 6)));
+    assert_eq!(dst.snapshot_meta().unwrap().last_log_id, Some(log_id(1, 6)));
+    if boundary == Boundary::AfterPurge {
+        assert!(keys.is_empty());
+        assert_eq!(
+            dst.log_store()
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id,
+            Some(log_id(1, 6))
+        );
+        return;
+    }
     assert_eq!(
         keys,
         vec![1, 2, 3],

@@ -1396,7 +1396,8 @@ async fn m2_storage_24_corrupt_log_entry_detected_on_open() {
     )
     .expect_err("a garbage log entry must refuse startup, not panic");
     match &err {
-        StorageOpenError::Corrupt { what, detail, .. } => {
+        StorageOpenError::Corrupt { what, detail, path } => {
+            assert_eq!(path, &config_storage::log_dir(tmp.path()));
             assert!(
                 what.contains('2'),
                 "the error should name the corrupted index (2): {what}"
@@ -1434,7 +1435,8 @@ async fn m2_storage_25_corrupt_state_meta_last_applied_detected_on_open() {
     )
     .expect_err("a garbage state_meta/last_applied must refuse startup, not panic");
     match &err {
-        StorageOpenError::Corrupt { what, detail, .. } => {
+        StorageOpenError::Corrupt { what, detail, path } => {
+            assert_eq!(path, tmp.path());
             assert_eq!(what, "state_meta/last_applied");
             assert!(!detail.is_empty(), "the decoder's own complaint is kept");
         }
@@ -1645,34 +1647,44 @@ fn open_result(dir: &Path, id: ClusterIdentity) -> Result<RocksStore, StorageOpe
 /// afterwards and no `raft-log/` is created beside it.
 #[retcd_test]
 async fn i186_pre_split_v3_directory_is_refused_and_left_as_found() {
-    let tmp = tempfile::tempdir().unwrap();
-    {
-        let s = open_plain(tmp.path());
-        s.log_store().save_vote(&Vote::new(1, 1)).await.unwrap();
-        append_apply(&s, vec![put(1, 1, "/a", "1"), put(1, 2, "/b", "2")])
-            .await
-            .expect("append, then apply");
-    }
-    pre_split::fold_to_pre_split(tmp.path(), 3);
-    let before = pre_split::snapshot_files(tmp.path());
-
-    match open_result(tmp.path(), identity()) {
-        Err(StorageOpenError::PreSplitLayout { found, path }) => {
-            assert_eq!(found, 3, "the refusal names the marker it found");
-            assert_eq!(path.as_path(), tmp.path());
+    for found in [3, 0] {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let s = open_plain(tmp.path());
+            s.log_store().save_vote(&Vote::new(1, 1)).await.unwrap();
+            append_apply(&s, vec![put(1, 1, "/a", "1"), put(1, 2, "/b", "2")])
+                .await
+                .expect("append, then apply");
         }
-        Err(other) => panic!("expected PreSplitLayout, got {other:?}"),
-        Ok(_) => panic!("a pre-split directory must not open"),
+        pre_split::fold_with(tmp.path(), 3, |db| {
+            if found == 0 {
+                db.delete_cf(db.cf_handle(CF_STATE_META).unwrap(), b"format_version")
+                    .unwrap();
+            }
+        });
+        let before = pre_split::snapshot_files(tmp.path());
+
+        match open_result(tmp.path(), identity()) {
+            Err(StorageOpenError::PreSplitLayout {
+                found: actual,
+                path,
+            }) => {
+                assert_eq!(actual, found, "the refusal names the marker it found");
+                assert_eq!(path.as_path(), tmp.path());
+            }
+            Err(other) => panic!("expected PreSplitLayout, got {other:?}"),
+            Ok(_) => panic!("a pre-split directory must not open"),
+        }
+        assert_eq!(
+            pre_split::snapshot_files(tmp.path()),
+            before,
+            "the refusal is read-only"
+        );
+        assert!(
+            !config_storage::log_dir(tmp.path()).exists(),
+            "and creates no log database beside the old one"
+        );
     }
-    assert_eq!(
-        pre_split::snapshot_files(tmp.path()),
-        before,
-        "the refusal is read-only"
-    );
-    assert!(
-        !config_storage::log_dir(tmp.path()).exists(),
-        "and creates no log database beside the old one"
-    );
 }
 
 /// I6: a state machine holding state with no log database beside it, or an empty one, is
@@ -1750,6 +1762,81 @@ async fn i186_log_without_its_state_machine_is_refused() {
     );
 }
 
+fn create_empty_root(path: &Path) {
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+    drop(rocksdb::DB::open_cf(&opts, path, config_storage::COLUMN_FAMILIES).unwrap());
+    assert!(path.join("CURRENT").is_file());
+}
+
+#[retcd_test]
+async fn i186_empty_root_beside_purged_log_is_refused_without_binding() {
+    use openraft::RaftSnapshotBuilder;
+    let original = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    {
+        let s = open_plain(original.path());
+        append_apply(&s, vec![put(1, 1, "/a", "1")]).await.unwrap();
+        s.state_machine()
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        s.log_store().purge(log_id(1, 1)).await.unwrap();
+        assert_eq!(s.raft_log_len(), 0);
+        assert_eq!(
+            s.log_store()
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id,
+            Some(log_id(1, 1))
+        );
+    }
+    create_empty_root(root.path());
+    let log = config_storage::log_dir(root.path());
+    std::fs::rename(config_storage::log_dir(original.path()), &log).unwrap();
+    for _ in 0..2 {
+        match open_result(root.path(), identity()) {
+            Err(StorageOpenError::MissingLogStore { path, missing }) => {
+                assert_eq!(path, root.path());
+                assert_eq!(missing, root.path());
+            }
+            Err(other) => panic!("expected MissingLogStore, got {other:?}"),
+            Ok(_) => panic!("an empty replacement root opened beside the surviving purged log"),
+        }
+        let opts = rocksdb::Options::default();
+        let db = rocksdb::DB::open_cf_for_read_only(
+            &opts,
+            root.path(),
+            config_storage::COLUMN_FAMILIES,
+            false,
+        )
+        .unwrap();
+        let meta = db.cf_handle(CF_STATE_META).unwrap();
+        assert_eq!(db.get_cf(meta, b"identity").unwrap(), None);
+        assert_eq!(db.get_cf(meta, b"format_version").unwrap(), None);
+        let db = rocksdb::DB::open_cf_for_read_only(
+            &opts,
+            &log,
+            config_storage::LOG_COLUMN_FAMILIES,
+            false,
+        )
+        .unwrap();
+        let meta = db.cf_handle("raft_meta").unwrap();
+        assert_eq!(
+            db.get_cf(meta, b"identity").unwrap().unwrap(),
+            postcard::to_stdvec(&identity()).unwrap()
+        );
+        assert_eq!(
+            db.get_cf(meta, b"last_purged").unwrap().unwrap(),
+            postcard::to_stdvec(&log_id(1, 1)).unwrap()
+        );
+    }
+}
+
 /// I6: a log database that belongs to another node (swapped in from a store with another
 /// identity) is refused as `IdentityMismatch` naming the log directory.
 #[retcd_test]
@@ -1794,20 +1881,26 @@ async fn i186_foreign_log_database_is_refused_by_identity() {
 /// a fresh store, not be refused.
 #[retcd_test]
 async fn i186_log_with_only_its_identity_opens_fresh() {
-    let tmp = tempfile::tempdir().unwrap();
-    let moved = tempfile::tempdir().unwrap();
-    drop(open_plain(tmp.path()));
-    let fresh = moved.path().join("node");
-    std::fs::create_dir(&fresh).unwrap();
-    std::fs::rename(
-        config_storage::log_dir(tmp.path()),
-        config_storage::log_dir(&fresh),
-    )
-    .unwrap();
+    for existing in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = tempfile::tempdir().unwrap();
+        drop(open_plain(tmp.path()));
+        let fresh = moved.path().join("node");
+        std::fs::create_dir(&fresh).unwrap();
+        if existing {
+            create_empty_root(&fresh);
+        }
+        std::fs::rename(
+            config_storage::log_dir(tmp.path()),
+            config_storage::log_dir(&fresh),
+        )
+        .unwrap();
 
-    let s = open_result(&fresh, identity()).expect("an identity-only log is a fresh store");
-    assert_eq!(s.identity(), identity());
-    assert_eq!(s.raft_log_len(), 0);
+        let s = open_result(&fresh, identity()).expect("an identity-only log is a fresh store");
+        assert_eq!(s.identity(), identity());
+        assert_eq!(s.raft_log_len(), 0);
+        assert!(s.is_fresh());
+    }
 }
 
 /// I1 across the two WALs: a crash right after an apply's state batch leaves the durable log at

@@ -719,8 +719,8 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
         other => panic!("expected a typed legacy-format refusal, got {other:?}"),
     }
 
-    // The refusal is read-only: the directory an operator has to go back and drain is
-    // byte-for-byte the one they left. Had the open reached `create_missing_column_families`,
+    // The refusal is read-only: the operator can return to the build that wrote this directory,
+    // or start fresh. Had the open reached `create_missing_column_families`,
     // `events` and `dedup` would exist here and that evidence would be gone.
     let families = rocksdb::DB::list_cf(&rocksdb::Options::default(), cluster.data_dir(legacy))
         .expect("the refused directory is still a readable database");
@@ -752,11 +752,8 @@ async fn m5_71_a_v1_dir_with_an_undrained_log_never_joins() {
 
 /// Write the directory an M2/M3-era build would have left behind, still holding one log entry.
 ///
-/// Only the three facts the refusal keys on are reproduced, because only those are load-bearing
-/// and the rest would be a guess at bytes this build cannot write: the v1 column-family set, a
-/// `format_version` marker of `1`, and a non-empty `raft_log`. The entry's *contents* are
-/// deliberately opaque — `count_log_entries` counts without decoding, and "this build cannot
-/// decode them" is the very reason the open is refused.
+/// The root `raft_log` family identifies a pre-split layout. The marker supplies the reported
+/// version. The opaque entry and old family set let the row check what the refusal preserved.
 fn seed_v1_dir_with_one_log_entry(dir: &std::path::Path) {
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
