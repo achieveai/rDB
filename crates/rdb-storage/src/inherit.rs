@@ -32,8 +32,9 @@ use rocksdb::{Direction, IteratorMode, WriteBatch, WriteOptions};
 
 use crate::engine::{InjectedFault, Marks, RocksEngine, LOG_TARGET};
 use crate::keys::{
-    self, encode_copying, encode_key, frame, private_key, Link, APPLIED_KEY, CF_METADATA,
-    COPYING_KEY, PARENT_KEY, SEALED_KEY,
+    self, encode_copying, encode_key, encode_possible_loss, frame, possible_loss_key, private_key,
+    Link, PossibleLossMark, APPLIED_KEY, CF_METADATA, COPYING_KEY, FORMAT_KEY, PARENT_KEY,
+    POSSIBLE_LOSS_FORMAT_VERSION, SEALED_KEY,
 };
 use crate::snapshot::MAX_CHAIN_DEPTH;
 
@@ -182,7 +183,27 @@ impl RocksEngine {
         to: Generation,
         base: Seq,
     ) -> Result<Inherited, InheritError> {
-        let result = self.inherit_inner(partition, from, to, base);
+        self.inherit_marked(partition, from, to, base, None)
+    }
+
+    /// [`Self::inherit`], and when `mark` is given, `partition`'s possible-loss marker (#177)
+    /// is written in the same batch as the switch, so the lineage and its marker land together
+    /// or not at all. A copy below [`POSSIBLE_LOSS_FORMAT_VERSION`] moves to it in that batch.
+    /// An inherit that finds the child already inherited writes nothing, the marker included:
+    /// it landed with the switch then, and an ack since must not be undone.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::inherit`].
+    pub fn inherit_marked(
+        &mut self,
+        partition: PartitionId,
+        from: Generation,
+        to: Generation,
+        base: Seq,
+        mark: Option<PossibleLossMark>,
+    ) -> Result<Inherited, InheritError> {
+        let result = self.inherit_inner(partition, from, to, base, mark);
         let (p, f, t, b) = (partition.0, from.0, to.0, base.0);
         match &result {
             Ok(Inherited::Linked) => tracing::info!(
@@ -226,6 +247,7 @@ impl RocksEngine {
         from: Generation,
         to: Generation,
         base: Seq,
+        mark: Option<PossibleLossMark>,
     ) -> Result<Inherited, InheritError> {
         let conflict = |reason| Err(InheritError::LineageConflict { reason });
         if from >= to {
@@ -302,7 +324,7 @@ impl RocksEngine {
                 base,
                 copied: false,
             };
-            self.switch(partition, from, to, link)?;
+            self.switch(partition, from, to, link, mark)?;
             return Ok(Inherited::Linked);
         };
         let keys = copy.len();
@@ -312,7 +334,7 @@ impl RocksEngine {
             base,
             copied: true,
         };
-        self.switch(partition, from, to, link)?;
+        self.switch(partition, from, to, link, mark)?;
         Ok(Inherited::Copied { keys })
     }
 
@@ -532,9 +554,21 @@ impl RocksEngine {
         from: Generation,
         to: Generation,
         link: Link,
+        mark: Option<PossibleLossMark>,
     ) -> Result<(), InheritError> {
         let meta = self.cf(CF_METADATA);
         let mut write = WriteBatch::default();
+        let moves_format = mark.is_some() && self.format < POSSIBLE_LOSS_FORMAT_VERSION;
+        if let Some(mark) = mark {
+            write.put_cf(
+                meta,
+                possible_loss_key(partition),
+                encode_possible_loss(mark),
+            );
+        }
+        if moves_format {
+            write.put_cf(meta, FORMAT_KEY, POSSIBLE_LOSS_FORMAT_VERSION.to_be_bytes());
+        }
         write.put_cf(meta, private_key(partition, to, PARENT_KEY), link.encode());
         write.put_cf(
             meta,
@@ -568,6 +602,20 @@ impl RocksEngine {
             .entry((partition, from))
             .or_default()
             .sealed_by = Some(to);
+        if let Some(mark) = mark {
+            tracing::info!(
+                target: LOG_TARGET,
+                partition = partition.0,
+                generation = mark.generation.0,
+                applied = mark.applied,
+                cause = ?mark.cause,
+                from_format = self.format,
+                "possible_loss_marked"
+            );
+            if moves_format {
+                self.format = POSSIBLE_LOSS_FORMAT_VERSION;
+            }
+        }
         Ok(())
     }
 

@@ -59,7 +59,7 @@ pub use db::{
     MAX_PAGE, MAX_SCOPED_ID, MAX_TXN_DEADLINE, MAX_VALUE, MAX_WRITE, TENANT,
 };
 pub use feed::{FeedCursor, FeedPage, FeedRecord, FeedWrite};
-pub use host::{Change, ListEdit, Look, Seen};
+pub use host::{Change, ListEdit, Look, PossibleLoss, PossibleLossReason, Seen};
 pub use ownership::{
     OwnerToken, Ownership, OwnershipEvent, OwnershipEvents, RouteInfo, DEACTIVATING_LEAD_MILLIS,
 };

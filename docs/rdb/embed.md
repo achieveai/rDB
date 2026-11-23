@@ -492,6 +492,42 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   grant has run out it moves every partition of that owner, logging `planner_node_silent` with
   reason `owner_faulted`, and raises no `planner_owner_alive_not_serving` (#122 half B; the
   owner's answer to Q13 on #81). A slow owner that answers without a fault is still only alerted.
+- **A failover past a rebooted host may have lost writes** (#177). After a failover onto a
+  copy whose host may have rebooted, rDB logs WARN `failover_possible_loss` (logger
+  `rdb_api::failover`) and sets `NodeStatus::possible_loss`. Alert and re-check the group, then
+  clear it with `Db::ack_possible_loss(generation)` (`admin ack-possible-loss`). Writes are not
+  blocked by it.
+  - When: the planner promoted while some member reported a copy restored after its owner
+    died, and that copy's host had a different OS boot from the one its folder recorded
+    (`os_boot_changed`), or one rDB could not compare (`os_boot_unknown`). A rebooted host may
+    have lost writes its store had not yet flushed, so a write acknowledged before the
+    failover may be on no copy.
+  - The fields, on the WARN line and on `PossibleLoss`: `partition`; `copy`, the node promoted,
+    whose store holds the record; `generation`, the generation the promote made, which the
+    ack names; `applied`, the last seq that copy held when it took over (writes above it,
+    acknowledged before the failover, are the ones to re-check); `reason`, `os_boot_changed`
+    or `os_boot_unknown` (`PossibleLossReason`).
+  - The record is kept on the promoted copy's store and survives restarts and later
+    failovers. The WARN is logged once when the promote is chosen and again at each open
+    while the record stands. `admin promote` by hand stores none.
+  - The ack clears it only for its own generation: another number is `INVALID_ARGUMENT` and
+    clears nothing, so a stale ack cannot clear a newer record. Before reporting that no record
+    stands, the ack checks the formation nodes and the durable `nodes/` registry, including
+    removal tombstones. Any registered node whose marker cannot be read leaves absence
+    unknown (`UNAVAILABLE`). A malformed `nodes/` key yields `INCOMPATIBLE_VERSION`. Both
+    errors leave the ack unsent. A retired holder that remains unreachable has no supported
+    operation to certify its marker absent. The empty scan must finish before its deadline. If all checked nodes report no record, success reflects the registry snapshot and
+    each node’s marker when read. A concurrent promotion can create a newer marker.
+    A missing reply after dispatch leaves the clear outcome unknown. Read node status
+    or retry the same generation. Discovery assumes the registry has been maintained by rDB;
+    manual deletion of historical node records is unsupported.
+    Only an admin app may ack, as for `forget_tail`. It logs INFO
+    `failover_possible_loss_acked`. One partition only in this release: the ack is refused
+    above one partition.
+  - A rebuild keeps or moves the record with the copy's folder. `admin rebuild N` without
+    `--wipe` restarts node N on its own folder, so the record stands. With `--wipe` the folder
+    is moved aside (never deleted), so the record goes with it and the node comes back with
+    none. A rebuild of a quarantined owner's copy always wipes.
 - **Run them at once.** Promotes of different partitions do not wait for each other, and they
   share the one grant wait. Give each its own thread: the call blocks.
 - **The freeze is the whole node's.** The first promote freezes the dead node's grant, so every
@@ -1872,14 +1908,14 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (13 at this commit:
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (14 at this commit:
   10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13
-  #80 S4's `members_revision` and refill call), whether or not this setting is on. A
-  build before these guards speaks 9, even one that has this setting, and a build at 10, 11 or 12
-  lacks the snapshot wire, the delete and list, or S4's fields. A build at another version and this one refuse each other when they
+  #244's membership revision and refill call, and 14 #238's possible-loss ack, status and restored holdings), whether or not this setting is on. A
+  build before these guards speaks 9, even one that has this setting, and builds at 10 through 13
+  lack one or more later changes. Protocol 13 lacks the possible-loss call, answer, and status fields. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
   added back live, and it cannot link at all. The same holds for an app process with no copy
-  (`--nodes`): an app at an older version is refused by nodes at 13. To upgrade: stop every
+  (`--nodes`): an app at an older version is refused by nodes at 14. To upgrade: stop every
   node and every app process that links to them, upgrade them all, start the nodes, then the
   apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
@@ -2203,11 +2239,15 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   full read of the object, and a clear of it are all refused `INCOMPATIBLE_VERSION`, with
   nothing changed. Open the folder with the newer build that wrote it. Repairing one such entry
   (`repair_element`) comes with a later release.
-- **Rolling back to an older build is not always possible.** Once this build has written an
-  ack floor or an epoch revocation into a folder, its copies are format 2. A format-1 build
-  refuses to open them, and its error names the format range it reads. So roll back only onto
-  a folder this build has written neither into. Otherwise, restore a backup taken before the
-  upgrade.
+- **Rolling back to an older build is not always possible.** Each build refuses a folder at a
+  newer format than it reads, and its error names the format range it reads.
+  - A folder this build creates is format 3, so a format-2 build refuses it.
+  - An older folder moves up when this build writes into it something an older build would
+    misread. An ack floor or an epoch revocation moves a format-1 folder to 2. A possible-loss
+    record (#177) moves a format-1 or format-2 folder to 3. Acking that record clears it, but
+    the folder stays at 3.
+  - So roll back only onto a folder at a format the older build reads. Otherwise, restore a
+    backup taken before the upgrade.
 - **An older build cannot open a folder after this build wrote `partitions/1`.** This build
   writes that record with its member list (layout 4). A build without layout 4 reads it as
   undecodable and refuses the open (`Undecodable`), and keeps refusing. Run this build or a
@@ -2215,9 +2255,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (13 at this commit: 10 for
-  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148, 13 for #80 S4's
-  membership and refill), and the handshake refuses any other version, from nodes and app
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (14 at this commit: 10 for
+  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148, 13 for #244's
+  membership and refill, and 14 for #238's possible-loss ack, status and restored holdings), and the handshake refuses any other version, from nodes and app
   processes alike, so nodes on different builds never link.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
   such a tail at upgrade time may need `admin forget-tail` once. The S4 protocol bump, which
@@ -2279,6 +2319,9 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   (`ReadyError::Blocked`) when a copy answers too late. Open the folder again. If that open is
   blocked too, it is not the machine: stop and report it with the message. An automatic retry
   is planned.
+- After a same-process restart, `ReadyError::Blocked` is final except while the owner is
+  re-planning at a restarted copy's new boot (#202). The open then waits up to its `within`
+  for that re-plan, and answers `Blocked` with the same text if it does not land.
 
 ## 6. When an open is refused
 

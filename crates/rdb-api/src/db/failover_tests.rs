@@ -897,6 +897,174 @@ fn own81_v3_a_lone_survivor_is_not_promoted() {
     assert!(logged(METHOD, "planner_promote_decision").is_empty());
 }
 
+/// #177's scenario on this rig's three node processes. Shape: partition 1 has owner node 1 and
+/// copies 2 and 3, as partitions 2, 7 and 12 had owner 2 and copies 3 and 4 in the issue's
+/// five-node run; nodes past a partition's three members take no part in its promote, so three
+/// processes are the issue's case. The control store is the rig's shared in-memory store, not
+/// a quorum the stopped processes hold, so the planner on node 3 keeps running throughout.
+///
+/// 1. Nodes 1 and 2 stop. The planner refuses partition 1 as `lone_survivor`: it ran, and only
+///    node 3 answers (the issue's step 1).
+/// 2. Node 2 restarts on its own folder. Its pinned primary is dead, so nothing rejoins it,
+///    and its status reports the lineage its store restored (`owner_epoch` none). That status
+///    is pinned by `i177_a_restored_copy_reports_its_newest_whole_lineage_never_a_staged_one`;
+///    here the promote replaces it within the restart's own wait for ready.
+/// 3. The planner counts it: partition 1 is promoted off node 1 and a put lands.
+///
+/// Integration (~15 s): a grant lapse, a refusal, a restart and a promote.
+/// Cut: `Host::status` reports `holds: None` for a restored copy (the pre-#177 status); the
+/// partition stays `lone_survivor` and never moves, so the restarted process is never ready
+/// (`TimedOut`, owner node 1 `unreachable`), red.
+#[config_log::retcd_test]
+fn i177_a_copy_restarted_while_its_owner_is_dead_counts_toward_a_promote() {
+    const METHOD: &str = "i177_a_copy_restarted_while_its_owner_is_dead_counts_toward_a_promote";
+    let (rig, _before, _after) = restarted_copy_promoted(METHOD, |_| {});
+    let (app, _net, _links) = rig.app(&[NodeId(2), NodeId(3)]);
+    put_lands(&app, group_of(&app, 1), lifetimes(10));
+}
+
+/// [`i177_a_copy_restarted_while_its_owner_is_dead_counts_toward_a_promote`]'s steps 1 to 3:
+/// nodes 1 and 2 stop, the planner refuses `lone_survivor`, `os_boot` is given node 2's copy
+/// folder, node 2 restarts, and the planner promotes partition 1 off node 1. Returns the rig
+/// and `partitions/1` before and after.
+fn restarted_copy_promoted(
+    method: &str,
+    os_boot: impl FnOnce(&Path),
+) -> (Rig, PartitionRecord, PartitionRecord) {
+    let mut rig = rig(1, Some(failover()));
+    assert_eq!(rig.owner(1), NodeId(1));
+    until("a planner holds its grant", lifetimes(7), || {
+        rig.planner_grant().is_some()
+    });
+    let before = rig.record(1);
+    rig.stop(0);
+    rig.stop(1);
+    let refused = logged_at_least_within(method, "planner_no_eligible_copy", 1, lifetimes(20));
+    assert!(
+        refused
+            .iter()
+            .any(|line| line["partition"] == 1 && line["reason"] == "lone_survivor"),
+        "the planner ran and refused partition 1 before the restart: {refused:?}"
+    );
+    assert_eq!(
+        rig.record(1),
+        before,
+        "nothing moved while only node 3 answers"
+    );
+
+    let decided = logged(method, "planner_promote_decision").len();
+    os_boot(&rig.dir.join("nodes").join("2"));
+    rig.restart(1, Some(failover()));
+
+    until(
+        "partition 1 moves off node 1 and serves",
+        lifetimes(20),
+        || {
+            let record = rig.record(1);
+            record.owner != NodeId(1) && record.lifecycle == PartitionLifecycle::Serving
+        },
+    );
+    let after = rig.record(1);
+    assert!(matches!(after.owner, NodeId(2 | 3)), "{after:?}");
+    assert!(
+        after.generation > before.generation,
+        "{before:?} -> {after:?}"
+    );
+    let decisions = logged(method, "planner_promote_decision");
+    assert!(
+        decisions[decided..].iter().any(|line| line["dead"] == 1),
+        "the promote was decided after the restart: {decisions:?}"
+    );
+    (rig, before, after)
+}
+
+/// The possible-loss record the new owner of partition 1 reports, read from its own process.
+fn owner_possible_loss(rig: &Rig, owner: NodeId) -> Option<crate::host::PossibleLoss> {
+    rig.procs[owner.0 as usize - 1]
+        .db
+        .node_status()
+        .into_iter()
+        .find(|status| status.node == owner)
+        .unwrap_or_else(|| panic!("node {} answers its own status look", owner.0))
+        .possible_loss
+}
+
+/// #177 on the issue's scenario, node 2's host rebooted: its copy restored from a store whose
+/// recorded OS boot (`boot-a`) is not the host's now (`boot-b`). The planner's promote logs
+/// WARN `failover_possible_loss` once, naming the copy it promoted, the generation and
+/// `os_boot_changed`, and the new owner's `NodeStatus::possible_loss` holds the record. Which
+/// copy wins is the planner's: with node 3 promoted this is "B promoted, A restored on a
+/// changed boot"; the planner unit row
+/// `i177_a_restored_member_on_a_changed_boot_marks_the_promote_whichever_copy_wins` holds the
+/// other outcomes. Writes go on.
+/// Cuts: the planner's `possible_loss` answers `None`, no WARN and no record, red;
+/// `Host::restored_holding` reports `restored: None`, the same, red.
+/// Integration (~15 s), as the scenario row.
+#[config_log::retcd_test]
+fn i177_a_promote_past_a_copy_restored_on_a_changed_boot_warns_and_records_a_possible_loss() {
+    const METHOD: &str =
+        "i177_a_promote_past_a_copy_restored_on_a_changed_boot_warns_and_records_a_possible_loss";
+    let (rig, _before, after) = restarted_copy_promoted(METHOD, |copy| {
+        crate::os_boot::record(copy, "boot-a").expect("node 2's recorded boot");
+        crate::os_boot::inject(copy, Ok("boot-b"));
+    });
+    let warned = logged(METHOD, "failover_possible_loss");
+    assert_eq!(
+        warned.len(),
+        1,
+        "once, when the promote is chosen: {warned:?}"
+    );
+    assert_eq!(warned[0]["@l"], "Warning", "{warned:?}");
+    assert_eq!(
+        (
+            &warned[0]["partition"],
+            &warned[0]["copy"],
+            &warned[0]["generation"],
+            &warned[0]["reason"]
+        ),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(after.owner.0),
+            &serde_json::json!(after.generation.0),
+            &serde_json::json!("os_boot_changed")
+        ),
+        "{warned:?}"
+    );
+    let loss = owner_possible_loss(&rig, after.owner).expect("the new owner holds the record");
+    assert_eq!(
+        (loss.copy, loss.generation, loss.reason),
+        (
+            after.owner,
+            after.generation,
+            crate::host::PossibleLossReason::OsBootChanged
+        ),
+        "{loss:?}"
+    );
+    let (app, _net, _links) = rig.app(&[NodeId(2), NodeId(3)]);
+    put_lands(&app, group_of(&app, 1), lifetimes(10));
+}
+
+/// #177, the control: the same scenario with node 2's host on the boot its copy recorded
+/// (`boot-a` both times). The promote is the same; no WARN `failover_possible_loss` and no
+/// record. Cut: `PossibleLossReason::from_os_boot` maps `Same` to `OsBootUnknown`, a WARN and a
+/// record, red.
+/// Integration (~15 s), as the scenario row.
+#[config_log::retcd_test]
+fn i177_a_promote_past_a_copy_restored_on_the_same_boot_records_no_possible_loss() {
+    const METHOD: &str =
+        "i177_a_promote_past_a_copy_restored_on_the_same_boot_records_no_possible_loss";
+    let (rig, _before, after) = restarted_copy_promoted(METHOD, |copy| {
+        crate::os_boot::record(copy, "boot-a").expect("node 2's recorded boot");
+        crate::os_boot::inject(copy, Ok("boot-a"));
+    });
+    assert!(
+        logged(METHOD, "failover_possible_loss").is_empty(),
+        "{:?}",
+        logged(METHOD, "failover_possible_loss")
+    );
+    assert_eq!(owner_possible_loss(&rig, after.owner), None);
+}
+
 /// V4 and V6 share one shape: node 1's process still answers on its links, so it is never
 /// failed over (customer answers 2 and 3). With `alert`, its grant runs out and the planner
 /// raises `planner_owner_alive_not_serving` naming node 1 (`heard_on_link`). Either way, two

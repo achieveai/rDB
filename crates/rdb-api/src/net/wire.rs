@@ -456,6 +456,8 @@ pub fn outbound(to: NodeId, msg: Msg) -> Result<Outbound, Box<(WireError, Msg)>>
         | Msg::Inject { .. }
         | Msg::HealLeftOut { .. }
         | Msg::PeerBooted { .. }
+        | Msg::BootReplan { .. }
+        | Msg::PossibleLossOf { .. }
         | Msg::Rebuild { .. }
         | Msg::Synced(_)
         | Msg::Subscribe(_)
@@ -492,6 +494,8 @@ const fn local_name(msg: &Msg) -> &'static str {
         Msg::Inject { .. } => "Inject",
         Msg::HealLeftOut { .. } => "HealLeftOut",
         Msg::PeerBooted { .. } => "PeerBooted",
+        Msg::BootReplan { .. } => "BootReplan",
+        Msg::PossibleLossOf { .. } => "PossibleLossOf",
         Msg::Rebuild { .. } => "Rebuild",
         #[cfg(test)]
         Msg::Stall(_) => "Stall",
@@ -949,6 +953,11 @@ pub enum WireCall {
         identity: RequestIdentity,
         to: NodeId,
     },
+    // #177: added last, with #177's protocol version, so the variants above keep their index.
+    AckPossibleLoss {
+        identity: RequestIdentity,
+        generation: Generation,
+    },
 }
 
 impl WireCall {
@@ -966,7 +975,8 @@ impl WireCall {
             | Self::Rebuild { identity, .. }
             | Self::ForgetTail { identity, .. }
             | Self::Changes { identity, .. }
-            | Self::Refill { identity, .. } => Some(*identity),
+            | Self::Refill { identity, .. }
+            | Self::AckPossibleLoss { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
         }
@@ -988,6 +998,7 @@ impl WireCall {
             Self::ForgetTail { .. } => "forget_tail",
             Self::Changes { .. } => "changes",
             Self::Refill { .. } => "refill",
+            Self::AckPossibleLoss { .. } => "ack_possible_loss",
         }
     }
 }
@@ -1088,6 +1099,13 @@ impl TryFrom<&ClientCall> for WireCall {
                 from: WireFeedCursor::from(*from),
                 max: *max,
             },
+            ClientCall::AckPossibleLoss {
+                identity,
+                generation,
+            } => Self::AckPossibleLoss {
+                identity: *identity,
+                generation: *generation,
+            },
         })
     }
 }
@@ -1175,6 +1193,13 @@ impl TryFrom<WireCall> for ClientCall {
                 identity,
                 from: from.into(),
                 max,
+            },
+            WireCall::AckPossibleLoss {
+                identity,
+                generation,
+            } => Self::AckPossibleLoss {
+                identity,
+                generation,
             },
         })
     }
@@ -2104,6 +2129,10 @@ pub enum WireAnswer {
     },
     // Issue #87 (protocol 10): added last, so the variants above keep their encoded index.
     Changes(WireFeedPage),
+    // #177: added last, with #177's protocol version, so the variants above keep their index.
+    PossibleLossAcked {
+        line: String,
+    },
 }
 
 impl WireAnswer {
@@ -2144,6 +2173,7 @@ impl WireAnswer {
             },
             Answer::Rebuilt(line) => Self::Rebuilt { line: line.clone() },
             Answer::TailForgotten(line) => Self::TailForgotten { line: line.clone() },
+            Answer::PossibleLossAcked(line) => Self::PossibleLossAcked { line: line.clone() },
             Answer::Durable => Self::Durable,
             Answer::Changes(page) => Self::Changes(WireFeedPage::from(page)),
             Answer::Error { error, request } => Self::Error {
@@ -2184,6 +2214,7 @@ impl WireAnswer {
             Self::Moved { done, line } => Answer::Moved(MoveAnswer { done, line }),
             Self::Rebuilt { line } => Answer::Rebuilt(line),
             Self::TailForgotten { line } => Answer::TailForgotten(line),
+            Self::PossibleLossAcked { line } => Answer::PossibleLossAcked(line),
             Self::Durable => Answer::Durable,
             Self::Changes(page) => match FeedPage::try_from(page) {
                 Ok(page) => Answer::Changes(page),
@@ -2205,9 +2236,25 @@ impl WireAnswer {
 #[allow(missing_docs)]
 pub struct WireHolding {
     pub generation: Generation,
-    pub owner_epoch: OwnerEpoch,
+    /// `None` for a holding reported from a restored store (#177). Changed from a bare
+    /// `OwnerEpoch` with #177's protocol version; postcard is positional, so the handshake's
+    /// version check is what keeps an older peer from reading it.
+    pub owner_epoch: Option<OwnerEpoch>,
     pub applied: u64,
     pub durable: u64,
+    /// Added with #177's protocol version: why a restored holding's host may have lost
+    /// acknowledged writes.
+    pub restored: Option<crate::host::PossibleLossReason>,
+}
+
+/// [`crate::host::PossibleLoss`] on the wire. Added with #177's protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WirePossibleLoss {
+    pub copy: NodeId,
+    pub generation: Generation,
+    pub applied: u64,
+    pub reason: crate::host::PossibleLossReason,
 }
 
 /// [`NodeStatus`] on the wire.
@@ -2248,6 +2295,10 @@ pub struct WireNodeStatus {
     pub needs_operator: Option<String>,
     /// Added under protocol 13 (#80 S4): [`NodeStatus::members_revision`].
     pub members_revision: Option<u64>,
+    /// Added with #177's protocol version: the partition's possible-loss record on this node.
+    pub possible_loss: Option<WirePossibleLoss>,
+    /// Protocol 14: why the node could not read its possible-loss record.
+    pub possible_loss_error: Option<String>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2332,6 +2383,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                 owner_epoch: held.owner_epoch,
                 applied: held.applied,
                 durable: held.durable,
+                restored: held.restored,
             }),
             authority: status.authority.clone(),
             fence: status.fence,
@@ -2363,6 +2415,13 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            possible_loss_error: status.possible_loss_error.clone(),
+            possible_loss: status.possible_loss.map(|loss| WirePossibleLoss {
+                copy: loss.copy,
+                generation: loss.generation,
+                applied: loss.applied,
+                reason: loss.reason,
+            }),
             needs_operator: status.needs_operator.clone(),
             members_revision: status.members_revision,
         }
@@ -2386,6 +2445,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 owner_epoch: held.owner_epoch,
                 applied: held.applied,
                 durable: held.durable,
+                restored: held.restored,
             }),
             authority: status.authority,
             fence: status.fence,
@@ -2430,6 +2490,13 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             needs_operator: status.needs_operator,
             lengths: None,
             members_revision: status.members_revision,
+            possible_loss_error: status.possible_loss_error,
+            possible_loss: status.possible_loss.map(|loss| crate::host::PossibleLoss {
+                copy: loss.copy,
+                generation: loss.generation,
+                applied: loss.applied,
+                reason: loss.reason,
+            }),
         })
     }
 }

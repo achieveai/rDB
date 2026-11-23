@@ -48,7 +48,7 @@ use rdb_core::contracts::time::Tick;
 
 use crate::admin::{self, PromoteCtx, PromoteError, Promoted};
 use crate::clock::HostClock;
-use crate::host::{Msg, NodeStatus, NodeStopped};
+use crate::host::{Msg, NodeStatus, NodeStopped, PossibleLossReason, FAILOVER_TARGET};
 use crate::transport::Links;
 
 /// How the planner runs (#81 C1). Set [`crate::DbConfig::failover`] to turn it on; `None`, the
@@ -201,6 +201,22 @@ fn cause(error: &ConfigError) -> &'static str {
 /// One `partitions/` record and the members it pins, if it pins them (layout 4).
 type Entry = (PartitionRecord, Option<Vec<RecordMember>>);
 
+/// #177: why a failover chosen over `looks` may lose acknowledged writes: some member that
+/// answered reports a holding restored from a store whose host may have rebooted. Every member
+/// that answered counts, whether or not the choice counted it, a faulted or frozen one too:
+/// its store may have held the only copy of a write. Of mixed reasons, unknown wins
+/// ([`PossibleLossReason::worst`]); otherwise changed. `None` when no member reports one.
+///
+/// A faulted member still reports: its host answers a look with its status, holds included
+/// (`Host::answer_faulted`). A member whose look does not answer reports nothing, so its
+/// store's state is not counted here; that is out of scope for #177.
+fn possible_loss(looks: &[(NodeId, Option<NodeStatus>)]) -> Option<PossibleLossReason> {
+    looks
+        .iter()
+        .filter_map(|(_, status)| status.as_ref()?.holds?.restored)
+        .reduce(PossibleLossReason::worst)
+}
+
 /// The copy to promote for `partition`, whose owner `dead` is dead. Pure.
 ///
 /// Candidates are the regular (non-shadow) members other than `dead` whose look answered with
@@ -210,6 +226,11 @@ type Entry = (PartitionRecord, Option<Vec<RecordMember>>);
 /// The highest `(generation, applied)` wins. Ties are spread by partition: index
 /// `partition mod count` of the tied nodes in node order (ruling C-6).
 ///
+/// #177 (t4's point 1): a copy restarted while its owner is dead reports the lineage its store
+/// restored, with no owner epoch ([`crate::host::Holding`]). It counts only at `current`, the
+/// generation `partitions/` names: a copy restored at an older generation missed a promote, so
+/// it may lack writes that promote's members acknowledged, and is no candidate.
+///
 /// # Errors
 ///
 /// [`NoEligible`].
@@ -217,6 +238,7 @@ pub(crate) fn choose_target(
     partition: PartitionId,
     members: &[RecordMember],
     dead: NodeId,
+    current: Generation,
     looks: &[(NodeId, Option<NodeStatus>)],
     frozen: &BTreeSet<NodeId>,
 ) -> Result<NodeId, NoEligible> {
@@ -233,6 +255,9 @@ pub(crate) fn choose_target(
                 return None;
             }
             let holds = status.holds?;
+            if holds.is_restored() && holds.generation != current {
+                return None;
+            }
             Some((holds.generation, holds.applied, member.node))
         })
         .collect();
@@ -935,13 +960,22 @@ impl Planner {
                 let planner = self.clone();
                 let frozen = frozen.clone();
                 let partition = record.partition;
+                let current = record.generation;
                 let quiet = memory
                     .promote_failed
                     .get(&partition)
                     .is_some_and(|repeats| repeats.quiet(now));
                 async move {
                     let answer = planner
-                        .fail_over(partition, dead, members.as_deref(), &frozen, quiet, held)
+                        .fail_over(
+                            partition,
+                            dead,
+                            current,
+                            members.as_deref(),
+                            &frozen,
+                            quiet,
+                            held,
+                        )
                         .await;
                     (partition, answer)
                 }
@@ -1084,10 +1118,12 @@ impl Planner {
     /// answers `Ok`: a grant that ran out in between is logged `planner_promote_observed`, not
     /// `planner_promoted`, and the answer is kept. The checks narrow the window and cannot close
     /// it; the store's fence and the `Fencing` CAS keep a late promote safe (#81).
+    #[allow(clippy::too_many_arguments)]
     async fn fail_over(
         &self,
         partition: PartitionId,
         dead: NodeId,
+        current: Generation,
         members: Option<&[RecordMember]>,
         frozen: &BTreeSet<NodeId>,
         quiet: bool,
@@ -1106,12 +1142,39 @@ impl Planner {
                 .map(|node| async move { (*node, self.look(partition, *node).await) }),
         )
         .await;
-        let to = choose_target(partition, members, dead, &looks, frozen)?;
+        let to = choose_target(partition, members, dead, current, &looks, frozen)?;
         let looked = looks
             .iter()
             .find(|(node, _)| *node == to)
             .and_then(|(_, status)| status.clone());
         let holds = looked.as_ref().and_then(|status| status.holds);
+        let possible_loss = possible_loss(&looks);
+        if let Some(reason) = possible_loss {
+            // Once per choice; a partition whose promote keeps failing repeats it at debug.
+            let generation = current.next().0;
+            let applied = holds.map(|h| h.applied);
+            if quiet {
+                tracing::debug!(
+                    target: FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = to.0,
+                    generation,
+                    applied,
+                    reason = reason.as_str(),
+                    "failover_possible_loss"
+                );
+            } else {
+                tracing::warn!(
+                    target: FAILOVER_TARGET,
+                    partition = partition.0,
+                    copy = to.0,
+                    generation,
+                    applied,
+                    reason = reason.as_str(),
+                    "failover_possible_loss"
+                );
+            }
+        }
         let answering: Vec<u32> = looks
             .iter()
             .filter(|(_, status)| status.is_some())
@@ -1163,6 +1226,7 @@ impl Planner {
             members_version: version,
             member_boot: Arc::new(member_boot),
             send: Arc::new(send),
+            possible_loss,
         };
         if self.still_held(held).is_none() {
             tracing::info!(

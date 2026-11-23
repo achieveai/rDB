@@ -108,6 +108,7 @@ pub(super) fn spawn_promote_dropping(
     let links = Arc::clone(&trio.links);
     let posted = Arc::clone(&trio.links);
     let ctx = crate::admin::PromoteCtx {
+        possible_loss: None,
         store: Arc::clone(&trio.store),
         budgets: trio.nodes[0].0.budgets,
         clock: trio.clock,

@@ -2824,6 +2824,7 @@ fn promote_in(
     )?;
     let links = Arc::clone(&trio.links);
     let ctx = crate::admin::PromoteCtx {
+        possible_loss: None,
         partition: crate::admin::PARTITION,
         owner_must_be_dead: false,
         look_within: Duration::from_secs(1),
@@ -3394,6 +3395,8 @@ fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
             member: NodeId(node),
         },
     );
+    // #202: a mark for another plan is no boot re-plan, so a ready wait does not wait on it.
+    assert!(!trio.nodes[0].0.boot_replan_pending(PartitionId(1)));
     until_through_blocks(&mut trio, "node 1 sends the plan again", |trio| {
         let same = matches!(
             trio.nodes[0].0.rejoins.get(&PartitionId(1)),
@@ -3401,10 +3404,108 @@ fn m10_bb_67_a_boot_mark_from_another_plan_does_not_replan() {
         );
         (!same).then_some(())
     });
+    // #202: nor is `retry_blocked_rejoin`'s re-plan.
+    assert!(!trio.nodes[0].0.boot_replan_pending(PartitionId(1)));
     assert_eq!(logged!(METHOD, "rejoin_retry").len(), 1);
     let dropped = logged!(METHOD, "rejoin_boot_mark_dropped");
     assert_eq!(dropped.len(), 1, "{dropped:?}");
     assert!(logged!(METHOD, "rejoin_replan_on_boot").is_empty());
+}
+
+/// #202 (A-R196 narrowed, 2026-11-21), the host half of `Db::wait_ready`'s wait on a local
+/// owner: [`Host::boot_replan_pending`] through the whole #67 Wait 2 re-plan, and not after.
+/// As `m10_bb_67_a_restart_heard_before_its_plan_blocks_replans_at_once`, with node 1's next
+/// two `DrainProof`s lost (the seam [`Host::drain_proofs_to_lose`]), so the re-plan's revoke
+/// stays in flight while F1 is still `Blocked` on the old plan, with no mark: the window #202's
+/// trace fell into. Then `retry_blocked_rejoin` asks the revocation again under a new `since`
+/// (`rejoin_revoke_retry`), which is no boot re-plan; its proof is lost too, so the row sees
+/// that state between steps (with one lost, the retry's proof lands and the rejoin commits
+/// in the same round). The next retry's proof lands and the rejoin commits.
+/// - mark held, F1 blocked on the planned plan: pending;
+/// - re-plan revoking, F1 still blocked, no mark: pending.
+///   Cut: `boot_replan_pending` answers `false` for `Rejoin::Revoking`, red here;
+/// - replaced by the revoke retry, F1 still blocked: not pending.
+///   Cut: `start_revoke` keeps `boot_replans` when the `since` changes, red here;
+/// - committed: not pending, nothing remembered.
+///
+/// Integration (~5 s): bootstrap, the drop clock, the re-plan, one revoke retry.
+#[config_log::retcd_test]
+fn m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced() {
+    const METHOD: &str = "m10_bb_202_a_boot_replan_is_pending_through_its_revoke_until_replaced";
+    let p = PartitionId(1);
+    let dir = config_testkit::fs::temp_dir();
+    let DropPlanned {
+        mut trio,
+        kept,
+        since,
+        request,
+        ..
+    } = drop_planned(dir.path());
+    assert!(
+        !trio.nodes[0].0.boot_replan_pending(p),
+        "a drop plan is no boot re-plan"
+    );
+    trio.nodes[0].0.drain_proofs_to_lose = 2;
+    let node = kept.1;
+    restart_dead(&mut trio, kept);
+    let reboot = trio.links.boot_of(NodeId(node)).expect("registered");
+
+    let (marked, pending) = until_through_blocks(&mut trio, "F1 blocked on node 1", |trio| {
+        let host = &trio.nodes[0].0;
+        host.f1_blocked(p).then(|| {
+            (
+                host.boot_seen_while_planned.contains_key(&p),
+                host.boot_replan_pending(p),
+            )
+        })
+    });
+    assert!(marked, "the boot was heard before the block");
+    assert!(pending, "mark held for the planned plan");
+
+    let boot_since = until_through_blocks(&mut trio, "the boot re-plan revokes", |trio| match trio
+        .nodes[0]
+        .0
+        .rejoins
+        .get(&p)
+    {
+        Some(Rejoin::Revoking { replan, .. }) if replan.since != since => Some(replan.since),
+        _ => None,
+    });
+    {
+        let host = &trio.nodes[0].0;
+        assert!(host.f1_blocked(p), "F1 is still blocked on the old plan");
+        assert!(
+            !host.boot_seen_while_planned.contains_key(&p),
+            "the mark is spent"
+        );
+        assert!(
+            host.boot_replan_pending(p),
+            "the re-plan's revoke is in flight"
+        );
+    }
+    assert_eq!(logged!(METHOD, "rejoin_replan_on_boot").len(), 1);
+
+    until_through_blocks(
+        &mut trio,
+        "the revocation is asked again",
+        |trio| match trio.nodes[0].0.rejoins.get(&p) {
+            Some(Rejoin::Revoking { replan, .. }) if replan.since != boot_since => Some(()),
+            _ => None,
+        },
+    );
+    {
+        let host = &trio.nodes[0].0;
+        assert!(host.f1_blocked(p), "F1 is still blocked on the old plan");
+        assert!(
+            !host.boot_replan_pending(p),
+            "a revoke retry is no boot re-plan"
+        );
+    }
+    assert_eq!(logged!(METHOD, "rejoin_revoke_retry").len(), 1);
+
+    kept_rejoined(&mut trio, node, reboot, request);
+    assert!(!trio.nodes[0].0.boot_replan_pending(p));
+    assert!(trio.nodes[0].0.boot_replans.is_empty());
 }
 
 /// d8's drop (#67 G5): exactly one `membership_drop_planned`, on the paused clock.
@@ -7013,6 +7114,54 @@ fn s4d_a_staged_copy_on_the_newest_lineage_is_reported_and_a_remnant_is_not() {
         host.tail_refused_of(PartitionId(1)),
         None,
         "a remnant below"
+    );
+}
+
+/// #177 (option B): a copy with no receiver and no adoption, as a restarted copy is until it
+/// rejoins, reports the lineage its store restored, with no owner epoch and the store's own
+/// marks, so a planner can count it. A staged child (a copy stopped part way, whose keys are
+/// partial) is never reported: the status names its parent. Once the child is switched in,
+/// the parent is sealed and the child is reported.
+/// Cut: `Host::restored_holding` stops checking `staging`, red (g2 reported while staged).
+#[cfg(debug_assertions)]
+#[config_log::retcd_test]
+fn i177_a_restored_copy_reports_its_newest_whole_lineage_never_a_staged_one() {
+    use rdb_storage::InjectedFault;
+    let dir = config_testkit::fs::temp_dir();
+    let rt = current_thread();
+    let mut host = host_over(dir.path(), &rt);
+    let (p, g1, g2) = (PartitionId(1), Generation(1), Generation(2));
+    assert_eq!(host.status(p).holds, None, "an empty store holds nothing");
+    super::trio::write_chain(&mut host.engine, g1, 3);
+    let restored = |host: &Host, generation| Holding {
+        generation,
+        owner_epoch: None,
+        applied: host.engine.buffered_applied(p, generation).0,
+        durable: host.engine.durable(p, generation).0,
+        restored: None,
+    };
+    let status = host.status(p);
+    assert_eq!(status.role, "none");
+    assert_eq!(status.holds, Some(restored(&host, g1)));
+    assert_eq!(status.holds.map(|held| held.applied), Some(3));
+
+    host.engine.inject_fault(InjectedFault::Switch);
+    assert!(host.engine.inherit(p, g1, g2, Seq(2)).is_err());
+    assert_eq!(host.engine.staging(p, g2), Some((g1, Seq(2))));
+    assert_eq!(
+        host.status(p).holds,
+        Some(restored(&host, g1)),
+        "the staged g2 is never reported"
+    );
+
+    host.engine
+        .inherit(p, g1, g2, Seq(2))
+        .expect("the copy finishes");
+    assert_eq!(host.engine.sealed_by(p, g1), Some(g2));
+    assert_eq!(
+        host.status(p).holds,
+        Some(restored(&host, g2)),
+        "g1 is sealed by g2"
     );
 }
 

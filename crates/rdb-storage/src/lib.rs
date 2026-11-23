@@ -9,7 +9,7 @@
 //! - [`dump`] lists every stored record read-only, for debugging.
 //! - [`RocksEngine::inherit`] links a new generation to its parent at a cutoff; [`RocksEngine::get`]
 //!   reads through the chain.
-//! - [`keys`] is the physical layout, [`keys::FORMAT_VERSION`] `2` (ADR-rdb-0010; M10 S2).
+//! - [`keys`] is the physical layout, [`keys::FORMAT_VERSION`] `3` (ADR-rdb-0010; M10 S2; #177).
 //!
 //! Manual entry point: `cargo run -p rdb-storage --example rocks_scenario -- --help`. The
 //! scenario walk-through is `crates/rdb-storage/README.md`.
@@ -35,6 +35,6 @@ pub use engine::{
 pub use inherit::flatten_at_depth;
 pub use inherit::{ConflictReason, InheritError, Inherited, COPY_BATCH_KEYS};
 pub use install::InstallError;
-pub use keys::{Link, PublishMark, TrimFloor, INSTANCE_LEN};
+pub use keys::{Link, PossibleLossCause, PossibleLossMark, PublishMark, TrimFloor, INSTANCE_LEN};
 pub use lineage::{verify_lineage, LineageFault, VerifiedLineage};
 pub use snapshot::{snapshot_entry_bytes, RocksSnapshot, SnapshotEntry, MAX_CHAIN_DEPTH};

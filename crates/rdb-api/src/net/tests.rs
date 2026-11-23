@@ -441,6 +441,11 @@ fn calls() -> Vec<ClientCall> {
         },
         give_up_live_copy: true,
     });
+    // #177: `admin ack-possible-loss`, its generation carried.
+    calls.push(ClientCall::AckPossibleLoss {
+        identity: identity(4, 37),
+        generation: Generation(6),
+    });
     // Issue #87: a feed call, its cursor's three parts and its cap carried.
     calls.push(ClientCall::Changes {
         identity: identity(4, 36),
@@ -664,6 +669,9 @@ fn answers() -> Vec<Answer> {
         Answer::Status(zero()),
         Answer::Rebuilt("rebuild: node 4 is not pinned".to_owned()),
         Answer::TailForgotten("forget-tail: partition 1 re-plans from generation 4".to_owned()),
+        Answer::PossibleLossAcked(
+            "ack-possible-loss: partition 1 generation 6 cleared on node 2".to_owned(),
+        ),
         Answer::Durable,
     ]);
     answers.extend(feed_pages().into_iter().map(Answer::Changes));
@@ -691,9 +699,10 @@ fn status() -> NodeStatus {
         fault: Some("f".to_owned()),
         holds: Some(Holding {
             generation: zero(),
-            owner_epoch: zero(),
+            owner_epoch: Some(zero()),
             applied: 5,
             durable: 4,
+            restored: Some(crate::host::PossibleLossReason::OsBootUnknown),
         }),
         authority: "Serving".to_owned(),
         fence: None,
@@ -733,12 +742,19 @@ fn status() -> NodeStatus {
             reason: "held_past_base",
             adoption: crate::host::TailAdoption::NotReady("replay_not_ready"),
         }),
+        possible_loss: Some(crate::host::PossibleLoss {
+            copy: NodeId(2),
+            generation: Generation(9),
+            applied: 5,
+            reason: crate::host::PossibleLossReason::OsBootChanged,
+        }),
         needs_operator: Some(crate::host::snapshot::needs_forget_tail(
             PartitionId(1),
             CopyId(2),
             NodeId(3),
             rdb_core::contracts::ids::Seq(9),
         )),
+        possible_loss_error: None,
         members_revision: Some(41),
     }
 }
@@ -944,6 +960,9 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         head: Seq(1),
     }));
     assert_eq!(index(&page), 10);
+    // #177: the ack's call and answer went last, after #244's refill and the feed answer.
+    let acked = WireAnswer::carry(&Answer::PossibleLossAcked(String::new()));
+    assert_eq!(index(&acked), 11);
     let call = wire::WireCall::try_from(&ClientCall::Changes {
         identity: identity(1, 1),
         from: crate::feed::FeedCursor::START,
@@ -959,6 +978,18 @@ fn every_message_kind_crosses_the_wire_unchanged() {
     let call_index = |call: &wire::WireCall| postcard::to_stdvec(call).expect("encodes")[0];
     assert_eq!(call_index(&forget), 9);
     assert_eq!(call_index(&call), 10);
+    let ack = wire::WireCall::AckPossibleLoss {
+        identity: identity(1, 3),
+        generation: Generation(1),
+    };
+    assert_eq!(
+        call_index(&wire::WireCall::Refill {
+            identity: identity(1, 4),
+            to: NodeId(2)
+        }),
+        11
+    );
+    assert_eq!(call_index(&ack), 12);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {
@@ -1461,6 +1492,45 @@ fn status_through_the_wire(
         panic!("not a status reply");
     };
     NodeStatus::try_from(*back)
+}
+
+/// #177 (PR #238 review): a restored holding (`owner_epoch` `None`) crosses the wire
+/// unchanged, with a reason or none, and is still restored on the far side; so does one with
+/// an epoch, which is not. Cut: send a restored holding's epoch as `Some(0)`, red.
+/// Unit.
+#[test]
+fn pr238_a_restored_holding_round_trips_with_no_owner_epoch() {
+    for (owner_epoch, restored) in [
+        (None, Some(crate::host::PossibleLossReason::OsBootChanged)),
+        (None, None),
+        (Some(rdb_core::contracts::ids::OwnerEpoch(3)), None),
+    ] {
+        let mut sent = status();
+        sent.holds = sent.holds.map(|holds| Holding {
+            owner_epoch,
+            restored,
+            ..holds
+        });
+        let bytes = wire::encode(&Frame::Reply {
+            correlation: 2,
+            reply: WireReply::Status(Box::new(wire::WireNodeStatus::from(&sent))),
+        });
+        let Ok(Frame::Reply {
+            reply: WireReply::Status(back),
+            ..
+        }) = wire::decode(&bytes)
+        else {
+            panic!("not a status reply");
+        };
+        let back = NodeStatus::try_from(*back).expect("lands");
+        assert_eq!(format!("{back:?}"), format!("{sent:?}"), "{owner_epoch:?}");
+        let holds = back.holds.expect("a holding");
+        assert_eq!(
+            holds.is_restored(),
+            owner_epoch.is_none(),
+            "{owner_epoch:?}"
+        );
+    }
 }
 
 /// PR #110 review: a status naming a tail crosses the wire unchanged in each adoption state,
@@ -2027,6 +2097,57 @@ async fn pr244_the_admin_app_reaches_the_owner_with_a_refill() {
     assert!(taken.contains(&(1, "refill".to_owned())), "{taken:?}");
 }
 
+/// #177: as the rows above, for `ack-possible-loss`: clearing the record is an operator's
+/// act, so an app off the admin list is refused as a forget-tail is, and no record is
+/// touched. Cut: drop `AckPossibleLoss` from `sender_refused`'s admin arm, red: node 1's first
+/// message is the ack.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::AckPossibleLoss {
+            identity: identity(9, 1),
+            generation: Generation(4),
+        },
+    )
+    .await;
+    // `assert_not_admin`'s checks but its last: a refused ack says nothing was cleared, as a
+    // refused forget-tail says nothing was given up, not that it did nothing.
+    assert!(
+        matches!(
+            got,
+            Msg::Client(Client {
+                call: ClientCall::Status { .. },
+                ..
+            })
+        ),
+        "an app not on the admin list never reaches node 1's node with an ack: {got:?}"
+    );
+    assert_eq!(
+        client_requests("i177_an_ack_possible_loss_from_an_app_not_on_the_admin_list_is_refused"),
+        [(1, "status".to_owned())]
+    );
+    let Answer::Error { error, request } = &answer else {
+        panic!("a refusal: {answer:?}");
+    };
+    assert_eq!(request, &None);
+    assert_eq!(
+        (error.kind, error.retry, error.no_mutation),
+        (ErrorKind::InvalidArgument, RetryRule::Definitive, true),
+        "{error}"
+    );
+    let text = error.explain();
+    assert!(
+        text.contains("app pilot is not an admin app")
+            && text.contains("--admin-apps")
+            && text.contains("ack a possible loss")
+            && text.contains("nothing was cleared"),
+        "{text}"
+    );
+    assert!(!text.contains("  "), "one space between words: {text:?}");
+}
+
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
 /// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
 /// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its
@@ -2285,6 +2406,43 @@ fn pr74_r479_only_an_admin_app_may_send_a_move_or_a_rebuild() {
         assert!(!reason.contains("as an admin app"), "{reason}");
     }
     assert_eq!(super::sender_refused(&pilot, &status, &none), None);
+}
+
+/// #177 (PR #238 review): the gate for an ack of a possible loss reads the list, as for a
+/// move. With the list {ops}, app ops may send it; with an empty list, even an app named
+/// `admin` is refused, told nothing was cleared. A node may always send it. That the ack then
+/// clears the record is `i177_a_possible_loss_record_stands_through_a_reopen_until_its_own_generation_is_acked`.
+/// Cut: an ack arm that tests `app == "admin"`, red. Unit.
+#[test]
+fn pr238_an_ack_possible_loss_passes_the_listed_admin_and_an_empty_list_refuses_admin() {
+    let ack = WireMsg::Client {
+        to: NodeId(1),
+        partition: PartitionId(1),
+        call: wire::WireCall::AckPossibleLoss {
+            identity: identity(1, 1),
+            generation: Generation(4),
+        },
+        reply: 1,
+    };
+    let ops = BTreeSet::from(["ops".to_owned()]);
+    let none = BTreeSet::new();
+    assert_eq!(
+        super::sender_refused(&Label::App("ops".to_owned()), &ack, &ops),
+        None
+    );
+    assert_eq!(
+        super::sender_refused(&Label::Node(NodeId(2)), &ack, &none),
+        None
+    );
+    for list in [&none, &ops] {
+        let reason = super::sender_refused(&Label::App("admin".to_owned()), &ack, list)
+            .expect("app admin is not on the list");
+        assert!(
+            reason.contains("app admin is not an admin app on node 1")
+                && reason.contains("nothing was cleared"),
+            "{reason}"
+        );
+    }
 }
 
 /// Revobot R3 4489400307: the gate reads the list, not the name `admin`. With the list {ops},

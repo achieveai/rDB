@@ -156,7 +156,7 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
 /// as for `10`: every node and every linked app process together.
 ///
-/// `13` came with #80 S4 (membership and refill): `WireNodeStatus::members_revision`, the
+/// `13` came with #244 (#80 S4) (membership and refill): `WireNodeStatus::members_revision`, the
 /// `nodes/` revision a node's membership watcher last applied, and `WireCall::Refill`. Each is
 /// added after main's fields and variants, so theirs keep their positions. A frame is
 /// positional postcard, so a build at 12 cannot read a status from 13; the handshake refuses
@@ -164,7 +164,14 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// status from it has arrived since its boot, which a build without layout 3 cannot send. The
 /// number is main's 12 + 1, set by the commit that merged main in. The upgrade is the same as
 /// for `10`: every node and every linked app process together.
-pub const PROTOCOL_VERSION: u32 = 13;
+///
+/// `14` came with #238 (#177): `WireCall::AckPossibleLoss` and `WireAnswer::PossibleLossAcked`
+/// carry the ack. `WireNodeStatus` gains a `WirePossibleLoss` record and its read error, and
+/// `WireHolding` gains `restored` and makes `owner_epoch` optional (`None`
+/// for a holding reported from a restored store). The number is main's version + 1, set in its
+/// own one-line commit after the pre-gate main merge, just before merging to main. The upgrade
+/// is the same as for `10`.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The largest frame either side accepts. A catch-up frame carries whole records.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -1394,7 +1401,8 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                     call @ (wire::WireCall::Move { .. }
                     | wire::WireCall::Rebuild { .. }
                     | wire::WireCall::Refill { .. }
-                    | wire::WireCall::ForgetTail { .. }),
+                    | wire::WireCall::ForgetTail { .. }
+                    | wire::WireCall::AckPossibleLoss { .. }),
                 to,
                 ..
             },
@@ -1405,6 +1413,10 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 wire::WireCall::ForgetTail { .. } => {
                     ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
                 }
+                wire::WireCall::AckPossibleLoss { .. } => (
+                    "ack-possible-loss",
+                    crate::db::error::ACK_POSSIBLE_LOSS_STEP,
+                ),
                 _ => ("rebuild", crate::db::error::REBUILD_STEP),
             };
             // App `admin` refused here is on a node whose list leaves it out: telling it to
@@ -1416,7 +1428,8 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
             };
             return Some(format!(
                 "app {app} is not an admin app on node {}: only an admin app may move, refill or \
-                 rebuild a copy or forget a tail, and the node's operator names them; add {app} \
+                 rebuild a copy, forget a tail or ack a possible loss, and the node's operator \
+                 names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
                  `NetConfig::admin_apps`){instead}; {step}",
                 to.0

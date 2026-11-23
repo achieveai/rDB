@@ -4393,6 +4393,11 @@ pub(crate) struct PromoteCtx {
     pub(crate) member_boot: Arc<dyn Fn(NodeId) -> Option<BootId> + Send + Sync>,
     /// Deliver a message to a node's host.
     pub(crate) send: Arc<dyn Fn(NodeId, Msg) -> Result<(), NodeStopped> + Send + Sync>,
+    /// #177: why this promote may lose acknowledged writes, when the planner chose it while a
+    /// member's restored store may have lost some. Stored with the plan, so the landing on `to`
+    /// writes the possible-loss record, a reopen's roll-forward included. `None` for an
+    /// operator's promote and every other planner promote.
+    pub(crate) possible_loss: Option<crate::host::PossibleLossReason>,
 }
 
 /// The members a promote of `to` plans with, their roles, and the version of the configuration
@@ -4736,7 +4741,14 @@ pub(crate) async fn promote_looked(
         AuthorityGeneration(1),
         prior_record,
     );
-    store_plan(&*ctx.store, ctx.partition, fenced_at, &plan).await?;
+    store_plan(
+        &*ctx.store,
+        ctx.partition,
+        fenced_at,
+        &plan,
+        ctx.possible_loss,
+    )
+    .await?;
     // What F1 pins in `partitions/1` when it commits this plan (A-R448): step 7 answers Ok only
     // for a commit that carries it.
     let own: Vec<NodeId> = sorted_nodes(&RecordMember::pinned(&plan.config));
@@ -5038,11 +5050,19 @@ pub(crate) const PROMOTE_OPERATION_BASE: u64 = 0x00B2 << 48;
 ///
 /// `2` (PR #74 F-001, ruling A-R477) appends [`RecoveryPlan::must_hold`]. `3` (#80 S5n) appends
 /// [`RecoveryPlan::prior`] after it. `4` (issue #105) appends the prior record's ledger inside
-/// `prior`, then [`RecoveryPlan::release`]. postcard is not self-describing, so a field cannot be
-/// defaulted in: this build reads `1` as [`StoredPlanV1`], `2` as [`StoredPlanV2`] and `3` as
-/// [`StoredPlanV3`], the fields they lack set by [`StoredPlanV1::with`], and an older build
-/// refuses a newer plan by this byte, naming both versions (`plan version 2, this build reads 1`).
-pub(crate) const PROMOTE_PLAN_VERSION: u8 = 4;
+/// `prior`, then [`RecoveryPlan::release`]. `5` (#177) appends, after the whole plan, the
+/// promote's possible-loss reason ([`PromoteCtx::possible_loss`]), outside [`RecoveryPlan`]:
+/// F1 never reads it, only the landing does. postcard is not self-describing, so a field cannot
+/// be defaulted in: this build reads `1` as [`StoredPlanV1`], `2` as [`StoredPlanV2`], `3` as
+/// [`StoredPlanV3`], the fields they lack set by [`StoredPlanV1::with`], and `4` as the plan
+/// alone, with no reason; an older build refuses a newer plan by this byte, naming both
+/// versions (`plan version 2, this build reads 1`).
+pub(crate) const PROMOTE_PLAN_VERSION: u8 = 5;
+
+/// The layout that stores the plan alone, with no possible-loss reason after it. A promote with
+/// no possible loss still writes it (t4's ask on #177): the plan sits in the control store, so
+/// a build that reads only up to `4` can read every plan but one that carries a reason.
+pub(crate) const PROMOTE_PLAN_VERSION_PLAN_ONLY: u8 = 4;
 
 /// The stored plan before `must_hold` (version `1`): every field of [`RecoveryPlan`] before it,
 /// in order.
@@ -5133,26 +5153,66 @@ pub(crate) fn promote_operation(revision: Revision) -> Result<ControlKey, String
     )))
 }
 
-/// A promote plan as stored: [`PROMOTE_PLAN_VERSION`], then the plan in postcard, the codec the
-/// links already use.
+/// A promote plan as stored, with no possible-loss reason: [`encode_promote_plan_with`].
+#[cfg(test)]
 pub(crate) fn encode_promote_plan(plan: &RecoveryPlan) -> Bytes {
-    let mut bytes = vec![PROMOTE_PLAN_VERSION];
+    encode_promote_plan_with(plan, None)
+}
+
+/// A promote plan as stored, in postcard, the codec the links already use: with no
+/// `possible_loss`, [`PROMOTE_PLAN_VERSION_PLAN_ONLY`] and the plan alone, as before #177;
+/// with one, [`PROMOTE_PLAN_VERSION`], the plan, then the reason. So only a plan that needs
+/// the new layout is one an older build refuses.
+pub(crate) fn encode_promote_plan_with(
+    plan: &RecoveryPlan,
+    possible_loss: Option<crate::host::PossibleLossReason>,
+) -> Bytes {
+    let version = if possible_loss.is_some() {
+        PROMOTE_PLAN_VERSION
+    } else {
+        PROMOTE_PLAN_VERSION_PLAN_ONLY
+    };
+    let mut bytes = vec![version];
     bytes.extend(postcard::to_stdvec(plan).expect("a recovery plan serialises"));
+    if possible_loss.is_some() {
+        bytes.extend(postcard::to_stdvec(&possible_loss).expect("a reason serialises"));
+    }
     Bytes::from(bytes)
 }
 
-/// The inverse of [`encode_promote_plan`], exactly: another version byte, or bytes left over
-/// after the plan, is refused.
+/// [`decode_promote_plan_with`], without the possible-loss reason.
+///
+/// # Errors
+///
+/// As [`decode_promote_plan_with`].
+#[cfg(test)]
+pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> {
+    decode_promote_plan_with(bytes).map(|(plan, _)| plan)
+}
+
+/// The inverse of [`encode_promote_plan_with`], exactly: another version byte, or bytes left
+/// over after the plan, is refused. A plan stored before version `5` carries no reason: `None`.
 ///
 /// # Errors
 ///
 /// A text saying which.
-pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> {
+pub(crate) fn decode_promote_plan_with(
+    bytes: &[u8],
+) -> Result<(RecoveryPlan, Option<crate::host::PossibleLossReason>), String> {
     let Some((&version, body)) = bytes.split_first() else {
         return Err("the record is empty".to_owned());
     };
+    let mut possible_loss = None;
     let (plan, rest) = match version {
         PROMOTE_PLAN_VERSION => {
+            let (plan, rest) = postcard::take_from_bytes::<RecoveryPlan>(body)
+                .map_err(|error| error.to_string())?;
+            let (reason, rest) = postcard::take_from_bytes(rest)
+                .map_err(|error| format!("the possible-loss reason: {error}"))?;
+            possible_loss = reason;
+            (plan, rest)
+        }
+        PROMOTE_PLAN_VERSION_PLAN_ONLY => {
             postcard::take_from_bytes::<RecoveryPlan>(body).map_err(|error| error.to_string())?
         }
         1 => {
@@ -5172,14 +5232,14 @@ pub(crate) fn decode_promote_plan(bytes: &[u8]) -> Result<RecoveryPlan, String> 
         }
         _ => {
             return Err(format!(
-                "plan version {version}, this build reads 1, 2, 3 and {PROMOTE_PLAN_VERSION}"
-            ));
+                "plan version {version}, this build reads 1 to {PROMOTE_PLAN_VERSION}"
+            ))
         }
     };
     if !rest.is_empty() {
         return Err(format!("{} bytes after the plan", rest.len()));
     }
-    Ok(plan)
+    Ok((plan, possible_loss))
 }
 
 /// Promote step 6 (A-R447): create `plan` at [`promote_operation`]`(fenced_at)`. When the create
@@ -5191,11 +5251,12 @@ async fn store_plan(
     partition: PartitionId,
     fenced_at: Revision,
     plan: &RecoveryPlan,
+    possible_loss: Option<crate::host::PossibleLossReason>,
 ) -> Result<(), PromoteError> {
     let key = promote_operation(fenced_at)
         .map_err(|error| PromoteError::Control(format!("{error}; promote again")))?
         .encode();
-    let value = encode_promote_plan(plan);
+    let value = encode_promote_plan_with(plan, possible_loss);
     let created = store
         .put(PutRequest {
             key: Bytes::from(key.clone()),
@@ -7629,6 +7690,7 @@ mod tests {
         rt: &tokio::runtime::Runtime,
     ) -> PromoteError {
         let ctx = PromoteCtx {
+            possible_loss: None,
             partition: PARTITION,
             owner_must_be_dead: true,
             look_within: Duration::from_millis(1),
@@ -7674,7 +7736,9 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         }
     }
@@ -7690,6 +7754,7 @@ mod tests {
         let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&looks);
         let ctx = PromoteCtx {
+            possible_loss: None,
             partition: PARTITION,
             owner_must_be_dead: true,
             look_within: Duration::from_secs(1),
@@ -8171,7 +8236,9 @@ mod tests {
             clock_bound_lost,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         for (qualifying_copy, clock_bound_lost) in
@@ -8224,6 +8291,7 @@ mod tests {
         let before = promote_marks(&*store, &rt);
         for owner_must_be_dead in [true, false] {
             let ctx = PromoteCtx {
+                possible_loss: None,
                 partition: PARTITION,
                 owner_must_be_dead,
                 look_within: Duration::from_millis(1),
@@ -8463,6 +8531,7 @@ mod tests {
         let sent: Sent = Arc::default();
         let log = Arc::clone(&sent);
         let ctx = PromoteCtx {
+            possible_loss: None,
             partition: PARTITION,
             owner_must_be_dead: false,
             look_within: Duration::from_secs(1),
@@ -8758,6 +8827,7 @@ mod tests {
                 old_grant(&*store, &rt, grant);
             }
             let ctx = PromoteCtx {
+                possible_loss: None,
                 partition: PARTITION,
                 owner_must_be_dead: false,
                 look_within: Duration::from_secs(1),
@@ -10188,6 +10258,7 @@ mod tests {
         let sent: Sent = Arc::default();
         let log = Arc::clone(&sent);
         let ctx = PromoteCtx {
+            possible_loss: None,
             partition: PARTITION,
             owner_must_be_dead: false,
             look_within: Duration::from_secs(1),

@@ -469,6 +469,19 @@
 //!                                         whose adoption was refused needs no flag), or
 //!                                         the intact rule not holding the partition.
 //!                                         Under `--nodes`, only an admin app may run it
+//! admin ack-possible-loss --partition 1 --generation <G>
+//!                                         #177: clear the possible-loss record a failover
+//!                                         onto a copy whose host may have rebooted left
+//!                                         (`failover_possible_loss`, `possible_loss=` in
+//!                                         `nodes`), once the group is re-checked. Prints
+//!                                         `ack-possible-loss: partition 1 generation G
+//!                                         cleared`. Refused, nothing cleared, when the
+//!                                         record names another generation; none standing
+//!                                         is not an error once all nodes have been checked.
+//!                                         An unreadable registered node leaves absence unknown
+//!                                         (UNAVAILABLE); a malformed nodes/ key gives
+//!                                         INCOMPATIBLE_VERSION. No ack is sent in either case.
+//!                                         Under `--nodes`, only an admin app may run it
 //! admin trim-history --through N [--node n]
 //!                                         debug builds only (issue #61): delete partition 1's
 //!                                         History below seq N on node n, or on every node this
@@ -1896,9 +1909,13 @@ fn holds_part(node: &NodeStatus) -> String {
     node.holds.map_or_else(
         || "holds=nothing".to_owned(),
         |h| {
+            // #177: a holding read from a restored store keeps no owner epoch; say so, never 0.
+            let epoch = h
+                .owner_epoch
+                .map_or_else(|| "restored".to_owned(), |epoch| epoch.0.to_string());
             format!(
-                "gen={} epoch={} applied={} durable={}",
-                h.generation.0, h.owner_epoch.0, h.applied, h.durable
+                "gen={} epoch={epoch} applied={} durable={}",
+                h.generation.0, h.applied, h.durable
             )
         },
     )
@@ -2364,6 +2381,21 @@ fn repl<'scope, 'env>(
                     }
                 })
             }
+            ["admin", "ack-possible-loss", rest @ ..] => {
+                parse_ack_possible_loss(rest).map(|generation| {
+                    match db.ack_possible_loss(generation) {
+                        Ok(()) => say(&format!(
+                            "ack-possible-loss: partition 1 generation {} cleared",
+                            generation.0
+                        )),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "repl_ack_possible_loss_refused");
+                            say(&format!("err admin ack-possible-loss: {error}"));
+                            bad = true;
+                        }
+                    }
+                })
+            }
             ["admin", "move", from, to] => parse_any_node(from).and_then(|from| {
                 parse_any_node(to).map(|to| bad |= !move_lines(db, from, to, &say))
             }),
@@ -2486,7 +2518,7 @@ fn repl<'scope, 'env>(
             }
             ["admin", "placement", ..] => Err(PLACEMENT_USAGE.to_owned()),
             ["admin", ..] => Err(format!(
-                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | {FORGET_TAIL_USAGE} | {ADD_NODE_USAGE} | {REMOVE_NODE_USAGE} | {REBALANCE_USAGE} | {DRAIN_USAGE} | {PLACEMENT_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
+                "admin status | {PROMOTE_USAGE} | {REBUILD_USAGE} | {MOVE_USAGE} | {FORGET_TAIL_USAGE} | {ACK_POSSIBLE_LOSS_USAGE} | {ADD_NODE_USAGE} | {REMOVE_NODE_USAGE} | {REBALANCE_USAGE} | {DRAIN_USAGE} | {PLACEMENT_USAGE} | admin clear-grant <n>: n is 1, 2 or 3 | admin \
                  clear <object> | \
                  {DAMAGE_USAGE} | \
                  {DAMAGE_RECORD_USAGE} | {REPAIR_USAGE}"
@@ -3145,6 +3177,44 @@ fn left_out_line(db: &Db, rt: &tokio::runtime::Runtime, store: &dyn ConfigStore)
 /// `admin rebuild`'s usage (#65).
 const REBUILD_USAGE: &str = "admin rebuild <n> [--wipe [--fence]]: n is a node of the cluster, not the owner; `lr rebuild n --wipe` adds --fence once it has stopped n";
 
+/// `admin ack-possible-loss`'s usage (#177).
+const ACK_POSSIBLE_LOSS_USAGE: &str = "admin ack-possible-loss --partition 1 --generation <G>";
+
+/// `admin ack-possible-loss`'s words after `ack-possible-loss`: the generation. `--partition`
+/// is required and must be 1, the one partition this tool runs.
+fn parse_ack_possible_loss(rest: &[&str]) -> Result<Generation, String> {
+    let usage = |why: &str| format!("{why}; {ACK_POSSIBLE_LOSS_USAGE}");
+    let (mut partition, mut generation) = (None, None);
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let value = |flag: &str, words: &mut std::slice::Iter<&str>| {
+            let value = words
+                .next()
+                .ok_or_else(|| usage(&format!("{flag} takes a number")))?;
+            value
+                .parse::<u64>()
+                .map_err(|_| usage(&format!("{flag} {value} is not a number")))
+        };
+        match *word {
+            "--partition" => partition = Some(value("--partition", &mut words)?),
+            "--generation" => generation = Some(value("--generation", &mut words)?),
+            other => return Err(usage(&format!("unknown word {other}"))),
+        }
+    }
+    match partition {
+        Some(1) => {}
+        Some(other) => {
+            return Err(usage(&format!(
+                "partition {other}: this tool runs partition 1"
+            )))
+        }
+        None => return Err(usage("--partition is required")),
+    }
+    generation
+        .map(Generation)
+        .ok_or_else(|| usage("--generation is required"))
+}
+
 /// `admin forget-tail`'s usage (issue #105).
 const FORGET_TAIL_USAGE: &str = "admin forget-tail --partition 1 (--through <H> [--give-up-live-copy] | --no-intact-copy | both)";
 
@@ -3443,7 +3513,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "probe-all",
         "changes",
     ];
-    const SUBVERBS: [&str; 34] = [
+    const SUBVERBS: [&str; 35] = [
         "put --as",
         "blob upload",
         "blob chunk",
@@ -3466,6 +3536,7 @@ fn command_fields(line: &str) -> (&'static str, Option<String>) {
         "admin promote",
         "admin rebuild",
         "admin forget-tail",
+        "admin ack-possible-loss",
         "admin damage-copy",
         "node stop",
         "control cut",
@@ -6210,7 +6281,7 @@ fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
     };
     format!(
         "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={} mode=? \
-         roles=?{published}{}{}",
+         roles=?{published}{}{}{}{}",
         node.node.0,
         node.boot.0,
         holds_part(node),
@@ -6227,6 +6298,16 @@ fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
         node.fault
             .as_ref()
             .map_or_else(String::new, |f| format!(" FAULT={f}")),
+        // #177: shown only while a record stands, so a walk greps for it.
+        node.possible_loss.map_or_else(String::new, |loss| format!(
+            " possible_loss=gen{}@{}:{}",
+            loss.generation.0,
+            loss.applied,
+            loss.reason.as_str()
+        )),
+        node.possible_loss_error
+            .as_ref()
+            .map_or_else(String::new, |why| format!(" possible_loss_error={why}")),
     )
 }
 
@@ -6949,9 +7030,72 @@ mod tests {
             clock_bound_lost: false,
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
+            possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         }
+    }
+
+    /// #177 (PR #238 review): the generation an ack names is kept exact at both ends of its
+    /// range. Cut: parse through `u32`, red. Unit.
+    #[test]
+    fn pr238_an_ack_keeps_generation_0_and_u64_max_exact() {
+        for generation in [0, u64::MAX] {
+            let word = generation.to_string();
+            assert_eq!(
+                parse_ack_possible_loss(&["--partition", "1", "--generation", &word]),
+                Ok(Generation(generation))
+            );
+        }
+    }
+
+    /// #177 (PR #238 review): a node's line. A holding with an owner epoch shows it; a
+    /// restored one shows `epoch=restored`, never 0. A standing record shows
+    /// `possible_loss=gen<G>@<applied>:<reason>` for each reason, and once it is cleared the
+    /// line has no `possible_loss=`. Cut: `epoch=0` for a restored holding, red; the record
+    /// left off the line, red. Unit.
+    #[test]
+    fn pr238_a_node_line_shows_the_epoch_or_restored_and_a_standing_record_until_cleared() {
+        let mut node = owner(None, true);
+        for (owner_epoch, shown) in [
+            (Some(rdb_core::contracts::ids::OwnerEpoch(4)), " epoch=4 "),
+            (None, " epoch=restored "),
+        ] {
+            node.holds = Some(rdb_api::host::Holding {
+                generation: Generation(5),
+                owner_epoch,
+                applied: 3,
+                durable: 3,
+                restored: None,
+            });
+            let line = node_line(&node, None);
+            assert!(line.contains(shown), "{line}");
+        }
+        for (reason, shown) in [
+            (
+                rdb_api::host::PossibleLossReason::OsBootChanged,
+                " possible_loss=gen5@3:os_boot_changed",
+            ),
+            (
+                rdb_api::host::PossibleLossReason::OsBootUnknown,
+                " possible_loss=gen5@3:os_boot_unknown",
+            ),
+        ] {
+            node.possible_loss = Some(rdb_api::host::PossibleLoss {
+                copy: NodeId(1),
+                generation: Generation(5),
+                applied: 3,
+                reason,
+            });
+            let line = node_line(&node, None);
+            assert!(line.contains(shown), "{line}");
+        }
+        node.possible_loss = None;
+        let line = node_line(&node, None);
+        assert!(!line.contains("possible_loss="), "{line}");
+        node.possible_loss_error = Some("marker read failed".into());
+        assert!(node_line(&node, None).contains(" possible_loss_error=marker read failed"));
     }
 
     /// Bug bash #65: after `rebuilt: node 3 ...` the poller still said "writes pause soon ...
@@ -6999,9 +7143,10 @@ mod tests {
         let holds = |generation| {
             Some(rdb_api::host::Holding {
                 generation: Generation(generation),
-                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                owner_epoch: Some(rdb_core::contracts::ids::OwnerEpoch(generation)),
                 applied: 1,
                 durable: 1,
+                restored: None,
             })
         };
         let mut old = owner(None, false);
@@ -7040,9 +7185,10 @@ mod tests {
         let holds = |generation| {
             Some(rdb_api::host::Holding {
                 generation: Generation(generation),
-                owner_epoch: rdb_core::contracts::ids::OwnerEpoch(generation),
+                owner_epoch: Some(rdb_core::contracts::ids::OwnerEpoch(generation)),
                 applied: 1,
                 durable: 1,
+                restored: None,
             })
         };
         // As `nodes` printed it after `admin promote 2 --drop 3`: both say `primary` and
@@ -9407,6 +9553,62 @@ mod tests {
         }
     }
 
+    /// #177: `admin ack-possible-loss` reaches `Db::ack_possible_loss`. With no record
+    /// standing the ack is `Ok`, the run exits 0, and the node's answer is logged
+    /// (`db_possible_loss_acked`, saying nothing was there to clear). A partition other than 1,
+    /// or no `--generation`, is a usage error and the run exits 1, with no ack sent. The
+    /// record's own life is `db::tests`'s
+    /// `i177_a_possible_loss_record_stands_through_a_reopen_until_its_own_generation_is_acked`.
+    /// Cut: the `ack-possible-loss` arm falls through to `admin ..`'s usage, the clean run
+    /// exits 1, red. Integration (~16 s): three real rEtcd voters per run.
+    #[config_log::retcd_test]
+    fn i177_admin_ack_possible_loss_runs_the_ack_and_a_malformed_one_exits_1() {
+        const METHOD: &str =
+            "i177_admin_ack_possible_loss_runs_the_ack_and_a_malformed_one_exits_1";
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        for (name, script, want, acks) in [
+            (
+                "clean",
+                "wait ready 60\nadmin ack-possible-loss --partition 1 --generation 2\nnodes\n",
+                ExitCode::SUCCESS,
+                1,
+            ),
+            (
+                "bad",
+                "wait ready 60\nadmin ack-possible-loss --partition 2 --generation 2\n\
+                 admin ack-possible-loss --partition 1\n",
+                ExitCode::from(1),
+                1,
+            ),
+        ] {
+            let path = root.path().join(format!("{name}.txt"));
+            std::fs::write(&path, script).expect("write the script");
+            let args = Args {
+                dir: root.path().join(name),
+                log_dir: root.path().join(format!("{name}-logs")),
+                script: Some(path),
+                ..parse(std::iter::empty()).expect("defaults")
+            };
+            assert_eq!(run(&args, Db::open), want, "{name}: {script}");
+            let acked: Vec<_> =
+                config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                    .into_iter()
+                    .filter(|line| line["@m"] == "db_possible_loss_acked")
+                    .collect();
+            assert_eq!(acked.len(), acks, "{name}: {acked:#?}");
+            assert_eq!(acked[0]["generation"], 2, "{acked:#?}");
+            assert!(
+                acked[0]["line"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("no possible-loss record")),
+                "{acked:#?}"
+            );
+        }
+    }
+
     /// Tester w3a03 (A-R191, k227): `wait ready` read rdb_dev's own latch, so after `node
     /// restart 1` it said "reached ready in 0ms" and exited 0, while node 1 will not admit a
     /// write again in this open. It now asks `Db::wait_ready`, which answers the present:
@@ -10945,6 +11147,34 @@ mod tests {
             .output()
             .expect("spawn the run");
         String::from_utf8_lossy(&child.stdout).into_owned()
+    }
+
+    /// #177 (PR #238 review): `admin ack-possible-loss` with a negative generation, and with
+    /// one past `u64::MAX`, is each a usage error: the run exits 1 and no ack is sent (no
+    /// `cleared`, no refused ack). Cut: parse the generation as `i128` and saturate, red.
+    /// Integration (~3 s): two child runs with three real rEtcd voters each.
+    #[test]
+    fn pr238_an_ack_with_a_negative_or_overflowing_generation_exits_1_and_sends_nothing() {
+        let root = config_testkit::fs::temp_dir();
+        for (name, generation) in [("negative", "-1"), ("overflow", "18446744073709551616")] {
+            let said = script_output(
+                root.path(),
+                name,
+                1,
+                &format!(
+                    "admin ack-possible-loss --partition 1 --generation {generation}
+quit
+"
+                ),
+            );
+            assert!(
+                said.contains(&format!("--generation {generation} is not a number")),
+                "{said}"
+            );
+            assert!(!said.contains("cleared"), "{said}");
+            assert!(!said.contains("err admin ack-possible-loss"), "{said}");
+            assert!(said.contains("SCRIPT_CHILD_EXIT=1"), "{said}");
+        }
     }
 
     /// PR #102 review: a groupless `txn&` was queued at two partitions, where it is sent to
