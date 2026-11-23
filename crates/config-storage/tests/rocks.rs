@@ -1979,6 +1979,17 @@ async fn i186_applied_past_the_durable_log_is_refused_as_corrupt() {
 /// for a root that subsequently applied its first entry and whose log had recorded a vote.
 #[retcd_test]
 async fn i186_first_open_log_cannot_cover_an_applied_index_zero() {
+    check_stale_first_open_log(false).await;
+}
+
+#[retcd_test]
+async fn i186_empty_snapshot_and_first_open_log_cannot_cover_an_applied_index_zero() {
+    check_stale_first_open_log(true).await;
+}
+
+async fn check_stale_first_open_log(publish_empty_snapshot: bool) {
+    use openraft::RaftSnapshotBuilder;
+
     let tmp = tempfile::tempdir().unwrap();
     let copies = tempfile::tempdir().unwrap();
     let log = config_storage::log_dir(tmp.path());
@@ -2001,6 +2012,14 @@ async fn i186_first_open_log_cannot_cover_an_applied_index_zero() {
     let vote = Vote::new(1, 1);
     {
         let s = open_plain(tmp.path());
+        if publish_empty_snapshot {
+            s.state_machine()
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+        }
         s.log_store().save_vote(&vote).await.unwrap();
         append_apply(&s, vec![membership_entry(0, &[1])])
             .await
@@ -2008,6 +2027,18 @@ async fn i186_first_open_log_cannot_cover_an_applied_index_zero() {
     }
     {
         let s = open_plain(tmp.path());
+        if publish_empty_snapshot {
+            let current = s.snapshot_meta().expect("empty snapshot remains current");
+            let file = s
+                .path()
+                .join("snapshots")
+                .join(format!("{}.snap", current.snapshot_id));
+            let published = config_storage::SnapshotReader::open(&file).unwrap();
+            assert_eq!(current.last_log_id, None);
+            assert_eq!(published.header().last_log_id, None);
+        } else {
+            assert!(s.snapshot_meta().is_none());
+        }
         assert_eq!(s.reader().last_applied().unwrap().index, 0);
         assert_eq!(s.log_store().read_vote().await.unwrap(), Some(vote));
     }
@@ -2030,6 +2061,30 @@ async fn i186_first_open_log_cannot_cover_an_applied_index_zero() {
     let s = open_plain(tmp.path());
     assert_eq!(s.log_store().read_vote().await.unwrap(), Some(vote));
     assert_eq!(s.reader().last_applied().unwrap().index, 0);
+}
+
+#[retcd_test]
+async fn i186_applied_index_zero_reopens_with_only_a_purge_pointer_for_coverage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let entry = membership_entry(0, &[1]);
+    let applied = entry.log_id;
+    {
+        let s = open_plain(tmp.path());
+        append_apply(&s, vec![entry]).await.unwrap();
+        s.log_store().purge(applied).await.unwrap();
+    }
+    let s = open_plain(tmp.path());
+    assert_eq!(s.reader().last_applied(), Some(applied));
+    assert_eq!(s.raft_log_len(), 0);
+    assert!(s.snapshot_meta().is_none());
+    assert_eq!(
+        s.log_store()
+            .get_log_state()
+            .await
+            .unwrap()
+            .last_purged_log_id,
+        Some(applied)
+    );
 }
 
 /// The harness shortcut the strict I1 check replaces: applying entries that were never appended

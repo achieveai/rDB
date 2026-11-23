@@ -329,7 +329,7 @@ pub enum StorageOpenError {
              return to the build that wrote it or start fresh. To replace a node in a surviving compatible cluster, use a fresh node id"
     )]
     PreSplitLayout {
-        /// The format marker the directory carries, or `0` when it has none.
+        /// The format marker the directory carries, or `0` when absent or unreadable.
         found: u32,
         /// The directory.
         path: PathBuf,
