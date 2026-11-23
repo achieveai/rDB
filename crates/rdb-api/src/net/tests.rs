@@ -1124,6 +1124,72 @@ fn certs_for(dir: &FsPath, nodes: &[u32]) {
     certs::generate(dir, &labels).expect("certs generate");
 }
 
+/// A successful list and a reopened stream leave the warning suppressed. Receiving a
+/// membership event starts a new run, so the next stream error warns again.
+#[config_log::retcd_test(flavor = "current_thread")]
+async fn members_watch_warns_once_per_run_of_stream_errors() {
+    use crate::test_store::{Script, Scripted};
+    use config_core::{ConfigError, MutationEvent, MutationEventKind, WatchItem};
+
+    const METHOD: &str = "members_watch_warns_once_per_run_of_stream_errors";
+    let dir = config_testkit::fs::temp_dir();
+    certs_for(dir.path(), &[1]);
+    let node = side(Spec::node(1, dir.path(), &[]), false).await;
+    let failure = |message: &str| {
+        Err(ConfigError::Unavailable {
+            reason: message.to_owned(),
+        })
+    };
+    let event = Ok(WatchItem::Event(MutationEvent {
+        revision: 1,
+        key: Bytes::from_static(b"nodes/2"),
+        kind: MutationEventKind::Delete,
+    }));
+    let store = Arc::new(Scripted::new(Script {
+        watch_items: [
+            failure("first outage"),
+            failure("first retry"),
+            event,
+            failure("second outage"),
+            failure("second retry"),
+        ]
+        .into(),
+        ..Script::default()
+    }));
+    tokio::time::pause();
+    let mut watcher = std::pin::pin!(crate::admin::watch_members(
+        store.clone(),
+        node.net.clone(),
+        BTreeSet::new(),
+        Arc::default()
+    ));
+    for (lists, expected_warnings) in [(1, 1), (2, 1), (4, 2), (5, 2)] {
+        assert!(futures::poll!(&mut watcher).is_pending());
+        assert_eq!(
+            store.list_arrivals().len(),
+            lists,
+            "each event or failure re-lists"
+        );
+        let warnings: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "members_watch_failed")
+            .collect();
+        assert_eq!(warnings.len(), expected_warnings, "{warnings:?}");
+        assert!(warnings[0]["error"]
+            .as_str()
+            .expect("error")
+            .contains("first outage"));
+        if expected_warnings == 2 {
+            assert!(warnings[1]["error"]
+                .as_str()
+                .expect("error")
+                .contains("second outage"));
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    node.net.shutdown();
+}
+
 const PATIENCE: Duration = Duration::from_secs(5);
 
 /// The admin-app list `lr` passes to `rdb_node` (A-R479, A-R480).
