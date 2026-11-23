@@ -313,9 +313,9 @@ pub enum KernelEvent {
         record_digest: Digest,
     },
     /// R1's durable views moved (team kernel-b `design.md` §4.3, §4.4): for each active
-    /// protection predicate, the highest sequence durable on every copy of it. Delivered to L1.
+    /// protection predicate, the highest sequence on its durable quorum (#79). Delivered to L1.
     DurableAdvanced {
-        /// `(config_version, all_durable_through)` for each active predicate.
+        /// `(config_version, durable quorum floor)` for each active predicate.
         per_predicate: Vec<(ConfigVersion, DurableSeq)>,
     },
     /// A new membership configuration was pinned (team kernel-b `design.md` §4.3). Delivered to
@@ -509,7 +509,7 @@ pub enum KernelEffect {
     },
     /// R1 publishes its durable views. The emitted half of [`KernelEvent::DurableAdvanced`].
     DurableAdvanced {
-        /// `(config_version, all_durable_through)` for each active predicate.
+        /// `(config_version, durable quorum floor)` for each active predicate.
         per_predicate: Vec<(ConfigVersion, DurableSeq)>,
     },
     /// R1 blocks the partition. The emitted half of [`KernelEvent::BlockPartition`].

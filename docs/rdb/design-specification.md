@@ -426,7 +426,7 @@ The storage adapter exposes `sync_wal_through(captured_prefixes)` as two halves,
 
 Writes may commit while the fsync runs. A write that returned before the sync began is durable once that sync succeeds. A write that commits during the sync is not credited by it: it is durable only after the next sync that begins after it returned. This is safe because, with manual WAL flushing off, each record reaches the OS before its write returns, and a sync covers every WAL file numbered at or below the current one when it begins.
 
-While a sync is in flight, the node's thread runs no synced write and no second sync, because RocksDB would make either one wait for that fsync. Such writes are staged, unsynced, and the next sync makes them durable. A sync in flight longer than `sync_stuck_millis` (default 30 s; 5 s before issue #109) is a stuck disk: when the watchdog finds it still in flight past that limit, the node faults, and its grant lapses for another node to take over. A slower sync that returns within `sync_stuck_millis` is slow, not a fault: it credits nothing until it returns, L1 pauses admission on unsafe age meanwhile (§6.2), and the host logs it at Warn once it passes 5 s (`wal_sync_slow_in_flight` while it runs, then `wal_sync_slow` when it returns to the live node). A sync the watchdog finds still in flight past the limit faults the node, and its later return does not clear that fault. On that already-faulted path, the returning sync logs `sync_finished_after_fault` (Info), as a sync that returns at stop logs `sync_finished_at_stop`. A sync that returns past the limit but is handled before the watchdog looks is not a fault, and logs `wal_sync_slow` (Warn) like any other slow return. An fsync that returns an error advances nothing, as before.
+While a sync is in flight, the node's thread runs no synced write and no second sync, because RocksDB would make either one wait for that fsync. Such writes are staged, unsynced, and the next sync makes them durable. A sync in flight longer than `sync_stuck_millis` (default 30 s; 5 s before issue #109) is a stuck disk: when the watchdog finds it still in flight past that limit, the node faults, and its grant lapses for another node to take over. A slower sync that returns within `sync_stuck_millis` is slow, not a fault: it credits nothing until it returns, L1 pauses admission on unsafe age meanwhile when the slow node is the primary or holds the quorum's last secondary (§6.2), and the host logs it at Warn once it passes 5 s (`wal_sync_slow_in_flight` while it runs, then `wal_sync_slow` when it returns to the live node). A sync the watchdog finds still in flight past the limit faults the node, and its later return does not clear that fault. On that already-faulted path, the returning sync logs `sync_finished_after_fault` (Info), as a sync that returns at stop logs `sync_finished_at_stop`. A sync that returns past the limit but is handled before the watchdog looks is not a fault, and logs `wal_sync_slow` (Warn) like any other slow return. An fsync that returns an error advances nothing, as before.
 
 Known limit (issue #142, fix tracked as #152): on Linux with XFS, the node's thread still waits on the fsync, inside the kernel. XFS holds the WAL inode's lock (`xfs_ilock`) for the whole journal force of an fsync, and the node's next WAL append needs that lock. So a commit can wait as long as the syncer's journal force: a few milliseconds on a quiet disk, and 300-800 ms when other writers keep the journal busy (measured on the shared build host, 2026-11-20). `host_slow_step` logs such a step. Issue #152 removes the wait by moving the WAL's `write` to the syncer (`manual_wal_flush`). `scripts/thread-waits.py` shows which kernel wait a slow node thread is in.
 
@@ -454,14 +454,22 @@ stateDiagram-v2
 |---|---|---|
 | Group WAL sync | Background flush every 100 ms; a waited sync starts at once when no sync is running, and otherwise queues behind the running one and starts when that one finishes | No guaranteed maximum; record completed sync latency and durable age |
 | All-regular-copy propagation | p99 ≤20 ms healthy local target | Measured from local apply to minimum regular `buffered_applied_seq`; not guaranteed RPO |
-| Unsafe-age warning | 1,000 ms | Age of oldest applied transaction not durably present on required regular copies |
+| Unsafe-age warning | 1,000 ms | Age of oldest applied transaction not durable on the durable quorum: the primary and one regular secondary in RF3, both copies in DegradedRf2 |
 | Unsafe-age pause | 2,000 ms | Reject new admission within additional 100 ms under tested scheduler budget |
 | Health evaluation | Every 50 ms plus progress events | Idle partitions with no outstanding transactions do not become falsely unsafe |
-| Resume | All configured regular copies durable through paused prefix; lag below 250 ms for 5 s | No timer reset merely because a replica was renamed/replaced |
+| Resume | The durable quorum through the paused prefix; lag below 250 ms for 5 s on every copy not held lost | No timer reset merely because a replica was renamed/replaced |
 
-"All configured regular copies" means those lag protection does not hold lost: ADR-rdb-0006 §1
-defines the lag domain as the copies minus self minus lost. The trace exports that set as
-`ProtectionState.lost_copy_set`, and INV-LAG reads it (M9 S0, 2026-10-07).
+The durable quorum is the primary plus `min_regular_acks` regular secondaries (issue #79, option A,
+owner ruling 2026-11-20, <https://github.com/achieveai/rDB/issues/79#issuecomment-7078410724>;
+amended 2026-11-22). It is the copies an acknowledgement already rests on, so a third copy's fsync
+protects no acknowledged write while the primary and one live secondary hold it. A copy that
+stays below the quorum for the pause age is logged at Warn (`copy_durable_lagging`), and does not
+pause writes. A warned regular secondary is eligible for the `lagging` drop clock (Q1), linked or
+not. While it remains the selected victim, `peer_drop_after_millis` without a change in its
+durable sequence triggers a drop plan. A changed victim or durable sequence restarts the clock,
+and the clock starts no earlier than the Warn. The lag domain is still the copies minus self minus lost (ADR-rdb-0006 §1); the
+trace exports the lost set as `ProtectionState.lost_copy_set`, and INV-LAG reads it (M9 S0,
+2026-10-07).
 
 Required copies are pinned by configuration version. Membership changes cannot erase old exposure: use a durable transition barrier and lineage checkpoint, then explicitly retire the old predicate. Export age and outstanding bytes separately.
 

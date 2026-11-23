@@ -2335,6 +2335,19 @@ struct Unreachable {
     boot: Option<BootId>,
 }
 
+/// Issue #79 (option A): a regular secondary below the durable quorum floor that L1 reads, since
+/// when, and the floor it was below then ([`Host::warn_lagging`]). It clears when the copy
+/// reaches `min(target, current floor)`, so a copy that keeps up with a moving floor never warns.
+#[derive(Debug, Clone, Copy)]
+struct Lagging {
+    since: Tick,
+    target: DurableSeq,
+    /// Whether `copy_durable_lagging` was logged for this entry, so it is logged once.
+    warned: bool,
+    /// When it was logged: the lagging drop clock starts no earlier ([`Host::drop_duty`]).
+    warned_at: Tick,
+}
+
 /// Which clock planned a drop ([`Host::drop_duty`]), logged as `clock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropClock {
@@ -2342,6 +2355,9 @@ enum DropClock {
     Unreachable,
     /// L1 refused writes on account of the copy for `peer_drop_after_millis` (A-R281).
     Paused,
+    /// Issue #79 (Q1): the copy stayed below the durable quorum floor past its
+    /// `copy_durable_lagging` Warn for `peer_drop_after_millis`, linked or not.
+    Lagging,
 }
 
 impl DropClock {
@@ -2349,6 +2365,7 @@ impl DropClock {
         match self {
             Self::Unreachable => "unreachable",
             Self::Paused => "paused",
+            Self::Lagging => "lagging",
         }
     }
 }
@@ -3653,6 +3670,9 @@ struct Host {
     /// #67 (A-R435): per (partition, pinned regular secondary), since when this owner has had
     /// no link to it ([`Self::count_unreachable`]).
     unreachable: BTreeMap<(PartitionId, NodeId), Unreachable>,
+    /// Issue #79: per (partition, pinned regular secondary), a copy below the durable quorum
+    /// floor ([`Self::warn_lagging`]).
+    lagging: BTreeMap<(PartitionId, CopyId), Lagging>,
     /// M11 T4: per partition, the shadow a move pinned and since when this owner has had no
     /// link to it ([`Self::shadow_give_up_duty`]).
     shadow_unreachable: BTreeMap<PartitionId, (NodeId, Tick)>,
@@ -3915,6 +3935,7 @@ impl Host {
             boot_seen_while_planned: BTreeMap::new(),
             boot_replans: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            lagging: BTreeMap::new(),
             shadow_unreachable: BTreeMap::new(),
             move_catching_up: BTreeMap::new(),
             target_lost_told: BTreeMap::new(),
@@ -8963,6 +8984,7 @@ impl Host {
             self.move_target_lost_duty(partition);
             // G6: counted before the early return, so it runs through a rejoin.
             self.count_unreachable(partition, now);
+            self.warn_lagging(partition, now);
             self.restore_left_out(partition);
             self.warn_left_out(partition, now);
             // D1 (#93): ahead of the gate below, so an idle partition, which L1 never pauses,
@@ -8973,21 +8995,35 @@ impl Host {
                     continue;
                 }
             }
-            let Some((copy, durable)) = self.holding_up(partition, now) else {
-                self.blamed.remove(&partition);
-                continue;
+            // A lagging clock starts no earlier than its copy's Warn (#249 review): a blame
+            // kept from a pause on the same copy at the same durable sequence would otherwise
+            // drop a linked copy well short of `peer_drop_after_millis` after it is warned.
+            let (copy, durable, clock, not_before) = match self.holding_up(partition, now) {
+                Some((copy, durable)) => (copy, durable, DropClock::Paused, None),
+                None => match self.lagging_past_pause(partition, now) {
+                    Some((copy, durable, warned_at)) => {
+                        (copy, durable, DropClock::Lagging, Some(warned_at))
+                    }
+                    None => {
+                        self.blamed.remove(&partition);
+                        continue;
+                    }
+                },
             };
             let unlinked = self
                 .committed
                 .get(&partition)
                 .and_then(|committed| holder_of(&committed.committed.pinned_config.members, copy))
                 .is_some_and(|node| !self.linked(node));
-            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now)
+            let mut blame = Blame::next(self.blamed.get(&partition), copy, durable, now)
                 .seen_unlinked(unlinked);
+            if let Some(warned_at) = not_before {
+                blame.since = blame.since.max(warned_at);
+            }
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
-                self.drop_copy(partition, blame, blamed_ms, DropClock::Paused);
+                self.drop_copy(partition, blame, blamed_ms, clock);
             }
         }
         self.live_readd_duty(now);
@@ -9450,6 +9486,109 @@ impl Host {
                 boot = left.boot.0,
                 action = %format!("restart node {} to bring it back", left.node.0),
                 "copy_left_out_until_restart"
+            );
+        }
+    }
+
+    /// Issue #79 (option A, owner ruling 2026-11-20): L1 reads the durable quorum floor, the
+    /// primary capped by its `min_regular_acks` most-durable regular secondaries, so a third copy
+    /// that stops making records durable no longer pauses writes. This is the signal that
+    /// replaces the pause: a regular secondary that stays below the floor of the pinned
+    /// predicate for `pause_age_millis`, where L1 used to start refusing, is logged once at
+    /// Warn as `copy_durable_lagging`. Its entry clears, with Info `copy_durable_lag_cleared`
+    /// when it had warned, once the copy is durable through the floor it was first found below,
+    /// or the current floor if that is lower,
+    /// and is re-armed at once if it is still below the floor then. In RF2 no copy can sit
+    /// below the floor, so it never fires there.
+    ///
+    /// It runs only while this node is the pinned primary and no rejoin runs. An entry goes
+    /// silently when its copy leaves the pinned regular secondaries, or this node stops being
+    /// the pinned primary (`membership_drop_planned` says why).
+    fn warn_lagging(&mut self, partition: PartitionId, now: Tick) {
+        if self.rejoins.contains_key(&partition) {
+            return;
+        }
+        let tracker = self
+            .is_pinned_primary(partition)
+            .then(|| self.replication.primary(self.node, partition))
+            .flatten()
+            .map(|primary| primary.tracker());
+        let Some(tracker) = tracker else {
+            self.lagging.retain(|(at, _), _| *at != partition);
+            return;
+        };
+        let pinned = tracker.config();
+        let floor = tracker
+            .durable_per_predicate()
+            .into_iter()
+            .find(|(version, _)| *version == pinned.config_version)
+            .map_or(DurableSeq(0), |(_, floor)| floor);
+        let generation = tracker.lineage().generation;
+        let copies: Vec<(CopyId, NodeId, DurableSeq)> = tracker
+            .regular_secondaries()
+            .into_iter()
+            .filter_map(|copy| {
+                let peer = tracker.peer(copy)?;
+                Some((copy, peer.node, peer.progress.durable))
+            })
+            .collect();
+        self.lagging.retain(|(at, copy), _| {
+            *at != partition || copies.iter().any(|(kept, _, _)| kept == copy)
+        });
+        for (copy, holder, durable) in copies {
+            let key = (partition, copy);
+            if let Some(entry) = self.lagging.get(&key).copied() {
+                // Caught up with the floor it lagged, or with today's floor if that is lower
+                // (#249 review: a floor that fell, as across a re-plan, must not keep it warned).
+                if durable.0 >= entry.target.0.min(floor.0) {
+                    self.lagging.remove(&key);
+                    if entry.warned {
+                        tracing::info!(
+                            node = self.node.0,
+                            partition = partition.0,
+                            copy = copy.0,
+                            durable = durable.0,
+                            lagged_ms = HostClock::millis_until(entry.since, now),
+                            "copy_durable_lag_cleared"
+                        );
+                    }
+                }
+            }
+            if durable.0 < floor.0 {
+                self.lagging.entry(key).or_insert(Lagging {
+                    since: now,
+                    target: floor,
+                    warned: false,
+                    warned_at: now,
+                });
+            }
+            let Some(entry) = self.lagging.get_mut(&key) else {
+                continue;
+            };
+            let lagging_ms = HostClock::millis_until(entry.since, now);
+            if entry.warned || lagging_ms < self.budgets.pause_age_millis {
+                continue;
+            }
+            entry.warned = true;
+            entry.warned_at = now;
+            let linked = self.linked(holder);
+            let unreachable_ms = self
+                .unreachable
+                .get(&(partition, holder))
+                .map(|count| HostClock::millis_until(count.since, now));
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                copy = copy.0,
+                holder = holder.0,
+                durable = durable.0,
+                floor = floor.0,
+                behind = floor.0.saturating_sub(durable.0),
+                lagging_ms,
+                linked,
+                unreachable_ms,
+                "copy_durable_lagging"
             );
         }
     }
@@ -11521,6 +11660,46 @@ impl Host {
             })
             .map(|member| member.node)
             .collect()
+    }
+
+    /// Issue #79 (Q1, default (a)): under the quorum floor a linked copy that stays behind no
+    /// longer pauses L1, so [`Self::holding_up`]'s clock never starts for it, and without this
+    /// the partition would run at RF2 with nothing to say so but a Warn. This names, for the
+    /// same drop clock, the most-behind regular secondary that warned `copy_durable_lagging`
+    /// ([`Self::warn_lagging`]): the blame starts at the Warn, at `pause_age_millis`, where the
+    /// paused clock used to start. The gates are [`Self::holding_up`]'s.
+    fn lagging_past_pause(
+        &self,
+        partition: PartitionId,
+        now: Tick,
+    ) -> Option<(CopyId, DurableSeq, Tick)> {
+        if self.rejoins.contains_key(&partition) {
+            return None;
+        }
+        let committed = self.committed.get(&partition)?;
+        if committed.mode == PartitionMode::ReadOnly || !self.is_pinned_primary(partition) {
+            return None;
+        }
+        // L1 blocking for an operator (a divergence, spec §8.1) is no drop clock's to clear,
+        // as in `holding_up`; only a pause on lag hands over to it there.
+        let blocked = self
+            .l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(now))
+            .is_some_and(|state| !state.allow && state.reason != Some(ErrorKind::ProtectionPaused));
+        if blocked {
+            return None;
+        }
+        let tracker = self.replication.primary(self.node, partition)?.tracker();
+        self.lagging
+            .iter()
+            .filter(|((at, _), entry)| *at == partition && entry.warned)
+            .filter_map(|((_, copy), entry)| {
+                tracker
+                    .peer(*copy)
+                    .map(|peer| (*copy, peer.progress.durable, entry.warned_at))
+            })
+            .min_by_key(|(copy, durable, _)| (durable.0, copy.0))
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable
@@ -15050,13 +15229,13 @@ impl Host {
             );
             return;
         };
-        let Some(member) = result
+        let Some((member, pinned_boot)) = result
             .committed
             .pinned_config
             .members
             .iter()
             .find(|member| member.copy == copy)
-            .map(|member| member.node)
+            .map(|member| (member.node, member.boot))
         else {
             tracing::warn!(
                 node,
@@ -15067,6 +15246,25 @@ impl Host {
             return;
         };
         let generation = result.new_generation.0;
+        // Issue #250: a member whose link reports a boot other than the one this root pins
+        // has restarted since, possibly on an empty disk. The root is not its to land: landing
+        // it inherits from a parent the new boot may not hold, which faults the host. Its
+        // restart is the owner's to re-plan (`PeerBooted`), so nothing is re-posted.
+        if let Some(boot) = self.links.boot_of(member) {
+            if boot != pinned_boot {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    copy = copy.0,
+                    member = member.0,
+                    generation,
+                    boot = boot.0,
+                    pinned_boot = pinned_boot.0,
+                    "copy_ahead_rebooted"
+                );
+                return;
+            }
+        }
         let msg = Msg::Landed {
             result: result.clone(),
             partition,
