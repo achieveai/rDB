@@ -43,6 +43,9 @@ pub async fn watch_members(
 ) {
     let prefix = Bytes::from_static(ControlPrefix::Nodes.encode().as_bytes());
     let mut failing = false;
+    // Its own flag: a list that succeeds says nothing of the watch, and a store that serves no
+    // watches fails every one (r158 counted a warn every 250 ms per node).
+    let mut watch_failing = false;
     loop {
         let revision = match read_nodes_at(&*store).await {
             Ok((records, revision)) => {
@@ -79,17 +82,26 @@ pub async fn watch_members(
         let mut stream = match watched {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::warn!(%error, revision, "members_watch_failed");
+                if !watch_failing {
+                    tracing::warn!(%error, revision, "members_watch_failed");
+                    watch_failing = true;
+                }
                 tokio::time::sleep(WATCH_RETRY).await;
                 continue;
             }
         };
         loop {
             match stream.next().await {
-                Some(Ok(WatchItem::Event(_))) => break,
-                Some(Ok(WatchItem::Progress { .. })) => {}
+                Some(Ok(WatchItem::Event(_))) => {
+                    watch_failing = false;
+                    break;
+                }
+                Some(Ok(WatchItem::Progress { .. })) => watch_failing = false,
                 Some(Err(error)) => {
-                    tracing::warn!(%error, revision, "members_watch_failed");
+                    if !watch_failing {
+                        tracing::warn!(%error, revision, "members_watch_failed");
+                        watch_failing = true;
+                    }
                     tokio::time::sleep(WATCH_RETRY).await;
                     break;
                 }

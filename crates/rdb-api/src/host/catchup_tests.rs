@@ -1769,8 +1769,9 @@ fn rejoin_put(request: u64) -> ClientCall {
 }
 
 /// Node 3's process dies: nothing crosses its links until [`restart_three`]. Then puts from
-/// `request` on land until L1 pauses on node 3, so node 3 misses them. Returns the next
-/// request id and how many landed.
+/// `request` on land until node 1 warns that node 3 lags the durable floor (#79 option A: one
+/// copy of three away no longer pauses writes; the warn starts the lagging drop clock), or L1
+/// pauses on it, so node 3 misses them. Returns the next request id and how many landed.
 fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
     for other in [1, 2] {
         trio.links.drop_direction(NodeId(3), NodeId(other));
@@ -1778,7 +1779,10 @@ fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
     }
     let mut landed = 0;
     loop {
-        assert!(landed < 2_000, "{landed} puts landed and L1 never paused");
+        assert!(
+            landed < 2_000,
+            "{landed} puts landed and node 3 never lagged"
+        );
         let answer = trio.ask(rejoin_put(request));
         request += 1;
         match answer {
@@ -1787,6 +1791,14 @@ fn three_dies_and_misses_puts(trio: &mut Trio, mut request: u64) -> (u64, u64) {
                 return (request, landed)
             }
             other => panic!("put {}: {other:?}", request - 1),
+        }
+        let warned = trio.nodes[0]
+            .0
+            .lagging
+            .iter()
+            .any(|((at, _), entry)| *at == PartitionId(1) && entry.warned);
+        if landed >= 1 && warned {
+            return (request, landed);
         }
     }
 }
@@ -1838,7 +1850,7 @@ pub(super) fn regular_rejoin(host: &mut Host) {
 }
 
 /// A-R278 (W6b): a secondary restarted behind a live owner catches up from the owner's own
-/// copy and rejoins, twice. Node 3 dies, misses puts until L1 pauses on it, and restarts. The
+/// copy and rejoins, twice. Node 3 dies, misses puts until node 1 warns it lags, and restarts. The
 /// owner re-plans (#42) and F1 routes node 3's catch-up to the owner's copy, which the owner
 /// holds as a live primary. The owner restores a dormant receiver beside its primary to source
 /// it (`dormant_restored` on node 1), node 3 catches up, the re-plan commits with all three

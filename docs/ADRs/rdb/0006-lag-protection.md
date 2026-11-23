@@ -14,8 +14,9 @@ D5). It does not mean fsync. So between a client being told "yes" and the data b
 anywhere, there is a window, and the size of that window is the system's real exposure.
 
 Spec §6.2 bounds it with a table: warn at 1,000 ms, pause admission at 2,000 ms plus a 100 ms
-scheduler budget, evaluate every 50 ms plus progress events, resume only when all configured regular
-copies are durable through the paused prefix **and** lag has stayed below 250 ms for 5 s. It adds
+scheduler budget, and evaluate every 50 ms and on progress events. Under the issue #79 amendment,
+resume requires the pinned durable quorum through the paused prefix **and** lag below 250 ms for
+5 s on every copy still in the lag domain. It adds
 three sentences that are easy to lose and expensive to lose:
 
 - "If no regular secondary can ACK, success stops immediately. The 2 s threshold is not permission
@@ -59,14 +60,17 @@ not either: a copy proved to be on another history can neither satisfy the resum
 waited for, and leaving it in the set made the barrier unsatisfiable forever with nothing saying
 why. The set that also excludes self is a different set, used for the ACK predicate (ADR-0005 §5),
 and the three are named apart in the design. The durable views over this set are computed by R1
-and arrive on `DurableAdvanced { per_predicate }`; this module does not recompute them.
+and arrive on `DurableAdvanced { per_predicate }`; this module does not recompute them. **A record
+is safe once it is durable on the durable quorum of those copies: the primary and the
+`min_regular_acks` most-durable regular secondaries, or every secondary when there are no more
+than that** (amendment 2026-11-22). The primary always counts.
 
 **`unsafe_age` is not the only age, and it is not the one the 250 ms resume threshold reads.**
 There are two quantities:
 
 | Name | Means | Input | Read by |
 |---|---|---|---|
-| `unsafe_age` | exposure: how long the oldest applied record has gone without being durable everywhere required | `LocalApplied` / `DurableAdvanced` | warn (1,000 ms), pause (2,000 ms) |
+| `unsafe_age` | exposure: how long the oldest applied record has gone without being durable on the durable quorum | `LocalApplied` / `DurableAdvanced` | warn (1,000 ms), pause (2,000 ms) |
 | `replication_lag` | liveness: how stale our freshest evidence is that every required copy is keeping up | `PeerProgress { copy, tick }` | resume (250 ms) |
 
 ```text
@@ -184,7 +188,7 @@ Healthy, unsafe_age >= 2000 ms      :    -> Paused
 Healthy, unsafe_age >= 1000 ms      :    -> Warn
 Warn,    unsafe_age >= 2000 ms      :    -> Paused
 Warn,    unsafe_age <  1000 ms      :    -> Healthy
-Paused,  every active predicate durable through resume_barrier
+Paused,  every active predicate's durable quorum through resume_barrier
          AND a regular secondary qualifies
          AND not blocked
                                     :    -> Reprotecting { below_since: None }
@@ -232,8 +236,8 @@ The qualification term also gates `Paused → Reprotecting`: handing admission b
 that still cannot replicate would be the same bug arriving by the resume path.
 
 Entering `Paused` records `paused_prefix = highest locally applied seq` and sets
-`resume_barrier = paused_prefix`. Resume requires **that exact barrier** durable on every copy of
-every active predicate — not "caught up", not "close". `resume_barrier` is built from `DurableProof`
+`resume_barrier = paused_prefix`. Resume requires **that exact barrier** durable on the durable
+quorum of every active predicate — not "caught up", not "close". `resume_barrier` is built from `DurableProof`
 values (ADR-0005 §4), so it cannot be satisfied by an applied watermark.
 
 The hysteresis restarts from zero whenever `replication_lag` crosses back above 250 ms. Five seconds
@@ -312,8 +316,9 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 
 ## Consequences
 
-- A partition with a slow disk and healthy replication still pauses, because the predicate is
-  durability on required copies, not liveness of peers. That is intended and will look like a
+- A partition with a slow disk on the primary, or on every secondary of the quorum, still pauses,
+  because the predicate is durability on the durable quorum, not liveness of peers. A slow or dead
+  third copy does not pause; the host warns (`copy_durable_lagging`, amendment 2026-11-22). That is intended and will look like a
   storage fault to an operator; the exported `oldest_unsafe_seq` and bytes are what distinguish it.
 - Membership changes get more expensive: until the transition barrier is confirmed, two predicates
   are evaluated and the stricter one governs. This is the cost of not being able to launder exposure
@@ -389,6 +394,35 @@ only once it reported `durable_through ≥ b` in this generation. A copy that ne
 durable through nothing, barrier 0 included. The host does send that report at open: `pilot_kv`
 reaches ready in 2759 ms with both rulings.
 
+## Amendment 2026-11-22: the durable floor is a quorum (issue #79, option A; owner ruling 2026-11-20)
+
+Ruling: <https://github.com/achieveai/rDB/issues/79#issuecomment-7078410724>.
+
+**The cost.** The floor was the minimum over every regular copy. One dead secondary of an RF3
+partition pinned it, so from `pause_age` (2 s) until the 10 s unreachable-drop re-plan, writes were
+refused: 9.4 s measured (run r1, 2026-11-20), with the primary and the other secondary live.
+
+**Decision.** R1's `DurableAdvanced` carries, per predicate, the durable quorum floor: the
+primary's durable seq capped by the `k`-th most durable regular secondary, `k = min(min_regular_acks, n)`.
+L1 is unchanged and reads it as before, for exposure, resume and retirement. RF2 and
+`DegradedRf2` have `k = n`, so their floor is the old minimum. The primary always counts. The
+all-copies views (`min_required_durable`, `all_durable_through`) keep their meaning.
+
+**Why it is safe.** An acknowledged write is on the primary and one live secondary (spec §5.2), so
+waiting for the third copy's fsync protects no acknowledged write while those two live. The
+pause still bounds how long an applied record can go without being durable on two copies.
+
+**What replaces the signal.** The host logs `copy_durable_lagging` (Warn) when a copy stays below
+the quorum floor for `pause_age_millis`, and `copy_durable_lag_cleared` when it catches up.
+A warned regular secondary is eligible for the `lagging` drop clock, linked or not (Q1, default
+(a)). While it remains the selected victim, `peer_drop_after_millis` without a change in its
+durable sequence triggers a drop plan. A changed victim or durable sequence restarts the clock,
+and the clock starts no earlier than the Warn. So a copy that stays linked but stops syncing
+cannot leave the partition running at two copies with nothing but a log line.
+
+**Rejected:** leaving a stale copy out of the floor (option B, a contract change); a 2 s drop
+clock (option C, about 3 s of refusal and bad for rolling restarts).
+
 ## Verification
 
 | Claim | How it is proven |
@@ -402,10 +436,12 @@ reaches ready in 2759 ms with both rulings.
 | Self is not in the lag domain | Primary sends no ACK to itself; with both peers reporting, `Reprotecting` completes — the earlier definition over a set containing self never did |
 | A lost copy leaves the lag domain | `CopyLost { C, Diverged }` during `Reprotecting` with the floor intact: the hold continues over the remaining peers and completes; `lost_copies` exports `[C]`. The trace carries the same set by node, `ProtectionState.lost_copy_set`, and INV-LAG clause (a) does not require a lost copy at the barrier (amended 2026-10-07, M9 S0 ruling item 5; `m9_f2_b`, `m9_f2_00`) |
 | A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |
-| The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier, reported by every pinned copy (A-R167); then `Reprotecting`, and `Healthy` with no hold on this first resume (A-R165) |
+| The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier, reported by the pinned durable quorum (A-R167, amended by issue #79); then `Reprotecting`, and `Healthy` with no hold on this first resume (A-R165) |
 | A block reads as a block | `BlockPartition` with no prior `Lost` (predicate already false, or before the first `Gained`): the module is `Paused`, `reason == DIVERGENCE_REQUIRES_OPERATOR`, and no later `HealthEval` or `Gained` resumes it |
 | A membership change does not unblock | `BlockPartition`, then a config change adding a regular copy that ACKs at head: `Gained` arrives, every predicate is durable through the barrier, and the module still stays `Paused` with admission unchanged |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |
+| A lost third copy does not pause (amendment 2026-11-22) | RF3, node 3 silent, writes for > `pause_age`: no `Paused`, no refusal, `copy_durable_lagging` names copy 3 (`i79_a_lost_secondary_refuses_no_write_and_warns`) |
+| The quorum still needs the primary (amendment 2026-11-22) | B and C durable, the primary's flush stalled: it pauses (the row above, unchanged; `i79_the_protection_floor_is_the_primary_and_the_best_secondary` clause 3) |
 | `next_interesting_tick` is sound | Property: for every state, no `HealthEval` strictly before the returned tick changes the state |
 | Idle never pauses | No transactions, advance virtual time by an hour: state stays `Healthy` |
 | Rename does not reset | Apply at t=0, rename a required copy at t=1,200 ms: `Warn` persists and pause still lands at 2,000 ms |

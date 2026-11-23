@@ -26,8 +26,9 @@ struct Predicate {
     config_version: ConfigVersion,
     /// The primary plus the regular secondaries. Never shadows (K-B-48).
     copies: BTreeSet<CopyId>,
-    /// The highest seq durable on every copy of this predicate, as R1 last reported it in this
-    /// generation. `None` until R1 reports: an unreported predicate is durable through nothing,
+    /// The highest seq durable on this predicate's durable quorum (the primary and its
+    /// `min_regular_acks` most-durable regular secondaries, issue #79), as R1 last reported it
+    /// in this generation. `None` until R1 reports: an unreported predicate is durable through nothing,
     /// barrier 0 included (ruling A-R167). Resume needs R1's evidence, never an assumption.
     durable_through: Option<DurableSeq>,
 }

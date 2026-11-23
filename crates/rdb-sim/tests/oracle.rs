@@ -2559,7 +2559,7 @@ fn lag_cycle(case: &str, durable: &[(NodeId, Seq)], resuming_age: u64, healthy_t
 }
 
 #[retcd_test]
-fn m7v_36_lag_resume_before_every_pinned_copy_reaches_the_barrier_violates() {
+fn m7v_36_lag_resume_without_durable_quorum_violates() {
     support::preamble();
     // Only n2 reached the barrier. A checker written with a singular `durability_advance` passes
     // this and is the weaker of the two implementations.
@@ -2568,7 +2568,7 @@ fn m7v_36_lag_resume_before_every_pinned_copy_reaches_the_barrier_violates() {
     let signature = violated(
         &judge(&trace),
         Invariant::Lag,
-        "resume_without_every_pinned_copy",
+        "resume_without_durable_quorum",
     );
     assert!(
         signature.detail.contains('1') && signature.detail.contains('3'),
@@ -2677,7 +2677,8 @@ fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
 /// self minus lost). Clause (a) quantifies over the pinned set less the copies the resume line
 /// names lost: n3 lost and short of the barrier, the other two at it, is a legal resume. Near-
 /// misses: the lost set excuses only its own nodes, so n1 short beside a lost n3 still reports n1
-/// alone; and the same run with nothing lost reports n3, as before the field existed.
+/// alone. Since issue #79 (option A) the same run with nothing lost is legal too: n1 and n2 are
+/// the durable quorum. It reported n3 before.
 #[retcd_test]
 fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     support::preamble();
@@ -2688,7 +2689,7 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     let signature = violated(
         &judge(&n1_short),
         Invariant::Lag,
-        "resume_without_every_pinned_copy",
+        "resume_without_durable_quorum",
     );
     assert!(
         signature.detail.contains("node(s) 1 short"),
@@ -2696,16 +2697,9 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
         signature.detail
     );
 
-    let signature = violated(
-        &judge(&n3_short()),
-        Invariant::Lag,
-        "resume_without_every_pinned_copy",
-    );
-    assert!(
-        signature.detail.contains("node(s) 3 short"),
-        "{}",
-        signature.detail
-    );
+    // Issue #79 (option A): the same run with nothing lost is legal too now. n3 short beside
+    // the primary and n2 at the barrier is the durable quorum (it reported n3 before #79).
+    proven(&judge(&n3_short()), Invariant::Lag);
 }
 
 #[retcd_test]
@@ -2743,34 +2737,35 @@ fn m7v_38_lag_unsafe_age_reset_by_a_config_version_change_violates() {
     );
     assert!(signature.detail.contains("1800"), "{}", signature.detail);
 
-    // Near-miss: the same drop **with** a retirement barrier — the paused prefix really did
-    // become durable on every pinned copy.
-    let retired = base("m7v-38b")
-        .at(2_000)
-        .push(protection(
-            ProtectionPhase::Paused,
-            1_800,
-            &[N1, N2, N3],
-            ConfigVersion(3),
-            Seq(40),
-            Seq(40),
-            None,
-        ))
-        .flush(N1, Seq(40))
-        .flush(N2, Seq(40))
-        .flush(N3, Seq(40))
-        .at(2_100)
-        .push(protection(
-            ProtectionPhase::Paused,
-            0,
-            &[N1, N2, N3],
-            ConfigVersion(4),
-            Seq(40),
-            Seq(40),
-            None,
-        ))
-        .build();
-    proven(&judge(&retired), Invariant::Lag);
+    // A quorum retires the prefix with N3 either durable through 40 or one record short.
+    for third in [Seq(40), Seq(39)] {
+        let retired = base("m7v-38b")
+            .at(2_000)
+            .push(protection(
+                ProtectionPhase::Paused,
+                1_800,
+                &[N1, N2, N3],
+                ConfigVersion(3),
+                Seq(40),
+                Seq(40),
+                None,
+            ))
+            .flush(N1, Seq(40))
+            .flush(N2, Seq(40))
+            .flush(N3, third)
+            .at(2_100)
+            .push(protection(
+                ProtectionPhase::Paused,
+                0,
+                &[N1, N2, N3],
+                ConfigVersion(4),
+                Seq(40),
+                Seq(40),
+                None,
+            ))
+            .build();
+        proven(&judge(&retired), Invariant::Lag);
+    }
 }
 
 #[retcd_test]

@@ -1,4 +1,4 @@
-<!-- drift-basis: bcef9df5ab5e1a4094c3242df4c2036319a0b225 -->
+<!-- drift-basis: 8eb9f8de00c2574fc982472511d0cd1de45faa92 -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -1115,6 +1115,10 @@ re-read, not before it.
 - Every row in this §15 that names `ErrorKind` was re-read against that: kernel-b's `Ignored`/`Alert` vocabulary rows, verification's row 9 (admission subset) and row 15 (`ClientOutcome::Error`), and kernel-a's `KernelEffect` rows. Each keeps its disposition. A row that quotes an `ErrorKind` count is a dated reading at its own basis and is left as it stands.
 
 **Merge (2026-11-12, lead, PR #110 takes main after #104), basis tree `629621d` (main) and tree `1d6140e` (this branch) → tree `618a021`.** `618a021` is the contracts tree of the merge, and it is the union of the two sides above, which touch different files. `git diff --stat 629621d 618a021` touches only `authority.rs`, `event.rs` and `recovery.rs` (this branch's issue #105 changes, described in the dev-tail entries above). `git diff --stat 1d6140e 618a021` touches only `errors.rs` (main's issue #90 changes, described in the PR #104 entries above). So `errors.rs` at `618a021` is byte-identical to main's, and `recovery.rs`, `authority.rs` and `event.rs` are byte-identical to this branch's; every claim and citation in both sets of entries stands as written. Marker moved after this re-read.
+
+**Re-read (2026-11-22, dev-79, issue #79 option A), basis moves tree `618a021` → tree `63f7306`.** `63f7306` is `git rev-parse HEAD:crates/rdb-core/src/contracts` at `b5ef107b` on branch `feat/79-quorum-floor`; the contract change is commit `e5717b4b`. `git diff --stat 618a021 63f7306` touches one file, `event.rs`, +3 −3, and every changed line is a `///` doc comment. `KernelEvent::DurableAdvanced` and `KernelEffect::DurableAdvanced` now say that each `per_predicate` value is the predicate's durable quorum floor (#79), where before they said it was `all_durable_through`, the highest sequence durable on every copy. No type, field, variant or derive changed, and the file has the same line count, so no line citation in this plan moves. This plan names neither `DurableAdvanced` variant, so no row here reads the changed text. Marker moved after this re-read.
+
+**Re-read (2026-11-22, dev-79, merge of main `1e336ceb` into `feat/79-quorum-floor`), basis moves to tree `8eb9f8d`.** The two moves above both started from tree `618a021`: #148 to `bcef9df` (`errors.rs`, `ErrorKind::TooLarge` added last) and #79 to `63f7306` (`event.rs`, doc comments on `KernelEvent::DurableAdvanced` and `KernelEffect::DurableAdvanced` only). `8eb9f8d` is both: `git diff --stat bcef9df 8eb9f8d` is `event.rs` +3 −3 and `git diff --stat 63f7306 8eb9f8d` is `errors.rs` +6. The two changes share no file, so each re-read above stands as written. Marker moved after this re-read.
 
 ---
 
