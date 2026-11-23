@@ -2559,7 +2559,7 @@ fn lag_cycle(case: &str, durable: &[(NodeId, Seq)], resuming_age: u64, healthy_t
 }
 
 #[retcd_test]
-fn m7v_36_lag_resume_before_every_pinned_copy_reaches_the_barrier_violates() {
+fn m7v_36_lag_resume_without_durable_quorum_violates() {
     support::preamble();
     // Only n2 reached the barrier. A checker written with a singular `durability_advance` passes
     // this and is the weaker of the two implementations.
@@ -2568,7 +2568,7 @@ fn m7v_36_lag_resume_before_every_pinned_copy_reaches_the_barrier_violates() {
     let signature = violated(
         &judge(&trace),
         Invariant::Lag,
-        "resume_without_every_pinned_copy",
+        "resume_without_durable_quorum",
     );
     assert!(
         signature.detail.contains('1') && signature.detail.contains('3'),
@@ -2689,7 +2689,7 @@ fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
     let signature = violated(
         &judge(&n1_short),
         Invariant::Lag,
-        "resume_without_every_pinned_copy",
+        "resume_without_durable_quorum",
     );
     assert!(
         signature.detail.contains("node(s) 1 short"),

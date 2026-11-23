@@ -120,8 +120,9 @@ fn hold_three(trio: &Trio) {
     trio.links.hold(NodeId(2), NodeId(3));
 }
 
-/// Put from `request` on until a new `membership_drop_planned` is logged. Every put before it
-/// must land, within [`PUTS_BEFORE_DROP`] puts. Returns the next request id and how many landed.
+/// Put from `request` on until a new `membership_drop_planned` is logged, within
+/// [`PUTS_BEFORE_DROP`] attempts. Accept transactions and `ProtectionPaused`, `LeaseExpired` or
+/// `UnknownOutcome` errors. Returns the next request id and the count of transaction answers.
 ///
 /// #79 option A: L1's floor is the durable quorum, so one dead copy of three no longer pauses
 /// writes. The drop comes on the unreachable clock, or on the lagging clock (Q1) for a copy
@@ -375,15 +376,15 @@ fn three_unreachable_since(trio: &mut Trio) -> Tick {
     })
 }
 
-/// b3 (A-R281 M1 flapping): node 3's links are held three times, each time long enough for L1
-/// to pause writes but healed 6/10 of the drop clock after node 1 starts counting node 3
-/// unreachable (#67), the earlier of the two clocks. A heal or an admit starts each clock
-/// again, so no flap drops it. Held past the clock, it is dropped exactly once, and writes
-/// resume.
-/// Cut: `drop_duty` keeps the blame while L1 admits, red (a flap drops node 3).
+/// b3 (A-R281 M1 flapping), re-cut for #79: node 3's links are held three times, each time
+/// long enough for node 1 to warn it lagging (`copy_durable_lagging`) but healed 6/10 of the
+/// drop clock after node 1 starts counting node 3 unreachable (#67), the earlier of the two
+/// clocks. Each heal lets node 3 catch up, which clears its lag and starts both clocks again,
+/// so no flap drops it. Held past the clock, it is dropped exactly once, and writes resume.
+/// Cut: `count_unreachable` keeps a count across a link that came back, red (a later flap
+/// never sees node 1 count node 3 unreachable again).
 /// Integration (~7 s): three flaps, then b1's drop.
 #[config_log::retcd_test]
-#[ignore = "#79: no pause with one copy dead; re-cut for the lagging clock in #248"]
 fn m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock() {
     const METHOD: &str =
         "m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock";
@@ -396,7 +397,7 @@ fn m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock()
         // pause. Healing a fixed time after the pause left the first clock only its start
         // lag as margin (8 ms on 2026-10-26, dropped at 1,001 ms), so heal against its start.
         let since = three_unreachable_since(&mut trio);
-        (request, _) = put_until_drop_planned(&mut trio, request);
+        (request, _) = put_until_blamed(&mut trio, request);
         let heal_at = since.plus_millis(DROP_AFTER_MILLIS * 6 / 10);
         trio.until("host time to pass the heal", |trio| {
             (trio.clock.now() >= heal_at).then_some(())
@@ -407,6 +408,15 @@ fn m10_s2_b3_a_flapping_copy_is_dropped_once_and_only_when_down_past_the_clock()
         );
         trio.links.heal_all();
         trio.ready();
+        // The episode ends when node 3 has caught up: its lag entry goes.
+        trio.until("node 3 caught up after the flap", |trio| {
+            (!trio.nodes[0]
+                .0
+                .lagging
+                .keys()
+                .any(|(at, _)| *at == PartitionId(1)))
+            .then_some(())
+        });
     }
     assert_eq!(
         logged!(METHOD, "membership_drop_planned").len(),
@@ -603,6 +613,79 @@ fn m10_s2_b8_the_clock_starts_again_while_the_blamed_copy_advances() {
     assert_eq!((other.copy, other.since), (CopyId(2), Tick(1_100)));
 }
 
+/// #249 review: a linked copy blamed through a pause gets the whole drop clock after its
+/// lagging Warn. Both secondaries' flushes stop, so the durable floor stands and L1 pauses;
+/// node 1 blames one of them for the pause. Partway through the clock the other flushes again:
+/// the floor moves past the blamed copy, node 1 warns it lagging, and L1's resume hold ends
+/// after the Warn, so the lagging clock takes over the same copy at the same durable sequence.
+/// It is dropped by the lagging clock no sooner than `peer_drop_after_millis` after the Warn.
+/// Cut: `drop_duty` keeps the pause's blame `since` for the lagging clock, red (dropped about
+/// half a clock after the Warn).
+/// Integration (~8 s): bootstrap's window, the pause, the Warn and one 4 s drop clock.
+#[config_log::retcd_test]
+fn m10_s2_w3_a_linked_copy_gets_the_whole_drop_clock_after_its_lagging_warn() {
+    const METHOD: &str = "m10_s2_w3_a_linked_copy_gets_the_whole_drop_clock_after_its_lagging_warn";
+    const CLOCK: u64 = 4 * DROP_AFTER_MILLIS;
+    use rdb_core::contracts::errors::ErrorKind;
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, _) = started(dir.path(), |host| {
+        tuned(host);
+        host.peer_drop_after_millis = CLOCK;
+        host.unreachable_drop_after_millis = 30 * CLOCK;
+        host.budgets.resume_hold_millis = CLOCK * 3 / 10;
+    });
+    trio.nodes[1].0.next_flush = Tick(u64::MAX);
+    trio.nodes[2].0.next_flush = Tick(u64::MAX);
+    let mut request = 1;
+    loop {
+        assert!(
+            request < PUTS_BEFORE_DROP,
+            "L1 never paused with no secondary flushing"
+        );
+        let answer = trio.ask(put(request));
+        request += 1;
+        match answer {
+            Answer::Txn { .. } => {}
+            Answer::Error { error, .. } if error.kind == ErrorKind::ProtectionPaused => break,
+            Answer::Error { error, .. } if error.kind == ErrorKind::UnknownOutcome => {}
+            other => panic!("put {}: {other:?}", request - 1),
+        }
+    }
+    let blame = trio.until("node 1 blames a copy for the pause", |trio| {
+        trio.nodes[0].0.blamed.get(&PartitionId(1)).copied()
+    });
+    let victim = blame.copy;
+    let other = if copy_of(&trio, 2) == victim { 2 } else { 1 };
+    pass(&mut trio, CLOCK * 4 / 10);
+    trio.nodes[other].0.next_flush = trio.clock.now();
+    let warned_at = trio.until("node 1 warns the blamed copy lagging", |trio| {
+        trio.nodes[0]
+            .0
+            .lagging
+            .get(&(PartitionId(1), victim))
+            .filter(|entry| entry.warned)
+            .map(|entry| entry.warned_at)
+    });
+    let kept = trio.nodes[0].0.blamed.get(&PartitionId(1)).map(|b| b.since);
+    assert_eq!(
+        kept,
+        Some(blame.since),
+        "the pause's blame stood to the Warn"
+    );
+    let planned = trio.until("node 1 plans a drop", |trio| {
+        let planned = logged!(METHOD, "membership_drop_planned");
+        (!planned.is_empty()).then(|| (planned, trio.clock.now()))
+    });
+    let (planned, at) = planned;
+    assert_eq!(planned[0]["clock"], "lagging", "{planned:?}");
+    assert_eq!(planned[0]["copy"], victim.0, "{planned:?}");
+    let after_warn = HostClock::millis_until(warned_at, at);
+    assert!(
+        after_warn >= CLOCK,
+        "dropped {after_warn} ms after its Warn, short of the {CLOCK} ms clock"
+    );
+}
+
 /// b9 (critic-degraded D1): node 2 stays linked and acks everything it is sent, but its
 /// durable sequence never moves (its flush duty is stopped). L1 pauses on it. The owner blames
 /// the regular copy with the lowest durable sequence below the resume barrier, node 2, and
@@ -696,10 +779,9 @@ fn m10_s2_d2_a_pause_for_divergence_is_never_dropped_past() {
 /// Since A-R336, node 3's newer boot also makes the drop's commit re-add it at once as a shadow
 /// (b15), which L1 never counts: the put lands at the drop's generation or that one.
 /// Cut: `rejoin_blocked` returns at once, red (node 1's F1 stays blocked).
-/// Integration (~5 s): bootstrap's window, puts until L1 pauses, F1's sync and barrier
-/// waits, the abandon's re-plan.
+/// Integration (~5 s): bootstrap's window, puts until node 1 warns node 3 lagging, F1's sync
+/// and barrier waits, the abandon's re-plan.
 #[config_log::retcd_test]
-#[ignore = "#79: no pause with one copy dead; re-cut for the lagging clock in #248"]
 fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
     const METHOD: &str = "m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned";
     let dir = config_testkit::fs::temp_dir();
@@ -711,7 +793,8 @@ fn m10_s2_b10_a_rejoin_whose_barrier_never_completes_is_abandoned() {
     trio.short_window_after_commit();
 
     kill(&trio, 3, &[1, 2]);
-    let (request, _) = put_until_drop_planned(&mut trio, 1);
+    // #79: node 3 misses puts until node 1 warns it lagging; nothing pauses or drops it.
+    let (request, _) = put_until_blamed(&mut trio, 1);
     trio.links.heal_all();
     // Its restart: the link reports a newer boot, and nodes 1 and 2 hear it.
     let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
@@ -2339,7 +2422,6 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
 /// Cut: a retry drops `promote` (r366b), red (the retry pins node 3 as a shadow again).
 /// Integration (~5 s): b1's drop, the re-add, the promote and its one retry.
 #[config_log::retcd_test]
-#[ignore = "#79: flaky against the lagging clock (red 2 of 4 runs); re-cut in #248"]
 fn m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote() {
     const METHOD: &str =
         "m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote";
@@ -2347,13 +2429,12 @@ fn m10_s2_b25_a_promote_whose_drain_proof_is_lost_is_asked_again_as_a_promote() 
     let (mut trio, _) = started(dir.path(), tuned);
     kill(&trio, 3, &[1, 2]);
     put_until_drop_planned(&mut trio, 1);
-    trio.until("node 1 decided to drop node 3", |trio| {
-        matches!(
-            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
-            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
-                if replan.drop == Some(NodeId(3))
-        )
-        .then_some(())
+    // As b15: the drop's re-plan can commit inside the put that started it.
+    trio.until("node 1 decided to drop node 3", |_| {
+        logged!(METHOD, "rejoin_plan")
+            .iter()
+            .any(|line| line["dropped"] == "Some(3)")
+            .then_some(())
     });
     trio.links.heal_all();
     trio.links.hold(NodeId(1), NodeId(3));
@@ -5604,7 +5685,6 @@ fn m11_r464_a_a_flapping_link_does_not_start_the_catch_up_clock_again() {
 /// 2 above the seal: no copy is stuck, and writes land. Cut: `sealed()` reading only that a
 /// seal was set, red (node 2 refuses the new generation). Integration (~5 s), as b10.
 #[config_log::retcd_test]
-#[ignore = "#79: no pause with one copy dead; re-cut for the lagging clock in #248"]
 fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_above() {
     const METHOD: &str =
         "s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_above";
@@ -5615,7 +5695,8 @@ fn s5_29b_a_live_owners_aborted_plan_leaves_a_sealed_copy_the_next_plan_moves_ab
     });
     trio.short_window_after_commit();
     kill(&trio, 3, &[1, 2]);
-    let (request, _) = put_until_drop_planned(&mut trio, 1);
+    // #79: node 3 misses puts until node 1 warns it lagging; nothing pauses or drops it.
+    let (request, _) = put_until_blamed(&mut trio, 1);
     trio.links.heal_all();
     let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
     let mailbox = trio.nodes[2].1.clone();

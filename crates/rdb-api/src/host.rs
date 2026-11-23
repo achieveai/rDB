@@ -2089,6 +2089,8 @@ struct Lagging {
     target: DurableSeq,
     /// Whether `copy_durable_lagging` was logged for this entry, so it is logged once.
     warned: bool,
+    /// When it was logged: the lagging drop clock starts no earlier ([`Host::drop_duty`]).
+    warned_at: Tick,
 }
 
 /// Which clock planned a drop ([`Host::drop_duty`]), logged as `clock`.
@@ -8527,10 +8529,15 @@ impl Host {
                     continue;
                 }
             }
-            let (copy, durable, clock) = match self.holding_up(partition, now) {
-                Some((copy, durable)) => (copy, durable, DropClock::Paused),
+            // A lagging clock starts no earlier than its copy's Warn (#249 review): a blame
+            // kept from a pause on the same copy at the same durable sequence would otherwise
+            // drop a linked copy well short of `peer_drop_after_millis` after it is warned.
+            let (copy, durable, clock, not_before) = match self.holding_up(partition, now) {
+                Some((copy, durable)) => (copy, durable, DropClock::Paused, None),
                 None => match self.lagging_past_pause(partition, now) {
-                    Some((copy, durable)) => (copy, durable, DropClock::Lagging),
+                    Some((copy, durable, warned_at)) => {
+                        (copy, durable, DropClock::Lagging, Some(warned_at))
+                    }
                     None => {
                         self.blamed.remove(&partition);
                         continue;
@@ -8542,8 +8549,11 @@ impl Host {
                 .get(&partition)
                 .and_then(|committed| holder_of(&committed.committed.pinned_config.members, copy))
                 .is_some_and(|node| !self.linked(node));
-            let blame = Blame::next(self.blamed.get(&partition), copy, durable, now)
+            let mut blame = Blame::next(self.blamed.get(&partition), copy, durable, now)
                 .seen_unlinked(unlinked);
+            if let Some(warned_at) = not_before {
+                blame.since = blame.since.max(warned_at);
+            }
             self.blamed.insert(partition, blame);
             let blamed_ms = HostClock::millis_until(blame.since, now);
             if blamed_ms >= self.peer_drop_after_millis {
@@ -9061,7 +9071,9 @@ impl Host {
         for (copy, holder, durable) in copies {
             let key = (partition, copy);
             if let Some(entry) = self.lagging.get(&key).copied() {
-                if durable.0 >= entry.target.0 {
+                // Caught up with the floor it lagged, or with today's floor if that is lower
+                // (#249 review: a floor that fell, as across a re-plan, must not keep it warned).
+                if durable.0 >= entry.target.0.min(floor.0) {
                     self.lagging.remove(&key);
                     if entry.warned {
                         tracing::info!(
@@ -9080,6 +9092,7 @@ impl Host {
                     since: now,
                     target: floor,
                     warned: false,
+                    warned_at: now,
                 });
             }
             let Some(entry) = self.lagging.get_mut(&key) else {
@@ -9090,6 +9103,7 @@ impl Host {
                 continue;
             }
             entry.warned = true;
+            entry.warned_at = now;
             let linked = self.linked(holder);
             let unreachable_ms = self
                 .unreachable
@@ -10747,7 +10761,7 @@ impl Host {
         &self,
         partition: PartitionId,
         now: Tick,
-    ) -> Option<(CopyId, DurableSeq)> {
+    ) -> Option<(CopyId, DurableSeq, Tick)> {
         if self.rejoins.contains_key(&partition) {
             return None;
         }
@@ -10769,12 +10783,12 @@ impl Host {
         self.lagging
             .iter()
             .filter(|((at, _), entry)| *at == partition && entry.warned)
-            .filter_map(|((_, copy), _)| {
+            .filter_map(|((_, copy), entry)| {
                 tracker
                     .peer(*copy)
-                    .map(|peer| (*copy, peer.progress.durable))
+                    .map(|peer| (*copy, peer.progress.durable, entry.warned_at))
             })
-            .min_by_key(|(copy, durable)| (durable.0, copy.0))
+            .min_by_key(|(copy, durable, _)| (durable.0, copy.0))
     }
 
     /// The copy L1 pauses `partition`'s writes on account of, with that copy's durable

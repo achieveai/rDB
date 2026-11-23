@@ -4,7 +4,7 @@
 //!
 //! | Clause | Rule(s) | Says |
 //! |---|---|---|
-//! | (a) | `resume_without_every_pinned_copy`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when the durable quorum of the pinned `required_copy_set`, less the lost ones, is durable at the barrier, no gating copy is past it, and lag stayed under 250 ms for the 5 s before it |
+//! | (a) | `resume_without_durable_quorum`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when the durable quorum of the pinned `required_copy_set`, less the lost ones, is durable at the barrier, no gating copy is past it, and lag stayed under 250 ms for the 5 s before it |
 //! | (b) | `unsafe_age_reset_across_config_version` | the unsafe-age timer never falls across a `config_version` change without a retirement barrier |
 //! | (c) | `admitted_while_paused` | pausing is an **admission** gate (critic F20) |
 //!
@@ -253,7 +253,7 @@ fn resume_is_legal(
     );
     if !quorum {
         return Err(Violation::detailed(
-            "resume_without_every_pinned_copy",
+            "resume_without_durable_quorum",
             ReplicaRole::Primary,
             format!(
                 "resumed at tick {healthy_tick} with node(s) {} short of the resume barrier {} \

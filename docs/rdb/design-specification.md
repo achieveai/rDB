@@ -464,8 +464,10 @@ owner ruling 2026-11-20, <https://github.com/achieveai/rDB/issues/79#issuecommen
 amended 2026-11-22). It is the copies an acknowledgement already rests on, so a third copy's fsync
 protects no acknowledged write while the primary and one live secondary hold it. A copy that
 stays below the quorum for the pause age is logged at Warn (`copy_durable_lagging`), and does not
-pause writes; still below it `peer_drop_after_millis` later, it is dropped on the `lagging` drop
-clock (Q1). The lag domain is still the copies minus self minus lost (ADR-rdb-0006 §1); the
+pause writes. A warned regular secondary is eligible for the `lagging` drop clock (Q1), linked or
+not. While it remains the selected victim, `peer_drop_after_millis` without a change in its
+durable sequence triggers a drop plan. A changed victim or durable sequence restarts the clock,
+and the clock starts no earlier than the Warn. The lag domain is still the copies minus self minus lost (ADR-rdb-0006 §1); the
 trace exports the lost set as `ProtectionState.lost_copy_set`, and INV-LAG reads it (M9 S0,
 2026-10-07).
 
