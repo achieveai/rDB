@@ -372,13 +372,18 @@ impl ClockGuard {
     }
 
     /// Fold one peer's round in, and report a change of the bound.
+    /// Membership is read under the verdict lock (verdicts, then members, as
+    /// [`Self::set_members`] takes them), so a retirement between the read and the record
+    /// cannot put the retired peer's verdict back (PR #244 review).
     pub(crate) fn observe(&self, peer: NodeId, sample: ClockSample) {
+        #[cfg(test)]
+        tests::before_verdict_lock();
+        let now = self.mono();
+        let mut verdicts = self.lock();
         if !self.counts(peer) {
             tracing::debug!(peer = peer.0, "clock_sample_not_a_member");
             return;
         }
-        let now = self.mono();
-        let mut verdicts = self.lock();
         let before = verdicts.peers.get(&peer).map(|seen| seen.verdict);
         let judged = verdicts.record(peer, sample, LINK_EPSILON_MILLIS, now);
         if let Some(judged) = judged {
@@ -739,7 +744,50 @@ impl Capped {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::time::Duration;
+
+    thread_local! {
+        /// Run once by the next [`ClockGuard::observe`] on this thread, before it takes the
+        /// verdict lock: a row's way to force an interleaving.
+        static BEFORE_VERDICT_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_verdict_lock() {
+        if let Some(hook) = BEFORE_VERDICT_LOCK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// PR #244 review (clock.rs): node 4 is retired while its observation is between entering
+    /// `observe` and taking the verdict lock. The retirement wins: node 4 has no verdict and
+    /// does not count, so 2 of 4 stays no majority. Unit.
+    /// Cut: the membership check back before the hook, outside the verdict lock: node 4's
+    /// Agree is recorded after its retirement ("a retired peer's Agree is not put back"), red.
+    #[test]
+    fn pr244_a_retirement_racing_an_observation_keeps_the_peer_out() {
+        let agree = offset_by(0, 10);
+        let guard = std::sync::Arc::new(ClockGuard::new());
+        let five: BTreeSet<NodeId> = (1..=5).map(NodeId).collect();
+        guard.set_members(&five);
+        guard.attach(five.len());
+        guard.observe(NodeId(2), agree);
+        let retire = std::sync::Arc::clone(&guard);
+        BEFORE_VERDICT_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let four: BTreeSet<NodeId> = [1, 2, 3, 5].into_iter().map(NodeId).collect();
+                retire.set_members(&four);
+                retire.attach(four.len());
+            }));
+        });
+        guard.observe(NodeId(4), agree);
+        assert_eq!(
+            guard.verdict_of(NodeId(4)),
+            None,
+            "a retired peer's Agree is not put back"
+        );
+        assert!(!guard.established(), "2 of 4 is no majority");
+    }
 
     /// #123 review: a tick deadline's `Instant` is never later than the moment the clock first
     /// reads that tick, however long ago the caller read the clock, and a deadline at or before
